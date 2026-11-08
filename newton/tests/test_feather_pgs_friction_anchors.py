@@ -102,7 +102,9 @@ def _run_squeeze(
     kwargs = dict(_SQUEEZE_SOLVER)
     kwargs.update(solver_kwargs)
     solver = newton.solvers.SolverFeatherPGS(model, **kwargs)
-    pipeline = newton.CollisionPipeline(model, rigid_contact_max=256, broad_phase="nxn", contact_matching=matching)
+    pipeline = newton.CollisionPipeline(
+        model, rigid_contact_max=256, broad_phase="nxn", contact_matching=matching, growable_contacts=True
+    )
     contacts = pipeline.contacts()
     s0, s1 = model.state(), model.state()
     control = model.control()
@@ -145,7 +147,9 @@ def _run_incline(steps: int, dt: float, **solver_kwargs):
     theta, mu = 30.0, 0.3
     model, box, _rot = _build_incline(theta, mu)
     solver = newton.solvers.SolverFeatherPGS(model, pgs_iterations=32, pgs_beta=0.05, **solver_kwargs)
-    pipeline = newton.CollisionPipeline(model, rigid_contact_max=64, broad_phase="nxn", contact_matching="latest")
+    pipeline = newton.CollisionPipeline(
+        model, rigid_contact_max=64, broad_phase="nxn", contact_matching="latest", growable_contacts=True
+    )
     contacts = pipeline.contacts()
     s0, s1 = model.state(), model.state()
     control = model.control()
@@ -172,7 +176,7 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
         """Keep patch history owned by the solver, independently of collision matching."""
         model, _jaws, _box = _build_v_jaws(5.0)
         solver = newton.solvers.SolverFeatherPGS(model, **_SQUEEZE_SOLVER, friction_anchor_beta=0.2)
-        pipeline = newton.CollisionPipeline(model, rigid_contact_max=256)
+        pipeline = newton.CollisionPipeline(model, rigid_contact_max=256, growable_contacts=True)
         state = model.state()
         newton.eval_fk(model, model.joint_q, model.joint_qd, state)
         contacts = pipeline.contacts()
@@ -228,7 +232,7 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
         def check(model, solver_kwargs, matching="latest", steps=120):
             solver = newton.solvers.SolverFeatherPGS(model, friction_anchor_beta=beta, **solver_kwargs)
             pipeline = newton.CollisionPipeline(
-                model, rigid_contact_max=256, broad_phase="nxn", contact_matching=matching
+                model, rigid_contact_max=256, broad_phase="nxn", contact_matching=matching, growable_contacts=True
             )
             contacts = pipeline.contacts()
             s0, s1 = model.state(), model.state()
@@ -274,7 +278,9 @@ class TestFeatherPGSFrictionAnchors(unittest.TestCase):
         """Capture and replay two steps with device-side anchor history under a CUDA graph."""
         model, jaws, box = _build_v_jaws(5.0)
         solver = newton.solvers.SolverFeatherPGS(model, friction_anchor_beta=0.05, **_SQUEEZE_SOLVER)
-        pipeline = newton.CollisionPipeline(model, rigid_contact_max=256, broad_phase="nxn", contact_matching="latest")
+        pipeline = newton.CollisionPipeline(
+            model, rigid_contact_max=256, broad_phase="nxn", contact_matching="latest", growable_contacts=True
+        )
         contacts = pipeline.contacts()
         s0, s1 = model.state(), model.state()
         control = model.control()

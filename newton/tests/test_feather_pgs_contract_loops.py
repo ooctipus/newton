@@ -773,7 +773,7 @@ class TestLoopsInScenes(unittest.TestCase):
         b.add_shape_sphere(ball, radius=0.04)
         model = b.finalize()
         solver = newton.solvers.SolverFeatherPGS(model, pgs_iterations=16, pgs_beta=0.1, dense_max_constraints=64)
-        pipeline = newton.CollisionPipeline(model, contact_matching="latest")
+        pipeline = newton.CollisionPipeline(model, contact_matching="latest", growable_contacts=True)
         contacts = pipeline.contacts()
         state_0, state_1, control = model.state(), model.state(), model.control()
         worst = 0.0
@@ -807,7 +807,7 @@ class TestSplitBody(unittest.TestCase):
         scene = scenes.stewart_platform()
         model = scene.build(wp.get_device())
         solver = newton.solvers.SolverFeatherPGS(model, dense_max_constraints=32)
-        pipeline = newton.CollisionPipeline(model, contact_matching="latest")
+        pipeline = newton.CollisionPipeline(model, contact_matching="latest", growable_contacts=True)
         contacts = pipeline.contacts()
         state_0, state_1, control = model.state(), model.state(), model.control()
         newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)

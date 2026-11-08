@@ -1100,7 +1100,7 @@ class TestPatchSolverRoutes(unittest.TestCase):
                     (solver.placement.row_parent, solver.placement.row_mu, solver.placement.impulses),
                     (solver.placement.row_parent, solver.placement.row_mu, solver.placement.impulses),
                 )
-                pipeline = newton.CollisionPipeline(model, contact_matching="latest")
+                pipeline = newton.CollisionPipeline(model, contact_matching="latest", growable_contacts=True)
                 contacts = pipeline.contacts()
                 state, out = model.state(), model.state()
                 newton.eval_fk(model, state.joint_q, state.joint_qd, state)
@@ -2471,7 +2471,7 @@ class _SolverTwin:
                 stack.enter_context(mock.patch.dict(os.environ, {"FEATHER_PGS_PATCH_FRAME_REUSE": "0"}))
             self.solver = SolverFeatherPGS(self.model, **options)
         self.patches = self.solver.laws.friction_patches
-        self.pipeline = newton.CollisionPipeline(self.model, **pipeline_options)
+        self.pipeline = newton.CollisionPipeline(self.model, **pipeline_options, growable_contacts=True)
         self.streams = [self.pipeline.contacts(), self.pipeline.contacts()]
         self.states = [self.model.state(), self.model.state()]
         newton.eval_fk(self.model, self.states[0].joint_q, self.states[0].joint_qd, self.states[0])
@@ -3321,7 +3321,9 @@ def run_captured_entry_filter(test, device, replays):
             )
         ],
     )
-    pipeline = newton.CollisionPipeline(model, rigid_contact_max=128, broad_phase="nxn", deterministic=True)
+    pipeline = newton.CollisionPipeline(
+        model, rigid_contact_max=128, broad_phase="nxn", deterministic=True, growable_contacts=True
+    )
     contacts = pipeline.contacts()
     state = model.state()
     poses = state.body_q.numpy()

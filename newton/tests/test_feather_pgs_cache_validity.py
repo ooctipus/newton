@@ -121,7 +121,7 @@ class _Rollout:
 
     def __init__(self, model, solver, *, copy_back=False):
         self.model, self.solver, self.copy_back = model, solver, copy_back
-        self.pipeline = newton.CollisionPipeline(model, deterministic=True)
+        self.pipeline = newton.CollisionPipeline(model, deterministic=True, growable_contacts=True)
         self.contacts = self.pipeline.contacts()
         self.control = model.control()
         self.states = [model.state(), model.state()]

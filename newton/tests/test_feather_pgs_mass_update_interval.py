@@ -229,8 +229,8 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
         graph_state, graph_out = _make_initial_state(graph_model), graph_model.state()
         eager_state, eager_out = _make_initial_state(eager_model), eager_model.state()
         graph_control, eager_control = graph_model.control(), eager_model.control()
-        graph_pipeline = newton.CollisionPipeline(graph_model)
-        eager_pipeline = newton.CollisionPipeline(eager_model)
+        graph_pipeline = newton.CollisionPipeline(graph_model, growable_contacts=True)
+        eager_pipeline = newton.CollisionPipeline(eager_model, growable_contacts=True)
         graph_contacts, eager_contacts = graph_pipeline.contacts(), eager_pipeline.contacts()
 
         def one_step(solver, state_in, state_out, control, contacts):

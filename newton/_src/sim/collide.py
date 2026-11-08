@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Literal
 import numpy as np
 import warp as wp
 
-from ..core.contact_pool import ContactDrops, ContactField, _capture_owner, capturing, model_contact_pool
+from ..core.contact_pool import ContactDrops, ContactField, ContactPool, _capture_owner, capturing, model_contact_pool
 from ..core.environment_flags import record_newton_environment, retired_notice
 from ..core.reset import normalize_reset_world_mask
 from ..exceptions import NewtonDeprecationWarning, NewtonWarning
@@ -66,7 +66,6 @@ from ..geometry.support_function import (
     SupportMapDataProvider,
     pack_mesh_ptr,
 )
-from ..geometry.tri_mesh_collision import TriMeshCollisionDetector
 from ..geometry.terrain_contacts import (
     TERRAIN_PARTNER_BOX,
     TERRAIN_PARTNER_CYLINDER,
@@ -74,6 +73,7 @@ from ..geometry.terrain_contacts import (
     TERRAIN_PARTNER_POINT,
     TERRAIN_PARTNER_WALK_SLOTS,
 )
+from ..geometry.tri_mesh_collision import TriMeshCollisionDetector
 from ..geometry.types import GeoType
 from ..sim.contacts import GENERATION_SENTINEL, Contacts, note_contact_frame_write
 from ..sim.enums import BodyFlags, JointType, ModelFlags
@@ -2314,6 +2314,7 @@ class CollisionPipeline:
         speculative_contact_gap_max: float | None = None,
         dynamic_shape_scale: bool = False,
         publish_capacity: bool = True,
+        growable_contacts: bool = False,
         convex_collision: Literal["auto", "ordinary", "rejection"] | None = None,
         contact_export: Literal["auto", "tiled", "compact"] | None = None,
     ):
@@ -2371,9 +2372,10 @@ class CollisionPipeline:
             body_pair_reduction: Reduce contacts per body pair in the narrow
                 phase. ``None`` (default) disables it. See
                 :class:`CollisionPipeline.BodyPairReductionConfig`.
-            rigid_contact_max: The rigid contact rows a pipeline's contact buffers start with; they grow
-                on demand (:meth:`service_capacity`), so this sets no limit. Resolved as this value,
-                else ``model.rigid_contact_max`` when it is not ``None`` (including zero), else an
+            rigid_contact_max: The rigid contact rows of the pipeline's contact buffers: a fixed
+                capacity, past which a pass drops contacts and flags it, unless ``growable_contacts``
+                makes it the rows they start from. Resolved as this value, else
+                ``model.rigid_contact_max`` when it is not ``None`` (including zero), else an
                 estimate from the model's shape pairs, and published to ``model.rigid_contact_max``
                 unless ``publish_capacity`` is ``False``. With ``body_pair_reduction``, the raw
                 primitive and convex contacts are staged in a buffer of the automatic estimate or this
@@ -2597,6 +2599,15 @@ class CollisionPipeline:
                 default :attr:`~newton.Model.rigid_contact_max` and
                 :attr:`~newton.Model.soft_contact_max`. Pass ``False`` for a private
                 pipeline, such as a solver's internal one. Defaults to ``True``.
+            growable_contacts: Whether the rigid contact buffers grow from demand, for a solver whose
+                per-contact state follows them (:class:`~newton.solvers.SolverFeatherPGS`). With
+                ``False`` (the default) the pipeline's buffers, its :meth:`contacts` among them, hold
+                the resolved ``rigid_contact_max`` rows from construction, of their own, and never
+                grow. With ``True`` they share the model's contact pool with the other growable
+                pipelines of the model and the solvers that follow it, start at a few thousand rows
+                (fewer when ``rigid_contact_max`` is smaller), grow before anything reads them in a
+                :meth:`collide` outside graph capture and between graph replays in
+                :meth:`service_capacity`, and trim once the demand settles.
 
         .. experimental::
 
@@ -2758,14 +2769,18 @@ class CollisionPipeline:
         self._terrain_law_reason = None
         self._terrain_law_listed = None
 
-        # The rows the buffers start with, by explicit > model > estimated precedence; they grow from demand.
+        # Resolve rigid contact capacity with explicit > model > estimated precedence: the rows of fixed buffers,
+        # or those growable buffers start from.
         estimate = None
         if rigid_contact_max is None:
             model_rigid_contact_max = model.rigid_contact_max
             if model_rigid_contact_max is not None:
                 rigid_contact_max = model_rigid_contact_max
             else:
-                rigid_contact_max = estimate = _estimate_rigid_contact_max(model)
+                rigid_contact_estimate = _estimate_rigid_contact_details(model)
+                rigid_contact_max = estimate = rigid_contact_estimate.capacity
+                if not growable_contacts:
+                    _warn_large_rigid_contact_estimate(rigid_contact_estimate)
         self._rigid_contact_max = rigid_contact_max
         if soft_contact_margin is not None:
             if soft_contact_gap is not None:
@@ -2786,9 +2801,15 @@ class CollisionPipeline:
             raise ValueError("max_triangle_pairs must be > 0 or None")
         if requires_grad is None:
             requires_grad = model.requires_grad
-        # Every per-contact buffer of this pipeline, its Contacts and the solvers that step the model
-        # holds the model's pool's ready rows, sized from measured and forecast demand.
-        self._contact_pool = model_contact_pool(model, device, rigid_contact_max)
+        # Every per-contact buffer of this pipeline and its Contacts holds the pool's ready rows: a fixed buffer of
+        # the capacity of the pipeline's own, or the model's pool, which the solvers that follow it share and which
+        # grows from measured and forecast demand.
+        if growable_contacts:
+            self._contact_pool = model_contact_pool(model, device, rigid_contact_max)
+        else:
+            self._contact_pool = ContactPool(
+                device=device, rows=rigid_contact_max, fixed=True, worlds=model.world_count
+            )
         # The pool's generation the last service_capacity() reported.
         self._service_generation = self._contact_pool.generation
         # The writers' row limit for a buffer whose pool was created during a capture (see _detect_rigid_contacts).
@@ -3624,7 +3645,7 @@ class CollisionPipeline:
         pool = self._contact_pool
         self._forecast = None
         self._no_velocities = wp.empty(0, dtype=wp.spatial_vector, device=device)
-        if pool.forecast_on is not None and model.shape_count:
+        if pool.forecast_on is not None and pool.growable and model.shape_count:
             self._forecast = _shape_forecast(
                 model, pool, self.geom_transform, terrain_law=self._terrain_law_listed is not None, estimate=estimate
             )
@@ -4192,19 +4213,20 @@ class CollisionPipeline:
 
     @property
     def rigid_contact_max(self) -> int:
-        """The rigid contact budget resolved at construction, kept for compatibility with Newton main.
+        """The rigid contact capacity resolved at construction: the rows of the pipeline's buffers.
 
-        Contact buffers grow on demand and are not sized by it: read
-        :attr:`newton.Contacts.rigid_contact_max` of :meth:`contacts` for the rows
-        they hold now.
+        With ``growable_contacts`` the buffers start from it and grow on demand:
+        read :attr:`newton.Contacts.rigid_contact_max` of :meth:`contacts` for the
+        rows they hold now.
         """
         return self._rigid_contact_max
 
     def service_capacity(self, state: State | None = None, *, dt: float | None = None) -> bool:
         """Size the rigid contact buffers from measured demand; return whether CUDA graphs must be recaptured.
 
-        The buffers of this pipeline, of its :meth:`contacts` and of the solvers
-        that step its model (e.g. :class:`~newton.solvers.SolverFeatherPGS`)
+        Fixed buffers (without ``growable_contacts``) never grow, and this returns
+        ``False``. Growable buffers, of this pipeline, of its :meth:`contacts` and of
+        the solvers that step its model (e.g. :class:`~newton.solvers.SolverFeatherPGS`),
         start at a few thousand rows. Call this
         once per step outside capture, e.g. right after launching the step's
         graph. Every
@@ -4243,8 +4265,6 @@ class CollisionPipeline:
         grow for them too. A :meth:`collide` outside graph capture grows the
         buffers itself before anything reads them. The buffers hold at most what
         the device memory can back: a demand past it raises :class:`MemoryError`.
-        Rows that a writer reserved during capture
-        (:meth:`~newton.Contacts.reserve_rigid_contacts`) are grown here too.
 
         Args:
             state: A state to measure before a graph starts from it, or ``None``.

@@ -300,7 +300,7 @@ def simulate(
         pipeline_options["contact_matching"] = scene.contact_matching
     if scene.deterministic_contacts:
         pipeline_options["deterministic"] = True
-    pipeline = newton.CollisionPipeline(model, **pipeline_options)
+    pipeline = newton.CollisionPipeline(model, **pipeline_options, growable_contacts=True)
     contacts = pipeline.contacts()
     # The history holds the rows the scene's contacts can fill (its budget), not every row the
     # contact buffers' first pages map, which can be a hundred times more.

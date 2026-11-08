@@ -39,7 +39,7 @@ def _roll(model, steps, *, dt=H, **options):
     state, out = model.state(), model.state()
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
     control = model.control()
-    pipeline = newton.CollisionPipeline(model)
+    pipeline = newton.CollisionPipeline(model, growable_contacts=True)
     contacts = pipeline.contacts()
     for _ in range(steps):
         pipeline.collide(state, contacts)
@@ -153,7 +153,7 @@ class TestOneContactPoint(unittest.TestCase):
         velocity[0], velocity[half] = 1.0, -1.0
         state.joint_qd.assign(velocity)
         newton.eval_fk(model, state.joint_q, state.joint_qd, state)
-        pipeline = newton.CollisionPipeline(model)
+        pipeline = newton.CollisionPipeline(model, growable_contacts=True)
         contacts = pipeline.contacts()
         before = _momenta(model, state)
         pipeline.collide(state, contacts)
@@ -304,7 +304,7 @@ class TestAngularDampingInThePredictor(unittest.TestCase):
         newton.eval_fk(model, state.joint_q, state.joint_qd, state)
         out = model.state()
         control = model.control()
-        pipeline = newton.CollisionPipeline(model)
+        pipeline = newton.CollisionPipeline(model, growable_contacts=True)
         contacts = pipeline.contacts()
         for _ in range(24):
             pipeline.collide(state, contacts)
@@ -807,7 +807,7 @@ def _press(targets, *, stop: bool = False, gap: float = 0.0005, device="cpu"):
     state, out = model.state(), model.state()
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
     control = model.control()
-    pipeline = None if stop else newton.CollisionPipeline(model, rigid_contact_max=32)
+    pipeline = None if stop else newton.CollisionPipeline(model, rigid_contact_max=32, growable_contacts=True)
     contacts = None if stop else pipeline.contacts()
     history = []
     for target in targets:
@@ -871,7 +871,7 @@ def _rattle(dt, *, worlds=16, steps=480, device="cpu"):
     state, out = model.state(), model.state()
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
     control = model.control()
-    pipeline = newton.CollisionPipeline(model, rigid_contact_max=32 * worlds)
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=32 * worlds, growable_contacts=True)
     contacts = pipeline.contacts()
     rng = np.random.default_rng(0)
     hold, peak = round(1.0 / (60.0 * dt)), 0.0

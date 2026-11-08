@@ -70,7 +70,7 @@ def _rollout(model, *, steps, dt=H, before=None, **options):
     solver = SolverFeatherPGS(model, **settings)
     state, out = model.state(), model.state()
     control = model.control()
-    pipeline = newton.CollisionPipeline(model)
+    pipeline = newton.CollisionPipeline(model, growable_contacts=True)
     contacts = pipeline.contacts()
     for step in range(steps):
         state.clear_forces()
@@ -247,7 +247,9 @@ class TestAudit(unittest.TestCase):
                 enable_bilateral_preelimination=True,
                 diagnostics=SolverFeatherPGS.Diagnostics(audit=True),
             )
-            pipeline = newton.CollisionPipeline(model, contact_matching=scene.contact_matching or "latest")
+            pipeline = newton.CollisionPipeline(
+                model, contact_matching=scene.contact_matching or "latest", growable_contacts=True
+            )
             contacts = pipeline.contacts()
             state, out, control = model.state(), model.state(), model.control()
             newton.eval_fk(model, model.joint_q, model.joint_qd, state)

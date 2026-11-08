@@ -111,7 +111,7 @@ def _roll(model, steps, *, dt=H, setup=None, each=None, before=None, contacts=Tr
         setup(state)
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
     control = model.control()
-    pipeline = newton.CollisionPipeline(model) if contacts else None
+    pipeline = newton.CollisionPipeline(model, growable_contacts=True) if contacts else None
     stream = pipeline.contacts() if contacts else None
     for step in range(steps):
         state.clear_forces()
@@ -755,6 +755,7 @@ class TestQ19Wall(unittest.TestCase):
             broad_phase="sap",
             speculative_contact_gap_max=0.1,
             rigid_contact_max=48 * model.body_count,
+            growable_contacts=True,
         )
         contacts = pipeline.contacts()
         state, out = model.state(), model.state()
@@ -1505,7 +1506,7 @@ class ManufacturedScene:
         pipeline_options = {"deterministic": True}
         if scene.rigid_contact_max is not None:
             pipeline_options["rigid_contact_max"] = scene.rigid_contact_max
-        self.pipeline = newton.CollisionPipeline(self.model, **pipeline_options)
+        self.pipeline = newton.CollisionPipeline(self.model, **pipeline_options, growable_contacts=True)
         self.contacts = self.pipeline.contacts()
         self.control = self.model.control()
         with conformance.route_context(route), wp.ScopedDevice(device):

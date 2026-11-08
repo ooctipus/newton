@@ -1507,14 +1507,13 @@ class SolverXPBD(TendonStateMixin, SolverBase, CouplingInterface):
         Args:
             contacts: :class:`Contacts` object whose :attr:`~Contacts.force` buffer will be written.
                 Must have been created with ``"force"`` in its requested attributes and must
-                be the :class:`Contacts` instance passed to the preceding :meth:`step`. Its
-                rows may have grown since (:meth:`newton.CollisionPipeline.service_capacity`);
-                rows past those of the step get zero force.
+                match the :class:`Contacts` instance (same ``rigid_contact_max``) passed to
+                the preceding :meth:`step`.
             state: Unused (accepted for API compatibility with :class:`SolverBase`).
 
         Raises:
             ValueError: If ``contacts.force`` is ``None`` (not requested), if no step has been run yet,
-                or if the contacts hold fewer rows than the last :meth:`step` used.
+                or if the contacts capacity does not match the one used in the last :meth:`step`.
         """
         warnings.warn(
             "SolverXPBD.update_contacts() is deprecated in Newton 1.7; request SolverBase.ObservableKind.CONTACT_F and pass "
@@ -1530,8 +1529,7 @@ class SolverXPBD(TendonStateMixin, SolverBase, CouplingInterface):
             )
         if not hasattr(self, "_contact_impulse") or self._contact_impulse is None:
             raise ValueError("No contact impulse data available. Call step() before update_contacts().")
-        # A growth between step() and here adds rows the step did not solve.
-        if contacts.rigid_contact_max < self._contact_impulse_capacity:
+        if contacts.rigid_contact_max != self._contact_impulse_capacity:
             raise ValueError(
                 f"Contacts capacity mismatch: update_contacts() received rigid_contact_max="
                 f"{contacts.rigid_contact_max}, but step() used {self._contact_impulse_capacity}. "
@@ -1542,7 +1540,7 @@ class SolverXPBD(TendonStateMixin, SolverBase, CouplingInterface):
 
         wp.launch(
             kernel=convert_contact_impulse_to_force,
-            dim=self._contact_impulse_capacity,
+            dim=contacts.rigid_contact_max,
             inputs=[
                 contacts.rigid_contact_count,
                 self._contact_impulse,

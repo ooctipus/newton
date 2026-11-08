@@ -153,7 +153,9 @@ def _step_tripods(device, *, threads=None, steps=4, deterministic=True, launched
     solver = SolverFeatherPGS(model, pins=SolverFeatherPGS.Pins(storage="dense"), **{**_ROUTE_OPTIONS, **options})
     state_in, state_out = model.state(), model.state()
     newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
-    pipeline = newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts=False, deterministic=deterministic)
+    pipeline = newton.CollisionPipeline(
+        model, broad_phase="nxn", reduce_contacts=False, deterministic=deterministic, growable_contacts=True
+    )
     contacts = pipeline.contacts()
     control = model.control()
     cap = rows._CONTACT_BUILD_THREAD_CAP if threads is None else threads

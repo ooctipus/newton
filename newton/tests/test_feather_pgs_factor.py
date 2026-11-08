@@ -590,7 +590,9 @@ class TestStateBlockPlacement(unittest.TestCase):
             self.assertEqual(solver.factor.held.groups[0].layout.global_block, budget is not None)
             # The row order must not follow thread scheduling: sorted contacts order the rows, and the scene's row limit
             # keeps them all, since a thread race picks the rows that survive a limit.
-            pipeline = newton.CollisionPipeline(model, rigid_contact_max=scene.rigid_contact_max, deterministic=True)
+            pipeline = newton.CollisionPipeline(
+                model, rigid_contact_max=scene.rigid_contact_max, deterministic=True, growable_contacts=True
+            )
             contacts = pipeline.contacts()
             state, out, control = model.state(), model.state(), model.control()
             # Different trees: a block read at another tree's offset then holds other values.
@@ -775,7 +777,7 @@ def run_route(physics, route, device="cpu", steps=STEPS):
     them) and its :class:`Capture`."""
     scene = physics.scene
     model = scene.build(device)
-    pipeline = newton.CollisionPipeline(model, **pipeline_options(scene))
+    pipeline = newton.CollisionPipeline(model, **pipeline_options(scene), growable_contacts=True)
     contacts = pipeline.contacts()
     options = {**conformance.BASE_OPTIONS, **scene.solver_options, **physics.options(physics.iterations)}
     options.update(route.options)
@@ -2119,7 +2121,7 @@ class Evaluated:
 def _run(physics, reference, device) -> Evaluated:
     scene = physics.scene
     model = scene.build(device)
-    pipeline = newton.CollisionPipeline(model)
+    pipeline = newton.CollisionPipeline(model, growable_contacts=True)
     contacts = pipeline.contacts()
     options = {**conformance.BASE_OPTIONS, **scene.solver_options, **physics.options(physics.iterations)}
     # The rows' material law is the sweep's: these contacts hold no per-contact material.

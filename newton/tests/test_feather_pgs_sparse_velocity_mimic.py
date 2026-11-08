@@ -105,7 +105,7 @@ def _case(enabled, offset=0.025, scale=-0.5, error=-0.015, *, friction_anchor_be
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
     control.joint_f.assign(np.tile([0.03, -0.08, 0.11], 2).astype(np.float32))
     # Sorted contacts: both arms see the same contact order, which the by-contact patch checks key on.
-    pipeline = newton.CollisionPipeline(model, rigid_contact_max=32, deterministic=True)
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=32, deterministic=True, growable_contacts=True)
     return model, solver, state, out, control, pipeline, pipeline.contacts()
 
 

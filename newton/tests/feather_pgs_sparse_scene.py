@@ -105,7 +105,9 @@ def make_case(enabled, *, options=None, pins=None, contact_matching=None, determ
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
     control.joint_f.assign(np.linspace(-0.08, 0.11, model.joint_dof_count, dtype=np.float32))
     matching = {} if contact_matching is None else {"contact_matching": contact_matching}
-    pipeline = newton.CollisionPipeline(model, rigid_contact_max=32, deterministic=deterministic, **matching)
+    pipeline = newton.CollisionPipeline(
+        model, rigid_contact_max=32, deterministic=deterministic, **matching, growable_contacts=True
+    )
     return model, solver, state, out, control, pipeline, pipeline.contacts()
 
 

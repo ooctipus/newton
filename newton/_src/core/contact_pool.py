@@ -109,12 +109,13 @@ virtual memory to bind, or rows that growth reallocates.
 :meth:`ContactPool.service` reports that such graphs must be recaptured once
 the pool holds more rows than they were captured with.
 
-A writer that produces contacts of its own (such as MuJoCo's or Kamino's
-collision) declares how many it may write with :meth:`ContactPool.reserve`
-(``Contacts.reserve_rigid_contacts``): outside graph capture the rows grow to at
-least that many right away; during capture the request warns and waits for the
-next service. Readers that keep per-contact buffers of their own grow them with
-the pool (:meth:`ContactPool.follow`).
+Fixed buffers: a pool built ``fixed`` holds its initial rows for good, as Newton's contact buffers do: it
+publishes no more, grows no more from demand and never trims, and writers drop the contacts past its rows and
+flag the drop. This is the default: a :class:`~newton.CollisionPipeline` holds its resolved ``rigid_contact_max``
+rows in a fixed pool of its own, and a :class:`~newton.Contacts` built directly holds its rows so. Only a pipeline
+built with ``growable_contacts=True``, for a solver that follows the rows (FeatherPGS), shares the model's pool
+(:func:`model_contact_pool`), which grows from demand as above. Readers that keep per-contact buffers of their
+own grow them with the pool (:meth:`ContactPool.follow`).
 """
 
 from __future__ import annotations
@@ -815,15 +816,15 @@ class ContactRows:
         _call(self._on_rows, self)
 
 
-def _grow_rows(members: list[ContactRows], rows: int, graphs=(), limit: int | None = None) -> int:
+def _grow_rows(members: list[ContactRows], rows: int, graphs=()) -> int:
     """Bring every member's rows to at least ``rows`` and return the rows they all hold.
 
     Reallocated rows keep what they replace while one of ``graphs`` (weak references to live graphs) lives.
 
     Virtual storage appends pages behind its fixed addresses without joining the
     GPU and holds every row its pages cover; the views are then published at the
-    rows all members hold, up to ``limit`` when it is given, the new rows
-    initialized in stream order, ahead of any later launch.
+    rows all members hold, the new rows initialized in stream order, ahead of any
+    later launch.
 
     Raises:
         MemoryError: Before changing anything, if the device cannot back the rows.
@@ -833,7 +834,7 @@ def _grow_rows(members: list[ContactRows], rows: int, graphs=(), limit: int | No
         return rows
     held = [member for member in members if member.covered_rows() < rows]
     if not held:
-        rows = max(rows, _published(min(member.covered_rows() for member in members), limit))
+        rows = min(member.covered_rows() for member in members)
         for member in members:
             if member.rows < rows:
                 member._publish_rows(rows, graphs)
@@ -871,16 +872,11 @@ def _grow_rows(members: list[ContactRows], rows: int, graphs=(), limit: int | No
                 f"Growing rigid contact buffers from {held} to {rows} rows ({added / 2**20:.1f} MiB more) exceeds "
                 f"the device memory: {error}"
             ) from error
-    rows = max(rows, _published(min(member.covered_rows() for member in members_to_publish), limit))
+    rows = max(rows, min(member.covered_rows() for member in members_to_publish))
     for member in members_to_publish:
         if member.rows < rows:
             member._publish_rows(rows, graphs)
     return rows
-
-
-def _published(covered: int, limit: int | None) -> int:
-    """Return the rows of ``covered`` to publish: all of them, or at most ``limit``."""
-    return covered if limit is None else min(covered, limit)
 
 
 class ContactPool:
@@ -890,21 +886,19 @@ class ContactPool:
         device: The device of the buffers.
         rows: Initial ready rows; defaults to :data:`MIN_READY_ROWS`. Fewer rows also lower the floor a trim
             stops at to them: a model whose pairs can make fewer contacts holds no more.
-        capacity: The rows consumers sized their per-contact scratch by (``model.rigid_contact_max``), or ``None``.
-            :meth:`settle` and :meth:`grow` publish no rows past it, or past the rows the demand asks for.
+        fixed: Hold ``rows`` for good, as a fixed buffer: publish no more, grow no more from demand and never
+            trim; writers drop the contacts past them and flag the drop.
         worlds: The worlds whose contacts the rows hold, each with a status of the contacts it dropped
             (:meth:`drops`); contacts of no world, or between two global shapes, share one more.
     """
 
-    def __init__(self, *, device, rows: int | None = None, capacity: int | None = None, worlds: int = 0):
+    def __init__(self, *, device, rows: int | None = None, fixed: bool = False, worlds: int = 0):
         self.device = wp.get_device(device)
         self.world_count = max(int(worlds), 0)
         """The worlds whose dropped contacts :meth:`drops` reports one by one."""
         self.ready = MIN_READY_ROWS if rows is None else max(int(rows), 0)
         self.floor = min(MIN_READY_ROWS, self.ready)
         """The fewest ready rows a trim keeps: :data:`MIN_READY_ROWS`, or the initial rows when fewer."""
-        self.capacity = None if capacity is None else max(int(capacity), 0)
-        """The rows consumers sized their scratch by: settling and growth publish no rows past it or the demand."""
         # Queried once: the bound is recomputed when members are added, possibly during capture.
         self._device_memory = int(self.device.total_memory) if self.device.is_cuda else 0
         self._members: list[weakref.ReferenceType] = []
@@ -1006,7 +1000,8 @@ class ContactPool:
         # Streams that may read the ready rows or the rows past them, by raw handle: where collision passes and
         # contact launches ran (a captured graph replays on the stream it was captured on), and consumers' own.
         self._readers: dict[int, weakref.ReferenceType] = {}
-        self._reserved = 0
+        self.fixed = bool(fixed)
+        """Whether the pool holds its initial rows for good, as a fixed buffer: no growth from demand, no trim."""
         # Graph binding: the updater recorded last in each scope of a capture (its graph or a conditional body),
         # the live updaters this pool recorded, and the captures that sized work by the host's rows.
         self._graph_ops = None
@@ -1052,8 +1047,8 @@ class ContactPool:
 
     @property
     def growable(self) -> bool:
-        """Whether the pool can still grow."""
-        return self.ready < self.bound
+        """Whether the rows grow from demand: the pool is not :attr:`fixed`, and the device can back more rows."""
+        return not self.fixed and self.ready < self.bound
 
     def _limit(self, fields) -> int:
         """Return the bound with ``fields`` added: the device limit for all live bytes per row, at most every
@@ -1095,17 +1090,13 @@ class ContactPool:
         The rows past the requested ones cost no memory, so writers fill them
         instead of dropping contacts. Owners call this once their members exist
         (:meth:`newton.CollisionPipeline.contacts`, :meth:`service`); a member
-        created later maps as many rows. A buffer sized explicitly keeps its
-        rows until it grows, and no rows past :attr:`capacity` are published, so a
-        consumer sized by it receives more only when the demand needs them.
-        Followers follow.
+        created later maps as many rows. A :attr:`fixed` buffer publishes no rows
+        past its own. Followers follow.
         """
         members = self._live_members()
-        if not members or capturing(self.device):
+        if not members or capturing(self.device) or self.fixed:
             return
         covered = min(member.covered_rows() for member in members)
-        if self.capacity is not None:
-            covered = _published(covered, max(self.capacity, self.ready))
         if covered <= self.ready:
             return
         for member in members:
@@ -1169,10 +1160,8 @@ class ContactPool:
             members = pool._live_members()
             # A trim not yet unmapped is dropped: growth publishes the withdrawn rows again.
             pool._trim = None
-            # Virtual rows hold every row their pages cover, often more than asked for; past the capacity
-            # consumers sized by, only the rows asked for are published.
-            limit = None if pool.capacity is None else max(pool.capacity, rows)
-            pool._publish_ready(_grow_rows(members, rows, graphs, limit))
+            # Virtual rows hold every row their pages cover, often more than asked for.
+            pool._publish_ready(_grow_rows(members, rows, graphs))
             pool.growth_count += 1
             pool._stale_on_growth |= any(not member.virtual for member in members)
         return self.needs_recapture
@@ -1203,45 +1192,6 @@ class ContactPool:
             for graph in (*pool._captured_passes.keys(), *pool._unbound_captures.keys()):
                 graphs[id(graph)] = weakref.ref(graph)
         return tuple(graphs.values())
-
-    def reserve(self, rows: int) -> bool:
-        """Hold at least ``rows`` ready rows from now on, for a writer that produces its own contacts.
-
-        Outside graph capture the pool and its followers grow now, to
-        :func:`reserved_rows`, keeping their contents. During capture the request
-        warns and waits for the next :meth:`service` (or a reservation outside
-        capture); meanwhile writers stay bounded by the current rows and flag
-        their overflow.
-
-        Returns:
-            Whether graphs that captured the buffers must be recaptured (see :meth:`grow`).
-
-        Raises:
-            MemoryError: If the device cannot back ``rows`` rows of the pool's fields.
-        """
-        rows = int(rows)
-        if rows <= self.ready:
-            return False
-        if rows > self.bound:
-            raise MemoryError(
-                f"{self.device} cannot back the {rows} rigid contact rows reserved, of {self.row_bytes} bytes each: "
-                f"it holds at most {self.bound}"
-            )
-        if capturing(self.device):
-            # The writer fills the rows of capture time on every replay: its graph must be recaptured after growth.
-            self.note_unbound()
-            if rows > self._reserved:
-                warnings.warn(
-                    f"{rows} rigid contact rows were reserved during CUDA graph capture, with {self.ready} ready: "
-                    "writers drop and flag the rows past them until the pool's service (or a reservation outside "
-                    "capture) grows it",
-                    RuntimeWarning,
-                    stacklevel=3,
-                )
-            self._reserved = max(self._reserved, rows)
-            return False
-        self._reserved = max(self._reserved, rows)
-        return self.grow(reserved_rows(rows, self.bound))
 
     def fit(self) -> bool:
         """Grow outside capture when the last recorded pass filled the rows, to :func:`sized_rows` for its count.
@@ -1347,7 +1297,8 @@ class ContactPool:
                 empty if self.rows_used is None else self.rows_used,
                 empty if status is None else status,
                 int(drops),
-                int(beat),
+                # A fixed buffer forecasts nothing: no demand grows it.
+                int(beat and not self.fixed),
             ],
             device=self.device,
             record_tape=False,
@@ -1560,11 +1511,10 @@ class ContactPool:
                 forecast = self.forecast
                 if forecast > self.ready:
                     target = max(target, reserved_rows(forecast, self.bound))
-            if self._reserved > self.ready:
-                target = max(target, reserved_rows(self._reserved, self.bound))
             if target > self.ready:
                 return self._grow_logged(target, high_water)
-        self._consider_trim()
+        if not self.fixed:
+            self._consider_trim()
         return False
 
     def _watch(self) -> None:
@@ -1597,8 +1547,12 @@ class ContactPool:
         if drops.passes > self._drops_seen:
             warnings.warn(
                 f"Rigid contact rows ran out in {drops.passes - self._drops_seen} collision pass(es) up to pass "
-                f"{drops.last_pass}: {drops.contacts} contacts dropped so far (the capacity status flags it); the "
-                f"buffers grow for the next replay.",
+                f"{drops.last_pass}: {drops.contacts} contacts dropped so far (the capacity status flags it); "
+                + (
+                    f"the buffers hold their fixed {self.ready} rows."
+                    if self.fixed
+                    else "the buffers grow for the next replay."
+                ),
                 RuntimeWarning,
                 stacklevel=3,
             )
@@ -1607,10 +1561,8 @@ class ContactPool:
     # -- trim ----------------------------------------------------------------------------------------------------
 
     def _kept_rows(self, high_water: int) -> int:
-        """Return the fewest rows a trim keeps: the demand's headroom, the floor, a reservation, unbound graphs."""
+        """Return the fewest rows a trim keeps: the demand's headroom, the floor, unbound graphs."""
         rows = max(self.floor, _round_up(HEADROOM * max(int(high_water), 0), ROW_QUANTUM))
-        if self._reserved:
-            rows = max(rows, reserved_rows(self._reserved, self.bound))
         return max(rows, *self._unbound_captures.values(), 0)
 
     def _trimmable(self) -> bool:
@@ -1717,11 +1669,10 @@ class ContactPool:
         before = self.mapped_bytes()
         recapture = self.grow(target)
         logger.debug(
-            "Rigid contact pool grew from %d to %d rows (demand %d, reserved %d, device bound %d): %.1f -> %.1f MiB",
+            "Rigid contact pool grew from %d to %d rows (demand %d, device bound %d): %.1f -> %.1f MiB",
             previous,
             target,
             demand,
-            self._reserved,
             self.bound,
             before / 2**20,
             self.mapped_bytes() / 2**20,
@@ -1947,11 +1898,8 @@ def model_contact_pool(model, device=None, capacity: int | None = None) -> Conta
     Args:
         model: The model whose rigid contacts the buffers hold.
         device: The device of the buffers; defaults to the model's.
-        capacity: The rigid contact capacity the creating pipeline resolved (``model.rigid_contact_max``). A new
-            pool starts at :data:`MIN_READY_ROWS` rows, or at this capacity when it is smaller, so a consumer that
-            sized its per-contact scratch by the capacity, as :class:`~newton.solvers.SolverSteel` does, receives
-            no more rows than it holds until the demand itself needs them, also where CUDA virtual memory maps
-            whole granules (:meth:`ContactPool.settle`).
+        capacity: The rigid contact capacity the creating pipeline resolved (``model.rigid_contact_max``): a new
+            pool starts at :data:`MIN_READY_ROWS` rows, or at this capacity when it is smaller.
     """
     device = wp.get_device(device if device is not None else model.device)
     rows = None if capacity is None else min(MIN_READY_ROWS, max(int(capacity), 0))
@@ -1959,10 +1907,8 @@ def model_contact_pool(model, device=None, capacity: int | None = None) -> Conta
         pools = _MODEL_POOLS.setdefault(model, {})
     except TypeError:
         # A model that cannot be weakly referenced keeps a pool per owner.
-        return ContactPool(device=device, rows=rows, capacity=capacity, worlds=getattr(model, "world_count", 0))
+        return ContactPool(device=device, rows=rows, worlds=getattr(model, "world_count", 0))
     pool = pools.get(device.alias)
     if pool is None:
-        pool = pools[device.alias] = ContactPool(
-            device=device, rows=rows, capacity=capacity, worlds=getattr(model, "world_count", 0)
-        )
+        pool = pools[device.alias] = ContactPool(device=device, rows=rows, worlds=getattr(model, "world_count", 0))
     return pool

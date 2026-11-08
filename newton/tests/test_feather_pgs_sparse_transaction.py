@@ -479,7 +479,7 @@ class TestContactUnitTwins(unittest.TestCase):
     @staticmethod
     def _rollout(solver, model, *, steps=20, dt=1.0 / 400.0):
         """Step a resting world and a sliding world; return the first solve's impulses and each step's state."""
-        pipeline = newton.CollisionPipeline(model, rigid_contact_max=64)
+        pipeline = newton.CollisionPipeline(model, rigid_contact_max=64, growable_contacts=True)
         contacts, control = pipeline.contacts(), model.control()
         state, output = model.state(), model.state()
         qd = state.joint_qd.numpy()

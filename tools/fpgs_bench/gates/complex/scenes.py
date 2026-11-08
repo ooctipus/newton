@@ -352,7 +352,9 @@ def build_pyramid(
     scene.replicate(world, world_count)
     model = scene.finalize()
     contacts_per_world = contacts_per_box * boxes + 64
-    pipeline = newton.CollisionPipeline(model, broad_phase="sap", rigid_contact_max=contacts_per_world * world_count)
+    pipeline = newton.CollisionPipeline(
+        model, broad_phase="sap", rigid_contact_max=contacts_per_world * world_count, growable_contacts=True
+    )
     contacts = pipeline.contacts()
     record = {}
     options = {

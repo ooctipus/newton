@@ -168,7 +168,7 @@ def _slide(device, mesh, angle, articulated=False, *, locked_tangent=False):
         dense_max_constraints=32,
         diagnostics=newton.solvers.SolverFeatherPGS.Diagnostics(row_watermark=True),
     )
-    pipeline = newton.CollisionPipeline(model, rigid_contact_max=128, deterministic=True)
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=128, deterministic=True, growable_contacts=True)
     contacts = pipeline.contacts()
     state, next_state = model.state(), model.state()
     control = model.control()

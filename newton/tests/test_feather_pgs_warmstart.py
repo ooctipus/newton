@@ -73,7 +73,7 @@ def _run_press(
         **warm_kwargs,
     )
     pipeline_kwargs = {} if contact_matching is None else {"contact_matching": contact_matching}
-    pipeline = newton.CollisionPipeline(model, **pipeline_kwargs)
+    pipeline = newton.CollisionPipeline(model, **pipeline_kwargs, growable_contacts=True)
     contacts = pipeline.contacts()
     state_0, state_1 = model.state(), model.state()
     control = model.control()
@@ -281,7 +281,7 @@ class TestFeatherPGSIdentityWarmstart(unittest.TestCase):
         shape_b = builder.add_shape_sphere(body_b, radius=0.1)
         builder.add_ground_plane()
         model = builder.finalize()
-        pipeline = newton.CollisionPipeline(model, broad_phase="nxn", contact_matching="sticky")
+        pipeline = newton.CollisionPipeline(model, broad_phase="nxn", contact_matching="sticky", growable_contacts=True)
         contacts = pipeline.contacts()
         solver = newton.solvers.SolverFeatherPGS(
             model,

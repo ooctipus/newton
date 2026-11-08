@@ -452,7 +452,7 @@ class TestStepsWithoutArmature(unittest.TestCase):
         model = scene.build("cpu")
         solver = SolverFeatherPGS(model, dense_max_constraints=384)
         np.testing.assert_array_equal(solver.factor.armature, model.joint_armature.numpy())
-        pipeline = newton.CollisionPipeline(model, rigid_contact_max=scene.rigid_contact_max)
+        pipeline = newton.CollisionPipeline(model, rigid_contact_max=scene.rigid_contact_max, growable_contacts=True)
         contacts = pipeline.contacts()
         state_0, state_1 = model.state(), model.state()
         control = model.control()

@@ -181,7 +181,7 @@ def _step_plane(
     _reset_state(model, state_in, vz)
     before = float(state_in.body_qd.numpy()[body][2])
 
-    pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
+    pipeline = newton.CollisionPipeline(model, broad_phase="nxn", growable_contacts=True)
     contacts = pipeline.contacts()
     pipeline.collide(state_in, contacts)
     solver.step(state_in, state_out, model.control(), contacts, dt)
@@ -463,7 +463,7 @@ def test_bouncing_ball_settles_to_rest_under_gravity(test, device):
         gravity=(0.0, 0.0, -gravity),
     )
     solver = _make_solver(model, restitution_velocity_threshold=0.5)
-    pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
+    pipeline = newton.CollisionPipeline(model, broad_phase="nxn", growable_contacts=True)
     contacts = pipeline.contacts()
     state_in, state_out = model.state(), model.state()
     _reset_state(model, state_in, -speed)
@@ -540,7 +540,7 @@ def _step_two_spheres(
     joint_qd[8] = velocity_b
     state_in.joint_qd.assign(joint_qd)
     newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
-    pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
+    pipeline = newton.CollisionPipeline(model, broad_phase="nxn", growable_contacts=True)
     contacts = pipeline.contacts()
     pipeline.collide(state_in, contacts)
     solver.step(state_in, state_out, model.control(), contacts, DEFAULT_DT)
@@ -645,7 +645,7 @@ def test_restitution_is_relative_to_a_moving_kinematic_surface(test, device):
             joint_qd[8] = velocity_surface
             state_in.joint_qd.assign(joint_qd)
             newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
-            pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
+            pipeline = newton.CollisionPipeline(model, broad_phase="nxn", growable_contacts=True)
             contacts = pipeline.contacts()
             pipeline.collide(state_in, contacts)
             solver.step(state_in, state_out, model.control(), contacts, DEFAULT_DT)
@@ -748,7 +748,7 @@ def test_multiworld_restitution_keeps_case_data_isolated(test, device):
             joint_qd[:, 2] = [-case[1] for case in cases]
             state_in.joint_qd.assign(joint_qd.reshape(-1))
             newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
-            pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
+            pipeline = newton.CollisionPipeline(model, broad_phase="nxn", growable_contacts=True)
             contacts = pipeline.contacts()
             pipeline.collide(state_in, contacts)
             solver.step(state_in, state_out, model.control(), contacts, DEFAULT_DT)
@@ -874,7 +874,9 @@ def test_warm_start_history_does_not_change_or_repeat_restitution(test, device):
                 model,
                 pgs_warmstart=True,
             )
-            pipeline = newton.CollisionPipeline(model, broad_phase="nxn", contact_matching="latest")
+            pipeline = newton.CollisionPipeline(
+                model, broad_phase="nxn", contact_matching="latest", growable_contacts=True
+            )
             contacts = pipeline.contacts()
             state_in, state_out = model.state(), model.state()
 
@@ -930,7 +932,7 @@ def test_redundant_box_contacts_do_not_multiply_restitution_energy(test, device)
     solver = _make_solver(model, pgs_iterations=32)
     state_in, state_out = model.state(), model.state()
     _reset_state(model, state_in, -speed)
-    pipeline = newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts=False)
+    pipeline = newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts=False, growable_contacts=True)
     contacts = pipeline.contacts()
     pipeline.collide(state_in, contacts)
     solver.step(state_in, state_out, model.control(), contacts, DEFAULT_DT)
@@ -1003,7 +1005,7 @@ def test_articulated_redundant_manifold_preserves_symmetric_rebound(test, device
             solver = _make_solver(model, pgs_iterations=16)
             state_in, state_out = model.state(), model.state()
             _reset_state(model, state_in, -speed)
-            pipeline = newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts=False)
+            pipeline = newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts=False, growable_contacts=True)
             contacts = pipeline.contacts()
             pipeline.collide(state_in, contacts)
             solver.step(state_in, state_out, model.control(), contacts, DEFAULT_DT)
@@ -1031,7 +1033,7 @@ def test_cuda_graph_replay_reads_current_restitution_and_matches_eager(test, dev
         )
         solver = _make_solver(model)
         state_in, state_out = model.state(), model.state()
-        pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
+        pipeline = newton.CollisionPipeline(model, broad_phase="nxn", growable_contacts=True)
         contacts = pipeline.contacts()
         control = model.control()
 

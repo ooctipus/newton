@@ -315,6 +315,8 @@ class Example:
             ),
             speculative_contact_gap_max=0.1 if args.solver == "fpgs" else None,
             rigid_contact_max=self.contact_capacity * args.world_count,
+            # FeatherPGS follows the contact rows as they grow; MuJoCo holds the fixed capacity.
+            growable_contacts=args.solver == "fpgs",
             max_triangle_pairs=self.triangle_pair_capacity * args.world_count,
         )
         self.contacts = self.pipeline.contacts()

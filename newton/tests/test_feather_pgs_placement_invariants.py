@@ -26,7 +26,7 @@ def _gaps(scene, device, steps, pins=None, solvers=None):
     """Step ``scene`` (with the test ``pins``) and yield each step's dense and free-body gaps and terms; ``solvers``
     collects the solver."""
     model = scene.build(device)
-    pipeline = newton.CollisionPipeline(model)
+    pipeline = newton.CollisionPipeline(model, growable_contacts=True)
     contacts = pipeline.contacts()
     solver = SolverFeatherPGS(model, pins=SolverFeatherPGS.Pins(**(pins or {})), **scene.solver_options)
     if solvers is not None:
@@ -69,7 +69,7 @@ def test_support_classes_hold_the_invariant(test, device):
 
 def _run(scene, device, pins, steps):
     model = scene.build(device)
-    pipeline = newton.CollisionPipeline(model)
+    pipeline = newton.CollisionPipeline(model, growable_contacts=True)
     contacts = pipeline.contacts()
     # Every key's limit rows fit a world's rows.
     options = {**scene.solver_options, "dense_max_constraints": 256}
