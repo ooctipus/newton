@@ -13,6 +13,7 @@ import unittest
 import numpy as np
 
 from newton._src.geometry import terrain_cells_mesh as tcm
+from newton.tests.unittest_utils import add_function_test, get_test_devices
 
 H = 0.1
 
@@ -104,6 +105,9 @@ class TestTerrainCellsMesh(unittest.TestCase):
         np.testing.assert_array_equal(z[:, :, 1], heights[1:, :-1].T)
         np.testing.assert_array_equal(z[:, :, 2], heights[:-1, 1:].T)
         np.testing.assert_array_equal(z[:, :, 3], heights[1:, 1:].T)
+        # the special case: the shared vertex grid is the height grid, and no cell needs a record
+        np.testing.assert_array_equal(table.vertex_z, heights.T)
+        self.assertEqual(table.record_z.shape[0], 0)
         inner = (table.cell_flags.reshape(4, 5)[1:-1, 1:-1] >> 4) & 0xF
         self.assertFalse(np.any(inner))
         self.assertEqual(report["reproduced"], f.shape[0])
@@ -257,6 +261,47 @@ class TestTerrainCellsMesh(unittest.TestCase):
         soup = tcm.build_terrain_mesh_cells(pts, tri, cell_size=(0.37, 0.37), origin=(0.0, 0.0))
         ok, why = tcm.terrain_mesh_cells_qualify(soup, tri.shape[0])
         self.assertFalse(ok, why)
+
+
+def test_devices_build_one_table(test, device):
+    """Every device runs the same kernels without floating-point contraction: the same table, bit for bit."""
+    rng = np.random.default_rng(5)
+    meshes = [
+        (_heightfield_mesh(rng.uniform(-0.2, 0.3, (6, 5)).astype(np.float32), origin=(-35.4, 60.1)), {}),
+        (
+            _merge(
+                _box(-0.1, 0.025, -0.1, 0.075, -1.0, 0.0),
+                _box(0.025, 0.2, -0.1, 0.075, -1.0, 0.05),
+                _box(-0.1, 0.025, 0.075, 0.2, -1.0, 0.02),
+                _box(0.025, 0.2, 0.075, 0.2, -1.0, 0.1),
+                _box(0.2, 0.22, -0.1, 0.2, -1.0, 0.3),
+            ),
+            {"cell_size": (H, H), "origin": (0.0, 0.0)},
+        ),
+    ]
+    for (v, f), kwargs in meshes:
+        cpu = tcm.build_terrain_mesh_cells(v, f, device="cpu", **kwargs)
+        here = tcm.build_terrain_mesh_cells(v, f, device=device, **kwargs)
+        for name in (
+            "vertex_z",
+            "cell_flags",
+            "record_z",
+            "record_offsets",
+            "mixed_cell",
+            "mixed_start",
+            "mixed_triangles",
+            "mixed_z",
+        ):
+            np.testing.assert_array_equal(getattr(here, name), getattr(cpu, name), err_msg=name)
+        test.assertEqual(here.origin, cpu.origin)
+        test.assertEqual(here.cell_size, cpu.cell_size)
+    test.assertGreater(cpu.counts()["mixed"], 0)
+    test.assertGreater(cpu.counts()["step"], 0)
+
+
+add_function_test(
+    TestTerrainCellsMesh, "test_devices_build_one_table", test_devices_build_one_table, devices=get_test_devices()
+)
 
 
 if __name__ == "__main__":
