@@ -306,7 +306,7 @@ def create_compute_gjk_mpr_contacts(
         support_func: Support mapping function (defaults to support_map)
         use_precomputed_center: Whether the geometry data supplies a cached center.
         penetration_refiner: Optional physical-proxy result refinement function.
-        query_filter: Optional surface normal of nonnegative-distance query witnesses (see
+        query_filter: Optional surface witness of nonnegative-distance queries (see
             :func:`create_solve_convex_multi_contact`).
 
     Returns:

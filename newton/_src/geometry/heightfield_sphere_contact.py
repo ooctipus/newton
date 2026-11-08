@@ -160,12 +160,13 @@ def create_point_prism_writer(writer_func: Any, query_filter: Any = None):
     ):
         if d > threshold + _ADMISSION_SLACK:
             return
+        surface_point = point_a
         surface_normal = normal
         surface_d = d
         if wp.static(has_query_filter):
             if d >= 0.0:
-                # The surface's own normal at this witness, and the distance along it.
-                surface_normal, surface_d = query_filter(prism, point_a, normal, d, query_context)
+                # The surface's own contact for this witness.
+                surface_point, surface_normal, surface_d = query_filter(prism, point_a, normal, d, query_context)
         normal_ws = wp.quat_rotate(rot_a, surface_normal)
         contact = ContactData()
         contact.radius_eff_a = 0.0
@@ -177,7 +178,9 @@ def create_point_prism_writer(writer_func: Any, query_filter: Any = None):
         contact.gap_sum = rigid_gap
         contact.sort_sub_key = sort_sub_key
         # The midpoint of the prism point and the sphere surface point.
-        contact.contact_point_center = wp.quat_rotate(rot_a, 0.5 * (point_a + p)) + pos_a - normal_ws * (radius * 0.5)
+        contact.contact_point_center = (
+            wp.quat_rotate(rot_a, 0.5 * (surface_point + p)) + pos_a - normal_ws * (radius * 0.5)
+        )
         contact.contact_normal_a_to_b = normal_ws
         contact.contact_distance = surface_d - radius
         writer_func(contact, writer_data, -1)
@@ -190,7 +193,7 @@ def create_sphere_prism_contacts(writer_func: Any, query_filter: Any = None):
 
     Args:
         writer_func: Contact writer ``(ContactData, writer_data, output_index)``.
-        query_filter: Optional surface normal of nonnegative-distance witnesses, as
+        query_filter: Optional surface witness of nonnegative-distance queries, as
             accepted by :func:`create_compute_gjk_mpr_contacts`.
     """
     write_point_contact = create_point_prism_writer(writer_func, query_filter)

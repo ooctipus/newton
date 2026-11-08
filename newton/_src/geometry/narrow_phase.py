@@ -73,7 +73,7 @@ from ..geometry.contact_sort import ContactSorter
 from ..geometry.flags import ShapeFlags
 from ..geometry.heightfield_cells import heightfield_cell_overlaps_kernel
 from ..geometry.heightfield_cylinder import create_heightfield_cylinder_split_kernels
-from ..geometry.heightfield_features import HeightfieldFeatureContext, seam_surface_normal
+from ..geometry.heightfield_features import HeightfieldFeatureContext, seam_surface_witness
 from ..geometry.heightfield_primitive_contact import ANALYTIC_PRIMITIVE_QUERIES, analytic_primitives_default
 from ..geometry.heightfield_row_gate import HEIGHTFIELD_ROW_COUNT, HEIGHTFIELD_TYPED_ROWS, heightfield_row_gate_kernel
 from ..geometry.mpr import create_solve_mpr, create_support_map_function
@@ -2147,7 +2147,7 @@ def create_narrow_phase_process_mesh_triangle_contacts_kernel(
         support_func=support_func,
         use_precomputed_center=True,
         penetration_refiner=create_triangle_prism_penetration_refiner(support_func),
-        query_filter=seam_surface_normal,
+        query_filter=seam_surface_witness,
     )
 
     def narrow_phase_process_mesh_triangle_contacts_kernel(

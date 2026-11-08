@@ -402,7 +402,7 @@ def create_cylinder_prism_contacts(writer_func: Any, query_filter: Any = None):
             return
         if wp.static(has_query_filter):
             if d >= 0.0:
-                normal, d = query_filter(prism, point_a, normal, d, query_context)
+                point_a, normal, d = query_filter(prism, point_a, normal, d, query_context)
         contact = ContactData()
         contact.radius_eff_a = 0.0
         contact.radius_eff_b = 0.0
@@ -775,7 +775,7 @@ def create_box_prism_contacts(writer_func: Any, query_filter: Any = None):
                 continue
             if wp.static(has_query_filter):
                 if d >= 0.0:
-                    normal, d = query_filter(shape_a_data, point_a, normal, d, query_context)
+                    point_a, normal, d = query_filter(shape_a_data, point_a, normal, d, query_context)
             contact = ContactData()
             contact.radius_eff_a = 0.0
             contact.radius_eff_b = 0.0
@@ -934,7 +934,7 @@ def create_convex_prism_contacts(writer_func: Any, query_filter: Any = None):
                 continue
             if wp.static(has_query_filter):
                 if d >= 0.0:
-                    normal, d = query_filter(shape_a_data, point_a, normal, d, query_context)
+                    point_a, normal, d = query_filter(shape_a_data, point_a, normal, d, query_context)
             contact = ContactData()
             contact.radius_eff_a = 0.0
             contact.radius_eff_b = 0.0
