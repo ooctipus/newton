@@ -815,15 +815,15 @@ class ContactRows:
         _call(self._on_rows, self)
 
 
-def _grow_rows(members: list[ContactRows], rows: int, graphs=()) -> int:
+def _grow_rows(members: list[ContactRows], rows: int, graphs=(), limit: int | None = None) -> int:
     """Bring every member's rows to at least ``rows`` and return the rows they all hold.
 
     Reallocated rows keep what they replace while one of ``graphs`` (weak references to live graphs) lives.
 
     Virtual storage appends pages behind its fixed addresses without joining the
     GPU and holds every row its pages cover; the views are then published at the
-    rows all members hold, the new rows initialized in stream order, ahead of any
-    later launch.
+    rows all members hold, up to ``limit`` when it is given, the new rows
+    initialized in stream order, ahead of any later launch.
 
     Raises:
         MemoryError: Before changing anything, if the device cannot back the rows.
@@ -833,7 +833,7 @@ def _grow_rows(members: list[ContactRows], rows: int, graphs=()) -> int:
         return rows
     held = [member for member in members if member.covered_rows() < rows]
     if not held:
-        rows = min(member.covered_rows() for member in members)
+        rows = max(rows, _published(min(member.covered_rows() for member in members), limit))
         for member in members:
             if member.rows < rows:
                 member._publish_rows(rows, graphs)
@@ -871,11 +871,16 @@ def _grow_rows(members: list[ContactRows], rows: int, graphs=()) -> int:
                 f"Growing rigid contact buffers from {held} to {rows} rows ({added / 2**20:.1f} MiB more) exceeds "
                 f"the device memory: {error}"
             ) from error
-    rows = max(rows, min(member.covered_rows() for member in members_to_publish))
+    rows = max(rows, _published(min(member.covered_rows() for member in members_to_publish), limit))
     for member in members_to_publish:
         if member.rows < rows:
             member._publish_rows(rows, graphs)
     return rows
+
+
+def _published(covered: int, limit: int | None) -> int:
+    """Return the rows of ``covered`` to publish: all of them, or at most ``limit``."""
+    return covered if limit is None else min(covered, limit)
 
 
 class ContactPool:
@@ -886,7 +891,7 @@ class ContactPool:
         rows: Initial ready rows; defaults to :data:`MIN_READY_ROWS`. Fewer rows also lower the floor a trim
             stops at to them: a model whose pairs can make fewer contacts holds no more.
         capacity: The rows consumers sized their per-contact scratch by (``model.rigid_contact_max``), or ``None``.
-            :meth:`settle` publishes no rows past it; only demand grows the rows further.
+            :meth:`settle` and :meth:`grow` publish no rows past it, or past the rows the demand asks for.
         worlds: The worlds whose contacts the rows hold, each with a status of the contacts it dropped
             (:meth:`drops`); contacts of no world, or between two global shapes, share one more.
     """
@@ -899,7 +904,7 @@ class ContactPool:
         self.floor = min(MIN_READY_ROWS, self.ready)
         """The fewest ready rows a trim keeps: :data:`MIN_READY_ROWS`, or the initial rows when fewer."""
         self.capacity = None if capacity is None else max(int(capacity), 0)
-        """The rows consumers sized their scratch by; :meth:`settle` publishes no rows past it."""
+        """The rows consumers sized their scratch by: settling and growth publish no rows past it or the demand."""
         # Queried once: the bound is recomputed when members are added, possibly during capture.
         self._device_memory = int(self.device.total_memory) if self.device.is_cuda else 0
         self._members: list[weakref.ReferenceType] = []
@@ -1100,7 +1105,7 @@ class ContactPool:
             return
         covered = min(member.covered_rows() for member in members)
         if self.capacity is not None:
-            covered = min(covered, max(self.capacity, self.ready))
+            covered = _published(covered, max(self.capacity, self.ready))
         if covered <= self.ready:
             return
         for member in members:
@@ -1164,8 +1169,10 @@ class ContactPool:
             members = pool._live_members()
             # A trim not yet unmapped is dropped: growth publishes the withdrawn rows again.
             pool._trim = None
-            # Virtual rows hold every row their pages cover, often more than asked for.
-            pool._publish_ready(_grow_rows(members, rows, graphs))
+            # Virtual rows hold every row their pages cover, often more than asked for; past the capacity
+            # consumers sized by, only the rows asked for are published.
+            limit = None if pool.capacity is None else max(pool.capacity, rows)
+            pool._publish_ready(_grow_rows(members, rows, graphs, limit))
             pool.growth_count += 1
             pool._stale_on_growth |= any(not member.virtual for member in members)
         return self.needs_recapture
