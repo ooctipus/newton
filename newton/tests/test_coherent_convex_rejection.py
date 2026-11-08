@@ -361,7 +361,7 @@ def test_pipeline_rejection_capacity_status(test, device):
 
 class TestCoherentConvexRejection(unittest.TestCase):
     def test_original_core_and_no_warm_factory(self):
-        """Keep original MPR/GJK closures and original default cutoff/iteration arguments."""
+        """Keep original MPR/GJK closures and iteration arguments; GJK takes the split queue's separation cutoff."""
         original, candidate = _original(), _create_rejection_query_kernels()
         self.assertEqual(
             [kernel.func.__name__ for kernel in candidate], ["classify_rejections", "cold_mpr", "cold_gjk"]
@@ -391,7 +391,9 @@ class TestCoherentConvexRejection(unittest.TestCase):
             and node.func.id in ("solve_mpr", "solve_gjk")
         ]
         self.assertEqual(len(calls), 2)
-        self.assertTrue(all(len(call.args) == 6 and not call.keywords for call in calls))
+        self.assertTrue(all(len(call.args) == 6 for call in calls))
+        keywords = {node.func.id: [keyword.arg for keyword in node.keywords] for node in calls}
+        self.assertEqual(keywords, {"solve_mpr": [], "solve_gjk": ["max_dist"]})
 
     def test_cpu_selector_fails_closed(self):
         """Recognize all modes without admitting unsupported CPU collision execution."""

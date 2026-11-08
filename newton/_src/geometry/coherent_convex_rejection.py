@@ -6,7 +6,7 @@
 import warp as wp
 
 from .coherent_convex import _CacheData, _find_slot, _finite_vector, _plane_lower_bound
-from .collision_convex import ConvexQueryResult
+from .collision_convex import ConvexQueryResult, gjk_separation_cutoff
 from .mpr import create_solve_mpr, create_support_map_function
 from .simplex_solver import create_solve_closest_distance
 from .support_function import (
@@ -238,6 +238,7 @@ def _create_rejection_query_kernels(accelerated=False, *, diagnostics=False):
                 if wp.static(diagnostics):
                     wp.atomic_add(cache.stats, 6, 1)
                 provider = query_provider(inputs)
+                # A support plane beyond the contact threshold stops the query: its normal separates the pair.
                 _separated, point_a, point_b, normal, signed_distance = solve_gjk(
                     query.geom_a,
                     query.geom_b,
@@ -245,6 +246,7 @@ def _create_rejection_query_kernels(accelerated=False, *, diagnostics=False):
                     query.relative_position_b,
                     0.0,
                     provider,
+                    max_dist=gjk_separation_cutoff(query.contact_threshold, query.position_a, query.position_b),
                 )
                 if signed_distance <= query.contact_threshold:
                     result = ConvexQueryResult()
