@@ -144,8 +144,10 @@ class TestHeightfieldFinite(unittest.TestCase):
                 NEWTON_HEIGHTFIELD_FINITE_QUERY="1",
                 NEWTON_TERRAIN_LAW="none",
             ):
+                # The reducer's buffer holds max_triangle_pairs contacts: 32 keeps every contact the scene
+                # finds, so the overflow check reports none (16 dropped three).
                 pipeline = newton.CollisionPipeline(
-                    model, reduce_contacts=reduce, rigid_contact_max=64, max_triangle_pairs=16
+                    model, reduce_contacts=reduce, rigid_contact_max=64, max_triangle_pairs=32
                 )
             contacts = pipeline.contacts()
             pipeline.collide(state, contacts)
