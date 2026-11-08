@@ -467,7 +467,8 @@ class TestContactPoolPolicy(unittest.TestCase):
 
 def test_default_pipeline_holds_a_fixed_buffer(test, device):
     """Without ``growable_contacts`` a pipeline's buffers hold its resolved capacity, of their own: a pass past it
-    drops the rest and flags it, and nothing grows them; a growable pipeline of the same model grows instead."""
+    drops the rest, flags it and counts every contact found, and nothing grows them; a growable pipeline of the same
+    model grows instead, and its count holds its rows."""
     model = _build_boxes(device)
     pipeline = newton.CollisionPipeline(model, rigid_contact_max=CONTACTS // 2)
     other = newton.CollisionPipeline(model, rigid_contact_max=CONTACTS)
@@ -480,9 +481,12 @@ def test_default_pipeline_holds_a_fixed_buffer(test, device):
         warnings.simplefilter("ignore")
         pipeline.collide(state, contacts)
     test.assertEqual(contacts.rigid_contact_max, CONTACTS // 2, "a pass past the rows does not grow them")
-    test.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), CONTACTS // 2)
+    test.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), CONTACTS, "the count keeps every contact found")
     wp.synchronize_device(device)
     test.assertEqual(pipeline.contact_drops().contacts, CONTACTS - CONTACTS // 2)
+    # A consumer that reads every row below the count (FeatherPGS) clamps it to the rows first.
+    contacts._rigid_contact_pool.clamp_count(contacts.rigid_contact_count)
+    test.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), CONTACTS // 2)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         test.assertFalse(pipeline.service_capacity(state))

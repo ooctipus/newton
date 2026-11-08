@@ -261,8 +261,10 @@ class Contacts:
     thousand and grow from the measured and forecast demand, limited only by the device memory: a
     collision pass outside graph capture grows them as it needs, and
     :meth:`newton.CollisionPipeline.service_capacity` grows them between graph replays. Growth and trims replace the array attributes with other views
-    (on CUDA, of the same memory), so read them from this object rather than keeping them. After a collision pass :attr:`rigid_contact_count` never
-    exceeds the rows: the pass drops the contacts past them and flags its capacity status.
+    (on CUDA, of the same memory), so read them from this object rather than keeping them. A collision pass drops the
+    contacts past the rows and flags its capacity status: a fixed buffer's :attr:`rigid_contact_count` keeps every
+    contact found, as consumers of Newton's buffers expect (they read ``min(count, rigid_contact_max)`` rows), and a
+    growable buffer's never exceeds the rows.
 
     On CUDA with ``gpu_components``, graphs whose contact launches follow the rows (the collision
     pipeline's and :class:`~newton.solvers.SolverFeatherPGS`'s) keep working after growth without a
