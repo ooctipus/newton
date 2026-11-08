@@ -12,12 +12,12 @@ box that its surface meets (an exact, closed triangle-box test in float64). Ever
 length. Floors, ceilings, walls and rooms are cells like any other: nothing assumes a height function.
 
 Only occupied cells are stored. Their keys ``(level, x, y, z)`` sit in an open-addressing hash table (linear probing,
-load at most one half), each slot holding the key and the cell's ``(start, count)`` into a CSR of entries. An entry is
-a triangle id with the triangle's bounding box relative to the cell (16-bit fixed point, rounded outward), so a query
-rejects most entries without touching the triangle. Each triangle keeps its vertices and its *registration*: its
-box's base cell and spans and a mask of the box cells it registered in. A query that meets a triangle in several
-cells emits it from the first registered one inside the query's cell range only (the reference-cell rule, by the
-mask: no memory).
+load at most two thirds), each slot holding the key, the cell's ``(start, count)`` into a CSR of entries and the box of
+the cell's triangles. An entry is a triangle id with the triangle's bounding box relative to the cell (fixed point,
+rounded outward), so a query rejects most entries without touching the triangle. Each triangle keeps its
+*registration*: its box's base cell and spans and a mask of the box cells it registered in. A query that meets a
+triangle in several cells emits it from the first registered one inside the query's cell range only (the
+reference-cell rule, by the mask: no memory); a small triangle's entries carry the same rule for its 2x2x2 block.
 
 A query visits, at every occupied level, the cells under its bound's box (level-0 cell coordinates shifted right by
 ``2 l``: ``floor(x / (h 4^l)) = floor(floor(x / h) / 4^l)``, the same identity the build uses). A point of the bound
@@ -115,14 +115,8 @@ class MeshCellSlot:
 
 @wp.struct
 class MeshCellTriangle:
-    """One triangle as the midphase reads it: its vertices and its registration."""
+    """One triangle's registration: the cells of its box it registered in."""
 
-    v0: wp.vec3
-    """First vertex, unscaled mesh frame [m]."""
-    v1: wp.vec3
-    """Second vertex [m]."""
-    v2: wp.vec3
-    """Third vertex [m]."""
     cells_mask: wp.uint64
     """Bit ``dx + (sx + 1) (dy + (sy + 1) dz)`` set for each cell of its box it registered in."""
     cells_box: wp.vec3i
@@ -145,7 +139,7 @@ class MeshCells:
     (each ``8192 + 2048 x / edge``, clamped) and, in the nibbles ``b0 | b1 << 4 | b2 << 8``, its block registration when its box
     spans at most two cells per axis (:func:`mesh_cells_entry_first_in_range`)."""
     triangles: wp.array[MeshCellTriangle]
-    """Per triangle, by mesh: its vertices and registration."""
+    """Per triangle, by mesh: its registration."""
     sorted_slots: wp.array[MeshCellSlot]
     """Every mesh's occupied cells, by ascending key (so grouped by level)."""
     level_start: wp.array[wp.int32]
@@ -708,7 +702,7 @@ def build_mesh_grid(points: np.ndarray, indices: np.ndarray, cell: float | None 
     cell_box_lo = c_lo[:, 0] | (c_lo[:, 1] << 8) | (c_lo[:, 2] << 16)
     cell_box_hi = c_hi[:, 0] | (c_hi[:, 1] << 8) | (c_hi[:, 2] << 16)
     capacity = 1
-    while capacity < 2 * ncell:
+    while capacity < ncell + ncell // 2:
         capacity <<= 1
     table_mask = capacity - 1
     table_keys = np.full(capacity, 0xFFFFFFFFFFFFFFFF, dtype=np.uint64)
@@ -737,7 +731,6 @@ def build_mesh_grid(points: np.ndarray, indices: np.ndarray, cell: float | None 
     for lvl in level_counts:
         levels |= 1 << lvl
     records = np.zeros(nt, dtype=MeshCellTriangle.numpy_dtype())
-    records["v0"], records["v1"], records["v2"] = v32[:, 0], v32[:, 1], v32[:, 2]
     records["cells_mask"] = mask
     records["cells_box"] = cells_box
     return {
@@ -811,6 +804,7 @@ def build_mesh_cells(
     device=None,
     *,
     meshes: dict | None = None,
+    query_size: float | None = None,
     cell: float | None = None,
 ) -> MeshCells:
     """Build the cell index of every triangle mesh shape (``GeoType.MESH``), one per distinct mesh.
@@ -823,7 +817,9 @@ def build_mesh_cells(
         device: Device of the returned arrays (and of the meshes).
         meshes: Optional host buffers ``{mesh id: (points, indices)}``, the same the meshes were built from; a mesh
             without them is read from the device by its id.
-        cell: Level-0 cell edge for every mesh [m]; chosen per mesh from its triangles when ``None``.
+        query_size: Typical extent of the shapes that query the meshes [m]; a mesh's level-0 cells are no finer.
+        cell: Level-0 cell edge for every mesh [m]; when ``None``, :func:`default_cell_size` of the mesh, raised to
+            ``query_size``.
 
     Returns:
         The packed :class:`MeshCells`.
@@ -854,7 +850,12 @@ def build_mesh_cells(
     read = dict(zip(unread, _read_meshes(unread, device), strict=True))
     for mid in mesh_ids:
         points, indices = meshes[mid] if mid in meshes else read[mid]
-        g = build_mesh_grid(points, indices, cell)
+        edge = cell
+        if edge is None:
+            edge = default_cell_size(points, indices)
+            if query_size is not None and query_size > edge:
+                edge = query_size
+        g = build_mesh_grid(points, indices, edge)
         info = MeshGrid()
         info.origin = wp.vec3(*[float(x) for x in g["origin"]])
         info.cell = float(g["cell"])

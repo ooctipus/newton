@@ -15425,16 +15425,6 @@ class ModelBuilder:
                 shape_mesh_boundary_start if shape_mesh_boundary_start else [-1], dtype=wp.int32, device=device
             )
 
-            # The cell index of each distinct collision mesh, read by the mesh-vs-convex midphase.
-            from ..geometry.mesh_cells import build_mesh_cells  # noqa: PLC0415
-
-            # The host buffers each mesh was built from, so the build reads no device memory.
-            mesh_buffers = {
-                int(source): (geo.vertices, geo.indices)
-                for shape_type, geo, source in zip(self.shape_type, generated_shape_sources, geo_sources, strict=True)
-                if shape_type == GeoType.MESH and isinstance(geo, Mesh) and source
-            }
-            m._mesh_cells = build_mesh_cells(self.shape_type, geo_sources, device, meshes=mesh_buffers)
 
             # Compact convex support data (one copy per shared geometry).
             shape_support_data = []
@@ -15702,6 +15692,32 @@ class ModelBuilder:
             m.shape_collision_aabb_upper = wp.array(local_aabb_upper, dtype=wp.vec3, device=device)
             m._shape_interior_point = wp.array(local_interior_point, dtype=wp.vec3, device=device)
             m._shape_voxel_resolution = wp.array(voxel_resolution, dtype=wp.vec3i, device=device)
+
+            # The cell index of each distinct collision mesh, read by the mesh-vs-convex midphase. Its cells are no
+            # finer than the shapes that query it: the median extent of the collidable non-mesh shapes' local boxes.
+            from ..geometry.mesh_cells import build_mesh_cells  # noqa: PLC0415
+
+            query_extents = [
+                float(np.max(np.asarray(upper) - np.asarray(lower)))
+                for shape_type, flags, lower, upper in zip(
+                    self.shape_type, shape_flags_list, local_aabb_lower, local_aabb_upper, strict=True
+                )
+                if flags & ShapeFlags.COLLIDE_SHAPES
+                and shape_type not in (GeoType.MESH, GeoType.HFIELD, GeoType.PLANE, GeoType.NONE)
+            ]
+            # The host buffers each mesh was built from, so the build reads no device memory.
+            mesh_buffers = {
+                int(source): (geo.vertices, geo.indices)
+                for shape_type, geo, source in zip(self.shape_type, generated_shape_sources, geo_sources, strict=True)
+                if shape_type == GeoType.MESH and isinstance(geo, Mesh) and source
+            }
+            m._mesh_cells = build_mesh_cells(
+                self.shape_type,
+                geo_sources,
+                device,
+                meshes=mesh_buffers,
+                query_size=float(np.median(query_extents)) if query_extents else None,
+            )
 
             # ---------------------
             # Compute and compact texture SDF resources (shared table + per-shape index indirection)
