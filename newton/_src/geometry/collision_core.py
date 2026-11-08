@@ -1400,18 +1400,22 @@ def mesh_vs_convex_midphase(
     """
     grid = mesh_cells.grids[mesh_cells.shape_grid[mesh_shape]]
     tri_index = candidate[1]
-    triangle = mesh_cells.triangles[grid.triangle_start + tri_index]
+    registration = mesh_cells.triangles[grid.triangle_start + tri_index]
     level = candidate[3] >> 15
     cell = wp.vec3i(candidate[2] & 0x7FFF, (candidate[2] >> 15) & 0x7FFF, candidate[3] & 0x7FFF)
     shift = MESH_CELLS_LEVEL_SHIFT * level
     qlo = wp.vec3i(lo0[0] >> shift, lo0[1] >> shift, lo0[2] >> shift)
     qhi = wp.vec3i(hi0[0] >> shift, hi0[1] >> shift, hi0[2] >> shift)
-    if not mesh_cells_first_in_range(triangle.cells_mask, triangle.cells_box, cell, qlo, qhi):
+    if not mesh_cells_first_in_range(registration.cells_mask, registration.cells_box, cell, qlo, qhi):
         return
+    mesh = wp.mesh_get(mesh_id)
+    v0 = mesh.points[mesh.indices[3 * tri_index + 0]]
+    v1 = mesh.points[mesh.indices[3 * tri_index + 1]]
+    v2 = mesh.points[mesh.indices[3 * tri_index + 2]]
     # The triangle meets the query box (which holds the bound), so it is met in a cell of the query's range.
     query_center = 0.5 * (query_lower + query_upper)
     if not triangle_meets_box(
-        triangle.v0 - query_center, triangle.v1 - query_center, triangle.v2 - query_center, 0.5 * (query_upper - query_lower)
+        v0 - query_center, v1 - query_center, v2 - query_center, 0.5 * (query_upper - query_lower)
     ):
         return
     watertight = (shape_mesh_properties[mesh_shape] & MeshProperties.WATERTIGHT) != 0
@@ -1422,9 +1426,9 @@ def mesh_vs_convex_midphase(
     bound = _mesh_query_bound(convex, convex_in_mesh, contact_threshold)
     if not mesh_query_bound_meets_triangle(
         bound,
-        wp.cw_mul(triangle.v0, mesh_scale),
-        wp.cw_mul(triangle.v1, mesh_scale),
-        wp.cw_mul(triangle.v2, mesh_scale),
+        wp.cw_mul(v0, mesh_scale),
+        wp.cw_mul(v1, mesh_scale),
+        wp.cw_mul(v2, mesh_scale),
     ):
         return
     _lower, _upper, inv_scale = aabb_to_unscaled(wp.vec3(0.0), wp.vec3(0.0), mesh_scale)
@@ -1432,9 +1436,9 @@ def mesh_vs_convex_midphase(
     if not _mesh_triangle_is_front_facing_local(
         mesh_id,
         center_in_bvh,
-        triangle.v0,
-        triangle.v1,
-        triangle.v2,
+        v0,
+        v1,
+        v2,
         watertight,
         convex,
         convex_in_mesh,
