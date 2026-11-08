@@ -7964,11 +7964,10 @@ for _expert_test in (
 
 
 def test_mesh_midphase_many_pairs(test, device):
-    """Find mesh contacts when there are more mesh pairs than midphase thread blocks.
+    """Find mesh contacts for many mesh pairs at once, each triangle once.
 
-    Past one pair per block, the CUDA midphase switches from one tile block per
-    query to a launch with several one-warp blocks per tile block. Boxes and
-    cube hulls cover both query-bound builders.
+    The midphase's lane groups stride over the pairs; boxes and cube hulls cover
+    the primitive and the hull bounds.
     """
     side = 18
     spacing = 0.5
@@ -8049,9 +8048,6 @@ def test_mesh_midphase_many_pairs(test, device):
     narrow_phase = pipeline.narrow_phase
     mesh_pairs = int(narrow_phase.shape_pairs_mesh_count.numpy()[0])
     test.assertEqual(mesh_pairs, len(shapes))
-    if device.is_cuda:
-        test.assertIsNotNone(narrow_phase._midphase_narrow_kernel)
-        test.assertGreater(mesh_pairs, narrow_phase.num_tile_blocks)
 
     triangle_count = int(narrow_phase.triangle_pairs_count.numpy()[0])
     triangle_pairs = narrow_phase.triangle_pairs.numpy()[:triangle_count]

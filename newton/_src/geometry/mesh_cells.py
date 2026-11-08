@@ -270,7 +270,7 @@ def mesh_cells_entry_first_in_range(entry: wp.vec4i, cell: wp.vec3i, qlo: wp.vec
 def mesh_cells_range(grid: MeshGrid, lower: wp.vec3, upper: wp.vec3) -> tuple[wp.vec3i, wp.vec3i, bool]:
     """Level-0 cell range ``[lo, hi]`` under the box ``[lower, upper]`` (unscaled mesh frame), clamped to the grid.
 
-    Returns ``False`` when the box misses the grid. The caller pads the box for float32 rounding.
+    Returns ``False`` when the box misses the grid or is not finite. The caller pads the box for float32 rounding.
     """
     lo = wp.vec3i(0)
     hi = wp.vec3i(0)
@@ -279,7 +279,8 @@ def mesh_cells_range(grid: MeshGrid, lower: wp.vec3, upper: wp.vec3) -> tuple[wp
         a = (lower[k] - grid.origin[k]) * grid.inv_cell
         b = (upper[k] - grid.origin[k]) * grid.inv_cell
         n = grid.dims[k]
-        if b < 0.0 or a >= float(n):
+        # A non-finite box (a shape with a non-finite pose) meets nothing.
+        if not (wp.isfinite(a) and wp.isfinite(b)) or b < 0.0 or a >= float(n):
             inside = False
         lo[k] = wp.clamp(int(wp.floor(a)), 0, n - 1)
         hi[k] = wp.clamp(int(wp.floor(b)), 0, n - 1)
