@@ -315,6 +315,8 @@ def create_compute_gjk_mpr_contacts(
     use_precomputed_center: bool = False,
     penetration_refiner: Any = None,
     query_filter: Any = None,
+    point_filter: Any = None,
+    manifold_shape: Any = None,
 ):
     """
     Factory function to create a compute_gjk_mpr_contacts function with a specific writer function.
@@ -327,12 +329,15 @@ def create_compute_gjk_mpr_contacts(
         penetration_refiner: Optional physical-proxy result refinement function.
         query_filter: Optional surface witness of nonnegative-distance queries (see
             :func:`create_solve_convex_multi_contact`).
+        point_filter: Optional admission of each written contact, ``(ContactData, query_context) -> bool``.
+        manifold_shape: Optional manifold geometry of shape A (see :func:`create_solve_convex_multi_contact`).
 
     Returns:
         A compute_gjk_mpr_contacts function with the writer function baked in
     """
     if support_func is None:
         support_func = support_map
+    has_point_filter = point_filter is not None
 
     @wp.func
     def compute_gjk_mpr_contacts(
@@ -406,7 +411,11 @@ def create_compute_gjk_mpr_contacts(
                         contact.shape_b = shape_b
                         contact.gap_sum = rigid_gap
                         contact.sort_sub_key = sort_sub_key
-                        writer_func(contact, writer_data, -1)
+                        if wp.static(has_point_filter):
+                            if point_filter(contact, query_context):
+                                writer_func(contact, writer_data, -1)
+                        else:
+                            writer_func(contact, writer_data, -1)
                     return
 
         radius_eff_a = float(0.0)
@@ -445,6 +454,8 @@ def create_compute_gjk_mpr_contacts(
                     use_precomputed_center,
                     penetration_refiner,
                     query_filter,
+                    point_filter,
+                    manifold_shape,
                 )
             )(
                 shape_a_data,
@@ -472,6 +483,7 @@ def create_compute_gjk_mpr_contacts(
                     use_precomputed_center,
                     penetration_refiner,
                     query_filter,
+                    point_filter,
                 )
             )(
                 shape_a_data,

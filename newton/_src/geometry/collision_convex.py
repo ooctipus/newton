@@ -153,6 +153,8 @@ def create_solve_convex_multi_contact(
     use_precomputed_center: bool = False,
     penetration_refiner: Any = None,
     query_filter: Any = None,
+    point_filter: Any = None,
+    manifold_shape: Any = None,
 ):
     """Create a fused MPR/GJK multi-contact solver.
 
@@ -164,6 +166,9 @@ def create_solve_convex_multi_contact(
         penetration_refiner: Optional physical-proxy result refinement function.
         query_filter: Optional surface witness of separated queries, ``(geom_a, point_a, normal,
             signed_distance, context) -> (point_a, normal, signed_distance)``, applied before the manifold.
+        point_filter: Optional admission of each written contact, ``(ContactData, context) -> bool``.
+        manifold_shape: Optional shape A for the manifold, ``(geom_a, point_a, normal, context) -> (geom, origin,
+            moved)``: the geometry the manifold clips against, its origin in A's frame, and whether it differs.
 
     Returns:
         The specialized contact solver.
@@ -175,6 +180,8 @@ def create_solve_convex_multi_contact(
     solve_gjk = create_solve_closest_distance(support_func, _support_funcs=support_funcs)
     has_penetration_refiner = penetration_refiner is not None
     has_query_filter = query_filter is not None
+    has_point_filter = point_filter is not None
+    has_manifold_shape = manifold_shape is not None
 
     @wp.func
     def solve_convex_multi_contact(
@@ -276,26 +283,47 @@ def create_solve_convex_multi_contact(
             contact_data = post_process_contact(
                 contact_data, geom_a, position_a, orientation_a, geom_b, position_b, orientation_b
             )
-            writer_func(contact_data, writer_data, -1)
+            if wp.static(has_point_filter):
+                if point_filter(contact_data, query_context):
+                    writer_func(contact_data, writer_data, -1)
+            else:
+                writer_func(contact_data, writer_data, -1)
             return 1
 
         # Generate multi-contact manifold -- pass A-local-frame data directly
         # to avoid redundant world-space round-trip.
+        manifold_a = geom_a
+        manifold_position_a = position_a
+        manifold_relative_b = relative_position_b
+        manifold_point_a = point_a
+        manifold_point_b = point_b
+        if wp.static(has_manifold_shape):
+            # The manifold's own shape A, its origin moved by ``shift`` in A's frame.
+            grown, shift, moved = manifold_shape(geom_a, point_a, normal, query_context)
+            if moved:
+                manifold_a = grown
+                manifold_position_a = position_a + wp.quat_rotate(orientation_a, shift)
+                manifold_relative_b = relative_position_b - shift
+                manifold_point_a = point_a - shift
+                manifold_point_b = point_b - shift
         count = wp.static(
-            create_build_manifold(support_func, writer_func, post_process_contact, _support_funcs=support_funcs)
+            create_build_manifold(
+                support_func, writer_func, post_process_contact, _support_funcs=support_funcs, point_filter=point_filter
+            )
         )(
-            geom_a,
+            manifold_a,
             geom_b,
             orientation_a,
-            position_a,
+            manifold_position_a,
             relative_orientation_b,
-            relative_position_b,
-            point_a,
-            point_b,
+            manifold_relative_b,
+            manifold_point_a,
+            manifold_point_b,
             normal,
             data_provider,
             writer_data,
             contact_template,
+            query_context,
         )
 
         return count
@@ -310,6 +338,7 @@ def create_solve_convex_single_contact(
     use_precomputed_center: bool = False,
     penetration_refiner: Any = None,
     query_filter: Any = None,
+    point_filter: Any = None,
 ):
     """Create a fused MPR/GJK single-contact solver.
 
@@ -321,6 +350,7 @@ def create_solve_convex_single_contact(
         penetration_refiner: Optional physical-proxy result refinement function.
         query_filter: Optional surface witness of separated queries, ``(geom_a, point_a, normal,
             signed_distance, context) -> (point_a, normal, signed_distance)``, applied before the manifold.
+        point_filter: Optional admission of each written contact, ``(ContactData, context) -> bool``.
 
     Returns:
         The specialized contact solver.
@@ -332,6 +362,7 @@ def create_solve_convex_single_contact(
     solve_gjk = create_solve_closest_distance(support_func, _support_funcs=support_funcs)
     has_penetration_refiner = penetration_refiner is not None
     has_query_filter = query_filter is not None
+    has_point_filter = point_filter is not None
 
     @wp.func
     def solve_convex_single_contact(
@@ -422,7 +453,11 @@ def create_solve_convex_single_contact(
         contact_data = post_process_contact(
             contact_data, geom_a, position_a, orientation_a, geom_b, position_b, orientation_b
         )
-        writer_func(contact_data, writer_data, -1)
+        if wp.static(has_point_filter):
+            if point_filter(contact_data, query_context):
+                writer_func(contact_data, writer_data, -1)
+        else:
+            writer_func(contact_data, writer_data, -1)
 
         return 1
 

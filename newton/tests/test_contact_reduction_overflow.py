@@ -29,9 +29,14 @@ def _fill_reducer(data: GlobalContactReducerData, allocated: wp.array[int]):
 
 
 def _boxes_on_mesh_model(device, height: float = 0.095, world_count: int | None = None):
-    """Three boxes resting on a 4x4-cell triangle-mesh ground, which uses global reduction."""
+    """Three boxes resting on a 4x4-cell triangle-mesh ground, which uses global reduction.
+
+    Each box rests inside one cell, so its four corner contacts (one per corner, the mesh's exact contacts)
+    outnumber the cell's two triangle pairs: the reducer's buffer, sized from the triangle pairs, is the one
+    to overflow.
+    """
     cells = 4
-    xs, ys = np.meshgrid(np.linspace(-1.0, 1.0, cells + 1), np.linspace(-1.0, 1.0, cells + 1))
+    xs, ys = np.meshgrid(np.linspace(-2.0, 2.0, cells + 1), np.linspace(-2.0, 2.0, cells + 1))
     vertices = np.stack([xs.ravel(), ys.ravel(), np.zeros(xs.size)], axis=1).astype(np.float32)
     indices = []
     for i in range(cells):
@@ -41,7 +46,7 @@ def _boxes_on_mesh_model(device, height: float = 0.095, world_count: int | None 
     builder = newton.ModelBuilder()
     builder.add_shape_mesh(-1, mesh=newton.Mesh(vertices, np.array(indices, dtype=np.int32)))
     for k in range(3):
-        body = builder.add_body(xform=wp.transform(wp.vec3(-0.5 + 0.5 * k, 0.0, height), wp.quat_identity()))
+        body = builder.add_body(xform=wp.transform(wp.vec3(-1.5 + 1.0 * k, 0.5, height), wp.quat_identity()))
         builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
     if world_count is not None:
         root = newton.ModelBuilder()
@@ -255,7 +260,7 @@ def test_default_capacity_scales_with_world_count(test, device):
 def _tray_worlds_model(device, world_count: int):
     """Replicate 8 boxes on a 16x16-cell mesh tray, about 800 reduction candidates per world."""
     cells = 16
-    xs, ys = np.meshgrid(np.linspace(-1.0, 1.0, cells + 1), np.linspace(-1.0, 1.0, cells + 1))
+    xs, ys = np.meshgrid(np.linspace(-2.0, 2.0, cells + 1), np.linspace(-2.0, 2.0, cells + 1))
     vertices = np.stack([xs.ravel(), ys.ravel(), np.zeros(xs.size)], axis=1).astype(np.float32)
     indices = []
     for i in range(cells):
