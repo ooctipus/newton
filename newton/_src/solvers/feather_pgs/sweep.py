@@ -80,7 +80,7 @@ class WorldRows:
     ``staging`` says where a row's record (:func:`.row_metadata.pack_row_record`) is read:
 
     - ``"shared"``: the record's words a staged row reads are staged in shared memory, word-major (``s_rec_dense``,
-      :data:`STAGED_WORDS`): its right-hand side (the law's bias plus the row's incident velocity ``row_incident``: its
+      :attr:`staged_words`): its right-hand side (the law's bias plus the row's incident velocity ``row_incident``: its
       residual at ``du = 0``), its diagonal, its kind and parent word and its friction coefficient; its sides are the
       row store's (``row_sides``);
     - ``"record"``: the rows' records stream (``row_record``, :func:`.row_metadata.pack_row_record`), the class's from
@@ -102,11 +102,12 @@ class WorldRows:
     stream: bool = False
     lanes: Lanes = dataclasses.field(default_factory=Lanes)
     every_lane: bool = False
+    sides: str | None = None
+    """Where a staged row's sides are staged too, their record words (its sides' first world coordinates, then their
+    widths, or with ``"classes"`` the row's support classes): a visit's coordinates then decode from the stage, as a
+    streamed record's do (``RECORD_COORDINATE``)."""
 
     STAGINGS: ClassVar[tuple[str, ...]] = ("shared", "record")
-    STAGED_WORDS: ClassVar[tuple[int, ...]] = (2, 1, 3, 5)
-    """The record words a staged row reads, in their stage's order: right-hand side, diagonal, kind and parent,
-    friction coefficient."""
     VISITED: ClassVar[str] = "i"
     """The row a row loop visits, whose record the loop holds in registers."""
 
@@ -122,6 +123,12 @@ class WorldRows:
     @property
     def record(self) -> bool:
         return self.staging == "record"
+
+    @property
+    def staged_words(self) -> tuple[int, ...]:
+        """The record words a staged row reads, in their stage's order: right-hand side, diagonal, kind and parent,
+        friction coefficient, and with :attr:`sides` its sides' words."""
+        return (2, 1, 3, 5, 0, 4) if self.sides else (2, 1, 3, 5)
 
     @property
     def own_stores(self) -> bool:
@@ -162,7 +169,7 @@ class WorldRows:
     def word(self, row: str, word: int) -> str:
         """Word ``word`` of row ``row``'s record: a staged row's from the stage, the visited row's from its registers."""
         if not self.record:
-            return f"s_rec_dense[{self.STAGED_WORDS.index(word) * self.capacity} + ({row})]"
+            return f"s_rec_dense[{self.staged_words.index(word) * self.capacity} + ({row})]"
         if row == self.VISITED:
             if word >= self.words:
                 raise ValueError(f"a record of {self.words} words has no word {word}")
@@ -267,7 +274,7 @@ class WorldRows:
 
     def buffers(self) -> tuple[Buffer, ...]:
         impulses = () if self.stream else (Buffer(self.impulses, "float", self.capacity),)
-        staged = len(self.STAGED_WORDS) * self.capacity
+        staged = len(self.staged_words) * self.capacity
         return impulses if self.record else (*impulses, Buffer("s_rec_dense", "int", staged))
 
     def declaration(self) -> str:
@@ -288,7 +295,19 @@ class WorldRows:
                 3: kind,
                 5: f"__float_as_int(world_row_mu.data[{at}])",
             }
-            lines += [f"{self.word(row, word)} = {words[word]};" for word in self.STAGED_WORDS]
+            if self.sides:
+                # The record's words (row_metadata.pack_row_record): each side's first world coordinate, -1 for none,
+                # then the sides' widths or the row's classes.
+                lines.append(f"const wp::vec2i sides = row_sides.data[{at}];")
+                first = "(sides[{0}] >= 0 ? articulation_world_dof_offset.data[sides[{0}]] : -1)"
+                words[0] = f"({first.format(0)} << 16) | ({first.format(1)} & 0xFFFF)"
+                width = "(sides[{0}] >= 0 ? response_dofs.data[sides[{0}]] : 0)"
+                words[4] = (
+                    f"row_classes.data[{at}]"
+                    if self.sides == "classes"
+                    else f"{width.format(0)} | ({width.format(1)} << 16)"
+                )
+            lines += [f"{self.word(row, word)} = {words[word]};" for word in self.staged_words]
         return "\n".join(lines)
 
     def stores(self, row: str = "i") -> str:

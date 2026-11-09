@@ -13,9 +13,9 @@ from typing import NamedTuple
 from ...core.memory import Place, Staging
 from .sweep_routes import RowPlaces
 
-_MFGS_RESIDENT_METADATA_MAX_BYTES = 4096
+_MFGS_RESIDENT_METADATA_MAX_BYTES = 6144
 """Row metadata a matrix-free sweep keeps resident at most [B]: larger working sets cost more occupancy than their
-repeated global loads (one 4-KiB set)."""
+repeated global loads (256 rows: one 4-KiB set of four words a row, measured before the sides' two staged with them)."""
 
 
 class _MFGSStorage(NamedTuple):

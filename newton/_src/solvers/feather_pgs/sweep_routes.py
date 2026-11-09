@@ -227,7 +227,7 @@ def packed_operator(
     def coordinate(row, entry):
         if wide:
             return f"(world_dof_indices.data[dof_map_base + ({entry})] >= 0 ? ({entry}) : -1)"
-        if rows is not None and rows.record:
+        if rows is not None and (rows.record or rows.sides):
             prefix = "CLASS_RECORD" if classes else "RECORD"
             return f"{prefix}_COORDINATE({rows.word(row, 0)}, {rows.word(row, 4)}, {entry})"
         if classes:
@@ -698,7 +698,11 @@ def mf_gs_staging(
     velocity, its dense rows' impulses and staged metadata, the free bodies' run's impulses (``free_rows``) unless they
     stream, ``colored`` the colors' staged offsets (and its trace's warp maxima), ``active_rows`` the active
     enumeration's bitsets, for ``groups`` worlds of ``lanes`` lanes a block."""
-    dense = WorldRows(max_constraints, staging=places.staging, stream=places.dense_impulses is Place.GLOBAL)
+    # A packed row's sides stage with its metadata (the classes' word takes the widths' place).
+    sides = None if wide_rows else "widths"
+    dense = WorldRows(
+        max_constraints, staging=places.staging, stream=places.dense_impulses is Place.GLOBAL, sides=sides
+    )
     free = WorldRows(
         mf_max_constraints, staging="record", free=True, stream=places.impulses is Place.GLOBAL or not free_rows
     )
@@ -737,7 +741,11 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     P = int(M_D + M_MF if sweep.pitch is None else sweep.pitch)
     row_lanes = Lanes(lanes)
     laws = sweep.laws
-    dense = WorldRows(M_D, staging=places.staging, stream=places.dense_impulses is Place.GLOBAL, lanes=row_lanes)
+    # A packed row's coordinates decode from its staged sides, as a streamed record's do.
+    sides = None if wide_rows else "classes" if sweep.support_classes else "widths"
+    dense = WorldRows(
+        M_D, staging=places.staging, stream=places.dense_impulses is Place.GLOBAL, lanes=row_lanes, sides=sides
+    )
     free = WorldRows(M_MF, staging="record", free=True, stream=places.impulses is Place.GLOBAL, lanes=row_lanes)
     dense_op = packed_operator(max_row_dofs, row_lanes, wide=wide_rows, rows=dense, classes=sweep.support_classes)
     free_op = free_body_rows(row_lanes, max_row_dofs)
