@@ -513,8 +513,22 @@ def tier_response(shape) -> tuple[tuple[int, int, int, int] | None, np.ndarray |
     return (na, nb, oa, ob), meta, f"The parallel tiers walk the rows of sizes {list(shape.sizes)}."
 
 
+def _hub(model, forest) -> bool:
+    """Whether a contact can join a free body to a tree of its world that is not one (``Model.shape_contact_pairs``,
+    each body's tree): every contact on a free body touches all six of its coordinates and every row of a tree shares
+    its tree, so such a contact joins two cliques of conflicting rows into one, a level whose rows all couple: the
+    split law's. Free bodies that touch each other color into exact levels (the colored units)."""
+    if not model.shape_contact_pair_count:
+        return False
+    bodies = model.shape_body.numpy()[model.shape_contact_pairs.numpy().reshape(-1, 2)]
+    trees = np.where(bodies >= 0, forest.body_tree[bodies], -1)
+    joined = trees[(trees >= 0).all(axis=1) & (trees[:, 0] != trees[:, 1])]
+    free = forest.is_free_rigid_host[forest.tree_articulation] != 0
+    return bool(np.any(free[joined[:, 0]] != free[joined[:, 1]]))
+
+
 def tier_rule(inputs: ClassInputs) -> tuple[Tiers | None, str]:
-    """Case K4, the Jacobi tiers of the dense rows of a hub: a free body beside a tree in one world.
+    """Case K4, the Jacobi tiers of the dense rows of a hub: a contact can join a free body to a tree (:func:`_hub`).
 
     They form each world's response in the kernel, which bounds the class (:func:`tier_response`: one articulation of
     each of one or two sizes per world, at most :data:`_INKERNEL_MAX_DOF` coordinates each), under the contact laws
@@ -534,7 +548,10 @@ def tier_rule(inputs: ClassInputs) -> tuple[Tiers | None, str]:
                 "No matrix-free sweep runs whose dense rows the tiers could take.",
             ),
             (pinned is None or bool(pinned), "A test pin builds no tier (tiers=0)."),
-            (bool(pinned) or forest.shape.beside, "The tiers serve a hub: a free body beside a tree in one world."),
+            (
+                bool(pinned) or _hub(inputs.model, forest),
+                "The tiers serve a hub: no contact joins a free body to a tree.",
+            ),
         )
     )
     if reason is not None:

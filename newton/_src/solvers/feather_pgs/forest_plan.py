@@ -120,13 +120,6 @@ class ClassShape:
     def present(self, block: int) -> bool:
         return self.arts is not None and bool(np.all(self.arts[:, block] >= 0))
 
-    @property
-    def beside(self) -> bool:
-        if self.arts is None:
-            return False
-        held, free = self.arts >= 0, np.asarray(self.free, dtype=bool)
-        return bool(np.any(held[:, free].any(axis=1) & held[:, ~free].any(axis=1)))
-
 
 _SCALAR_JOINTS = (int(JointType.PRISMATIC), int(JointType.REVOLUTE))
 """The joints of one coordinate, the only ones a constraint mimic (one relation, not componentwise) can couple."""
