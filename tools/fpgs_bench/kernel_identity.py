@@ -154,9 +154,8 @@ def factory_calls():
         sweep_routes,
         sweep_routes_tiers,
     )
-    from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout  # noqa: PLC0415
     from newton._src.solvers.feather_pgs.sweep import EXACT, LevelLaw  # noqa: PLC0415
-    from newton.tests.feather_pgs_law_harness import built, keyed_classes  # noqa: PLC0415
+    from newton.tests.feather_pgs_law_harness import built, tier_classes  # noqa: PLC0415
 
     mf_gs = _unwrapped(built(sweep_routes.GeneralSweep))
     toggles = (
@@ -174,10 +173,9 @@ def factory_calls():
         for change in toggles:
             yield "sweep_routes.GeneralSweep", mf_gs, (64, 32, 12, ARCH), {**base, **change}
 
-    def parallel(layout, *args, **kwargs):
-        return built(sweep_routes_tiers.TierSweep)(*args, keyed=layout, classes=keyed_classes(layout), **kwargs)
+    def parallel(*args, **kwargs):
+        return built(sweep_routes_tiers.TierSweep)(*args, emit=True, classes=tier_classes((18,)), **kwargs)
 
-    layout = Named("KeyedLayout(18, 0, 0, 0, 48, False, 0)", KeyedLayout(18, 0, 0, 0, 48, False, 0))
     for rows in (32, 48):
         kwargs = {
             "rows": rows,
@@ -185,7 +183,7 @@ def factory_calls():
             "inkernel_response": (18, 0, 0, 0),
             "linked_rows": True,
         }
-        yield "sweep_routes_tiers.TierSweep[keyed]", parallel, (layout, 72, 32, 18, ARCH), kwargs
+        yield "sweep_routes_tiers.TierSweep[emit]", parallel, (72, 32, 18, ARCH), kwargs
 
 
 def _schedules(layout, chain):
@@ -543,10 +541,9 @@ def census_calls():
         sweep_routes_diag,
         sweep_routes_tiers,
     )
-    from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout  # noqa: PLC0415
     from newton._src.solvers.feather_pgs.sweep import EXACT, LevelLaw  # noqa: PLC0415
     from newton._src.solvers.feather_pgs.sweep_routes_sparse import SparseSweep  # noqa: PLC0415
-    from newton.tests.feather_pgs_law_harness import built, keyed_classes  # noqa: PLC0415
+    from newton.tests.feather_pgs_law_harness import built, tier_classes  # noqa: PLC0415
 
     mf_gs = (
         _axis("places", sweep_routes.ROW_PLACES),
@@ -554,7 +551,6 @@ def census_calls():
         _axis("torsion"),
         _axis("speed_rows"),
     )
-    keyed = KeyedLayout(16, 6, 0, 16, 128, False, 0)
     specs = (
         (
             "sweep_routes.GeneralSweep",
@@ -602,8 +598,8 @@ def census_calls():
             ),
         ),
         (
-            f"sweep_routes_tiers.TierSweep[keyed={keyed!r}]",
-            functools.partial(built(sweep_routes_tiers.TierSweep), keyed=keyed, classes=keyed_classes(keyed)),
+            "sweep_routes_tiers.TierSweep[emit]",
+            functools.partial(built(sweep_routes_tiers.TierSweep), emit=True, classes=tier_classes((16, 6))),
             ((128, 32, 22, ARCH),),
             (
                 tuple(

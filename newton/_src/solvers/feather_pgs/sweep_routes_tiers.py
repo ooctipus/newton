@@ -7,8 +7,8 @@
 :data:`PARALLEL_ABI`, the world queue).
 
 A tier owns each world without free-body rows whose dense rows it bounds: one block per world and a lane per row
-(:class:`.sweep.JacobiRows`). The rows are the walk's (:class:`.response_operator.WalkedRows`): the keyed rows walk their
-seeds in the kernel, and the other rows are the one writer's stored ``Z`` (:mod:`.walk_rows`). They step together under
+(:class:`.sweep.JacobiRows`). The rows are the walk's (:class:`.response_operator.WalkedRows`): the one writer's stored
+``Z``, or under its EMIT sink their seeds walked in the kernel (:mod:`.walk_rows`). They step together under
 the Jacobi law with Nesterov momentum (:func:`.sweep.jacobi_sweeps`) over the matrix-free response, ``Z`` in registers
 and staged transposed (:class:`.response_operator.TransposedResponse`), and leave by the walk down.
 """
@@ -26,17 +26,17 @@ from ...core.execution import Work, device_lanes
 from ...core.memory import Buffer, Staging
 from . import kernel_template
 from .device_preludes import VirtualLanes
-from .factor.walk import walk_prelude, walk_row_prelude, walk_tables
+from .factor.walk import WALK_FRAME, WALK_LINK, walk_prelude, walk_row_prelude, walk_tables
 from .kernel_template import Dispatch
-from .keyed_row_layout import KeyedLayout
-from .keyed_rows import get_direct_parallel_inputs
+from .law_source import law_preludes
 from .response_operator import Lanes, TransposedResponse, WalkedRows
 from .row_inputs import RowArgument
-from .row_laws import ROW_CONTACT, ROW_JOINT_LIMIT, ROW_JOINT_VELOCITY_LIMIT
+from .row_laws import ROW_CONTACT, ROW_JOINT_LIMIT, ROW_JOINT_VELOCITY_LIMIT, ROW_LAW
 from .solve_policy import block_argmax
 from .sweep import SPLIT, JacobiRows, SweepConfig, dense_tier_world, jacobi_limit_pass, jacobi_scale, jacobi_sweeps
 from .sweep_routes import MF_GS_ABI, worlds
 from .tree_scan import WALK_BOTH, WalkClass, classes_half
+from .walk_rows import RowSeeds
 
 PARALLEL_ABI = kernel_template.params(
     *MF_GS_ABI[:-1],
@@ -45,8 +45,8 @@ PARALLEL_ABI = kernel_template.params(
     ("v_out", wp.array[float]),
 )
 """The parallel tiers' native ABI: the matrix-free sweep's (the walk among it), then the worlds' trees (``ink_meta``:
-each world's articulation of each size and its first coordinate) and the rows' law's cfm before ``v_out``; keyed rows
-insert theirs after ``cfm``."""
+each world's articulation of each size and its first coordinate) and the rows' law's cfm before ``v_out``; a tier that
+walks its rows inserts their seeds after ``cfm``."""
 
 # The parallel tiers' automatic budget (tier_sweeps) grows with the serial sweep's iteration count, whose accuracy
 # every tier must match, and with the square root of a tier's row bound, as Jacobi sweeps with momentum need more passes
@@ -72,7 +72,7 @@ TIER_ROWS = 32
 (:func:`.sweep_levels.claim_worlds` buckets its worlds)."""
 REGISTER_LINE = 80
 """The register line of a tier: 24 warps a multiprocessor (6 in each of the register file's 4 sub-partitions). It is
-no cap: a tier's variants compile on both sides of it unbounded (72 registers plain, 100 to 108 keyed) and spill under
+no cap: a tier's variants compile on both sides of it unbounded (72 registers plain, 100 to 108 seeded) and spill under
 it, so a tier is bound only where its shared memory keeps no more blocks than the line (the layer's ``Work.cap``),
 which leaves ptxas spare registers for the sweep's load schedule."""
 
@@ -103,6 +103,49 @@ def _stored_row(pitch: int, dofs: int) -> str:
     )
 
 
+def _seeded_row(weighted: bool, material: bool) -> str:
+    """Walk the lane's row from the seed the one writer's EMIT sink kept (:class:`.walk_rows.RowSeeds`): a covector's
+    coordinates, or each body's wrench at its frame (the second body's negated) on its tree of the world, then a
+    bouncing contact's rebound from the incident (:func:`.row_laws.contact_restitution_rhs`, weight 1)."""
+    eps = " && world_row_eps.data[at] <= 0.0f" if material else ""
+    weight = " world_row_w.data[at] = 1.0f;" if weighted else ""
+    return f"""        const size_t at = (size_t)off_dense + i;
+        const wp::vec4i s = row_seeds.ids.data[at];
+        const wp::vec4 d = row_seeds.direction.data[at];
+        // The seed's components by selects: a runtime index into a vector would hold it in local memory.
+        if (s[1] == -2) {{
+            const int side = s[0] == art_a ? 0 : (s[0] == art_b ? 1 : -1);
+            #pragma unroll
+            for (int k = 0; k < 2; ++k) {{
+                const int dof = k == 0 ? s[2] : s[3];
+                const float value = k == 0 ? d[0] : d[1];
+                if (dof >= 0 && side >= 0)
+                    TIER_WALK(side, walk.dof_body.data[dof], dof - walk.dof_start.data[s[0]], &value);
+            }}
+        }} else {{
+            const wp::vec4 p = row_seeds.point.data[at];
+            #pragma unroll
+            for (int end = 0; end < 2; ++end) {{
+                const int art = end == 0 ? s[0] : s[2], body = end == 0 ? s[1] : s[3];
+                const int side = art >= 0 && art == art_a ? 0 : (art >= 0 && art == art_b ? 1 : -1);
+                if (body < 0 || side < 0) continue;
+                const int joint = walk.body_joint.data[body];
+                const float* o = walk.link.data + (size_t)joint * {WALK_LINK} + {WALK_FRAME};
+                const wp::vec3 origin = walk.origin.data[art];
+                float seed[6];
+                WALK_WRENCH(seed, end == 0 ? 1.0f : -1.0f, d.c, p.c, origin.c, o, d[3] != 0.0f);
+                TIER_WALK(side, joint - walk.joint_start.data[art], -1, seed);
+            }}
+            const float restitution = row_seeds.restitution.data[at];
+            if (restitution > 0.0f && world_row_type.data[at] == {ROW_CONTACT}{eps}) {{
+                const float target = row_seeds.target.data[at];
+                const auto bounce = RowLaw::contact_restitution_rhs(row_seeds.phi.data[at], incident - target, target,
+                                                                    restitution, row_seeds.dt, row_seeds.threshold);
+                if (bounce.v0) {{ s_rhs[i] = bounce.v1;{weight} }}
+            }}
+        }}"""
+
+
 def parallel_source(tier: TierSweep) -> tuple[str, Staging]:
     """The native body of a parallel tier: a world's dense rows (at most ``rows``: its claim's bucket holds the rest)
     under the Jacobi law, a lane per row (``tier``, :class:`TierSweep`'s source); under ``torsion`` a contact's spin
@@ -111,22 +154,22 @@ def parallel_source(tier: TierSweep) -> tuple[str, Staging]:
     a loop.
 
     The block stages the rows (:class:`.sweep.JacobiRows`) and the velocity, then the rows in the walk's coordinates
-    (:class:`.WalkedRows`, the world's trees ``inkernel_response = (NA, NB, OA, OB)``): the keyed rows' operands
-    (:attr:`TierSweep.row_inputs`: their metadata, their walked rows and arguments) walk their seeds in the kernel, with the release
-    of each tree that can slip (``frame``: the class's slip capacity of each tree; FL3.4's release ``R``, the leave
-    ``R^T``); the other rows are the one writer's stored ``Z``, its frame ``F`` included (the leave ``F^T``). They form the matrix-free response (:class:`.TransposedResponse`: ``Z`` in
+    (:class:`.WalkedRows`, the world's trees ``inkernel_response = (NA, NB, OA, OB)``): under ``emit`` their seeds
+    (:func:`_seeded_row`) walk in the kernel, with the release of each tree that can slip (``frame``: the class's slip
+    capacity of each tree; FL3.4's release ``R``, the leave ``R^T``); else the one writer's stored ``Z``, its frame
+    ``F`` included (the leave ``F^T``). They form the matrix-free response (:class:`.TransposedResponse`: ``Z`` in
     registers and staged transposed, its step scale bounded by the column sums). It runs at most ``sweeps`` Jacobi
     sweeps (:func:`.sweep.jacobi_sweeps`: Nesterov momentum, pairs projected on their patch ring's pooled load with
     ``linked_rows``, a world stopped under ``solve_policy``), with ``velocity_limit_pass`` the velocity limits' last
     word, then publishes the velocity by the walk down and the impulses. With ``weighted`` contact rows step by their
     weights (the relative regularization's; ``material``: a material contact's ``d / (d + eps)`` from the diagonal the
-    tier forms). Keyed rows walk their trees by the walking ``classes``' path tables in constant memory
+    tier forms). Seeded rows walk their trees by the walking ``classes``' path tables in constant memory
     (:func:`.factor.walk.walk_prelude`, the half their records share, :func:`.tree_scan.classes_half`).
 
     Returns the body and its staging.
     """
     NA, NB, OA, OB = tier.inkernel_response
-    operands = tier.row_inputs
+    emit = tier.emit
     M_D, D, AM, NT = tier.max_constraints, tier.max_world_dofs, tier.rows, tier.threads
     pitch, frame, classes, sweeps = tier.pitch, tier.frame, tier.classes, tier.levels.budget
     torsion, solve_policy, linked_rows = tier.torsion, tier.solve_policy, tier.linked_rows
@@ -145,8 +188,10 @@ def parallel_source(tier: TierSweep) -> tuple[str, Staging]:
         D,
         AM + 4,
         row_lanes,
-        read=operands.read if operands is not None else _stored_row(M_D if pitch is None else int(pitch), D),
-        walked=operands is not None,
+        read=_seeded_row(tier.weighted, tier.material)
+        if emit
+        else _stored_row(M_D if pitch is None else int(pitch), D),
+        walked=emit,
         frame=tuple(int(cap) for cap in frame),
         classes=len(classes),
     )
@@ -170,8 +215,6 @@ def parallel_source(tier: TierSweep) -> tuple[str, Staging]:
         "parent": "world_row_parent.data[off_dense + i]",
         "mu": "world_row_mu.data[off_dense + i]",
     }
-    if operands is not None:
-        metadata = {name: getattr(operands, name) for name in metadata}
     loads = store.loads(**metadata, unilateral=(ROW_CONTACT, ROW_JOINT_LIMIT, ROW_JOINT_VELOCITY_LIMIT))
 
     def scale(aii, bound, pad):
@@ -202,9 +245,9 @@ def parallel_source(tier: TierSweep) -> tuple[str, Staging]:
     // The world queue's next world restages the shared rows: every lane has read this world's.
 {group.barrier("    ")}
 """
-    row_preludes = operands.preludes if operands is not None else ()
+    row_preludes = law_preludes(ROW_LAW) if emit else ()
     walk = ()
-    if operands is not None:
+    if emit:
         # The walk last, as the general sweep declares it (sweep_routes.mf_gs_source).
         walk = (walk_prelude(walk_tables(classes), 1, classes_half(classes)), walk_row_prelude(1))
     lanes = device_lanes(tier.device_arch)
@@ -219,9 +262,8 @@ class TierSweep(SweepConfig):
     Its switches, each the plan's from the class's shape and the laws (:meth:`.sweep_plan.Sweep.build`):
 
     - the level law: split (:class:`.sweep.LevelLaw`), its budget :func:`tier_sweeps` of the bucket's bound ``rows``;
-    - the producer's sink: with a ``keyed`` layout (:class:`.keyed_row_layout.KeyedLayout`) the rows are walked from
-      their keys in the kernel's prologue (:func:`.keyed_rows.get_direct_parallel_inputs`), else read as the one writer
-      stored them (``pitch`` rows a world's line);
+    - the producer's sink: under ``emit`` the rows are walked from the seeds the one writer kept in the kernel's
+      prologue (:func:`_seeded_row`), else read as the one writer stored them (``pitch`` rows a world's line);
     - the rows' trees: ``inkernel_response`` ``(NA, NB, OA, OB)``, their slip capacities ``frame`` and walking
       ``classes``;
     - ``linked_rows``: pairs project on their patch ring's pooled load; ``velocity_limit_pass``: the velocity limits'
@@ -241,7 +283,7 @@ class TierSweep(SweepConfig):
     _: dataclasses.KW_ONLY
     rows: int
     inkernel_response: tuple[int, int, int, int]
-    keyed: KeyedLayout | None = None
+    emit: bool = False
     linked_rows: bool = False
     velocity_limit_pass: bool = False
     frame: tuple[int, int] = (0, 0)
@@ -265,7 +307,7 @@ class TierSweep(SweepConfig):
             raise ValueError("inkernel_response needs group sizes within the world DOF count")
         if AM % 4 != 0:
             raise ValueError("rows must be a multiple of 4")
-        if self.keyed is not None and not self.classes:
+        if self.emit and not self.classes:
             raise ValueError("a tier that walks its rows walks the classes of their trees")
         object.__setattr__(self, "inkernel_response", (NA, NB, OA, OB))
         object.__setattr__(self, "frame", tuple(int(cap) for cap in self.frame))
@@ -276,26 +318,12 @@ class TierSweep(SweepConfig):
         return 32 * ((int(self.rows) + 31) // 32)
 
     @property
-    def row_inputs(self):
-        """The keyed rows' operands (:class:`.row_inputs.ParallelRowInputs`), ``None`` for stored rows."""
-        if self.keyed is None:
-            return None
-        return get_direct_parallel_inputs(
-            self.keyed,
-            *self.inkernel_response,
-            self.max_world_dofs,
-            self.max_constraints,
-            weighted=self.weighted,
-            torsion=self.torsion,
-        )
-
-    @property
     def name(self) -> str:
         NA, NB, OA, OB = self.inkernel_response
         walk_half = classes_half(self.classes) if self.classes else WALK_BOTH
         frame, pitch = self.frame, self.pitch
         return (
-            f"sweep_{'parallel' if self.keyed is None else 'keyed_parallel'}_{self.max_constraints}_"
+            f"sweep_{'seeded_parallel' if self.emit else 'parallel'}_{self.max_constraints}_"
             f"{self.mf_max_constraints}_{self.max_world_dofs}_rows{int(self.rows)}_sweeps{int(self.levels.budget)}"
             f"_nt{self.threads}_ink{NA}_{NB}_o{OA}_{OB}"
             + (f"_frame{int(frame[0])}_{int(frame[1])}" if any(frame) else "")
@@ -315,15 +343,15 @@ class TierSweep(SweepConfig):
         return worlds()
 
     def operands(self) -> tuple[RowArgument, ...]:
-        inputs = self.row_inputs
-        return (*(inputs.arguments if inputs is not None else ()), *self.law_operands())
+        seeds = (RowArgument("row_seeds", RowSeeds, after="cfm"),) if self.emit else ()
+        return (*seeds, *self.law_operands())
 
     def work(self, items: int = 0, shared: int = 0) -> Work:
         """A block a world, a thread a row. Not persistent: an uncapped line does not fix the tier's residency, and a
-        grid of one wave by the line is 1.2 waves at a keyed tier's 96 registers (allegro's 64-row tier 5% slower,
+        grid of one wave by the line is 1.2 waves at a seeded tier's 96 registers (allegro's 64-row tier 5% slower,
         PRO)."""
         NT = self.threads
         # A tier that walks its rows is bound at the line past a warp's rows: where registers bind (the GB300) the walk
         # would cost a third of its warps for the whole run (64 rows: 98 -> 80, a 16 B spill; 32 rows spill 104 B).
-        cap = self.keyed is not None and int(self.rows) > TIER_ROWS
+        cap = self.emit and int(self.rows) > TIER_ROWS
         return Work(int(items), lanes=NT, block=NT, registers=REGISTER_LINE, cap=cap, shared=int(shared))

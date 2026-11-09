@@ -1611,7 +1611,7 @@ at 0.1 m it weighs 30%, and the doubled ``mu_t`` misses by up to 2.2e-3 m/s."""
 UNREAD = 2.4e-5
 """The held offset [m/s] a reading cannot remove where a placement keeps its rows inside its sweep: about two float32
 steps of a contact point over 1/240 s (:class:`Manufactured`). Legged's regular seed of conditioning 0.043 carries it
-20x into a contact's speed, 2.6e-4 m/s on the keyed tier however converged."""
+20x into a contact's speed, 2.6e-4 m/s on the seeded tier however converged."""
 SCAN = 64
 """How many seeds a scene's choice reads: a problem is stated in milliseconds, without a solve."""
 SPARSE, SPARSER = 0.25, 0.15
@@ -1631,11 +1631,11 @@ def check_regular(case, prepared, seed, *, audit=True):
     case.assertLess(problem.drift, TestQ18Manufactured.DRIFT)
     case.assertLess(point, TestQ18Manufactured.TOLERANCE)
     if audit:
-        # The audit reads every world a store holds the rows of: all but the keyed rows' worlds, whose rows exist only
-        # inside the Jacobi tiers' sweep (:mod:`.audit`); those answer to the solution above alone.
+        # The audit reads every world a store holds the rows of: all but the seeded tiers' worlds, whose rows exist
+        # only inside the Jacobi tiers' sweep (:mod:`.audit`); those answer to the solution above alone.
         reading = solver.read_audit()
         read = ~np.isnan(reading["gap"])
-        if solver.placement.keyed_rows is None:
+        if solver.placement.row_seeds.tiers == 0:
             case.assertTrue(read.all())
         if read.any():
             case.assertLess(float(np.nanmax(reading["gap"])), 1.0e-6)
@@ -1718,7 +1718,7 @@ class TestQ18Manufactured(unittest.TestCase):
         admit a second solution: sliding friction on an open split, or another status. It is judged on what any solution
         must hold, never on ``lambda``: the step's ``v+`` with its stored impulses solves the stated rows, and those
         impulses through the stated rows are the total force that moved it (:meth:`Manufactured.residual`). It reads
-        the rows a store holds after the step: no Jacobi tier, whose keyed rows live inside its sweep (``tiers=0``)."""
+        the rows a store holds after the step: no Jacobi tier, whose seeded rows live inside its sweep (``tiers=0``)."""
         stored = conformance.CPU.but("cpu_stored", pins={"tiers": 0})
         for build, settle, spins in self.IRREGULAR_SCENES:
             scene = build()
@@ -1751,7 +1751,7 @@ class TestQ18Placements(unittest.TestCase):
         (scenes.hand, 30, 2.0 / 3.0, ("HUB", "HUB_FOREST")),
     )
     """``(build, settle, loaded, routes)``, as :attr:`TestQ18Manufactured.SCENES`."""
-    TIERS = ("MF_PARALLEL", "KEYED_PARALLEL")
+    TIERS = ("MF_PARALLEL", "EMIT_PARALLEL")
     """The Jacobi tiers (K4), on legged."""
 
     def _route(self, name):

@@ -34,8 +34,8 @@ class Pins:
     """``"forest"`` or ``"per_size"``: the held families."""
     star: str | None = None
     """``"held"``: the compact diagonal family in a held tree group, never the one-coordinate class."""
-    producer: str | None = None
-    """``"walk"``: no keyed rows."""
+    sink: str | None = None
+    """``"store"``: the Jacobi tiers read the one writer's stored rows, never its EMIT sink."""
     claims: tuple[str, ...] = ("resolved_worlds",)
     """The runtime claims kept, of ``("resolved_worlds",)``."""
     active_rows: bool = True
@@ -125,8 +125,8 @@ class RouteRow:
     support: str
     """Axis 3: where a row's entries live (:attr:`.class_plan.ClassPlan.support`)."""
     producer: str
-    """Axis 3: the producer of the contact rows, decided once at construction: ``walk`` (the one writer), ``keyed_rows``
-    (the tiers' in-kernel rows) or ``none`` (a class without a responding coordinate admits no contact)."""
+    """Axis 3: the producer of the contact rows, decided once at construction: ``walk`` (the one writer) or ``none`` (a
+    class without a responding coordinate admits no contact)."""
     packed: bool
     """Axis 3: the matrix-free sweeps read the dense rows packed by support, so no size builds a response."""
     tier_rows: int

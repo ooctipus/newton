@@ -966,10 +966,10 @@ def built(config):
     return factory
 
 
-def keyed_classes(layout) -> tuple[WalkClass, ...]:
-    """The walking classes of a keyed layout's trees (:class:`.keyed_row_layout.KeyedLayout`), chains of its primary
-    and secondary sizes: what a keyed tier's walks read (:attr:`.sweep_routes_tiers.TierSweep.classes`)."""
-    return tuple(chain_class(n) for n in (layout.primary, layout.secondary) if n)
+def tier_classes(sizes) -> tuple[WalkClass, ...]:
+    """The walking classes of a tier's trees, chains of its primary and secondary ``sizes``: what a seeded tier's walks
+    read (:attr:`.sweep_routes_tiers.TierSweep.classes`)."""
+    return tuple(chain_class(n) for n in sizes if n)
 
 
 def chain_walk(device, lowers) -> WalkTrees:

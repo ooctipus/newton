@@ -124,7 +124,7 @@ A tangent row acts at its region's friction location, carries the anchor's tange
 corrects it with ``beta`` (``friction_anchor_beta``, the stick's gain, positive). Producers write the undivided friction coefficient; the patch
 link (``_FrictionPatchState.link``, which launches ``link_patch_routes``) divides it and links the
 ring. The Warp producers apply the law through :func:`.contact_input.contact_frame` and
-:func:`patch_tangent_row`; keyed rows write it in their native row source (``keyed_rows._row_source``).
+:func:`patch_tangent_row`.
 """
 
 

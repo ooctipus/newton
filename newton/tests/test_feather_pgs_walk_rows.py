@@ -17,7 +17,7 @@
 - **The sparse diagonal** (FL3.5, CUDA): its arm's rows of a slipping tree, released along the slips' paths (W9's
   ``R``), give the decided operator, and the keyboard's rows (arm and keys) and its arm's leave hold the same invariant
   on each of its routes.
-- **The Jacobi tiers' release** (FL3.7, CUDA): the tiers walk their keyed rows in the kernel, or read the writer's, and
+- **The Jacobi tiers' release** (FL3.7, CUDA): the tiers walk their rows' seeds in the kernel, or read the writer's, and
   leave by the release's transpose; on saturating drives their step is the decided operator's, as the general sweep's.
 """
 
@@ -31,6 +31,7 @@ import newton
 from newton._src.solvers.feather_pgs.factor.walk import TreeWalk, local_frames
 from newton._src.solvers.feather_pgs.row_laws import ROW_SPEED
 from newton.solvers import SolverFeatherPGS
+from newton.tests import feather_pgs_scenes as scenes
 from newton.tests.feather_pgs_law_harness import packed_coordinates, walk_class_of
 from newton.tests.test_feather_pgs_factor import BOUND, ROUNDING, Capture, catalogue, random_tree, run_route
 from newton.tests.test_feather_pgs_response_diagonal import _build_mixed_response_model
@@ -382,7 +383,7 @@ def _hinges_step(pins: dict, iterations: int = 30, **options) -> tuple:
 @unittest.skipUnless(wp.is_cuda_available(), "the Jacobi tiers run on CUDA")
 class TestTierSlipFrame(unittest.TestCase):
     """The Jacobi tiers on the walk (FL3.7): their rows and leave carry the release ``R`` of the decided operator (the
-    keyed rows walked in the kernel and the one writer's rows take ``R``, the leave ``R^T``), so their step is the
+    seeded rows walked in the kernel and the one writer's rows take ``R``, the leave ``R^T``), so their step is the
     decided operator's."""
 
     def test_tiers_take_the_decided_operator(self):
@@ -391,29 +392,25 @@ class TestTierSlipFrame(unittest.TestCase):
         self.assertFalse(general.sweep.tiers)
         self.assertEqual(int(general.factor.walk_view().release.count.numpy()[0]), 3)
         scale = float(np.linalg.norm(reference))
-        for producer in (None, "walk"):
-            # The conformance routes' pins: the tiers on any class whose rows they hold (keyed_parallel, without the
-            # resolved-world claim; mf_parallel).
-            pins = {"tiers": 32, **({"producer": producer} if producer else {"claims": ()})}
-            with self.subTest(producer=producer or "keyed"):
-                solver, qd = _hinges_step(pins)
+        for sink in (None, "store"):
+            # The tiers on any class whose rows they hold, walking the seeds of the writer's EMIT sink or its rows.
+            with self.subTest(sink=sink or "emit"):
+                solver, qd = _hinges_step({"tiers": 32, "sink": sink})
                 self.assertTrue(solver.sweep.tiers)
-                self.assertEqual(solver.placement.keyed_rows is not None, producer is None)
-                # The keyed rows and the writer's rows release their slips along their paths (R).
+                self.assertEqual(solver.placement.row_seeds.tiers != 0, sink is None)
+                # The seeded rows and the writer's rows release their slips along their paths (R).
                 self.assertEqual(int(solver.factor.walk_view().release.count.numpy()[0]), 3)
                 self.assertLess(np.linalg.norm(qd - reference) / scale, 1.0e-4, f"{qd} {reference}")
 
-    def test_keyed_general_worlds_take_the_decided_operator(self):
-        """A keyed class's world of more rows than its tier holds goes to the general sweep through the one writer:
-        its rows carry the release ``R`` as the tiers' do, so its step is the decided operator's (the all-K factor's
-        rows missed it while the predictor took the decided step)."""
+    def test_emitting_class_general_worlds_take_the_decided_operator(self):
+        """An emitting class's world of more rows than its tier holds goes to the general sweep through the one writer's
+        STORE sink: its rows carry the release ``R`` as the tiers' do, so its step is the decided operator's (the all-K
+        factor's rows missed it while the predictor took the decided step)."""
         general, reference = _hinges_step({"tiers": 0}, enable_joint_velocity_limits=True)
         scale = float(np.linalg.norm(reference))
         solver, qd = _hinges_step({"tiers": 4}, enable_joint_velocity_limits=True)
-        self.assertIsNotNone(solver.placement.keyed_rows)
-        self.assertGreater(
-            int(solver.placement.constraint_count.numpy()[0]), solver.placement.keyed_rows.layout.parallel_rows
-        )
+        self.assertNotEqual(solver.placement.row_seeds.tiers, 0)
+        self.assertGreater(int(solver.placement.constraint_count.numpy()[0]), solver.placement.row_seeds.bound)
         self.assertEqual(int(solver.factor.walk_view().release.count.numpy()[0]), 3)
         self.assertLess(np.linalg.norm(qd - reference) / scale, 1.0e-4, f"{qd} {reference}")
 
@@ -803,10 +800,12 @@ class TestHubPlacement(unittest.TestCase):
                         enable_joint_limits=True,
                         dense_max_constraints=96,
                         mf_max_constraints=32,
+                        # The frames read the stored rows: the tiers' worlds take the writer's STORE sink.
+                        pins=SolverFeatherPGS.Pins(sink="store"),
                     )
                 self.assertIsNotNone(solver.spec.classes.tiers)
                 self.assertTrue(solver.placement.walks)
-                self.assertIsNone(solver.placement.keyed_rows)
+                self.assertEqual(solver.placement.row_seeds.tiers, 0)
                 capture = Capture(solver)
                 pipeline = newton.CollisionPipeline(
                     model, broad_phase="nxn", reduce_contacts=False, deterministic=True, growable_contacts=True
@@ -836,6 +835,80 @@ class TestHubPlacement(unittest.TestCase):
                 self.assertLess(worst["rows"], BOUND, worst)
                 self.assertLess(worst["free_rows"], BOUND, worst)
                 self.assertLess(worst["leave"], BOUND, worst)
+
+
+def _sink_rollout(device, sink, *, kinematic_at=None, steps=12):
+    """The Jacobi tiers' class with joint limits on ``device`` under the one writer's ``sink`` pin: without
+    ``kinematic_at`` :func:`hub_arm_and_box` (a mimic's two covectors among its rows), else the legged scene, its
+    free-floating base made kinematic before step ``kinematic_at``. The solver and its joint coordinates and
+    velocities a step."""
+    if kinematic_at is None:
+        model, control = hub_arm_and_box(device, False)
+    else:
+        model = scenes.legged().build(device)
+        control = model.control()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        solver = SolverFeatherPGS(
+            model,
+            pgs_iterations=16,
+            enable_joint_limits=True,
+            dense_max_constraints=96,
+            mf_max_constraints=32,
+            pins=SolverFeatherPGS.Pins(tiers=None if kinematic_at is None else 32, sink=sink),
+        )
+    pipeline = newton.CollisionPipeline(
+        model, broad_phase="nxn", reduce_contacts=False, deterministic=True, growable_contacts=True
+    )
+    contacts = pipeline.contacts()
+    state, out = model.state(), model.state()
+    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+    boxes = np.flatnonzero(model.joint_type.numpy() == int(newton.JointType.FREE))
+    trace = []
+    for step in range(steps):
+        if step == kinematic_at:
+            flags = model.body_flags.numpy()
+            flags[model.joint_child.numpy()[boxes]] = int(newton.BodyFlags.KINEMATIC)
+            model.body_flags.assign(flags)
+            solver.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)
+        state.clear_forces()
+        pipeline.collide(state, contacts)
+        solver.step(state, out, control, contacts, 1.0 / 240.0)
+        trace.append((out.joint_q.numpy().astype(np.float64), out.joint_qd.numpy().astype(np.float64)))
+        state, out = out, state
+    return solver, trace
+
+
+class TestRowSink(unittest.TestCase):
+    """The one writer's sink, STORE or EMIT (:class:`.walk_rows.RowSeeds`): a tier's worlds keep their rows' seeds and the
+    tier walks them in its prologue, its rows' layout read from live data, as the writer walks them."""
+
+    def test_emit_steps_as_store(self):
+        """The tiers walking their rows' seeds step as the tiers on the stored rows, to the walk's rounding."""
+        for device in ("cpu", *(("cuda:0",) if wp.is_cuda_available() else ())):
+            with self.subTest(device=device):
+                emit, emitted = _sink_rollout(device, None)
+                store, stored = _sink_rollout(device, "store")
+                self.assertNotEqual(emit.placement.row_seeds.tiers, 0)
+                self.assertEqual(store.placement.row_seeds.tiers, 0)
+                self.assertGreater(int(emit.placement.constraint_count.numpy().sum()), 0, "no row reached the tiers")
+                for (q, qd), (q_ref, qd_ref) in zip(emitted, stored, strict=True):
+                    np.testing.assert_allclose(q, q_ref, rtol=0.0, atol=1.0e-5)
+                    np.testing.assert_allclose(qd, qd_ref, rtol=0.0, atol=1.0e-3 * max(np.abs(qd_ref).max(), 1.0))
+
+    def test_a_body_made_kinematic_steps_without_a_rebuild(self):
+        """A body made kinematic at run time (a legged robot's base) steps on, without a rebuild: the seeds and their
+        walk read live data, and no layout of the class's topology holds them (DECISIONS 11-06 17:02 kept keyed rows
+        to the classes with joint limits for this rebuild alone; the keyed owner refused the notification)."""
+        for device in ("cpu", *(("cuda:0",) if wp.is_cuda_available() else ())):
+            with self.subTest(device=device):
+                emit, emitted = _sink_rollout(device, None, kinematic_at=6)
+                _store, stored = _sink_rollout(device, "store", kinematic_at=6)
+                self.assertNotEqual(emit.placement.row_seeds.tiers, 0)
+                for (q, qd), (q_ref, qd_ref) in zip(emitted, stored, strict=True):
+                    self.assertTrue(np.all(np.isfinite(qd)))
+                    np.testing.assert_allclose(q, q_ref, rtol=0.0, atol=1.0e-5)
+                    np.testing.assert_allclose(qd, qd_ref, rtol=0.0, atol=1.0e-3 * max(np.abs(qd_ref).max(), 1.0))
 
 
 # ---------------------------------------------------------------------------------------------------------------------

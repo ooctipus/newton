@@ -545,19 +545,10 @@ class SolverFeatherPGS(SolverBase):
         if walking.size:
             self.factor.plan_walk(walking)
         self.placement.allocate_packed_rows()
-        # The producer of the tiers' rows (case K4), admitted by its own fit: keyed rows (keyed_rows.create_owner),
-        # which write the point and the patch row law.
-        self.placement.keyed_rows = None
-        if self.spec.pins.producer not in (None, "keyed_rows"):
-            self.placement.keyed_rows_reason = "A test pin selects another contact-row producer."
-        else:
-            from .keyed_rows import create_owner as create_kinetic_rows_owner  # noqa: PLC0415
-
-            self.placement.keyed_rows, self.placement.keyed_rows_reason = create_kinetic_rows_owner(self)
         # The general placement (case K6) whitens and leaves its rows by the walk (FL3.3): the factor holds the walk's
         # data for every responding tree, a free rigid body's six coordinates included, and the one writer, the free
-        # bodies' writer and the sweeps' leaves read it. The Jacobi tiers (case K4, FL3.7) read the one writer's rows, or walk their keyed rows in the kernel,
-        # and leave by the walk; the keyed rows' general worlds are the one writer's (keyed_rows.keyed_general_units).
+        # bodies' writer and the sweeps' leaves read it. The Jacobi tiers (case K4, FL3.7) read the one writer's rows,
+        # or walk the seeds its EMIT sink keeps in their prologue, and leave by the walk.
         # The support placement (case K1, FL3.4) whitens and leaves its rows by the walk too, into its support sink.
         general = support == "factor" or bool(
             support == "dense" and self.spec.classes.mf_sweeps and np.any(self.forest.response_dof_count > 0)
@@ -601,16 +592,13 @@ class SolverFeatherPGS(SolverBase):
 
         self.placement.place_dense_response()
         # The route: the row of the route table the class takes. The step plan and the route record read it. Its
-        # producer writes every contact row, decided once from the owners' admissions: keyed rows (the tiers' in-kernel
-        # sink, case K4), else the one writer where the class walks its rows, else none (no responding coordinate: no
-        # contact is admitted).
+        # producer writes every contact row: the one writer where the class walks its rows, else none (no responding
+        # coordinate: no contact is admitted).
         route = RouteRow(
             laws=self.laws.set,
             support=support,
             reasons=dict(self.spec.classes.reasons),
-            producer=(
-                "keyed_rows" if self.placement.keyed_rows is not None else "walk" if self.placement.walks else "none"
-            ),
+            producer="walk" if self.placement.walks else "none",
             packed=self.placement.packed_response,
             tier_rows=self.spec.classes.tier_rows,
             sizes={
@@ -653,9 +641,8 @@ class SolverFeatherPGS(SolverBase):
         of worlds without rows as skipped and the owners of the worlds no counter
         counts, and ``routes.sweep.exit_law`` the law every sweep stops under. The
         row builders (``contact_rows.builder_by_dof``) are those of the dense
-        contact rows built outside the sweep: the parallel tiers build keyed rows'
-        direct rows in the sweep (``direct_rows``) and the free-body matrix-free
-        rows follow ``free_rigid_bodies``.
+        contact rows built outside the sweep: the free-body matrix-free rows
+        follow ``free_rigid_bodies``.
         ``contact_consumers.max_blocks`` is the block cap of the launches over the
         contact capacity (0: uncapped). ``measurements`` holds, under
         ``Diagnostics.solve_readout``, the cumulative sweep counts
@@ -745,8 +732,6 @@ class SolverFeatherPGS(SolverBase):
         if flags & ModelFlags.CONSTRAINT_PROPERTIES:
             # The mimics' coefficients and enable bits, of both representations (forest_plan.MimicRelations).
             self.laws.refresh_mimics(self.model)
-        if self.placement.keyed_rows is not None:
-            self.placement.keyed_rows.validate_notification(flags)
         self.factor.notify_model_changed(flags, kinematic)
         if flags & (
             ModelFlags.BODY_PROPERTIES

@@ -18,11 +18,11 @@ Routes
     the sparse-diagonal sweep) also get an ownership
     test that reads the solve readout. Covered on CUDA: native sparse factors
     (with contact triplets), the matrix-free Gauss-Seidel sweep with its
-    parallel and keyed-parallel tiers
+    parallel tiers on stored and on seeded rows
     and the sparse-diagonal sweep (its slot rows); on CPU, the general row of the matrix-free sweep, one thread per
     world. Dynamics owners: the held groups (sparse, tree and forest), scalar
     branches and ordinary dynamics. Contact-row producers: the one writer (into the general, the support and the
-    sparse diagonal's sinks) and keyed rows. Friction: the one-wrench patch friction
+    sparse diagonal's sinks), its EMIT sink for the tiers. Friction: the one-wrench patch friction
     (``friction_anchor_beta`` 0.2).
 
 Scenes and features
@@ -1414,20 +1414,19 @@ MF_PARALLEL = Route(
     "cuda",
     # The Jacobi tiers that a test pin builds on any class whose response they form, over the group rows.
     options=_MF,
-    pins={"tiers": 32, "producer": "walk"},
+    pins={"tiers": 32, "sink": "store"},
     expect={"sweep.route": "matrix_free_gs", "sweep.tiers.family": "parallel"},
 )
-# The allegro recipe: the tiers take keyed rows on a model they fit (the legged scene) where no resolved-world claim
-# runs (allegro's velocity limits decline it; here a pin drops it).
-KEYED_PARALLEL = Route(
-    "keyed_parallel",
+# The allegro recipe: the tiers walk the seeds of the one writer's EMIT sink on a model they fit (the legged scene).
+EMIT_PARALLEL = Route(
+    "emit_parallel",
     "cuda",
     options=_MF,
-    pins={"tiers": 32, "claims": ()},
+    pins={"tiers": 32},
     expect={
         "sweep.route": "matrix_free_gs",
-        "sweep.tiers.family": "keyed_parallel",
-        "contact_rows.producer": "keyed_rows",
+        "sweep.tiers.family": "parallel",
+        "contact_rows.producer": "walk",
         "held_tree.owner": "mixed",
     },
 )
@@ -1569,7 +1568,7 @@ def cuda_groups() -> list:
     for law in _laws():
         # Patch friction keeps the packed full sweep of the legged scene's small worlds.
         legged = [SPARSE, MF_HELD]
-        legged += [MF_PARALLEL, KEYED_PARALLEL]
+        legged += [MF_PARALLEL, EMIT_PARALLEL]
         groups += [
             Group(_physics(scenes.box_drop(), law, 32), ref, (MF_HELD,)),
             Group(_physics(scenes.box_stack(), law, 32), ref, (MF_HELD,)),
@@ -1577,14 +1576,14 @@ def cuda_groups() -> list:
             Group(_physics(scenes.heightfield(), law, 32), ref, (MF_HELD,)),
             Group(_physics(scenes.legged(), law, 32), ref, tuple(legged)),
             # Native sparse factors' spin rows (and their quads where triplets fuse) and the Jacobi tiers' radial
-            # projection of the friction triple (fed by the general producer, and by the keyed rows' decode),
+            # projection of the friction triple (fed by the general producer, its rows stored or seeded),
             # against the general route's sequential sweep.
             Group(
                 _physics(scenes.legged(), law, 32, "torsion", contact_torsion=True),
                 ref,
                 tuple(
                     route.but(f"{route.name}_torsion", expect={"friction.torsion": True})
-                    for route in (SPARSE, MF_PARALLEL, KEYED_PARALLEL)
+                    for route in (SPARSE, MF_PARALLEL, EMIT_PARALLEL)
                 ),
             ),
             # A grasp drifts with the row order at a small budget: the scene sorts its contacts and runs 32 iterations.
@@ -1629,14 +1628,14 @@ def cuda_groups() -> list:
             ref,
             (MF_HELD.but("mf_held_warm_start", options=_WARM),),
         ),
-        # The Jacobi tiers start from the impulses the warm start carries, on the one writer's rows and on keyed rows.
+        # The Jacobi tiers start from the impulses the warm start carries, on the one writer's stored and seeded rows.
         Group(
             _physics(scenes.legged(contact_matching="latest"), "patch", 32),
             ref,
             (
                 SPARSE.but("sparse_warm_start", options=_WARM),
                 MF_PARALLEL.but("mf_parallel_warm_start", options=_WARM),
-                KEYED_PARALLEL.but("keyed_parallel_warm_start", options=_WARM),
+                EMIT_PARALLEL.but("emit_parallel_warm_start", options=_WARM),
             ),
         ),
         # The sparse diagonal starts from the impulses the warm start carries, its fused limits from zero (case K2).
@@ -1775,7 +1774,7 @@ def cuda_groups() -> list:
     # rigid contacts under the relative regularization, through the routes that serve their topologies (the
     # specialized placements' row laws against the reference's).
     for scene, iterations, routes in (
-        (scenes.legged(), 32, (SPARSE, MF_HELD, MF_PARALLEL, KEYED_PARALLEL)),
+        (scenes.legged(), 32, (SPARSE, MF_HELD, MF_PARALLEL, EMIT_PARALLEL)),
         (scenes.gripper(), 32, (MF_DEFAULT, MF_FOREST)),
         (scenes.keyboard(), 16, (SPARSE_DIAGONAL, SPARSE_DIAGONAL_TREE)),
         (scenes.hand(), 16, (HUB, HUB_FOREST)),
@@ -2041,7 +2040,7 @@ OWNERSHIP = (
     (scenes.legged, "patch", 32, MF_HELD, ("mf_gs",), ()),
     (scenes.legged, "patch", 32, SPARSE, ("sparse_pgs",), ("mf_gs",)),
     (scenes.legged, "patch", 32, MF_PARALLEL, (), ("mf_gs",)),
-    (scenes.legged, "patch", 32, KEYED_PARALLEL, (), ("mf_gs",)),
+    (scenes.legged, "patch", 32, EMIT_PARALLEL, (), ("mf_gs",)),
     # The hub's tiers own its worlds; the matrix-free sweep solves none.
     (scenes.hand, "patch", 16, HUB, (), ("mf_gs",)),
     (scenes.keyboard, "patch", 16, SPARSE_DIAGONAL, ("sparse_diagonal",), ("mf_gs",)),

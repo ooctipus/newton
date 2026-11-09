@@ -1202,7 +1202,7 @@ class TestDepenetrationCapOnRoutes(unittest.TestCase):
             (scenes.box_drop(), conformance.MF_HELD, 32),
             (scenes.legged(), conformance.MF_HELD, 32),
             (scenes.legged(), conformance.SPARSE, 32),
-            (scenes.legged(), conformance.KEYED_PARALLEL, 32),
+            (scenes.legged(), conformance.EMIT_PARALLEL, 32),
             (scenes.gripper(), conformance.MF_DEFAULT, 32),
             (scenes.keyboard(), conformance.SPARSE_DIAGONAL, 64),
             (scenes.hand(), conformance.HUB, 16),

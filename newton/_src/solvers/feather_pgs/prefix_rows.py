@@ -7,9 +7,8 @@ A world's dense rows open with its prefix: the position rows (mimic equalities a
 velocity limits (``dense_phase_bounds`` holds both ends). :func:`prefix_rows` is the candidate loop of every native
 prefix producer: a lane group walks an articulation's candidates in order, takes each one's law from
 :data:`.row_laws.ROW_LAW`, places the active rows in candidate order and writes their records. The producers differ
-in their families, in who owns the world's row counter and in the sink their consumer reads: the general route's
-joint limits and joint velocity limits (the per-size Jacobian, or the one writer's unit sources) reserve on the
-shared counter; keyed rows (limit and velocity-limit rows into row keys) own their worlds' counters.
+in their families and in the sink their consumer reads (the per-size Jacobian, or the one writer's unit sources); every
+row reserves on the world's shared counter.
 """
 
 import warp as wp
@@ -166,25 +165,17 @@ $LOCALS$EVALUATE        $SLOT
             LAW::row_beta.data[at] = beta;
             LAW::phi.data[at] = phi;
             LAW::target.data[at] = target;
-$SIDES$RHS$SINK
+$SIDES$SINK
         }
 $AFTER    }
 """
 """One phase's candidate loop (``LAW::`` stands for the accessor of :data:`LAW`'s fields)."""
-
-_RHS = """            LAW::restitution.data[at] = 0.0f;
-            // The position pass's row law (bias scale 1): a limit's Baumgarte or speculative term, a mimic's
-            // Baumgarte term, a velocity limit's target.
-            LAW::rhs.data[at] = RowLaw::row_rhs(type, phi, beta, target, 1.0f / LAW::dt, 1.0f, 0.0f, 1.0f, 1.0f).v0;
-"""
 
 
 def prefix_rows(
     phases,
     *,
     law: str,
-    ordered: bool,
-    rhs: bool,
     sink: str = "",
     after: str = "",
     locals_: str = "",
@@ -198,9 +189,6 @@ def prefix_rows(
             sets ``active``, ``type`` (3, a limit, by default), ``phi``, ``target``, ``beta``, the coordinates and
             coefficients ``d0, w0`` and ``d1, w1``, and a coordinate family's ``dof`` and ``side``.
         law: The accessor of :data:`LAW`'s fields (``"data."``, say), which ``world`` indexes.
-        ordered: The lane group owns the world's counter: rows take slots in candidate order from 0, and the group
-            writes the phase bounds and the count. Otherwise the rows reserve on the shared counter (``votes``).
-        rhs: Write each row's restitution and position-pass ``rhs`` too.
         sink: Native code that publishes an active row's coefficients at ``slot`` (record ``at``).
         after: Native code the whole lane group runs after each chunk of candidates (a cooperative sink).
         locals_: Native declarations of the families' and the sinks' own per-candidate variables.
@@ -208,15 +196,11 @@ def prefix_rows(
             for the packed placement (:mod:`.packed_rows`); empty: a sink that keeps its rows elsewhere.
     """
     slot = (
-        "const int slot = ORDERED(base, active != 0);"
-        if ordered
-        else "const unsigned votes = BALLOT(active != 0);\n"
+        "const unsigned votes = BALLOT(active != 0);\n"
         f"        const int slot = RESERVE(&{law}slot_counter.data[world], COUNT(votes)) + BELOW(votes);"
     )
-    source = f"    const int prefix_line = {law}first.data[world];\n    __builtin_assume(prefix_line >= 0);\n" + (
-        "    int base = 0;\n" if ordered else ""
-    )
-    for phase, families in enumerate(phases):
+    source = f"    const int prefix_line = {law}first.data[world];\n    __builtin_assume(prefix_line >= 0);\n"
+    for families in phases:
         start, evaluate = 0, ""
         for count, declaration, evaluation in families:
             if start == 0:
@@ -239,12 +223,7 @@ def prefix_rows(
                 EVALUATE=evaluate,
                 SLOT=slot,
                 SIDES=f"            LAW::sides.data[at] = wp::vec2i({side}, -1);\n" if side else "",
-                RHS=_RHS if rhs else "",
                 SINK=sink,
                 AFTER=after,
             ).replace("LAW::", law)
-        if ordered:
-            source += f"    if (LANE == 0) {law}bounds.data[world * 2 + {phase}] = base;\n"
-    if ordered:
-        source += f"    if (LANE == 0) {law}slot_counter.data[world] = base;\n"
     return source

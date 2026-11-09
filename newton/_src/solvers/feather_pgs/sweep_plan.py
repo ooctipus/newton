@@ -432,10 +432,8 @@ class Sweep:
         # The claims' worlds (sweep_levels.claim_worlds): a bucket a tier, then the general sweep's.
         self.claims = None
         self.claims_beside = None
-        # The one writer's list where it walks every world (walked_claims): empty.
-        self.every_world = Buckets()
-        self.every_world.items = self.every_world.count = wp.zeros(1, dtype=int, device=self.model.device)
-        self.every_world.region = self.every_world.first = self.every_world.last = 0
+        # The one writer's EMIT sink (walk_rows.RowSeeds): none until a tier walks its rows.
+        self.placement.row_seeds = walk_rows.row_seeds(self.placement, 0, 0, sweep_routes_tiers.TIER_ROWS)
         if self.classes.mf_sweeps:
             # A test pin streams the impulses, the free bodies' or every row's (storage is part of the kernel
             # specialization key); the selection sizes the resident row metadata with its choice.
@@ -540,8 +538,8 @@ class Sweep:
                 self.colored_sweep = dataclasses.replace(self.general_sweep, **_COLORED)
                 self.mf_colored_kernel = self.sweep("mf_colored", self.colored_sweep)
             if parallel_rows > 0:
-                # Under keyed rows each tier walks its rows from their keys in its prologue (the producer's sink).
-                keyed = self.placement.keyed_rows.layout if self.placement.keyed_rows is not None else None
+                # The producer's sink: a tier that takes EMIT walks its rows from their seeds in its prologue.
+                emit = self._emits()
                 width = sweep_routes_tiers.TIER_ROWS
                 tiers = [(min(first + width, parallel_rows), first) for first in range(0, parallel_rows, width)]
                 self.par_tiers = list(tiers)
@@ -555,7 +553,7 @@ class Sweep:
                         rows=rows_,
                         levels=LevelLaw.split(sweeps_),
                         inkernel_response=self.classes.tiers.sizes,
-                        keyed=keyed,
+                        emit=emit,
                         linked_rows=True,
                         velocity_limit_pass=self._parallel_velocity_limit_pass(),
                         frame=self._tier_frame(),
@@ -569,6 +567,10 @@ class Sweep:
                     layout = shape(config.work(self.forest.world_count), device(model.device))
                     named = functools.partial(self._tier_operands, config, tier_index, layout.grid)
                     self.tiers.append(SweepLaunch(config, kernel, layout.grid, layout.block, named))
+                if emit:
+                    self.placement.row_seeds = walk_rows.row_seeds(
+                        self.placement, (1 << len(tiers)) - 1, parallel_rows, width
+                    )
             # Each sweep walks its bucket of the claims' worlds (claim_worlds), a bucket of every world's slots: a tier's,
             # the general sweep's, and with the colored mapping its candidates' (which the unit builder walks) and the
             # colored worlds' (which it appends).
@@ -578,9 +580,8 @@ class Sweep:
             self.claim_colored = self.claim_general + 2 if colored else -1
             buckets = self.claim_general + (3 if colored else 1)
             self.claims = Queue(buckets * worlds, model.device, buckets=buckets)
-            # The claim stage runs beside the step's stream until its first reader (claim_worlds), except under keyed
-            # rows, whose hand-off reads it right away.
-            self.claims_beside = Beside(model.device) if self.placement.keyed_rows is None else None
+            # The claim stage runs beside the step's stream until its first reader (claim_worlds).
+            self.claims_beside = Beside(model.device)
             if colored:
                 self.colored_units = sweep_units.ColoredUnits(
                     self.forest.world_count,
@@ -634,7 +635,7 @@ class Sweep:
         walks its bucket of them too. A stream a tier.
 
         The other side streams (inertia, dynamics, memset) read no contact rows nor the contact pool's ready count:
-        they run factorizations and articulation data. The claims do (the keyed tiers), between the fork and the join
+        they run factorizations and articulation data. The claims do (the tiers), between the fork and the join
         only, and the launch stream, which the pool registers, waits for the join before it goes on. A trim that waits
         for the launch stream therefore waits for them too (:meth:`ContactPool.add_reader_stream`).
         """
@@ -650,7 +651,7 @@ class Sweep:
         rows, inside the tiers' row bound), the colored candidates' (a world with a colored storage slot) or the
         general sweep's. The one writer, the unit builder and every sweep read their buckets.
 
-        Without keyed rows its first reader is the unit builder or the sweep: it runs beside the stage's stream until
+        Its first reader is the unit builder or the sweep: it runs beside the stage's stream until
         :meth:`join_claims`."""
         if self.claims_beside is not None:
             self.claims_beside.start(self._claim_worlds)
@@ -689,13 +690,10 @@ class Sweep:
         general = self.claim_general
         return self.claims.span(general, general + (1 if self.colored_units is None else 2))
 
-    def walked_claims(self) -> tuple[Buckets, int]:
-        """The one writer's worlds (:func:`.walk_rows.walked_rows_kernel`): a list of the claims' buckets, and whether it
-        walks it or every world. Under keyed rows the tiers walk their worlds' seeds in their kernels, so the writer
-        walks the other claims' worlds (:meth:`general_claims`)."""
-        if self.placement.keyed_rows is None:
-            return self.every_world, 0
-        return self.general_claims(), 1
+    def _emits(self) -> bool:
+        """Whether the tiers' rows take the one writer's EMIT sink (:class:`.walk_rows.RowSeeds`): where the writer
+        closes no bilateral block, whose closure reads every row's stored ``Z``, and no test pins the store."""
+        return not (self.factor.eliminates and self.factor.block_capacity) and self.pins.sink != "store"
 
     def store_records(self) -> None:
         """The streamed rows' records of the worlds :meth:`general_claims` lists, once their writers and the patch link
@@ -836,12 +834,11 @@ class Sweep:
         return {"general_world_count": count, "general_worlds": worlds, "general_world_grid_stride": grid}
 
     def _tier_operands(self, config, bucket: int, grid: int) -> dict:
-        """A Jacobi tier's operands: its bucket, the in-kernel response's trees and, under keyed rows, their operands."""
+        """A Jacobi tier's operands: its bucket, the in-kernel response's trees and, under EMIT, the rows' seeds."""
         named = dict(self._walk(), **self._queued(bucket, grid))
         named.update(self.placement.inkernel_response_inputs())
-        if config.keyed is not None:
-            keyed = self.placement.keyed_rows.parallel_arguments()
-            named.update(zip(("kinetic_rows", "patch_law"), keyed, strict=False))
+        if config.emit:
+            named["row_seeds"] = self.placement.row_seeds
         return named
 
     def _mapped_operands(self, bucket: int, grid: int) -> dict:
@@ -1247,7 +1244,7 @@ class Sweep:
         if not tiers:
             return None
         return {
-            "family": "keyed_parallel" if row.producer == "keyed_rows" else "parallel",
+            "family": "parallel",
             # Why the class takes the tiers (case K4: the in-kernel response's shape).
             "inkernel_response_reason": row.reasons["tiers"],
             # Every built tier projects each friction pair on its patch ring's pooled normal load (patch friction).
@@ -1263,6 +1260,8 @@ class Sweep:
                     "rows": int(rows),
                     "min_rows": int(min_rows),
                     "sweeps": tier.config.levels.budget,
+                    # The one writer's sink for the tier's worlds: its prologue walks their seeds, or reads stored Z.
+                    "sink": "emit" if tier.config.emit else "store",
                     "kernel": kernel_key(tier.kernel),
                 }
                 for (rows, min_rows), tier in zip(self.par_tiers, tiers, strict=True)

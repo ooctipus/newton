@@ -76,6 +76,7 @@ from .row_records import (
     unit_source,
 )
 from .sparse_mass_matrix import _SparseRowSupport
+from .sweep_levels import tier_world
 from .tree_scan import WALK_BOTH, held_fits, record_half
 
 __all__ = [
@@ -84,6 +85,7 @@ __all__ = [
     "WRITE_ROWS",
     "WRITE_TOPOLOGY",
     "JointSeeds",
+    "RowSeeds",
     "RowSink",
     "RowUnit",
     "SlotRows",
@@ -93,6 +95,7 @@ __all__ = [
     "free_body_sink",
     "packed_sink",
     "packed_walker",
+    "row_seeds",
     "row_sink",
     "slot_rows_kernel",
     "slot_writer",
@@ -153,6 +156,40 @@ def joint_seeds(seeds: JointSeeds, kind: int, index: int):
         dof1 = seeds.mimic_dof1[index]
         value1 = -seeds.mimic_coef1[index]
     return dof0, value0, dof1, value1
+
+
+@wp.struct
+class RowSeeds:
+    """The one writer's EMIT sink: a world whose Jacobi tier walks its rows in its prologue (bit ``t`` of ``tiers``: the
+    tier of ``(width t, width (t + 1)]`` rows, :func:`.sweep_levels.tier_world` within ``bound``) keeps each row's
+    seed, world-major a lane a row: its articulations and bodies (``ids``; a covector's ``(art, -2, dof0, dof1)``), its
+    direction and torque flag (a covector's two values) and its point. The tier's prologue adds the incident's part of
+    the row law, a contact's bounce, from its records (``phi``, ``target``, ``restitution``) and the step's ``dt`` and
+    ``threshold``."""
+
+    tiers: int
+    bound: int
+    width: int
+    free_body_rows: wp.array[int]
+    speed_first: wp.array[int]
+    ids: wp.array2d[wp.vec4i]
+    direction: wp.array2d[wp.vec4]
+    point: wp.array2d[wp.vec4]
+    phi: wp.array2d[float]
+    target: wp.array2d[float]
+    restitution: wp.array2d[float]
+    dt: float
+    threshold: float
+
+
+@wp.func
+def emits(seeds: RowSeeds, world: int, rows: int) -> bool:
+    """Whether the world of ``rows`` rows takes the EMIT sink: its tier's reader walks them (:class:`RowSeeds`)."""
+    if seeds.tiers == 0 or rows <= 0:
+        return False
+    if not tier_world(rows, seeds.free_body_rows[world], seeds.speed_first, world, seeds.bound):
+        return False
+    return ((seeds.tiers >> ((rows - 1) // seeds.width)) & 1) != 0
 
 
 @wp.func
@@ -328,7 +365,13 @@ def unit_reader(links: bool, unit_rows: int = 1, contacts: bool = True) -> wp.Fu
 
 @cache
 def walked_rows_kernel(
-    blocks: int, mimic_blocks: bool, side: bool, tables: tuple, block: int = 0, classes: bool = False
+    blocks: int,
+    mimic_blocks: bool,
+    side: bool,
+    tables: tuple,
+    block: int = 0,
+    classes: bool = False,
+    emit: bool = False,
 ) -> wp.Kernel:
     """The one writer of the general placement, world-major: a world's group of ``lanes`` lanes (:func:`writer_lanes`)
     writes its rows in the block primitive's phases (FL3_design §1.4, W9), the group synchronized between them:
@@ -349,8 +392,8 @@ def walked_rows_kernel(
     ``part`` (:data:`WRITE_ROWS`, :data:`WRITE_TOPOLOGY`, :data:`WRITE_REST`): the rows a world's topology fixes (its
     links, mimics, limits and velocity limits, the slots below its family bound ``bounds[world, 1]``,
     :meth:`.rows.RowLaws.bound_phase`) are known before the contacts, so a launch can write them alone, beside the
-    contact pass, and a second the rest and the closure; one launch writes every row where the rows' order holds no
-    family bound (keyed rows).
+    contact pass, and a second the rest and the closure; one launch writes every row where a tier's reader walks its
+    rows (``emit``: the sink is known once the counts are).
 
     ``side``: whether the model's records can have a side (:attr:`.tree_factor.TreeFactor.walk_side`); ``tables``: the
     walking classes' path tables (:func:`.factor.walk.walk_prelude`), each tree's path read from constant memory by its
@@ -363,9 +406,8 @@ def walked_rows_kernel(
     ``classes``: each row stored by its support class (:func:`.packed_rows.row_classes`, :func:`packed_walker`), its
     classes' word beside it (which its record takes, :func:`.response_builds_rows.write_row_record`).
 
-    The worlds: every world, or with ``claimed`` the worlds of the claims' ``walked`` buckets
-    (:class:`~newton._src.core.execution.Buckets`, the claim stage's: :func:`.sweep_levels.claim_worlds`), a world a
-    lane group of the launch, where the keyed Jacobi tiers walk their own worlds' seeds in their kernels."""
+    ``emit``: a tier of the class takes the EMIT sink (:class:`RowSeeds`): a world's rows are walked here (STORE) or
+    keep their seeds where its Jacobi tier walks them in its prologue (:func:`emits`, the claims' predicate)."""
     has_blocks = blocks > 0
     capacity = max(blocks, 1)
     mimics = int(mimic_blocks)
@@ -381,8 +423,6 @@ def walked_rows_kernel(
         rows: DenseRows,
         support: RowSupport,
         counts: wp.array[int],
-        walked: Buckets,
-        claimed: int,
         lanes: int,
         data: ContactInput,
         law: PatchRowLaw,
@@ -394,13 +434,9 @@ def walked_rows_kernel(
         bias: RowBias,
         bounds: wp.array2d[int],
         part: int,
+        sink_seeds: RowSeeds,
     ):
         world, lane = wp.tid()
-        if claimed != 0:
-            # The claims' worlds: a lane group past them returns whole, before any barrier.
-            world = bucket_item(walked, world)
-            if world < 0:
-                return
         # The writer's rows are the line's dense rows: the packed rows past them are the free bodies'.
         dense_rows = support.units.shape[1]
         count = wp.min(counts[world], dense_rows)
@@ -434,9 +470,19 @@ def walked_rows_kernel(
                 for slot in range(start, start + rows_here):
                     row_bias(rows, bias, line, slot, sink.row_incident[line, slot])
             return
+        # The sink, by the reading tier (emits): STORE walks the row here, EMIT keeps its seed for the tier's prologue
+        # and its rhs without the incident's part, which the tier adds (the relative incident 0 fires no bounce).
+        seeded = False
+        if wp.static(emit):
+            seeded = part != WRITE_TOPOLOGY and emits(sink_seeds, world, count)
         for slot in range(first + lane, end, lanes):
             source = support.units[line, slot]
             unit = read_unit(rows, data, law, seeds, line, slot, source)
+            if wp.static(emit):
+                if unit.rows > 0 and seeded:
+                    store_seed(sink_seeds, line, slot, unit)
+                    row_bias(rows, bias, line, slot, rows.target[line, slot])
+                    continue
             if unit.rows > 0:
                 walk(sink, unit)
                 incident = sink.row_incident[line, slot]
@@ -464,6 +510,7 @@ def walked_rows_kernel(
     name += "_mimics" if mimic_blocks else ""
     name += f"_topology{block}" if block else ""
     name += "_classes" if classes else ""
+    name += "_emit" if emit else ""
     return python_kernel(kernel, name, launch_bounds=WRITERS["packed_blocks" if has_blocks else "packed"].bounds)
 
 
@@ -479,7 +526,8 @@ def writer_kernel(solver, part: int = WRITE_ROWS) -> wp.Kernel:
     mimics = bool(blocks and solver.options.enable_bilateral_preelimination)
     block = WRITER_BLOCK_ROWS if part == WRITE_TOPOLOGY else 0
     tables = walk_tables(factor.walk_classes)
-    return walked_rows_kernel(blocks, mimics, factor.walk_side, tables, block, solver.placement.classed)
+    emit = bool(solver.placement.row_seeds.tiers)
+    return walked_rows_kernel(blocks, mimics, factor.walk_side, tables, block, solver.placement.classed, emit)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -902,6 +950,20 @@ def contact_row_unit(
     if row == CONTACT_SPIN_ROW:
         unit.torque = 1
     return unit
+
+
+@wp.func
+def store_seed(seeds: RowSeeds, line: int, slot: int, unit: RowUnit):
+    """A row's seed into the EMIT sink (:class:`RowSeeds`): a covector's coordinates and values, or a unit row's bodies,
+    direction, torque flag and point."""
+    if unit.dof0 >= 0:
+        seeds.ids[line, slot] = wp.vec4i(unit.art_a, -2, unit.dof0, unit.dof1)
+        seeds.direction[line, slot] = wp.vec4(unit.value0, unit.value1, 0.0, 0.0)
+    else:
+        seeds.ids[line, slot] = wp.vec4i(unit.art_a, unit.body_a, unit.art_b, unit.body_b)
+        d = unit.frame[0]
+        seeds.direction[line, slot] = wp.vec4(d[0], d[1], d[2], float(unit.torque))
+        seeds.point[line, slot] = wp.vec4(unit.point[0], unit.point[1], unit.point[2], 0.0)
 
 
 def unit_walker(name: str, snippet: str) -> wp.Function:
@@ -1807,3 +1869,22 @@ def free_body_sink(solver) -> RowSink:
     layout.dense = 0
     sink.layout, sink.entries, sink.base = layout, placement.packed_Z, int(placement.body_base)
     return sink
+
+
+def row_seeds(placement, tiers: int, bound: int, width: int) -> RowSeeds:
+    """The one writer's EMIT sink (:class:`RowSeeds`) for the tiers of mask ``tiers`` within ``bound`` rows, ``width``
+    rows a tier; without tiers its seeds are one-entry placeholders. The step binds ``dt`` and ``threshold``."""
+    seeds = RowSeeds()
+    seeds.tiers, seeds.bound, seeds.width = int(tiers), int(bound), int(width)
+    device = placement.dense_first.device
+    if not tiers:
+        seeds.free_body_rows = seeds.speed_first = wp.zeros(1, dtype=int, device=device)
+        seeds.phi = seeds.target = seeds.restitution = wp.zeros((1, 1), dtype=float, device=device)
+    else:
+        seeds.free_body_rows, seeds.speed_first = placement.mf_constraint_count, placement.speed_first
+        seeds.phi, seeds.target, seeds.restitution = placement.phi, placement.target_velocity, placement.row_restitution
+    shape = placement.phi.shape if tiers else (1, 1)
+    seeds.ids = wp.empty(shape, dtype=wp.vec4i, device=device)
+    seeds.direction = wp.empty(shape, dtype=wp.vec4, device=device)
+    seeds.point = wp.empty(shape, dtype=wp.vec4, device=device)
+    return seeds

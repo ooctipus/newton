@@ -333,8 +333,8 @@ class Placement:
         # ``body_base``.
         worlds = np.arange(forest.world_count, dtype=np.int32)
         self.dense_first = wp.array(worlds, dtype=wp.int32, device=model.device)
-        # Launches over the contact capacity (the force export, the warm start's carry and gathers, the keyed-row key
-        # scatters) grid-stride over about one wave of blocks.
+        # Launches over the contact capacity (the force export, the warm start's carry and gathers) grid-stride over
+        # about one wave of blocks.
         self.contact_capacity_blocks = contact_capacity_blocks(model.device)
         # The spec's capacities (step_plan.Capacities): a link's rows come on top of the rows the option gives the
         # world's contacts.
@@ -795,14 +795,11 @@ class Placement:
         (``Contacts.rigid_contacts_pair_sorted``), whose determinism Newton promises when the
         solver is deterministic as well; the default pipeline keeps the allocator's atomic
         reservation, whose order on CUDA follows the warps. A captured step keeps the order of
-        its capture. Dense rows are placed unless the keyed rows place their own; matrix-free rows are placed with free
-        rigid bodies. ``units``: the one writer's unit sources, which follow the placed slots (empty where the writer
+        its capture. Dense rows are placed; matrix-free rows are placed with free rigid bodies. ``units``: the one writer's unit sources, which follow the placed slots (empty where the writer
         does not take the contact rows).
         """
-        order_dense = int(self.keyed_rows is None)
+        order_dense = 1
         order_mf = int(self.forest.has_free_rigid_bodies)
-        if not (order_dense or order_mf):
-            return
         device = self.model.device
         runs = (self.contact_run_first, self.contact_run_last, self.contact_run_rows)
         blocks = (self.contact_run_lead, self.contact_run_trail_start)
@@ -912,8 +909,8 @@ class Placement:
         packed rows' width and why they keep their sides (``routes.row_classes``)."""
         blocks = int(self.contact_capacity_blocks)
         reason = (
-            "Launches over the contact capacity (force export, warm-start snapshot and gathers, keyed-row key"
-            f" scatters) grid-stride over {CAPACITY_BLOCKS_PER_SM} blocks of 256 threads per SM, about one wave."
+            "Launches over the contact capacity (force export, warm-start snapshot and gathers)"
+            f" grid-stride over {CAPACITY_BLOCKS_PER_SM} blocks of 256 threads per SM, about one wave."
             if blocks
             else "Uncapped: a CPU launch, or a kernel compiled without the grid-stride loop, covers every slot."
         )

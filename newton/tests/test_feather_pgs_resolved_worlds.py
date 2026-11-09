@@ -378,7 +378,6 @@ class TestResolvedWorlds(unittest.TestCase):
         solver = SimpleNamespace(
             model=SimpleNamespace(device=wp.get_device("cpu")),
             spec=SimpleNamespace(pins=SolverFeatherPGS.Pins()),
-            placement=SimpleNamespace(keyed_rows=None),
             laws=SimpleNamespace(set=plain_laws(warm_start=True)),
         )
         classifier = rw.ResolvedWorlds(solver)
@@ -512,7 +511,6 @@ def _admissible_solver():
     """A stand-in solver whose policy the classifier admits, on any device."""
     return SimpleNamespace(
         factor=SimpleNamespace(block_count=0),
-        placement=SimpleNamespace(keyed_rows=None),
         model=SimpleNamespace(device=SimpleNamespace(is_cuda=False)),
         spec=SimpleNamespace(pins=SolverFeatherPGS.Pins(), classes=SimpleNamespace(support="dense")),
         forest=SimpleNamespace(
@@ -546,7 +544,7 @@ def _rollout(
     the worlds whose rows all separate (``separating``) and those it resolved (``resolved``).
     """
     # The classifier evaluates the serial matrix-free sweep's law: the pin keeps the Jacobi tiers (case K4, an arm
-    # beside a free body, whose keyed rows own the contact rows) off these worlds.
+    # beside a free body) off these worlds.
     pins = {"storage": "dense", "predicted_twists": bool(published), "tiers": 0}
     if not classifier:
         pins["claims"] = ()

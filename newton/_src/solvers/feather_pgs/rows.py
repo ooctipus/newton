@@ -214,8 +214,6 @@ def _prefix_warp_kernel(size: int, groups: int, family: str, mimics: int = 0) ->
         ((candidates,),),
         law="law.",
         sink=sink,
-        ordered=False,
-        rhs=False,
         locals_="int mimic = -1;" if family == "mimics" else "",
         side="art",
     )
@@ -663,8 +661,7 @@ class RowLaws:
     # order: :meth:`begin`, :meth:`write_mimics`, :meth:`write_links`, :meth:`prepare_fused_limits`,
     # :meth:`write_limits`, :meth:`bound_phase` (0), :meth:`write_velocity_limits`, :meth:`bound_phase` (1),
     # :meth:`write_contacts`, :meth:`bound_free_body_contacts`, :meth:`allocate_free_body_limits`,
-    # :meth:`write_free_bodies`, :meth:`finalize_dense`
-    # and the keyed rows' finish.
+    # :meth:`write_free_bodies`, :meth:`finalize_dense`.
     #
     # Dense row-family layout: slots are handed out in the order [mimic][joint-limit][joint-velocity-limit]
     # [contact/friction], so each family owns one contiguous dense row range:
@@ -675,11 +672,8 @@ class RowLaws:
     # keep a stable slot index across steps.
 
     def begin(self, solver, state_in: State, state_aug: State, dt: float) -> None:
-        """Clear the rows' allocation state, and start the keyed rows' step where the class holds them."""
-        placement = solver.placement
-        placement.begin()
-        if placement.keyed_rows is not None:
-            placement.keyed_rows.begin_rows(state_in, state_aug, dt)
+        """Clear the rows' allocation state."""
+        solver.placement.begin()
 
     def _prefix_law(self, solver, law, state_in: State, dt: float, **extra):
         """A joint row family's law (:mod:`.prefix_rows`), bound for this step."""
@@ -783,8 +777,7 @@ class RowLaws:
 
     def write_velocity_limits(self, solver, state_in: State, dt: float) -> None:
         """The joint velocity-limit rows (a per-DOF clamp on ``|qdot_i|``), one warp per articulation; the contact rows
-        follow them, and the sweeps visit them in a final pass whatever their slots (staged where no keyed rows hold
-        them)."""
+        follow them, and the sweeps visit them in a final pass whatever their slots."""
         law = self._prefix_law(solver, prefix_rows.PrefixVelocityLaw, state_in, dt, vhat=solver.v_hat)
         support = solver.placement.row_support()
         for size, warp_kernel in self.velocity_limit_warp_kernels.items():
@@ -794,8 +787,7 @@ class RowLaws:
         self, solver, state_in: State, state_aug: State, contacts: Contacts, dt: float, producer: str
     ) -> None:
         """The contact rows' slots, after the joint families: the dense rows' unit sources (the one writer's seeds) and
-        the free bodies' slots (their writer's, :meth:`write_free_bodies`); the keyed rows' contacts where the tiers
-        hold them.
+        the free bodies' slots (their writer's, :meth:`write_free_bodies`).
 
         Args:
             solver: The solver whose step this is: its model, options, plan and primitives.
@@ -832,7 +824,7 @@ class RowLaws:
 
             self._build_friction_patches(solver, state_in, contacts)
 
-            # The allocator and the keyed rows read the contacts, the bodies and the row law, and write the
+            # The allocator reads the contacts, the bodies and the row law, and writes the
             # contacts' allocation records, through one struct (contact_input.ContactInput), bound for this step.
             contact_input = bind_contact_input(solver, state_in, state_aug, contacts, dt, 1.0)
 
@@ -881,10 +873,6 @@ class RowLaws:
                 solver.placement.place_sorted_contact_rows(
                     contacts, contact_build_threads, mf_slot_counter, mf_first_rejected_slot, units
                 )
-
-            # The one writer's contact rows ("walk") take their records in the writer (walk_rows).
-            if producer == "keyed_rows":
-                solver.placement.keyed_rows.produce_contacts(contact_input)
 
     def bound_free_body_contacts(self, solver) -> None:
         """Record where the free bodies' contact rows end in their run: every contact and friction row precedes the
@@ -1058,8 +1046,6 @@ class RowLaws:
             bind_dense_rows(placement),
             placement.row_support(),
             placement.constraint_count,
-            # The keyed tiers walk their worlds' seeds: the writer walks the other claims' worlds.
-            *solver.sweep.walked_claims(),
             lanes,
             contact_input,
             patch_row_law(solver),
@@ -1071,6 +1057,7 @@ class RowLaws:
             self.bias(solver.options, dt),
             placement.dense_phase_bounds,
             int(part),
+            self.row_seeds(solver, dt),
         ]
         wp.launch(
             walk_rows.writer_kernel(solver, part),
@@ -1079,6 +1066,13 @@ class RowLaws:
             block_dim=walk_rows.WRITERS["packed"].block,
             device=model.device,
         )
+
+    def row_seeds(self, solver, dt: float) -> walk_rows.RowSeeds:
+        """The one writer's EMIT sink (:class:`.walk_rows.RowSeeds`) for a step of ``dt``, which the tiers that walk
+        their rows read too."""
+        seeds = solver.placement.row_seeds
+        seeds.dt, seeds.threshold = dt, self.effective_restitution_velocity_threshold
+        return seeds
 
     def write_support(self, solver, state_in, contact_input: ContactInput, dt: float) -> None:
         """Case K1's writer in two launches: the step's units listed, with the contact rows' records
@@ -1202,7 +1196,6 @@ class RowLaws:
                 # Every producer, every size: the builder method, its kernels in launch order and the law they write,
                 # for the dense contact rows built outside the sweep (_row_builder names the rows built elsewhere).
                 "builder_by_dof": {str(int(size)): self._row_builder(solver, producer, size) for size in sizes},
-                "keyed_rows": {"enabled": producer == "keyed_rows", "reason": solver.placement.keyed_rows_reason},
             },
             "velocity_limits": {
                 "joint": joint,
@@ -1229,8 +1222,8 @@ class RowLaws:
     @staticmethod
     def _row_builder(solver, method, size) -> dict:
         """Name the kernels that build one DOF size's dense contact rows outside the sweep, in launch order (a launch
-        shared by several sizes under each). Not named: the keyed rows' direct rows, which the tiers build in the sweep
-        (``direct_rows``), and the free bodies' rows (walk_rows.write_free_body_rows, routes.free_rigid_bodies)."""
+        shared by several sizes under each). Not named: the free bodies' rows (walk_rows.write_free_body_rows,
+        routes.free_rigid_bodies)."""
         marker = ()
         if size == solver.spec.classes.diagonal_size:
             # The sparse diagonal's marker encodes schedule links into the slots its writer just wrote.
@@ -1244,21 +1237,16 @@ class RowLaws:
             elif solver._plan.route.support == "diagonal":
                 writers = (walk_rows.slot_writer(solver),)
             else:
-                # The general placement's rows in two parts: the topology's, walked in blocks, and the rest.
-                writers = (walk_rows.writer_kernel(solver, walk_rows.WRITE_TOPOLOGY), walk_rows.writer_kernel(solver))
+                # The general placement's rows in two parts, the topology's walked in blocks and the rest, or in one
+                # where a tier's reader walks its rows (the sink is known once the counts are).
+                split = solver.placement.row_seeds.tiers == 0
+                topology = (walk_rows.writer_kernel(solver, walk_rows.WRITE_TOPOLOGY),) if split else ()
+                writers = (*topology, walk_rows.writer_kernel(solver))
             kernels = (*writers, *marker)
-        elif method == "keyed_rows":
-            from . import keyed_rows  # noqa: PLC0415 - the owner's module; loaded with the owner
-
-            # The parallel tiers (routes.sweep.tiers) build the direct rows in the sweep; the one writer walks the rows
-            # of every other world (keyed_general_units hands them over).
-            kernels = (keyed_rows.scatter_contact_keys, keyed_rows.keyed_general_units, walk_rows.writer_kernel(solver))
         else:
             raise ValueError(f"No contact-row builder kernels are known for the method {method!r}.")
         entry = {
             "method": method,
             "kernels": [kernel if isinstance(kernel, str) else kernel_key(kernel) for kernel in kernels],
         }
-        if method == "keyed_rows":
-            entry["direct_rows"] = "routes.sweep.tiers"
         return entry

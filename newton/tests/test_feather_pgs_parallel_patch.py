@@ -10,9 +10,7 @@ projected into the disk of radius ``mu * (sum of its ring's normal impulses)``
 with one isotropic step, so a sliding pair converges to the serial pair solve's
 maximal dissipation. The reference below repeats the kernel's sweep in float64
 so the CUDA kernels can be checked row by row; on CPU it also sweeps the rows a
-CPU solver builds, against that solver's serial solution. Keyed rows write the
-patch row law themselves; the CPU fallback checks it against the general
-producer and the patch link.
+CPU solver builds, against that solver's serial solution.
 """
 
 import functools
@@ -36,8 +34,6 @@ from newton._src.solvers.feather_pgs.factor.kernels import prescale_joint_veloci
 from newton._src.solvers.feather_pgs.factor.walk import WALK_LINK, WalkTrees, pack_walk_records, release_view
 from newton._src.solvers.feather_pgs.forest_plan import ClassShape
 from newton._src.solvers.feather_pgs.joint_table import JointTable
-from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout
-from newton._src.solvers.feather_pgs.placement import Placement
 from newton._src.solvers.feather_pgs.row_laws import (
     ROW_CONTACT,
     ROW_FRICTION,
@@ -45,17 +41,13 @@ from newton._src.solvers.feather_pgs.row_laws import (
     ROW_JOINT_VELOCITY_LIMIT,
     ROW_TORSION,
 )
-from newton._src.solvers.feather_pgs.row_records import DenseRows
-from newton._src.solvers.feather_pgs.rows import RowLaws, velocity_prescale_launch
+from newton._src.solvers.feather_pgs.rows import velocity_prescale_launch
 from newton._src.solvers.feather_pgs.sweep import LevelLaw, sweep_kernel
 from newton._src.solvers.feather_pgs.sweep_plan import Sweep, SweepLaunch
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_law_harness import (
-    bias_rows,
-    keyed_classes,
     leave_walk,
-    row_bias,
-    row_lines,
+    tier_classes,
     unpacked_rows,
 )
 from newton.tests.feather_pgs_mass_reference import MassReference
@@ -67,7 +59,6 @@ from newton.tests.feather_pgs_patch_parity import (
 )
 from newton.tests.feather_pgs_row_builders import (
     assert_row_builders_named,
-    install_cpu_keyed_rows,
     launched_kernels,
 )
 from newton.tests.test_feather_pgs_native_prelude import _native_snippets
@@ -707,15 +698,14 @@ class TestParallelPatchReference(unittest.TestCase):
 
     def test_every_tier_steps_pairs_isotropically(self):
         """Give every tier variant, point and linked, the isotropic pair step once; no per-row variant remains."""
-        layout = KeyedLayout(16, 6, 0, 16, 128, False, 0)
-        keyed = functools.partial(sweep_routes_tiers.TierSweep, keyed=layout)
+        seeded = functools.partial(sweep_routes_tiers.TierSweep, emit=True)
         for factory, shape, extra in (
             (
                 sweep_routes_tiers.TierSweep,
                 (_CAPACITY, 32, _DOFS, "120"),
                 {"inkernel_response": (_DOFS, 0, 0, 0)},
             ),
-            (keyed, (128, 32, 22, "120"), {"inkernel_response": (16, 6, 0, 16), "classes": keyed_classes(layout)}),
+            (seeded, (128, 32, 22, "120"), {"inkernel_response": (16, 6, 0, 16), "classes": tier_classes((16, 6))}),
         ):
             for linked in (False, True):
                 with self.subTest(shape=shape, linked=linked, **extra):
@@ -757,20 +747,12 @@ class TestParallelPatchReference(unittest.TestCase):
                 self.assertEqual(impulses[2], 0.0)
 
     def test_velocity_limit_pass_reaches_every_tier_variant(self):
-        """Stage the velocity-limit flag and append the last word to each tier variant only on request.
-
-        The keyed-row tiers read their rows from a layout that plans joint velocity
-        limits, as a solver with ``enable_joint_velocity_limits`` builds them.
-        """
+        """Stage the velocity-limit flag and append the last word to each tier variant only on request."""
         plain_tiers = (sweep_routes_tiers.TierSweep, (_CAPACITY, 32, _DOFS, "120"))
-        layout = KeyedLayout(16, 6, 0, 16, 128, True, (1 << 16) - 1)
-        keyed_tiers = (
-            functools.partial(sweep_routes_tiers.TierSweep, keyed=layout),
-            (128, 32, 22, "120"),
-        )
+        seeded_tiers = (functools.partial(sweep_routes_tiers.TierSweep, emit=True), (128, 32, 22, "120"))
         variants = {
             "group rows": (plain_tiers, {"inkernel_response": (6, 0, 0, 0)}),
-            "keyed rows": (keyed_tiers, {"inkernel_response": (16, 6, 0, 16), "classes": keyed_classes(layout)}),
+            "seeded rows": (seeded_tiers, {"inkernel_response": (16, 6, 0, 16), "classes": tier_classes((16, 6))}),
         }
         for name, ((factory, args), options) in variants.items():
             with self.subTest(variant=name):
@@ -843,248 +825,6 @@ class TestParallelPatchReference(unittest.TestCase):
             self.assertLessEqual(speeds[key], limit * (1.0 + 1.0e-5), (key, speeds))
 
 
-class _RowsBuilt(Exception):
-    """Stops a step once its contact rows are built and linked, before any sweep."""
-
-
-_ROW_ARRAYS = (
-    "constraint_count",
-    "row_type",
-    "row_parent",
-    "row_mu",
-    "row_beta",
-    "phi",
-    "target_velocity",
-    "row_restitution",
-    "rhs",
-    "contact_slot",
-    "contact_world",
-    "contact_slots_needed",
-    "contact_path",
-)
-
-
-def _linked_rows(solver, state, contacts, dt):
-    """Step until the contact rows are built and linked, and return host copies of the rows: the row pass's records,
-    with those the one writer writes after it where the placement walks, once the patches link them."""
-    rows = {}
-    finalize = Placement.latch_status
-    link_patches = RowLaws.link_patches
-
-    def capture(self, step_contacts):
-        finalize(self, step_contacts)
-        if self is solver.placement:
-            rows.update({name: getattr(self, name).numpy().copy() for name in _ROW_ARRAYS})
-            if not self.walks:
-                raise _RowsBuilt
-
-    def linked(self, step_solver, *args):
-        link_patches(self, step_solver, *args)
-        if step_solver is solver and step_solver.placement.walks:
-            rows.update({name: getattr(solver.placement, name).numpy().copy() for name in _ROW_ARRAYS})
-            raise _RowsBuilt
-
-    with patch.object(Placement, "latch_status", capture), patch.object(RowLaws, "link_patches", linked):
-        try:
-            solver.step(state, solver.model.state(), solver.model.control(), contacts, dt)
-        except _RowsBuilt:
-            pass
-    if not rows:
-        raise AssertionError("The step did not build contact rows")
-    return rows
-
-
-def _walked_jacobian(solver, joint_q, rows):
-    """The Jacobian rows of the general placement's walked rows (the one writer forms no ``J``), at their packed
-    entries: ``J^T = P^T L P z`` of each side by the float64 walk at the step's coordinates (FL3.3)."""
-    placement, forest = solver.placement, solver.forest
-    Z = placement.packed_Z.numpy().astype(np.float64)
-    J = np.zeros_like(Z)
-    sides = placement.row_sides.numpy()
-    sizes = forest.articulation_response_dof_count.numpy()
-    offsets = forest.articulation_world_dof_offset.numpy()
-    factors = {}
-    for world, count in enumerate(rows["constraint_count"]):
-        line = int(placement.dense_first.numpy()[world])
-        for row in range(int(count)):
-            first = 0
-            for art in sides[line, row]:
-                if art < 0:
-                    continue
-                n = int(sizes[art])
-                at = int(offsets[art]) if placement.packed_dense else first
-                first += n
-                if art not in factors:
-                    inverse, _ = solver.factor.walk(joint_q, int(art)).up(covector=np.eye(n))
-                    factors[art] = np.linalg.inv(inverse)
-                J[line, row, at : at + n] = factors[art] @ Z[line, row, at : at + n]
-    return J
-
-
-def _general_bias(solver, rows, dt):
-    """The general route's contact and friction bias for captured rows (without ``J v``)."""
-    device = solver.model.device
-    count = wp.array(rows["constraint_count"], dtype=wp.int32, device=device)
-    rhs = wp.zeros(rows["rhs"].shape, dtype=wp.float32, device=device)
-    records = field_group.upload(
-        DenseRows,
-        device,
-        phi=rows["phi"],
-        row_beta=rows["row_beta"],
-        row_type=rows["row_type"],
-        target=rows["target_velocity"],
-        restitution=wp.zeros_like(rhs),
-        rhs=rhs,
-        row_w=wp.zeros_like(rhs),
-        first=row_lines(device),
-    )
-    wp.launch(
-        bias_rows,
-        dim=(rhs.shape[0], rhs.shape[1]),
-        inputs=[
-            records,
-            wp.zeros_like(rhs),
-            count,
-            rhs.shape[1],
-            rhs.shape[1],
-            row_bias(dt, solver.options.contact_speculative_scale, 1.0, 0.0, 0, 0),
-        ],
-        device=device,
-    )
-    return rhs.numpy()
-
-
-def _contact_rows_by_id(rows, count):
-    """Map each live dense-routed contact to its rows: ``{contact: (world, first row, row count)}``."""
-    owner = {}
-    for c in range(count):
-        slot, needed = int(rows["contact_slot"][c]), int(rows["contact_slots_needed"][c])
-        if rows["contact_path"][c] == 0 and slot >= 0 and needed > 0:
-            owner[c] = (int(rows["contact_world"][c]), slot, needed)
-    return owner
-
-
-class TestKeyedPatchRows(unittest.TestCase):
-    def test_keyed_rows_write_the_patch_row_law(self):
-        """Write keyed patch rows as the general producer and the patch link write them.
-
-        Every world above the keyed row budget takes the fallback, which runs on
-        CPU and shares its row source with the parallel tiers' in-kernel reader:
-        tangent rows act at the patch friction location with the anchor's phi and
-        friction_anchor_beta, normals link their ring and anchors divide the
-        coefficient, and the bias matches the general route's. Both solvers build
-        the frame from the same anchor history, which a few general steps load.
-        Both also read a friction_anchor_beta assigned after construction, as the
-        general producer reads it every step.
-        """
-        for late_beta in (None, 0.35):
-            with self.subTest(late_beta=late_beta):
-                self._check_keyed_patch_rows(late_beta)
-
-    def _check_keyed_patch_rows(self, late_beta):
-        model = standing_model(device="cpu", worlds=2)
-        dt = 1.0 / 240.0
-        options = {
-            "friction_anchor_beta": 0.2,
-            "pgs_iterations": 4,
-            "dense_max_constraints": 64,
-            "joint_limit_activation_gap": 0.1,
-        }
-        # Both on the general placement, which the keyed rows' stand-ins take over (install_cpu_keyed_rows).
-        pins = SolverFeatherPGS.Pins(placement="general")
-        general = SolverFeatherPGS(model, pins=pins, **options)
-        keyed = SolverFeatherPGS(model, pins=pins, **options)
-        keyed.laws.friction_patches = general.laws.friction_patches
-        install_cpu_keyed_rows(keyed)
-        if late_beta is not None:
-            general.laws.friction_anchor_beta = keyed.laws.friction_anchor_beta = late_beta
-        state, out = model.state(), model.state()
-        velocity = state.joint_qd.numpy()
-        velocity[0], velocity[11] = 0.05, -0.04
-        state.joint_qd.assign(velocity)
-        newton.eval_fk(model, state.joint_q, state.joint_qd, state)
-        pipeline = newton.CollisionPipeline(model, rigid_contact_max=64, deterministic=True, growable_contacts=True)
-        contacts = pipeline.contacts()
-        for _ in range(6):
-            pipeline.collide(state, contacts)
-            general.step(state, out, model.control(), contacts, dt)
-            state, out = out, state
-        pipeline.collide(state, contacts)
-        joint_q = state.joint_q.numpy().astype(np.float64)
-        size = keyed.placement.keyed_rows.layout.primary
-        # The keyed rows first: a whole step's finish moves the shared history (each region's anchor is the centre of
-        # pressure its solve leaves), and both writers must build from the same history.
-        actual = _linked_rows(keyed, state, contacts, dt)
-        # The keyed class's general worlds are the one writer's walked rows too (keyed_rows.keyed_general_units).
-        actual["J"] = {size: _walked_jacobian(keyed, joint_q, actual)}
-        expected = _linked_rows(general, state, contacts, dt)
-        # The general placement's one writer walks its rows after the row pass (FL3.3): its J, from the step's
-        # walked rows, is the reference of the keyed rows' J.
-        general.step(state, out, model.control(), contacts, dt)
-        expected["J"] = {size: _walked_jacobian(general, joint_q, expected)}
-        live = int(contacts.rigid_contact_count.numpy()[0])
-        owner = _contact_rows_by_id(expected, live)
-        self.assertEqual(owner, _contact_rows_by_id(actual, live))
-        slot_contact = {(world, first): c for c, (world, first, _) in owner.items()}
-        bias = _general_bias(general, expected, dt)
-        linked = tangent_phi = 0
-        for c, (world, first, needed) in owner.items():
-            rows = slice(first, first + needed)
-            with self.subTest(contact=c):
-                for name in ("row_type", "row_beta", "row_restitution"):
-                    np.testing.assert_array_equal(actual[name][world, rows], expected[name][world, rows], name)
-                # Ring links by contact: the next normal of the patch, the owning normal of a tangent row.
-                for rows_of in (expected, actual):
-                    parents = [
-                        slot_contact.get((world, int(p)), -2) if p >= 0 else -1
-                        for p in rows_of["row_parent"][world, rows]
-                    ]
-                    rows_of.setdefault("linked", {})[c] = parents
-                self.assertEqual(actual["linked"][c], expected["linked"][c])
-                for name in ("row_mu", "phi", "target_velocity"):
-                    np.testing.assert_allclose(
-                        actual[name][world, rows], expected[name][world, rows], rtol=1.0e-6, atol=1.0e-9, err_msg=name
-                    )
-                np.testing.assert_allclose(
-                    actual["J"][size][world, rows], expected["J"][size][world, rows], rtol=1.0e-4, atol=1.0e-5
-                )
-                np.testing.assert_allclose(actual["rhs"][world, rows], bias[world, rows], rtol=1.0e-5, atol=1.0e-7)
-                linked += expected["linked"][c][0] not in (-1, c)
-                tangent_phi += needed >= 3 and bool(np.any(expected["phi"][world, first + 1 : first + 3] != 0.0))
-                if needed >= 3:
-                    # The anchors carry the coefficient in force at this step, on their spin rows too.
-                    beta = options["friction_anchor_beta"] if late_beta is None else late_beta
-                    np.testing.assert_array_equal(
-                        expected["row_beta"][world, first + 1 : first + needed], np.float32(beta)
-                    )
-        self.assertGreater(linked, 0, "A box foot must link several normals in one ring")
-        self.assertGreater(tangent_phi, 0, "Anchors must carry tangential phi")
-
-    def test_keyed_factory_reads_linked_parents(self):
-        """Read every row's parent and coefficient in the keyed patch tiers instead of building them."""
-        layout = KeyedLayout(16, 6, 0, 16, 128, False, 0)
-        options = {
-            "rows": 32,
-            "levels": LevelLaw.split(24),
-            "inkernel_response": (16, 6, 0, 16),
-            "classes": keyed_classes(layout),
-        }
-        linked = sweep_routes_tiers.TierSweep(128, 32, 22, "120", keyed=layout, linked_rows=True, **options)
-        kernel = sweep_kernel(linked)
-        self.assertTrue(kernel.key.startswith("sweep_keyed_parallel_"))
-        self.assertTrue(kernel.key.endswith("_linked"))
-        self.assertIn("patch_law", inspect.signature(kernel.func).parameters)
-        text = _source(linked)
-        self.assertIn("s_parent[i] = world_row_parent.data[off_dense + i];", text)
-        self.assertIn("s_mu[i] = world_row_mu.data[off_dense + i];", text)
-        for written in ("c.row_parent.data", "c.row_mu.data", "c.row_type.data", "built_parent", "built_mu"):
-            self.assertNotIn(written, text)
-        self.assertIn("patch_law.patches.point.data[contact]", text)
-        self.assertIn("patch_law.patches.phi.data[contact][r - 1]", text)
-        for golden in _tier_texts(32)[1:]:
-            self.assertEqual(text.count(golden), 1, golden)
-
-
 def _cpu_arm():
     """A one-joint arm: enough for construction-time admission on CPU."""
     builder = newton.ModelBuilder()
@@ -1103,10 +843,7 @@ class TestPatchParallelAdmission(unittest.TestCase):
                 solver = SolverFeatherPGS(model, friction_anchor_beta=beta)
                 selected = solver.get_path_selection()
                 friction = selected["routes"]["friction"]
-                keyed = selected["routes"]["contact_rows"]["keyed_rows"]
-                self.assertNotIn("keyed rows", friction["reason"])
                 self.assertNotIn("need point friction", friction["reason"])
-                self.assertNotIn("point contacts", keyed["reason"])
 
     def test_route_record_reads_the_built_tiers(self):
         """Record the tiers' ring-pooled projection and sweep budgets from the kernels built, not the law."""
@@ -1554,8 +1291,6 @@ class TestParallelPatchKernel(unittest.TestCase):
 _STATE_FIELDS = ("joint_q", "joint_qd", "body_q", "body_qd")
 # Dense storage (a test-only route pin).
 _DENSE = {"storage": "dense"}
-# Keyed rows: no resolved-world claim, which keyed rows would otherwise decline for (keyed_rows.create_owner).
-_KEYED = {**_DENSE, "claims": ()}
 # Float-order tolerances of an exact route change (assert_states_close of the sparse solver tests).
 _STATE_FLOOR = {"joint_q": 2.0e-4, "body_q": 2.0e-4, "joint_qd": 2.0e-3, "body_qd": 2.0e-3}
 
@@ -1753,43 +1488,32 @@ class TestPatchParallelRoutes(unittest.TestCase):
             sweeps = sweep_routes_tiers.tier_sweeps(32, 8)
             self.assertTrue(all(f"_sweeps{sweeps}_" in key for key in keys), keys)
             tiers = solver.get_path_selection()["routes"]["sweep"]["tiers"]
-            self.assertIn(tiers["family"], ("parallel", "keyed_parallel"))
+            self.assertEqual(tiers["family"], "parallel")
             self.assertEqual(tiers["linked_rows"], linked)
             self.assertEqual((tiers["sweeps"], tiers["sweeps_rule"]), (sweeps, "auto"))
 
-    def test_keyed_rows_record_names_the_launched_builders(self):
-        """Name in the route record the keyed-row builders one step launches.
-
-        Matrix-free parallel tiers that form the response in-kernel admit keyed rows on CUDA. The keyed parallel tiers build the direct rows in the sweep, which every entry
-        points to; the scatter and the fallback are the row builders a step launches outside it.
-        """
+    def test_emitting_tiers_record_names_the_launched_builders(self):
+        """Name in the route record the row builders one step launches where the tiers walk their rows' seeds: the one
+        writer alone, in one launch (its sink is known once the counts are), every tier's sink EMIT."""
         model = standing_model()
         with patch.dict(os.environ):
             for law, beta in (("patch", 0.2),):
                 with self.subTest(law=law):
-                    # No resolved-world claim (a pin), whose worlds the keyed prefix would make live: the tiers take keyed rows.
-                    solver = _matrix_free_solver(
-                        model, beta=beta, parallel_rows=32, pins=_KEYED, enable_joint_limits=True
-                    )
+                    solver = _matrix_free_solver(model, beta=beta, parallel_rows=32, enable_joint_limits=True)
                     routes = solver.get_path_selection()["routes"]
                     record = routes["contact_rows"]
-                    self.assertTrue(record["keyed_rows"]["enabled"], record["keyed_rows"]["reason"])
-                    self.assertEqual(routes["sweep"]["tiers"]["family"], "keyed_parallel")
-                    self.assertEqual(record["producer"], "keyed_rows")
-                    builder = {
-                        "method": "keyed_rows",
-                        "kernels": ["scatter_contact_keys", "keyed_general_units", "write_walked_rows"],
-                        "direct_rows": "routes.sweep.tiers",
-                    }
+                    self.assertEqual([tier["sink"] for tier in routes["sweep"]["tiers"]["tiers"]], ["emit"])
+                    self.assertEqual(record["producer"], "walk")
+                    builder = {"method": "walk", "kernels": ["write_walked_rows"]}
                     self.assertEqual(record["builder_by_dof"], dict.fromkeys(record["builder_by_dof"], builder))
                     with launched_kernels() as keys:
                         _rollout(model, solver, 1)
                     assert_row_builders_named(self, record, keys)
 
-    def test_keyed_linked_tiers_replay_alike_with_and_without_frame_reuse(self):
-        """Replay captured keyed linked-tier steps bit for bit whether a shared contact frame is kept or sorted again.
+    def test_emitting_linked_tiers_replay_alike_with_and_without_frame_reuse(self):
+        """Replay captured seeded linked-tier steps bit for bit whether a shared contact frame is kept or sorted again.
 
-        Patch friction runs keyed rows into the linked tiers by default, and a captured build that shares the
+        Patch friction runs seeded rows into the linked tiers by default, and a captured build that shares the
         previous captured build's contact frame keeps its sorted pairs (``FEATHER_PGS_PATCH_FRAME_REUSE``, default
         on). Neither the source A/B nor the tier probes ran the two together. A graph of one collision pass and two
         substeps sorts its first build and keeps the second; under ``=0`` it sorts both. Frame reuse keeps the
@@ -1807,10 +1531,9 @@ class TestPatchParallelRoutes(unittest.TestCase):
                 os.environ.pop("FEATHER_PGS_PATCH_FRAME_REUSE", None)
                 if reuse is not None:
                     os.environ["FEATHER_PGS_PATCH_FRAME_REUSE"] = reuse
-                solver = _matrix_free_solver(model, beta=0.2, parallel_rows=32, pins=_KEYED, enable_joint_limits=True)
-                self.assertIsNotNone(solver.placement.keyed_rows, solver.get_path_selection()["routes"]["contact_rows"])
+                solver = _matrix_free_solver(model, beta=0.2, parallel_rows=32, enable_joint_limits=True)
                 tiers = solver.get_path_selection()["routes"]["sweep"]["tiers"]
-                self.assertEqual((tiers["family"], tiers["linked_rows"]), ("keyed_parallel", True))
+                self.assertEqual((tiers["tiers"][0]["sink"], tiers["linked_rows"]), ("emit", True))
                 self.assertEqual(solver.laws.friction_patches.reuse_frames, reuse is None)
                 states, control = [model.state(), model.state()], model.control()
                 newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
