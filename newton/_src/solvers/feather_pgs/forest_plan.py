@@ -257,16 +257,12 @@ class ForestPlan:
     articulation_response_dof_count: wp.array
     is_free_rigid: wp.array | None
     free_rigid_body_indices: wp.array | None
-    free_rigid_body_world: wp.array | None
-    """Each free rigid body's world, in the order of ``free_rigid_body_indices`` (the warm start's publication)."""
 
     # Roots.
     free_root_joint_count: int
     free_root_joint_indices: wp.array | None
     """Every joint that roots a free tree (FREE or DISTANCE without a parent), standalone joints included."""
-    articulation_root_is_free: wp.array | None
     articulation_root_dof_start: wp.array | None
-    has_root_free: bool
     has_prescribed_response: bool
 
     # Free bodies.
@@ -329,12 +325,9 @@ class ForestPlan:
     """Per topology-compatible size group, each coordinate's joint as an offset from the articulation's first."""
     diagonal_mass_sizes: frozenset
     """Size groups whose every tree has one coordinate (stars): their fill-free factor pattern is diagonal."""
-    direct_diagonal_inertia_sizes: frozenset
-    """Star size groups whose every coordinate's child body has it as its only response coordinate."""
 
     # Worlds.
     art_to_world: wp.array | None
-    world_art_start: wp.array | None
     world_response_group_art_start: dict
     world_response_group_to_art: dict
     max_world_dofs: int
@@ -349,7 +342,6 @@ class ForestPlan:
     body_has_response_dofs: wp.array | None
     body_response_dof_mask: wp.array | None
     body_single_response_dof: wp.array | None
-    body_single_response_dof_host: np.ndarray | None
 
     @classmethod
     def build(cls, cut: BodyCut, joint_forest: TreePlan, kinematic_dof_mask: np.ndarray) -> ForestPlan:
@@ -505,18 +497,12 @@ def _roots(plan, model, free_root):
         plan.free_root_joint_indices = None
 
     if not model.articulation_count or not model.joint_count:
-        plan.articulation_root_is_free = None
         plan.articulation_root_dof_start = None
-        plan.has_root_free = False
         return
 
     root_joint = model.articulation_start.numpy()[: model.articulation_count]
     root_dof_start = model.joint_qd_start.numpy()[root_joint].astype(np.int32, copy=False)
-    root_is_free = free_root[root_joint].astype(np.int32)
-
-    plan.articulation_root_is_free = wp.array(root_is_free, dtype=wp.int32, device=model.device)
     plan.articulation_root_dof_start = wp.array(root_dof_start, dtype=wp.int32, device=model.device)
-    plan.has_root_free = bool(np.any(root_is_free != 0))
 
 
 def _equal_ids(lengths: np.ndarray, rows) -> np.ndarray:
@@ -609,22 +595,15 @@ def _world_mapping(plan, model):
     plan.articulation_joint_end = None
     if not model.articulation_count:
         plan.art_to_world = None
-        plan.world_art_start = None
         return
 
-    articulation_world = plan.articulation_world
-    plan.art_to_world = wp.array(articulation_world, dtype=wp.int32, device=model.device)
+    plan.art_to_world = wp.array(plan.articulation_world, dtype=wp.int32, device=model.device)
     plan.articulation_joint_end = wp.array(plan.articulation_joint_end_host, dtype=wp.int32, device=model.device)
-
-    world_art_counts = np.bincount(articulation_world, minlength=plan.world_count).astype(np.int32)
-    world_art_start = host_index.offsets(world_art_counts, dtype=np.int32)
-    plan.world_art_start = wp.array(world_art_start, dtype=wp.int32, device=model.device)
 
 
 def _body_maps(plan, model):
     """Each body's tree joint, articulation and response support (:func:`.body_mapping.build_body_maps`)."""
     maps = dict.fromkeys(field.name for field in BODY_MAPS)
-    plan.body_single_response_dof_host = None
     if model.body_count and model.articulation_count:
         (
             body_to_joint,
@@ -651,7 +630,6 @@ def _body_maps(plan, model):
             body_response_dof_mask=body_response_dof_mask,
             body_single_response_dof=body_single_response_dof,
         )
-        plan.body_single_response_dof_host = body_single_response_dof
     for name, array in maps.items():
         setattr(plan, name, array)
 
@@ -666,7 +644,6 @@ def _free_bodies(plan, model):
         plan.has_non_free_articulations = False
         plan.is_free_rigid = None
         plan.free_rigid_body_indices = None
-        plan.free_rigid_body_world = None
         plan.free_rigid_body_count = 0
         return
 
@@ -689,9 +666,6 @@ def _free_bodies(plan, model):
     plan.free_rigid_per_world = np.bincount(free_world, minlength=plan.free_rigid_per_world.size)
     plan.is_free_rigid = wp.array(is_free_rigid, dtype=wp.int32, device=model.device)
     plan.free_rigid_body_indices = wp.array(plan.response_free_rigid_body_indices, dtype=wp.int32, device=model.device)
-    plan.free_rigid_body_world = wp.array(
-        articulation_world[solve_mask & free_mask], dtype=wp.int32, device=model.device
-    )
 
 
 def _coordinate_trees(plan, model):
@@ -813,9 +787,7 @@ def _mass_schedules(plan, model):
     """Per topology-homogeneous size group: the coordinate-to-joint map and the star test."""
     plan.crba_dof_joint_offset_by_size = {}
     diagonal_mass_sizes: set[int] = set()
-    direct_diagonal_inertia_sizes: set[int] = set()
     plan.diagonal_mass_sizes = frozenset()
-    plan.direct_diagonal_inertia_sizes = frozenset()
     if not model.articulation_count or not model.joint_count:
         return
 
@@ -824,11 +796,6 @@ def _mass_schedules(plan, model):
     response_dof_count = plan.response_dof_count
     joint_qd_start = model.joint_qd_start.numpy()
     joint_ancestor = model.joint_ancestor.numpy()
-    joint_child = model.joint_child.numpy()
-    body_single_response_dof = plan.body_single_response_dof_host
-    response_body_counts = np.bincount(
-        body_single_response_dof[body_single_response_dof >= 0], minlength=model.joint_dof_count
-    )
 
     for size in plan.size_groups:
         arts = np.flatnonzero(response_dof_count == size)
@@ -858,21 +825,11 @@ def _mass_schedules(plan, model):
             # A star: every tree of the group has one coordinate, so each entry of the mass matrix is a coordinate's own.
             if np.all(plan.tree_size[response_dof_count[plan.tree_articulation] == size] == 1):
                 diagonal_mass_sizes.add(int(size))
-                # Direct when each DOF's child body has that DOF as its single
-                # response DOF, and no other body does.
-                child = joint_child[joint_start[:, None] + reference_offsets]
-                global_dof = dof_start[:, None] + np.arange(size)
-                single_dof = np.where(child >= 0, body_single_response_dof[np.maximum(child, 0)], -1)
-                owned = single_dof == global_dof
-                owned &= response_body_counts[np.where(owned, global_dof, 0)] == 1
-                if np.all(owned):
-                    direct_diagonal_inertia_sizes.add(int(size))
             plan.crba_dof_joint_offset_by_size[int(size)] = wp.array(
                 reference_offsets, dtype=wp.int32, device=model.device
             )
 
     plan.diagonal_mass_sizes = frozenset(diagonal_mass_sizes)
-    plan.direct_diagonal_inertia_sizes = frozenset(direct_diagonal_inertia_sizes)
 
 
 def _world_size_groups(plan, model):
