@@ -915,6 +915,14 @@ def test_example_runner_measures_and_recaptures(test, device):
         test.assertEqual(overflowing.captures, [GROWN] if reallocates else [], "8 rows cannot hold 48 contacts")
         test.assertFalse(_service_contact_capacity(overflowing))
         test.assertFalse(_service_contact_capacity(overflowing, overflowing.state_0))
+        # A graph over reallocated rows never replays stale: the runner asks for the capture() it lacks.
+        uncapturable = example_with_graph()
+        del uncapturable.capture
+        if reallocates:
+            with test.assertRaisesRegex(AttributeError, "capture"):
+                _service_contact_capacity(uncapturable, uncapturable.state_0)
+        else:
+            test.assertFalse(_service_contact_capacity(uncapturable, uncapturable.state_0))
     test.assertEqual(overflowing.captures, [GROWN] if reallocates else [], "no growth, no recapture")
     with _small_pool_policy(64, 8):
         holding = example_with_graph()
