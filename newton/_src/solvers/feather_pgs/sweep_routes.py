@@ -24,7 +24,7 @@ from .packed_rows import CLASS_SIDES, PACKED_SIDES
 from .response_operator import Lanes, SparseFactor, Velocity
 from .row_inputs import RowArgument
 from .row_laws import ROW_CONTACT, ROW_FRICTION, ROW_JOINT_VELOCITY_LIMIT, ROW_SPEED
-from .row_metadata import record_layout, validate_record_coordinates
+from .row_metadata import record_layout, unpack_mf_header, validate_record_coordinates
 from .solve_policy import QUIET_LITERAL, block_argmax, sweep_exit
 from .sweep import (
     EXACT,
@@ -47,8 +47,6 @@ from .sweep import (
     end_sweep,
     formed_friction_laws,
     friction_metric,
-    friction_metric_law,
-    friction_metric_stage,
     friction_record_stage,
     impulse_seed,
     indent,
@@ -797,34 +795,30 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
             )
         )
 
-    # Where spin rows may appear, every dense friction contact's record (its Gram couplings and metric) is formed once
-    # per launch before the sweeps (sweep.friction_record_stage), and its visits only reduce velocity terms and
-    # project; the free bodies' triples in the warp mapping form their metric at their first loaded visit
-    # (sweep.friction_metric_stage; the colored units cache theirs in their slots, _colored_metrics). A contact holds
-    # three rows at least: a slot each.
-    dense_metric = free_metric = dense_record = None
+    # Where spin rows may appear, every friction contact's record (its Gram couplings and metric) is formed once per
+    # launch before the sweeps (sweep.friction_record_stage), the dense rows' and the free bodies' in the warp mapping
+    # (the colored units cache theirs in their slots, _colored_metrics), and its visits only reduce velocity terms and
+    # project. A contact holds three rows at least: a slot each.
+    metric = dense_record = free_record = None
     friction_laws = metric_stage = ""
     if contact_torsion:
-        dense_metric = "DENSE_TRIPLE"
+        metric = "FRICTION"
 
         def dense_record(row: str) -> str:
             return friction_metric(row, rows=3)
 
-        def free_record(row: str) -> str:
-            # The free bodies' rows follow the dense ones in the line.
-            return friction_metric(row, str(M_D), rows=3)
-
-        friction_laws = formed_friction_laws(dense_metric, "    ") + "\n"
+        friction_laws = formed_friction_laws(metric, "    ") + "\n"
         metric_stage = friction_record_stage(dense, dense_op, end="m_dense", record=dense_record, pad="    ") + "\n"
         if free_rows and not colored:
-            free_metric = "FREE_TRIPLE"
-            friction_laws += friction_metric_law(free_metric, free_record, "    ") + "\n"
-            stage = friction_metric_stage(
-                *free.scan(),
-                lambda row: free.spin_of(row, "mf_contact_end"),
-                end="mf_contact_end",
-                record=free_record,
-                pad="    ",
+
+            def free_record(row: str) -> str:
+                # The free bodies' rows follow the dense ones in the line.
+                return friction_metric(row, str(M_D), rows=3)
+
+            # A free row's coordinates are its sides', from its header.
+            sides = free.visit("normal") + "\n" + unpack_mf_header("rec_a", "")
+            stage = friction_record_stage(
+                free, free_op, end="mf_contact_end", record=free_record, declare=sides, pad="    "
             )
             metric_stage += stage + "\n"
 
@@ -859,7 +853,9 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         barrier = "SYNC();"
         free_phase = ""
         if free_rows:
-            free_phase = rows_block(free, free_op, laws, admission=_MF_ADMISSION, metric=free_metric, pad="    ")
+            free_phase = rows_block(
+                free, free_op, laws, admission=_MF_ADMISSION, metric=metric, formed=free_record, pad="    "
+            )
         offsets = trace_reduction = ""
 
     thread, threads = ("tid", "(int)blockDim.x") if colored else ("lane", "STRIDE")
@@ -925,7 +921,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         dense_op,
         laws,
         admission=admission,
-        metric=dense_metric,
+        metric=metric,
         formed=dense_record,
         selected=sweep.active_rows,
         unit=units,
