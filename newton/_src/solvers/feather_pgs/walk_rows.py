@@ -440,8 +440,13 @@ def walked_rows_kernel(
         bounds: wp.array2d[int],
         part: int,
         sink_seeds: RowSeeds,
+        acts: wp.array[int],
     ):
         world, lane = wp.tid()
+        # A world none of whose rows can act keeps them at zero impulse, unwritten (.placement.WORLD_ACTS); the topology
+        # part runs beside the contact pass, before the word is final.
+        if part != WRITE_TOPOLOGY and acts.shape[0] > 0 and acts[world] == 0:
+            return
         # The writer's rows are the line's dense rows: the packed rows past them are the free bodies'.
         dense_rows = support.units.shape[1]
         count = wp.min(counts[world], dense_rows)

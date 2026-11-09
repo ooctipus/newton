@@ -57,6 +57,18 @@ LINK_ROWS = wp.constant(6)
 CONTACT_END_GAP_SLOP = wp.constant(1.0e-6)
 """Gap within which a contact counts as reached: absorbs float32 residuals of rows that land exactly at contact."""
 
+SEPARATION_MARGIN = wp.constant(1.0e-5)
+SEPARATION_SCALE = wp.constant(2.0**-20)
+
+
+@wp.func
+def separates(residual: float, magnitude: float) -> bool:
+    """Whether a row keeps its zero impulse (P4): its residual at the predictor ``J v_hat + b`` stays above
+    ``SEPARATION_MARGIN`` [m/s] plus ``SEPARATION_SCALE`` of its terms' ``magnitude``, so the complete path's own
+    rounding of it is positive too (the joint limits' native form: :func:`.prefix_rows.limits`)."""
+    margin = SEPARATION_MARGIN + SEPARATION_SCALE * magnitude
+    return wp.isfinite(residual) and wp.isfinite(margin) and residual >= margin
+
 
 @ROW_LAW.law
 def contact_restitution_fires(phi: float, relative_incident: float, dt: float, threshold: float) -> bool:

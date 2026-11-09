@@ -32,6 +32,7 @@ from ...sim.enums import JointType
 from . import field_group, host_index, packed_rows
 from .factor.walk import walk_tables
 from .field_group import Field, FieldGroup, SolverArrays, fields_of
+from .forest_plan import RowLaw
 from .route_table import first_failed
 from .row_kernels import RIGID_SPEED_ROWS
 from .row_laws import LINK_ROWS
@@ -89,6 +90,11 @@ WORLD_ROW_STATE = FieldGroup(
 )
 """Per-world row-family boundaries: the dense rows' phases, the free bodies' contact rows' end and the line's speed
 rows' start."""
+
+WORLD_ACTS = FieldGroup(Field("world_acts", wp.int32, ("world",), owner="placement"))
+"""Whether a row of the world can act at the predictor (:func:`.row_laws.separates`): set by its allocators where every
+row is separable (:meth:`Placement.hold_acts`); the claims, the one writer and the patch finish leave a world without it
+at its exact solution, zero impulse (P4)."""
 
 CONTACT_RUNS = FieldGroup(
     Field("contact_run_first", wp.int32, ("world", "run_block"), fill=2**31 - 1, owner="placement"),
@@ -203,10 +209,11 @@ def _clear_dense_row_state(
     has_free_rigid: int,
     body_base: int,
     impulses: wp.array2d[float],
+    acts: wp.array[int],
 ):
-    """Clear each row class's allocation state and row-loss counters (by class and world), and the free bodies' rows
-    (their count, and impulses from ``body_base`` of each world's line), in one launch. The dense rows' count stands
-    until their producers' finalize: the last step's rows are cleared by it."""
+    """Clear each row class's allocation state and row-loss counters (by class and world), the world's acts word, and
+    the free bodies' rows (their count, and impulses from ``body_base`` of each world's line), in one launch. The dense
+    rows' count stands until their producers' finalize: the last step's rows are cleared by it."""
     world, column = wp.tid()
     line = first[world]
     if column == 0:
@@ -215,6 +222,8 @@ def _clear_dense_row_state(
             first_rejected[row_class, world] = ROW_SLOT_UNBOUNDED
             dropped[row_class, world] = 0
         count[1, world] = 0
+        if acts.shape[0] > 0:
+            acts[world] = 0
     if has_free_rigid != 0:
         impulses[line, body_base + column] = 0.0
 
@@ -749,6 +758,29 @@ class Placement:
         self.free_records, words = record_layout(self.record_first, self.body_base, self.row_pitch)
         self.arrays.allocate(ROW_RECORDS, world=self.forest.world_count, record=max(words, 1))
 
+    def hold_acts(self, solver) -> None:
+        """Hold each world's acts word (:data:`WORLD_ACTS`) where every row is separable (:attr:`.route_table.Laws.separable`,
+        no link) and the claims take the worlds. A contact's residual reads the body twists the predictor publishes
+        (``acts_twists``) where a contact can occur and it publishes every responding tree's; elsewhere a contact acts."""
+        laws, forest = solver.laws, self.forest
+        self.acts_reason = first_failed(
+            (
+                (
+                    laws.set.separable and not laws.link_count,
+                    "A row can act at a separating residual or starts loaded (a warm start, a weighted contact, a joint "
+                    "velocity limit, a mimic, a link or a pre-eliminated row).",
+                ),
+                (solver.sweep.claims is not None, "Only the claims' sweeps leave a world out."),
+                (solver.spec.pins.separated_worlds, "A test pin sweeps every world (separated_worlds=False)."),
+            )
+        )
+        self.arrays.allocate(WORLD_ACTS, world=forest.world_count if self.acts_reason is None else 0)
+        published = getattr(solver, "_predicted_twist_arts_host", None)
+        contacts = RowLaw.CONTACT & RowLaw(int(np.bitwise_or.reduce(forest.world_laws, initial=0)))
+        twists = self.acts_reason is None and bool(contacts) and published is not None
+        twists = twists and bool(np.all(published[forest.response_dof_count > 0] != 0))
+        self.acts_twists = solver._predicted_twist if twists else self.arrays.placeholder(wp.spatial_vector, (0,))
+
     def allocate_placeholders(self):
         """The operands of the features that are off."""
         if self.row_record is None:
@@ -782,6 +814,7 @@ class Placement:
                 1 if mf_active else 0,
                 self.body_base,
                 self.impulses if mf_active else self.dummy_mf_impulses,
+                self.world_acts,
             ],
             device=self.model.device,
         )

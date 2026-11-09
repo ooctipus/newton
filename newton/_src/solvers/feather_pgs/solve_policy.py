@@ -98,11 +98,15 @@ SolveTrace = field_group.struct("SolveTrace", (*READOUT_COUNTERS, *TRACE_COUNTER
 def count_skipped_solves(
     world_constraint_count: wp.array[int],
     mf_constraint_count: wp.array[int],
+    acts: wp.array[int],
     skipped: wp.array[wp.int32],
 ):
-    """Count one skipped solve of every world without dense or matrix-free rows."""
+    """Count one skipped solve of every world without dense or matrix-free rows, or none of whose rows can act
+    (``acts``, :data:`.placement.WORLD_ACTS`)."""
     world = wp.tid()
-    if world_constraint_count[world] == 0 and mf_constraint_count[world] == 0:
+    if (world_constraint_count[world] == 0 and mf_constraint_count[world] == 0) or (
+        acts.shape[0] > 0 and acts[world] == 0
+    ):
         skipped[world] = skipped[world] + 1
 
 
@@ -505,14 +509,15 @@ class SolveReadoutRecord:
             return
         self._skipped = wp.zeros(int(world_count), dtype=wp.int32, device=device)
 
-    def count_skipped(self, world_constraint_count: wp.array, mf_constraint_count: wp.array) -> None:
-        """Count one skipped solve of every world without dense or matrix-free rows.
+    def count_skipped(self, world_constraint_count: wp.array, mf_constraint_count: wp.array, acts: wp.array) -> None:
+        """Count one skipped solve of every world without dense or matrix-free rows, or none of whose rows can act.
 
         A launch of its own, made only under a registered readout; capturable.
 
         Args:
             world_constraint_count: Dense rows per world.
             mf_constraint_count: Matrix-free rows per world.
+            acts: Each world's acts word (:data:`.placement.WORLD_ACTS`; empty: every world acts).
         """
         skipped = self._skipped
         if skipped is None:
@@ -520,7 +525,7 @@ class SolveReadoutRecord:
         wp.launch(
             count_skipped_solves,
             dim=skipped.shape[0],
-            inputs=[world_constraint_count, mf_constraint_count],
+            inputs=[world_constraint_count, mf_constraint_count, acts],
             outputs=[skipped],
             device=skipped.device,
         )

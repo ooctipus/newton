@@ -220,9 +220,11 @@ class TestWorldLists(unittest.TestCase):
         # Where the line's speed rows start: a world with any (rows past it) is the general sweep's too.
         speed_first = rows - (rng.random(worlds) < 0.2).astype(np.int32) * rng.integers(0, 3, worlds).astype(np.int32)
         slot = np.where(rng.random(worlds) < 0.3, np.arange(worlds), -1).astype(np.int32)
+        # The worlds' acts words: a world none of whose rows can act takes no bucket (empty: every world acts).
+        words = (rng.random(worlds) < 0.8).astype(np.int32)
         tiers = -(-bound // width)
-        for device, candidates in itertools.product(_devices(), (False, True)):
-            with self.subTest(device=device, candidates=candidates):
+        for device, candidates, acts in itertools.product(_devices(), (False, True), (words[:0], words)):
+            with self.subTest(device=device, candidates=candidates, acts=acts.size):
                 buckets = tiers + 1 + int(candidates)
                 claims = Queue(buckets * worlds, device, buckets=buckets)
                 wp.launch(
@@ -238,12 +240,14 @@ class TestWorldLists(unittest.TestCase):
                         tiers,
                         tiers + 1 if candidates else -1,
                         claims.region,
+                        wp.array(acts, dtype=int, device=device),
                     ],
                     outputs=[claims.items, claims.count],
                     device=device,
                 )
-                tiered = (rows > 0) & (rows <= bound) & (free == 0) & (rows <= speed_first)
-                rest = ~tiered & ((rows > 0) | (free > 0))
+                acting = acts != 0 if acts.size else np.ones(worlds, dtype=bool)
+                tiered = (rows > 0) & (rows <= bound) & (free == 0) & (rows <= speed_first) & acting
+                rest = ~tiered & ((rows > 0) | (free > 0)) & acting
                 slotted = (slot >= 0) & candidates
                 for bucket in range(buckets):
                     count, items = (array.numpy() for array in claims.bucket(bucket))
@@ -278,6 +282,7 @@ class TestWorldLists(unittest.TestCase):
                         3,
                         -1,
                         lists.region,
+                        wp.zeros(0, dtype=int, device=device),
                     ],
                     outputs=[lists.items, lists.count],
                     device=device,

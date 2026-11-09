@@ -94,10 +94,12 @@ AuditRows = struct(
         Field("weighted", int, owner="step"),
         Field("material", int, owner="options", attr="contact_compliance"),
         Field("capacity", int, owner="placement", attr="dense_max_constraints"),
+        Field("acts", int, ("line",), owner="placement", attr="world_acts"),
     ),
     __name__,
 )
-"""What the law reads: the row store's records and impulses, the dense and free-body counts, and the laws in play."""
+"""What the law reads: the row store's records and impulses, the dense and free-body counts, the laws in play and each
+world's acts word (:data:`.placement.WORLD_ACTS`)."""
 
 
 @wp.func
@@ -525,10 +527,16 @@ def audit_world(
     """One thread per world: the row laws of both stores over the rows' velocity terms, into :data:`AUDIT_SLOTS`; the
     free bodies' rows from ``base`` of the world's line, a tier's walked rows by ``rhs`` and ``diag``."""
     world = wp.tid()
+    # A world none of whose rows can act holds them unwritten at their solution, zero impulse: it has none to read.
+    rows = a.counts[world]
+    free_rows = a.mf_counts[world]
+    if a.acts.shape[0] > 0 and a.acts[world] == 0:
+        rows = 0
+        free_rows = 0
     line = a.rows.first[world]
-    walked = emits(seeds, world, a.counts[world])
-    dense = audit_store(a, world, line, 0, wp.min(a.counts[world], a.capacity), velocity, walked, rhs, diag)
-    free = audit_store(a, world, line, base, a.mf_counts[world], mf_velocity, False, rhs, diag)
+    walked = emits(seeds, world, rows)
+    dense = audit_store(a, world, line, 0, wp.min(rows, a.capacity), velocity, walked, rhs, diag)
+    free = audit_store(a, world, line, base, free_rows, mf_velocity, False, rhs, diag)
     extra = fused[world]
     gap = dense[0] + free[0] + extra[0]
     violation = wp.max(wp.max(dense[1], free[1]), extra[1])

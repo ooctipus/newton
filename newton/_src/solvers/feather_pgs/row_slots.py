@@ -6,11 +6,13 @@ world's rows under sorted contacts, and the counts with their capacity status.""
 
 import warp as wp
 
+from ...sim import BodyFlags
 from .contact_filters import contact_normal_gap_limit
 from .contact_input import ContactInput
-from .contact_laws import contact_endpoints, contact_points, contact_responds
+from .contact_laws import contact_endpoints, contact_materials, contact_points, contact_responds, jacobian_entry
 from .device_preludes import dual_native, lane_group, lane_scan, lane_sum, lane_sync, reserve, reserved_count
 from .friction_patches import CONTACT_PATH_RESOLVED, FrictionPatches, patch_spin_rows
+from .row_laws import contact_capped_beta, contact_depenetration_cap, contact_restitution_rhs, contact_rhs, separates
 from .row_records import UNIT_CONTACT, unit_source
 
 # =============================================================================
@@ -18,6 +20,39 @@ from .row_records import UNIT_CONTACT, unit_source
 # =============================================================================
 # These kernels enable contacts between multiple articulations within the same
 # world. The constraint system becomes world-level instead of per-articulation.
+
+
+@wp.func
+def _endpoint_speed(
+    data: ContactInput,
+    twists: wp.array[wp.spatial_vector],
+    body_has_response_dofs: wp.array[int],
+    body_flags: wp.array[wp.int32],
+    body: int,
+    art: int,
+    free: bool,
+    normal: wp.vec3,
+    lever: wp.vec3,
+):
+    """A contact endpoint's speed along ``normal`` at the predictor, its point ``lever`` from its tree's origin, and
+    whether its twist is known: a prescribed tree's body velocity, a free body's coordinates where the contact takes the
+    free bodies' law (``free``), a responding body's published twist, a welded body's zero. A kinematic body of a tree
+    with coordinates moves at a velocity the publication does not hold."""
+    if body < 0 or art < 0:
+        return 0.0, True
+    twist = wp.spatial_vector()
+    known = True
+    if data.prescribed[art] != 0:
+        twist = data.body_v[body]
+    else:
+        if body_has_response_dofs[body] != 0:
+            known = (body_flags[body] & BodyFlags.KINEMATIC) == 0
+            twist = twists[body]
+        if free and data.response_dofs[art] > 0:
+            s = data.dof_start[art]
+            v = data.incident
+            twist = wp.spatial_vector(v[s], v[s + 1], v[s + 2], v[s + 3], v[s + 4], v[s + 5])
+    return jacobian_entry(twist, normal, lever, wp.vec3(0.0)), known
 
 
 @wp.func
@@ -32,22 +67,27 @@ def _admit_contact(
     contact_gap_gate: float,
     same_articulation_contact_gap_gate: float,
     articulation_pair_contact_gap_gate: float,
+    twists: wp.array[wp.spatial_vector],
 ):
-    """Return whether a contact gets rows, and its articulations, world and gap: ``(admitted, art_a, art_b, world, phi)``.
+    """Return whether a contact gets rows, whether its rows keep zero impulse at the predictor, and its articulations,
+    world and gap: ``(admitted, separates, art_a, art_b, world, phi)``.
 
     A contact needs an endpoint that responds to its impulses, one world (not
     two, nor none without an articulation) and a gap within the normal gap limit.
+    Its normal row separates where its residual at the predictor (the body ``twists`` it publishes; none: never) does
+    (:func:`.row_laws.separates`), and its friction and spin rows, bounded by a finite non-negative coefficient of
+    its ring's load, keep zero with it.
     """
     body_a, body_b, art_a, art_b, world = contact_endpoints(
         data.shape0[c], data.shape1[c], data.shape_body, body_to_articulation, art_to_world
     )
-    responds = contact_responds(art_a, body_a, data.response_dofs, body_has_response_dofs, body_flags)
-    if not responds:
-        responds = contact_responds(art_b, body_b, data.response_dofs, body_has_response_dofs, body_flags)
+    responds_a = contact_responds(art_a, body_a, data.response_dofs, body_has_response_dofs, body_flags)
+    responds_b = contact_responds(art_b, body_b, data.response_dofs, body_has_response_dofs, body_flags)
     phi = float(0.0)
-    admitted = responds and world >= 0
+    admitted = (responds_a or responds_b) and world >= 0
+    separating = False
     if admitted:
-        _normal, _translation_a, _offset_a, _translation_b, _offset_b, _separation, phi = contact_points(
+        normal, translation_a, offset_a, translation_b, offset_b, separation, phi = contact_points(
             data.normal[c],
             data.point0[c],
             data.point1[c],
@@ -68,7 +108,43 @@ def _admit_contact(
             same_articulation_contact_gap_gate,
         )
         admitted = not (phi > normal_gap_limit)
-    return admitted, art_a, art_b, world, phi
+        if admitted and twists.shape[0] > 0:
+            # The free bodies' law where neither side has coordinates of a tree that is not a free body.
+            free = (not (art_a >= 0 and data.response_dofs[art_a] > 0) or not a_non_free) and (
+                not (art_b >= 0 and data.response_dofs[art_b] > 0) or not b_non_free
+            )
+            lever_a = offset_a
+            lever_b = offset_b
+            if art_a >= 0:
+                lever_a += translation_a - data.origin[art_a]
+            if art_b >= 0:
+                lever_b += translation_b - data.origin[art_b]
+            lever_a -= 0.5 * separation
+            lever_b += 0.5 * separation
+            speed_a, known_a = _endpoint_speed(
+                data, twists, body_has_response_dofs, body_flags, body_a, art_a, free, normal, lever_a
+            )
+            speed_b, known_b = _endpoint_speed(
+                data, twists, body_has_response_dofs, body_flags, body_b, art_b, free, normal, lever_b
+            )
+            incident = speed_a - speed_b
+            cap = contact_depenetration_cap(
+                wp.where(responds_a, body_a, -1), wp.where(responds_b, body_b, -1), data.max_depenetration_velocity
+            )
+            beta = contact_capped_beta(phi, data.beta, cap, data.dt)
+            bias, _row_w = contact_rhs(phi, beta, 0.0, 1.0 / data.dt, 1.0, data.speculative_scale, 1.0)
+            mu, restitution = contact_materials(
+                data.shape0[c], data.shape1[c], data.material_mu, data.material_restitution
+            )
+            if restitution > 0.0:
+                fires, bounce = contact_restitution_rhs(
+                    phi, incident, 0.0, restitution, data.dt, data.restitution_threshold
+                )
+                if fires:
+                    bias = bounce
+            separating = known_a and known_b and wp.isfinite(mu) and mu >= 0.0
+            separating = separating and separates(incident + bias, wp.abs(speed_a) + wp.abs(speed_b) + wp.abs(bias))
+    return admitted, separating, art_a, art_b, world, phi
 
 
 @wp.kernel
@@ -91,7 +167,9 @@ def allocate_world_contact_slots(
     row_capacity_telemetry: int,
     friction_patches: FrictionPatches,
     resolved_worlds: wp.array[int],
+    twists: wp.array[wp.spatial_vector],
     # outputs
+    acts: wp.array[int],
     world_slot_counter: wp.array[int],
     mf_slot_counter: wp.array[int],
     dense_dropped_contact_rows: wp.array[int],
@@ -128,7 +206,8 @@ def allocate_world_contact_slots(
     In a world the resolved-world classifier skips, no contact gets rows. A
     contact the allocator would give rows there takes CONTACT_PATH_RESOLVED and no slot, so the patch finish
     releases its anchor, as the complete path releases an anchor whose rows solve zero load; every other contact
-    keeps path -1, and its anchor history.
+    keeps path -1, and its anchor history. Elsewhere an admitted contact whose rows may act at the predictor marks its
+    world's ``acts`` word (:data:`.placement.WORLD_ACTS`; empty: no word).
     """
     thread = wp.tid()
     # A collision pass clamps the count to the rows it wrote, all of them, and flags the overflow itself.
@@ -150,7 +229,7 @@ def allocate_world_contact_slots(
                 data.path[c] = -1
                 data.slots_needed[c] = 0
                 resolved = True
-        admitted, art_a, art_b, world, phi = _admit_contact(
+        admitted, separating, art_a, art_b, world, phi = _admit_contact(
             c,
             data,
             body_to_articulation,
@@ -161,6 +240,7 @@ def allocate_world_contact_slots(
             contact_gap_gate,
             same_articulation_contact_gap_gate,
             articulation_pair_contact_gap_gate,
+            twists,
         )
         if resolved:
             if admitted:
@@ -170,6 +250,8 @@ def allocate_world_contact_slots(
             data.slot[c] = -1
             data.path[c] = -1
             continue
+        if not separating and acts.shape[0] > 0:
+            acts[world] = 1
         a_has_dofs = art_a >= 0 and data.response_dofs[art_a] > 0
         b_has_dofs = art_b >= 0 and data.response_dofs[art_b] > 0
         # Classify: MF path if both sides are free rigid or ground.

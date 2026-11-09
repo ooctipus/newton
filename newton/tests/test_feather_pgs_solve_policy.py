@@ -639,7 +639,7 @@ class TestSolveReadoutRecord(unittest.TestCase):
         dense = wp.array([4, 0, 0, 0], dtype=wp.int32, device="cpu")
         free = wp.array([0, 0, 2, 0], dtype=wp.int32, device="cpu")
         for _ in range(2):
-            record.count_skipped(dense, free)
+            record.count_skipped(dense, free, wp.zeros(0, dtype=wp.int32, device="cpu"))
         # A second registration keeps the counters.
         record.register_skipped(world_count=4, device="cpu")
         summary = record.summary()
@@ -655,7 +655,7 @@ class TestSolveReadoutRecord(unittest.TestCase):
                 record = SolveReadoutRecord(policy)
                 if register:
                     record.register_skipped(world_count=2, device="cpu")
-                record.count_skipped(empty, empty)
+                record.count_skipped(empty, empty, wp.zeros(0, dtype=wp.int32, device="cpu"))
                 self.assertIsNone(record.summary()["skipped"])
 
     def test_trace_record_summarizes_stops_reasons_and_final_changes(self):

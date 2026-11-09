@@ -1676,7 +1676,8 @@ def patch_normal_load(parents: wp.array2d[int], impulses: wp.array2d[float], wor
 
 @wp.struct
 class _PatchRoutes:
-    """Row arrays of the contact routes that hold patch rows; ``enabled`` gates each route."""
+    """Row arrays of the contact routes that hold patch rows; ``enabled`` gates each route. ``acts``: each world's acts
+    word (:data:`.placement.WORLD_ACTS`; empty: every world's rows hold their solution)."""
 
     enabled: wp.vec3i
     parents0: wp.array2d[int]
@@ -1691,6 +1692,7 @@ class _PatchRoutes:
     first0: wp.array[int]
     first1: wp.array[int]
     first2: wp.array[int]
+    acts: wp.array[int]
 
 
 def patch_routes(rows):
@@ -1937,8 +1939,9 @@ def _finish_and_store(
     Finishing writes only the contact's own validity and tangent impulse and
     reads other contacts only through the row arrays, so finishing and storing
     contact by contact matches finishing every route before storing. A contact
-    the resolved-world classifier left without rows (CONTACT_PATH_RESOLVED)
-    releases its anchor, as its zero load does on the complete path. Other
+    the resolved-world classifier left without rows (CONTACT_PATH_RESOLVED), or one on its route in a world none of
+    whose rows can act (the routes' ``acts`` word: the sweeps left its rows unwritten at zero), releases its anchor, as
+    its zero load does on the complete path. Other
     anchors without rows (capacity rejection, or a disabled route) keep their
     history. Thread 0 publishes the stored count, which this launch never reads.
     """
@@ -1949,32 +1952,33 @@ def _finish_and_store(
     finishing = routes.enabled[0] + routes.enabled[1] + routes.enabled[2] > 0
     for c in range(thread, extent[0], threads):
         if finishing and c < live and frame.valid[c] != 0:
+            route = _contact_route(routes, slot, path, c)
             if slot[c] < 0 and path[c] == CONTACT_PATH_RESOLVED:
                 frame.valid[c] = 0
-            else:
-                route = _contact_route(routes, slot, path, c)
-                if route >= 0:
-                    parents = _route_parents(routes, route)
-                    mu = _route_mu(routes, route)
-                    impulses = _route_impulses(routes, route)
-                    _finish_contact(
-                        c,
-                        frame,
-                        patches,
-                        q,
-                        q_out,
-                        qd_out,
-                        com,
-                        world,
-                        slot,
-                        path,
-                        slots_needed,
-                        parents,
-                        mu,
-                        impulses,
-                        dt,
-                        _route_first(routes, route),
-                    )
+            elif route >= 0 and routes.acts.shape[0] > 0 and routes.acts[world[c]] == 0:
+                frame.valid[c] = 0
+            elif route >= 0:
+                parents = _route_parents(routes, route)
+                mu = _route_mu(routes, route)
+                impulses = _route_impulses(routes, route)
+                _finish_contact(
+                    c,
+                    frame,
+                    patches,
+                    q,
+                    q_out,
+                    qd_out,
+                    com,
+                    world,
+                    slot,
+                    path,
+                    slots_needed,
+                    parents,
+                    mu,
+                    impulses,
+                    dt,
+                    _route_first(routes, route),
+                )
         _store_contact(c, q, body_world, frame, prev, previous_world, previous_q)
 
 

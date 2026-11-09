@@ -230,6 +230,28 @@ def _rows(device, resolved=None, articulation_count=257, size=6):
 
 
 class TestFeatherPGSJointLimitWarp(unittest.TestCase):
+    def test_acts_word_marks_worlds_whose_limits_may_act(self):
+        """A world's acts word is set where an active side's residual at the predictor ``w v_hat + rhs`` is not above
+        the separation margin (:func:`.row_laws.separates`), and the rows stay those of no word, on every device."""
+        arts, size, dt = 257, 6, 0.01
+        rng = np.random.default_rng(5)
+        q = rng.uniform(-1.2, 1.2, arts * size)
+        vhat = rng.uniform(-40.0, 40.0, arts * size) * (rng.random(arts * size) < 0.2)
+        bounds = {"lower": np.full(arts * size, -1.0), "upper": np.full(arts * size, 1.0)}
+        law = {**bounds, "q": q, "activation_gap": 0.25, "beta": 0.2, "cfm": 1.0e-6, "dt": dt}
+        active, phi, sign = np.stack([q <= -0.75, q >= 0.75]), np.stack([q + 1.0, 1.0 - q]), np.array([[1.0], [-1.0]])
+        rhs = np.where(phi < 0.0, 0.2 * phi, phi) / dt
+        margin = 1.0e-5 + 2.0**-20 * (np.abs(vhat) + np.abs(rhs))
+        acting = np.any(active & (sign * vhat + rhs < margin), axis=0).reshape(arts, size).any(axis=1)
+        self.assertTrue(acting.any() and not acting.all())
+        for device in ["cpu"] + (["cuda:0"] if wp.is_cuda_available() else []):
+            with self.subTest(device=device):
+                plain = prefix_warp_rows(device, arts, size, 2 * size, **law)
+                rows = prefix_warp_rows(device, arts, size, 2 * size, vhat=vhat, acts=np.zeros(arts), **law)
+                np.testing.assert_array_equal(rows["acts"], acting)
+                for name in ("count", "J", *PREFIX_RECORDS):
+                    np.testing.assert_array_equal(rows[name], plain[name], err_msg=name)
+
     def test_resolved_worlds_take_no_rows(self):
         """An all-zero mask builds the same rows as the empty mask, and a resolved world builds none, on every device.
 
@@ -265,9 +287,10 @@ def _joint_velocity_rows(qd: float, *, fraction: float, qdot_max: float = 1.0):
 
 
 def _allocated_rigid_velocity_slots(
-    qd6, *, fraction: float, lin_limit: float = 1.0, ang_limit: float = 1.0, resolved: bool = False
+    qd6, *, fraction: float, lin_limit: float = 1.0, ang_limit: float = 1.0, resolved: bool = False, acts=None
 ):
     device = "cpu"
+    acts = wp.zeros(0 if acts is None else 1, dtype=wp.int32, device=device)
     rigid_velocity_limit_slot = wp.full((2,), 91, dtype=wp.int32, device=device)
     mf_slot_counter = wp.zeros((1,), dtype=wp.int32, device=device)
 
@@ -294,6 +317,7 @@ def _allocated_rigid_velocity_slots(
             0,
         ],
         outputs=[
+            acts,
             rigid_velocity_limit_slot,
             mf_slot_counter,
             wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
@@ -310,6 +334,8 @@ def _allocated_rigid_velocity_slots(
         ],
         device=device,
     )
+    if acts.shape[0]:
+        return rigid_velocity_limit_slot.numpy().tolist(), int(mf_slot_counter.numpy()[0]), int(acts.numpy()[0])
     return rigid_velocity_limit_slot.numpy().tolist(), int(mf_slot_counter.numpy()[0])
 
 
@@ -369,6 +395,18 @@ class TestFeatherPGSVelocityLimitActivationFraction(unittest.TestCase):
         slots, count = _allocated_rigid_velocity_slots([0.0] * 6, fraction=0.0, lin_limit=float("inf"))
         self.assertEqual(slots, [-1, 0])
         self.assertEqual(count, 1)
+
+    def test_acts_word_marks_a_speed_row_that_may_act(self):
+        """A reserved speed row marks its world's acts word unless ``limit - |v|`` at the predictor is above the
+        separation margin (:func:`.row_laws.separates`); a row the fraction leaves out marks nothing."""
+        for qd6, fraction, acts in (
+            ([0.5, 0.0, 0.0, 0.0, 0.0, 0.0], 0.0, 0),
+            ([0.0, 0.0, 0.0, 0.0, 1.2, 0.0], 0.0, 1),
+            ([0.6, 0.8, 0.0, 0.0, 0.0, 0.0], 0.0, 1),
+            ([0.9, 0.0, 0.0, 0.0, 0.0, 0.0], 0.95, 0),
+        ):
+            with self.subTest(qd6=qd6, fraction=fraction):
+                self.assertEqual(_allocated_rigid_velocity_slots(qd6, fraction=fraction, acts=True)[2], acts)
 
     def test_fraction_gates_static_rigid_body_to_zero_rows(self):
         """Reserve no speed row for a free body at rest under a positive fraction."""

@@ -56,6 +56,8 @@ def _allocator_arrays(capacity, *, route=0, count=205, device="cpu"):
         "row_capacity_telemetry": 0,
         "friction_patches": anchored_patches(length, device),
         "resolved_worlds": wp.empty(0, dtype=wp.int32, device=device),
+        "twists": wp.empty(0, dtype=wp.spatial_vector, device=device),
+        "acts": wp.empty(0, dtype=wp.int32, device=device),
         "contact_world": zeros(length),
         "contact_slot": integers([-9] * length),
         "contact_art_a": zeros(length),

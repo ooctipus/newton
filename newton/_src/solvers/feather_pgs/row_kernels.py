@@ -25,6 +25,7 @@ from .row_laws import (
     joint_limit_side,
     limit_rhs,
     row_rhs,
+    separates,
     velocity_limit_active,
 )
 from .row_records import UNIT_LINK, UNIT_SPEED, DenseRows, RowSupport, row_sides, unit_source
@@ -242,6 +243,7 @@ def allocate_rigid_velocity_limit_slots(
     resolved_worlds: wp.array[int],
     base: int,
     # outputs
+    acts: wp.array[int],
     rigid_velocity_limit_slot: wp.array[int],
     slot_counter: wp.array[int],
     first_rejected_slot: wp.array[int],
@@ -266,7 +268,8 @@ def allocate_rigid_velocity_limit_slots(
     as the joint velocity limits (:func:`.prefix_rows.velocity_limits`): a positive fraction
     reserves a row only when the speed read from ``joint_qd`` at the free
     root's DOFs satisfies ``|v| >= fraction * limit``. A fraction of ``0.0``
-    reserves every finitely limited speed's row without reading ``joint_qd``.
+    reserves every finitely limited speed's row without reading ``joint_qd``. A reserved row whose residual
+    ``limit - |v|`` may not separate (:func:`.row_laws.separates`) marks its world's ``acts`` word (empty: no word).
     """
     candidate = wp.tid()
     body = bodies.free_rigid_body_indices[candidate]
@@ -307,6 +310,8 @@ def allocate_rigid_velocity_limit_slots(
         rigid_velocity_limit_slot[first + speed_axis] = slot
         if slot < 0:
             continue
+        if acts.shape[0] > 0 and not separates(limit - speed, limit + speed):
+            acts[world] = 1
         row = base + slot
         # The one writer's unit source, where it writes the row (the line's); the run's rows are their writer's.
         if row < units.shape[1]:

@@ -17,6 +17,7 @@ from . import field_group
 from .device_preludes import substitute
 from .field_group import Field, FieldGroup
 from .joint_table import JOINTS
+from .row_laws import SEPARATION_MARGIN, SEPARATION_SCALE
 from .row_records import RECORDS
 
 LAW = (
@@ -33,16 +34,18 @@ LAW = (
     Field("bounds", wp.int32, ("world", 2), attr="dense_phase_bounds", owner="placement"),
     *(field for field in RECORDS if field.name not in ("row_w", "row_eps")),
     Field("capacity", wp.int32, owner="placement", attr="dense_max_constraints"),
+    Field("vhat", wp.float32, ("dof",), attr="v_hat"),
+    Field("acts", wp.int32, ("world",), owner="placement", attr="world_acts"),
 )
 """The prefix law's inputs (the model's live limits; a prescribed coordinate takes no row, :data:`.joint_table.JOINTS`),
 the world's row counter and phase bounds, and the dense row records with the dense class's capacity (its rows' line of
-the row store holds the free bodies' rows after them)."""
+the row store holds the free bodies' rows after them); the predictor and the worlds' acts words
+(:data:`.placement.WORLD_ACTS`)."""
 
 PrefixLaw = field_group.struct("PrefixLaw", LAW, __name__)
 
 VELOCITY_LAW = (
     Field("velocity_limit", wp.float32, ("dof",), owner="model", attr="joint_velocity_limit"),
-    Field("vhat", wp.float32, ("dof",), attr="v_hat"),
     Field("activation", wp.float32, owner="options", attr="velocity_limit_activation_fraction"),
 )
 """The joint velocity-limit family's inputs."""
@@ -90,7 +93,10 @@ def _family(coordinates, name: str, evaluation: str) -> tuple:
 
 
 def limits(coordinates, dof: str, law: str) -> tuple:
-    """The joint-limit family; ``dof`` is coordinate ``d``'s joint DOF, ``law`` the accessor of :data:`LAW`."""
+    """The joint-limit family; ``dof`` is coordinate ``d``'s joint DOF, ``law`` the accessor of :data:`LAW`. An active
+    side whose residual at the predictor ``w0 v_hat + rhs`` may not separate (:func:`.row_laws.separates`) marks its
+    world's acts word."""
+    margin = f"{float(SEPARATION_MARGIN)!r}f + {float(SEPARATION_SCALE)!r}f * (fabsf(speed) + fabsf(bias))"
     return _family(
         coordinates,
         "limit_coordinates",
@@ -105,6 +111,13 @@ def limits(coordinates, dof: str, law: str) -> tuple:
                 beta = {law}beta;
                 d0 = d;
                 w0 = limit.v2;
+                if (active && {law}acts.shape[0] > 0) {{
+                    const float speed = w0 * {law}vhat.data[dof];
+                    const float bias = RowLaw::limit_rhs(phi, beta, 0.0f, 1.0f / {law}dt, 1.0f, 1.0f);
+                    const float margin = {margin};
+                    if (!(isfinite(speed + bias) && isfinite(margin) && speed + bias >= margin))
+                        {law}acts.data[world] = 1;
+                }}
             }}""",
     )
 
