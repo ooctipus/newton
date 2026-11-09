@@ -538,8 +538,9 @@ class Sweep:
                 self.colored_sweep = dataclasses.replace(self.general_sweep, **_COLORED)
                 self.mf_colored_kernel = self.sweep("mf_colored", self.colored_sweep)
             if parallel_rows > 0:
-                # The producer's sink: a tier that takes EMIT walks its rows from their seeds in its prologue.
-                emit = self._emits()
+                # The producer's sink, a tier's by data and the device (sweep_routes_tiers.emits): a tier that takes EMIT
+                # walks its rows from their seeds in its prologue.
+                emit, sinks = self._emits(), 0
                 width = sweep_routes_tiers.TIER_ROWS
                 tiers = [(min(first + width, parallel_rows), first) for first in range(0, parallel_rows, width)]
                 self.par_tiers = list(tiers)
@@ -553,7 +554,6 @@ class Sweep:
                         rows=rows_,
                         levels=LevelLaw.split(sweeps_),
                         inkernel_response=self.classes.tiers.sizes,
-                        emit=emit,
                         linked_rows=True,
                         velocity_limit_pass=self._parallel_velocity_limit_pass(),
                         frame=self._tier_frame(),
@@ -561,16 +561,16 @@ class Sweep:
                         pitch=self.placement.row_pitch,
                         **self.law_fields,
                     )
+                    config = dataclasses.replace(config, emit=emit and sweep_routes_tiers.emits(config))
+                    sinks |= int(config.emit) << tier_index
                     kernel = self.sweep("parallel_tier", config, readout_budget=sweeps_)
                     # On its own list, a tier takes a block a world of the list's capacity (its work's shape); it
                     # grid-strides over its bucket.
                     layout = shape(config.work(self.forest.world_count), device(model.device))
                     named = functools.partial(self._tier_operands, config, tier_index, layout.grid)
                     self.tiers.append(SweepLaunch(config, kernel, layout.grid, layout.block, named))
-                if emit:
-                    self.placement.row_seeds = walk_rows.row_seeds(
-                        self.placement, (1 << len(tiers)) - 1, parallel_rows, width
-                    )
+                if sinks:
+                    self.placement.row_seeds = walk_rows.row_seeds(self.placement, sinks, parallel_rows, width)
             # Each sweep walks its bucket of the claims' worlds (claim_worlds), a bucket of every world's slots: a tier's,
             # the general sweep's, and with the colored mapping its candidates' (which the unit builder walks) and the
             # colored worlds' (which it appends).

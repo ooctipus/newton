@@ -22,8 +22,8 @@ from typing import ClassVar
 
 import warp as wp
 
-from ...core.execution import Work, device_lanes
-from ...core.memory import Buffer, Staging
+from ...core.execution import Work, device_lanes, shape
+from ...core.memory import Buffer, Staging, built_for
 from . import kernel_template
 from .device_preludes import VirtualLanes
 from .factor.walk import WALK_FRAME, WALK_LINK, walk_prelude, walk_row_prelude, walk_tables
@@ -254,6 +254,19 @@ def parallel_source(tier: TierSweep) -> tuple[str, Staging]:
     return tier.native(body, lanes=lanes, group=NT, ring=bool(linked_rows), rows=row_preludes, walks=walk), staging
 
 
+def emits(tier: TierSweep) -> bool:
+    """Whether the tier's worlds take the one writer's EMIT sink, by data and the device: the tier stages its rows and
+    alone reads them, so it walks them where, bound at its register line, it keeps the stored tier's resident blocks
+    within the line's stack allowance. Where shared memory binds the line (the PRO's wide worlds), or no line holds
+    (the CPU's one thread), the walk's registers cost no warp; past a warp's rows the bound spills at most 16 B (the
+    GB300's 64-row tier 98 -> 80 registers, 10.3% faster); a warp's rows bound where registers bind spill 104 B, and
+    their tier keeps the store (SINK G1)."""
+    stored, found = dataclasses.replace(tier, emit=False), built_for(tier.device_arch)
+    if int(tier.rows) > TIER_ROWS or not found.cuda:
+        return True
+    return shape(stored.work(0, parallel_source(stored)[1].bytes), found).bounds is not None
+
+
 @dataclasses.dataclass(frozen=True)
 class TierSweep(SweepConfig):
     """A parallel tier's configuration (case K4): a world's dense rows (at most ``rows``, its claim's bucket) one split
@@ -351,7 +364,5 @@ class TierSweep(SweepConfig):
         grid of one wave by the line is 1.2 waves at a seeded tier's 96 registers (allegro's 64-row tier 5% slower,
         PRO)."""
         NT = self.threads
-        # A tier that walks its rows is bound at the line past a warp's rows: where registers bind (the GB300) the walk
-        # would cost a third of its warps for the whole run (64 rows: 98 -> 80, a 16 B spill; 32 rows spill 104 B).
-        cap = self.emit and int(self.rows) > TIER_ROWS
-        return Work(int(items), lanes=NT, block=NT, registers=REGISTER_LINE, cap=cap, shared=int(shared))
+        # A tier that walks its rows is bound at the line (emits): the walk's registers would cost it warps.
+        return Work(int(items), lanes=NT, block=NT, registers=REGISTER_LINE, cap=self.emit, shared=int(shared))
