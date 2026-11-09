@@ -1801,35 +1801,6 @@ class Pipelined:
 
 
 @dataclasses.dataclass(frozen=True)
-class BallotHeads:
-    """The heads of a phase's units, found by the lanes together, a lane a row of ``[0, count)`` (``test(row)``),
-    and visited in slot order, ``head`` at a time (the sparse sweep's friction triples, :func:`.sweep_routes_sparse.
-    triple_phase`); ``guard`` skips the phase where the world holds none."""
-
-    count: str
-    lanes: Lanes
-    test: Callable[[str], str]
-    guard: str = ""
-
-    def inner(self, pad: str) -> str:
-        return pad + "        "
-
-    def wrap(self, visit: str, pad: str) -> str:
-        guard = f"if ({self.guard}) " if self.guard else ""
-        return (
-            f"{pad}{guard}for (int first = 0; first < {self.count}; first += {self.lanes.width}) {{\n"
-            f"{pad}    const int row = first + {self.lanes.lane};\n"
-            f"{pad}    unsigned heads = BALLOT({self.test('row')});\n"
-            f"{pad}    while (heads != 0u) {{\n"
-            f"{pad}        const int head = first + FIRST(heads);\n"
-            f"{pad}        heads &= heads - 1u;\n"
-            f"{visit}\n"
-            f"{pad}    }}\n"
-            f"{pad}}}"
-        )
-
-
-@dataclasses.dataclass(frozen=True)
 class Levels:
     """A phase's units by level (the exact law, :class:`LevelLaw`): a level at a time, its units at once, a thread a
     unit (``place``), synchronized after each level. ``count`` is the world's levels, ``offsets(level)`` a level's first
@@ -2231,19 +2202,44 @@ def rows_block(
     return f"{pad}{{\n{_record_pipeline(rows, op, end).wrap(chr(10).join(line for line in body if line), pad)}\n{pad}}}"
 
 
-def friction_triple_visit(
-    ctx: RowContext, laws: RowLaws, *, head: str, metric: str, pool: str, load: str, law: str, pad: str
+def triple_phase(
+    rows: RowStore,
+    op,
+    laws: RowLaws,
+    *,
+    count: str,
+    record: str,
+    law: str,
+    heads: Callable[[str], str],
+    pool: str = "",
+    guard: str = "",
+    pad: str,
 ) -> str:
-    """Visit the friction triple of the contact whose normal is row ``head``, its pair and spin row on their elliptic
-    cone (:func:`.projection_laws.friction_triple`), in a phase of their own after the row loop.
+    """The friction triples after a sweep's rows (contact torsion, the row loop skipping a triple's rows): each
+    contact's pair and spin row on their elliptic cone (:func:`.projection_laws.friction_triple`), which sees its patch
+    ring's normals of this sweep. The lanes find the triples' normals together, a lane a row of ``[0, count)``
+    (``heads(row)``, as the store marks a triple's normal), and visit them in row order; ``guard`` skips the phase
+    where the world holds none.
 
-    ``metric`` loads what the law and the pool read, first and off the chain; ``pool`` forms the pooled normal ``load``
-    (the patch ring's), and a zero cone with no carried impulse is skipped before one reduction of the three rows'
-    velocity terms on their shared support. ``law`` is the triple's law up to its residual argument
-    (:func:`.projection_laws.friction_triple_from_metric`). The first lane stores, the three changes vote together and
-    one block apply adds their sum, in the rows' order, to each coordinate once.
+    ``record`` loads what the law reads, first and off the chain; ``pool`` turns the normal's impulse ``pooled`` into
+    its patch ring's (by default the ring's walk), and a zero cone with no carried impulse is skipped before one
+    reduction of the three rows' velocity terms on their shared support. ``law`` is the triple's law up to its
+    residual argument (:func:`.projection_laws.friction_triple_from_metric`). The first lane stores, the three changes
+    vote together and one block apply adds their sum, in the rows' order, to each coordinate once.
     """
-    op, diag = ctx.operator, ctx.diagonal
+    ctx = RowContext(
+        row="tangent",
+        kind=str(ROW_FRICTION),
+        operator=op,
+        diagonal=rows.diagonal(""),
+        load=rows.load,
+        store=rows.store,
+        rhs=rows.rhs_of,
+        mu=rows.mu,
+        lanes=rows.lanes,
+        owned=rows.owned,
+    )
+    diag = ctx.diagonal
     names = (("tangent", "first"), ("sibling", "second"), ("spin", "spin"))
     rhs = {name: ctx.rhs(row) for row, name in names}
     changes = tuple(
@@ -2251,10 +2247,11 @@ def friction_triple_visit(
         for row, name in names
     )
     lines = [
-        f"const int tangent = {head} + 1, sibling = {head} + 2, spin = {head} + 3;",
-        metric,
-        pool,
-        f"const float load = fmaxf({load}, 0.0f);",
+        "const int tangent = head + 1, sibling = head + 2, spin = head + 3;",
+        record,
+        f"float pooled = {rows.load('head')};",
+        pool or f"pooled = {rows.ring_load('head', 'pooled')};",
+        "const float load = fmaxf(pooled, 0.0f);",
         *(f"const float {name}_old = {ctx.load(row)};" for row, name in names),
         "// Zero load gives a zero cone: a triple without impulse moves nothing.",
         "if (load == 0.0f && first_old == 0.0f && second_old == 0.0f && spin_old == 0.0f) continue;",
@@ -2285,7 +2282,19 @@ def friction_triple_visit(
         "}",
         ctx.sync(),
     ]
-    return indent("\n".join(line for line in lines if line), pad)
+    visit = indent("\n".join(line for line in lines if line), pad + "        ")
+    lanes = rows.lanes
+    return (
+        f"{pad}{f'if ({guard}) ' if guard else ''}for (int first = 0; first < {count}; first += {lanes.width}) {{\n"
+        f"{pad}    const int row = first + {lanes.lane};\n"
+        f"{pad}    unsigned heads = BALLOT({heads('row')});\n"
+        f"{pad}    while (heads != 0u) {{\n"
+        f"{pad}        const int head = first + FIRST(heads);\n"
+        f"{pad}        heads &= heads - 1u;\n"
+        f"{visit}\n"
+        f"{pad}    }}\n"
+        f"{pad}}}"
+    )
 
 
 def friction_metric_law(name: str, record: Callable[[str], str], pad: str) -> str:
