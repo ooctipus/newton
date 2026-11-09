@@ -618,7 +618,7 @@ class TestCoordinateTreesRule(unittest.TestCase):
         from newton.tests.test_feather_pgs_star_rows import build_solver_fixture  # noqa: PLC0415
 
         model = build_solver_fixture("cpu")
-        topology, reason = ct.coordinate_topology(model, np.array([0, 2]), model.articulation_start.numpy()[1:])
+        topology, reason = ct.coordinate_topology(model, cpu_solver(model).forest, 108)
         self.assertIsNotNone(topology, reason)
         np.testing.assert_array_equal(topology.leaves, np.arange(1, 109))
         self.assertEqual((topology.turns, topology.weld_joint_offset.size), (False, 0))
@@ -646,8 +646,7 @@ class TestCoordinateTreesRule(unittest.TestCase):
         ):
             with self.subTest(**variant):
                 model = build_branch_model(worlds=2, **variant)
-                joint_end = model.articulation_start.numpy()[1:]
-                topology, reason = ct.coordinate_topology(model, branch_articulations(model), joint_end)
+                topology, reason = ct.coordinate_topology(model, cpu_solver(model).forest, branch_size(model))
                 self.assertIsNone(topology)
                 self.assertIn(words, reason)
 

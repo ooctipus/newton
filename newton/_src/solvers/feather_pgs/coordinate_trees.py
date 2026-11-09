@@ -48,7 +48,7 @@ import numpy as np
 import warp as wp
 
 from ...sim import BodyFlags, JointType
-from . import cached_state_binding
+from . import cached_state_binding, host_index
 from .factor.fields import drive_terms
 from .factor.kernels import Clock, clock_changed
 from .kernel_template import python_kernel
@@ -70,6 +70,8 @@ from .spatial_laws import (
 )
 from .tree_kinetic_owner import proof_runs
 
+_LEAF_JOINTS = (int(JointType.PRISMATIC), int(JointType.REVOLUTE), int(JointType.D6))
+"""The joints a leaf of one coordinate stands on."""
 # Lanes of the repair launch: one warp per articulation, so a valid cache exits per warp.
 _REPAIR_LANES = wp.constant(32)
 # Threads per block of the repair launch, four articulations per block; the predict and finish launches take Warp's
@@ -530,94 +532,51 @@ class CoordinateTopology:
     weld_start: np.ndarray
     """Each leaf's first weld (CSR over ``weld_joint_offset``, one more entry than leaves)."""
     weld_joint_offset: np.ndarray
-    """Each weld's joint, its offset from the root's: a leaf's welds in joint order, each after its parent."""
+    """Each weld's joint, its offset from the root's: a leaf's welds in its tree's depth-first order, each after its
+    parent."""
     turns: bool
     """Whether a leaf turns (its joint has an angular axis)."""
 
 
-def coordinate_topology(model, articulations: np.ndarray, articulation_joint_end: np.ndarray) -> tuple:
-    """Check that every articulation is a world-fixed root over one-coordinate leaves, each with the bodies welded below
-    it, all of one template.
-
-    The root joint is FIXED or a zero-coordinate D6 joint to the world; every other joint is a leaf of one coordinate
-    (prismatic, revolute or a one-axis D6) whose parent is the root body, or a weld (a FIXED or zero-coordinate D6
-    joint) below a leaf or another weld. The leaves' coordinates and DOFs follow the root's in joint order, and every
-    articulation has the first one's joint kinds and local parents.
+def coordinate_topology(model, forest, size: int) -> tuple:
+    """Whether the articulations of size group ``size`` are world-fixed roots over trees of one coordinate each, as the
+    forest's root cut (:attr:`.forest_plan.ForestPlan.coordinate_forest`) holds them: one template of joints (one
+    topology of the size group), a root to the world above every coordinate, and every other joint in a tree of one
+    coordinate whose root, a prismatic, revolute or one-axis D6 leaf, hangs from the root body.
 
     Returns:
         ``(topology, reason)``: the template (:class:`CoordinateTopology`), or ``None`` with the reason the topology is
         declined.
     """
-    articulations = np.asarray(articulations, dtype=np.int64)
-    if articulations.size == 0:
-        return None, "No articulations."
-    starts = model.articulation_start.numpy().astype(np.int64)
-    ends = np.asarray(articulation_joint_end, dtype=np.int64)
-    if np.any(ends[articulations] != starts[articulations + 1]):
+    arts = forest.group_to_art_host[size]
+    starts = model.articulation_start.numpy()
+    if np.any(forest.articulation_joint_end_host[arts] != starts[arts + 1]):
         return None, "Joints outside every tree keep their articulations on the tree route."
-    joint_counts = starts[articulations + 1] - starts[articulations]
-    count = int(joint_counts[0])
-    if count < 2 or np.any(joint_counts != count):
-        return None, "One-coordinate trees require the same joints on every root."
-    joints = starts[articulations][:, None] + np.arange(count)[None, :]
-    types = model.joint_type.numpy()[joints]
-    dims = model.joint_dof_dim.numpy()[joints]
-    parents = model.joint_parent.numpy()[joints]
-    children = model.joint_child.numpy()[joints]
-    q_start = model.joint_q_start.numpy().astype(np.int64)
-    qd_start = model.joint_qd_start.numpy().astype(np.int64)
-    roots = joints[:, 0]
-    rigid = (types == int(JointType.FIXED)) | ((types == int(JointType.D6)) & (dims.sum(axis=-1) == 0))
-    if (
-        not np.all(rigid[:, 0])
-        or np.any(parents[:, 0] != -1)
-        or np.any(children[:, 0] < 0)
-        or np.any(q_start[roots + 1] != q_start[roots])
-        or np.any(qd_start[roots + 1] != qd_start[roots])
-    ):
-        return None, "One-coordinate trees require a FIXED or zero-coordinate D6 root joint to the world."
-    if np.any(children < 0):
-        return None, "One-coordinate trees require every joint to move a body."
-    owners = np.bincount(children.reshape(-1), minlength=model.body_count)
-    if np.any(owners[children] != 1):
-        return None, "One-coordinate trees require every body to be one joint's."
-    # Each joint's parent as a local joint (-1: the world), one template for every articulation.
-    local = np.full(model.body_count, -1, np.int64)
-    local[children] = np.arange(count)[None, :]
-    local_parents = np.where(parents >= 0, local[np.maximum(parents, 0)], -1)
-    if np.any(types != types[0]) or np.any(dims != dims[0]) or np.any(local_parents != local_parents[0]):
+    if forest.size_topologies[size].size != 2:
         return None, "One-coordinate trees require one template of joints on every root."
-    types, dims, rigid, local_parents = types[0], dims[0], rigid[0], local_parents[0]
-    one_axis = (types == int(JointType.PRISMATIC)) | (types == int(JointType.REVOLUTE)) | (types == int(JointType.D6))
-    coordinate = one_axis & (dims.sum(axis=-1) == 1)
-    if not np.all((coordinate | rigid)[1:]):
+    start, end = int(starts[arts[0]]), int(starts[arts[0] + 1])
+    cut, trees = forest.coordinate_forest, np.flatnonzero(forest.tree_articulation == arts[0])
+    roots = forest.tree_root[trees]
+    held = forest.body_tree[model.joint_child.numpy()[start:end]] >= 0
+    if model.joint_parent.numpy()[start] != -1 or held[0]:
+        return None, "One-coordinate trees require a FIXED or zero-coordinate D6 root joint to the world."
+    if not np.all(held[1:]):
+        return None, "One-coordinate trees require every weld to hang from a coordinate's body (none on the root)."
+    if np.any(cut.dofs[roots] != 1) or not np.all(np.isin(model.joint_type.numpy()[roots], _LEAF_JOINTS)):
         return None, "One-coordinate trees require one-coordinate leaves (prismatic, revolute or a one-axis D6)."
-    leaves = np.flatnonzero(coordinate)
-    if np.any(local_parents[leaves] != 0):
+    if np.any(forest.tree_size[trees] != 1) or np.any(forest.joint_forest.parent[roots] != start):
         return None, (
             "One-coordinate trees require every coordinate's joint to hang from the root body "
             "(chains are not admitted)."
         )
-    # Each weld's leaf, up its welded parents; a weld on the root body is the root's, not a coordinate's.
-    leaf_of = np.full(count, -1, np.int64)
-    leaf_of[leaves] = np.arange(leaves.size)
-    welds = np.flatnonzero(rigid[1:]) + 1
-    for weld in welds:
-        parent = local_parents[weld]
-        if parent <= 0 or parent > weld or leaf_of[parent] < 0:
-            return None, "One-coordinate trees require every weld to hang from a coordinate's body (none on the root)."
-        leaf_of[weld] = leaf_of[parent]
-    offsets = np.arange(leaves.size)[None, :]
-    if np.any(q_start[roots[:, None] + leaves] != q_start[roots][:, None] + offsets) or np.any(
-        qd_start[roots[:, None] + leaves] != qd_start[roots][:, None] + offsets
-    ):
-        return None, "One-coordinate trees require leaf coordinates in joint order."
-    order = np.argsort(leaf_of[welds], kind="stable")
+    # Each leaf's welds: its tree's depth-first positions after its own.
+    welds = cut.subtree_size[roots] - 1
+    leaf, rank = host_index.expand(welds)
     topology = CoordinateTopology(
-        leaves=leaves.astype(np.int32),
-        weld_start=np.searchsorted(leaf_of[welds][order], np.arange(leaves.size + 1)).astype(np.int32),
-        weld_joint_offset=welds[order].astype(np.int32),
-        turns=bool(np.any(dims[leaves, 1] != 0)),
+        leaves=(roots - start).astype(np.int32),
+        weld_start=host_index.offsets(welds, np.int32),
+        weld_joint_offset=(cut.dfs_order[cut.dfs_position[roots][leaf] + 1 + rank] - start).astype(np.int32),
+        turns=bool(np.any(model.joint_dof_dim.numpy()[roots, 1] != 0)),
     )
     return topology, ""
 
@@ -658,22 +617,13 @@ def plan(inputs, *, size: int | None) -> tuple[CoordinateTreesPlan | None, str]:
         return None, "One-coordinate trees exclude particles."
     if inputs.options.enable_joint_velocity_limits:
         return None, "Joint velocity limits keep the compact diagonal family in a held tree group (motion velocity)."
-    articulations = forest.group_to_art[size].numpy()
-    topology, reason = coordinate_topology(model, articulations, forest.articulation_joint_end.numpy())
+    topology, reason = coordinate_topology(model, forest, size)
     if topology is None:
         return None, reason
-    if not np.array_equal(forest.crba_dof_joint_offset_by_size[size].numpy(), topology.leaves):
-        return None, "The compact diagonal family's coordinates do not follow its leaves."
     if not factor.parallel_drives:
         return None, "One-coordinate trees evaluate the augmented drives of the owned drive-row topology."
-    roots = model.articulation_start.numpy()[articulations]
-    leaf = np.arange(size)[None, :]
-    dofs = model.joint_qd_start.numpy()[roots][:, None] + leaf
-    coordinates = model.joint_q_start.numpy()[roots][:, None] + leaf
-    driven = factor.drive_row_by_dof.numpy()[dofs] >= 0
-    # The kernels read a driven leaf's coordinate directly; the drive rows must address the same one.
-    if np.any(factor.drive_q_index_by_dof.numpy()[dofs][driven] != coordinates[driven]):
-        return None, "The augmented drives of the compact diagonal family do not read its leaf coordinates."
+    articulations = forest.group_to_art_host[size]
+    dofs = forest.articulation_dof_start_host[articulations][:, None] + np.arange(size)[None, :]
     chosen = CoordinateTreesPlan(
         size=int(size),
         group_count=len(articulations),
