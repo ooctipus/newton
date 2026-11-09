@@ -323,4 +323,7 @@ class TierSweep(SweepConfig):
         grid of one wave by the line is 1.2 waves at a keyed tier's 96 registers (allegro's 64-row tier 5% slower,
         PRO)."""
         NT = self.threads
-        return Work(int(items), lanes=NT, block=NT, registers=REGISTER_LINE, cap=False, shared=int(shared))
+        # A tier that walks its rows is bound at the line past a warp's rows: where registers bind (the GB300) the walk
+        # would cost a third of its warps for the whole run (64 rows: 98 -> 80, a 16 B spill; 32 rows spill 104 B).
+        cap = self.keyed is not None and int(self.rows) > TIER_ROWS
+        return Work(int(items), lanes=NT, block=NT, registers=REGISTER_LINE, cap=cap, shared=int(shared))
