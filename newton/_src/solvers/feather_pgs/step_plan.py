@@ -455,10 +455,10 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
     speed_rows = placement.speed_rows or spec.classes.tiers is not None
     free_limits = forest.has_free_rigid_bodies and placement.rigid_velocity_limit_slot is not None
     # The rows a world's topology fixes (links, mimics, limits) are known once their families are written, before the
-    # contacts: where the one writer walks the general placement's rows and its sink does not wait for the counts (no
-    # tier walks its rows), it walks them beside the contact pass (Beside) and the rest after it, the two parts joined
-    # before the rest. Their diagonals start from zero before them.
-    split = holds and route.support == "dense" and placement.row_seeds.tiers == 0
+    # contacts: where the one writer walks the general placement's rows, it walks them beside the contact pass (Beside)
+    # and the rest after it, the two parts joined before the rest (where a tier walks a world's rows, only a few:
+    # walk_rows.TOPOLOGY_BESIDE). Their diagonals start from zero before them.
+    split = holds and route.support == "dense"
     topology = Beside(device) if split else None
     clear = ((placement, "diagonals"),) if placement.clears_diagonals else ()
     walk = (laws, "write_walked", solver, STATE_IN, CONTACTS, DT)

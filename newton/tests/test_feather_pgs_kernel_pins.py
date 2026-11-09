@@ -145,7 +145,7 @@ def _audit_calls():
     yield "audit.slot_class", kernel(audit.slot_class), (6, 1024), {}
     yield "audit.free_class", kernel(audit.free_class), (), {}
     # The rows the tiers walk from their seeds, at the seeded tiers' 16+6 coordinate world (_emit_tier_kwargs).
-    seeded = (22, (16, 6, 0, 16), (0, 0), tier_classes((16, 6)), False)
+    seeded = (22, (16, 6, 0, 16), (0, 0), tier_classes((16, 6)), False, 128)
     yield "audit.seeded_class", kernel(audit.seeded_class), seeded, {}
 
 
@@ -276,12 +276,13 @@ def _dense_build_calls():
             (0, False, True, tables, *tail),
             {},
         )
-    # The EMIT sink's variant, where a class's tiers walk their rows' seeds: plain and by support classes.
-    for classes in (False, True):
+    # The EMIT sink's variants, where a class's tiers walk their rows' seeds: the rest (plain and by support classes),
+    # and the topology part, which stores a world's few topology rows.
+    for block, classes in ((0, False), (0, True), (walk_rows.WRITER_BLOCK_ROWS, False)):
         yield (
             "walk_rows.walked_rows_kernel",
             walk_rows.walked_rows_kernel.__wrapped__,
-            (0, False, True, tables, 0, classes, True),
+            (0, False, True, tables, block, classes, True),
             {},
         )
     # The sparse diagonal's one writer, the star's walker on the same classes.

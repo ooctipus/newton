@@ -32,7 +32,7 @@ from newton._src.solvers.feather_pgs.factor.walk import TreeWalk, local_frames
 from newton._src.solvers.feather_pgs.row_laws import ROW_SPEED
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_scenes as scenes
-from newton.tests.feather_pgs_law_harness import packed_coordinates, walk_class_of
+from newton.tests.feather_pgs_law_harness import packed_coordinates, walk_class_of, walked_worlds
 from newton.tests.test_feather_pgs_factor import BOUND, ROUNDING, Capture, catalogue, random_tree, run_route
 from newton.tests.test_feather_pgs_response_diagonal import _build_mixed_response_model
 
@@ -426,8 +426,8 @@ def walked_frames(solver, joint_q: np.ndarray, capture) -> dict:
     (and ``u`` of the incident velocity), and ``n u kappa |dv|`` (FL3.1's leave bound) with the publication's rounding
     of ``v_hat`` and ``v_out``. A free rigid body is a one-body tree of six coordinates. A tree whose drives slip this
     step leaves ``R^T du`` (its rows carry the release and are checked by :class:`TestSlipRelease`); the closure's
-    corrected rows (``test_feather_pgs_preelim``) and a world whose speed ball acted (its ``du`` is a law's, not
-    ``sum Z lambda``) are left to their own checks."""
+    corrected rows (``test_feather_pgs_preelim``), a world whose speed ball acted (its ``du`` is a law's, not
+    ``sum Z lambda``) and the leave of a world whose tier walks its rows are left to their own checks."""
     forest, placement, factor = solver.forest, solver.placement, solver.factor
     out = {"rows": 0.0, "free_rows": 0.0, "leave": 0.0, "worlds": 0, "free_bodies": 0, "slipping": 0}
     sizes = forest.articulation_response_dof_count.numpy()
@@ -444,8 +444,9 @@ def walked_frames(solver, joint_q: np.ndarray, capture) -> dict:
     first = placement.dense_first.numpy()
     kinds_all = placement.row_type.numpy()
     walks, hats = {}, {}
-    # A world whose speed ball acted: a speed row of the line (its last rows) or of the free bodies' run.
-    ball = np.zeros(int(forest.world_count), dtype=bool)
+    # A world whose speed ball acted: a speed row of the line (its last rows) or of the free bodies' run; and a world
+    # whose tier walks its rows (its rows above the family bound stay in its sweep).
+    ball, walked = np.zeros(int(forest.world_count), dtype=bool), walked_worlds(solver)
 
     def walk_of(art):
         if art not in walks:
@@ -520,7 +521,7 @@ def walked_frames(solver, joint_q: np.ndarray, capture) -> dict:
     view = factor.walk_view()
     for art in range(sizes.size):
         world, n = int(art_world[art]), int(sizes[art])
-        if world < 0 or n == 0 or solver.factor.eliminates or ball[world]:
+        if world < 0 or n == 0 or solver.factor.eliminates or ball[world] or walked[world]:
             continue
         line, count = int(first[world]), int(counts[world])
         du = np.zeros(n) + free_du.get(art, 0.0)

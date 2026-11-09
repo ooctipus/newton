@@ -30,7 +30,7 @@ from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_references as refs
 from newton.tests import feather_pgs_scenes as scenes
 from newton.tests import test_feather_pgs_conformance as conformance
-from newton.tests.feather_pgs_law_harness import line_rows, walk_inverse
+from newton.tests.feather_pgs_law_harness import line_rows, walk_inverse, walked_worlds
 from newton.tests.test_feather_pgs_factor import newton_state_body_q, relative, transform_point
 
 H = 1.0 / 240.0
@@ -1087,16 +1087,6 @@ def patch_units(solver, count):
             m = ring[m]
         units.append(FrictionUnit(int(c), tuple(members), float(weight[c]), tuple(location[c]), float(arm[c])))
     return units
-
-
-def walked_worlds(solver) -> np.ndarray:
-    """Each world whose tier walks its rows (the one writer's EMIT sink, :func:`.walk_rows.emits`): the audit reads its
-    rows, but their ``Z`` stays inside its sweep."""
-    placement, seeds = solver.placement, solver.placement.row_seeds
-    counts, free = placement.constraint_count.numpy(), placement.mf_constraint_count.numpy()
-    tier = (np.maximum(counts, 1) - 1) // max(int(seeds.width), 1)
-    dense = (free == 0) & (counts > 0) & (counts <= int(seeds.bound)) & (counts <= placement.speed_first.numpy())
-    return dense & ((int(seeds.tiers) >> tier) & 1 != 0)
 
 
 class Manufactured:
