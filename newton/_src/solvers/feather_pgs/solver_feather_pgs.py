@@ -447,7 +447,6 @@ class SolverFeatherPGS(SolverBase):
         # factors and evaluator as construction reaches them.
         self.factor = TreeFactor(model, options)
 
-        self.forest: ForestPlan | None = None
         # The model's joint forest (Model.joint_ancestor): body maps, CRBA's ancestor test.
         forest = joint_forest(model)
         self.factor.apply_kinematic_state(self.factor.kinematic_state())
@@ -489,39 +488,32 @@ class SolverFeatherPGS(SolverBase):
         self.placement = Placement(self.spec, model, options, self.laws, self.factor)
         support = classes.support
         # The sweep: its owners build the class's choice.
-        self.sweep = Sweep(
-            model,
-            options,
-            self.forest,
-            self.laws,
-            self.placement,
-            self.factor,
-            self.spec.classes,
-            self.spec.pins,
-        )
-        self.sweep.place_diagonal(self.spec.classes.diagonal)
+        self.sweep = Sweep(model, options, self.forest, self.laws, self.placement, self.factor, classes, pins)
+        self.sweep.place_diagonal(classes.diagonal)
         self.placement.dense_internal_max_rows = self.placement.internal_rows_per_world(model)
         self.placement.dense_internal_rows_at_once = self.placement.internal_rows_per_world(model, at_once=True)
         self._contact_material_placeholder = self._arrays.placeholder(wp.float32, (1,))
         self._bind_contact_material(None)
         self._allocate_common_buffers(model)
-        self.sweep.place_packed(self.spec.classes.packed)
+        self.sweep.place_packed(classes.packed)
         # The matrix-free sweeps read the dense rows packed (packed_rows): every class but native sparse factors (case
         # K1) and the sparse diagonal (case K2). Decided before the buffers, since that placement allocates no size
         # group's Jacobian.
-        self._allocate_buffers(model)
+        self.placement.allocate_size_groups()
+        if model.articulation_count:
+            self.placement.allocate_contact_rows(model)
         self.placement.allocate_world_rows(model)
         self.placement.allocate_sparse_diagonal_rows()
         self.placement.allocate_free_body_rows(model)
         self.factor.scatter_armature()
-        self.sweep.place_tiers(self.spec.classes.tiers)
+        self.sweep.place_tiers(classes.tiers)
         # The walk is the trees' factor (Z4): the predictor solves every tree of its groups by it, a prescribed tree
         # beside a responding one in a size group included (the dense factor held it before Z4.2), the placements
         # that walk read it for their rows and leave, and the border decides a slipping tree's step on it. The held
         # plan names its trees (held_tree.HeldPlan.walking): the compact diagonal's walk is its inverse (one division a
         # coordinate, which the star's rows and the sparse diagonal's leave already take), so it takes no walk, in a
         # held tree group or in the one-coordinate class (coordinate_trees.py). The packed rows' classes read it.
-        walking = self.spec.classes.held.walking
+        walking = classes.held.walking
         if walking.size:
             self.factor.plan_walk(walking)
         self.placement.allocate_packed_rows()
@@ -835,13 +827,6 @@ class SolverFeatherPGS(SolverBase):
         )
         # The tree factor's mass-update mask, compact inverse mass, body inertia records and articulation origins.
         self.factor.allocate_common()
-
-    def _allocate_buffers(self, model):
-        self.placement.allocate_size_groups()
-        if not model.articulation_count:
-            return
-
-        self.placement.allocate_contact_rows(model)
 
     def read_audit(self) -> dict:
         """Return the per-world audit of ``Diagnostics.audit`` by name (:data:`.audit.AUDIT_SLOTS`), each a NumPy array.
