@@ -90,8 +90,10 @@ class WorldRows:
       :func:`.row_metadata.pack_row_record`), with their diagonal's inverse; the dense rows' records keep ``A_ii``.
 
     Impulses are staged (``s_lam_dense``, ``s_lam_mf``) or, with ``stream``, in place (``g_lam_dense``, ``g_lam_mf``).
-    A dense row's impulse is owned by its first lane, which every lane reads by broadcast; a staged free row's every
-    lane, and every row's with ``every_lane``, stores what it computed and reads its own stores.
+    A dense row's impulse is owned by its first lane, which stores it after every lane's reads, and every lane reads it
+    directly after the row's closing barrier; a staged free row's every lane, and every row's with ``every_lane``,
+    stores what it computed and reads its own stores; a streamed free row's first lane stores, without a barrier, and
+    every lane reads its value by broadcast.
     """
 
     capacity: int
@@ -225,8 +227,9 @@ class WorldRows:
         return spin_row(parent, end, lambda row: f"({self.kind(row)})")
 
     def load(self, row: str) -> str:
-        """Row ``row``'s impulse on every lane (read by the first lane where it owns it)."""
-        if self.own_stores:
+        """Row ``row``'s impulse on every lane: read directly, or, a streamed free row's, the first lane's by
+        broadcast."""
+        if self.own_stores or self.owned:
             return self.peek(row)
         return self.lanes.broadcast(f"{self.impulses}[{row}]")
 
