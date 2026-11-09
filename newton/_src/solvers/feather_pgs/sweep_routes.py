@@ -523,9 +523,8 @@ const float mf_diag = __int_as_float(meta.y);"""
 def dense_units(
     dense: WorldRows, op: SparseFactor, laws: RowLaws, *, active: bool, record: Callable[[str], str] | None, pad: str
 ) -> str:
-    """The contact unit on the dense rows (:func:`.sweep.unit_visit`), its couplings and pair metric the contact's
-    ``record`` formed for the launch (:func:`.sweep.friction_record_stage`), else its own reduction's; a friction
-    triple declined (the row step solves it)."""
+    """The contact unit on the dense rows (:func:`.sweep.unit_visit`), its couplings and pair metric the launch's
+    ``record`` (:func:`.sweep.friction_record_stage`) or its own reduction's; a friction triple declined."""
     loads = after = ""
     if record is not None:
         loads = f"""        const float4* const record = reinterpret_cast<const float4*>({record("i")});

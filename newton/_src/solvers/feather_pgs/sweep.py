@@ -90,10 +90,9 @@ class WorldRows:
       :func:`.row_metadata.pack_row_record`), with their diagonal's inverse; the dense rows' records keep ``A_ii``.
 
     Impulses are staged (``s_lam_dense``, ``s_lam_mf``) or, with ``stream``, in place (``g_lam_dense``, ``g_lam_mf``).
-    A dense row's impulse is owned by its first lane, which stores it after every lane's reads, and every lane reads it
-    directly after the row's closing barrier; a staged free row's every lane, and every row's with ``every_lane``,
-    stores what it computed and reads its own stores; a streamed free row's first lane stores, without a barrier, and
-    every lane reads its value by broadcast.
+    A dense row's first lane stores its impulse after every lane's reads, which read it directly; a staged free row's
+    every lane (every row's with ``every_lane``) stores what it computed and reads its own stores; a streamed free row's
+    first lane stores without a barrier, and every lane reads it by broadcast.
     """
 
     capacity: int
@@ -103,9 +102,8 @@ class WorldRows:
     lanes: Lanes = dataclasses.field(default_factory=Lanes)
     every_lane: bool = False
     sides: str | None = None
-    """Where a staged row's sides are staged too, their record words (its sides' first world coordinates, then their
-    widths, or with ``"classes"`` the row's support classes): a visit's coordinates then decode from the stage, as a
-    streamed record's do (``RECORD_COORDINATE``)."""
+    """A staged row's sides staged too, its record's two words (first coordinates, then ``"widths"`` or the support
+    ``"classes"``): a visit's coordinates decode from the stage, as a streamed record's do."""
 
     STAGINGS: ClassVar[tuple[str, ...]] = ("shared", "record")
     VISITED: ClassVar[str] = "i"
@@ -661,9 +659,8 @@ class RowContext:
     """The friction triple's law, up to its first argument: :func:`.projection_laws.friction_triple`, or a law of the
     same arguments after a leading ``int`` of its own (a cache of the triple's metric, :func:`cached_triple_law`)."""
     formed: Callable[[str], str] | None = None
-    """The address of the record of the contact whose normal is ``row``, formed for the launch
-    (:func:`friction_record_stage`): a friction visit loads it with its rows, reduces no Gram term, and its laws read
-    it (:func:`formed_friction_laws`); the triple's law takes no block."""
+    """The address of the launch's record of the contact whose normal is ``row`` (:func:`friction_record_stage`): a
+    friction visit loads it with its rows and reduces no Gram term; its laws read it (:func:`formed_friction_laws`)."""
     owned: bool = True
     """The row's first lane owns the stored impulses: the lanes synchronize before the stores (every lane has read
     the impulses the first lane overwrites; :attr:`first_store`); the applies after them read no impulse, and the
@@ -698,9 +695,8 @@ class RowContext:
     ) -> RowContext:
         """The context of row ``i`` of a row loop over a store's rows ``[0, end)``: every row accessor is the store's
         (:class:`RowStore`), its ownership included, the visited row's diagonal read into the local ``own``, its kind
-        into ``row_type`` and a friction row's parent into ``parent``; with ``metric`` a friction triple's law reads
-        its metric cached for the launch (:func:`friction_metric_law`), or with ``formed`` both friction laws read the
-        contact's record (:func:`formed_friction_laws`). ``choices`` sets the context's other fields."""
+        into ``row_type`` and a friction row's parent into ``parent``, the friction laws ``metric``'s and ``formed``'s
+        (:func:`friction_laws`). ``choices`` sets the context's other fields."""
         return cls(
             row="i",
             kind="row_type",
@@ -917,8 +913,7 @@ def _pair_terms(ctx: RowContext, *, own: bool) -> str:
 
 def _spin_terms(ctx: RowContext) -> str:
     """Declare a friction triple's spin terms after :func:`_pair_terms`: ``spin_residual`` (``Z_p . u + rhs_p``),
-    ``spin_cross`` and ``spin_cross_sibling`` (none where the laws read the contact's record, ``formed``), the visit's
-    sums (:func:`row_sums`) or a ladder of their own."""
+    ``spin_cross`` and ``spin_cross_sibling`` (none when ``formed``), the visit's sums or a ladder of their own."""
     sums = (("spin_residual", "spin", None),)
     sums += () if ctx.formed else (("spin_cross", "row", "spin"), ("spin_cross_sibling", "sib", "spin"))
     rows = {"row": ctx.row, "sib": "sib", "spin": "spin"}
@@ -1100,9 +1095,8 @@ def row_sums(
     With ``sibling`` a ``paired`` row (a first tangent) also reduces its pair's terms in the same ladder,
     ``sibling_jv = Z_sibling . u`` and ``pair_coupling = Z_row . Z_sibling``, on the support's one load (rows in
     memory: :attr:`.ResponseOperator.pair_with_visit`), the sibling's entries kept for the pair's apply; ``spin`` adds
-    the spin row's (``spin_jv``, ``spin_coupling``, ``spin_coupling_sibling``), reduced only by a triple. Where the
-    friction laws read the contact's record (``formed``, :func:`friction_record_stage`) the ladder holds the three
-    velocity terms alone, ``spin_jv`` beside the pair's.
+    the spin row's (``spin_jv``, ``spin_coupling``, ``spin_coupling_sibling``), reduced only by a triple; ``formed``
+    (the laws on the contact's record) reduces the three velocity terms alone.
     """
     if sibling is None:
         return op.dot(((out, "row", None),), {"row": row}, pad)
@@ -1140,8 +1134,7 @@ def friction_laws(metric: str | None, formed: Callable[[str], str] | None) -> di
 
 
 def _record_loads(ctx: RowContext, kind: str, pad: str) -> str:
-    """A first tangent's loads of its contact's record (:attr:`RowContext.formed`) into :data:`FORMED_RECORD`, with its
-    rows and off the reduction's chain: the pair metric's half, the ball metric's whole where a spin row follows."""
+    """A first tangent's loads of its contact's record into :data:`FORMED_RECORD`, with its rows, off the chain."""
     m0, m1, m2, m3 = FORMED_RECORD
     lines = [
         f"float4 {m0}, {m1}, {m2}, {m3};",
@@ -1233,23 +1226,18 @@ _UNIT_CHANGE = {
 
 @dataclasses.dataclass(frozen=True)
 class UnitZ(ResponseOperator):
-    """A contact unit's rows (:func:`contact_unit`) on the unit's Gram block: every placement's one operator for them.
+    """A contact unit's rows (:func:`contact_unit`) on the unit's Gram block ``G = Z^T Z``: every placement's operator.
 
-    A contact unit is a contact normal (the unit's row ``r == 0``) and its friction pair (``r == 1``: the first tangent,
-    the second its sibling), visited by the row law (:func:`row_visit`) one after the other on the unit's Gram block
-    ``G = Z^T Z``. The placement reduces the unit's velocity terms once, before its rows (``unit_jv0``, ``unit_jv1``,
-    ``unit_jv2``), and gives the pair's Gram couplings with the normal (``gram_n1``, ``gram_n2``): a cache formed once
-    per launch, the builder's record, or the same reduction. The rows read the pair's terms moved by the normal's
-    change, ``Z_t^T (u + Z_n dn) = Z_t^T u + G_tn dn``, and defer their applies into ``unit_dn``, ``unit_dt1`` and
-    ``unit_dt2``, which the placement applies once after the unit: in exact arithmetic the row-by-row sweep.
-
-    The friction rows' couplings (``Z_t1 . Z_t2``, and the spin row's with the pair) are the placement's reduction's
-    (``unit_cross``, ``unit_cross13``, ``unit_cross23``: ``cached`` false), or none where the friction law reads a
-    metric cached for the unit (``cached``). A row's vote reads its terms' magnitude through a lower bound
-    (:meth:`terms`): the reduced term's own, or, where the placement's ladder also reduced the magnitudes
-    (``magnitudes``: ``unit_jv{k}_terms``, and ``C_t = sum_k |Z_tk Z_nk|`` in ``gram_n{t}_terms``), the normal's
-    ``S_n`` and a moved tangent's ``max(|Z_t^T u'|, S_t - |dn| C_t)``, the row-by-row sweep's ``S_t`` itself when the
-    normal did not move. ``fused_pair_apply`` is the placement's tail (:func:`_row_tail`).
+    A unit is a contact normal (row ``r == 0``) and its friction pair (``r == 1``, the first tangent; the second its
+    sibling), visited by the row law (:func:`row_visit`) in turn. The placement reduces the velocity terms once
+    (``unit_jv0..2``) and gives the pair's couplings with the normal (``gram_n1``, ``gram_n2``: a record formed once
+    a launch, or the same reduction); the rows read the pair's terms moved by the normal's change, ``Z_t^T u + G_tn
+    dn``, and defer their applies into ``unit_dn``, ``unit_dt1``, ``unit_dt2``: in exact arithmetic the row-by-row
+    sweep. The friction rows' couplings are the reduction's (``unit_cross``, ``unit_cross13``, ``unit_cross23``), or
+    none where the law reads a cached metric (``cached``). A row's vote reads its terms' magnitude through a lower bound
+    (:meth:`terms`): the reduced term's own, or with ``magnitudes`` (``unit_jv{k}_terms``, ``C_t = sum_k |Z_tk Z_nk|``
+    in ``gram_n{t}_terms``) a moved tangent's ``max(|Z_t^T u'|, S_t - |dn| C_t)``. ``fused_pair_apply`` is the
+    placement's tail (:func:`_row_tail`).
     """
 
     cached: bool = False
@@ -1315,14 +1303,11 @@ def cached_triple_law(
     name: str, pad: str, *, metric: tuple[str, ...] = (), record: str = "", basis: bool = False
 ) -> str:
     """Declare ``name``, the friction triple's law (:attr:`RowContext.triple_law`'s arguments after one leading
-    ``int``, the contact's normal row ``row``) from a metric cached for the unit, eight values
-    (:func:`.projection_laws.friction_ball_metric`): its three eigenvalues and an unused value, then its eigenbasis as
-    a rotation quaternion ``(x, y, z, w)`` (:func:`.projection_laws.friction_triple_from_metric`); the visit's block
-    goes unread. The values are ``metric``'s expressions, or two ``float4`` loads from ``record`` (an address
-    expression of ``row``). With ``basis`` the record holds the eigenbasis itself (:data:`FRICTION_METRIC_FLOATS`), four
-    ``float4``, marked unformed before the sweeps (a negative first eigenvalue, :func:`friction_metric_stage`): the
-    launch's first loaded visit forms it from its block and stores it, and a zero spin coefficient takes the pair's
-    law from the block, so the law is the visit's own arithmetic (:func:`.projection_laws.friction_triple`)."""
+    ``int``, the contact's normal ``row``) from a cached metric: its three eigenvalues, an unused value and its
+    eigenbasis as a quaternion (:func:`.projection_laws.friction_triple_from_metric`), ``metric``'s expressions or two
+    ``float4`` from ``record`` (an address of ``row``). With ``basis`` the record holds the eigenbasis itself, marked
+    unformed before the sweeps (:func:`friction_metric_stage`): the first loaded visit forms it from its block, and a
+    zero spin coefficient takes the pair's law, so the law is the visit's own (:func:`.projection_laws.friction_triple`)."""
     loads = []
     block = ""
     if record and basis:
@@ -1420,16 +1405,12 @@ def contact_unit(
     :func:`row_visit` with the unit's operator (:class:`UnitZ`), the pair at the normal ``parent``. A visit that
     skips its row leaves it (a one-pass loop), not the unit.
 
-    The rows defer their applies, so none synchronizes the lanes after it: the placement does once, after the unit's
-    apply. Where the rows' first lane owns the stores, the placement holds the unit's staged values in registers
-    (``held``: :data:`UNIT_HELD`, the impulses, right-hand sides and diagonals of the normal and its two tangents,
-    loaded with its rows ahead of its reduction, :func:`unit_held_loads`), which the rows read, and the pair pools its
-    ring from the normal's new impulse in a register (``unit_normal``, what the normal stores). The rows then read no
-    store of the unit, so only the unit's first stores wait for every lane's reads: the normal's where the placement
-    admitted it, else each row's (a skipped normal leaves the pair's stores first). Nor does a row read its staged
-    values after such a barrier, which orders the reads after it (a memory fence): the pair's right-hand sides and
-    diagonals would load after the normal's stores, on the unit's critical chain. Rows that every lane stores alike, or
-    one thread's, pass no barrier and read their own stores.
+    The rows defer their applies: the placement synchronizes once, after the unit's apply. Where the first lane owns
+    the stores, the placement holds the unit's staged values in registers (``held``: :data:`UNIT_HELD`, loaded with its
+    rows ahead of its reduction, :func:`unit_held_loads`) and the pair pools its ring from the normal's new impulse
+    (``unit_normal``): the rows read no store of the unit, so only its first stores wait for every lane's reads, and no
+    staged value loads after a barrier, on the unit's chain. Rows that every lane stores alike, or one thread's, pass
+    no barrier and read their own stores.
 
     Where the laws allow spin rows (``laws.torsion``) a unit of four ``rows`` has its spin row after the pair, which
     the pair's visit solves with it (the friction triple, :func:`friction_pair`); a unit of three solves its pair as
@@ -1969,13 +1950,10 @@ def friction_metric_stage(
     record: Callable[[str], str],
     pad: str,
 ) -> str:
-    """Before the sweeps, mark the metric of every friction triple (a contact with a spin row ``spin(normal)``,
-    :func:`spin_row`) of a class's rows ``[0, end)`` unformed (a negative first eigenvalue at ``record(parent)``), each
-    row's ``kind`` and ``parent`` as the row store reads them: the lanes find the triples together, a lane a row. A
-    triple's first loaded visit of the launch forms its metric and stores it, and every later visit only projects
-    (:func:`cached_triple_law` with ``basis``): its block is fixed across the launch's sweeps.
-
-    Formed at the first visit, not here: a triple the sweeps never load forms none."""
+    """Before the sweeps, mark the metric of every friction triple (a contact with a spin row ``spin(normal)``) of a
+    class's rows ``[0, end)`` unformed at ``record(parent)``, a lane a row, its rows' ``kind`` and ``parent`` the
+    store's: the triple's first loaded visit forms it (:func:`cached_triple_law` with ``basis``). The sparse diagonal's;
+    the general sweep forms its contacts' records whole (:func:`friction_record_stage`)."""
     lines = [
         "const int row = first + LANE;",
         f"if (row < {end} && {kind('row')} == {ROW_FRICTION}) {{",
@@ -1991,13 +1969,10 @@ def friction_record_stage(
     rows: RowStore, op, *, end: str, record: Callable[[str], str], declare: str = "", pad: str
 ) -> str:
     """Before the sweeps, form the record of every friction contact of a class's rows ``[0, end)`` at
-    ``record(normal)``, once for the launch: the lanes find the first tangents together, a lane a row, and reduce each
-    contact's Gram couplings in one ladder of the operator's products, those its visits reduced. A pair, or a triple
-    of a zero spin coefficient, stores ``W_nt1, W_nt2, W_t1t2``, then its pair metric
-    (:func:`.projection_laws.friction_pair_metric`); a triple its ball metric
-    (:func:`.projection_laws.friction_ball_metric`): its eigenvalues, then its eigenbasis row by row. The visits then
-    reduce only velocity terms and project (:func:`formed_friction_laws`). ``declare`` declares what the operator's
-    coordinates read of the contact's normal (a free row's sides, from its header)."""
+    ``record(normal)``: the lanes find the first tangents by ballot and reduce each contact's Gram couplings in one
+    ladder of the operator's own products. A pair (or a zero spin coefficient) stores ``W_nt1, W_nt2, W_t1t2`` and its
+    pair metric, a triple its ball metric, eigenvalues then eigenbasis (:mod:`.projection_laws`); the visits reduce
+    velocity terms alone (:func:`formed_friction_laws`). ``declare`` declares what the operator's coordinates read."""
     kind, parent = rows.scan()
     heads = BallotHeads(
         end, rows.lanes, lambda row: f"{row} < {end} && {kind(row)} == {ROW_FRICTION} && ({parent(row)}) + 1 == {row}"
@@ -2040,11 +2015,9 @@ def friction_record_stage(
 
 
 def formed_friction_laws(name: str, pad: str) -> str:
-    """Declare ``name``, the friction triple's law, and ``{name}_PAIR``, the pair's, each from its contact's record
-    formed for the launch (:func:`friction_record_stage`), which the visit loaded (:data:`FORMED_RECORD`): the pair's
-    and a zero spin coefficient's from the pair metric, the triple's from the ball metric, so each law is the visit's
-    own arithmetic on a block it no longer reduces (:func:`.projection_laws.friction_pair`,
-    :func:`.projection_laws.friction_ball`)."""
+    """Declare ``name``, the friction triple's law, and ``{name}_PAIR``, the pair's, on the contact's record as the
+    visit loaded it (:data:`FORMED_RECORD`): the pair metric's law for a pair or a zero spin coefficient, the ball
+    metric's for a triple, each the visit's own arithmetic (:func:`.projection_laws.friction_ball`)."""
     pair = "ProjectionLaw::friction_pair_from_metric(metric.x, metric.y, wp::vec2(metric.z, metric.w),"
     lines = [
         f"const auto {name}_PAIR = [&](const float4& metric, float, float, float, wp::vec2 residual, wp::vec2 old,",
@@ -2142,9 +2115,7 @@ def row_step(
     - ``triple_phase``: a friction triple's rows are solved in a phase of their own after the loop (the store restaged
       its pair as spin rows, :attr:`StagedRows.triples`), and the loop's visit carries none of the triple's code;
       otherwise a spin row is solved with its friction pair in the loop (the store's :meth:`RowStore.spin_of`), its
-      metric cached for the launch with ``metric`` (the law :func:`friction_metric_law` declared,
-      :func:`friction_metric_stage`), or with ``formed`` the contact's record at that address
-      (:func:`formed_friction_laws`);
+      laws ``metric``'s and ``formed``'s (:func:`friction_laws`);
     - a row known where the step is emitted (``kind``, and a friction row's ``parent``) replaces its metadata, so the
       step compiles to that kind's law: a known kind is no spin row, and one other than friction admits no pair (the
       sparse-diagonal sweep's chains).
@@ -2210,9 +2181,7 @@ def rows_block(
     the value it computed (or, streamed, the first lane stores and every read takes the first lane's value), so a lane
     only ever reads its own stores.
 
-    With ``metric`` (the law :func:`friction_metric_law` declared) every friction triple forms its metric once per
-    launch, at its first loaded visit (:func:`friction_metric_stage`), or with ``formed`` (their address) the dense
-    rows' laws read the contacts' records (:func:`friction_record_stage`). ``selected``: the active enumeration's rows
+    ``metric`` and ``formed`` are the friction laws' (:func:`friction_laws`). ``selected``: the active enumeration's rows
     (:class:`SelectedRows`), each record loaded at its visit; ``unit``: a contact unit's visit (:func:`unit_visit`).
     """
     inner = pad + "    "
@@ -2263,17 +2232,14 @@ def rows_block(
 def friction_triple_visit(
     ctx: RowContext, laws: RowLaws, *, head: str, metric: str, pool: str, load: str, law: str, pad: str
 ) -> str:
-    """Visit the friction triple of the contact whose normal is row ``head``: its pair and its spin row
-    (:func:`spin_row`), solved together on their elliptic cone (:func:`.projection_laws.friction_triple`) apart from
-    the row loop, in a phase of their own after it.
+    """Visit the friction triple of the contact whose normal is row ``head``, its pair and spin row on their elliptic
+    cone (:func:`.projection_laws.friction_triple`), in a phase of their own after the row loop.
 
     ``metric`` loads what the law and the pool read, first and off the chain; ``pool`` forms the pooled normal ``load``
-    (an expression, its patch ring's), and a zero cone with no carried impulse is skipped (``continue``) before one
-    reduction of the three rows' velocity terms on the contact's shared support (``dot``).
-    The triple's law projects the residuals: ``law`` is the call up to its residual argument, ``(residual, old, mu,
-    mu_t, load, omega)`` after it (:func:`.projection_laws.friction_triple_from_metric` of the contact's metric). The
-    first lane stores the impulses, the three changes vote together and one apply writes each coordinate once
-    (``axpy`` of a block): the three changes summed in the rows' order, then added.
+    (the patch ring's), and a zero cone with no carried impulse is skipped before one reduction of the three rows'
+    velocity terms on their shared support. ``law`` is the triple's law up to its residual argument
+    (:func:`.projection_laws.friction_triple_from_metric`). The first lane stores, the three changes vote together and
+    one block apply adds their sum, in the rows' order, to each coordinate once.
     """
     op, diag = ctx.operator, ctx.diagonal
     names = (("tangent", "first"), ("sibling", "second"), ("spin", "spin"))

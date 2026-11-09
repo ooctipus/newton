@@ -431,16 +431,13 @@ SYNC();"""
 
 
 def triple_phase(sweep: SparseSweep, rows: StagedRows, op: SparseFactor, laws: RowLaws, pad: str) -> str:
-    """The friction triples after a sweep's rows (contact torsion), in row order, each visited by
-    :func:`.sweep.friction_triple_visit`: one reduction and one apply of its pair and spin row together, on the pooled
-    normal load of its contact's patch ring. A triple's normal is a contact whose next row is staged as a spin row (its
-    pair, :class:`.sweep.StagedRows`): the lanes find them together, a lane a row.
+    """The friction triples after a sweep's rows (contact torsion), in row order, each by
+    :func:`.sweep.friction_triple_visit` on the pooled normal load of its patch ring. A triple's normal is a contact
+    whose next row is staged as a spin row (:class:`.sweep.StagedRows`), found by the lanes together.
 
-    A triple's metric is its contact's record's (three eigenvalues and the eigenbasis as a quaternion), formed
-    once per solve by the writer (:func:`.walk_rows.support_rows_kernel`), and loads with the ring ahead of the
-    reduction. A linked sweep's contact units store each normal's ring members behind its record at entry
-    (:func:`contact_units`), a triple's too: the visit pools them from the record, and a longer ring (or a sweep
-    without them) walks the ring.
+    Its metric is its contact's record's (eigenvalues and eigenbasis quaternion), formed once a solve by the writer
+    (:func:`.walk_rows.support_rows_kernel`) and loaded with the ring ahead of the reduction; a linked sweep's units
+    store each normal's ring members behind its record (:func:`contact_units`), else the visit walks the ring.
     """
     record = _record("contact_records.shape[2]", "head")
     ring = rows.ring_load("head", "pooled")
