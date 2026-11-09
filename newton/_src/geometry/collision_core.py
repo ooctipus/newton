@@ -1533,65 +1533,69 @@ def mesh_vs_convex_cell_hits(
     index in :attr:`MeshCells.sorted_slots`; :func:`mesh_vs_convex_hit_candidates` scans them, one thread a hit.
     """
     grid = mesh_cells.grids[grid_index]
-    for level in range(16):
-        if (grid.levels >> level) & 1 == 0:
-            continue
-        shift = MESH_CELLS_LEVEL_SHIFT * level
-        qlo = wp.vec3i(lo0[0] >> shift, lo0[1] >> shift, lo0[2] >> shift)
-        qhi = wp.vec3i(hi0[0] >> shift, hi0[1] >> shift, hi0[2] >> shift)
-        list_start = mesh_cells.level_start[grid.level_start + level]
-        list_count = mesh_cells.level_start[grid.level_start + level + 1] - list_start
-        blo = wp.vec3i(qlo[0] >> 2, qlo[1] >> 2, qlo[2] >> 2)
-        nbx = (qhi[0] >> 2) - blo[0] + 1
-        nby = (qhi[1] >> 2) - blo[1] + 1
-        # Look the range's blocks up, or walk the level's occupied cells when they are fewer.
-        n = nbx * nby * ((qhi[2] >> 2) - blo[2] + 1)
-        by_list = n > list_count
-        if by_list:
-            n = list_count
-        size = grid.cell * float(1 << shift)
-        inv_size = grid.inv_cell / float(1 << shift)
-        for k in range(n):
-            # Item k's occupied cells (bits of a block) and its first cell's slot: a block of the range, or the
-            # level's k-th occupied cell alone. A cell's slot is the first plus the occupied cells below its bit.
-            b = wp.vec3i(blo[0] + k % nbx, blo[1] + (k // nbx) % nby, blo[2] + k // (nbx * nby))
-            mask = wp.uint64(0)
-            first = list_start + k
-            bits = wp.uint64(0)
+    occupied = grid.levels
+    level = int(0)
+    while occupied != 0:
+        if occupied & 1 != 0:
+            shift = MESH_CELLS_LEVEL_SHIFT * level
+            qlo = wp.vec3i(lo0[0] >> shift, lo0[1] >> shift, lo0[2] >> shift)
+            qhi = wp.vec3i(hi0[0] >> shift, hi0[1] >> shift, hi0[2] >> shift)
+            list_start = mesh_cells.level_start[grid.level_start + level]
+            list_count = mesh_cells.level_start[grid.level_start + level + 1] - list_start
+            blo = wp.vec3i(qlo[0] >> 2, qlo[1] >> 2, qlo[2] >> 2)
+            nbx = (qhi[0] >> 2) - blo[0] + 1
+            nby = (qhi[1] >> 2) - blo[1] + 1
+            # Look the range's blocks up, or walk the level's occupied cells when they are fewer.
+            n = nbx * nby * ((qhi[2] >> 2) - blo[2] + 1)
+            by_list = n > list_count
             if by_list:
-                cell = mesh_cells_key_cell(mesh_cells.sorted_slots[first].key)
-                b = wp.vec3i(cell[0] >> 2, cell[1] >> 2, cell[2] >> 2)
-                mask = wp.uint64(1) << wp.uint64((cell[0] & 3) + 4 * (cell[1] & 3) + 16 * (cell[2] & 3))
-                if (
-                    cell[0] >= qlo[0]
-                    and cell[0] <= qhi[0]
-                    and cell[1] >= qlo[1]
-                    and cell[1] <= qhi[1]
-                    and cell[2] >= qlo[2]
-                    and cell[2] <= qhi[2]
-                ):
-                    bits = mask
-            else:
-                block = mesh_cells_find_block(mesh_cells, grid, mesh_cells_block_key(level, b[0], b[1], b[2]))
-                mask = block.mask
-                first = block.first
-                bits = mask & mesh_cells_block_range(b, qlo, qhi)
-            while bits != wp.uint64(0):
-                below = (bits & (~bits + wp.uint64(1))) - wp.uint64(1)
-                bit = mesh_cells_popcount(below)
-                slot_index = first + mesh_cells_popcount(mask & below)
-                slot = mesh_cells.sorted_slots[slot_index]
-                cell_lower = grid.origin + size * wp.vec3(
-                    float(4 * b[0] + (bit & 3)), float(4 * b[1] + ((bit >> 2) & 3)), float(4 * b[2] + (bit >> 4))
-                )
-                union_lo, union_hi, union_bounded = mesh_cells_slot_box(slot, cell_lower, size)
-                if mesh_cells_slot_overlaps(slot, query_lower, query_upper, cell_lower, inv_size) and (
-                    not union_bounded or mesh_cells_box_meets_slabs(union_lo, union_hi, slab0, slab1, slab2, slab_half)
-                ):
-                    out = wp.atomic_add(hit_count, 0, 1)
-                    if out < hits.shape[0]:
-                        hits[out] = wp.vec2i(pair_index, slot_index)
-                bits = bits & (bits - wp.uint64(1))
+                n = list_count
+            size = grid.cell * float(1 << shift)
+            inv_size = grid.inv_cell / float(1 << shift)
+            for k in range(n):
+                # Item k's occupied cells (bits of a block) and its first cell's slot: a block of the range, or the
+                # level's k-th occupied cell alone. A cell's slot is the first plus the occupied cells below its bit.
+                b = wp.vec3i(blo[0] + k % nbx, blo[1] + (k // nbx) % nby, blo[2] + k // (nbx * nby))
+                mask = wp.uint64(0)
+                first = list_start + k
+                bits = wp.uint64(0)
+                if by_list:
+                    cell = mesh_cells_key_cell(mesh_cells.sorted_slots[first].key)
+                    b = wp.vec3i(cell[0] >> 2, cell[1] >> 2, cell[2] >> 2)
+                    mask = wp.uint64(1) << wp.uint64((cell[0] & 3) + 4 * (cell[1] & 3) + 16 * (cell[2] & 3))
+                    if (
+                        cell[0] >= qlo[0]
+                        and cell[0] <= qhi[0]
+                        and cell[1] >= qlo[1]
+                        and cell[1] <= qhi[1]
+                        and cell[2] >= qlo[2]
+                        and cell[2] <= qhi[2]
+                    ):
+                        bits = mask
+                else:
+                    block = mesh_cells_find_block(mesh_cells, grid, mesh_cells_block_key(level, b[0], b[1], b[2]))
+                    mask = block.mask
+                    first = block.first
+                    bits = mask & mesh_cells_block_range(b, qlo, qhi)
+                while bits != wp.uint64(0):
+                    below = (bits & (~bits + wp.uint64(1))) - wp.uint64(1)
+                    bit = mesh_cells_popcount(below)
+                    slot_index = first + mesh_cells_popcount(mask & below)
+                    slot = mesh_cells.sorted_slots[slot_index]
+                    cell_lower = grid.origin + size * wp.vec3(
+                        float(4 * b[0] + (bit & 3)), float(4 * b[1] + ((bit >> 2) & 3)), float(4 * b[2] + (bit >> 4))
+                    )
+                    union_lo, union_hi, union_bounded = mesh_cells_slot_box(slot, cell_lower, size)
+                    if mesh_cells_slot_overlaps(slot, query_lower, query_upper, cell_lower, inv_size) and (
+                        not union_bounded
+                        or mesh_cells_box_meets_slabs(union_lo, union_hi, slab0, slab1, slab2, slab_half)
+                    ):
+                        out = wp.atomic_add(hit_count, 0, 1)
+                        if out < hits.shape[0]:
+                            hits[out] = wp.vec2i(pair_index, slot_index)
+                    bits = bits & (bits - wp.uint64(1))
+        occupied = occupied >> 1
+        level += 1
 
 
 @wp.func
