@@ -34,6 +34,7 @@ from newton._src.geometry.mesh_cells import (
 )
 from newton._src.geometry.narrow_phase import NarrowPhase
 from newton._src.geometry.support_function import GenericShapeData, pack_mesh_ptr
+from newton._src.geometry.terrain_contacts import TerrainFeatures
 from newton._src.geometry.types import GeoType
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
@@ -591,7 +592,106 @@ def test_mesh_data_built_once(test, device):
     test.assertEqual(int(kw["contact_count"].numpy()[0]), contacts)
 
 
+def _sheet_scene(device, *, mesh: bool, seed: int, n: int = 33, hx: float = 1.6):
+    """A random lattice surface, as a heightfield or as its triangle mesh, under spheres, capsules, boxes and cylinders
+    (each body in its own world).
+
+    The mesh has two triangles per cell on the heightfield's diagonal, its vertices at the lattice positions and at the
+    heights the heightfield decodes to, so both shapes are one surface.
+    """
+    rng = np.random.default_rng(seed)
+    data = (np.round(rng.uniform(0.0, 0.1, (n, n)) / 0.005) * 0.005).astype(np.float32)
+    field = newton.Heightfield(data=data, nrow=n, ncol=n, hx=hx, hy=hx)
+    probe = newton.ModelBuilder()
+    probe.add_shape_heightfield(heightfield=field)
+    z = TerrainFeatures(probe.finalize(device="cpu")).heights.numpy()[: n * n].reshape(n, n)
+    builder = newton.ModelBuilder()
+    cfg = builder.ShapeConfig(margin=0.01, gap=0.01)
+    if mesh:
+        lattice = (np.float64(-hx) + np.arange(n) * (2.0 * hx / (n - 1))).astype(np.float32)
+        xx, yy = np.meshgrid(lattice, lattice, indexing="xy")
+        vertices = np.stack([xx.ravel(), yy.ravel(), z.ravel()], 1).astype(np.float32)
+        p00 = (np.arange(n - 1)[:, None] * n + np.arange(n - 1)[None, :]).ravel()
+        triangles = np.concatenate([np.stack([p00, p00 + 1, p00 + n + 1], 1), np.stack([p00, p00 + n + 1, p00 + n], 1)])
+        builder.add_shape_mesh(
+            -1, mesh=newton.Mesh(vertices, triangles.astype(np.int32), compute_inertia=False), cfg=cfg
+        )
+    else:
+        builder.add_shape_heightfield(heightfield=field, cfg=cfg)
+    dx = 2.0 * hx / (n - 1)
+    for i in range(24):
+        builder.begin_world()
+        x, y = rng.uniform(-1.2, 1.2, 2)
+        c, r = int((x + hx) / dx), int((y + hx) / dx)
+        z0 = float(z[r : r + 2, c : c + 2].max())
+        q = wp.quat_from_axis_angle(wp.normalize(wp.vec3(*rng.normal(size=3))), float(rng.uniform(0.0, 3.0)))
+        body = builder.add_body(xform=wp.transform(wp.vec3(x, y, z0 + rng.uniform(-0.01, 0.05)), q))
+        kind = i % 4
+        if kind == 0:
+            builder.add_shape_sphere(body, radius=0.03, cfg=cfg)
+        elif kind == 1:
+            builder.add_shape_capsule(body, radius=0.025, half_height=0.06, cfg=cfg)
+        elif kind == 2:
+            builder.add_shape_box(body, hx=0.05, hy=0.04, hz=0.03, cfg=cfg)
+        else:
+            builder.add_shape_cylinder(body, radius=0.03, half_height=0.04, cfg=cfg)
+        builder.end_world()
+    return builder.finalize(device=device)
+
+
+def _deepest_gaps(model):
+    """Collide the model's initial state; per partner shape (on a body), the smallest signed gap of its contacts."""
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=1 << 14, max_triangle_pairs=1 << 16)
+    contacts = pipeline.contacts()
+    state = model.state()
+    pipeline.collide(state, contacts)
+    count = int(contacts.rigid_contact_count.numpy()[0])
+    shapes = np.stack([contacts.rigid_contact_shape0.numpy()[:count], contacts.rigid_contact_shape1.numpy()[:count]])
+    points = (contacts.rigid_contact_point0.numpy()[:count], contacts.rigid_contact_point1.numpy()[:count])
+    normal = contacts.rigid_contact_normal.numpy()[:count]
+    margin = contacts.rigid_contact_margin0.numpy()[:count] + contacts.rigid_contact_margin1.numpy()[:count]
+    body = model.shape_body.numpy()
+    body_q = state.body_q.numpy()
+    world = []
+    for side in range(2):
+        out = np.array(points[side], dtype=np.float64)
+        for k in range(count):
+            b = body[shapes[side, k]]
+            if b >= 0:
+                pose = wp.transform(wp.vec3(*body_q[b][:3]), wp.quat(*body_q[b][3:7]))
+                out[k] = wp.transform_point(pose, wp.vec3(*points[side][k]))
+        world.append(out)
+    gap = np.einsum("ij,ij->i", normal, world[1] - world[0]) - margin
+    partner = np.where(body[shapes[1]] >= 0, shapes[1], shapes[0])
+    deepest = {}
+    for s, g in zip(partner, gap, strict=True):
+        deepest[int(s)] = min(deepest.get(int(s), np.inf), float(g))
+    return deepest, pipeline
+
+
+def test_mesh_sheet_matches_heightfield(test, device):
+    """The same surface as a heightfield and as its static triangle mesh: the mesh path finds the heightfield's contacts.
+
+    Every partner within its contact band of the surface or penetrating it by less than 2 cm touches both, and its
+    deepest gap is the same within float32 rounding (the heightfield's contacts are the terrain law's, exact in
+    float64 windows). Deeper, the two differ by nature: a heightfield is a solid below its surface, a triangle sheet
+    only a surface. A model whose only terrain is a mesh builds no terrain law.
+    """
+    for seed in (6, 7, 8):
+        on_heightfield, _ = _deepest_gaps(_sheet_scene(device, mesh=False, seed=seed))
+        on_mesh, pipeline = _deepest_gaps(_sheet_scene(device, mesh=True, seed=seed))
+        test.assertIsNone(pipeline._terrain_law_decision)
+        test.assertEqual(pipeline._terrain_law_reason, "No heightfield pair.")
+        test.assertLessEqual(set(on_mesh), set(on_heightfield))
+        shallow = [s for s, g in on_heightfield.items() if g > -0.02]
+        test.assertGreaterEqual(len(shallow), 5)
+        for s in shallow:
+            test.assertIn(s, on_mesh, f"seed {seed}: partner {s} touches the heightfield only")
+            test.assertAlmostEqual(on_mesh[s], on_heightfield[s], delta=1.0e-5, msg=f"seed {seed}, partner {s}")
+
+
 for _test in (
+    test_mesh_sheet_matches_heightfield,
     test_mesh_data_built_once,
     test_non_finite_pose_meets_nothing,
     test_build_registers_surface_cells,

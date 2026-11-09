@@ -130,11 +130,6 @@ from ..utils.heightfield import (
 )
 
 _SPARSE_GJK_PAIR_CAPACITY_THRESHOLD = 1_000_000
-TERRAIN_LAW_PARTNER = wp.constant(1)
-"""A shape's terrain-law role (:meth:`NarrowPhase.set_terrain_law_roles`): a partner whose pairs with the law's surfaces
-(heightfields and the static meshes it reads) the law writes."""
-TERRAIN_LAW_MESH_SURFACE = wp.constant(2)
-"""A shape's terrain-law role: a static triangle mesh the law reads as a surface (its cell table)."""
 # CUDA lane midphase: pairs with more cells than this move to the lane pass, which
 # gives each of them this many lanes. Replayed on recorded rough-terrain pair
 # lists, these values cut the warp iterations of the height test by 40-69% and the
@@ -576,7 +571,7 @@ def create_narrow_phase_primitive_kernel(
         shape_sdf_index: wp.array[wp.int32],
         shape_edge_range: wp.array[wp.vec2i],
         shape_unit_scale_sdf: wp.array[wp.int32],
-        terrain_law_role: wp.array[wp.int32],
+        terrain_law_partner: wp.array[wp.int32],
         writer_data: Any,
         total_num_threads: int,
         # Output: pairs that need GJK/MPR processing
@@ -693,8 +688,8 @@ def create_narrow_phase_primitive_kernel(
                 else:
                     hf_pair = wp.vec2i(shape_b, shape_a)
                 # The terrain law writes the contacts of its partners' heightfield pairs.
-                if terrain_law_role.shape[0] > 0:
-                    if terrain_law_role[hf_pair[1]] == TERRAIN_LAW_PARTNER:
+                if terrain_law_partner.shape[0] > 0:
+                    if terrain_law_partner[hf_pair[1]] != 0:
                         continue
                 idx = wp.atomic_add(shape_pairs_mesh_count, 0, 1)
                 if idx < shape_pairs_mesh.shape[0]:
@@ -706,14 +701,6 @@ def create_narrow_phase_primitive_kernel(
             # =====================================================================
             is_mesh_a = type_a == GeoType.MESH
             is_mesh_b = type_b == GeoType.MESH
-            # The terrain law writes the contacts of its partners' pairs with the static meshes it reads as surfaces.
-            if (is_mesh_a or is_mesh_b) and terrain_law_role.shape[0] > 0:
-                role_a = terrain_law_role[shape_a]
-                role_b = terrain_law_role[shape_b]
-                if (role_a == TERRAIN_LAW_MESH_SURFACE and role_b == TERRAIN_LAW_PARTNER) or (
-                    role_b == TERRAIN_LAW_MESH_SURFACE and role_a == TERRAIN_LAW_PARTNER
-                ):
-                    continue
             is_box_a = type_a == GeoType.BOX
             is_box_b = type_b == GeoType.BOX
             is_plane_a = type_a == GeoType.PLANE
@@ -3809,8 +3796,8 @@ class NarrowPhase:
             # CollisionPipeline enables this diagnostic only for unit-scale SDF queries.
             self._shape_unit_scale_sdf = wp.zeros(0, dtype=wp.int32, device=device)
             self._unit_scale_sdf_rescaled = wp.zeros(0, dtype=wp.int32, device=device)
-            # Per shape, its role in the terrain law (TERRAIN_LAW_PARTNER, TERRAIN_LAW_MESH_SURFACE; empty: none).
-            self._terrain_law_role = wp.zeros(0, dtype=wp.int32, device=device)
+            # Per shape, nonzero for a partner whose heightfield pairs the terrain law writes (empty: none).
+            self._terrain_law_partner = wp.zeros(0, dtype=wp.int32, device=device)
             det_capacity = contact_max if contact_max is not None else max_candidate_pairs
             if deterministic and det_capacity > 0:
                 self._sort_key_array = wp.zeros(det_capacity, dtype=wp.int64, device=device)
@@ -4475,7 +4462,7 @@ class NarrowPhase:
                 shape_sdf_index,
                 shape_edge_range,
                 self._shape_unit_scale_sdf,
-                self._terrain_law_role,
+                self._terrain_law_partner,
                 writer_data,
                 self.total_num_threads,
             ],
@@ -5432,23 +5419,21 @@ class NarrowPhase:
                 record_tape=False,
             )
 
-    def set_terrain_law_roles(self, role: wp.array | None) -> None:
-        """Leave the surface pairs of some partner shapes to the terrain law, which writes their contacts.
+    def set_terrain_law_partners(self, partner: wp.array | None) -> None:
+        """Leave the heightfield pairs of some partner shapes to the terrain law, which writes their contacts.
 
         Set outside graph capture, before the first capture: a captured collide keeps the array it launched with.
 
         Args:
-            role: Per shape (int32, one entry per shape): :data:`TERRAIN_LAW_PARTNER` for a partner whose pairs with
-                heightfields and with the law's static mesh surfaces the primitive kernel drops instead of routing
-                them to the terrain or mesh route, :data:`TERRAIN_LAW_MESH_SURFACE` for a static mesh the law reads as
-                a surface, else 0; ``None`` routes every pair.
+            partner: Per shape, nonzero for a partner whose heightfield pairs the primitive kernel drops instead of
+                routing them to the terrain route (int32, one entry per shape); ``None`` routes every pair.
         """
-        if role is None:
-            self._terrain_law_role = wp.zeros(0, dtype=wp.int32, device=self.device)
+        if partner is None:
+            self._terrain_law_partner = wp.zeros(0, dtype=wp.int32, device=self.device)
             return
-        if role.dtype != wp.int32 or role.ndim != 1:
-            raise ValueError("The terrain law's shape roles must be a one-dimensional int32 array")
-        self._terrain_law_role = role
+        if partner.dtype != wp.int32 or partner.ndim != 1:
+            raise ValueError("The terrain law's partner mask must be a one-dimensional int32 array")
+        self._terrain_law_partner = partner
 
     def check_buffer_capacity(self) -> None:
         """Raise at a safe host boundary if any narrow-phase verification flag is set.

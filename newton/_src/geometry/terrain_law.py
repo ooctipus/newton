@@ -26,10 +26,10 @@ Surface model:
   of up to 9.5 um on a 200 m terrain). The window's origin is the exact grid position in float64 and a core
   point enters the frame rounded once, so its position against the grid is exact to a float32 rounding of a
   window-sized number (a float32 origin rounds by up to 4 um 100 m out). The law reads one surface type, vertex
-  heights in float32 on a lattice (:attr:`TerrainFeatureData.heights`): a heightfield's are decoded once at build as
-  the narrow phase decodes them on the CPU (float32 ``min_z + e * (max_z - min_z)``, each operation rounded once, on
+  heights in float32 on a lattice (:attr:`TerrainFeatureData.heights`), a heightfield's decoded once at build as the
+  narrow phase decodes them on the CPU (float32 ``min_z + e * (max_z - min_z)``, each operation rounded once, on
   every device: :func:`terrain_decode` uses explicitly rounded operations, which no floating-point contraction
-  fuses), a static mesh's cell table holds its own (:mod:`~newton._src.geometry.terrain_cells_mesh`).
+  fuses).
 * Canonical edge functions. The face test of a triangle at an edge and the edge's own test read one value
   ``s = (k - v0) . m`` (``m`` the triangle's in-plane outward normal at the edge, ``v0`` the edge's lower vertex),
   and the edge's slab test and the vertex's Voronoi test read one value ``(k - v) . (w - v)``. Both sides of every
@@ -275,8 +275,8 @@ answer of a block's lanes is the first candidate any lane has."""
 
 @wp.struct
 class TerrainSurfaceInfo:
-    """One surface's layout in the law's static arrays: a heightfield, or a static mesh's cell table
-    (:mod:`~newton._src.geometry.terrain_cells_mesh`), both a lattice of vertex heights in the shape's frame."""
+    """One surface's layout in the law's static arrays: a heightfield, a lattice of vertex heights in the shape's
+    frame."""
 
     data_offset: int
     """First vertex height of the surface in :attr:`TerrainFeatureData.heights`."""
@@ -290,8 +290,7 @@ class TerrainSurfaceInfo:
     y0: float
     """Position of vertex row 0 along y [m] (a heightfield's ``-hy``), float32."""
     x0_64: wp.float64
-    """:attr:`x0` in float64, exact (the window origin's: a mesh lattice's fitted origin, a heightfield's float32
-    ``-hx``)."""
+    """:attr:`x0` in float64, exact (the window origin's: a heightfield's float32 ``-hx``)."""
     y0_64: wp.float64
     """:attr:`y0` in float64, exact."""
     min_z: float
@@ -306,7 +305,7 @@ class TerrainSurfaceInfo:
     dx64: wp.float64
     """Cell size along x [m] in float64: the window origin's and the cluster planes' grid step (a heightfield's
     ``2 hx / (ncol - 1)`` from the float32 ``hx``, computed once on the host, bit for bit the device's float64
-    division; a mesh lattice's fitted size)."""
+    division)."""
     dy64: wp.float64
     """Cell size along y [m] in float64."""
     triangle_offset: int
@@ -343,7 +342,7 @@ class TerrainFeatureData:
 
     heights: wp.array[wp.float32]
     """Every surface's vertex heights [m], concatenated: a heightfield's elevations decoded once at build
-    (:func:`terrain_decode`, the narrow phase's CPU decode), a mesh table's ``vertex_z``."""
+    (:func:`terrain_decode`, the narrow phase's CPU decode)."""
     clusters: wp.array[wp.int32]
     """Per triangle: the dense index of its cluster's plane record, or ``-(1 + local triangle id)`` alone."""
     planes: wp.array[TerrainClusterPlane]
