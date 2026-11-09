@@ -22,26 +22,13 @@ def tree_joints(model):
 
 
 def make_plan(model, operator, *, complete=True):
-    """Check the tree, scalar laws and packed operator before allocating caches.
-
-    Returns the group's layout, its lanes left to the owner's launch rule, and its template tree's parents.
-    """
-    worlds, arts = int(model.world_count), int(model.articulation_count)
+    """The layout of a held group (its lanes left to the owner's launch rule) and its template tree's parents. The plan
+    groups trees of one topology on the template's pattern; what their data can still refuse is checked: coverage, one
+    owner a body, uniform parents and joint kinds (a sparse size group, a forest's rest trees), the kinematic roots."""
     owned, counts_by_art = tree_joints(model)
-    if worlds < 1 or arts < 1:
-        raise ValueError("Cached trees require articulations")
     starts = model.articulation_start.numpy()
     group = operator.plan.group_to_art.numpy()
-    art_world = operator.plan.art_to_world.numpy()
-    if (
-        group.ndim != 1
-        or not len(group)
-        or np.any(group < 0)
-        or np.any(group >= arts)
-        or len(np.unique(group)) != len(group)
-    ):
-        raise ValueError("Cached tree groups require distinct valid articulation IDs")
-    if complete and not np.array_equal(np.sort(group), np.arange(arts)):
+    if complete and not np.array_equal(np.sort(group), np.arange(model.articulation_count)):
         raise ValueError("Cached tree groups must cover every articulation exactly once")
     # A forest group owns several consecutive articulations of one world; the
     # operator names them and the group map holds the first of each.
@@ -64,11 +51,8 @@ def make_plan(model, operator, *, complete=True):
     if bodies < 1 or not np.all(counts_by_art[group] == counts_by_art[group[0]]):
         raise ValueError("Cached tree groups require uniform body counts")
     joints = starts[group, None] + np.arange(bodies)
-    qd = model.joint_qd_start.numpy()
-    counts = np.diff(qd)[joints]
+    counts = np.diff(model.joint_qd_start.numpy())[joints]
     dofs = int(counts[0].sum())
-    if art_world.shape != (arts,) or np.any(art_world < 0) or np.any(art_world >= worlds):
-        raise ValueError("Cached tree articulations require valid world ownership")
     child = model.joint_child.numpy()
     if np.unique(child[owned]).size != np.count_nonzero(owned):
         raise ValueError("Cached tree publication requires each body at most once")
@@ -96,10 +80,6 @@ def make_plan(model, operator, *, complete=True):
     free_roots = [int(types[0, root]) in FREE_JOINTS for root in root_locals]
     linear, angular = model.joint_dof_dim.numpy()[joints[0]].T
     own_bias = bool(np.any((types[0] == int(JointType.D6)) & (((linear > 0) & (angular > 0)) | (angular > 1))))
-    if not np.all(counts == counts[0]) or not np.all(
-        qd[joints] - qd[starts[group, None]] == qd[joints[0]] - qd[starts[group[0]]]
-    ):
-        raise ValueError("Cached trees require uniform coordinate indexing")
     # Kinematic bodies. A prescribed group owns whole free bodies whose six
     # coordinates are all kinematic, and a forest's zero family a kinematic
     # free root; neither holds a factor. Held groups serve kinematic
@@ -125,10 +105,6 @@ def make_plan(model, operator, *, complete=True):
                 raise ValueError("A dynamic forest root must not be kinematic")
     tree = TreePlan.build(parent, counts[0])
     mass = tree.factor
-    if not np.array_equal(mass.lookup, operator.host["index"]) or not np.array_equal(
-        mass.dof_joint, operator.host["dof_joint"]
-    ):
-        raise ValueError("Cached tree and held operator use different coordinates")
     offsets = tuple(int(v) for v in np.cumsum(np.concatenate(([0], counts[0])))[list(root_locals)])
     layout = TreeLayout(
         bodies,
