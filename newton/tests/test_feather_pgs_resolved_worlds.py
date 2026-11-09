@@ -45,17 +45,14 @@ def make_case(*, free=False):
     data.art_to_world = a([0, 0], wp.int32)
     data.free_bodies = wp.array([0] if free else [], dtype=wp.int32, device=device)
     data.predicted_twist = a(np.zeros((2, 6)), wp.spatial_vector)
-    data.use_published = 0
     data.articulation_dof_start = a([0, width], wp.int32)
     data.articulation_response_dof_count = a([width, 0], wp.int32)
     data.prescribed_articulation = a([0, 1], wp.int32)
     data.is_free_rigid = a([int(free), 0], wp.int32)
     data.body_flags = a([1, 2], wp.int32)
     data.body_has_response_dofs = a([1, 0], wp.int32)
-    data.body_response_dof_mask = a([(1 << width) - 1, 0], wp.uint32)
     data.body_q = a([[0, 0, 0, 0, 0, 0, 1]] * 2, wp.transform)
     data.body_v_s = a([[999, 999, 999, 0, 0, 0], [0, 0, 0, 0, 0, 0]], wp.spatial_vector)
-    data.joint_S_s = a(np.eye(6, dtype=np.float32)[:width], wp.spatial_vector)
     data.articulation_origin = a([[0, 0, 0], [0, 0, 0]], wp.vec3)
     data.max_linear_velocity = a([np.inf, np.inf])
     data.max_angular_velocity = a([np.inf, np.inf])
@@ -75,32 +72,28 @@ def make_case(*, free=False):
     for name in ("rejected", "resolved", "checked_limits", "checked_normals", "global_invalid"):
         setattr(scratch, name, a([0], wp.int32))
     scratch.minimum_residual = a([0])
-    scratch.body_twist = a(np.zeros((2, 6)), wp.spatial_vector)
-    scratch.body_valid = a([0, 0], wp.int32)
     return data, raw, scratch
 
 
-def evaluate(data, raw, scratch, *, enabled=1, published=False, row_bound=(100, 100)):
-    """Execute the decision kernels on CPU, without initializing CUDA.
+def evaluate(data, raw, scratch, *, row_bound=(100, 100), axes=None):
+    """Execute the decision kernels on CPU, without initializing CUDA, on the case's own twist publication.
 
-    ``published`` reads the predictor twists in ``data.predicted_twist``, as
-    on the held-tree owner, instead of running the classifier's body pass.
+    A responding body's published twist sums its articulation's coordinate axes (``axes``, a row a coordinate; the
+    unit twists by default) against ``data.v_hat``, as the held-tree predictor does.
     ``row_bound`` (dense, matrix-free) bounds the worlds' rows; the default leaves every case room.
     """
-    data.use_published = int(published)
+    v = data.v_hat.numpy()
+    axes = np.eye(6, dtype=np.float32)[: min(v.size, 6)] if axes is None else np.asarray(axes, np.float32)
+    start, count = data.articulation_dof_start.numpy(), data.articulation_response_dof_count.numpy()
+    responding = data.body_has_response_dofs.numpy()
+    twists = np.zeros((responding.size, 6), np.float32)
+    for body, art in enumerate(data.body_to_articulation.numpy()):
+        if responding[body]:
+            with np.errstate(invalid="ignore"):
+                twists[body] = axes[start[art] : start[art] + count[art]].T @ v[start[art] : start[art] + count[art]]
+    data.predicted_twist.assign(twists)
     free_normals = wp.zeros(scratch.resolved.shape[0], dtype=wp.int32, device="cpu")
-    rw.launch(
-        data,
-        raw,
-        scratch,
-        1,
-        "cpu",
-        enabled=enabled,
-        published=published,
-        row_bound=row_bound,
-        free_normals=free_normals,
-        free_line=0,
-    )
+    rw.launch(data, raw, scratch, 1, "cpu", row_bound=row_bound, free_normals=free_normals, free_line=0)
     return int(scratch.resolved.numpy()[0])
 
 
@@ -188,7 +181,6 @@ class TestResolvedWorlds(unittest.TestCase):
         self.assertEqual(evaluate(data, raw, scratch), 1)
         data.v_hat.assign([-2.0])
         self.assertEqual(evaluate(data, raw, scratch), 0)
-        np.testing.assert_array_equal(scratch.body_twist.numpy()[0], [-2, 0, 0, 0, 0, 0])
         self.assertEqual(int(scratch.checked_normals.numpy()[0]), 1)
 
     def test_position_limits_both_sides_and_speculative_bias(self):
@@ -250,14 +242,12 @@ class TestResolvedWorlds(unittest.TestCase):
         self.assertEqual(evaluate(data, raw, scratch), 1)
 
     def test_kinematic_body_of_a_responding_tree_keeps_its_rows(self):
-        """A contact with a kinematic body of a responding articulation is never resolved, on either twist source.
+        """A contact with a kinematic body of a responding articulation is never resolved.
 
         Such a body, a free body made kinematic after construction or a
-        kinematic root of a dynamic tree, moves with its prescribed velocity.
-        The body pass rejects its world. The published path reads no twist
-        for it and took it as still, resolving a world it was closing on.
-        Persistent patch friction runs the capacity-bounded decision, whose
-        contact check must reject the same contacts under both twist sources.
+        kinematic root of a dynamic tree, moves with its prescribed velocity,
+        which the predictor does not publish: taken as still, it resolved a
+        world it was closing on.
         """
         data, raw, scratch = make_case()
 
@@ -268,20 +258,16 @@ class TestResolvedWorlds(unittest.TestCase):
         data.world_dof_indices, data.world_dof_count = a([[0, 1]], wp.int32), a([2], wp.int32)
         data.limit_q_index = a([-1, -1], wp.int32)
         data.lower, data.upper, data.v_hat = a([-np.inf] * 2), a([np.inf] * 2), a([0.0, 0.0])
-        data.joint_S_s = a(np.eye(6, dtype=np.float32)[[0, 0]], wp.spatial_vector)
         data.articulation_response_dof_count = a([1, 1], wp.int32)
         data.prescribed_articulation = a([0, 0], wp.int32)
         data.body_has_response_dofs = a([1, 1], wp.int32)
-        data.body_response_dof_mask = a([1, 1], wp.uint32)
         # (flag of body 1, its speed along the contact normal, resolved); positive speed closes the gap.
         for flag, speed, resolved in ((1, 2.0, 0), (1, -2.0, 1), (2, 2.0, 0), (2, -2.0, 0)):
             data.body_flags.assign([1, flag])
             data.v_hat.assign([0.0, speed])
-            data.predicted_twist.assign([[0.0] * 6, [speed, 0.0, 0.0, 0.0, 0.0, 0.0]])
-            for published in (False, True):
-                with self.subTest(kinematic=flag == 2, speed=speed, published=published):
-                    self.assertEqual(evaluate(data, raw, scratch, published=published), resolved)
-                    self.assertEqual(int(scratch.checked_normals.numpy()[0]), 1)
+            with self.subTest(kinematic=flag == 2, speed=speed):
+                self.assertEqual(evaluate(data, raw, scratch, axes=np.eye(6)[[0, 0]]), resolved)
+                self.assertEqual(int(scratch.checked_normals.numpy()[0]), 1)
 
     def test_zero_friction_radius_allows_slip(self):
         """Accept zero normal impulse without requiring zero tangential speed."""
@@ -323,21 +309,22 @@ class TestResolvedWorlds(unittest.TestCase):
     def test_one_point_and_large_world_translation(self):
         """Act at the contact's one point, with stable endpoint-relative geometry."""
         data, raw, scratch = make_case()
-        data.joint_S_s.assign([[0, 0, 0, 0, 0, 1]])
         data.v_hat.assign([1])
         raw.point0.assign([[0, 1, 0]])
         raw.point1.assign([[0, -1, 0]])
-        self.assertEqual(evaluate(data, raw, scratch), 1)
+        self.assertEqual(evaluate(data, raw, scratch, axes=[[0, 0, 0, 0, 0, 1]]), 1)
         data.body_q.assign([[1e6, 0, 0, 0, 0, 0, 1]] * 2)
         data.articulation_origin.assign([[1e6, 0, 0]] * 2)
-        self.assertEqual(evaluate(data, raw, scratch), 1)
+        self.assertEqual(evaluate(data, raw, scratch, axes=[[0, 0, 0, 0, 0, 1]]), 1)
         self.assertEqual(float(scratch.minimum_residual.numpy()[0]), 0.0)
 
-    def test_empty_disabled_and_transient_decisions(self):
-        """Clear prior acceptance on disabled and newly violating calls."""
+    def test_empty_and_transient_decisions(self):
+        """Clear prior acceptance on a newly violating call; a world without candidates resolves."""
         data, raw, scratch = make_case()
         self.assertEqual(evaluate(data, raw, scratch), 1)
-        self.assertEqual(evaluate(data, raw, scratch, enabled=0), 0)
+        data.v_hat.assign([-2.0])
+        self.assertEqual(evaluate(data, raw, scratch), 0)
+        data.v_hat.assign([0.0])
         self.assertEqual(evaluate(data, raw, scratch), 1)
         raw.count.assign([0])
         self.assertEqual(evaluate(data, raw, scratch), 1)
@@ -377,7 +364,7 @@ class TestResolvedWorlds(unittest.TestCase):
         """Keep unsupported solvers disabled without raising or launching."""
         solver = SimpleNamespace(
             model=SimpleNamespace(device=wp.get_device("cpu")),
-            spec=SimpleNamespace(pins=SolverFeatherPGS.Pins()),
+            spec=SimpleNamespace(pins=SolverFeatherPGS.Pins(), classes=SimpleNamespace(support="dense")),
             laws=SimpleNamespace(set=plain_laws(warm_start=True)),
         )
         classifier = rw.ResolvedWorlds(solver)
@@ -456,16 +443,20 @@ class TestResolvedWorlds(unittest.TestCase):
         self.assertEqual(evaluate(data, raw, scratch, row_bound=(100, 2)), 0)
 
     def test_patch_friction_admission(self):
-        """Admit persistent patch friction on the dense route and contact torsion (a separating contact carries no
-        spin either), not compliance."""
+        """Admit separable laws (contact torsion too: a separating contact carries no spin) on the dense support with
+        every twist published; decline compliance, another support and a missing publication."""
         solver = _admissible_solver()
-        self.assertTrue(rw.supported(solver))
+        self.assertIsNone(rw.decline(solver))
         solver.laws.set = plain_laws(torsion=True)
-        self.assertTrue(rw.supported(solver))
+        self.assertIsNone(rw.decline(solver))
         solver.laws.set = plain_laws(compliance=True)
-        self.assertFalse(rw.supported(solver))
+        self.assertIsNotNone(rw.decline(solver))
+        solver.laws.set = plain_laws()
         solver.spec.classes.support = "factor"
-        self.assertFalse(rw.supported(solver))
+        self.assertIsNotNone(rw.decline(solver))
+        solver.spec.classes.support = "dense"
+        solver._predicted_twist_arts_host = np.zeros(1, np.int32)
+        self.assertIsNotNone(rw.decline(solver))
 
     def test_classify_bounds_worlds_by_the_solver_capacities(self):
         """The decision gets the solver's dense and matrix-free row capacities."""
@@ -475,11 +466,10 @@ class TestResolvedWorlds(unittest.TestCase):
         state = model.state()
         newton.eval_fk(model, state.joint_q, state.joint_qd, state)
         pipeline.collide(state, contacts)
-        augmented = SimpleNamespace(
-            body_v_s=wp.zeros(model.body_count, dtype=wp.spatial_vector, device="cpu"),
-            joint_S_s=wp.zeros(model.joint_dof_count, dtype=wp.spatial_vector, device="cpu"),
-        )
+        augmented = SimpleNamespace(body_v_s=wp.zeros(model.body_count, dtype=wp.spatial_vector, device="cpu"))
         solver = SolverFeatherPGS(model, dense_max_constraints=48, mf_max_constraints=24)
+        # The CPU's predictor publishes no twists: its admission and the decision launch are mocked, zeros stand in.
+        solver._predicted_twist = wp.zeros(model.body_count, dtype=wp.spatial_vector, device="cpu")
         # The classifier owns only the CUDA matrix-free route; split mode keeps no world DOF map,
         # which the mocked decision launch never reads.
         solver.forest = dataclasses.replace(
@@ -508,20 +498,15 @@ class TestResolvedWorlds(unittest.TestCase):
 
 
 def _admissible_solver():
-    """A stand-in solver whose policy the classifier admits, on any device."""
+    """A stand-in solver whose policy the classifier admits: one responding articulation, its twist published."""
     return SimpleNamespace(
-        factor=SimpleNamespace(block_count=0),
-        model=SimpleNamespace(device=SimpleNamespace(is_cuda=False)),
         spec=SimpleNamespace(pins=SolverFeatherPGS.Pins(), classes=SimpleNamespace(support="dense")),
         forest=SimpleNamespace(
-            max_world_dofs=29,
-            world_dof_indices=1,
-            world_dof_count=1,
-            body_response_dof_mask=1,
-            body_has_response_dofs=1,
+            articulation_response_dof_count=wp.array([6], dtype=wp.int32, device="cpu"),
+            prescribed_articulation=wp.array([0], dtype=wp.int32, device="cpu"),
         ),
-        laws=SimpleNamespace(set=plain_laws(), mimic_count=0, link_count=0, joint_limit_q_index=1),
-        options=SimpleNamespace(enable_bilateral_preelimination=False, diagnostics=SolverFeatherPGS.Diagnostics()),
+        laws=SimpleNamespace(set=plain_laws(), link_count=0),
+        _predicted_twist_arts_host=np.ones(1, np.int32),
     )
 
 
@@ -530,7 +515,6 @@ def _rollout(
     *,
     classifier,
     steps=90,
-    published=True,
     history=None,
     solver_kwargs=None,
     toss_every=2,
@@ -545,7 +529,7 @@ def _rollout(
     """
     # The classifier evaluates the serial matrix-free sweep's law: the pin keeps the Jacobi tiers (case K4, an arm
     # beside a free body) off these worlds.
-    pins = {"storage": "dense", "predicted_twists": bool(published), "tiers": 0}
+    pins = {"storage": "dense", "tiers": 0}
     if not classifier:
         pins["claims"] = ()
     solver = SolverFeatherPGS(
@@ -648,8 +632,9 @@ def _tossed_spheres(device, worlds=4):
     return model
 
 
+@unittest.skipUnless(wp.get_device().is_cuda, "The predictor publishes its body twists on CUDA")
 class TestResolvedWorldsDevice(unittest.TestCase):
-    """The classifier on the default device: one rule decides which rows exist on the CPU and on CUDA."""
+    """The classifier on the default device, where the predictor publishes its twists."""
 
     def test_resolved_worlds_match_the_complete_path(self):
         """Fixed-base arms over free boxes: resolved worlds step identically with no rows built."""
@@ -756,25 +741,6 @@ class TestResolvedWorldsDevice(unittest.TestCase):
             np.testing.assert_array_equal(record["valid"], expected["valid"], err_msg=f"previous.valid at step {step}")
         assert_history_close(solver, plain_solver)
         np.testing.assert_allclose(poses, plain, atol=1.0e-5, rtol=0.0)
-
-    def test_published_twists_match_the_body_pass(self):
-        """The predictor's published twists decide the same worlds as the classifier's own body pass."""
-        model = _build(wp.get_device(), worlds=6)
-        own_solver, own_poses, own_masks = _rollout(model, classifier=True, published=False)
-        solver, poses, masks = _rollout(model, classifier=True)
-        self.assertFalse(own_solver.sweep.resolved_worlds_owner.published)
-        if not model.device.is_cuda:
-            # The predictor publishes its twists from a CUDA register scan (tree_kinetic_owner): the CPU's classifier
-            # builds them itself in both runs.
-            self.assertFalse(solver.sweep.resolved_worlds_owner.published)
-            return
-        self.assertTrue(solver.sweep.resolved_worlds_owner.published)
-        self.assertGreater(int(masks.sum()), 0)
-        # The published twist sums the same axis terms in tree order; a residual within
-        # rounding of the margin may decide differently on a handful of steps.
-        self.assertGreater(float(np.mean(masks == own_masks)), 0.995)
-        np.testing.assert_allclose(poses[:, :, :3], own_poses[:, :, :3], atol=1.0e-5, rtol=0.0)
-        np.testing.assert_allclose(poses[:, :, 3:], own_poses[:, :, 3:], atol=1.0e-5, rtol=0.0)
 
 
 def _walkers(device, worlds=4):

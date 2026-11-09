@@ -472,7 +472,6 @@ class TestFeatherPGSTreeBodyFlags(unittest.TestCase):
                         self.assertIsInstance(solver.factor.held, HeldTree)
                         classifier = solver.sweep.resolved_worlds_owner
                         self.assertIsNotNone(classifier, solver.sweep.resolved_worlds_reason)
-                        self.assertTrue(classifier.published)
                     if toggle:
                         self._notify(model, solver, driver, KINEMATIC)
                     runs[cached] = self._drive(model, solver, driver, axis, steps=8)
