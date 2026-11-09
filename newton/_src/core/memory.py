@@ -70,8 +70,8 @@ __all__ = [
 # ---------------------------------------------------------------------------------------------------------------------
 
 STATIC_SHARED_BYTES = 48 * 1024
-"""Static shared memory a block may declare in an offline build [B]: ptxas 13.2 rejects more on every architecture
-(0xc000)."""
+"""Static shared memory a block may declare in a build ptxas assembles [B] (offline, or a CUBIN of Warp's NVRTC):
+ptxas rejects more on every architecture (0xc000)."""
 
 CPU_STAGING_BYTES = 4 * 1024 * 1024
 """The working set a CPU block may declare [B]: the CPU's one thread runs the block and keeps it on its stack (an
@@ -82,8 +82,8 @@ RESERVED_SHARED_BYTES = 1024
 
 STATIC_SHARED_BUDGETS: dict[int, int] = {}
 """Static shared memory budgets [B] by architecture (``Device.arch``) that a probe measured below the opt-in
-maximum less the driver's reservation; :func:`static_budget` reads them first. None is recorded: the RTX PRO 6000
-(sm_120, opt-in 101,376 B) loads a kernel declaring 100,352 B and refuses one declaring 101,376 B, the GB300 (sm_103)
+maximum less the driver's reservation; :func:`static_budget` reads them first. None is recorded: from PTX, the RTX
+PRO 6000 (sm_120, opt-in 101,376 B) loads a kernel declaring 100,352 B and refuses 101,376 B, the GB300 (sm_103)
 loads 231,424 B and refuses 232,448 B (measured 2026-10-27)."""
 
 REFERENCE_ARCH = 120
@@ -180,7 +180,11 @@ def _read(alias: str) -> Device:
     found = wp.get_device(alias)
     if not found.is_cuda:
         return CPU
-    return Device.of(int(found.arch), int(found.sm_count), int(found.max_shared_memory_per_block))
+    opt_in = int(found.max_shared_memory_per_block)
+    if found.get_cuda_output_format() != "ptx":
+        # Warp's NVRTC assembles a CUBIN (its toolkit is newer than the driver): ptxas admits an offline build's budget.
+        opt_in = min(opt_in, STATIC_SHARED_BYTES + RESERVED_SHARED_BYTES)
+    return Device.of(int(found.arch), int(found.sm_count), opt_in)
 
 
 def device(identifier=None) -> Device:
@@ -220,9 +224,9 @@ def static_budget(arch: int) -> int:
     """Static shared memory a block of a kernel built for the CUDA architecture ``arch`` may declare [B].
 
     The one place a device's static budget is read: a probe's measured budget of the architecture
-    (:data:`STATIC_SHARED_BUDGETS`), else the opt-in maximum per block that Warp reports for a CUDA device of the
-    architecture less the driver's reservation (:attr:`Device.shared_per_block`), else, with no such device (an
-    offline build, the CPU), :data:`STATIC_SHARED_BYTES`.
+    (:data:`STATIC_SHARED_BUDGETS`), else a CUDA device's (:attr:`Device.shared_per_block`): the opt-in maximum per
+    block less the driver's reservation where the driver assembles Warp's PTX, else :data:`STATIC_SHARED_BYTES`, as
+    with no such device (an offline build, the CPU).
     """
     if arch in STATIC_SHARED_BUDGETS:
         return int(STATIC_SHARED_BUDGETS[arch])
