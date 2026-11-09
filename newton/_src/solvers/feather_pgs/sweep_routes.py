@@ -20,7 +20,7 @@ from ...core.memory import REGISTERS_PER_THREAD, Buffer, Place, Staging
 from . import kernel_template, sweep_units
 from .factor.walk import FREE_BODY_WALK, WALK_COORDINATE, WALK_LINK, WalkTrees, walk_down_prelude
 from .kernel_template import Dispatch
-from .packed_rows import CLASS_SIDES, PACKED_SIDES
+from .packed_rows import CLASS_SIDES, PACKED_SIDES_BY_SIDE, PACKED_SIDES_DENSE
 from .response_operator import Lanes, SparseFactor, Velocity
 from .row_inputs import RowArgument
 from .row_laws import ROW_CONTACT, ROW_FRICTION, ROW_JOINT_LIMIT, ROW_JOINT_VELOCITY_LIMIT, ROW_SPEED, ROW_TORSION
@@ -1097,7 +1097,9 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         {dense.stores("i")}
     }}{free_stores}
 {end_first_warp}"""
-    sides = (PACKED_SIDES, *((CLASS_SIDES,) if sweep.support_classes else ()))
+    # The rows' layout is the configuration's: rows as wide as the world (and no classes) sit at their coordinates.
+    packed = PACKED_SIDES_DENSE if not sweep.support_classes and max_row_dofs == D else PACKED_SIDES_BY_SIDE
+    sides = (packed, *((CLASS_SIDES,) if sweep.support_classes else ()))
     return sweep.native(body, lanes=lanes, rows=sides, walks=(FREE_BODY_WALKS,)), staging
 
 
