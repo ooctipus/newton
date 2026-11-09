@@ -1417,12 +1417,13 @@ MF_PARALLEL = Route(
     pins={"tiers": 32, "sink": "store"},
     expect={"sweep.route": "matrix_free_gs", "sweep.tiers.family": "parallel"},
 )
-# The allegro recipe: the tiers walk the seeds of the one writer's EMIT sink on a model they fit (the legged scene).
+# The allegro recipe: the tiers walk the seeds of the one writer's EMIT sink on a model they fit (the legged scene), on
+# any device (a pin: the GB300's 32-row tier keeps the store, sweep_routes_tiers.emits).
 EMIT_PARALLEL = Route(
     "emit_parallel",
     "cuda",
     options=_MF,
-    pins={"tiers": 32},
+    pins={"tiers": 32, "sink": "emit"},
     expect={
         "sweep.route": "matrix_free_gs",
         "sweep.tiers.family": "parallel",
