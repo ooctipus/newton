@@ -3,9 +3,11 @@
 
 """Check and resolve FPGS options before topology admission."""
 
+import functools
+import inspect
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, make_dataclass
 from typing import Any, Literal
 
 from .solve_policy import SOLVE_READOUTS
@@ -115,49 +117,27 @@ class Diagnostics:
         return first <= step < first + steps
 
 
-@dataclass(frozen=True)
-class Options:
-    """Every option of :class:`.SolverFeatherPGS`, as the solver applies it (:func:`check_options`).
-
-    Numbers are coerced and checked by the rule tables and the switches of :data:`_BOOLEANS` made booleans;
-    ``diagnostics`` is a :class:`Diagnostics` (``None`` gives the default); every other option is as given.
-    ``friction_anchor_beta`` is the request (``None`` for the default): the row laws resolve it.
-    """
-
-    angular_damping: Any
-    update_mass_matrix_interval: Any
-    enable_contact_friction: Any
-    contact_friction_gap_threshold: Any
-    enable_joint_limits: Any
-    enable_bilateral_preelimination: bool
-    joint_limit_activation_gap: float
-    enable_joint_velocity_limits: Any
-    velocity_limit_activation_fraction: float
-    pgs_iterations: Any
-    pgs_beta: Any
-    pgs_cfm: Any
-    pgs_omega: Any
-    pgs_contact_regularization: float
-    dense_max_constraints: int
-    pgs_warmstart: bool
-    mf_max_constraints: int
-    restitution_velocity_threshold: float
-    contact_speculative_scale: float
-    contact_gap_gate: float
-    enable_restitution: bool
-    same_articulation_contact_gap_gate: float
-    articulation_pair_contact_gap_gate: float
-    pgs_warmstart_decay: float
-    friction_anchor_beta: Any
-    contact_torsion: bool
-    contact_compliance: bool
-    diagnostics: Diagnostics
+@functools.cache
+def declared_options(init) -> dict:
+    """Every option of the constructor ``init`` with its declared default: the parameters after ``self`` and ``model``,
+    but the test pins, which are the spec's (``routes.spec.pins``), not an option."""
+    parameters = list(inspect.signature(init).parameters.values())[2:]
+    return {parameter.name: parameter.default for parameter in parameters if parameter.name != "pins"}
 
 
-def check_options(options: Mapping[str, Any]) -> Options:
-    """Return every option as the solver applies it (:class:`Options`), after checking each.
+@functools.cache
+def _record(names: tuple[str, ...]) -> type:
+    return make_dataclass("Options", names, frozen=True)
+
+
+def check_options(init, options: Mapping[str, Any]):
+    """Return every option of the constructor ``init`` (:func:`declared_options`) as the solver applies it, after
+    checking each: a frozen record, numbers coerced by the rule tables and the switches of :data:`_BOOLEANS` booleans,
+    ``diagnostics`` a :class:`Diagnostics` (``None`` gives the default), every other option as given
+    (``friction_anchor_beta`` the request, ``None`` for the default: the row laws resolve it).
 
     Args:
+        init: The constructor.
         options: The constructor's options by keyword (more keys are ignored).
 
     Raises:
@@ -187,4 +167,5 @@ def check_options(options: Mapping[str, Any]) -> Options:
     elif not isinstance(diagnostics, Diagnostics):
         raise TypeError(f"diagnostics must be None or a SolverFeatherPGS.Diagnostics, got {type(diagnostics).__name__}")
     checked["diagnostics"] = diagnostics
-    return Options(**{name: checked.get(name, options[name]) for name in Options.__dataclass_fields__})
+    names = tuple(declared_options(init))
+    return _record(names)(**{name: checked.get(name, options[name]) for name in names})

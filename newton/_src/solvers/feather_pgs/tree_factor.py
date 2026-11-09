@@ -144,7 +144,7 @@ class TreeFactor:
 
     Args:
         model: The solver's model.
-        options: The solver's physics options (:class:`.configuration.Options`).
+        options: The solver's physics options (:func:`.configuration.check_options`).
     """
 
     def __init__(self, model, options):

@@ -12,11 +12,11 @@ tuples become lists.
 """
 
 import dataclasses
-import functools
-import inspect
 import math
 
 import numpy as np
+
+from .configuration import declared_options
 
 
 def kernel_key(kernel) -> str | None:
@@ -47,14 +47,6 @@ def json_value(value):
     return f"<{type(value).__name__}>"
 
 
-@functools.cache
-def _declared_defaults(init) -> dict:
-    """Every option's declared default: the parameters after ``self`` and ``model``, but the test pins, which are the
-    spec's (``routes.spec.pins``), not an option."""
-    parameters = list(inspect.signature(init).parameters.values())[2:]
-    return {parameter.name: parameter.default for parameter in parameters if parameter.name != "pins"}
-
-
 def _is_default(value, default) -> bool:
     if value is default:
         return True
@@ -69,7 +61,7 @@ def applied_options(init, arguments: dict, applied) -> dict:
     """Record every constructor option's requested, declared-default and applied value.
 
     ``arguments`` is ``locals()`` taken as the constructor's first statement, ``applied`` the options in effect after
-    construction's gates and clamps (:class:`.configuration.Options`): an option whose owner, tier or stream was not
+    construction's gates and clamps (:func:`.configuration.check_options`): an option whose owner, tier or stream was not
     built reports its off value (``False``, ``0`` or ``"off"``). ``routes`` names the owners. ``source`` is
     ``"argument"`` when the requested value differs from the declared default and ``"default"`` otherwise; Python
     cannot tell an omitted option from one passed with its default value.
@@ -81,7 +73,7 @@ def applied_options(init, arguments: dict, applied) -> dict:
             "default": json_value(default),
             "source": "default" if _is_default(arguments[name], default) else "argument",
         }
-        for name, default in _declared_defaults(init).items()
+        for name, default in declared_options(init).items()
     }
 
 

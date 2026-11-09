@@ -314,7 +314,7 @@ class Placement:
     Args:
         spec: The step's spec: the forest and the row capacities.
         model: The solver's model.
-        options: The solver's physics options (:class:`.configuration.Options`).
+        options: The solver's physics options (:func:`.configuration.check_options`).
         laws: The row laws.
         factor: The tree factor.
     """

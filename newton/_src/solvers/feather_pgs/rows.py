@@ -3,7 +3,7 @@
 
 """The row laws' tables: what every row writer reads besides the step's state, built once per model.
 
-:meth:`RowLaws.build` resolves the laws from the options (:class:`.configuration.Options`) and the model:
+:meth:`RowLaws.build` resolves the laws from the options (:func:`.configuration.check_options`) and the model:
 
 - the contact law: the friction law (one wrench a friction region, its stick's gain ``friction_anchor_beta > 0``), the
   regularization weight, the restitution threshold, the shape materials and contact torsion;
@@ -35,7 +35,6 @@ from ...core.execution import Shape, Work, launch, shape
 from ...sim import Contacts, Model, State
 from ...sim.enums import JointType
 from . import field_group, host_index, prefix_rows, walk_rows
-from .configuration import Options
 from .contact_input import ContactInput
 from .contact_input import bind as bind_contact_input
 from .device_preludes import lane_group
@@ -283,7 +282,7 @@ class RowLaws:
         cls,
         model: Model,
         forest: ForestPlan,
-        options: Options,
+        options,
     ) -> RowLaws:
         """Resolve the row laws and build their tables.
 
