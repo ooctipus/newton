@@ -47,7 +47,7 @@
   "friction_patches._prepare": "3cf4e2614b6c8e07e35a43276d92f2fbd8af00aea69f388b4926a4ac4e63b556",
   "friction_patches._prepare_frame": "0d3cb2881b0b8ada0f2b29c4a362433daadda03cffd77e6771830ec1ae172d6c",
   "friction_patches._reset_history": "d1024f6372fbe2dbca2bf4cedf19a137e51b9d00c4a64bc0f6e954e72bbf325e",
-  "friction_patches._scan_worlds": "86a0b140f987202d75c5b146724b38876104f4c9e074cb2bcdcf861a6147c59b",
+  "friction_patches._scan_worlds": "55ebbe74ecc28e42e394da68a499a3b58689e10bf528f7953addba521e7659e7",
   "friction_patches._sort_worlds": "6a10e1d30fd52fb2fdcf2bc9ed7a8e7bc161f4712a2f20cc1286c46aacfc9e56",
   "friction_patches.link_patch_routes": "35da86f8a9880d1608ff3976fd8093fffe908208add8b2f3b2f4e604ea5a8648",
   "held_tree._diagonal_geometry": "13c3a58ef772d3bf86d108568dad1df54b152469155edd2c622c0f71aa60e92e",
