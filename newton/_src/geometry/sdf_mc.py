@@ -14,6 +14,7 @@ triangles per voxel along the zero-crossing.
 
 import numpy as np
 import warp as wp
+from warp.geometry import IsoSurfaceMarchingCubes
 
 from newton._src.core.types import MAXVAL
 
@@ -47,19 +48,6 @@ range and still yield an unreliable normal after division.  A threshold of
 triangles contribute near-zero area anyway)."""
 
 
-def _get_marching_cubes_class():
-    """Find Warp's marching-cubes class without using its deprecated alias.
-
-    Remove the fallback once Newton's minimum Warp version provides
-    ``warp.geometry.IsoSurfaceMarchingCubes``.
-    """
-    try:
-        from warp.geometry import IsoSurfaceMarchingCubes  # noqa: PLC0415 - Warp 1.17 lacks this module
-    except ImportError:
-        return wp.MarchingCubes
-    return IsoSurfaceMarchingCubes
-
-
 def get_mc_tables(device):
     """Create marching cubes lookup tables on the specified device.
 
@@ -89,7 +77,7 @@ def get_mc_tables(device):
         ]
     )
 
-    marching_cubes = _get_marching_cubes_class()
+    marching_cubes = IsoSurfaceMarchingCubes
     tri_local_inds = np.asarray(marching_cubes.TRI_LOCAL_INDICES, dtype=np.int32)
     tri_range_table = wp.array(marching_cubes.CASE_TO_TRI_RANGE, dtype=wp.int32, device=device)
     tri_local_inds_table = wp.array(tri_local_inds, dtype=wp.int32, device=device)
