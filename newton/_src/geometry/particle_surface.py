@@ -29,11 +29,11 @@ from typing import Literal, NamedTuple
 
 import numpy as np
 import warp as wp
+from warp.geometry import IsoSurfaceMarchingCubes
 
 from . import particle_surface_kernels as kernels
 from . import particle_surface_sparse_kernels as sparse_kernels
 from .hashtable import HashTable
-from .sdf_mc import _get_marching_cubes_class
 
 __all__ = ["ParticleSurface", "extract_particle_surface"]
 
@@ -207,7 +207,7 @@ class _ParticleSurfaceSparseWorkspace(_ParticleSurfaceWorkspaceBase):
         self.topology_voxel_mask = wp.zeros(1, dtype=wp.int32, device=self.device)
         self.topology_voxel_count = wp.zeros(1, dtype=wp.uint32, device=self.device)
         self.rebuild_status = wp.zeros(5, dtype=wp.uint32, device=self.device)
-        marching_cubes = _get_marching_cubes_class()
+        marching_cubes = IsoSurfaceMarchingCubes
         corner_offsets = marching_cubes.CUBE_CORNER_OFFSETS
         edge_offsets: list[tuple[int, int, int]] = []
         edge_axes: list[int] = []
