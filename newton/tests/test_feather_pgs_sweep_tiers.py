@@ -96,7 +96,7 @@ def _source(args, kwargs) -> str:
 def _operator() -> TransposedResponse:
     """A 32-row tier's response operator over 18 coordinates, the walked rows of trees of 12 and 6."""
     lanes = Lanes(32)
-    return TransposedResponse(18, 32, WalkedRows(12, 6, 0, 12, 18, 36, lanes, read=""), lanes)
+    return TransposedResponse.of(18, 32, WalkedRows(12, 6, 0, 12, 18, 36, lanes, read=""), lanes)
 
 
 class TestParallelTier(unittest.TestCase):

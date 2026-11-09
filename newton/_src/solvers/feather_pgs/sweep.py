@@ -3190,14 +3190,14 @@ def jacobi_limit_pass(rows: JacobiRows, op, *, pad: str = "    ") -> str:
     nothing at the sweeps' fixed point, where no row is violated, and gives the limits the last word of a world
     stopped early, as the Gauss-Seidel sweeps' end pass does. The staged rows' walked support class forms
     ``(A x)_i = Z_i . w`` on ``w = Y^T x`` (:meth:`~.TransposedResponse.push_prologue`) with ``A_ii = |Z_i|^2 + cfm``
-    in one ladder, and each push adds its change to ``w`` (:meth:`~.TransposedResponse.staged`).
+    in one ladder, and each push adds its change to ``w`` (the staged entries' actions on ``w``).
     """
     if not rows.limits:
         raise ValueError("the last word pushes the velocity-limit rows the rows stage")
     # The first warp pushes; on the CPU the one thread is the group's every lane.
     group = rows.group
     warp = 1 if group.serial else 32
-    pushed = op.staged(Lanes(warp))
+    pushed = dataclasses.replace(op, lanes=Lanes(warp))
     body = "            "
     lines = [
         "{",

@@ -195,9 +195,9 @@ def parallel_source(tier: TierSweep) -> tuple[str, Staging]:
         frame=tuple(int(cap) for cap in frame),
         classes=len(classes),
     )
-    op = TransposedResponse(D, AM, walked, row_lanes)
+    op = TransposedResponse.of(D, AM, walked, row_lanes)
     # Each lane's row registers; on the CPU arrays over the virtual lanes.
-    group = VirtualLanes(NT, serial, (*op.registers(), *store.registers()))
+    group = VirtualLanes(NT, serial, (*op.lane_registers(), *store.registers()))
     store = dataclasses.replace(store, group=group)
     op = dataclasses.replace(op, group=group)
     dot = (Buffer("s_dot", "float", NT // 32),) if NT > 32 and not serial else ()
