@@ -159,7 +159,7 @@ def _step_tripods(device, *, threads=None, steps=4, deterministic=True, launched
     )
     contacts = pipeline.contacts()
     control = model.control()
-    cap = rows._CONTACT_BUILD_THREAD_CAP if threads is None else threads
+    forced = rows._contact_threads if threads is None else (lambda count, device: min(count, threads))
     launch = wp.launch
 
     def record_launch(kernel, *args, **kwargs):
@@ -169,7 +169,7 @@ def _step_tripods(device, *, threads=None, steps=4, deterministic=True, launched
 
     records = []
     with (
-        mock.patch.object(rows, "_CONTACT_BUILD_THREAD_CAP", cap),
+        mock.patch.object(rows, "_contact_threads", forced),
         mock.patch.object(wp, "launch", record_launch),
     ):
         for _ in range(steps):
