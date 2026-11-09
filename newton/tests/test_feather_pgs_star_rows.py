@@ -377,5 +377,49 @@ class TestStarRows(unittest.TestCase):
             self.assertTrue(solvers[0].laws.friction_patches.previous.valid.numpy().any(), "Anchors must carry history")
 
 
+class TestCoordinateLevels(unittest.TestCase):
+    def test_levels_step_as_the_rows_in_order(self):
+        """Under the general placement the star's units of one entry step by level before the rows in order (the
+        coordinate levels): the limits and the level support's patch ring take levels, the ring coupled to the chain
+        stays in order, and the steps are the rows in order bit for bit (the schedule emptied)."""
+        for device in ("cpu", *(str(d) for d in wp.get_cuda_devices())):
+            model = build_solver_fixture(device)
+            runs = []
+            for empty in (False, True):
+                solver = newton.solvers.SolverFeatherPGS(
+                    model,
+                    pgs_iterations=8,
+                    enable_joint_limits=True,
+                    dense_max_constraints=320,
+                    pins=newton.solvers.SolverFeatherPGS.Pins(placement="general"),
+                )
+                self.assertIn("_levels", solver.get_path_selection()["routes"]["sweep"]["mf_gs"])
+                schedule, leveled = solver.sweep.schedule_diagonal, []
+
+                def emptied(schedule=schedule, solver=solver, empty=empty, leveled=leveled):
+                    schedule()
+                    placement = solver.placement
+                    counts = placement.sparse_contact_level_count.numpy()
+                    offsets = placement.sparse_contact_level_offsets.numpy()
+                    leveled.append([int(offsets[w, c]) for w, c in enumerate(counts)])
+                    if empty:
+                        placement.sparse_contact_level_count.zero_()
+
+                solver.sweep.schedule_diagonal = emptied
+                state, following, control = model.state(), model.state(), model.control()
+                newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+                contacts = newton.Contacts(24, 0, device=device)
+                install_patch_contacts(model, state, contacts)
+                for _ in range(6):
+                    solver.step(state, following, control, contacts, 1 / 240)
+                    state, following = following, state
+                solver.check_constraint_capacity()
+                runs.append((leveled, {f: getattr(state, f).numpy() for f in ("joint_q", "joint_qd", "body_q")}))
+            # Every world levels its limits and its level support's ring; the coupled ring's rows stay in order.
+            self.assertTrue(all(min(step) > 0 for step in runs[0][0]), runs[0][0])
+            for field, value in runs[0][1].items():
+                np.testing.assert_array_equal(value, runs[1][1][field], err_msg=f"{device} {field}")
+
+
 if __name__ == "__main__":
     unittest.main()
