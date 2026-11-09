@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import functools
 import itertools
 import unittest
 from unittest import mock
@@ -72,6 +73,7 @@ def colored(units: int = 1, solvers: list | None = None, parallelism: float = 0.
     ``parallelism`` units per color."""
     original = SolverFeatherPGS.__init__
 
+    @functools.wraps(original)  # the solver checks its options against its constructor's signature
     def init(self, *args, **kwargs):
         original(self, *args, **kwargs)
         if solvers is not None:
