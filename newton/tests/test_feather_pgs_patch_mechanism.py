@@ -732,7 +732,7 @@ def run_reference_differential(
     live_states = [state for state in (patches, twin) if state is not None]
     states = [*live_states, reference]
     rows = _Rows(scene, capacity, rng)
-    coverage = {"carried": 0, "released": 0, "unstored": 0, "live": 0}
+    coverage = {"carried": 0, "released": 0, "unstored": 0, "live": 0, "by_world": 0, "by_stream": 0}
     fraction = 0.1
     dt = 1.0 / 240.0
     for step, event in enumerate(plan):
@@ -791,6 +791,9 @@ def run_reference_differential(
         assert_same_patches(patches, reference, live, f"{context} build", twin)
         assert_empty_tail(patches, f"{context} build")
         coverage["live"] = max(coverage["live"], live)
+        extent = patches.extent.numpy()
+        coverage["by_world"] += int(extent[friction_patches._WORLD_EXTENT] > 0)
+        coverage["by_stream"] += int(extent[friction_patches._SORT_EXTENT] > 0)
         coverage["carried"] += int(np.count_nonzero(reference.current.source.numpy()[:live] >= 0))
         routes_present = (0, 1, 2) if rng.random() < 0.7 else (0, 1)
         rows.generate(reference, live, routes_present)
@@ -1153,13 +1156,13 @@ def _fill_sort_case(patches, live, rng, codes):
 
 
 def _patch_extent(end, live, size):
-    """Return the patch extent a prepare publishes: the slots to visit, then the live sort's extent."""
+    """Return the patch extent of a frame the stream sorts: the slots to visit, the live count, the live sort's extent."""
     extent = np.zeros(size, dtype=np.int32)
     rounds = 0
     while (int(SORT_CHUNK) << rounds) < live and rounds < int(MAX_MERGES):
         rounds += 1
-    extent[:3] = end, live, -(-live // int(SORT_CHUNK))
-    extent[3 : 3 + rounds] = live
+    extent[:4] = end, live, live, -(-live // int(SORT_CHUNK))
+    extent[4 : 4 + rounds] = live
     return extent
 
 
@@ -1219,12 +1222,15 @@ class TestPatchLiveSort(unittest.TestCase):
         for seed, threads in ((4, None), (5, (7, 5))):
             with self.subTest(seed=seed, threads=threads):
                 run_reference_differential("cpu", seed, capacity=160, threads=threads, live_sort=True)
-        # More than one chunk of live contacts runs the merges.
+        # Small worlds sort on their own lanes; worlds past _WORLD_CONTACTS sort the stream, and more than one chunk
+        # of live contacts runs the merges.
         plan = ("grow", "grow", "grow", "live", "sparse", "grow", "overflow", "live", "rebuild", "masked", "live")
-        coverage = run_reference_differential(
-            "cpu", 6, worlds=110, contacts=4096, capacity=4600, threads=(97, 61), live_sort=True, plan=plan
-        )
-        self.assertGreater(coverage["live"], 2048)
+        for worlds, bodies, kind in ((110, 4, "by_world"), (2, 400, "by_stream")):
+            coverage = run_reference_differential(
+                "cpu", 6, worlds=worlds, bodies=bodies, contacts=4096, capacity=4600, threads=(97, 61), plan=plan
+            )
+            self.assertGreater(coverage["live"], 2048)
+            self.assertGreater(coverage[kind], 0)
 
     @unittest.skipUnless(wp.is_cuda_available(), "the device sort needs CUDA")
     def test_live_sort_matches_on_the_device(self):
@@ -1582,9 +1588,10 @@ class TestPatchLaunchShapes(unittest.TestCase):
         original = wp.launch
 
         def record(kernel, **kwargs):
-            # Each launch strides over the slots by its own thread count.
+            # Each launch over the slots strides by its own thread count; the worlds' sort takes a lane group a world.
             arguments = [*kwargs.get("inputs", ()), *kwargs.get("outputs", ())]
-            stride = dict(zip((arg.label for arg in kernel.adj.args), arguments, strict=True))["threads"]
+            named = dict(zip((arg.label for arg in kernel.adj.args), arguments, strict=True))
+            stride = named.get("threads", named.get("lanes"))
             launched.add((kernel.key, kwargs["dim"], stride, kwargs.get("block_dim")))
             return original(kernel, **kwargs)
 
@@ -1592,7 +1599,14 @@ class TestPatchLaunchShapes(unittest.TestCase):
         with mock.patch.object(wp, "launch", record):
             state.build(scene.model, scene.state, scene.contacts)
         self.assertEqual(
-            launched, {("_prepare", 1536, 1536, None), ("_merge_runs", 1024, 1024, None), ("_build", 2048, 2048, 32)}
+            launched,
+            {
+                ("_prepare", 1536, 1536, None),
+                ("_copy_by_world", 1536, 1536, None),
+                ("_sort_worlds", (110, 1), 1, None),
+                ("_merge_runs", 1024, 1024, None),
+                ("_build", 2048, 2048, 32),
+            },
         )
 
     def test_launch_shapes_match_bitwise(self):
@@ -1919,7 +1933,7 @@ class TestPatchFrameReuse(unittest.TestCase):
                 launched.clear()
                 with mock.patch.object(wp, "launch", record):
                     patches.build(scene.model, scene.state, contacts)
-                self.assertEqual(launched, ["_prepare", "_build"])
+                self.assertEqual(launched, ["_prepare", "_copy_by_world", "_sort_worlds", "_build"])
                 np.testing.assert_array_equal(patches.sorted_frame.numpy(), -1)
 
 
@@ -2128,28 +2142,32 @@ class TestPatchFrameModes(unittest.TestCase):
         np.testing.assert_array_equal(patches.frame_status.numpy(), [0])
 
     def test_capture_kernels_load_at_construction(self):
-        """Load the module of the kernel that captured builds launch first when a CUDA patch state is built.
+        """Load the modules of the kernels that captured builds may launch first when a CUDA patch state is built.
 
-        Without it, the first capture would load that module. A stand-in
+        Without it, the first capture would load those modules. A stand-in
         CUDA device lets the CPU check which modules load; a CPU state loads
         none, since CPU captures build as eager ones do.
         """
         scene = _Scene("cpu", 49)
         phi = wp.zeros(128, dtype=wp.vec2, device="cpu")
         cuda = SimpleNamespace(is_cuda=True)
-        for reuse, expected in ((False, []), (True, ["_prepare_frame"])):
-            with self.subTest(reuse=reuse):
+        worlds = ["_scan_worlds", "_copy_by_world", "_sort_worlds"]
+        for reuse, expected in ((False, worlds), (True, [*worlds, "_prepare_frame"])):
+            with self.subTest(reuse=reuse), contextlib.ExitStack() as stack:
                 loaded = []
-                kernel = friction_patches._prepare_frame
-                with mock.patch.object(
-                    kernel.module,
-                    "load",
-                    side_effect=lambda device, key=kernel.key, loaded=loaded: loaded.append((key, device)),
-                ):
-                    patches = _FrictionPatchState(scene.model, 128, phi, reuse_frames=reuse)
-                    self.assertEqual(loaded, [], "a CPU state loads no module")
-                    patches.device = cuda
-                    patches._load_capture_modules()
+                for name in (*worlds, "_prepare_frame"):
+                    kernel = getattr(friction_patches, name)
+                    stack.enter_context(
+                        mock.patch.object(
+                            kernel.module,
+                            "load",
+                            side_effect=lambda device, *_, key=kernel.key, loaded=loaded: loaded.append((key, device)),
+                        )
+                    )
+                patches = _FrictionPatchState(scene.model, 128, phi, reuse_frames=reuse)
+                self.assertEqual(loaded, [], "a CPU state loads no module")
+                patches.device = cuda
+                patches._load_capture_modules()
                 self.assertEqual([key for key, _ in loaded], expected)
                 self.assertTrue(all(device is cuda for _, device in loaded))
 
@@ -2650,7 +2668,8 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
         )
         for live, capacity, key_bits, reason in cases:
             with self.subTest(capacity=capacity, key_bits=key_bits):
-                patches = SimpleNamespace(live_sort=live, capacity=capacity, key_bits=key_bits)
+                worlds = SimpleNamespace(count=np.zeros(3))
+                patches = SimpleNamespace(live_sort=live, capacity=capacity, key_bits=key_bits, worlds=worlds)
                 self.assertEqual(friction_patches._uses_live_sort(key_bits), live)
                 record = friction_patches._FrictionPatchState.record(patches)
                 self.assertEqual(

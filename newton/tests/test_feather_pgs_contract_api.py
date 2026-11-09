@@ -435,11 +435,12 @@ class _Run:
 
 def _carry_friction_history(source, target):
     """Give ``target`` the friction history ``source`` stores: its stored anchors (the previous patch frame, their
-    worlds and count) and the poses they were stored at."""
+    worlds, count and each world's first slot) and the poses they were stored at."""
     stored, kept = source.laws.friction_patches, target.laws.friction_patches
     for name, view in stored._previous_rows.views.items():
         kept._previous_rows.views[name].assign(view)
     kept.stored.assign(stored.stored)
+    kept.worlds.stored.assign(stored.worlds.stored)
     kept.previous_q.assign(stored.previous_q)
 
 
