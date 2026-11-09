@@ -361,8 +361,11 @@ class Example:
         self.graph = None
         if self.body_pair_reduction:
             self.pipeline.collide(self.state_0, self.contacts, dt=self.sim_dt)
+        self.capture()
+
+    def capture(self):
         # Even substep counts leave the same state buffer at frame boundaries.
-        if args.cuda_graph and self.model.device.is_cuda and self.sim_substeps % 2 == 0:
+        if self.args.cuda_graph and self.model.device.is_cuda and self.sim_substeps % 2 == 0:
             with wp.ScopedCapture(device=self.model.device) as capture:
                 self.simulate()
             self.graph = capture.graph
