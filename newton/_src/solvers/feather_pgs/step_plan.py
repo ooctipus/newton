@@ -223,7 +223,7 @@ class StepPlan:
         owners."""
         sweep = solver.sweep
         streams = (
-            ("dynamics", solver.factor.dynamics_stream),
+            ("dynamics", getattr(solver.factor.dynamics, "stream", None)),
             *((f"claim{i}", stream) for i, stream in enumerate(sweep.claim_streams)),
         )
         return cls(
@@ -356,15 +356,6 @@ class Step:
         solver._step += 1
         solver.factor.last_step_dt = self.dt
 
-    def fork(self, device, stream, owner, name: str, *arguments) -> None:
-        # The call on the side stream, after the work the device's current stream queued so far.
-        stream.wait_event(wp.get_stream(device).record_event())
-        with wp.ScopedStream(stream, sync_enter=False):
-            getattr(owner, name)(*arguments)
-
-    def join(self, device, stream) -> None:
-        wp.get_stream(device).wait_event(stream.record_event())
-
     def beside(self, beside: Beside, owner, name: str, *arguments) -> None:
         beside.start(partial(getattr(owner, name), *arguments))
 
@@ -444,10 +435,10 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
     device, limited, preelimination = model.device, options.enable_joint_velocity_limits, spec.laws.preelimination
 
     # The drives' stage takes the held plan's coordinates (a one-coordinate tree's predict decides its own drive) and
-    # overlaps FK/ID on the dynamics stream; the mask (refresh) joins them.
-    stream = factor.dynamics_stream
+    # overlaps FK/ID beside the step's stream (Beside); the mask (refresh) joins them.
+    overlap = factor.dynamics
     drives = bool(factor.parallel_drives and factor.held.prepares_drives)
-    forked = drives and stream is not None
+    forked = drives and overlap is not None
     drive = (factor, "prepare_drives", STATE_IN, CONTROL, DT, v_hat, v_out, factor.held.drive_dofs)
     free_roots = bool(forest.free_root_joint_count and forest.free_rigid_body_count)
     snapshots = ()
@@ -500,12 +491,12 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
         # Stages 1-3: the tree factor (the drives, FK/ID, the mass refresh and the factor's, the walk's refresh with the
         # clock), then the predictor v_hat and the free roots' corrections.
         (s1, "check_call", True, (cached_state_binding, "check_call", device, STATE_IN, STATE_OUT, DT)),
-        (s1, "drives_on_stream", forked, (STEP, "fork", device, stream, *drive)),
-        (s1, "drives", drives and stream is None, drive),
+        (s1, "drives_on_stream", forked, (STEP, "beside", overlap, *drive)),
+        (s1, "drives", drives and overlap is None, drive),
         (s1, "prescale", limited, (STEP, "prescale", factor, solver.qd_work)),
         (s1, "velocity", not limited, (STEP, "velocity")),
         (s1, "fk_id", True, (factor, "fk_id", STATE_IN, STATE_OUT, QD, DT)),
-        (s1, "join_drives", forked, (STEP, "join", device, stream)),
+        (s1, "join_drives", forked, (overlap, "join")),
         (s1, "refresh", True, (factor, "refresh", DT)),
         (s1, "advance_clock", factor.walk_arts is None, (factor, "advance_clock", DT)),
         (s1, "walk_step", factor.walk_arts is not None, (factor, "walk_step", STATE_IN, DT)),
