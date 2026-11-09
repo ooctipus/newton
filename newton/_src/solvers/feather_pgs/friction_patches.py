@@ -86,8 +86,8 @@ _SORT_EXTENT = wp.constant(2)
 _WORLD_EXTENT = wp.constant(2 + EXTENT_SIZE)
 # A frame whose worlds hold at most this many contacts each sorts every world on its own lanes, each lane holding
 # _WORLD_HELD of them at a time and ranking them in one pass over its world's; a frame with a larger world sorts the
-# stream. The scan of the worlds' counts takes one block.
-_WORLD_CONTACTS = wp.constant(512)
+# stream, unless its pair keys are too wide for the stream sort. The scan of the worlds' counts takes one block.
+_WORLD_CONTACTS = 512
 _WORLD_LANES = 32
 _WORLD_HELD = wp.constant(8)
 _HeldKeys = wp.types.vector(length=_WORLD_HELD, dtype=wp.int64)
@@ -520,9 +520,9 @@ def _prepare_frame(
 
 
 @wp.kernel(enable_backward=False, module="unique")
-def _scan_worlds(worlds: _PatchWorlds, extent: wp.array[int]):
+def _scan_worlds(worlds: _PatchWorlds, extent: wp.array[int], limit: int):
     """Start each world's slots past the lower worlds' contacts and clear the counts, in one block; publish whether
-    the worlds sort on their own lanes (none holds more than :data:`_WORLD_CONTACTS`) or the stream sort runs."""
+    the worlds sort on their own lanes (none holds more than ``limit`` contacts) or the stream sort runs."""
     _block, lane = wp.tid()
     buckets = worlds.count.shape[0]
     run = (buckets + wp.block_dim() - 1) // wp.block_dim()
@@ -543,7 +543,7 @@ def _scan_worlds(worlds: _PatchWorlds, extent: wp.array[int]):
         worlds.count[bucket] = 0
     if lane == 0:
         worlds.start[buckets] = live
-        on_lanes = largest <= _WORLD_CONTACTS
+        on_lanes = largest <= limit
         publish_sort_extent(extent, _SORT_EXTENT, wp.where(on_lanes, 0, live))
         extent[_WORLD_EXTENT] = wp.where(on_lanes, live, 0)
 
@@ -1199,13 +1199,9 @@ def _body_buckets(body_world):
 
 
 def _uses_live_sort(key_bits):
-    """Whether the pair sort orders only the live slots instead of the whole capacity.
-
-    It does whenever a chunk key, the pair key with an 11-bit slot appended,
-    stays below the pad bit (pair keys up to 51 bits: about 47 million bodies
-    and shapes); wider keys take the radix sort of the whole capacity. Both sorts
-    leave the unique (key, slot) order. The live sort's cost follows the live
-    contacts, the radix sort's the capacity.
+    """Whether the stream sort can order a frame's pairs: a chunk key, the pair key with an 11-bit slot appended,
+    stays below the pad bit (pair keys up to 51 bits: about 47 million bodies and shapes). With wider keys every world
+    sorts on its own lanes, whatever it holds; both leave the unique (key, slot) order.
     """
     return slot_keys_fit(key_bits)
 
@@ -1329,25 +1325,23 @@ class _FrictionPatchState:
         self._set_capacity(rows.rows)
 
     def _set_capacity(self, capacity):
-        """Hold the slots' capacity: the rows the radix fallback sorts and eager grids follow."""
+        """Hold the slots' capacity: the rows eager grids follow."""
         self.capacity = capacity
         self.build_block_dim = _BUILD_BLOCK_DIM
         self.live_sort = _uses_live_sort(self.key_bits)
         self._grids(capacity)
 
     def record(self) -> dict:
-        """The pair sort's record (``routes.friction.pair_sort``): by world, else the live slots' sort or the radix's."""
-        if self.live_sort:
-            stream = "orders only the live slots, so its cost follows the live contacts"
-        else:
-            stream = (
-                f"is the radix sort of the whole capacity: {self.key_bits}-bit pair keys leave no room for the live "
-                f"sort's {SLOT_BITS} slot bits"
-            )
+        """The pair sort's record (``routes.friction.pair_sort``): by world, else the stream's live slots."""
         reason = (
             f"Each world sorts its own contacts on its lanes while no world holds more than {_WORLD_CONTACTS}; "
-            f"a frame with a larger world sorts the stream, whose sort {stream}."
+            "a frame with a larger world sorts the stream, ordering only the live slots."
         )
+        if not self.live_sort:
+            reason = (
+                f"{self.key_bits}-bit pair keys leave no room for the stream sort's {SLOT_BITS} slot bits: every "
+                "world sorts its own contacts on its lanes, whatever it holds."
+            )
         return {
             "worlds": int(self.worlds.count.shape[0]),
             "world_contacts": int(_WORLD_CONTACTS),
@@ -1465,7 +1459,7 @@ class _FrictionPatchState:
         Every slot starts as the empty record _prepare writes: the sentinel key,
         its own index, and no owner or source. Bounded launches never revisit
         slots that still hold it. A built frame's keys and indices hold a second,
-        scratch half for the radix sort. The stored frame keeps what the next
+        scratch half for the stream sort. The stored frame keeps what the next
         build reads (_build_pair, _seed_contact; _store_contact writes it): one
         key and index a slot, which no sort visits, and none of the fields only
         a build reads (:data:`_BUILD_FIELDS`).
@@ -1711,7 +1705,7 @@ class _FrictionPatchState:
         wp.launch_tiled(
             _scan_worlds,
             dim=1,
-            inputs=[self.worlds, self.extent],
+            inputs=[self.worlds, self.extent, _WORLD_CONTACTS if self.live_sort else 2**31 - 1],
             block_dim=_SCAN_THREADS,
             device=self.device,
             record_tape=False,
@@ -1742,25 +1736,16 @@ class _FrictionPatchState:
         )
         if self.live_sort:
             self._sort_live()
-        else:
-            # Empty slots hold INT64_MAX, whose low key_bits are all ones: no pair
-            # key exceeds them, and the stable sort keeps live slots ahead of a tie.
-            # The radix sort covers today's rows: a capture of it is recaptured after growth.
-            self.pool.note_unbound()
-            wp.utils.radix_sort_pairs(self.current.keys, self.current.indices, self.capacity, end_bit=self.key_bits)
 
     def _sort_live(self):
         """Stably sort the live slots by pair key and leave every other slot untouched.
 
-        A stable sort of slots [0, live) from indices c is the unique order by
-        (key, c), which the full radix sort produces; slots past live already
-        hold the empty record that sort leaves there. The launches follow the
-        sort's work that the worlds' scan published: a capture launches the chunk
-        sort over the live chunks and only the merges the live slots need. The
-        scratch half starts at the ready rows, which a capture's updater
-        rewrites on every replay, and the kernels address the whole
-        reservation, of which the live slots, the scratch half and one chunk of
-        slack are mapped.
+        A stable sort of slots [0, live) from indices c is the unique order by (key, c), which each world's sort on
+        its lanes also gives; slots past live already hold the empty record. The launches follow the
+        sort's work that the worlds' scan published: a capture launches the chunk sort over the live chunks and only
+        the merges the live slots need. The scratch half starts at the ready rows, which a capture's updater rewrites
+        on every replay, and the kernels address the whole reservation, of which the live slots, the scratch half
+        and one chunk of slack are mapped.
         """
         launch_live_sort(
             self.pool,
