@@ -1207,17 +1207,16 @@ $copy
     };
 """
 
-_LEAVE_SLIPS = """        const int cap = walk.release.step.shape[1], steps = walk.release.step.shape[2];
-        for (int j = walk.release.count.data[art] - 1; j >= 0; --j) {
-            // Slip j's steps, one record each (WALK_STEP): its first holds the slip's coordinate.
-            const auto* records = walk.release.step.data + ((size_t)art * cap + j) * steps;
+_LEAVE_SLIPS = """        WALK_SLIPS(walk.release, art, true, [&](const size_t at) {
+            // A slip's steps, one record each (WALK_STEP): its first holds the slip's coordinate.
+            const auto* records = walk.release.step.data + at;
             int slip;
             float t = 0.0f, b0, a0, g0;
             WALK_STEP(records, slip, b0, a0, g0);
             switch (slip) {
 $paths
             }
-        }"""
+        });"""
 
 
 def _leave_class(k: int, walk: WalkClass, node: tuple[int, ...] | None, release: bool, unroll: int) -> str:
