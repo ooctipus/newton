@@ -1089,6 +1089,16 @@ def patch_units(solver, count):
     return units
 
 
+def walked_worlds(solver) -> np.ndarray:
+    """Each world whose tier walks its rows (the one writer's EMIT sink, :func:`.walk_rows.emits`): the audit reads its
+    rows, but their ``Z`` stays inside its sweep."""
+    placement, seeds = solver.placement, solver.placement.row_seeds
+    counts, free = placement.constraint_count.numpy(), placement.mf_constraint_count.numpy()
+    tier = (np.maximum(counts, 1) - 1) // max(int(seeds.width), 1)
+    dense = (free == 0) & (counts > 0) & (counts <= int(seeds.bound)) & (counts <= placement.speed_first.numpy())
+    return dense & ((int(seeds.tiers) >> tier) & 1 != 0)
+
+
 class Manufactured:
     """Q18: a contact problem with a known solution, on a real step's Jacobian and mass matrix.
 
@@ -1325,12 +1335,12 @@ class Manufactured:
             array.assign(margin)
 
     def _held(self, solver):
-        """Each contact's row store, world and first row where the audit reads its world, else ``None``; each contact
-        must hold the rows the law states, a normal and its unit's."""
+        """Each contact's row store, world and first row where its world holds its rows (:func:`walked_worlds`), else
+        ``None``; each contact must hold the rows the law states, a normal and its unit's."""
         rows = solver.placement
         paths, slots, worlds = rows.contact_path.numpy(), rows.contact_slot.numpy(), rows.contact_world.numpy()
         needed = rows.contact_slots_needed.numpy()
-        held = ~np.isnan(solver.read_audit()["gap"])
+        held = ~walked_worlds(solver)
         stores = [
             (paths[c], worlds[c], slots[c]) if slots[c] >= 0 and paths[c] in (0, 1) and held[worlds[c]] else None
             for c in range(self.count)
@@ -1526,7 +1536,7 @@ class ManufacturedScene:
             self.state = state
             self.pipeline.collide(state, self.contacts)
             probe = self._step(np.zeros(self.model.joint_dof_count))
-            self.held = bool(np.isfinite(probe.read_audit()["gap"]).all())
+            self.held = not walked_worlds(probe).any()
             count = int(self.contacts.rigid_contact_count.numpy()[0])
             self.units = patch_units(probe, count)
 
@@ -1631,10 +1641,9 @@ def check_regular(case, prepared, seed, *, audit=True):
     case.assertLess(problem.drift, TestQ18Manufactured.DRIFT)
     case.assertLess(point, TestQ18Manufactured.TOLERANCE)
     if audit:
-        # The audit reads every world a store holds the rows of: all but the seeded tiers' worlds, whose rows exist
-        # only inside the Jacobi tiers' sweep (:mod:`.audit`); those answer to the solution above alone.
+        # The worlds a store holds the rows of; the seeded tiers' answer to the solution above alone.
         reading = solver.read_audit()
-        read = ~np.isnan(reading["gap"])
+        read = ~walked_worlds(solver)
         if solver.placement.row_seeds.tiers == 0:
             case.assertTrue(read.all())
         if read.any():

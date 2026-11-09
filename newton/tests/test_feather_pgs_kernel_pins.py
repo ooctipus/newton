@@ -144,6 +144,9 @@ def _audit_calls():
         yield "audit.sparse_class", kernel(audit.sparse_class), (support, table), {}
     yield "audit.slot_class", kernel(audit.slot_class), (6, 1024), {}
     yield "audit.free_class", kernel(audit.free_class), (), {}
+    # The rows the tiers walk from their seeds, at the seeded tiers' 16+6 coordinate world (_emit_tier_kwargs).
+    seeded = (22, (16, 6, 0, 16), (0, 0), tier_classes((16, 6)), False)
+    yield "audit.seeded_class", kernel(audit.seeded_class), seeded, {}
 
 
 def _readout_calls():

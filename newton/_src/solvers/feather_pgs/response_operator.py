@@ -225,6 +225,10 @@ class WalkedRows:
             lines.append(f"if ({art} >= 0) WALK_RELEASE(walk.release, {art}, &Zi[{offset} * ZS], ZS);")
         return lines
 
+    def seed_walk(self, indent: str) -> tuple[str, str]:
+        """``TIER_WALK`` and the release after it, as :meth:`stage` writes them (for :func:`.audit.seeded_class`)."""
+        return _lines([self._walk()], indent), _lines(self._release_rows(), indent)
+
     def stage(self, target: str, *, indent: str) -> str:
         """Walk each lane's row into ``target`` (``Zi = &target[i]``) and its registers, its incident velocity folded
         into its right-hand side."""
