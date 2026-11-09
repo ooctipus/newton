@@ -11,6 +11,7 @@ every claim's sweep shares: the world queue's dispatch (:func:`worlds`), the fre
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Callable
 
 import warp as wp
 
@@ -44,9 +45,11 @@ from .sweep import (
     cached_triple_law,
     contact_unit,
     end_sweep,
+    formed_friction_laws,
     friction_metric,
     friction_metric_law,
     friction_metric_stage,
+    friction_record_stage,
     impulse_seed,
     indent,
     level_loop,
@@ -519,13 +522,24 @@ const float mf_diag = __int_as_float(meta.y);"""
     return f"{ring_sum}\n{COLORS.wrap(visit, ' ' * 12)}"
 
 
-def dense_units(dense: WorldRows, op: SparseFactor, laws: RowLaws, *, active: bool, pad: str) -> str:
-    """The contact unit on the dense rows (:func:`.sweep.unit_visit`), its couplings its own reduction's; a friction
+def dense_units(
+    dense: WorldRows, op: SparseFactor, laws: RowLaws, *, active: bool, record: Callable[[str], str] | None, pad: str
+) -> str:
+    """The contact unit on the dense rows (:func:`.sweep.unit_visit`), its couplings and pair metric the contact's
+    ``record`` formed for the launch (:func:`.sweep.friction_record_stage`), else its own reduction's; a friction
     triple declined (the row step solves it)."""
+    loads = after = ""
+    if record is not None:
+        loads = f"""        const float4* const record = reinterpret_cast<const float4*>({record("i")});
+        const float4 coupling = record[0], basis = record[1];
+"""
+        after = "\n        const float gram_n1 = coupling.x, gram_n2 = coupling.y;\n" + cached_pair_law(
+            "UNIT_PAIR", "basis.x", "basis.y", ("basis.z", "basis.w"), "        "
+        )
     ctx = RowContext(
         row="i",
         kind="row_type",
-        operator=UnitZ(fused_pair_apply=op.fused_pair_apply),
+        operator=UnitZ(cached=record is not None, fused_pair_apply=op.fused_pair_apply),
         diagonal=Diagonal(dense.diag),
         load=dense.load,
         store=dense.store,
@@ -536,6 +550,7 @@ def dense_units(dense: WorldRows, op: SparseFactor, laws: RowLaws, *, active: bo
         parent="parent",
         ring_load=dense.ring_load,
         lanes=dense.lanes,
+        **({"pair_law": "UNIT_PAIR(0, "} if record is not None else {}),
     )
     triple = f" && {dense.spin_of('i', 'm_dense')} < 0" if laws.torsion else ""
     condition = f"{dense.parent('tangent')} == i && {dense.parent('sibling')} == i{triple}"
@@ -548,6 +563,7 @@ def dense_units(dense: WorldRows, op: SparseFactor, laws: RowLaws, *, active: bo
         active=active,
         mu=dense.mu("tangent"),
         guard=("", condition),
+        record=(loads, after),
         pad=pad,
     )
 
@@ -773,25 +789,25 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
             )
         )
 
-    # Where spin rows may appear, every friction triple's metric is formed once per launch, at its first loaded visit
-    # (sweep.friction_metric_stage), and its later visits only project: the dense rows' in either mapping, the free
-    # bodies' in the warp's (the colored units cache theirs in their slots, _colored_metrics).
-    dense_metric = free_metric = None
+    # Where spin rows may appear, every dense friction contact's record (its Gram couplings and metric) is formed once
+    # per launch before the sweeps (sweep.friction_record_stage), and its visits only reduce velocity terms and
+    # project; the free bodies' triples in the warp mapping form their metric at their first loaded visit
+    # (sweep.friction_metric_stage; the colored units cache theirs in their slots, _colored_metrics). A contact holds
+    # three rows at least: a slot each.
+    dense_metric = free_metric = dense_record = None
     friction_laws = metric_stage = ""
     if contact_torsion:
-        dense_metric, dense_record = "DENSE_TRIPLE", friction_metric
+        dense_metric = "DENSE_TRIPLE"
+
+        def dense_record(row: str) -> str:
+            return friction_metric(row, rows=3)
 
         def free_record(row: str) -> str:
             # The free bodies' rows follow the dense ones in the line.
-            return friction_metric(row, str(M_D))
+            return friction_metric(row, str(M_D), rows=3)
 
-        friction_laws = friction_metric_law(dense_metric, dense_record, "    ") + "\n"
-        metric_stage = (
-            friction_metric_stage(
-                *dense.scan(), lambda row: dense.spin_of(row, "m_dense"), end="m_dense", record=dense_record, pad="    "
-            )
-            + "\n"
-        )
+        friction_laws = formed_friction_laws(dense_metric, dense_record, "    ") + "\n"
+        metric_stage = friction_record_stage(dense, dense_op, end="m_dense", record=dense_record, pad="    ") + "\n"
         if free_rows and not colored:
             free_metric = "FREE_TRIPLE"
             friction_laws += friction_metric_law(free_metric, free_record, "    ") + "\n"
@@ -893,13 +909,16 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         if ({"!__syncthreads_or(velocity_moved != 0)" if colored else "BALLOT(velocity_moved != 0) == 0u"}) iteration_changed = 0;
 """
     admission = _LINE_ADMISSION if speed_rows else _DENSE_ADMISSION
-    units = dense_units(dense, dense_op, laws, active=sweep.active_rows, pad="") if sweep.contact_units else ""
+    units = ""
+    if sweep.contact_units:
+        units = dense_units(dense, dense_op, laws, active=sweep.active_rows, record=dense_record, pad="")
     dense_phase = rows_block(
         dense,
         dense_op,
         laws,
         admission=admission,
         metric=dense_metric,
+        formed=contact_torsion,
         selected=sweep.active_rows,
         unit=units,
         pad="        ",

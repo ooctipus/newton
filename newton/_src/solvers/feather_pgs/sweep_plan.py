@@ -88,9 +88,9 @@ SPARSE_CONTACT_RECORDS = FieldGroup(
 """The single-stage transaction's per-triplet block records (``sparse_contact.CONTACT_RECORD_FLOATS``)."""
 
 FRICTION_METRIC = FieldGroup(Field("friction_metric", wp.float32, ("world", "contact", "metric"), owner="placement"))
-"""Where spin rows may appear, each friction triple's metric, formed once per launch by the sweeps that visit a triple's
-rows one by one, the matrix-free and the sparse-diagonal sweeps (:func:`.sweep.friction_metric_stage`):
-a slot per four rows of the row store's line, a triple's rows."""
+"""Where spin rows may appear, each friction contact's metric, formed once per launch by the sweeps that visit its rows
+one by one, the matrix-free and the sparse-diagonal sweeps (:func:`.sweep.friction_record_stage`,
+:func:`.sweep.friction_metric_stage`): a slot per three rows of the row store's line, a contact's rows."""
 
 
 __all__ = ["Sweep"]
@@ -411,12 +411,12 @@ class Sweep:
         )
         row_by_row = self.sparse_diagonal_kernel is not None
         if self.laws.spin_rows and (self.classes.mf_sweeps or row_by_row):
-            # Static storage for graph capture: the friction triples' metrics, formed per launch by the sweeps that
-            # visit a triple's rows one by one (sweep.friction_metric_stage).
+            # Static storage for graph capture: the friction contacts' metrics, formed per launch by the sweeps that
+            # visit a contact's rows one by one (sweep.friction_record_stage).
             self.placement.arrays.allocate(
                 FRICTION_METRIC,
                 world=self.forest.world_count,
-                contact=(self.placement.row_pitch + 3) // 4,
+                contact=(self.placement.row_pitch + 2) // 3,
                 metric=FRICTION_METRIC_FLOATS,
             )
         self.mf_gs_kernel = None
