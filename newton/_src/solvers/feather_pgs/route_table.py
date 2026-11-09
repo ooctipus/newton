@@ -45,8 +45,6 @@ class Pins:
     """``None``: unfused sparse contact triplets."""
     mf_storage: str | None = None
     """``"streamed"``: streamed matrix-free impulses, the free bodies'; ``"line"``: every row's, the line's too."""
-    predicted_twists: bool = True
-    """``False``: the held tree's predictor without the twists' publication."""
     row_support: bool = True
     """``False``: sparse rows on explicit indices; packed rows on their sides, not their support classes."""
     placement: str | None = None
@@ -86,6 +84,12 @@ class Laws:
     """Bilateral rows are pre-eliminated through a Schur complement."""
     mimic: bool
     """The model has mimic rows."""
+
+    @property
+    def separable(self) -> bool:
+        """Every row starts at zero and keeps it at a positive predictor residual: the hard contact law, its friction
+        and spin rows, position limits; no warm start, weighted contact, joint velocity limit, mimic or eliminated row."""
+        return not (self.warm_start or self.weighted or self.velocity_limits or self.mimic or self.preelimination)
 
     @property
     def weighted(self) -> bool:

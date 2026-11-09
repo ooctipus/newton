@@ -1148,14 +1148,6 @@ class Sweep:
                     "launch_bounds": json_value(self.sparse_kernel.options.get("launch_bounds")),
                 }
             )
-        owner = self.resolved_worlds_owner
-        published = bool(owner is not None and owner.published)
-        if owner is None:
-            twists = None
-        elif published:
-            twists = "The held-tree predictor publishes body twists for every responding articulation."
-        else:
-            twists = "The classifier builds body twists itself: a responding articulation has no twist-publishing tree."
         count = int(forest.free_rigid_body_count)
         owners = []
         if count:
@@ -1175,10 +1167,8 @@ class Sweep:
             "sparse_mass_matrix": sparse,
             "sweep": self._record_sweep(plan),
             "resolved_worlds": {
-                "enabled": owner is not None,
+                "enabled": self.resolved_worlds_owner is not None,
                 "reason": self.resolved_worlds_reason,
-                "publishes_predicted_twists": published,
-                "twists_reason": twists,
             },
             "free_rigid_bodies": {
                 "count": count,
