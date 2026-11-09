@@ -438,19 +438,6 @@ def mesh_cells_first_in_range(
     return (below & inside) == wp.uint64(0)
 
 
-@wp.func
-def mesh_cells_boxes_overlap(lower_a: wp.vec3, upper_a: wp.vec3, lower_b: wp.vec3, upper_b: wp.vec3) -> bool:
-    """Whether two closed boxes overlap."""
-    return (
-        lower_a[0] <= upper_b[0]
-        and lower_b[0] <= upper_a[0]
-        and lower_a[1] <= upper_b[1]
-        and lower_b[1] <= upper_a[1]
-        and lower_a[2] <= upper_b[2]
-        and lower_b[2] <= upper_a[2]
-    )
-
-
 @wp.struct
 class MeshQueryBound:
     """A convex shape's bound in the scaled mesh frame, inflated by the pair's contact threshold.
