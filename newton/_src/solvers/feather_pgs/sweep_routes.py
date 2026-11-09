@@ -806,7 +806,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
             # The free bodies' rows follow the dense ones in the line.
             return friction_metric(row, str(M_D), rows=3)
 
-        friction_laws = formed_friction_laws(dense_metric, dense_record, "    ") + "\n"
+        friction_laws = formed_friction_laws(dense_metric, "    ") + "\n"
         metric_stage = friction_record_stage(dense, dense_op, end="m_dense", record=dense_record, pad="    ") + "\n"
         if free_rows and not colored:
             free_metric = "FREE_TRIPLE"
@@ -918,7 +918,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         laws,
         admission=admission,
         metric=dense_metric,
-        formed=contact_torsion,
+        formed=dense_record,
         selected=sweep.active_rows,
         unit=units,
         pad="        ",

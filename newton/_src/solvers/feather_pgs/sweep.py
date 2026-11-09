@@ -641,9 +641,10 @@ class RowContext:
     triple_law: str = "ConeLaw::friction_triple("
     """The friction triple's law, up to its first argument: :func:`.projection_laws.friction_triple`, or a law of the
     same arguments after a leading ``int`` of its own (a cache of the triple's metric, :func:`cached_triple_law`)."""
-    formed: bool = False
-    """The friction laws read the contact's record formed for the launch (:func:`formed_friction_laws`): the visit
-    reduces no Gram term, and the triple's law takes no block."""
+    formed: Callable[[str], str] | None = None
+    """The address of the record of the contact whose normal is ``row``, formed for the launch
+    (:func:`friction_record_stage`): a friction visit loads it with its rows, reduces no Gram term, and its laws read
+    it (:func:`formed_friction_laws`); the triple's law takes no block."""
     owned: bool = True
     """The row's first lane owns the stored impulses: the lanes synchronize before the stores (every lane has read
     the impulses the first lane overwrites; :attr:`first_store`); the applies after them read no impulse, and the
@@ -673,7 +674,7 @@ class RowContext:
         end: str,
         own: str = "denom",
         metric: str | None = None,
-        formed: bool = False,
+        formed: Callable[[str], str] | None = None,
         **choices,
     ) -> RowContext:
         """The context of row ``i`` of a row loop over a store's rows ``[0, end)``: every row accessor is the store's
@@ -682,8 +683,11 @@ class RowContext:
         its metric cached for the launch (:func:`friction_metric_law`), or with ``formed`` both friction laws read the
         contact's record (:func:`formed_friction_laws`). ``choices`` sets the context's other fields."""
         laws = {"triple_law": f"{metric}(parent, "} if metric is not None else {}
-        if formed:
-            laws.update(pair_law=f"{metric}_PAIR(parent, ", formed=True)
+        if formed is not None:
+            records = ", ".join(FORMED_RECORD)
+            laws.update(
+                triple_law=f"{metric}({records}, ", pair_law=f"{metric}_PAIR({FORMED_RECORD[1]}, ", formed=formed
+            )
         return cls(
             row="i",
             kind="row_type",
@@ -1105,6 +1109,29 @@ def row_sums(
     return op.dot(sums, rows, pad, exists=exists, apart=apart)
 
 
+FORMED_RECORD = ("friction_m0", "friction_m1", "friction_m2", "friction_m3")
+"""The registers a friction visit loads its contact's record into (:func:`formed_friction_laws`)."""
+
+
+def _record_loads(ctx: RowContext, kind: str, pad: str) -> str:
+    """A first tangent's loads of its contact's record (:attr:`RowContext.formed`) into :data:`FORMED_RECORD`, with its
+    rows and off the reduction's chain: the pair metric's half, the ball metric's whole where a spin row follows."""
+    m0, m1, m2, m3 = FORMED_RECORD
+    lines = [
+        f"float4 {m0}, {m1}, {m2}, {m3};",
+        f"if ({kind} == {ROW_FRICTION}) {{",
+        f"    const float4* const friction_record = reinterpret_cast<const float4*>({ctx.formed('parent')});",
+        f"    {m0} = friction_record[0];",
+        f"    {m1} = friction_record[1];",
+        "    if (spin >= 0) {",
+        f"        {m2} = friction_record[2];",
+        f"        {m3} = friction_record[3];",
+        "    }",
+        "}",
+    ]
+    return indent("\n".join(lines), pad)
+
+
 def row_visit(
     ctx: RowContext,
     laws: RowLaws,
@@ -1149,9 +1176,11 @@ def row_visit(
             *between,
             friction_radius(kind, *disk, pad, keep_next=keep_next, **spin) if pairs else "",
         ]
+    if pairs and ctx.formed is not None:
+        lines.append(_record_loads(ctx, kind, pad))
     pair = {"sibling": "parent + 2", "paired": f"{kind} == {ROW_FRICTION}"} if pairs and op.pair_with_visit else {}
     if pair and laws.torsion:
-        pair["spin" if not ctx.formed else "formed"] = True
+        pair["spin" if ctx.formed is None else "formed"] = True
     lines += [row_sums(op, "jv", pad, **pair), row_update(ctx, laws, residual="jv", pad=pad)]
     return "\n".join(line for line in lines if line)
 
@@ -1978,37 +2007,33 @@ def friction_record_stage(rows: RowStore, op, *, end: str, record: Callable[[str
     return heads.wrap(indent("\n".join(lines), heads.inner(pad)), pad) + f"\n{pad}SYNC();"
 
 
-def formed_friction_laws(name: str, record: Callable[[str], str], pad: str) -> str:
-    """Declare ``name``, the friction triple's law, and ``{name}_PAIR``, the pair's, each from the contact's record
-    formed for the launch at ``record(row)`` (``row``: the contact's normal; :func:`friction_record_stage`): the pair's
+def formed_friction_laws(name: str, pad: str) -> str:
+    """Declare ``name``, the friction triple's law, and ``{name}_PAIR``, the pair's, each from its contact's record
+    formed for the launch (:func:`friction_record_stage`), which the visit loaded (:data:`FORMED_RECORD`): the pair's
     and a zero spin coefficient's from the pair metric, the triple's from the ball metric, so each law is the visit's
     own arithmetic on a block it no longer reduces (:func:`.projection_laws.friction_pair`,
     :func:`.projection_laws.friction_ball`)."""
-    metric = "const float4 metric = reinterpret_cast<const float4*>({})[1];".format(record("row"))
     pair = "ProjectionLaw::friction_pair_from_metric(metric.x, metric.y, wp::vec2(metric.z, metric.w),"
     lines = [
-        f"const auto {name}_PAIR = [&](int row, float, float, float, wp::vec2 residual, wp::vec2 old, float radius,",
-        f"{' ' * (len(name) + 23)}float relaxation) -> wp::vec2 {{",
-        f"    {metric}",
+        f"const auto {name}_PAIR = [&](const float4& metric, float, float, float, wp::vec2 residual, wp::vec2 old,",
+        f"{' ' * (len(name) + 23)}float radius, float relaxation) -> wp::vec2 {{",
         f"    return {pair} residual, old, radius, relaxation);",
         "};",
-        f"const auto {name} = [&](int row, wp::vec3 residual, wp::vec3 old, float mu, float mu_t, float load,",
+        f"const auto {name} = [&](const float4& values, const float4& metric, const float4& b1, const float4& b2,",
+        f"{' ' * (len(name) + 18)}wp::vec3 residual, wp::vec3 old, float mu, float mu_t, float load,",
         f"{' ' * (len(name) + 18)}float relaxation) -> wp::vec3 {{",
         "    if (mu_t <= 0.0f) {",
         "        wp::vec3 pair(0.0f);",
         "        if (load > 0.0f) {",
-        f"            {metric}",
         f"            const wp::vec2 tangents = {pair}",
         "                wp::vec2(residual[0], residual[1]), wp::vec2(old[0], old[1]), mu * load, relaxation);",
         "            pair = wp::vec3(tangents[0], tangents[1], 0.0f);",
         "        }",
         "        return ConeLaw::ball(pair, mu, mu_t, load);",
         "    }",
-        f"    const float4* const record = reinterpret_cast<const float4*>({record('row')});",
-        "    const float4 values = record[0], b0 = record[1], b1 = record[2], b2 = record[3];",
         "    return ConeLaw::friction_triple_from_metric(wp::vec3(values.x, values.y, values.z),",
-        "        wp::mat33(b0.x, b0.y, b0.z, b0.w, b1.x, b1.y, b1.z, b1.w, b2.x), residual, old, mu, mu_t, load,",
-        "        relaxation);",
+        "        wp::mat33(metric.x, metric.y, metric.z, metric.w, b1.x, b1.y, b1.z, b1.w, b2.x), residual, old, mu,",
+        "        mu_t, load, relaxation);",
         "};",
     ]
     return "\n".join(pad + line for line in lines)
@@ -2070,7 +2095,7 @@ def row_step(
     held: bool = False,
     triple_phase: bool = False,
     metric: str | None = None,
-    formed: bool = False,
+    formed: Callable[[str], str] | None = None,
     pad: str = "            ",
 ) -> str:
     """Row ``i``'s step in a row loop over a store's rows ``[0, end)``: its kind read from the store, the schedule's
@@ -2086,7 +2111,8 @@ def row_step(
       its pair as spin rows, :attr:`StagedRows.triples`), and the loop's visit carries none of the triple's code;
       otherwise a spin row is solved with its friction pair in the loop (the store's :meth:`RowStore.spin_of`), its
       metric cached for the launch with ``metric`` (the law :func:`friction_metric_law` declared,
-      :func:`friction_metric_stage`), or with ``formed`` the contact's record (:func:`formed_friction_laws`);
+      :func:`friction_metric_stage`), or with ``formed`` the contact's record at that address
+      (:func:`formed_friction_laws`);
     - a row known where the step is emitted (``kind``, and a friction row's ``parent``) replaces its metadata, so the
       step compiles to that kind's law: a known kind is no spin row, and one other than friction admits no pair (the
       sparse-diagonal sweep's chains).
@@ -2134,7 +2160,7 @@ def rows_block(
     admission: str = "",
     end: str | None = None,
     metric: str | None = None,
-    formed: bool = False,
+    formed: Callable[[str], str] | None = None,
     selected: bool = False,
     unit: str = "",
     pad: str = "        ",
@@ -2153,8 +2179,8 @@ def rows_block(
     only ever reads its own stores.
 
     With ``metric`` (the law :func:`friction_metric_law` declared) every friction triple forms its metric once per
-    launch, at its first loaded visit (:func:`friction_metric_stage`), or with ``formed`` the dense rows' laws read
-    the contacts' records (:func:`friction_record_stage`). ``selected``: the active enumeration's rows
+    launch, at its first loaded visit (:func:`friction_metric_stage`), or with ``formed`` (their address) the dense
+    rows' laws read the contacts' records (:func:`friction_record_stage`). ``selected``: the active enumeration's rows
     (:class:`SelectedRows`), each record loaded at its visit; ``unit``: a contact unit's visit (:func:`unit_visit`).
     """
     inner = pad + "    "
