@@ -1041,22 +1041,22 @@ class RowLaws:
         else:
             rows = placement.dense_internal_max_rows
         lanes = walk_rows.writer_lanes(rows, placement.dense_max_constraints, model.device)
+        law = (bind_dense_rows(placement), contact_input, patch_row_law(solver))
+        law += (self.joint_seeds(solver, state_in), self.bias(solver.options, dt))
         inputs = [
-            bind_dense_rows(placement),
+            law[0],
             placement.row_support(),
             placement.constraint_count,
             lanes,
-            contact_input,
-            patch_row_law(solver),
+            *law[1:3],
             walk_rows.packed_sink(solver),
             factor.blocks() if blocks else Preelim(),
             self.mimic_slot if blocks and self.mimic_slot is not None else dummy_int,
             self.link_slot if blocks and self.link_slot is not None else dummy_int,
-            self.joint_seeds(solver, state_in),
-            self.bias(solver.options, dt),
+            *law[3:],
             placement.dense_phase_bounds,
             int(part),
-            self.row_seeds(solver, dt),
+            self.row_seeds(solver, dt, *law),
         ]
         wp.launch(
             walk_rows.writer_kernel(solver, part),
@@ -1066,11 +1066,13 @@ class RowLaws:
             device=model.device,
         )
 
-    def row_seeds(self, solver, dt: float) -> walk_rows.RowSeeds:
+    def row_seeds(self, solver, dt: float, *law) -> walk_rows.RowSeeds:
         """The one writer's EMIT sink (:class:`.walk_rows.RowSeeds`) for a step of ``dt``, which the tiers that walk
-        their rows read too."""
+        their rows read too, with the ``law``'s inputs (rows, contacts, patch law, joint seeds, bias)."""
         seeds = solver.placement.row_seeds
         seeds.dt, seeds.threshold = dt, self.effective_restitution_velocity_threshold
+        if seeds.tiers:
+            seeds.rows, seeds.data, seeds.law, seeds.joint, seeds.bias = law
         return seeds
 
     def write_support(self, solver, state_in, contact_input: ContactInput, dt: float) -> None:

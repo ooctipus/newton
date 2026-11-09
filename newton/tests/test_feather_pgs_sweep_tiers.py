@@ -304,7 +304,9 @@ class TestOfflineCompile(unittest.TestCase):
             with self.subTest(label):
                 config = sweep_routes_tiers.TierSweep(*args, **kwargs)
                 new = sass.compile_kernel(sweep_kernel(config), arch=120, block_dim=config.threads)
-                self.assertEqual(new["stack"], 0)
+                # A tier that runs its rows' law in its prologue keeps a few words there, outside the sweeps: a friction
+                # row's anchor displacement read by its row, and the world queue's index across the law.
+                self.assertLessEqual(new["stack"], 24 if config.emit else 0)
                 self.assertEqual(new["local"], 0)
 
 
