@@ -10,8 +10,8 @@ reads it; nothing in it is computed a second time elsewhere.
 
 :class:`StepPlan` is what the owners built from it: the class's route (the row of the route table: the spec's case, the
 producer and the sizes the owners built), the sweep's kernels and streams, and the stages. The
-plan's :attr:`StepPlan.stages` are the step: each a closure bound once to its owners, chosen from the spec and the
-route, so ``step()`` is the stages run in order on a :class:`Step` with no construction constant re-tested. Every
+plan's :attr:`StepPlan.stages` are the step: each its owners' calls, bound once, chosen from the spec and the route,
+so ``step()`` is the stages run in order on a :class:`Step` with no construction constant re-tested. Every
 stage whose work depends on the articulation size (where stage 4 whitens the rows) has one table: each size's route
 and the reason for it. The solve of stages 5 and 6 has one entry: the rows its sweep solves and what drives the sweep.
 The route record (:mod:`.path_selection`) is the spec's record and the plan's, and construction builds exactly the
@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass, fields
 from functools import partial
 from itertools import groupby
 from operator import attrgetter, itemgetter
@@ -37,14 +37,13 @@ from ...core.memory import L1_LINE_BYTES, Device, device
 from . import cached_state_binding
 from .class_plan import ClassPlan
 from .forest_plan import ForestPlan
-from .path_selection import kernel_key
+from .path_selection import json_value, kernel_key
 from .route_table import Laws, Pins, RouteRow
 from .walk_rows import WRITE_REST, WRITE_ROWS, WRITE_TOPOLOGY
 
 __all__ = [
     "Capacities",
     "Route",
-    "SolveRoute",
     "Stage",
     "Step",
     "StepPlan",
@@ -102,10 +101,6 @@ class Capacities:
             free_contact_rows=run,
             speed_rows=speed_rows,
         )
-
-    def record(self) -> dict:
-        """The capacities as a JSON-compliant record."""
-        return asdict(self)
 
 
 DIAGNOSTICS = ("nvtx", "snapshots", "audit", "row_watermark", "readout", "sync_timings")
@@ -183,17 +178,10 @@ class StepSpec:
         )
 
     def record(self) -> dict:
-        """The spec's own fields as a JSON-compliant record (``routes.spec``; the laws are ``routes.laws``)."""
-        return {
-            "device": {"arch": self.device.arch, "sms": self.device.sms},
-            "pins": self.pins.record(),
-            "capacities": self.capacities.record(),
-            "mass_interval": self.mass_interval,
-            "articulated": self.articulated,
-            "particles": self.particles,
-            "pure_forest": self.pure_forest,
-            "diagnostics": list(self.diagnostics),
-        }
+        """The spec's own fields as a JSON-compliant record (``routes.spec``; the laws are ``routes.laws``): the
+        device's architecture and multiprocessors, and the pins in force."""
+        own = {f.name: getattr(self, f.name) for f in fields(self) if f.name not in ("forest", "laws", "classes")}
+        return json_value(dict(own, device={"arch": self.device.arch, "sms": self.device.sms}, pins=self.pins.record()))
 
 
 @dataclass(frozen=True)
@@ -206,14 +194,6 @@ class Route:
     def record(self) -> dict:
         """The route as a JSON-compliant record."""
         return {"route": self.name, "reason": self.reason}
-
-
-@dataclass(frozen=True)
-class SolveRoute:
-    """Stages 5 and 6: the rows the sweep solves, all iterations in one dispatch."""
-
-    route: Route
-    """The rows the sweep solves: ``sparse_pgs``, ``sparse_diagonal`` or ``matrix_free_gs``."""
 
 
 @dataclass(frozen=True)
@@ -231,7 +211,9 @@ class StepPlan:
     response: Mapping[int, Route]
     """Stage 4, per size, where its rows are whitened: ``owner`` (a contact owner publishes the response),
     ``sparse_diagonal`` or ``packed`` (the packed rows' build)."""
-    solve: SolveRoute
+    solve: Route
+    """Stages 5 and 6: the rows the sweep solves, ``sparse_pgs``, ``sparse_diagonal`` or ``matrix_free_gs``, all
+    iterations in one dispatch."""
     stages: tuple[Stage, ...]
     """The step, in order (:func:`_stages`)."""
 
@@ -264,10 +246,6 @@ class StepPlan:
         """Run the step's stages in order."""
         for stage in self.stages:
             stage.run(step)
-
-    def sizes(self, stage: str, route: str) -> tuple[int, ...]:
-        """The sizes a stage's table routes to ``route``."""
-        return tuple(size for size, entry in getattr(self, stage).items() if entry.name == route)
 
     def record(self) -> dict:
         """The tables, the sweep's kernels and streams as a JSON-compliant record (``routes.stages`` of the path
@@ -304,14 +282,12 @@ def _response(row: RouteRow, forest) -> dict[int, Route]:
     return routes
 
 
-def _solve(row: RouteRow) -> SolveRoute:
+def _solve(row: RouteRow) -> Route:
     if row.support == "factor":
-        route = Route("sparse_pgs", "Native sparse factors own the sweep.")
-    elif row.support == "diagonal":
-        route = Route("sparse_diagonal", "The diagonal-mass contact owner owns the sweep.")
-    else:
-        route = Route("matrix_free_gs", "Matrix-free Gauss-Seidel; the tiers claim their worlds first.")
-    return SolveRoute(route=route)
+        return Route("sparse_pgs", "Native sparse factors own the sweep.")
+    if row.support == "diagonal":
+        return Route("sparse_diagonal", "The diagonal-mass contact owner owns the sweep.")
+    return Route("matrix_free_gs", "Matrix-free Gauss-Seidel; the tiers claim their worlds first.")
 
 
 class Step:

@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import copy
+import dataclasses
 import sys
 
 import numpy as np
@@ -39,12 +40,7 @@ from .class_plan import ClassInputs, general_reason, plan_class
 from .configuration import Diagnostics, check_options
 from .field_group import Field, FieldGroup, SolverArrays
 from .forest_plan import ForestPlan, joint_forest
-from .path_selection import (
-    applied_options,
-    measurement_selection,
-    options_selection,
-    route_selection,
-)
+from .path_selection import applied_options, measurement_selection, route_selection
 from .placement import Placement
 from .route_table import Pins, RouteRow
 from .rows import RowLaws
@@ -610,8 +606,16 @@ class SolverFeatherPGS(SolverBase):
         # The step: its stages bound to the owners above from the spec and the route, the sweep's kernels and streams,
         # and its per-stage dispatch tables, which the route record reads.
         self._plan = StepPlan.build(self.spec, route, self)
-        # Record the applied options once; get_path_selection() returns detached copies.
-        self._applied_options = applied_options(self, SolverFeatherPGS.__init__, requested_options)
+        # The options as construction applied them: the row laws' friction beta, the closure's pre-elimination, and a
+        # readout only where a sweep kernel carries its counters. Recorded once; get_path_selection() returns copies.
+        readout = options.diagnostics.solve_readout if self.sweep.readout.kernels else "off"
+        applied = dataclasses.replace(
+            options,
+            friction_anchor_beta=self.laws.friction_anchor_beta,
+            enable_bilateral_preelimination=self.factor.eliminates,
+            diagnostics=dataclasses.replace(options.diagnostics, solve_readout=readout),
+        )
+        self._applied_options = applied_options(SolverFeatherPGS.__init__, requested_options, applied)
 
     def get_path_selection(self) -> dict:
         """Return the active plans and selection reasons.
@@ -678,7 +682,7 @@ class SolverFeatherPGS(SolverBase):
         }
         selection["routes"] = route_selection(self)
         selection["measurements"] = measurement_selection(self)
-        selection["options"] = options_selection(self)
+        selection["options"] = copy.deepcopy(self._applied_options)
         selection["environment"] = copy.deepcopy(self._environment_record)
         return selection
 

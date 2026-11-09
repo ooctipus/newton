@@ -458,7 +458,6 @@ class SolveReadoutRecord:
     def __init__(self, policy: SolvePolicy):
         self.policy = policy
         self._slots: dict[str, _ReadoutSlot] = {}
-        self._labels: dict[str, str] = {}
         self._skipped: wp.array | None = None
 
     def register(
@@ -482,9 +481,8 @@ class SolveReadoutRecord:
             budget: Largest sweep budget a launch of the kernel passes.
             device: Device of the counters.
         """
-        if kernel is None or not readout or kernel.key in self._labels:
+        if kernel is None or not readout or kernel.key in self._slots:
             return
-        self._labels[kernel.key] = label
         rows = max(int(budget), 1) + 1
         trace = readout == "trace"
         operand = SolveTrace() if trace else SolveReadout()
@@ -536,7 +534,7 @@ class SolveReadoutRecord:
     @property
     def kernels(self) -> dict[str, str]:
         """``{kernel key: route label}`` of the registered readout kernels."""
-        return dict(self._labels)
+        return {key: slot.label for key, slot in self._slots.items()}
 
     @property
     def counts_skipped(self) -> bool:
