@@ -836,8 +836,10 @@ class Sweep:
 
     def _claim_launch(self, config: SweepConfig, kernel: wp.Kernel, items: int, bucket: int) -> SweepLaunch:
         """The launch of a matrix-free mapping over its claim's ``bucket``, its grid the layer's shape of its work over
-        ``items`` (the bucket's capacity)."""
-        layout = shape(config.work(items), device(self.model.device))
+        ``items`` (the bucket's capacity): persistent where tiers run beside it, whose launches then start without
+        waiting for its exiting blocks; alone, a full grid, which the device balances as blocks finish."""
+        work = config.work(items)
+        layout = shape(work if self.tiers else dataclasses.replace(work, persistent=False), device(self.model.device))
         return SweepLaunch(
             config,
             kernel,
