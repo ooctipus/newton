@@ -240,7 +240,6 @@ def allocate_rigid_velocity_limit_slots(
     joint_qd: wp.array[float],
     velocity_limit_activation_fraction: float,
     capacity: int,
-    resolved_worlds: wp.array[int],
     base: int,
     # outputs
     acts: wp.array[int],
@@ -288,8 +287,6 @@ def allocate_rigid_velocity_limit_slots(
 
     world = bodies.art_to_world[art]
     if world < 0:
-        return
-    if world < resolved_worlds.shape[0] and resolved_worlds[world] != 0:
         return
 
     line = rows.first[world]

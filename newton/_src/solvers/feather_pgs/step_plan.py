@@ -431,7 +431,7 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
     cut, factor, laws, placement, sweep = attrgetter("cut", "factor", "laws", "placement", "sweep")(solver)
     model, options, forest, diagnostics = solver.model, solver.options, spec.forest, spec.diagnostics
     articulated, particles, pure, warm = spec.articulated, spec.particles, spec.pure_forest, spec.laws.warm_start
-    v_hat, v_out, resolved, colored = solver.v_hat, solver.v_out, sweep.resolved_worlds_owner, sweep.colored_units
+    v_hat, v_out, colored = solver.v_hat, solver.v_out, sweep.colored_units
     device, limited, preelimination = model.device, options.enable_joint_velocity_limits, spec.laws.preelimination
 
     # The drives' stage takes the held plan's coordinates (a one-coordinate tree's predict decides its own drive) and
@@ -505,12 +505,11 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
         (s3, "damp_spin", options.angular_damping != 0.0, (factor, "damp_spin", DT, v_hat)),
         (dynamics, "snapshots", "snapshots" in diagnostics, *snapshots),
         (dynamics, "wait_for_collision", not particles, (STEP, "wait_for_collision", device)),
-        # Stage 4: the rows. The resolved-world claim, the row pass (each family's slots and seeds), the status and the
+        # Stage 4: the rows. The row pass (each family's slots and seeds, and each world's acts word), the status and the
         # overflow warning; then the diagonals, the one writer (every walking class's: it walks the rows into their
         # placement's sink after the row pass, each row's rhs by the row law; the free bodies' writer runs in the row
         # pass, after their families' slots, beside the topology part), the patches' link once every contact row's
         # records are written, and the sweep's claims, which read the rows.
-        (s4, "classify_resolved_worlds", resolved is not None, (resolved, "classify", STATE_IN, factor, CONTACTS, DT)),
         (s4, "begin_rows", True, (laws, "begin", solver, STATE_IN, factor, DT)),
         (s4, "write_mimics", laws.mimic_warp_kernels and holds, (laws, "write_mimics", solver, STATE_IN, DT)),
         (s4, "write_links", laws.link_count > 0 and holds, (laws, "write_links", solver, STATE_IN)),
@@ -558,14 +557,7 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
         # The carry: the patches' history, then under the warm start the contacts' normals and normal impulses.
         (s7p, "carry_patches", True, (sweep, "finish_patches", STATE_IN, STATE_OUT, CONTACTS, DT)),
         (s7w, "carry", warm, (sweep, "carry", CONTACTS)),
-        # The rows the resolved worlds skipped: the diagnostic counts them and leaves the classifier's choice alone.
         (dynamics, "watermarks", "row_watermark" in diagnostics, (placement, "record_watermarks", CONTACTS)),
-        (
-            dynamics,
-            "resolved_watermark",
-            "row_watermark" in diagnostics and resolved is not None,
-            (resolved, "record_watermark", placement.row_watermark_resolved),
-        ),
         # The forest's boundary: a pure forest is the caller's, so it enters and leaves nothing.
         (call, "count", True, (STEP, "count", solver)),
         (call, "leave", not pure, (cut, "leave", SOURCE_IN, SOURCE_OUT)),

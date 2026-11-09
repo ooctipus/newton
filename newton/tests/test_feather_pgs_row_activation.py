@@ -4,8 +4,8 @@
 """The row-activation gates: which rows a step builds, read from the step's data.
 
 A joint-limit row exists where its coordinate is within joint_limit_activation_gap of a finite bound, a velocity-limit
-row where its speed is past velocity_limit_activation_fraction of its limit, and a resolved world builds none. The
-rows the general route's warp builds are checked against the row law on both devices.
+row where its speed is past velocity_limit_activation_fraction of its limit; a row that may act at the predictor marks
+its world's acts word. The rows the general route's warp builds are checked against the row law on both devices.
 """
 
 import unittest
@@ -29,14 +29,13 @@ from newton.tests.feather_pgs_law_harness import PREFIX_RECORDS, prefix_warp_row
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-def _built_rows(q: float, *, gap: float, lower: float = -1.0, upper: float = 1.0, resolved: bool = False):
+def _built_rows(q: float, *, gap: float, lower: float = -1.0, upper: float = 1.0):
     """One revolute coordinate's joint-limit rows (the general route's warp, on the CPU): their J and phi."""
     rows = prefix_warp_rows(
         "cpu",
         1,
         1,
         8,
-        resolved=[int(resolved)],
         lower=[lower],
         upper=[upper],
         q=[q],
@@ -155,13 +154,6 @@ def _run_joint_limit_trajectory():
 
 
 class TestFeatherPGSJointLimitActivationGap(unittest.TestCase):
-    def test_resolved_world_skips_active_signed_limits(self):
-        """The selector owns feasibility; the allocator must bypass either active side."""
-        for q in (-1.2, 1.2):
-            with self.subTest(q=q):
-                self.assertEqual(len(_built_rows(q, gap=0.0)[0]), 1)
-                self.assertEqual(_built_rows(q, gap=0.0, resolved=True), ([], []))
-
     @unittest.skipUnless(wp.is_cuda_available(), "the matrix-free row families require CUDA")
     def test_limit_rows_follow_the_law_over_a_trajectory(self):
         """Give every step the joint-limit rows the row law gives at its input coordinates, with bitwise phi."""
@@ -208,27 +200,6 @@ class TestFeatherPGSJointLimitActivationGap(unittest.TestCase):
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-def _rows(device, resolved=None, articulation_count=257, size=6):
-    """One D6 joint per articulation and world, with positions drawn around its [-1, 1] limits: each world's row count,
-    Jacobian rows and records."""
-    dof_count = articulation_count * size
-    rng = np.random.default_rng(42)
-    rows = prefix_warp_rows(
-        device,
-        articulation_count,
-        size,
-        2 * size,
-        resolved=resolved,
-        lower=np.full(dof_count, -1.0),
-        upper=np.full(dof_count, 1.0),
-        q=rng.uniform(-1.2, 1.2, dof_count),
-        activation_gap=0.25,
-        beta=0.2,
-        cfm=1.0e-6,
-    )
-    return {name: rows[name] for name in ("count", "J", *PREFIX_RECORDS)}
-
-
 class TestFeatherPGSJointLimitWarp(unittest.TestCase):
     def test_acts_word_marks_worlds_whose_limits_may_act(self):
         """A world's acts word is set where an active side's residual at the predictor ``w v_hat + rhs`` is not above
@@ -252,24 +223,6 @@ class TestFeatherPGSJointLimitWarp(unittest.TestCase):
                 for name in ("count", "J", *PREFIX_RECORDS):
                     np.testing.assert_array_equal(rows[name], plain[name], err_msg=name)
 
-    def test_resolved_worlds_take_no_rows(self):
-        """An all-zero mask builds the same rows as the empty mask, and a resolved world builds none, on every device.
-
-        Mixed decisions share a block: a resolved group must leave its neighbors' ballots and row order unchanged.
-        """
-        devices = ["cpu"] + (["cuda:0"] if wp.is_cuda_available() else [])
-        for device in devices:
-            with self.subTest(device=device):
-                unmasked = _rows(device)
-                self.assertGreater(int(unmasked["count"].sum()), 0)
-                for name, actual in _rows(device, np.zeros(257)).items():
-                    np.testing.assert_array_equal(actual, unmasked[name], err_msg=name)
-                resolved = np.arange(257) % 3 == 0
-                for name, actual in _rows(device, resolved).items():
-                    expected = unmasked[name].copy()
-                    expected[resolved] = 0
-                    np.testing.assert_array_equal(actual, expected, err_msg=name)
-
 
 # ---------------------------------------------------------------------------------------------------------------------
 # velocity_limit_activation_fraction
@@ -286,9 +239,7 @@ def _joint_velocity_rows(qd: float, *, fraction: float, qdot_max: float = 1.0):
     return rows["J"][0, :count, 0].tolist(), rows["target"][0, :count].tolist(), count
 
 
-def _allocated_rigid_velocity_slots(
-    qd6, *, fraction: float, lin_limit: float = 1.0, ang_limit: float = 1.0, resolved: bool = False, acts=None
-):
+def _allocated_rigid_velocity_slots(qd6, *, fraction: float, lin_limit: float = 1.0, ang_limit: float = 1.0, acts=None):
     device = "cpu"
     acts = wp.zeros(0 if acts is None else 1, dtype=wp.int32, device=device)
     rigid_velocity_limit_slot = wp.full((2,), 91, dtype=wp.int32, device=device)
@@ -313,7 +264,6 @@ def _allocated_rigid_velocity_slots(
             wp.array(list(qd6), dtype=wp.float32, device=device),
             fraction,
             64,
-            wp.array([int(resolved)], dtype=wp.int32, device=device),
             0,
         ],
         outputs=[
@@ -340,12 +290,6 @@ def _allocated_rigid_velocity_slots(
 
 
 class TestFeatherPGSVelocityLimitActivationFraction(unittest.TestCase):
-    def test_resolved_world_clears_stale_rigid_slots_without_allocating(self):
-        """Resolved worlds leave no stale velocity-limit publication metadata."""
-        slots, count = _allocated_rigid_velocity_slots([0.0] * 6, fraction=0.0, resolved=True)
-        self.assertEqual(slots, [-1, -1])
-        self.assertEqual(count, 0)
-
     def test_solver_rejects_invalid_velocity_limit_activation_fraction(self):
         model = newton.ModelBuilder().finalize()
 

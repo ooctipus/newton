@@ -4,8 +4,8 @@
 """The contact row allocation against the contact laws it composes.
 
 Contact endpoints and admission: each kernel's output equals the laws' composition written out
-in this module. The gap's precision far from the origin is tested with its consumers (the resolved-world classifier in
-``test_feather_pgs_resolved_worlds``, the rows in ``test_feather_pgs_regimes`` Q20), the torsion oracle in
+in this module. The gap's precision far from the origin is tested with its consumers (the rows in
+``test_feather_pgs_regimes`` Q20), the torsion oracle in
 ``test_feather_pgs_torsion_device``.
 """
 
@@ -181,7 +181,6 @@ def test_contact_endpoints_match_row_allocation(test, device):
         enable_friction=1,
         row_capacity_telemetry=0,
         friction_patches=_patches(rng, contacts, device, 0),
-        resolved_worlds=np.zeros(0, dtype=np.int32),
         twists=np.zeros((0, 6), dtype=np.float32),
         acts=np.zeros(0, dtype=np.int32),
         units=np.zeros((0, 0), dtype=np.int32),

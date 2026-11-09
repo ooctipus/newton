@@ -166,7 +166,6 @@ def _prefix_warp_params(law) -> tuple:
         ("articulation_dof_start", wp.array[int]),
         ("art_to_world", wp.array[int]),
         ("group_to_art", wp.array[int]),
-        ("resolved_worlds", wp.array[int]),
         ("law", law),
         ("support", RowSupport),
     )
@@ -191,8 +190,7 @@ def _prefix_warp_kernel(size: int, groups: int, family: str, mimics: int = 0) ->
     (:func:`.prefix_rows.prefix_rows`), ``groups`` a block (:func:`prefix_shape`'s, one on the CPU): its joint limits, its joint
     velocity limits, or its mimics (at most ``mimics`` an articulation). The warp takes each candidate's law, reserves
     the active rows on the world's counter, writes their records and publishes each row's seed, its unit source, which
-    the one writer walks (a mimic's slot in ``mimic_slot`` too). The joint limits skip the resolved worlds; every world
-    takes its velocity limits and mimics."""
+    the one writer walks (a mimic's slot in ``mimic_slot`` too); a limit that may act marks its world's acts word."""
     name, native, law, kind = _PREFIX_FAMILIES[family]
     kind = int(kind)
     if family == "mimics":
@@ -216,11 +214,6 @@ def _prefix_warp_kernel(size: int, groups: int, family: str, mimics: int = 0) ->
         locals_="int mimic = -1;" if family == "mimics" else "",
         side="art",
     )
-    head = (
-        "    if (world >= 0 && world < resolved_worlds.shape[0] && resolved_worlds.data[world] != 0) return;\n"
-        if family == "limits"
-        else ""
-    )
     first_dof = "    const int first_dof = articulation_dof_start.data[art];\n"
     if family == "mimics":
         first_dof += (
@@ -228,7 +221,7 @@ def _prefix_warp_kernel(size: int, groups: int, family: str, mimics: int = 0) ->
         )
     body = f"""    const int art = group_to_art.data[group];
     const int world = art_to_world.data[art];
-{head}{first_dof}{rows}"""
+{first_dof}{rows}"""
     suffix = f"_m{mimics}" if family == "mimics" else ""
     return KernelTemplate(
         f"{name}_{size}_{groups}{suffix}",
@@ -647,7 +640,6 @@ class RowLaws:
                 solver.forest.articulation_dof_start,
                 solver.forest.art_to_world,
                 solver.forest.group_to_art[size],
-                solver.sweep.resolved_worlds,
                 law,
                 support,
             ],
@@ -831,9 +823,7 @@ class RowLaws:
             # The one writer's contact rows are its own to fill: their unit sources are written where their slots are
             # reserved.
             units = solver.placement.unit_source if producer == "walk" else solver.placement.no_units
-            # Under persistent patch friction, contacts of resolved worlds that the complete path would
-            # give rows are marked so the patch finish releases their anchors (row_slots.py); elsewhere a contact whose
-            # rows may act at the predictor marks its world (Placement.world_acts).
+            # A contact whose rows may act at the predictor marks its world (Placement.world_acts).
             pool.launch(
                 allocate_world_contact_slots,
                 contact_build_threads,
@@ -855,7 +845,6 @@ class RowLaws:
                     solver.options.contact_friction_gap_threshold,
                     1,
                     self.friction_patches.view,
-                    solver.sweep.resolved_worlds,
                     solver.placement.acts_twists,
                 ],
                 outputs=[
@@ -923,7 +912,6 @@ class RowLaws:
                 solver.v_hat,
                 solver.options.velocity_limit_activation_fraction,
                 capacity,
-                solver.sweep.resolved_worlds,
                 base,
             ],
             outputs=[

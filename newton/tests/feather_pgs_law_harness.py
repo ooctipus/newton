@@ -761,9 +761,7 @@ PREFIX_RECORDS = {
 """The records the general route's joint row warps write (:func:`prefix_warp_rows`), by their law's names."""
 
 
-def prefix_warp_rows(
-    device, arts: int, size: int, rows: int, *, family="limits", mimics=0, resolved=None, **law
-) -> dict:
+def prefix_warp_rows(device, arts: int, size: int, rows: int, *, family="limits", mimics=0, **law) -> dict:
     """Launch a joint row family's warp (``family``: the joint limits' :func:`.rows.joint_limit_warp_kernel`, the joint
     velocity limits' ``"velocity"`` or the mimics' ``"mimics"``, at most ``mimics`` an articulation), as
     :meth:`.rows.RowLaws.write_limits` launches it (:func:`.rows.prefix_shape`), its seeds into unit sources
@@ -771,8 +769,8 @@ def prefix_warp_rows(
 
     Articulation ``a`` is world ``a`` and group ``a``, its ``size`` coordinates from ``a * size``; its world holds
     ``rows`` rows. ``law`` holds the law's inputs by :data:`.prefix_rows.LAW`'s (and the family's) names; every
-    coordinate is a limit coordinate and none is prescribed unless it says. ``resolved`` is the worlds' resolved mask
-    (``None``: none). Returns each world's row count (``count``), the unit sources ``units`` and the rows' seeds as
+    coordinate is a limit coordinate and none is prescribed unless it says. Returns each world's row count (``count``),
+    the unit sources ``units`` and the rows' seeds as
     Jacobian rows ``J`` (each covector at its articulation's coordinates: :func:`.walk_rows.joint_seeds`), the records
     by name and every array the law was given, as numpy arrays.
     """
@@ -815,7 +813,6 @@ def prefix_warp_rows(
             wp.array(size * np.arange(arts), dtype=wp.int32, device=device),
             order,
             order,
-            wp.array(np.zeros(0) if resolved is None else np.asarray(resolved), dtype=wp.int32, device=device),
             struct,
             support,
         ],

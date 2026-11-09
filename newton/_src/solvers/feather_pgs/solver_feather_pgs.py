@@ -552,15 +552,6 @@ class SolverFeatherPGS(SolverBase):
         # The tree factor's evaluator: the held tree.
         self.factor.install(self)
 
-        # Worlds whose every candidate row separates at the predictor skip row
-        # allocation entirely (resolved_worlds.py); the mask is empty when the
-        # solver's row law is outside what the classifier evaluates.
-        from .resolved_worlds import ResolvedWorlds  # noqa: PLC0415
-
-        classifier = ResolvedWorlds(self)
-        self.sweep.resolved_worlds_owner = classifier if classifier.enabled else None
-        self.sweep.resolved_worlds = classifier.resolved
-        self.sweep.resolved_worlds_reason = classifier.reason
         # A world none of whose rows can act at the predictor solves to zero impulse: its allocators say which
         # (Placement.hold_acts).
         self.placement.hold_acts(self)
@@ -617,7 +608,7 @@ class SolverFeatherPGS(SolverBase):
         producer with each DOF size's row-builder kernels and friction law (from
         the plan the row build dispatches on), the sparse responses,
         the sweep kernels per route and tier, what drives them and the matrix-free
-        sweep's shared-memory storage (``sweep.mf_gs_storage``), resolved worlds,
+        sweep's shared-memory storage (``sweep.mf_gs_storage``), separated worlds,
         publication, velocity limits and the lane width of their prescale, free
         bodies and the friction law, each with a reason; ``routes.sweep.readout`` names the
         sweep kernels that count their sweeps, the passes that count the solves
@@ -946,9 +937,7 @@ class SolverFeatherPGS(SolverBase):
         These are whole-run running maxima (warmup included) of retained and
         raw per-world dense / matrix-free / rigid-contact row counts, rejected
         contact rows that allocators rolled back, peak over-capacity demand,
-        the number of overflowing world-steps, and the most rows a resolved world
-        skipped (``resolved_high_water``: its checked limits and three rows a
-        checked contact; the classifier runs as with the telemetry off). They are accumulated inside
+        and the number of overflowing world-steps. They are accumulated inside
         the captured :meth:`step` when
         ``Diagnostics.row_watermark`` is on. Reads the telemetry words back in one
         copy and so must be called OUTSIDE any captured/timed region (it

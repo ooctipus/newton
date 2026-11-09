@@ -23,7 +23,6 @@ import newton
 from newton._src.solvers.feather_pgs import coordinate_trees as ct
 from newton._src.solvers.feather_pgs import held_tree, tree_factor
 from newton._src.solvers.feather_pgs.device_proof import DeviceProof
-from newton._src.solvers.feather_pgs.friction_patches import CONTACT_PATH_RESOLVED
 from newton._src.solvers.feather_pgs.held_tree import HeldTree
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_mass_reference import MassReference
@@ -316,9 +315,9 @@ def dense_head(model, *, rows=64, **options):
     """The A/B head: the keyboard recipe on the general placement and dense storage, with the star in the held tree.
 
     ``rows`` is its dense row capacity: every key's limit rows are dense rows there. The general rows are inside
-    the resolved-world classifier's law, the sparse-diagonal rows of the class's route are not: the head alone leaves
-    a world whose rows all separate without rows (:func:`_normal_impulses`), which changes the rows the arms keep,
-    not their physics (the pusher press: key travel within 5.6e-7 and normal impulses within 3.0e-6 relative).
+    the separated worlds' switch, the sparse-diagonal rows of the class's route are not: the head alone leaves a world
+    whose rows all separate unswept at zero impulse (:func:`_normal_impulses`), which changes no physics (the pusher
+    press: key travel within 5.6e-7 and normal impulses within 3.0e-6 relative).
     """
     return recipe_solver(model, coordinate=False, pins={"placement": "general"}, dense_max_constraints=rows, **options)
 
@@ -907,15 +906,11 @@ def _contact_rows(test, solver, count):
 
 
 def _normal_impulses(test, solver, count):
-    """The solved normal impulse [N·s] of each of the first ``count`` contacts, in contact order.
-
-    A contact of a world the resolved-world classifier resolved (every row separates at the predictor) has no
-    rows and carries none.
-    """
+    """The solved normal impulse [N·s] of each of the first ``count`` contacts, in contact order: zero, as prepared,
+    in a world none of whose rows can act."""
     world, slot = solver.placement.contact_world.numpy()[:count], solver.placement.contact_slot.numpy()[:count]
-    resolved = solver.placement.contact_path.numpy()[:count] == int(CONTACT_PATH_RESOLVED)
-    test.assertTrue(np.all((slot >= 0) | resolved), "every contact owns a row or sits in a resolved world")
-    return np.where(resolved, 0.0, solver.placement.impulses.numpy()[world, np.maximum(slot, 0)]).astype(np.float64)
+    test.assertTrue(np.all(slot >= 0), "every contact owns a row")
+    return solver.placement.impulses.numpy()[world, slot].astype(np.float64)
 
 
 def _key_inertia(model, leaves, dofs, axes):
@@ -1098,8 +1093,8 @@ class TestGripperContactBound(unittest.TestCase):
                 values = getattr(model, name).numpy()
                 values[layout.key_dofs] = 0.0
                 getattr(model, name).assign(values)
-        # The bound reads every step's rows: the complete path builds them in a world whose contacts separate too.
-        solver = recipe_solver(model, coordinate=False, pgs_iterations=iterations, pins={"claims": ()})
+        # The bound reads every step's rows: the complete path writes them in a world whose contacts separate too.
+        solver = recipe_solver(model, coordinate=False, pgs_iterations=iterations, pins={"separated_worlds": False})
         return solver, _press_key_with_tip(self, model, layout, solver, shift=shift)
 
     def _head_and_reference(self):

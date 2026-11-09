@@ -450,10 +450,10 @@ class SolveReadoutRecord:
 
     A sweep that returns before its first sweep for a world records nothing
     for it. The matrix-free sweeps do so for every world without dense or
-    matrix-free rows, such as one the resolved-world classifier left without
-    rows: the route that launches them registers skip counters
+    matrix-free rows, or none of whose rows can act (no claim takes it):
+    the route that launches them registers skip counters
     (:meth:`register_skipped`) and counts, at each launch
-    (:meth:`count_skipped`), the worlds without rows of any family, so a
+    (:meth:`count_skipped`), those worlds, so a
     world's solves are its slots' solves plus its skipped ones. Every sweep
     carries counters, the parallel (Jacobi) tiers against their own sweep
     budget, so every world-solve that a sweep enters lands in a slot.

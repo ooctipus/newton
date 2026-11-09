@@ -8,7 +8,8 @@
 - the sweeps that own their worlds, each a configuration (:class:`.sweep.SweepConfig`) the plan binds from the class
   plan's choices, the laws and the placement, built by the one factory (:func:`.sweep.sweep_kernel`), and their streams
   (:meth:`Sweep.build`, :meth:`Sweep.open_streams`);
-- the claims: the worlds the row pass left to each owner (:meth:`Sweep.claim_worlds`), and the resolved worlds;
+- the claims: the worlds the row pass left to each owner (:meth:`Sweep.claim_worlds`), none of them one whose rows all
+  separate;
 - the warm start: the normal impulses gathered by contact identity (:meth:`Sweep.warm_start`), and what a step
   carries to the next (:meth:`Sweep.carry`);
 - the launches, one bound launch a sweep (:class:`SweepLaunch`), in line or on the claims' streams
@@ -1171,10 +1172,6 @@ class Sweep:
             },
             "sparse_mass_matrix": sparse,
             "sweep": self._record_sweep(plan),
-            "resolved_worlds": {
-                "enabled": self.resolved_worlds_owner is not None,
-                "reason": self.resolved_worlds_reason,
-            },
             # A world none of whose rows can act at the predictor keeps zero impulse (Placement.hold_acts).
             "separated_worlds": {
                 "enabled": self.placement.acts_reason is None,

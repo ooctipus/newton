@@ -476,7 +476,7 @@ _MOTION = ts.TWIST.with_zero_acceleration()
 """The motion scan's combine where no joint has an own bias acceleration (:attr:`.TreeLayout.own_bias`)."""
 _REDUCE = ts.add(ts.Group("wrench", 6), ts.Group("moment", INERTIA_CHANNELS, "refresh"))
 _TWIST_SUM = ts.add(ts.Group("twist", 6))
-# Predicted body twists for the resolved-world classifier: each lane sums its body's own axes against the final
+# Predicted body twists for the contacts' residuals at allocation: each lane sums its body's own axes against the final
 # predictor velocity, then pointer-jumps up the tree through shuffles (velocities at a common origin add).
 _TWIST_SOURCE = (
     "{{const int first=ds+plan.body_dof_start.data[{node}],count=plan.body_dof_count.data[{node}];"
