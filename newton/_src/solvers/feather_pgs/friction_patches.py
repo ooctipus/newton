@@ -84,11 +84,14 @@ _BUILD_BLOCKS_PER_SM = 8
 _LIVE = wp.constant(1)
 _SORT_EXTENT = wp.constant(2)
 _WORLD_EXTENT = wp.constant(2 + EXTENT_SIZE)
-# A frame whose worlds hold at most this many contacts each sorts every world on its own lanes, each lane ranking its
-# contacts against its world's; a frame with a larger world sorts the stream. The scan of the worlds' counts takes
-# one block.
-_WORLD_CONTACTS = wp.constant(256)
+# A frame whose worlds hold at most this many contacts each sorts every world on its own lanes, each lane holding
+# _WORLD_HELD of them at a time and ranking them in one pass over its world's; a frame with a larger world sorts the
+# stream. The scan of the worlds' counts takes one block.
+_WORLD_CONTACTS = wp.constant(512)
 _WORLD_LANES = 32
+_WORLD_HELD = wp.constant(8)
+_HeldKeys = wp.types.vector(length=_WORLD_HELD, dtype=wp.int64)
+_HeldIndices = wp.types.vector(length=_WORLD_HELD, dtype=wp.int32)
 _SCAN_THREADS = 1024
 # Contact paths 0 and 1 hold dense and matrix-free rows, and -1 holds none.
 # A region's spin arm over the polar radius of gyration of its contacts' hull: the mean radius of a convex patch under
@@ -573,22 +576,31 @@ def _sort_worlds(
     keys: wp.array[wp.int64],
     indices: wp.array[int],
 ):
-    """Sort each world's contacts by (key, contact) into its slots, a lane ranking its contacts by the world's."""
+    """Sort each world's contacts by (key, contact) into its slots: a lane ranks the contacts it holds by the world's."""
     bucket, lane = wp.tid()
     if extent[_WORLD_EXTENT] == 0:
         return
     start = worlds.start[bucket]
     count = worlds.start[bucket + 1] - start
-    for i in range(lane, count, lanes):
-        key = world_keys[start + i]
-        c = world_indices[start + i]
-        rank = int(0)
+    for first in range(lane * _WORLD_HELD, count, lanes * _WORLD_HELD):
+        held = _HeldKeys()
+        contact = _HeldIndices()
+        rank = _HeldIndices()
+        for k in range(_WORLD_HELD):
+            held[k] = wp.int64(0x7FFFFFFFFFFFFFFF)
+            if first + k < count:
+                held[k] = world_keys[start + first + k]
+                contact[k] = world_indices[start + first + k]
         for j in range(count):
             other = world_keys[start + j]
-            if other < key or (other == key and world_indices[start + j] < c):
-                rank += 1
-        keys[start + rank] = key
-        indices[start + rank] = c
+            other_contact = world_indices[start + j]
+            for k in range(_WORLD_HELD):
+                if other < held[k] or (other == held[k] and other_contact < contact[k]):
+                    rank[k] += 1
+        for k in range(_WORLD_HELD):
+            if first + k < count:
+                keys[start + rank[k]] = held[k]
+                indices[start + rank[k]] = contact[k]
 
 
 @wp.func
