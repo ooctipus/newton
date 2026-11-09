@@ -324,8 +324,8 @@ class TierSweep(SweepConfig):
 
     @property
     def threads(self) -> int:
-        """A block's threads: the rows in whole warps."""
-        return 32 * ((int(self.rows) + 31) // 32)
+        """A block's threads: its row store's, a lane a row in whole warps (:attr:`.sweep.JacobiRows.threads`)."""
+        return JacobiRows(int(self.rows)).threads
 
     @property
     def name(self) -> str:
