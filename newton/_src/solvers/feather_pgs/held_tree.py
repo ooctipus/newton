@@ -116,30 +116,14 @@ def _prescribed_articulations(forest):
 
 
 def _coverage(model, forest, compact):
-    """Prove disjoint articulation and physical coordinate ownership; ``compact`` is the compact diagonal size the
-    groups carry. An articulation no size group holds has no coordinates (a ``"rest"`` group), and a body outside
-    the articulations stays outside the solver."""
+    """The dense groups' coverage, which the held tree proves on notification; ``compact`` is the compact diagonal size
+    the groups carry. The forest plan's size groups and prescribed bodies own each articulation's coordinates once by
+    construction; what the model can still break is checked: contiguous nonempty articulations, a body one joint's."""
     prescribed = _prescribed_articulations(forest)
     owned, _ = tree_joints(model)
-    arts = np.concatenate([forest.group_to_art[size].numpy() for size in forest.size_groups] + [prescribed])
-    if np.unique(arts).size != arts.size:
-        raise ValueError("Mixed tree factors must hold an articulation at most once")
     starts = model.articulation_start.numpy()
     if starts[0] != 0 or starts[-1] != model.joint_count or np.any(np.diff(starts) <= 0):
         raise ValueError("Mixed tree cache requires contiguous nonempty articulations")
-    qd = model.joint_qd_start.numpy()
-    ends = forest.articulation_joint_end_host
-    ds = forest.articulation_dof_start.numpy()
-    if not np.array_equal(ds, qd[starts[:-1]]):
-        raise ValueError("Mixed tree factor starts must preserve physical coordinate ownership")
-    for size in forest.size_groups:
-        group = forest.group_to_art[size].numpy()
-        if np.any(qd[ends[group]] - qd[starts[group]] != size):
-            raise ValueError("Mixed tree factor size disagrees with its physical coordinates")
-        if forest.n_arts_by_size[size] != len(group):
-            raise ValueError("Mixed tree factor count disagrees with its group map")
-    if prescribed.size and np.any(qd[ends[prescribed]] - qd[starts[prescribed]] != 6):
-        raise ValueError("Prescribed cached roots must be six-coordinate free bodies")
     if np.unique(model.joint_child.numpy()[owned]).size != np.count_nonzero(owned):
         raise ValueError("Mixed tree cache must publish a body at most once")
     return (
