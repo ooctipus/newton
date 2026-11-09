@@ -186,37 +186,21 @@ class SolverFeatherPGS(SolverBase):
                 return float("inf")
             return value * np.pi / 180.0
 
-        builder.add_custom_attribute(
-            ModelBuilder.CustomAttribute(
-                name="rigid_body_max_linear_velocity",
-                frequency=Model.AttributeFrequency.BODY,
-                assignment=Model.AttributeAssignment.MODEL,
-                dtype=wp.float32,
-                default=float("inf"),
-                usd_attribute_name="physxRigidBody:maxLinearVelocity",
+        for name, usd_name, transformer in (
+            ("rigid_body_max_linear_velocity", "physxRigidBody:maxLinearVelocity", None),
+            ("rigid_body_max_angular_velocity", "physxRigidBody:maxAngularVelocity", _angular_velocity_deg_to_rad),
+            ("rigid_body_max_depenetration_velocity", "physxRigidBody:maxDepenetrationVelocity", None),
+        ):
+            builder.add_custom_attribute(
+                ModelBuilder.CustomAttribute(
+                    name=name,
+                    frequency=Model.AttributeFrequency.BODY,
+                    dtype=wp.float32,
+                    default=float("inf"),
+                    usd_attribute_name=usd_name,
+                    usd_value_transformer=transformer,
+                )
             )
-        )
-        builder.add_custom_attribute(
-            ModelBuilder.CustomAttribute(
-                name="rigid_body_max_angular_velocity",
-                frequency=Model.AttributeFrequency.BODY,
-                assignment=Model.AttributeAssignment.MODEL,
-                dtype=wp.float32,
-                default=float("inf"),
-                usd_attribute_name="physxRigidBody:maxAngularVelocity",
-                usd_value_transformer=_angular_velocity_deg_to_rad,
-            )
-        )
-        builder.add_custom_attribute(
-            ModelBuilder.CustomAttribute(
-                name="rigid_body_max_depenetration_velocity",
-                frequency=Model.AttributeFrequency.BODY,
-                assignment=Model.AttributeAssignment.MODEL,
-                dtype=wp.float32,
-                default=float("inf"),
-                usd_attribute_name="physxRigidBody:maxDepenetrationVelocity",
-            )
-        )
 
     def __init__(
         self,
