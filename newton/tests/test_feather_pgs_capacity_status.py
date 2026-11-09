@@ -204,8 +204,9 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
                 if capacity >= 640:
                     solver.check_constraint_capacity()
                     # Every contact's three rows, or none once every contact separates at the predictor (a resolved
-                    # world: zero impulse solves its step).
-                    resolved = bool(solver.sweep.resolved_worlds.numpy()[0])
+                    # world: zero impulse solves its step). The CPU's predictor publishes no twists: no world resolves.
+                    mask = solver.sweep.resolved_worlds.numpy()
+                    resolved = bool(mask.size and mask[0])
                     self.assertEqual(int(solver.placement.constraint_count.numpy()[0]), 0 if resolved else count * 3)
                     residual = velocity + solver.options.pgs_beta * (old_position - depths.astype(np.float64)) / dt
                     self.assertGreaterEqual(float(residual.min()), -2.0e-6)
