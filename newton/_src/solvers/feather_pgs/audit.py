@@ -517,7 +517,7 @@ class Audit:
         """The dense rows' support class, by the solve's route (:attr:`.step_plan.StepPlan.solve`), chosen once."""
         solver = self.solver
         placement = solver.placement
-        route = solver._plan.solve.route.name
+        route = solver._plan.solve.name
         if route == "sparse_pgs":
             return sparse_class(int(placement.sparse_row_factor.shape[2]), bool(placement.sparse_row_support.enabled))
         if route == "sparse_diagonal":
@@ -544,7 +544,7 @@ class Audit:
         device, worlds, v = solver.model.device, forest.world_count, solver.v_out
         first, capacity = placement.dense_first, placement.dense_max_constraints
         # The walked rows (walk_rows) are in the walk's coordinates: their trees' coordinates are the walk's too.
-        route = solver._plan.solve.route.name
+        route = solver._plan.solve.name
         if route != "sparse_pgs" and placement.walks:
             self._walk_coordinates(v, self.coordinates)
             if route != "sparse_diagonal":

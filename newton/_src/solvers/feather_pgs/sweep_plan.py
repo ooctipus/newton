@@ -1167,8 +1167,8 @@ class Sweep:
         counted = self.readout.kernels
         readout = self.options.diagnostics.solve_readout
         return {
-            "route": plan.solve.route.name,
-            "reason": plan.solve.route.reason,
+            "route": plan.solve.name,
+            "reason": plan.solve.reason,
             "iterations": int(self.options.pgs_iterations),
             # The streamed rows' records, which the rows' writers store where a sweep streams a row.
             "row_records": {
