@@ -987,26 +987,59 @@ def _plan_class(inputs, *, general):
 
 
 class TestTierRule(unittest.TestCase):
-    """Build the Jacobi tiers for case K4, a tree beside a free body (a hub)."""
+    """Build the Jacobi tiers for case K4, a hub: a contact can join a free body to a tree."""
 
     @staticmethod
     def _rule(
         response=((16, 6, 0, 16), "The parallel tiers form the response in-kernel."),
+        hub=True,
         **changes,
     ):
-        """The tier rule on a class's inputs, allegro's by default (a 16-coordinate hand and a cube, 192 dense rows),
-        with the in-kernel response ``response`` (its sizes and why)."""
+        """The tier rule on a class's inputs, allegro's by default (a 16-coordinate hand and a cube, 192 dense rows, a
+        hub), with the in-kernel response ``response`` (its sizes and why)."""
         inputs = SimpleNamespace(
+            model=None,
             pins=SolverFeatherPGS.Pins(),
             dense_rows=192,
-            forest=SimpleNamespace(world_count=4, max_world_dofs=22, shape=SimpleNamespace(beside=True)),
+            forest=SimpleNamespace(world_count=4, max_world_dofs=22, shape=None),
         )
         for name, value in changes.items():
             setattr(inputs, name, value)
         sizes, reason = response
         meta = None if sizes is None else np.zeros((4, 4), np.int32)
-        with patch.object(class_plan, "tier_response", lambda shape: (sizes, meta, reason)):
+        with (
+            patch.object(class_plan, "tier_response", lambda shape: (sizes, meta, reason)),
+            patch.object(class_plan, "_hub", lambda model, forest: hub),
+        ):
             return class_plan.tier_rule(inputs)
+
+    def test_a_hub_is_a_contact_that_joins_a_free_body_to_a_tree(self):
+        """A world's rows all couple where a contact joins a free body to a tree that is not one (``_hub``): not
+        through a contact with the static world or within one tree, nor between two trees of which neither or both are
+        free bodies (the colored units' exact levels)."""
+
+        def hub(pairs, free=(0, 1, 0)):
+            # Bodies 0-2 on trees 0-2 (tree 1 a free body, articulation 1), body 3 on tree 0; shapes a body each, the
+            # last static.
+            model = SimpleNamespace(
+                shape_contact_pair_count=len(pairs),
+                shape_contact_pairs=SimpleNamespace(numpy=lambda: np.asarray(pairs, np.int32)),
+                shape_body=SimpleNamespace(numpy=lambda: np.asarray((0, 1, 2, 3, -1), np.int32)),
+            )
+            forest = SimpleNamespace(
+                body_tree=np.asarray((0, 1, 2, 0), np.int32),
+                tree_articulation=np.asarray((0, 1, 2), np.int32),
+                is_free_rigid_host=np.asarray(free, np.int32),
+            )
+            return class_plan._hub(model, forest)
+
+        self.assertTrue(hub(((0, 1),)))
+        self.assertTrue(hub(((4, 1), (1, 2))))
+        self.assertFalse(hub(((1, 4), (0, 3))))
+        self.assertFalse(hub(((0, 2),)))
+        self.assertFalse(hub(((0, 1),), free=(0, 0, 0)))
+        self.assertFalse(hub(((1, 2),), free=(0, 1, 1)))
+        self.assertFalse(hub(()))
 
     def test_a_tree_beside_a_body_takes_the_tiers(self):
         """Bound the tiers by the dense row capacity, at most 128 rows, in whole quads."""
@@ -1019,15 +1052,9 @@ class TestTierRule(unittest.TestCase):
         """Leave every other class to its own placement and say why."""
         for changes, reason in (
             # A class with no coordinate a world leaves no matrix-free sweep.
-            (
-                {"forest": SimpleNamespace(world_count=4, max_world_dofs=0, shape=SimpleNamespace(beside=True))},
-                "No matrix-free sweep",
-            ),
-            # No world holds a free body beside a tree: no hub.
-            (
-                {"forest": SimpleNamespace(world_count=4, max_world_dofs=22, shape=SimpleNamespace(beside=False))},
-                "a free body beside a tree",
-            ),
+            ({"forest": SimpleNamespace(world_count=4, max_world_dofs=0, shape=None)}, "No matrix-free sweep"),
+            # No contact can join a free body to another tree: no hub.
+            ({"hub": False}, "no contact joins a free body to a tree"),
             ({"pins": SolverFeatherPGS.Pins(tiers=0)}, "tiers=0"),
             ({"response": (None, "A world has several articulations of size 6.")}, "several"),
         ):

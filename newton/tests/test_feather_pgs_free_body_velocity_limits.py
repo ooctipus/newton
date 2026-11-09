@@ -93,13 +93,14 @@ def _add_body(builder, xform, limits):
 
 def _add_arm(builder, joints=1):
     """Add an arm of ``joints`` revolute joints in a chain to the current world, so the world's sweep visits dense rows
-    before its free bodies' speed rows; 17 joints beside the box make a hub of more coordinates than a hand's."""
+    before its free bodies' speed rows, and return its last link (whose inertia its shapes do not change)."""
     parent, chain = -1, []
     for _ in range(joints):
-        link = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * 0.1))
+        link = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * 0.1), lock_inertia=True)
         chain.append(builder.add_joint_revolute(parent, link, axis=newton.Axis.Y))
         parent = link
     builder.add_articulation(chain)
+    return parent
 
 
 def _run(builder, device, bodies, *, velocities=None, wrenches=None, **options):
@@ -168,7 +169,9 @@ def _free_boxes(
         builder.add_shape_box(box, hx=0.1, hy=0.1, hz=0.1)
         boxes.append(box)
         if articulated:
-            _add_arm(builder, int(articulated))
+            # The arm's tip can touch the box, which it never reaches: a hub, the tiers' class (17 joints: more
+            # coordinates than a hand's).
+            builder.add_shape_sphere(_add_arm(builder, int(articulated)), radius=0.05)
         builder.end_world()
     return _run(
         builder,
