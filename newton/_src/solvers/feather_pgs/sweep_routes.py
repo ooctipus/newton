@@ -28,6 +28,7 @@ from .row_metadata import record_layout, unpack_mf_header, validate_record_coord
 from .solve_policy import QUIET_LITERAL, block_argmax, sweep_exit
 from .sweep import (
     EXACT,
+    FORMED_RECORD,
     ITERATION,
     SEQUENTIAL,
     Diagonal,
@@ -54,6 +55,7 @@ from .sweep import (
     row_step,
     rows_block,
     speed_rows_pass,
+    triple_phase,
     unit_visit,
     velocity_limit_pass,
 )
@@ -672,10 +674,11 @@ def _colored_metrics(units: int, *, torsion: bool = False) -> str:
 
 
 def coordinate_levels(
-    dense: WorldRows, op: SparseFactor, laws: RowLaws, *, metric: str | None, formed
+    dense: WorldRows, op: SparseFactor, laws: RowLaws, *, metric: str | None, formed, triple_phase: bool = False
 ) -> tuple[str, str, str]:
     """The units on one coordinate no wider unit holds (:func:`.sweep_levels.coordinate_levels_kernel`) by level, a
-    lane a unit, before the order, with which they commute: the leveled heads' marks, the phase and the order's skip."""
+    lane a unit, before the order, with which they commute: the leveled heads' marks, the phase and the order's skip.
+    Under ``triple_phase`` a leveled contact's triple is the triple phase's, after the order, as every triple's."""
     M = dense.capacity
     count, offsets = (
         "sparse_contact_level_count.data[world]",
@@ -691,7 +694,10 @@ def coordinate_levels(
 
     pad = " " * 16
     owns = f"head + 2 < m_dense && ({dense.kind('head + 1')}) == {ROW_FRICTION} && {dense.parent('head + 1', enclosed=True)} == head"
-    pair = f"{pad}if ({owns}) {{\n{visit('head + 1', pad + '    ', kind=ROW_FRICTION, parent='head')}\n{pad}}}"
+    if triple_phase:
+        owns += f" && {dense.spin_of('head', 'm_dense')} < 0"
+    known = {"kind": ROW_FRICTION, "parent": "head", "triple_phase": triple_phase}
+    pair = f"{pad}if ({owns}) {{\n{visit('head + 1', pad + '    ', **known)}\n{pad}}}"
     levels = Levels(
         count,
         offsets.format,
@@ -968,12 +974,32 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         if ({"!__syncthreads_or(velocity_moved != 0)" if colored else "BALLOT(velocity_moved != 0) == 0u"}) iteration_changed = 0;
 """
     admission = _LINE_ADMISSION if speed_rows else _DENSE_ADMISSION
+    triples = ""
+    if contact_torsion and sweep.one_tree and not colored:
+        # Every world holds one tree: K1's order. The row loop solves every contact's normal and every other row, then
+        # the friction triples follow in the shared phase (sweep.triple_phase), each on its contact's record.
+        spin = dense.spin_of(dense.parent("i", enclosed=True), "m_dense")
+        admission += f"\nif (row_type == {ROW_FRICTION} && {spin} >= 0) continue;"
+        record = ", ".join(f"{name} = friction_record[{k}]" for k, name in enumerate(FORMED_RECORD))
+        triples = triple_phase(
+            dense,
+            dense_op,
+            laws,
+            count="m_dense",
+            record=f"const float4* const friction_record = reinterpret_cast<const float4*>({dense_record('head')});\n"
+            f"const float4 {record};",
+            law=f"{metric}({', '.join(FORMED_RECORD)}, ",
+            heads=lambda row: f"{dense.spin_of(row, 'm_dense')} >= 0 && {dense.kind(row)} == {ROW_CONTACT}",
+            pad="        ",
+        )
     units = ""
     if sweep.contact_units:
         units = dense_units(dense, dense_op, laws, active=sweep.active_rows, record=dense_record, pad="")
     level_marks = level_phase = ""
     if sweep.coordinate_levels:
-        level_marks, level_phase, skip = coordinate_levels(dense, dense_op, laws, metric=metric, formed=dense_record)
+        level_marks, level_phase, skip = coordinate_levels(
+            dense, dense_op, laws, metric=metric, formed=dense_record, triple_phase=bool(triples)
+        )
         units = f"{skip}\n{units}" if units else skip
     dense_phase = rows_block(
         dense,
@@ -984,13 +1010,15 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         formed=dense_record,
         selected=sweep.active_rows,
         unit=units,
+        triple_phase=bool(triples),
         pad="        ",
     )
     if units and sweep.contact_units:
         dense_phase = f"        int consumed_tangent = -1;\n{dense_phase}"
     if sweep.active_rows:
         # The active enumeration: each sweep's scan selects the dense rows it visits, after the last sweep's stores.
-        spin = (lambda parent: dense.spin_of(parent, "m_dense")) if contact_torsion else None
+        # A triple left in the loop (two trees a world) is selected while its spin row holds impulse too.
+        spin = (lambda parent: dense.spin_of(parent, "m_dense")) if contact_torsion and not triples else None
         scan = active_scan(
             dense, dense_op, count="m_dense", seeded=seeded, linked=True, torsion=contact_torsion, spin=spin, pad=""
         )
@@ -1000,6 +1028,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         (
             f"{first_warp}{level_phase}{chr(10) if level_phase else ''}{dense_phase}\n{end_first_warp}"
             + ("        __syncthreads();" if colored else ""),
+            triples,
             indent(free_phase, "    "),
         ),
         (f"{first_warp}{chr(10).join(passes)}\n{end_first_warp}",),
@@ -1113,6 +1142,7 @@ class GeneralSweep(SweepConfig):
     pitch: int | None = None
     free_rows: bool = True
     speed_rows: bool = False
+    one_tree: bool = False
 
     def __post_init__(self):
         if self.levels.law not in (SEQUENTIAL, EXACT):
@@ -1187,6 +1217,7 @@ class GeneralSweep(SweepConfig):
             + (f"_p{pitch}" if pitch is not None and pitch != M + MF else "")
             + ("" if self.free_rows else "_line")
             + ("_speed" if self.speed_rows else "")
+            + ("_tree" if self.one_tree else "")
             + "_walk"
             + self.solve_policy.suffix
         )

@@ -27,8 +27,9 @@ from newton.tests.feather_pgs_patch_parity import (
 from newton.tests.feather_pgs_row_builders import assert_row_builders_named, launched_kernels
 
 
-def build_solver_fixture(device):
-    """Actual admitted two-world sparse108 + serial-six model with live contact shapes."""
+def build_solver_fixture(device, *, chain: bool = True):
+    """Actual admitted two-world sparse108 + serial-six model with live contact shapes (without ``chain`` each world
+    holds the star alone: one tree)."""
     template = newton.ModelBuilder()
     inertia = wp.mat33(0.04, 0.0, 0.0, 0.0, 0.05, 0.0, 0.0, 0.0, 0.06)
     root = template.add_link(mass=2.0, inertia=inertia)
@@ -50,28 +51,29 @@ def build_solver_fixture(device):
         if index < 2:
             template.add_shape_sphere(body=body, radius=0.01)
     template.add_articulation(joints)
-    # The chain stands on a fixed base: the held tree, which alone evaluates the compact diagonal, takes fixed or
-    # free roots.
-    parent = template.add_link(mass=0.4, inertia=inertia)
-    joints = [template.add_joint_fixed(parent=-1, child=parent)]
-    for index in range(6):
-        body = template.add_link(mass=0.4, com=wp.vec3(0.02, 0.01, 0.06), inertia=inertia)
-        joints.append(
-            template.add_joint_revolute(
-                parent=parent,
-                child=body,
-                axis=newton.Axis.Y,
-                parent_xform=wp.transform(wp.vec3(0.03, 0.0, 0.04), wp.quat_identity()),
-                target_ke=2.0,
-                target_kd=0.1,
-                limit_lower=-0.04,
-                limit_upper=0.04,
+    if chain:
+        # The chain stands on a fixed base: the held tree, which alone evaluates the compact diagonal, takes fixed or
+        # free roots.
+        parent = template.add_link(mass=0.4, inertia=inertia)
+        joints = [template.add_joint_fixed(parent=-1, child=parent)]
+        for index in range(6):
+            body = template.add_link(mass=0.4, com=wp.vec3(0.02, 0.01, 0.06), inertia=inertia)
+            joints.append(
+                template.add_joint_revolute(
+                    parent=parent,
+                    child=body,
+                    axis=newton.Axis.Y,
+                    parent_xform=wp.transform(wp.vec3(0.03, 0.0, 0.04), wp.quat_identity()),
+                    target_ke=2.0,
+                    target_kd=0.1,
+                    limit_lower=-0.04,
+                    limit_upper=0.04,
+                )
             )
-        )
-        if index in (0, 5):
-            template.add_shape_sphere(body=body, radius=0.01)
-        parent = body
-    template.add_articulation(joints)
+            if index in (0, 5):
+                template.add_shape_sphere(body=body, radius=0.01)
+            parent = body
+        template.add_articulation(joints)
     builder = newton.ModelBuilder(gravity=(0.4, -0.9, -9.2))
     builder.add_world(template)
     builder.add_world(template)
@@ -109,7 +111,7 @@ def install_patch_contacts(model, state, contacts):
     Per world, each star sphere rests on a static support at three contacts in a row: the outer two
     become the ring's anchors (three-row units) and the middle one a normal-only unit. A two-contact
     ring couples the first star sphere to the chain's last sphere, which keeps that sphere's
-    coordinate out of the independent schedule.
+    coordinate out of the independent schedule (a model without the chain holds no such ring).
 
     The stars slide along z only, so a level support's tangent rows have no Jacobian. The first star's
     support is tilted by 30 degrees and its contacts start 1 mm deep: the depth's correction slides the
@@ -132,17 +134,19 @@ def install_patch_contacts(model, state, contacts):
         p = point - pose[:3]
         return p + 2 * np.cross(q, np.cross(q, p) + pose[6] * p)
 
-    rows = []
+    rows, per = [], model.shape_count // 2
     for world in range(2):
-        star0, star1, _, chain = 4 * world, 4 * world + 1, 4 * world + 2, 4 * world + 3
+        star0, star1 = per * world, per * world + 1
         for shape, normal, depth in ((star0, tilted, 1.0e-3), (star1, down, 0.0)):
             bottom = poses[shape_body[shape], :3] - np.array((0.0, 0.0, radius))
             # The row runs along y, which both supports keep tangent.
             rows += [
                 (shape, -1, bottom + np.array((0.0, offset, 0.0)), normal, depth) for offset in (-0.004, 0.0, 0.004)
             ]
-        middle = 0.5 * (poses[shape_body[star0], :3] + poses[shape_body[chain], :3])
-        rows += [(star0, chain, middle + np.array((0.0, offset, 0.0)), down, 0.0) for offset in (-0.004, 0.004)]
+        if per > 2:
+            chain = per * world + 3
+            middle = 0.5 * (poses[shape_body[star0], :3] + poses[shape_body[chain], :3])
+            rows += [(star0, chain, middle + np.array((0.0, offset, 0.0)), down, 0.0) for offset in (-0.004, 0.004)]
     capacity = contacts.rigid_contact_shape0.shape[0]
     shapes = np.full((2, capacity), -1, dtype=np.int32)
     points = np.zeros((2, capacity, 3), dtype=np.float32)
@@ -382,8 +386,17 @@ class TestCoordinateLevels(unittest.TestCase):
         """Under the general placement the star's units of one entry step by level before the rows in order (the
         coordinate levels): the limits and the level support's patch ring take levels, the ring coupled to the chain
         stays in order, and the steps are the rows in order bit for bit (the schedule emptied)."""
+        self._levels_against_order(chain=True, contact_torsion=False)
+
+    def test_levels_leave_a_one_tree_triple_to_the_triple_phase(self):
+        """With the star alone (one tree a world: its friction triples in the phase after the rows, K1's order) under
+        contact torsion, a leveled contact's triple is the phase's alone: a triple solved twice would break the steps'
+        bitwise match with the rows in order."""
+        self._levels_against_order(chain=False, contact_torsion=True)
+
+    def _levels_against_order(self, *, chain: bool, contact_torsion: bool):
         for device in ("cpu", *(str(d) for d in wp.get_cuda_devices())):
-            model = build_solver_fixture(device)
+            model = build_solver_fixture(device, chain=chain)
             runs = []
             for empty in (False, True):
                 solver = newton.solvers.SolverFeatherPGS(
@@ -391,9 +404,12 @@ class TestCoordinateLevels(unittest.TestCase):
                     pgs_iterations=8,
                     enable_joint_limits=True,
                     dense_max_constraints=320,
+                    contact_torsion=contact_torsion,
                     pins=newton.solvers.SolverFeatherPGS.Pins(placement="general"),
                 )
-                self.assertIn("_levels", solver.get_path_selection()["routes"]["sweep"]["mf_gs"])
+                name = solver.get_path_selection()["routes"]["sweep"]["mf_gs"]
+                self.assertIn("_levels", name)
+                self.assertEqual("_tree" in name, not chain)
                 schedule, leveled = solver.sweep.schedule_diagonal, []
 
                 def emptied(schedule=schedule, solver=solver, empty=empty, leveled=leveled):
