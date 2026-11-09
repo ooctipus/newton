@@ -240,12 +240,11 @@ class TestResponseOperators(unittest.TestCase):
                 source = _source(args, kwargs)
                 self.assertNotIn("s_L", source)
                 # The change goes to the step's one leave in the walk's coordinates (no walk down in the sweep); the
-                # seeded rows walk the seeds of the one writer's EMIT sink, the others read its stored rows.
+                # seeded rows walk the seeds of the one writer's EMIT sink, the topology's rows read its stored rows.
                 self.assertIn("if (global_dof >= 0) walk.du.data[global_dof] += u;", source)
                 self.assertNotIn("WALK_DOWN", source)
-                emit = "emit" in kwargs
-                self.assertEqual("TIER_WALK(" in source, emit)
-                self.assertEqual("incident = row_incident.data[off_dense + i];" in source, not emit)
+                self.assertEqual("TIER_WALK(" in source, "emit" in kwargs)
+                self.assertIn("incident = row_incident.data[off_dense + i];", source)
                 self.assertIn("s_rhs[i] += incident;", source)
 
     def test_the_release_compiles_where_a_tree_can_slip(self):

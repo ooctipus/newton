@@ -1521,7 +1521,7 @@ class TestPatchParallelRoutes(unittest.TestCase):
 
     def test_emitting_tiers_record_names_the_launched_builders(self):
         """Name in the route record the row builders one step launches where the tiers walk their rows' seeds: the one
-        writer alone, in one launch (its sink is known once the counts are), every tier's sink EMIT."""
+        writer's two parts, a world's few topology rows beside the contact pass and the rest, every tier's sink EMIT."""
         model = standing_model()
         with patch.dict(os.environ):
             for law, beta in (("patch", 0.2),):
@@ -1533,7 +1533,8 @@ class TestPatchParallelRoutes(unittest.TestCase):
                     record = routes["contact_rows"]
                     self.assertEqual([tier["sink"] for tier in routes["sweep"]["tiers"]["tiers"]], ["emit"])
                     self.assertEqual(record["producer"], "walk")
-                    builder = {"method": "walk", "kernels": ["write_walked_rows_emit"]}
+                    kernels = ["write_walked_rows_topology1_emit", "write_walked_rows_emit"]
+                    builder = {"method": "walk", "kernels": kernels}
                     self.assertEqual(record["builder_by_dof"], dict.fromkeys(record["builder_by_dof"], builder))
                     with launched_kernels() as keys:
                         _rollout(model, solver, 1)

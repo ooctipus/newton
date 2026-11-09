@@ -1237,11 +1237,8 @@ class RowLaws:
             elif solver._plan.route.support == "diagonal":
                 writers = (walk_rows.slot_writer(solver),)
             else:
-                # The general placement's rows in two parts, the topology's walked in blocks and the rest, or in one
-                # where a tier's reader walks its rows (the sink is known once the counts are).
-                split = solver.placement.row_seeds.tiers == 0
-                topology = (walk_rows.writer_kernel(solver, walk_rows.WRITE_TOPOLOGY),) if split else ()
-                writers = (*topology, walk_rows.writer_kernel(solver))
+                # The general placement's rows in two parts: the topology's walked in blocks, and the rest.
+                writers = (walk_rows.writer_kernel(solver, walk_rows.WRITE_TOPOLOGY), walk_rows.writer_kernel(solver))
             kernels = (*writers, *marker)
         else:
             raise ValueError(f"No contact-row builder kernels are known for the method {method!r}.")

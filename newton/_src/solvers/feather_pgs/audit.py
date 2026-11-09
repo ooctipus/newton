@@ -60,7 +60,7 @@ from .row_records import bind as bind_dense_rows
 from .sparse_mass_matrix import _SparseRowSupport
 from .sweep_routes import free_body_rows, packed_operator
 from .sweep_routes_diag import slot_rows
-from .sweep_routes_tiers import _seeded_row
+from .sweep_routes_tiers import _seeded_row, _stored_row
 from .tree_scan import classes_half
 from .walk_rows import RowSeeds, emits
 
@@ -156,6 +156,7 @@ OPERANDS = FieldGroup(
     Field("cfm", float, owner="options", attr="pgs_cfm"),
     Field("rhs", float, ("world", "row"), owner="audit"),
     Field("diag", float, ("world", "row"), owner="audit"),
+    Field("dense_phase_bounds", int, ("world", 2), owner="placement"),
 )
 """Every operand a support class reads beside the kernel's own, declared once with where the audit finds it."""
 
@@ -373,17 +374,18 @@ EMITTED = Dispatch(
 """A thread a world whose tier walks its rows (:func:`.walk_rows.emits`)."""
 
 
-_SEEDED = "row_seeds rhs_bias world_row_type ink_meta walk world_dof_indices v_hat coordinates cfm rhs diag"
+_SEEDED = "row_seeds rhs_bias world_row_type ink_meta walk world_dof_indices v_hat coordinates cfm rhs diag packed_Z"
+_SEEDED += " row_incident dense_phase_bounds"
 
 
 @functools.cache
-def seeded_class(dofs: int, response: tuple, frame: tuple, classes: tuple, material: bool) -> RowClass:
+def seeded_class(dofs: int, response: tuple, frame: tuple, classes: tuple, material: bool, pitch: int) -> RowClass:
     """The rows a Jacobi tier walks from their seeds (:class:`.walk_rows.RowSeeds`), by the tier's own text
     (:func:`.sweep_routes_tiers._seeded_row`, :meth:`.WalkedRows.seed_walk`): ``Z_i^T u+`` its term; its rhs (a bounce
     from ``J_i v_hat``) and diagonal ``|Z_i|^2 + cfm`` as the tier forms them, into ``rhs`` and ``diag``."""
     NA, NB, OA, OB = response
-    read = _seeded_row(False, material)
-    walk, release = WalkedRows(NA, NB, OA, OB, dofs, 1, ONE, read, True, frame, len(classes)).seed_walk("    ")
+    walk, release = WalkedRows(NA, NB, OA, OB, dofs, 1, ONE, "", True, frame, len(classes)).seed_walk("        ")
+    read = _seeded_row(False, material, _stored_row(pitch, dofs), release)
     tables = walk_tables(classes)
     return RowClass(
         f"seeded{dofs}_{NA}_{NB}_{OA}_{OB}_f{frame[0]}_{frame[1]}_{abs(hash(tables)) % (1 << 32):08x}"
@@ -404,7 +406,6 @@ def seeded_class(dofs: int, response: tuple, frame: tuple, classes: tuple, mater
         {{
 {read}
         }}
-{release}
         float term = 0.0f, norm = 0.0f;
         for (int d = 0; d < {dofs}; ++d) {{
             term += Zi[d] * u[d];
@@ -612,7 +613,8 @@ class Audit:
         if not emitted:
             return None
         tier = emitted[0]
-        return seeded_class(tier.max_world_dofs, tier.inkernel_response, tier.frame, tier.classes, tier.material)
+        pitch = tier.max_constraints if tier.pitch is None else int(tier.pitch)
+        return seeded_class(tier.max_world_dofs, tier.inkernel_response, tier.frame, tier.classes, tier.material, pitch)
 
     def _operands_of(self, cls: RowClass, v: wp.array) -> list:
         solver, placement, classes = self.solver, self.solver.placement, self.solver.spec.classes

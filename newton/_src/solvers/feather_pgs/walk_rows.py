@@ -161,11 +161,11 @@ def joint_seeds(seeds: JointSeeds, kind: int, index: int):
 @wp.struct
 class RowSeeds:
     """The one writer's EMIT sink: a world whose Jacobi tier walks its rows in its prologue (bit ``t`` of ``tiers``: the
-    tier of ``(width t, width (t + 1)]`` rows, :func:`.sweep_levels.tier_world` within ``bound``) runs their law there
-    (:func:`emit_rows`, on the rows' unit sources, counts and records and the law's inputs) and keeps each row's seed,
-    world-major a lane a row: its articulations and bodies (``ids``; a covector's ``(art, -2, dof0, dof1)``), its
-    direction and torque flag (a covector's two values) and its point. The tier's walk adds a contact's bounce from its
-    records and the step's ``dt`` and ``threshold``."""
+    tier of ``(width t, width (t + 1)]`` rows, :func:`.sweep_levels.tier_world` within ``bound``) runs there the law of
+    its rows past its few topology rows (``bounds``; :func:`emit_rows`, on the rows' unit sources, counts, records and
+    the law's inputs) and keeps each row's seed, world-major a lane a row: its articulations and bodies (``ids``; a
+    covector's ``(art, -2, dof0, dof1)``), its direction and torque flag (a covector's two values) and its point. The
+    tier's walk adds a contact's bounce from its records and the step's ``dt`` and ``threshold``."""
 
     tiers: int
     bound: int
@@ -184,6 +184,7 @@ class RowSeeds:
     law: PatchRowLaw
     joint: JointSeeds
     bias: RowBias
+    bounds: wp.array2d[int]
 
 
 @wp.func
@@ -232,6 +233,11 @@ rest with the closure."""
 
 WRITER_BLOCK_ROWS = 1
 """The rows a lane of the topology part walks as one block (:func:`block_walker`): one, its seeds in one sweep."""
+
+# Where a tier walks a world's rows (EMIT), the topology part stores its topology rows beside the contact pass only
+# where they are few: a quarter of a warp's rows. The part's cost grows with the rows, while the tier's saving does not
+# (one warp's covector branch), so a world with more leaves them to its tier's prologue walk, as its contacts.
+TOPOLOGY_BESIDE = wp.constant(8)
 
 WALKER_LINE = 80
 """The one walker's register line: a world-lane writer of the packed rows or the star's slots holds its walk at 80
@@ -396,9 +402,8 @@ def walked_rows_kernel(
 
     ``part`` (:data:`WRITE_ROWS`, :data:`WRITE_TOPOLOGY`, :data:`WRITE_REST`): the rows a world's topology fixes (its
     links, mimics, limits and velocity limits, the slots below its family bound ``bounds[world, 1]``,
-    :meth:`.rows.RowLaws.bound_phase`) are known before the contacts, so a launch can write them alone, beside the
-    contact pass, and a second the rest and the closure; one launch writes every row where a tier's reader walks its
-    rows (``emit``: the sink is known once the counts are).
+    :meth:`.rows.RowLaws.bound_phase`) are known before the contacts, so a launch writes them alone, beside the
+    contact pass, a second the rest and the closure (``emit``: only a few, :data:`TOPOLOGY_BESIDE`; its tier the rest).
 
     ``side``: whether the model's records can have a side (:attr:`.tree_factor.TreeFactor.walk_side`); ``tables``: the
     walking classes' path tables (:func:`.factor.walk.walk_prelude`), each tree's path read from constant memory by its
@@ -459,6 +464,13 @@ def walked_rows_kernel(
             end = wp.min(bounds[world, 1], dense_rows)
         elif part == WRITE_REST:
             first = wp.min(bounds[world, 1], count)
+        if wp.static(emit):
+            # A world of many topology rows leaves them to the rest (TOPOLOGY_BESIDE).
+            if bounds[world, 1] > TOPOLOGY_BESIDE:
+                if part == WRITE_TOPOLOGY:
+                    end = 0
+                else:
+                    first = 0
         if wp.static(block > 0):
             for start in range(first + lane * wp.static(block), end, lanes * wp.static(block)):
                 arts, dof0, dof1 = ints(), ints(), ints()
@@ -1706,16 +1718,23 @@ read_law_unit = unit_reader(False, kinds=False)
 
 @wp.func
 def emit_rows(world: int, lane: int, lanes: int, seeds: RowSeeds):
-    """A world's rows by their law in its Jacobi tier's prologue (:meth:`.sweep_routes_tiers.TierSweep.dispatch`), its
-    ``lanes`` lanes striding over them: each row's seed (:func:`store_seed`; a contact's kind the one writer wrote) and
-    its rhs without the incident's part, which the tier's walk adds (the relative incident 0 fires no bounce)."""
+    """A world's rows past the topology rows the one writer stored, by their law in its Jacobi tier's prologue
+    (:meth:`.sweep_routes_tiers.TierSweep.dispatch`), its ``lanes`` lanes striding over them: each row's seed
+    (:func:`store_seed`; a contact's kind the one writer wrote) and its rhs without the incident's part, which the
+    tier's walk adds (the relative incident 0 fires no bounce)."""
     rows = seeds.rows
     line = rows.first[world]
     count = wp.min(seeds.counts[world], seeds.units.shape[1])
+    # The topology's rows below the family bound are the writer's where they are few (TOPOLOGY_BESIDE).
+    stored = seeds.bounds[world, 1]
+    if stored > TOPOLOGY_BESIDE:
+        stored = 0
     for slot in range(lane, count, lanes):
-        unit = read_law_unit(rows, seeds.data, seeds.law, seeds.joint, line, slot, seeds.units[line, slot])
-        store_seed(seeds, line, slot, unit)
-        row_bias(rows, seeds.bias, line, slot, rows.target[line, slot])
+        # A lane takes the row its tier's lane reads.
+        if slot >= stored:
+            unit = read_law_unit(rows, seeds.data, seeds.law, seeds.joint, line, slot, seeds.units[line, slot])
+            store_seed(seeds, line, slot, unit)
+            row_bias(rows, seeds.bias, line, slot, rows.target[line, slot])
 
 
 @cache
@@ -1916,6 +1935,7 @@ def row_seeds(placement, tiers: int, bound: int, width: int) -> RowSeeds:
     else:
         seeds.free_body_rows, seeds.speed_first = placement.mf_constraint_count, placement.speed_first
         seeds.units, seeds.counts = placement.unit_source, placement.constraint_count
+        seeds.bounds = placement.dense_phase_bounds
     shape = placement.phi.shape if tiers else (1, 1)
     seeds.ids = wp.empty(shape, dtype=wp.vec4i, device=device)
     seeds.direction = wp.empty(shape, dtype=wp.vec4, device=device)

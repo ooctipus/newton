@@ -246,10 +246,7 @@ class WalkedRows:
         ]
         if self.walked:
             row.append(_lines([self._walk()], "    "))
-        row += ["    {", self.read, "    }", "    s_rhs[i] += incident;"]
-        if self.walked:
-            row.append(_lines(self._release_rows(), "    "))
-        row.append("}")
+        row += ["    {", self.read, "    }", "    s_rhs[i] += incident;", "}"]
         # Each lane's registers take its row only now (a lane past the rows zero), so they are not live during the walk.
         row += [
             "#pragma unroll",

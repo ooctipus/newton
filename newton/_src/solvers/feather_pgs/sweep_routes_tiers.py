@@ -36,7 +36,7 @@ from .solve_policy import block_argmax
 from .sweep import SPLIT, JacobiRows, SweepConfig, dense_tier_world, jacobi_limit_pass, jacobi_scale, jacobi_sweeps
 from .sweep_routes import MF_GS_ABI, worlds
 from .tree_scan import WALK_BOTH, WalkClass, classes_half
-from .walk_rows import RowSeeds, emit_rows
+from .walk_rows import TOPOLOGY_BESIDE, RowSeeds, emit_rows
 
 PARALLEL_ABI = kernel_template.params(
     *MF_GS_ABI[:-1],
@@ -103,13 +103,17 @@ def _stored_row(pitch: int, dofs: int) -> str:
     )
 
 
-def _seeded_row(weighted: bool, material: bool) -> str:
-    """Walk the lane's row from the seed the one writer's EMIT sink kept (:class:`.walk_rows.RowSeeds`): a covector's
-    coordinates, or each body's wrench at its frame (the second body's negated) on its tree of the world, then a
-    bouncing contact's rebound from the incident (:func:`.row_laws.contact_restitution_rhs`, weight 1)."""
+def _seeded_row(weighted: bool, material: bool, stored: str, release: str) -> str:
+    """The lane's row as the one writer stored it below a few topology rows' bound (``stored``), else walked from its
+    EMIT seed (:class:`.walk_rows.RowSeeds`: a covector, or each body's wrench at its frame, the second's negated),
+    its trees' ``release`` applied, a bouncing contact's rebound (:func:`.row_laws.contact_restitution_rhs`)."""
     eps = " && world_row_eps.data[at] <= 0.0f" if material else ""
     weight = " world_row_w.data[at] = 1.0f;" if weighted else ""
-    return f"""        const size_t at = (size_t)off_dense + i;
+    return f"""        const int topology = dense_phase_bounds.data[world * 2 + 1];
+        if (i < topology && topology <= {TOPOLOGY_BESIDE}) {{
+{stored}
+        }} else {{
+        const size_t at = (size_t)off_dense + i;
         const wp::vec4i s = row_seeds.ids.data[at];
         const wp::vec4 d = row_seeds.direction.data[at];
         // The seed's components by selects: a runtime index into a vector would hold it in local memory.
@@ -144,6 +148,8 @@ def _seeded_row(weighted: bool, material: bool) -> str:
                                                                     row_seeds.threshold);
                 if (bounce.v0) {{ s_rhs[i] = bounce.v1;{weight} }}
             }}
+        }}
+{release}
         }}"""
 
 
@@ -181,21 +187,11 @@ def parallel_source(tier: TierSweep) -> tuple[str, Staging]:
         AM, limits=velocity_limit_pass, types=solve_policy.traces, weighted=tier.weighted, torsion=torsion
     )
     row_lanes = Lanes(NT)
-    walked = WalkedRows(
-        NA,
-        NB,
-        OA,
-        OB,
-        D,
-        AM + 4,
-        row_lanes,
-        read=_seeded_row(tier.weighted, tier.material)
-        if emit
-        else _stored_row(M_D if pitch is None else int(pitch), D),
-        walked=emit,
-        frame=tuple(int(cap) for cap in frame),
-        classes=len(classes),
-    )
+    stored, frame = _stored_row(M_D if pitch is None else int(pitch), D), tuple(int(cap) for cap in frame)
+    walked = WalkedRows(NA, NB, OA, OB, D, AM + 4, row_lanes, stored, emit, frame, len(classes))
+    if emit:
+        release = walked.seed_walk("        ")[1]
+        walked = dataclasses.replace(walked, read=_seeded_row(tier.weighted, tier.material, stored, release))
     op = TransposedResponse.of(D, AM, walked, row_lanes)
     # Each lane's row registers; on the CPU arrays over the virtual lanes.
     group = VirtualLanes(NT, serial, (*op.lane_registers(), *store.registers()))

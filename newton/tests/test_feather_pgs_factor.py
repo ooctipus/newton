@@ -72,6 +72,7 @@ from newton.tests.feather_pgs_law_harness import (
     packed_coordinates,
     unpacked_rows,
     walk_inverse,
+    walked_worlds,
 )
 from newton.tests.feather_pgs_mass_reference import MassReference
 from newton.tests.feather_pgs_tree_scan_fixture import (
@@ -903,12 +904,15 @@ def check_rows(solver, joint_q: np.ndarray, capture: Capture, rng) -> RowCheck:
     D = int(forest.max_world_dofs)
     du = np.zeros((int(forest.world_count), max(D, 1)))
     ball = np.zeros(du.shape[0], dtype=bool)
-    # Every stored row's footprints, the one writer's (FL3.3, whose rows form no J).
+    # Every stored row's footprints, the one writer's (FL3.3, whose rows form no J), but a world whose tier walks its
+    # rows: those above its family bound stay in its sweep, so its du is not theirs.
     if getattr(solver.placement, "walks", False):
-        kinds_line = solver.placement.row_type.numpy()
+        kinds_line, walked = solver.placement.row_type.numpy(), walked_worlds(solver)
         # Each entry's world coordinate, whatever the rows' layout (by side, dense, or by support class).
         coordinates = packed_coordinates(solver)
         for world, count in enumerate(capture.counts):
+            if walked[world]:
+                continue
             line = int(capture.dense_first[world])
             for row in range(int(count)):
                 lam = capture.impulses[line, row]

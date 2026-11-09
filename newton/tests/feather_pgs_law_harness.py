@@ -1091,6 +1091,16 @@ def line_rows(solver, world: int) -> np.ndarray:
     return np.concatenate((np.arange(dense), placement.body_base + np.arange(free)))
 
 
+def walked_worlds(solver) -> np.ndarray:
+    """Each world whose tier walks its rows (the one writer's EMIT sink, :func:`.walk_rows.emits`): the audit reads its
+    rows, but the ``Z`` of those above its family bound stays inside its sweep."""
+    placement, seeds = solver.placement, solver.placement.row_seeds
+    counts, free = placement.constraint_count.numpy(), placement.mf_constraint_count.numpy()
+    tier = (np.maximum(counts, 1) - 1) // max(int(seeds.width), 1)
+    dense = (free == 0) & (counts > 0) & (counts <= int(seeds.bound)) & (counts <= placement.speed_first.numpy())
+    return dense & ((int(seeds.tiers) >> tier) & 1 != 0)
+
+
 def free_body_Z(solver) -> np.ndarray:
     """Every world's free-body rows' packed entries ``[world, row, 12]`` (float32): the line's packed rows from
     ``body_base`` in the sides layout, side ``a``'s six then side ``b``'s (zero past a line narrower than twelve)."""
