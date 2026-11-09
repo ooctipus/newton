@@ -255,6 +255,21 @@ def _support_writer_calls():
         yield "factor.walk.walk_leave_kernel", factor_walk.walk_leave_kernel.__wrapped__, (walk, release), {}
 
 
+def _solve_group_calls():
+    """The general sweep's solve group (sweep_plan.solve_group), at one lane group a warp and two."""
+    from newton._src.solvers.feather_pgs import sweep_routes  # noqa: PLC0415
+
+    for lanes in (16, 32):
+        config = sweep_routes.GeneralSweep(64, 32, 12, _ARCH, free_rows=False, lanes_per_world=lanes, block_warps=2)
+        yield "sweep_plan.solve_group", _group, (config,), {}
+
+
+def _group(*args):
+    from newton._src.solvers.feather_pgs import sweep_plan  # noqa: PLC0415
+
+    return sweep_plan.solve_group.__wrapped__(*args).template.kernel()
+
+
 def _dense_build_calls():
     """The dense rows' builds: the one writer's variants."""
     # The general placement's one writer: plain, and with blocks of up to eight rows (the closure), mimics among them.
@@ -417,6 +432,7 @@ def _factory_kernels():
         _sparse_sweep_calls(),
         _linked_sweep_calls(),
         _support_writer_calls(),
+        _solve_group_calls(),
         _dense_build_calls(),
         _solver_factory_calls(),
         _suite_shape_calls(),
