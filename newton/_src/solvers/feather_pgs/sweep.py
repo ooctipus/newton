@@ -2921,109 +2921,51 @@ def _jacobi_step(rows: JacobiRows, op, laws: RowLaws, pad: str) -> str:
 
 
 def _jacobi_projection(rows: JacobiRows, *, pooled: bool, pad: str) -> str:
-    """Project each friction row's update radially onto its pair's disk of radius ``mu`` times the normal load.
+    """Project each friction block's update radially onto its set, each row keeping its own component on its lane:
+    the triple ``(p + 1, p + 2, p + 3)`` of normal ``p`` onto its elliptic cone in the scaled impulse
+    (:func:`.projection_laws.ball`), a contact without a spin row (:func:`spin_row`, and every contact without
+    torsion) its pair as the triple of a zero spin coefficient, the pair's disk of radius ``mu`` times the normal load.
 
     The load is the pair's normal's fresh impulse (``pooled``: the sum over its patch ring of normals, in ring order
     from its own). One warp exchanges the fresh updates by shuffle (a pooled load reads the ring's staged ones, and
-    the warp synchronizes before the impulses are stored again); several warps stage them in ``s_x``. The pair's
-    tangents project together, each on its own lane. Under torsion the pair and its contact's spin row (its
-    normal's row plus three) project together, radially onto their elliptic cone in the scaled impulse
-    (:func:`.projection_laws.ball`).
+    the warp synchronizes before the impulses are stored again); several warps stage them in ``s_x``. Every lane of a
+    block projects the same triple, in its order.
     """
-    if rows.torsion:
-        return _jacobi_triple_projection(rows, pooled=pooled, pad=pad)
-    F, n = JACOBI_FRICTION, rows.rows
-    disk = "radius <= 0.0f ? 0.0f : ProjectionLaw::disk(wp::vec2({first}, {second}), radius)[0]"
-    if rows.warp:
-        load = "xp"
-        lines = [
-            "{",
-            "    const int i = lane;",
-            f"    const bool fr = (i < {n}) && (s_kind[i] == {F});",
-            f"    const int p = fr ? {rows.parent('i')} : i;",
-            "    const int sib = fr ? ((i == p + 1) ? p + 2 : p + 1) : i;",
-        ]
-        if pooled:
-            lines += [
-                "    const float xs = READ(x_new, sib & 31);",
-                f"    if (i < {n}) {rows.store('i', 'x_new')}",
-                "    WARP_SYNC();",
-                "    if (fr) {",
-                indent(f"const float load = {rows.ring_load('p')};", "        "),
-            ]
-            load = "load"
-        else:
-            lines += [
-                "    const float xp = READ(x_new, p & 31);",
-                "    const float xs = READ(x_new, sib & 31);",
-                "    if (fr) {",
-            ]
-        lines += [
-            f"        const float radius = fmaxf({rows.mu('i')} * {load}, 0.0f);",
-            f"        x_new = {disk.format(first='x_new', second='xs')};",
-            "    }",
-            "    WARP_SYNC();" if pooled else "",
-            "}",
-        ]
-        return indent("\n".join(line for line in lines if line), pad)
-    load = rows.load("p")
-    ring = []
-    if pooled:
-        ring = [indent(f"const float load = {rows.ring_load('p')};", "        ")]
-        load = "load"
-    project = [
-        "{",
-        "    const int i = lane;",
-        f"    if (i < {n} && s_kind[i] == {F}) {{",
-        f"        const int p = {rows.parent('i')};",
-        "        const int sib = (i == p + 1) ? p + 2 : p + 1;",
-        *ring,
-        f"        const float radius = fmaxf({rows.mu('i')} * {load}, 0.0f);",
-        f"        x_new = {disk.format(first=rows.load('i'), second=rows.load('sib'))};",
-        "    }",
-        "}",
-    ]
-    return _staged_projection(rows, project, pad)
-
-
-def _staged_projection(rows: JacobiRows, project: list[str], pad: str) -> str:
-    """Stage every row's fresh update in ``s_x``, then run each lane's ``project`` lines on the staged updates: the
-    projection of a block of several warps, or of the CPU's virtual lanes."""
-    group = rows.group
-    lines = [
-        group.barrier(""),
-        group.phase(f"if (lane < {rows.rows}) {rows.store('lane', 'x_new')}"),
-        group.barrier(""),
-        group.phase("\n".join(project)),
-        group.barrier(""),
-    ]
-    return indent("\n".join(lines), pad)
-
-
-def _jacobi_triple_projection(rows: JacobiRows, *, pooled: bool, pad: str) -> str:
-    """:func:`_jacobi_projection` where spin rows may appear: each friction-kind lane (a tangent or the spin row of
-    normal ``p``) projects the triple ``(p + 1, p + 2, p + 3)`` onto its cone and keeps its own component; a contact
-    without a spin row (:func:`spin_row`: no friction-kind row of the same normal at ``p + 3``) projects its pair as the
-    triple of a zero spin coefficient, its pair's disk."""
     F, n = JACOBI_FRICTION, rows.rows
     spun = rows.spin_of("p", n) + " >= 0"
-    project = [
-        "        const float radius_load = fmaxf({load}, 0.0f);",
-        f"        const wp::vec3 triple = ConeLaw::ball(wp::vec3({{t1}}, {{t2}}, spun ? {{s}} : 0.0f), {rows.mu('p + 1')},",
-        f"                                              spun ? {rows.mu('p + 3')} : 0.0f, radius_load);",
-        "        x_new = triple[i - p - 1];",
-    ]
+    project = ["        const float radius_load = fmaxf({load}, 0.0f);"]
+    if rows.torsion:
+        project += [
+            f"        const wp::vec3 triple = ConeLaw::ball(wp::vec3({{t1}}, {{t2}}, spun ? {{s}} : 0.0f), {rows.mu('p + 1')},",
+            f"                                              spun ? {rows.mu('p + 3')} : 0.0f, radius_load);",
+            "        x_new = triple[i - p - 1];",
+        ]
+    else:
+        project += [
+            f"        const wp::vec2 pair = ProjectionLaw::disk(wp::vec2({{t1}}, {{t2}}), {rows.mu('p + 1')} * radius_load);",
+            "        x_new = i == p + 1 ? pair[0] : pair[1];",
+        ]
     if rows.warp:
         lines = [
             "{",
             "    const int i = lane;",
             f"    const bool fr = (i < {n}) && (s_kind[i] == {F});",
             f"    const int p = fr ? {rows.parent('i')} : i;",
-            f"    const bool spun = fr && {spun};",
-            "    const float x1 = READ(x_new, (fr ? p + 1 : i) & 31);",
-            "    const float x2 = READ(x_new, (fr ? p + 2 : i) & 31);",
-            "    const float x3 = READ(x_new, (spun ? p + 3 : i) & 31);",
         ]
+        if rows.torsion:
+            lines += [
+                f"    const bool spun = fr && {spun};",
+                "    const float x1 = READ(x_new, (fr ? p + 1 : i) & 31);",
+                "    const float x2 = READ(x_new, (fr ? p + 2 : i) & 31);",
+                "    const float x3 = READ(x_new, (spun ? p + 3 : i) & 31);",
+            ]
+        else:
+            # The pair's two lanes exchange their tangents (a shuffle each) and order them as the triple does.
+            lines += [
+                "    const float xs = READ(x_new, (fr ? ((i == p + 1) ? p + 2 : p + 1) : i) & 31);",
+                "    const float x1 = (i == p + 1) ? x_new : xs;",
+                "    const float x2 = (i == p + 1) ? xs : x_new;",
+            ]
         load = "xp"
         if pooled:
             lines += [f"    if (i < {n}) {rows.store('i', 'x_new')}", "    WARP_SYNC();", "    if (fr) {"]
@@ -3040,7 +2982,7 @@ def _jacobi_triple_projection(rows: JacobiRows, *, pooled: bool, pad: str) -> st
         "    const int i = lane;",
         f"    if (i < {n} && s_kind[i] == {F}) {{",
         f"        const int p = {rows.parent('i')};",
-        f"        const bool spun = {spun};",
+        f"        const bool spun = {spun};" if rows.torsion else "",
         *ring,
         *(
             line.format(
@@ -3054,7 +2996,21 @@ def _jacobi_triple_projection(rows: JacobiRows, *, pooled: bool, pad: str) -> st
         "    }",
         "}",
     ]
-    return _staged_projection(rows, lines, pad)
+    return _staged_projection(rows, [line for line in lines if line], pad)
+
+
+def _staged_projection(rows: JacobiRows, project: list[str], pad: str) -> str:
+    """Stage every row's fresh update in ``s_x``, then run each lane's ``project`` lines on the staged updates: the
+    projection of a block of several warps, or of the CPU's virtual lanes."""
+    group = rows.group
+    lines = [
+        group.barrier(""),
+        group.phase(f"if (lane < {rows.rows}) {rows.store('lane', 'x_new')}"),
+        group.barrier(""),
+        group.phase("\n".join(project)),
+        group.barrier(""),
+    ]
+    return indent("\n".join(lines), pad)
 
 
 def _jacobi_momentum(rows: JacobiRows, *, pad: str) -> str:
