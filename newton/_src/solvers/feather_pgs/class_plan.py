@@ -43,7 +43,7 @@ class ClassInputs:
 
     model: object
     options: object
-    """The checked options (:class:`.configuration.Options`)."""
+    """The checked options (:func:`.configuration.check_options`)."""
     forest: object
     """The forest plan (:class:`.forest_plan.ForestPlan`)."""
     laws: object

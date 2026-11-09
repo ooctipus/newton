@@ -437,7 +437,7 @@ class SolverFeatherPGS(SolverBase):
         model = self.cut.model
         super().__init__(model)
         # Every scalar option coerced and checked once (configuration.OPTION_RULES).
-        self.options = options = check_options(requested_options)
+        self.options = options = check_options(SolverFeatherPGS.__init__, requested_options)
 
         # The solver's device fields (the primitives' field groups), on the model's device.
         self._arrays = SolverArrays(self, model.device)
