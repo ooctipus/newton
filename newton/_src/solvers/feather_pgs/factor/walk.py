@@ -24,6 +24,7 @@ from ....core.execution import Use, Work
 from ....sim import JointType
 from .. import tree_scan as ts
 from ..device_preludes import DevicePrelude, memory_words, substitute
+from ..tree_plan import UP_FIRST, TreePlan
 from ..tree_scan import WALK_AHEAD, WALK_BOTH, WALK_TOUCH, WALK_UNROLL, WalkClass, indent_text
 from .kernels import Clock, clock_advance
 
@@ -481,34 +482,41 @@ _WALK_TABLE = """    // The classes' path tables in constant memory, class after
     const auto WALK_FIRST_OF = [&](const int b) -> int { return WALK_FIRST[WALK_AT_FIRST + b]; };$joins"""
 
 _WALK_JOINS = """
-    // Each body's join slot (WALK_JOIN, WalkClass.slots: -1 where no child other than the next body meets it).
+    // Each body's join slot (WALK_JOIN, WalkClass.slots: -1 where no child other than the next body meets it), and
+    // its parent's (WALK_INTO), the bit WALK_JOIN_SLOTS set where it is the parent's first child (UP_FIRST).
     $join_table
-    const auto WALK_JOIN_OF = [&](const int b) -> int { return WALK_JOIN[WALK_AT + b]; };"""
+    $into_table
+    const auto WALK_JOIN_OF = [&](const int b) -> int { return WALK_JOIN[WALK_AT + b]; };
+    const auto WALK_INTO_OF = [&](const int b) -> int { return WALK_INTO[WALK_AT + b]; };"""
 
 
 def walk_table(tables: tuple[tuple[tuple[int, ...], tuple[int, ...]], ...], joins: bool = False) -> str:
     """The classes' path tables in constant memory (:data:`_WALK_TABLE`): ``WALK_TREE(cls)``, ``WALK_PARENT_OF``,
-    ``WALK_FIRST_OF`` and ``WALK_BODIES``, with ``joins`` each body's join slot (``WALK_JOIN_OF``,
-    :attr:`.tree_scan.WalkClass.slots`). No walking tree: one class of no body.
+    ``WALK_FIRST_OF`` and ``WALK_BODIES``, with ``joins`` each body's join slot and its parent's (``WALK_JOIN_OF``,
+    ``WALK_INTO_OF``: :attr:`.tree_scan.WalkClass.slots`, :data:`WALK_JOIN_SLOTS`). No walking tree: a class of no body.
 
     Args:
         tables: Each class's path table: each body's parent (-1: the world, every parent before its children), and
             each body's first coordinate with the count after the last.
-        joins: Whether to declare each body's join slot.
+        joins: Whether to declare the bodies' join slots.
     """
     tables = tables or (((), (0,)),)
     if any(len(first) != len(parent) + 1 or any(p >= b for b, p in enumerate(parent)) for parent, first in tables):
         raise ValueError("a walk's path table needs every parent before its children and a first coordinate per body")
-    starts = [0]
-    for parent, _ in tables:
+    starts, slots, into = [0], [], []
+    for parent, first in tables:
         starts.append(starts[-1] + len(parent))
-    slots = [s for parent, first in tables for s in ts.WalkClass(parent, first).slots[0]]
+        slot, up = ts.WalkClass(parent, first).slots[0], TreePlan.build(parent).up_flags
+        slots += slot
+        into += [slot[p] | WALK_JOIN_SLOTS * bool(up[b] & UP_FIRST) if p >= 0 else -1 for b, p in enumerate(parent)]
+    into = ts.constant_table("WALK_INTO", into)
+    joins = substitute(_WALK_JOINS, join_table=ts.constant_table("WALK_JOIN", slots), into_table=into) if joins else ""
     return substitute(
         _WALK_TABLE,
         parent_table=ts.constant_table("WALK_PARENT", [p for parent, _ in tables for p in parent]),
         first_table=ts.constant_table("WALK_FIRST", [f for _, first in tables for f in first]),
         class_table=ts.constant_table("WALK_CLASS", starts),
-        joins=substitute(_WALK_JOINS, join_table=ts.constant_table("WALK_JOIN", slots)) if joins else "",
+        joins=joins,
     )
 
 
@@ -1464,10 +1472,10 @@ release's memory until a data-sized arena holds it (DECISIONS 10-24); nothing el
 # ---------------------------------------------------------------------------------------------------------------------
 
 WALK_JOIN_SLOTS = 32
-"""The most joins one tree's inward pass holds at once: a parent that waits for the lifted inertia of a child other
-than the joint after it (:meth:`.tree_factor.TreeFactor.plan_walk` assigns the slots). On CUDA lane ``k`` of the tree's group
-holds slot ``k`` in registers, so a group has at least as many lanes as its tree's joins in flight; the CPU's one
-thread holds them all."""
+"""The most joins one tree's inward pass holds at once (:meth:`.tree_factor.TreeFactor.plan_walk`): a parent waiting for
+a child other than the joint after it. On CUDA lane ``k`` of the tree's group holds slot ``k`` in registers, so a group
+has at least as many lanes as its tree's joins in flight; the CPU's one thread holds them all. Every slot is below it,
+so a body's parent's slot (``WALK_INTO``) carries it as a bit where the body is the first child, which assigns."""
 
 
 def walk_work(trees: int, bodies: int, joins: int) -> Work:
@@ -1624,18 +1632,15 @@ $lift
         WALK_TOUCH(Ra + c);
         WALK_TOUCH(Dr + c);
     }
+    // A join slot is set by its first child in the walk (WALK_INTO's bit $slots), read once by its join: never cleared.
     float held[HELD][21];
-    for (int s = 0; s < HELD; ++s)
-        for (int k = 0; k < 21; ++k) held[s][k] = 0.0f;
     const auto OWNS = [&](int slot) -> bool { return HELD > 1 || LANE == slot; };
     const auto AT = [&](int slot) -> int { return HELD > 1 ? slot : 0; };
     float h[21];
     for (int k = 0; k < 21; ++k) h[k] = 0.0f;
-    // h += a join slot's sum, the slot cleared.
+    // h += a join slot's sum.
     const auto TAKE = [&](int slot) {
         for (int k = 0; k < 21; ++k) h[k] += READ(held[AT(slot)][k], slot);
-        if (OWNS(slot))
-            for (int k = 0; k < 21; ++k) held[AT(slot)][k] = 0.0f;
     };
     bool carrying = false;
     // A body as the feed hands it to the chain: BODY's words, its last coordinate's column (s 6, R, R + K), and as
@@ -1654,7 +1659,7 @@ $lift
                 lo = dof0 + WALK_FIRST_OF(b);
                 hi = dof0 + WALK_FIRST_OF(b + 1);
                 slot = WALK_JOIN_OF(b);
-                into = up >= 0 ? WALK_JOIN_OF(up) : -1;
+                into = WALK_INTO_OF(b);
                 BODY(mine, up >= 0 ? j0 + up : -1, r.w);
                 if (hi > lo) COLUMN(hi - 1, r.w + RECORD);
             }
@@ -1689,8 +1694,12 @@ $lift
                     carrying = true;
                     // The parent's sides are all in its slot: its other children come before its chain.
                     if (b_into >= 0) TAKE(b_into);
-                } else if (OWNS(b_into)) {
-                    for (int k = 0; k < 21; ++k) held[AT(b_into)][k] += h[k];
+                } else {
+                    // Into the parent's slot: its first child starts the sum (the bit $slots), the others add.
+                    const int into = b_into & ~$slots;
+                    if (OWNS(into))
+                        for (int k = 0; k < 21; ++k)
+                            held[AT(into)][k] = (b_into & $slots ? 0.0f : held[AT(into)][k]) + h[k];
                 }
             }
         });
