@@ -613,8 +613,7 @@ def _service_contact_capacity(example, state: newton.State | None = None, *, rec
             rows = pipeline._contact_pool.ready
             grew |= pipeline.service_capacity(measured)
             overflowed |= measured is not None and pipeline._contact_pool.high_water > rows
-    graph = getattr(example, "graph", None) is not None and callable(getattr(example, "capture", None))
-    if not graph or not (grew or recapture):
+    if getattr(example, "graph", None) is None or not (grew or recapture):
         return False
     if state is not None and not overflowed:
         return True
