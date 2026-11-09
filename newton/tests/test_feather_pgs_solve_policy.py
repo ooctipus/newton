@@ -513,6 +513,19 @@ class TestExitLaw(unittest.TestCase):
             with self.subTest(switch=switch), self.assertRaises(ValueError):
                 sweep_routes.GeneralSweep(64, 32, 12, "120", levels=LevelLaw(EXACT), **{switch: value})
 
+    def test_general_sweep_takes_k1s_order_where_each_world_holds_one_tree(self):
+        """Where every world holds one tree (``one_tree``), the warp mapping solves every friction triple in the
+        shared phase after its rows, K1's order, and its row loop and active scan carry none of the triple's code;
+        elsewhere a triple stays at its first tangent."""
+        for one_tree in (False, True):
+            config = sweep_routes.GeneralSweep(
+                64, 32, 12, "120", torsion=True, active_rows=True, free_rows=False, one_tree=one_tree
+            )
+            body, _ = config.source()
+            self.assertEqual("unsigned heads = BALLOT(" in body, one_tree)
+            self.assertEqual("s_lam_dense[spin] != 0.0f" in body, not one_tree)
+            self.assertEqual("triple_residual" in body, not one_tree)
+
     def test_general_sweep_holds_two_worlds_a_block(self):
         """Two warps a block of the warp mapping (``block_warps``): a world each with its own copy of the stage, the
         dispatch's lane groups walking the claim's queue, at the sparse sweeps' register line; one thread a world on

@@ -1096,23 +1096,17 @@ def row_sums(
     ``sibling_jv = Z_sibling . u`` and ``pair_coupling = Z_row . Z_sibling``, on the support's one load (rows in
     memory: :attr:`.ResponseOperator.pair_with_visit`), the sibling's entries kept for the pair's apply; ``spin`` adds
     the spin row's (``spin_jv``, ``spin_coupling``, ``spin_coupling_sibling``), reduced only by a triple; ``formed``
-    (the laws on the contact's record) reduces the three velocity terms alone.
+    (the laws on the contact's record) reduces the velocity terms alone.
     """
     if sibling is None:
         return op.dot(((out, "row", None),), {"row": row}, pad)
-    sums = ((out, "row", None), ("sibling_jv", "sib", None), ("pair_coupling", "row", "sib"))
+    sums = ((out, "row", None), ("sibling_jv", "sib", None)) + (() if formed else (("pair_coupling", "row", "sib"),))
     rows, exists, apart = {"row": row, "sib": sibling}, {"sib": paired}, None
-    if formed:
-        sums = (*sums[:2], ("spin_jv", "spin", None))
+    if spin:
+        spun = ("spin_jv",) if formed else ("spin_jv", "spin_coupling", "spin_coupling_sibling")
+        sums += ((spun[0], "spin", None),) + (() if formed else ((spun[1], "row", "spin"), (spun[2], "sib", "spin")))
         rows, exists = {**rows, "spin": "spin"}, {**exists, "spin": f"{paired} && spin >= 0"}
-    elif spin:
-        spun = ("spin_jv", "spin_coupling", "spin_coupling_sibling")
-        sums += ((spun[0], "spin", None), (spun[1], "row", "spin"), (spun[2], "sib", "spin"))
-        rows, exists, apart = (
-            {**rows, "spin": "spin"},
-            {**exists, "spin": f"{paired} && spin >= 0"},
-            ("spin >= 0", spun),
-        )
+        apart = None if formed else ("spin >= 0", spun)
     return op.dot(sums, rows, pad, exists=exists, apart=apart)
 
 
@@ -1133,19 +1127,23 @@ def friction_laws(metric: str | None, formed: Callable[[str], str] | None) -> di
     return {"triple_law": f"{metric}(parent, "} if metric is not None else {}
 
 
-def _record_loads(ctx: RowContext, kind: str, pad: str) -> str:
-    """A first tangent's loads of its contact's record into :data:`FORMED_RECORD`, with its rows, off the chain."""
+def _record_loads(ctx: RowContext, kind: str, pad: str, *, torsion: bool) -> str:
+    """A first tangent's loads of its contact's record into :data:`FORMED_RECORD`, with its rows, off the chain (the
+    spin half where it solves a triple, ``torsion``)."""
     m0, m1, m2, m3 = FORMED_RECORD
+    spin = [
+        "    if (spin >= 0) {",
+        f"        {m2} = friction_record[2];",
+        f"        {m3} = friction_record[3];",
+        "    }",
+    ]
     lines = [
         f"float4 {m0}, {m1}, {m2}, {m3};",
         f"if ({kind} == {ROW_FRICTION}) {{",
         f"    const float4* const friction_record = reinterpret_cast<const float4*>({ctx.formed('parent')});",
         f"    {m0} = friction_record[0];",
         f"    {m1} = friction_record[1];",
-        "    if (spin >= 0) {",
-        f"        {m2} = friction_record[2];",
-        f"        {m3} = friction_record[3];",
-        "    }",
+        *(spin if torsion else ()),
         "}",
     ]
     return indent("\n".join(lines), pad)
@@ -1196,10 +1194,10 @@ def row_visit(
             friction_radius(kind, *disk, pad, keep_next=keep_next, **spin) if pairs else "",
         ]
     if pairs and ctx.formed is not None:
-        lines.append(_record_loads(ctx, kind, pad))
+        lines.append(_record_loads(ctx, kind, pad, torsion=laws.torsion))
     pair = {"sibling": "parent + 2", "paired": f"{kind} == {ROW_FRICTION}"} if pairs and op.pair_with_visit else {}
-    if pair and laws.torsion:
-        pair["spin" if ctx.formed is None else "formed"] = True
+    if pair:
+        pair.update(spin=laws.torsion, formed=ctx.formed is not None)
     lines += [row_sums(op, "jv", pad, **pair), row_update(ctx, laws, residual="jv", pad=pad)]
     return "\n".join(line for line in lines if line)
 
@@ -2085,10 +2083,11 @@ def row_step(
       ``pair_impulse``) and the law reads them there (the sparse sweep's rows);
     - the store's reciprocal: a store that keeps the diagonals' reciprocals steps by multiplying, otherwise by
       dividing (:meth:`RowStore.diagonal`): a rounding difference kept as data;
-    - ``triple_phase``: a friction triple's rows are solved in a phase of their own after the loop (the store restaged
-      its pair as spin rows, :attr:`StagedRows.triples`), and the loop's visit carries none of the triple's code;
-      otherwise a spin row is solved with its friction pair in the loop (the store's :meth:`RowStore.spin_of`), its
-      laws ``metric``'s and ``formed``'s (:func:`friction_laws`);
+    - ``triple_phase``: a friction triple's rows are solved in a phase of their own after the loop
+      (:func:`triple_phase`; the store restaged its pair as spin rows, :attr:`StagedRows.triples`, or ``admission``
+      skips it), and the loop's visit carries none of the triple's code; otherwise a spin row is solved with its
+      friction pair in the loop (the store's :meth:`RowStore.spin_of`), its laws ``metric``'s and ``formed``'s
+      (:func:`friction_laws`);
     - a row known where the step is emitted (``kind``, and a friction row's ``parent``) replaces its metadata, so the
       step compiles to that kind's law: a known kind is no spin row, and one other than friction admits no pair (the
       sparse-diagonal sweep's chains).
@@ -2139,6 +2138,7 @@ def rows_block(
     formed: Callable[[str], str] | None = None,
     selected: bool = False,
     unit: str = "",
+    triple_phase: bool = False,
     pad: str = "        ",
 ) -> str:
     """The Gauss-Seidel loop over a world's rows of one class ``[0, end)`` in slot order (:class:`WorldRows`): the
@@ -2155,21 +2155,23 @@ def rows_block(
     only ever reads its own stores.
 
     ``metric`` and ``formed`` are the friction laws' (:func:`friction_laws`). ``selected``: the active enumeration's rows
-    (:class:`SelectedRows`), each record loaded at its visit; ``unit``: a contact unit's visit (:func:`unit_visit`).
+    (:class:`SelectedRows`), each record loaded at its visit; ``unit``: a contact unit's visit (:func:`unit_visit`);
+    ``triple_phase``: the dense rows' friction triples are a phase's (:func:`row_step`).
     """
     inner = pad + "    "
     if end is None:
         end = "mf_contact_end" if rows.free else "m_dense"
     if (selected or unit) and rows.free:
         raise ValueError("the active enumeration and the contact unit visit the dense rows")
+    step = {"end": end, "admission": admission, "metric": metric, "formed": formed, "triple_phase": triple_phase}
     if selected:
         order = SelectedRows(end)
         inner = order.inner(pad)
-        visit = row_step(rows, op, laws, end=end, admission=admission, metric=metric, formed=formed, pad=inner)
+        visit = row_step(rows, op, laws, **step, pad=inner)
         visit = f"{indent(unit, inner)}\n{visit}" if unit else visit
         return order.wrap(indent(rows.visit("i"), inner) + "\n" + visit if rows.record else visit, pad)
     if not rows.free:
-        visit = row_step(rows, op, laws, end=end, admission=admission, metric=metric, formed=formed, pad=inner)
+        visit = row_step(rows, op, laws, **step, pad=inner)
         visit = f"{indent(unit, inner)}\n{visit}" if unit else visit
         if rows.record:
             return f"{pad}{{\n{_record_pipeline(rows, op, end).wrap(visit, pad)}\n{pad}}}"

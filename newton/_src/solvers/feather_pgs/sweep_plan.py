@@ -518,6 +518,7 @@ class Sweep:
                 block_warps=block_warps,
                 free_rows=bool(self.placement.free_contact_rows),
                 speed_rows=speed_rows,
+                one_tree=self._one_tree(),
                 **self.law_fields,
             )
             # The colored mapping takes the worlds the unit builder's rule picks at every pack
@@ -833,6 +834,12 @@ class Sweep:
         """The launch of a sweep over every world (the layer's shape of its work over them)."""
         layout = shape(config.work(self.forest.world_count), device(self.model.device))
         return SweepLaunch(config, kernel, layout.grid, layout.block, named)
+
+    def _one_tree(self) -> bool:
+        """Whether every world holds at most one tree with response coordinates: then every contact acts on one tree
+        (against the world, a kinematic body or itself), and the general sweep takes K1's order whole."""
+        worlds = self.forest.articulation_world[self.forest.response_dof_count > 0]
+        return worlds.size == 0 or int(np.bincount(worlds).max()) <= 1
 
     def _claim_launch(self, config: SweepConfig, kernel: wp.Kernel, items: int, bucket: int) -> SweepLaunch:
         """The launch of a matrix-free mapping over its claim's ``bucket``, its grid the layer's shape of its work over
