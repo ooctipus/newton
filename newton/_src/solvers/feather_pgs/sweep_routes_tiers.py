@@ -177,7 +177,7 @@ def parallel_source(tier: TierSweep) -> tuple[str, Staging]:
     velocity_limit_pass = tier.velocity_limit_pass
     laws = tier.laws
     store = JacobiRows(
-        AM, NT, limits=velocity_limit_pass, types=solve_policy.traces, weighted=tier.weighted, torsion=torsion
+        AM, limits=velocity_limit_pass, types=solve_policy.traces, weighted=tier.weighted, torsion=torsion
     )
     row_lanes = Lanes(NT)
     walked = WalkedRows(
@@ -217,9 +217,6 @@ def parallel_source(tier: TierSweep) -> tuple[str, Staging]:
     }
     loads = store.loads(**metadata, unilateral=(ROW_CONTACT, ROW_JOINT_LIMIT, ROW_JOINT_VELOCITY_LIMIT))
 
-    def scale(aii, bound, pad):
-        return jacobi_scale(aii, bound, cfm="cfm", pad=pad)
-
     # The velocity limits' last word closes the sweeps: none without a sweep, as the serial sweeps' at no iterations.
     last_word = jacobi_limit_pass(store, op) if velocity_limit_pass and sweeps else ""
     velocity = f"""    for (int d = lane; d < {D}; d += {NT}) {{
@@ -236,9 +233,9 @@ def parallel_source(tier: TierSweep) -> tuple[str, Staging]:
 {group.phase(loads + chr(10) + velocity)}
 {group.barrier("    ")}
 
-{op.jacobi_stage(store.padding(), scale, "    ", idle=store.idle(), counted=store.counted)}
+{op.jacobi_stage(store.padding(), jacobi_scale, "    ", idle=store.idle(), counted=store.counted)}
 
-{jacobi_sweeps(store, op, laws, sweeps=int(sweeps), pooled=bool(linked_rows), scale=scale)}
+{jacobi_sweeps(store, op, laws, sweeps=int(sweeps), pooled=bool(linked_rows))}
 
 {last_word}
 {group.phase(publish)}

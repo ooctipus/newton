@@ -593,7 +593,7 @@ def assert_budget_reaches_the_fixed_point(test, truncated, budget, scale):
 
 def _tier_texts(rows: int):
     """The emitter's text of a ``rows``-row tier's pair projections, point and pooled, and of its isotropic step."""
-    store = emitter.JacobiRows(rows, 32 * ((rows + 31) // 32))
+    store = emitter.JacobiRows(rows)
     point = emitter._jacobi_projection(store, pooled=False, pad="            ")
     pooled = emitter._jacobi_projection(store, pooled=True, pad="            ")
     return point, pooled, emitter.isotropic_friction_step(store, "    ")

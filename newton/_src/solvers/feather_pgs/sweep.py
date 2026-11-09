@@ -2557,32 +2557,24 @@ negative and it becomes unilateral again (:meth:`JacobiRows.idle`, :func:`jacobi
 
 @dataclasses.dataclass(frozen=True)
 class JacobiRows:
-    """A world's dense rows ``[0, rows)`` under the Jacobi law, a lane each (row ``i`` on lane ``i``, ``threads``
-    lanes, at most ``capacity`` rows).
+    """A world's dense rows ``[0, rows)`` under the Jacobi law, a lane each (row ``i`` on lane ``i``, at most
+    ``capacity`` rows, in whole warps): the split law's row store, read by the frame's accessors (:class:`RowStore`).
 
-    Staged per row: its impulse ``s_x``; the extrapolated impulse the next step
-    reads, ``s_y``; its right-hand side ``s_rhs``
-    (once the operator has staged, the residual at zero impulse); its scaled
-    step ``s_step``; its friction coefficient and parent; and its kind
-    ``s_kind`` (:data:`JACOBI_UNILATERAL` and the others). ``s_x`` and ``s_y``
-    are float4-aligned and padded with zeros to a multiple of four rows. With
-    ``limits``, which rows are joint velocity limits are staged (``s_vlim``, for
-    the last word: :func:`jacobi_limit_pass`). Every row is admitted
-    provisionally: the operator forms its diagonal from the
-    staged rows (walked in the kernel or read from the store), and a row whose formed diagonal is
-    not positive is frozen once every lane has read the staged kinds (its
-    lane's ``frozen``). The lane keeps its row's diagonal in a register
-    (``row_diag``), which the exit law scales the row's impulse by; with
-    ``types`` each row's constraint type is staged (``s_type``), which the
-    trace names its change by. With ``weighted`` the lane also keeps whether
-    its row is a contact (``row_contact``), whose weight the weighted Jacobi
-    law reads (:func:`jacobi_sweeps`). Under ``torsion`` a contact's friction
-    block is its pair and its spin row after it (contact torsion), else its
-    pair.
+    Staged per row: its impulse ``s_x``; the extrapolated impulse the next step reads, ``s_y``; its right-hand side
+    ``s_rhs`` (once the operator has staged, the residual at zero impulse); its scaled step ``s_step``; its friction
+    coefficient and parent; and its kind ``s_kind`` (:data:`JACOBI_UNILATERAL` and the others). ``s_x`` and ``s_y``
+    are float4-aligned and padded with zeros to a multiple of four rows. With ``limits``, which rows are joint
+    velocity limits are staged (``s_vlim``, for the last word: :func:`jacobi_limit_pass`). Every row is admitted
+    provisionally: the operator forms its diagonal from the staged rows (walked in the kernel or read from the store),
+    and a row whose formed diagonal is not positive is frozen once every lane has read the staged kinds (its lane's
+    ``frozen``). The lane keeps its row's diagonal in a register (``row_diag``), which the exit law scales the row's
+    impulse by; with ``types`` each row's constraint type is staged (``s_type``), which the trace names its change by.
+    With ``weighted`` the lane also keeps whether its row is a contact (``row_contact``), whose weight the weighted
+    Jacobi law reads (:func:`jacobi_sweeps`). Under ``torsion`` a contact's friction block is its pair and its spin
+    row after it (contact torsion), else its pair.
     """
 
     capacity: int
-    threads: int
     limits: bool = False
     rows: str = "n_rows"
     types: bool = False
@@ -2590,6 +2582,44 @@ class JacobiRows:
     torsion: bool = False
     group: VirtualLanes = BLOCK_THREADS
     """The block's lanes: CUDA's threads, or the CPU's virtual lanes (:meth:`registers`)."""
+
+    lanes: ClassVar[Lanes] = Lanes(1)
+    owned: ClassVar[bool] = True
+
+    @property
+    def threads(self) -> int:
+        return 32 * ((self.capacity + 31) // 32)
+
+    def load(self, row: str) -> str:
+        return f"s_x[{row}]"
+
+    def store(self, row: str, value: str) -> str:
+        return f"s_x[{row}] = {value};"
+
+    def rhs_of(self, row: str) -> str:
+        return f"s_rhs[{row}]"
+
+    def mu(self, row: str) -> str:
+        return f"s_mu[{row}]"
+
+    def parent(self, row: str, *, enclosed: bool = False) -> str:
+        return f"s_parent[{row}]"
+
+    def weight(self, row: str) -> str:
+        return f"world_row_w.data[off_dense + {row}]"
+
+    def eps(self, row: str) -> str:
+        return f"world_row_eps.data[off_dense + {row}]"
+
+    def spin_of(self, parent: str, end: str) -> str:
+        """The spin row of the contact whose normal is row ``parent`` (:func:`spin_row`): a spin row takes its pair's
+        kind here, so it is a friction-kind row of the same normal after the pair."""
+        return spin_row(
+            parent,
+            end,
+            lambda row: f"(s_kind[{row}] == {JACOBI_FRICTION} && {self.parent(row)} == {parent} ? 1 : 0)",
+            spin="1",
+        )
 
     def registers(self) -> tuple[tuple[str, str], ...]:
         """Each lane's registers of its row: its diagonal, frozen flag and weight, its residual at zero impulse and
@@ -2684,7 +2714,7 @@ class JacobiRows:
         """Mark each unilateral row at zero impulse with a non-negative residual at zero impulse idle, once the staging
         has formed ``s_rhs`` (each lane its own rows: no barrier). Its update clamps it at zero, so it moves nothing
         until its residual turns negative (:func:`jacobi_sweeps`)."""
-        test = f"s_kind[i] == {JACOBI_UNILATERAL} && s_x[i] == 0.0f && s_rhs[i] >= 0.0f"
+        test = f"s_kind[i] == {JACOBI_UNILATERAL} && {self.load('i')} == 0.0f && {self.rhs_of('i')} >= 0.0f"
         return indent(
             f"for (int i = lane; i < {self.rows}; i += {self.threads})\n    if ({test}) s_kind[i] = {JACOBI_IDLE};\n"
             "if (lane == 0) s_joined[0] = 0;",
@@ -2709,25 +2739,25 @@ class JacobiRows:
             "{ s_y[j] = 0.0f; s_x[j] = 0.0f; }"
         )
 
-    def ring_load(self, parent: str) -> str:
+    def ring_load(self, parent: str, load: str | None = None) -> str:
         """The pooled normal load of the patch ring of normal row ``parent``; a parent past the rows ends the ring."""
         rows = self.rows
         return (
-            f"RING_LOAD(s_x[{parent}], {parent}, {rows},\n"
-            f"    [&](int r) {{ const int next = s_parent[r]; return next < {rows} ? next : -1; }},\n"
-            "    [&](int r) { return s_x[r]; })"
+            f"RING_LOAD({load or self.load(parent)}, {parent}, {rows},\n"
+            f"    [&](int r) {{ const int next = {self.parent('r')}; return next < {rows} ? next : -1; }},\n"
+            f"    [&](int r) {{ return {self.load('r')}; }})"
         )
 
     def stores(self, pad: str = "    ") -> str:
         """Write the rows' impulses back."""
         return (
             f"{pad}for (int i = lane; i < {self.rows}; i += {self.threads}) {{\n"
-            f"{pad}    world_impulses.data[off_dense + i] = s_x[i];\n{pad}}}"
+            f"{pad}    world_impulses.data[off_dense + i] = {self.load('i')};\n{pad}}}"
         )
 
 
-def jacobi_scale(aii: str, bound: str, *, cfm: str, pad: str) -> str:
-    """Set admitted row ``i``'s Jacobi step: ``omega w_i / (A_ii + cfm)`` with ``w_i = min(A_ii / bound, 1)`` (zero
+def jacobi_scale(aii: str, bound: str, pad: str) -> str:
+    """Set admitted row ``i``'s Jacobi step: ``omega w_i / (A_ii + cfm)`` (the rows' law's ``cfm``) with ``w_i = min(A_ii / bound, 1)`` (zero
     for a zero bound), ``bound`` a bound of the row's absolute sum ``sum_j |A_ij|`` over the rows that can move.
 
     ``w_i`` is the row's share of the response of the rows it couples to (generalized mass splitting), which keeps
@@ -2745,7 +2775,7 @@ def jacobi_scale(aii: str, bound: str, *, cfm: str, pad: str) -> str:
         "\n".join(
             [
                 f"const float w = ({bound} > 0.0f) ? fminf({aii} / {bound}, 1.0f) : 0.0f;",
-                f"const float diag_i = {aii} + {cfm};",
+                f"const float diag_i = {aii} + cfm;",
                 "row_diag = diag_i;",
                 "if (diag_i > 0.0f) s_step[i] = w * omega / diag_i;",
                 f"else {{ s_step[i] = 0.0f; frozen = s_kind[i] != {JACOBI_FRICTION}; }}",
@@ -2771,9 +2801,9 @@ def isotropic_friction_step(rows: JacobiRows, pad: str = "    ") -> str:
     F = JACOBI_FRICTION
     lines = [
         f"for (int i = lane; i < {rows.rows}; i += {rows.threads}) {{",
-        f"    if (s_kind[i] == {F} && i == s_parent[i] + 1) {{",
+        f"    if (s_kind[i] == {F} && i == {rows.parent('i')} + 1) {{",
         "        const int j = i + 1;",
-        f"        if (j < {rows.rows} && s_kind[j] == {F} && s_parent[j] == s_parent[i]) {{",
+        f"        if (j < {rows.rows} && s_kind[j] == {F} && {rows.parent('j')} == {rows.parent('i')}) {{",
         "            const float step_a = s_step[i];",
         "            const float step_b = s_step[j];",
         # The block's step: the smallest positive one.
@@ -2783,10 +2813,10 @@ def isotropic_friction_step(rows: JacobiRows, pad: str = "    ") -> str:
     if rows.torsion:
         lines += [
             "            const int k = i + 2;",
-            "            const float mu = s_mu[i];",
-            f"            if (k < {rows.rows} && s_kind[k] == {F} && s_parent[k] == s_parent[i] && mu > 0.0f) {{",
+            f"            const float mu = {rows.mu('i')};",
+            f"            if (k < {rows.rows} && s_kind[k] == {F} && {rows.parent('k')} == {rows.parent('i')} && mu > 0.0f) {{",
             # The spin coordinate's scale squared, (mu_t / mu)^2: zero pins the spin, whose step then stays.
-            "                const float ratio = s_mu[k] / mu;",
+            f"                const float ratio = {rows.mu('k')} / mu;",
             "                const float spin_scale = ratio * ratio;",
             "                const float step_spin = s_step[k];",
             "                if (spin_scale > 0.0f && step_spin > 0.0f) {",
@@ -2808,7 +2838,7 @@ def isotropic_friction_step(rows: JacobiRows, pad: str = "    ") -> str:
     return rows.group.phase(indent("\n".join(lines), pad)) + "\n" + rows.group.barrier(pad)
 
 
-def _jacobi_join(rows: JacobiRows, op, scale, pad: str) -> str:
+def _jacobi_join(rows: JacobiRows, op, pad: str) -> str:
     """Rows that left idleness join the steps' bound, between two epochs of sweeps: an idle row whose residual turned
     negative kept its zero impulse in its sweep, voted loud and raised ``s_joined`` (:func:`_jacobi_step`), which ended
     the epoch after that sweep's vote; every admitted row's step is set again on the rows that can now move
@@ -2820,11 +2850,11 @@ def _jacobi_join(rows: JacobiRows, op, scale, pad: str) -> str:
         f"row_step = lane < {rows.rows} ? s_step[lane] : 0.0f;",
         "row_inv_step = row_step > 0.0f ? 1.0f / row_step : 0.0f;",
         "row_share = row_diag * row_step;",
-        f"if (lane < {rows.rows}) s_y[lane] = s_x[lane];",
+        f"if (lane < {rows.rows}) s_y[lane] = {rows.load('lane')};",
     ]
     lines = [
         group.barrier(""),
-        op.jacobi_steps(scale, "", counted=rows.counted, first="if (lane == 0) s_joined[0] = 0;"),
+        op.jacobi_steps(jacobi_scale, "", counted=rows.counted, first="if (lane == 0) s_joined[0] = 0;"),
         isotropic_friction_step(rows, ""),
         group.phase("\n".join(restep)),
         "t_k = 1.0f;",
@@ -2860,7 +2890,7 @@ def _jacobi_step(rows: JacobiRows, op, laws: RowLaws, pad: str) -> str:
         "{",
         "    const int i = lane;",
         f"    if (i < {rows.rows}) {{",
-        "        const float xi = s_x[i];",
+        f"        const float xi = {rows.load('i')};",
         "        x_old = xi;",
         "        x_from = xi;",
         "        float value = xi;",
@@ -2897,13 +2927,13 @@ def _jacobi_projection(rows: JacobiRows, *, pooled: bool, pad: str) -> str:
             "{",
             "    const int i = lane;",
             f"    const bool fr = (i < {n}) && (s_kind[i] == {F});",
-            "    const int p = fr ? s_parent[i] : i;",
+            f"    const int p = fr ? {rows.parent('i')} : i;",
             "    const int sib = fr ? ((i == p + 1) ? p + 2 : p + 1) : i;",
         ]
         if pooled:
             lines += [
                 "    const float xs = READ(x_new, sib & 31);",
-                f"    if (i < {n}) s_x[i] = x_new;",
+                f"    if (i < {n}) {rows.store('i', 'x_new')}",
                 "    WARP_SYNC();",
                 "    if (fr) {",
                 indent(f"const float load = {rows.ring_load('p')};", "        "),
@@ -2916,14 +2946,14 @@ def _jacobi_projection(rows: JacobiRows, *, pooled: bool, pad: str) -> str:
                 "    if (fr) {",
             ]
         lines += [
-            f"        const float radius = fmaxf(s_mu[i] * {load}, 0.0f);",
+            f"        const float radius = fmaxf({rows.mu('i')} * {load}, 0.0f);",
             f"        x_new = {disk.format(first='x_new', second='xs')};",
             "    }",
             "    WARP_SYNC();" if pooled else "",
             "}",
         ]
         return indent("\n".join(line for line in lines if line), pad)
-    load = "s_x[p]"
+    load = rows.load("p")
     ring = []
     if pooled:
         ring = [indent(f"const float load = {rows.ring_load('p')};", "        ")]
@@ -2932,11 +2962,11 @@ def _jacobi_projection(rows: JacobiRows, *, pooled: bool, pad: str) -> str:
         "{",
         "    const int i = lane;",
         f"    if (i < {n} && s_kind[i] == {F}) {{",
-        "        const int p = s_parent[i];",
+        f"        const int p = {rows.parent('i')};",
         "        const int sib = (i == p + 1) ? p + 2 : p + 1;",
         *ring,
-        f"        const float radius = fmaxf(s_mu[i] * {load}, 0.0f);",
-        f"        x_new = {disk.format(first='s_x[i]', second='s_x[sib]')};",
+        f"        const float radius = fmaxf({rows.mu('i')} * {load}, 0.0f);",
+        f"        x_new = {disk.format(first=rows.load('i'), second=rows.load('sib'))};",
         "    }",
         "}",
     ]
@@ -2949,7 +2979,7 @@ def _staged_projection(rows: JacobiRows, project: list[str], pad: str) -> str:
     group = rows.group
     lines = [
         group.barrier(""),
-        group.phase(f"if (lane < {rows.rows}) s_x[lane] = x_new;"),
+        group.phase(f"if (lane < {rows.rows}) {rows.store('lane', 'x_new')}"),
         group.barrier(""),
         group.phase("\n".join(project)),
         group.barrier(""),
@@ -2963,12 +2993,11 @@ def _jacobi_triple_projection(rows: JacobiRows, *, pooled: bool, pad: str) -> st
     without a spin row (:func:`spin_row`: no friction-kind row of the same normal at ``p + 3``) projects its pair as the
     triple of a zero spin coefficient, its pair's disk."""
     F, n = JACOBI_FRICTION, rows.rows
-    # The Jacobi kinds give a spin row its pair's: a friction-kind row of the same normal after the pair is one.
-    spun = spin_row("p", n, lambda row: f"(s_kind[{row}] == {F} && s_parent[{row}] == p ? 1 : 0)", spin="1") + " >= 0"
+    spun = rows.spin_of("p", n) + " >= 0"
     project = [
         "        const float radius_load = fmaxf({load}, 0.0f);",
-        "        const wp::vec3 triple = ConeLaw::ball(wp::vec3({t1}, {t2}, spun ? {s} : 0.0f), s_mu[p + 1],",
-        "                                              spun ? s_mu[p + 3] : 0.0f, radius_load);",
+        f"        const wp::vec3 triple = ConeLaw::ball(wp::vec3({{t1}}, {{t2}}, spun ? {{s}} : 0.0f), {rows.mu('p + 1')},",
+        f"                                              spun ? {rows.mu('p + 3')} : 0.0f, radius_load);",
         "        x_new = triple[i - p - 1];",
     ]
     if rows.warp:
@@ -2976,7 +3005,7 @@ def _jacobi_triple_projection(rows: JacobiRows, *, pooled: bool, pad: str) -> st
             "{",
             "    const int i = lane;",
             f"    const bool fr = (i < {n}) && (s_kind[i] == {F});",
-            "    const int p = fr ? s_parent[i] : i;",
+            f"    const int p = fr ? {rows.parent('i')} : i;",
             f"    const bool spun = fr && {spun};",
             "    const float x1 = READ(x_new, (fr ? p + 1 : i) & 31);",
             "    const float x2 = READ(x_new, (fr ? p + 2 : i) & 31);",
@@ -2984,7 +3013,7 @@ def _jacobi_triple_projection(rows: JacobiRows, *, pooled: bool, pad: str) -> st
         ]
         load = "xp"
         if pooled:
-            lines += [f"    if (i < {n}) s_x[i] = x_new;", "    WARP_SYNC();", "    if (fr) {"]
+            lines += [f"    if (i < {n}) {rows.store('i', 'x_new')}", "    WARP_SYNC();", "    if (fr) {"]
             lines.append(indent(f"const float load = {rows.ring_load('p')};", "        "))
             load = "load"
         else:
@@ -2997,11 +3026,16 @@ def _jacobi_triple_projection(rows: JacobiRows, *, pooled: bool, pad: str) -> st
         "{",
         "    const int i = lane;",
         f"    if (i < {n} && s_kind[i] == {F}) {{",
-        "        const int p = s_parent[i];",
+        f"        const int p = {rows.parent('i')};",
         f"        const bool spun = {spun};",
         *ring,
         *(
-            line.format(load="load" if pooled else "s_x[p]", t1="s_x[p + 1]", t2="s_x[p + 2]", s="s_x[p + 3]")
+            line.format(
+                load="load" if pooled else rows.load("p"),
+                t1=rows.load("p + 1"),
+                t2=rows.load("p + 2"),
+                s=rows.load("p + 3"),
+            )
             for line in project
         ),
         "    }",
@@ -3050,7 +3084,7 @@ def _jacobi_momentum(rows: JacobiRows, *, pad: str) -> str:
     return indent("\n".join(lines), pad)
 
 
-def jacobi_sweeps(rows: JacobiRows, op, laws: RowLaws, *, sweeps: int, pooled: bool, scale, pad: str = "    ") -> str:
+def jacobi_sweeps(rows: JacobiRows, op, laws: RowLaws, *, sweeps: int, pooled: bool, pad: str = "    ") -> str:
     """The Jacobi sweeps of a world's rows over the response operator ``op`` (its Jacobi actions), at most ``sweeps``.
 
     The rows of each friction block first take one step, isotropic in the block's scaled coordinates
@@ -3058,7 +3092,7 @@ def jacobi_sweeps(rows: JacobiRows, op, laws: RowLaws, *, sweeps: int, pooled: b
     ``y``: its residual ``r = b' + (A y)_i`` (:meth:`~.TransposedResponse.jacobi_residual`, after the operator's
     :meth:`~.TransposedResponse.gather`); then ``y_i - s_step_i r`` clamped at zero for a unilateral or idle row (an idle
     row whose residual turned negative stays at zero, votes loud and joins the steps' bound after the sweep's vote,
-    :func:`_jacobi_join`, the steps set again by ``scale`` as the staging set them). Each friction block is then
+    :func:`_jacobi_join`, the steps set again by :func:`jacobi_scale` as the staging set them). Each friction block is then
     projected radially onto its disk, or under torsion its ball (``pooled``: on its patch ring's pooled normal load), the
     impulses advance with Nesterov's
     momentum and adaptive restart, each row votes its change under the exit law (:func:`change_vote`:
@@ -3079,9 +3113,9 @@ def jacobi_sweeps(rows: JacobiRows, op, laws: RowLaws, *, sweeps: int, pooled: b
     if laws.regularize:
         # The lane's row's weight, fixed through the sweeps: a contact's stored one, or a material contact's from the
         # diagonal the tier formed (row_weight); 1 for every other row.
-        stored = "world_row_w.data[off_dense + lane]"
+        stored = rows.weight("lane")
         if laws.material:
-            stored = row_weight(stored, "world_row_eps.data[off_dense + lane]", "row_diag")
+            stored = row_weight(stored, rows.eps("lane"), "row_diag")
         weight = f"{pad}{group.declare('const float', ('row_w', f'row_contact ? {stored} : 1.0f'))}"
     inner = pad + "    "
     hot = inner + "    "
@@ -3095,7 +3129,7 @@ def jacobi_sweeps(rows: JacobiRows, op, laws: RowLaws, *, sweeps: int, pooled: b
         f"{hot}{{",
         f"{hot}    const int i = lane;",
         f"{hot}    if (i < {rows.rows}) {{",
-        f"{hot}        s_x[i] = x_new;",
+        f"{hot}        {rows.store('i', 'x_new')}",
         f"{hot}        s_y[i] = x_new + beta * (x_new - x_old);",
         f"{hot}        if (row_joins) iteration_changed = 1;",
         f"{hot}        if (x_new != x_from) {{",
@@ -3123,8 +3157,9 @@ def jacobi_sweeps(rows: JacobiRows, op, laws: RowLaws, *, sweeps: int, pooled: b
     # The lane's row: its residual at zero impulse, fixed through the sweeps, and its step size, set again when a row
     # joins the steps' bound; the step's share of a Gauss-Seidel step (omega w_i): the bound's impulse term in the
     # step's units.
+    rhs = rows.rhs_of("lane")
     row = [
-        f"{pad}{group.declare('const float', ('row_rhs', f'lane < {rows.rows} ? s_rhs[lane] : 0.0f'))}",
+        f"{pad}{group.declare('const float', ('row_rhs', f'lane < {rows.rows} ? {rhs} : 0.0f'))}",
         f"{pad}{group.declare('float', ('row_step', f'lane < {rows.rows} ? s_step[lane] : 0.0f'))}",
         f"{pad}{group.declare('float', ('row_inv_step', 'row_step > 0.0f ? 1.0f / row_step : 0.0f'))}",
         f"{pad}{group.declare('float', ('row_share', 'row_diag * row_step'))}",
@@ -3140,7 +3175,7 @@ def jacobi_sweeps(rows: JacobiRows, op, laws: RowLaws, *, sweeps: int, pooled: b
         f"{pad}for (;;) {{",
         level_loop(phases, exit=exit_, iteration="sweep", budget=budget, resume=True, pad=inner),
         f"{inner}if (sweep >= {sweeps} || !s_joined[0]) break;",
-        _jacobi_join(rows, op, scale, inner),
+        _jacobi_join(rows, op, inner),
         f"{pad}}}",
     ]
     return "\n".join(line for line in lines if line)
@@ -3172,12 +3207,12 @@ def jacobi_limit_pass(rows: JacobiRows, op, *, pad: str = "    ") -> str:
         f"        for (int i = 0; i < {rows.rows}; ++i) {{",
         f"            if (!{rows.clamps('i')} || s_vlim[i] == 0) continue;",
         pushed.dot((("part", "row", None), ("zz", "row", "row")), {"row": "i"}, body),
-        "            const float r_vlim = s_rhs[i] + part;",
+        f"            const float r_vlim = {rows.rhs_of('i')} + part;",
         "            const float diag_vlim = zz + cfm;",
         "            const float delta_vlim = diag_vlim > 0.0f",
         "                ? ProjectionLaw::velocity_limit_update(0.0f, r_vlim / diag_vlim).v1 : 0.0f;",
         "            if (delta_vlim != 0.0f) {",
-        "                if (lane == 0) s_x[i] += delta_vlim;",
+        f"                if (lane == 0) {rows.load('i')} += delta_vlim;",
         pushed.axpy((("row", "delta_vlim"),), body + "    ", row="i"),
         "            }",
         "            WARP_SYNC();",

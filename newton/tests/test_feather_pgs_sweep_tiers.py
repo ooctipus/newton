@@ -30,7 +30,6 @@ from newton._src.solvers.feather_pgs.sweep import (
     LevelLaw,
     RowLaws,
     end_sweep,
-    jacobi_scale,
     jacobi_sweeps,
     sweep_kernel,
 )
@@ -38,11 +37,6 @@ from newton._src.solvers.feather_pgs.sweep_routes_diag import DiagonalSweep
 from newton.tests.feather_pgs_law_harness import built, tier_classes
 
 _TIER = built(sweep_routes_tiers.TierSweep)
-
-
-def _scale(aii, bound, pad):
-    """The tiers' step scale (:func:`jacobi_scale`), with the rows' law's cfm as the tiers read it."""
-    return jacobi_scale(aii, bound, cfm="cfm", pad=pad)
 
 
 # The exit of a warp's sweep and of a block's, without readout: stop a quiet sweep once friction is active.
@@ -186,9 +180,9 @@ class TestJacobiLaw(unittest.TestCase):
         """A row's step from the extrapolated impulse votes against its bound: the floor of its residual times its
         step size (its right-hand side and terms, and its impulse before the step times its step's share of a
         Gauss-Seidel step, ``A_ii s_i``)."""
-        rows = JacobiRows(32, 32)
+        rows = JacobiRows(32)
         op = _operator()
-        text = jacobi_sweeps(rows, op, RowLaws(regularize=False), sweeps=1, pooled=False, scale=_scale)
+        text = jacobi_sweeps(rows, op, RowLaws(regularize=False), sweeps=1, pooled=False)
         self.assertNotIn("if (x_new != x_old) {", text)
         self.assertIn("float row_share = row_diag * row_step;", text)
         self.assertIn(
@@ -197,9 +191,9 @@ class TestJacobiLaw(unittest.TestCase):
         self.assertIn("x_from = s_y[i];", text)
         self.assertIn("if (x_new != x_from) {", text)
         self.assertIn("(!(fabsf(x_new - x_from) <= row_bound))", text)
-        typed = JacobiRows(32, 32, types=True)
+        typed = JacobiRows(32, types=True)
         traced = RowLaws(regularize=False, policy=SolvePolicy(readout="trace"))
-        text = jacobi_sweeps(typed, op, traced, sweeps=7, pooled=False, scale=_scale)
+        text = jacobi_sweeps(typed, op, traced, sweeps=7, pooled=False)
         self.assertIn("solve_trace_change(fabsf(x_new - x_from) * (row_inv_step), s_type[i]);", text)
         self.assertIn("sweep + 1 == 7", text)
 
@@ -209,7 +203,7 @@ class TestJacobiLaw(unittest.TestCase):
         self.assertIn(_BLOCK_EXIT, block)
 
     def test_the_trace_needs_staged_types(self):
-        rows = JacobiRows(32, 32)
+        rows = JacobiRows(32)
         op = _operator()
         with self.assertRaisesRegex(ValueError, "staged types"):
             jacobi_sweeps(
@@ -218,7 +212,6 @@ class TestJacobiLaw(unittest.TestCase):
                 RowLaws(regularize=False, policy=SolvePolicy(readout="trace")),
                 sweeps=1,
                 pooled=False,
-                scale=_scale,
             )
         counted = jacobi_sweeps(
             rows,
@@ -226,7 +219,6 @@ class TestJacobiLaw(unittest.TestCase):
             RowLaws(regularize=False, policy=SolvePolicy(readout="sweeps")),
             sweeps=3,
             pooled=False,
-            scale=_scale,
         )
         self.assertIn("solve_readout_sweeps(world, sweep + 1, sweep_stop);", counted)
 
