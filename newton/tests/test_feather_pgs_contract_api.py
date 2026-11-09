@@ -144,19 +144,10 @@ def test_readouts_answer_only_when_asked(test, device):
     audit = solver.read_audit()
     record = solver.get_path_selection()["routes"]["diagnostics"]["audit"]
     test.assertEqual(set(audit), set(record["slots"]))
-    # A world whose rows exist only inside its sweep (its tier walks their seeds: no free-body row, at most the tiers'
-    # row bound) reads NaN, as the record says; a world without rows (the classifier resolved it) reads a value, as
-    # does every other world.
-    resolved = solver.sweep.resolved_worlds.numpy()
-    if record["reason"] == "Reads every row of every world.":
-        test.assertEqual(int(audit["steps"][0]), STEPS)
-    else:
-        placement = solver.placement
-        counts, free = placement.constraint_count.numpy(), placement.mf_constraint_count.numpy()
-        emitted = (free == 0) & (counts > 0) & (counts <= int(placement.row_seeds.bound))
-        if resolved.shape[0]:
-            emitted &= resolved == 0
-        np.testing.assert_array_equal(np.isnan(audit["gap"]), emitted, err_msg=record["reason"])
+    # Every world reads, a tier's walked rows too (audit.seeded_class).
+    test.assertEqual(record["reason"], "Reads every row of every world.")
+    test.assertTrue(np.all(audit["steps"] == STEPS))
+    test.assertTrue(np.all(np.isfinite(audit["gap"])))
     test.assertGreater(solver.constraint_row_watermarks()["contact_high_water"], 0)
     solver, _, _ = _rollout(model, None, steps=1)
     with test.assertRaisesRegex(RuntimeError, "Diagnostics"):

@@ -1,11 +1,12 @@
 {
  "kernels": {
-  "audit.audit_world": "3c6c57373cf44feec6c280f4c5d23fb97a6777e2d09d3477170668e84bbf90d3",
+  "audit.audit_world": "fc9194dc2e017d4659b6ce471bfd6a26b4ad032fc382d1b1fb57cf933f3376d2",
   "audit.free_class()": "9bd5edf61737396666ef45fd258e1280f8fc7014eb56b8e23706787596311548",
   "audit.fused_limits": "3eccd0400c0000c09e1249ec93f7478fc3b01fa2622d9927b255cc20fd2faecd",
   "audit.packed_class(12, False)": "5957349b1955e7144c3e7f27a8516e178cdf72979789003e0ed5a1c26d0e78bd",
   "audit.packed_class(18, False)": "f869044f954b4404b66985ffc176021ff7e2f3ce96aa87e595b9d254cf945c74",
   "audit.packed_class(25, True)": "fb53ee37486a48494e27c44316e89801854b3123695decaf0234c248fa272cee",
+  "audit.seeded_class(22, (16, 6, 0, 16), (0, 0), (WalkClass(parent=(-1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14), first=(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16), half=()), WalkClass(parent=(-1, 0, 1, 2, 3, 4), first=(0, 1, 2, 3, 4, 5, 6), half=())), False)": "667a75f815ac6ae0fdbe014c74382670783d2d88f39e3b2f06b7b2319e65baf0",
   "audit.slot_class(6, 1024)": "39e5556ba973999859aa4391d6ce307ae5cbd89b378d572d0a532ad1b503123d",
   "audit.sparse_class(12, False)": "c42df92b683fde72f62f0dbcc65b6069d51f196b73a530aef7253930922d52f9",
   "audit.sparse_class(12, True)": "4267b1a812bdd216faa691e23ce4416245846a4c321ec06ebc1005b78827daa1",

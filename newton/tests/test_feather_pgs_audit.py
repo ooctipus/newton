@@ -296,6 +296,19 @@ class TestAudit(unittest.TestCase):
         self.assertAlmostEqual(velocity, 0.2 * 0.05 / H, delta=0.05)
         self.assertAlmostEqual(float(audit["work"][0]), velocity * velocity, delta=0.1)
 
+    def test_walked_rows_read_as_stored(self):
+        """A world whose tier walks its rows' seeds reads them by the tier's walk, as the stored rows read: the same
+        readout to the solves' rounding (the two sinks walk one walk)."""
+        reads = []
+        for sink in ("emit", "store"):
+            pins = SolverFeatherPGS.Pins(tiers=32, sink=sink)
+            model = scenes.legged().build(self.device)
+            solver, _state = _rollout(model, steps=12, pgs_iterations=16, dense_max_constraints=96, pins=pins)
+            self.assertEqual(solver._audit.record()["reason"], "Reads every row of every world.")
+            reads.append(solver.read_audit())
+        for slot in ("gap_sum", "violation_max", "work_sum"):
+            np.testing.assert_allclose(reads[0][slot], reads[1][slot], rtol=1.0e-2, atol=1.0e-6)
+
 
 @unittest.skipUnless(wp.is_cuda_available(), "needs CUDA")
 class TestAuditCUDA(TestAudit):
@@ -323,9 +336,7 @@ class TestAuditCUDA(TestAudit):
             (scenes.keyboard, (conformance.SPARSE_DIAGONAL,)),
         ):
             scene = build()
-            for routed in routes:
-                # The stored rows are readable: the tiers' worlds take the one writer's STORE sink.
-                route = routed.but(routed.name, pins={"sink": "store"})
+            for route in routes:
                 with self.subTest(scene=scene.name, route=route.name):
                     coarse, record = self._route(scene, route, 8)
                     fine, _record = self._route(scene, route, 512)
@@ -334,12 +345,6 @@ class TestAuditCUDA(TestAudit):
                     self.assertTrue(np.all(fine["gap_sum"] <= coarse["gap_sum"] * 1.01 + 1.0e-7))
                     self.assertLess(float(fine["gap_sum"].max()), 1.0e-3)
                     self.assertLess(float(fine["violation_max"].max()), 1.0e-3)
-
-    def test_worlds_without_stored_rows_read_nan(self):
-        """A world whose rows exist only inside its sweep reads NaN and is named, not skipped in silence."""
-        audit, record = self._route(scenes.legged(), conformance.EMIT_PARALLEL, 16)
-        self.assertTrue(np.any(np.isnan(audit["gap"])))
-        self.assertIn("tier walks their rows", record["reason"])
 
 
 if __name__ == "__main__":
