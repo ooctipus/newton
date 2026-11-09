@@ -151,22 +151,6 @@ def _lines(lines, indent: str) -> str:
     return "\n".join(indent + line if line.strip() else line for line in "\n".join(lines).split("\n"))
 
 
-# The last word of a Jacobi sweep's velocity-limit rows (:func:`.sweep.jacobi_limit_pass`) on ``w``, the velocity
-# change of the current impulses: ``Y`` (or ``Z``) at ``(row, coordinate)`` through ``response``, the pushed row's ``J``
-# at a coordinate through ``row``.
-
-
-def _push_prologue(response: Callable[[str, str], str], lanes: Lanes, dofs: int, rows: str):
-    """Lines of ``w = Y^T x`` (``s_dv``), lane-strided over the coordinates, each a sum over the rows in order."""
-    return [
-        f"for (int d = {lanes.lane}; d < {dofs}; d += {lanes.width}) {{",
-        "    float acc = 0.0f;",
-        f"    for (int j = 0; j < {rows}; ++j) acc += {response('j', 'd')} * s_x[j];",
-        "    s_dv[d] = acc;",
-        "}",
-    ]
-
-
 @dataclass(frozen=True)
 class WalkedRows:
     """A world's rows in the walk's coordinates, built in the kernel: each row's seeds walked up its trees' root paths
@@ -282,234 +266,6 @@ class WalkedRows:
             "}",
         ]
         return _lines(lines, indent)
-
-    def operator(self, target: str, lanes: Lanes, velocity: Velocity) -> "SparseFactor":
-        """The staged rows as the operator's walked support class: row ``r``'s entry ``d`` at coordinate ``d``, its
-        value ``target[d * stride + r]`` (as :meth:`stage` wrote it), on the velocity ``velocity``."""
-        return SparseFactor(
-            self.dofs,
-            lambda row, entry: entry,
-            lambda row, entry: f"{target}[{entry} * {self.stride} + {row}]",
-            lanes,
-            velocity=velocity,
-        )
-
-
-@dataclass(frozen=True)
-class TransposedResponse(ResponseOperator):
-    """Walked rows ``Z`` in registers and staged transposed: ``A y = Z^T (Z y)``, one lane a row: the simultaneous
-    form of the response, every row of a Jacobi level at once (row ``i = lane``).
-
-    A Jacobi sweep (:func:`.sweep.jacobi_sweeps`) keeps each row's residual at zero impulse, ``b'_i = rhs_i + J_i (v -
-    Y^T lambda_0)``, in ``s_rhs`` and forms ``r_i(y) = b'_i + (A y)_i`` at the extrapolated impulses ``y`` (``s_y``)
-    each sweep. The velocity is published once, from the impulses the sweeps applied; the last word of the
-    velocity-limit rows pushes them on ``A x``, maintained as ``w = Y^T x``.
-
-    The rows are walked in the kernel or read from the one writer's store (:class:`WalkedRows`), so ``Z``
-    serves as both ``J^T`` and ``Y``. Each lane holds its row in registers
-    (``Jr``); the block stages ``Z`` coordinate-major, ``s_Yt[d * stride + i]
-    = Z_i[d]`` (``stride = capacity + 4``: past the rows by a float4, so that
-    neighbouring coordinates fall in different banks), with zero columns up to
-    a multiple of four rows. Each sweep forms ``w = Z y`` once
-    (:meth:`gather`): a lane per coordinate and chunk of the rows' float4
-    groups (``chunks`` of them, as many as the lanes cover), four accumulators
-    joined pairwise, the chunks summed in order; a row's residual is then
-    ``b'_i + Z_i w`` in coordinate order. The step scale's bound is the
-    column-sum bound ``sum_d |Z_id| sum_j |Z_jd|`` over the rows that can move
-    (:meth:`jacobi_steps`), the bound the tiers' sweep budget was fit with
-    (:data:`.sweep_routes_tiers.TIER_SWEEPS_PER_ITERATION`).
-    """
-
-    dofs: int
-    capacity: int
-    walked: WalkedRows
-    lanes: Lanes = Lanes()
-    rows: str = "n_rows"
-    group: VirtualLanes = BLOCK_THREADS
-    """The block's lanes: CUDA's threads, or the CPU's virtual lanes, each with its row's registers ``Jr``."""
-
-    def __post_init__(self):
-        if self.walked is None:
-            raise ValueError("the transposed response holds walked rows")
-
-    @property
-    def stride(self) -> int:
-        return self.capacity + 4
-
-    @property
-    def chunks(self) -> int:
-        """Row chunks of :meth:`gather`: lanes per coordinate."""
-        return max(self.lanes.width // self.dofs, 1)
-
-    def _yt(self, row: str, coordinate: str) -> str:
-        return f"s_Yt[{coordinate} * {self.stride} + {row}]"
-
-    def buffers(self, capacity: int) -> tuple[Buffer, ...]:
-        """The staged block, the column sums of the bound, ``w`` and the chunks' partial ``w``."""
-        D = self.dofs
-        buffers = [Buffer("s_Yt", "float", self.stride * D, align=16), Buffer("s_colsum", "float", D)]
-        buffers.append(Buffer("s_dv", "float", (D + 3) & ~3, align=16))
-        if self.chunks > 1:
-            buffers.append(Buffer("s_dvp", "float", self.chunks * D))
-        return tuple(buffers)
-
-    def registers(self) -> tuple[tuple[str, str], ...]:
-        """Each lane's row registers ``Jr``, which the stage fills (:meth:`WalkedRows.stage`)."""
-        return (("float", f"Jr[{self.dofs}]"),)
-
-    def declarations(self, indent: str) -> str:
-        """Declare the lanes' registers ahead of the phases: on CUDA ``Jr`` (the phases declare the rows' own)."""
-        return self.group.declarations(indent, f"{indent}float Jr[{self.dofs}];")
-
-    def jacobi_stage(
-        self,
-        padding: str,
-        scale: Callable[[str, str, str], str],
-        indent: str,
-        *,
-        idle: str,
-        counted: Callable[[str], str],
-    ) -> str:
-        """Walk and stage the rows, mark the rows that cannot move (``idle``) and set each step scale
-        (:meth:`jacobi_steps`): ``s_rhs[i]``, which took ``J_i v_hat`` at staging, is the row's residual ``b'_i`` at
-        zero impulse; ``padding`` pads the rows' impulses.
-        """
-        lane, width, D, AM, rows = self.lanes.lane, self.lanes.width, self.dofs, self.capacity, self.rows
-        group = self.group
-        stage = self.walked.stage("s_Yt", indent=indent)
-        zero = [
-            f"for (int e = {lane}; e < {D} * 4; e += {width}) {{",
-            "    const int d = e >> 2;",
-            f"    const int j = {rows} + (e & 3);",
-            f"    if (j < {AM}) {self._yt('j', 'd')} = 0.0f;",
-            "}",
-            idle,
-        ]
-        return "\n".join(
-            [
-                group.phase(stage + "\n" + _lines(zero, indent)),
-                group.barrier(indent),
-                self._steps(scale, counted, indent, last=padding),
-            ]
-        )
-
-    def jacobi_steps(
-        self, scale: Callable[[str, str, str], str], indent: str, *, counted: Callable[[str], str], first: str = ""
-    ) -> str:
-        """Set each admitted row's step from the column-sum bound over the counted rows (after the lanes' ``first``
-        statements); synchronized."""
-        return self._steps(scale, counted, indent, first=first)
-
-    def _steps(
-        self,
-        scale: Callable[[str, str, str], str],
-        counted: Callable[[str], str],
-        indent: str,
-        *,
-        first: str = "",
-        last: str = "",
-    ) -> str:
-        """The column sums over the counted rows, then each admitted row's ``A_ii``, bound and step (lane ``i``'s row
-        in its registers), each a phase, the lanes' ``first`` and ``last`` statements in the first and the last."""
-        lane, width, D, rows, group = self.lanes.lane, self.lanes.width, self.dofs, self.rows, self.group
-        sums = [
-            *([first] if first else []),
-            f"for (int d = {lane}; d < {D}; d += {width}) {{",
-            "    float csum = 0.0f;",
-            f"    for (int j = 0; j < {rows}; ++j)",
-            f"        if ({counted('j')}) csum += fabsf({self._yt('j', 'd')});",
-            "    s_colsum[d] = csum;",
-            "}",
-        ]
-        steps = [
-            f"for (int i = {lane}; i < {rows}; i += {width}) {{",
-            "    const float* Ji = Jr;",
-            "    if (s_kind[i] >= 0) {",
-            "        float aii = 0.0f, bound = 0.0f;",
-            "        #pragma unroll",
-            f"        for (int d = 0; d < {D}; ++d) {{",
-            f"            aii += Ji[d] * {self._yt('i', 'd')};",
-            "            bound += fabsf(Ji[d]) * s_colsum[d];",
-            "        }",
-            scale("aii", "bound", "        "),
-            "    }",
-            "}",
-            *([last] if last else []),
-        ]
-        return "\n".join(
-            [
-                group.phase(_lines(sums, indent)),
-                group.barrier(indent),
-                group.phase(_lines(steps, indent)),
-                group.barrier(indent),
-            ]
-        )
-
-    def gather(self, indent: str) -> str:
-        """``w = Y^T y`` (``s_dv``): a lane per coordinate and chunk of float4 row groups, four accumulators joined
-        pairwise, the chunks' partial sums (``s_dvp``) added in chunk order; synchronized."""
-        lane, width, D, chunks = self.lanes.lane, self.lanes.width, self.dofs, self.chunks
-        store = "s_dv[d]" if chunks == 1 else f"s_dvp[ch * {D} + d]"
-        group = self.group
-        # On the CPU the virtual lanes take the coordinates and chunks CUDA's do: the same sums in the same order.
-        head = [
-            "{",
-            f"    const int n4 = ({self.rows} + 3) >> 2;",
-            f"    const int per = (n4 + {chunks - 1}) / {chunks};",
-        ]
-        lines = [
-            f"    if ({lane} < {chunks * D}) {{",
-            f"        const int d = {lane} % {D};",
-            f"        const int ch = {lane} / {D};",
-            "        const float4* y4 = reinterpret_cast<const float4*>(s_y);",
-            f"        const float4* Y4 = reinterpret_cast<const float4*>(&s_Yt[d * {self.stride}]);",
-            "        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;",
-            "        const int j4_end = min(n4, (ch + 1) * per);",
-            "        for (int j4 = ch * per; j4 < j4_end; ++j4) {",
-            "            const float4 yv = y4[j4];",
-            "            const float4 Yv = Y4[j4];",
-            "            a0 += Yv.x * yv.x; a1 += Yv.y * yv.y; a2 += Yv.z * yv.z; a3 += Yv.w * yv.w;",
-            "        }",
-            f"        {store} = (a0 + a1) + (a2 + a3);",
-            "    }",
-        ]
-        parts = [_lines(head, indent), group.phase(_lines(lines, indent)), group.barrier(indent + "    ")]
-        if chunks > 1:
-            join = [
-                f"    for (int d = {lane}; d < {D}; d += {width}) {{",
-                "        float acc = 0.0f;",
-                "        #pragma unroll",
-                f"        for (int ch = 0; ch < {chunks}; ++ch) acc += s_dvp[ch * {D} + d];",
-                "        s_dv[d] = acc;",
-                "    }",
-            ]
-            parts += [group.phase(_lines(join, indent)), group.barrier(indent + "    ")]
-        parts.append(_lines(["}"], indent))
-        return "\n".join(parts)
-
-    def jacobi_residual(self, out: str, indent: str) -> str:
-        """``float out = b'_i + J_i w``, in coordinate order from ``b'_i``."""
-        lines = [
-            "const float* Ji = Jr;",
-            f"float {out} = s_rhs[i];",
-            "#pragma unroll",
-            f"for (int d = 0; d < {self.dofs}; ++d) {out} += Ji[d] * s_dv[d];",
-        ]
-        return _lines(lines, indent)
-
-    def publish(self, indent: str = "    ", *, applied: Callable[[str], str]) -> str:
-        """``v = v_hat + P^T L^-T sum_i Z_i applied_i`` in row order from the staged block."""
-        return self.walked.publish(lambda row: self._yt(row, "d"), applied, indent)
-
-    def push_prologue(self, indent: str) -> str:
-        """``w = Y^T x`` before the pushes of the last word; synchronized."""
-        lines = _push_prologue(self._yt, self.lanes, self.dofs, self.rows)
-        return self.group.phase(_lines(lines, indent)) + "\n" + self.group.barrier(indent)
-
-    def staged(self, lanes: Lanes) -> "SparseFactor":
-        """The staged rows (``s_Yt``) on ``w`` (``s_dv``), the walked support class: the last word's row actions
-        (:func:`.sweep.jacobi_limit_pass`)."""
-        return self.walked.operator("s_Yt", lanes, Velocity("s_dv"))
 
 
 @dataclass(frozen=True)
@@ -746,3 +502,218 @@ class SparseFactor(ResponseOperator):
             f"{indent}    if (index >= 0) {self.local}[row * {dense} + index] = {self.factor('row', 'entry')};\n"
             f"{indent}}}"
         )
+
+
+@dataclass(frozen=True, kw_only=True)
+class TransposedResponse(SparseFactor):
+    """Walked rows ``Z`` as :class:`SparseFactor`'s entries staged transposed, on ``w`` (``s_dv``): ``A y = Z^T (Z
+    y)``, one lane a row, the simultaneous form of the response, every row of a Jacobi level at once (row ``i = lane``).
+
+    A Jacobi sweep (:func:`.sweep.jacobi_sweeps`) keeps each row's residual at zero impulse, ``b'_i = rhs_i + J_i (v -
+    Y^T lambda_0)``, in ``s_rhs`` and forms ``r_i(y) = b'_i + (A y)_i`` at the extrapolated impulses ``y`` (``s_y``)
+    each sweep. The velocity is published once, from the impulses the sweeps applied; the last word of the
+    velocity-limit rows pushes them on ``A x``, maintained as ``w = Y^T x`` by the entries' two actions.
+
+    The rows are walked in the kernel or read from the one writer's store (:class:`WalkedRows`), so ``Z`` serves as
+    both ``J^T`` and ``Y``. Each lane holds its row in registers (``Jr``); the block stages ``Z`` coordinate-major,
+    entry ``d`` of row ``i`` at ``s_Yt[d * stride + i]`` (``stride = capacity + 4``: past the rows by a float4, so
+    that neighbouring coordinates fall in different banks), with zero columns up to a multiple of four rows. Each sweep
+    forms ``w = Z y`` once (:meth:`gather`): a lane per coordinate and chunk of the rows' float4 groups (``chunks`` of
+    them, as many as the lanes cover), four accumulators joined pairwise, the chunks summed in order; a row's residual
+    is then ``b'_i + Z_i w`` in coordinate order. The step scale's bound is the column-sum bound ``sum_d |Z_id| sum_j
+    |Z_jd|`` over the rows that can move (:meth:`jacobi_steps`), the bound the tiers' sweep budget was fit with
+    (:data:`.sweep_routes_tiers.TIER_SWEEPS_PER_ITERATION`).
+    """
+
+    capacity: int
+    walked: WalkedRows
+    rows: str = "n_rows"
+    group: VirtualLanes = BLOCK_THREADS
+    """The block's lanes: CUDA's threads, or the CPU's virtual lanes, each with its row's registers ``Jr``."""
+
+    @classmethod
+    def of(cls, dofs: int, capacity: int, walked: WalkedRows, lanes: Lanes) -> "TransposedResponse":
+        """The staged rows of ``walked``, ``capacity`` at most, over ``dofs`` coordinates."""
+        stride = capacity + 4
+        return cls(
+            dofs,
+            lambda row, entry: entry,
+            lambda row, entry: f"s_Yt[{entry} * {stride} + {row}]",
+            lanes,
+            velocity=Velocity("s_dv"),
+            capacity=capacity,
+            walked=walked,
+        )
+
+    @property
+    def stride(self) -> int:
+        return self.capacity + 4
+
+    @property
+    def chunks(self) -> int:
+        """Row chunks of :meth:`gather`: lanes per coordinate."""
+        return max(self.lanes.width // self.support, 1)
+
+    def buffers(self, capacity: int) -> tuple[Buffer, ...]:
+        """The staged block, the column sums of the bound, ``w`` and the chunks' partial ``w``."""
+        D = self.support
+        buffers = [Buffer("s_Yt", "float", self.stride * D, align=16), Buffer("s_colsum", "float", D)]
+        buffers.append(Buffer("s_dv", "float", (D + 3) & ~3, align=16))
+        if self.chunks > 1:
+            buffers.append(Buffer("s_dvp", "float", self.chunks * D))
+        return tuple(buffers)
+
+    def lane_registers(self) -> tuple[tuple[str, str], ...]:
+        """Each lane's row registers ``Jr``, which the stage fills (:meth:`WalkedRows.stage`)."""
+        return (("float", f"Jr[{self.support}]"),)
+
+    def declarations(self, indent: str) -> str:
+        """Declare the lanes' registers ahead of the phases: on CUDA ``Jr`` (the phases declare the rows' own)."""
+        return self.group.declarations(indent, f"{indent}float Jr[{self.support}];")
+
+    def jacobi_stage(
+        self,
+        padding: str,
+        scale: Callable[[str, str, str], str],
+        indent: str,
+        *,
+        idle: str,
+        counted: Callable[[str], str],
+    ) -> str:
+        """Walk and stage the rows, mark the rows that cannot move (``idle``) and set each step scale
+        (:meth:`jacobi_steps`): ``s_rhs[i]``, which took ``J_i v_hat`` at staging, is the row's residual ``b'_i`` at
+        zero impulse; ``padding`` pads the rows' impulses.
+        """
+        lane, width, D, AM, rows = self.lanes.lane, self.lanes.width, self.support, self.capacity, self.rows
+        group = self.group
+        stage = self.walked.stage("s_Yt", indent=indent)
+        zero = [
+            f"for (int e = {lane}; e < {D} * 4; e += {width}) {{",
+            "    const int d = e >> 2;",
+            f"    const int j = {rows} + (e & 3);",
+            f"    if (j < {AM}) {self.factor('j', 'd')} = 0.0f;",
+            "}",
+            idle,
+        ]
+        return "\n".join(
+            [
+                group.phase(stage + "\n" + _lines(zero, indent)),
+                group.barrier(indent),
+                self.jacobi_steps(scale, indent, counted=counted, last=padding),
+            ]
+        )
+
+    def jacobi_steps(
+        self,
+        scale: Callable[[str, str, str], str],
+        indent: str,
+        *,
+        counted: Callable[[str], str],
+        first: str = "",
+        last: str = "",
+    ) -> str:
+        """Set each admitted row's step from the column-sum bound over the counted rows: the column sums, then each
+        row's ``A_ii``, bound and step (lane ``i``'s row in its registers), each a phase, the lanes' ``first`` and
+        ``last`` statements in the first and the last; synchronized."""
+        lane, width, D, rows, group = self.lanes.lane, self.lanes.width, self.support, self.rows, self.group
+        sums = [
+            *([first] if first else []),
+            f"for (int d = {lane}; d < {D}; d += {width}) {{",
+            "    float csum = 0.0f;",
+            f"    for (int j = 0; j < {rows}; ++j)",
+            f"        if ({counted('j')}) csum += fabsf({self.factor('j', 'd')});",
+            "    s_colsum[d] = csum;",
+            "}",
+        ]
+        steps = [
+            f"for (int i = {lane}; i < {rows}; i += {width}) {{",
+            "    const float* Ji = Jr;",
+            "    if (s_kind[i] >= 0) {",
+            "        float aii = 0.0f, bound = 0.0f;",
+            "        #pragma unroll",
+            f"        for (int d = 0; d < {D}; ++d) {{",
+            f"            aii += Ji[d] * {self.factor('i', 'd')};",
+            "            bound += fabsf(Ji[d]) * s_colsum[d];",
+            "        }",
+            scale("aii", "bound", "        "),
+            "    }",
+            "}",
+            *([last] if last else []),
+        ]
+        return "\n".join(
+            [
+                group.phase(_lines(sums, indent)),
+                group.barrier(indent),
+                group.phase(_lines(steps, indent)),
+                group.barrier(indent),
+            ]
+        )
+
+    def gather(self, indent: str) -> str:
+        """``w = Y^T y`` (``s_dv``): a lane per coordinate and chunk of float4 row groups, four accumulators joined
+        pairwise, the chunks' partial sums (``s_dvp``) added in chunk order; synchronized."""
+        lane, width, D, chunks = self.lanes.lane, self.lanes.width, self.support, self.chunks
+        store = "s_dv[d]" if chunks == 1 else f"s_dvp[ch * {D} + d]"
+        group = self.group
+        # On the CPU the virtual lanes take the coordinates and chunks CUDA's do: the same sums in the same order.
+        head = [
+            "{",
+            f"    const int n4 = ({self.rows} + 3) >> 2;",
+            f"    const int per = (n4 + {chunks - 1}) / {chunks};",
+        ]
+        lines = [
+            f"    if ({lane} < {chunks * D}) {{",
+            f"        const int d = {lane} % {D};",
+            f"        const int ch = {lane} / {D};",
+            "        const float4* y4 = reinterpret_cast<const float4*>(s_y);",
+            f"        const float4* Y4 = reinterpret_cast<const float4*>(&s_Yt[d * {self.stride}]);",
+            "        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;",
+            "        const int j4_end = min(n4, (ch + 1) * per);",
+            "        for (int j4 = ch * per; j4 < j4_end; ++j4) {",
+            "            const float4 yv = y4[j4];",
+            "            const float4 Yv = Y4[j4];",
+            "            a0 += Yv.x * yv.x; a1 += Yv.y * yv.y; a2 += Yv.z * yv.z; a3 += Yv.w * yv.w;",
+            "        }",
+            f"        {store} = (a0 + a1) + (a2 + a3);",
+            "    }",
+        ]
+        parts = [_lines(head, indent), group.phase(_lines(lines, indent)), group.barrier(indent + "    ")]
+        if chunks > 1:
+            join = [
+                f"    for (int d = {lane}; d < {D}; d += {width}) {{",
+                "        float acc = 0.0f;",
+                "        #pragma unroll",
+                f"        for (int ch = 0; ch < {chunks}; ++ch) acc += s_dvp[ch * {D} + d];",
+                "        s_dv[d] = acc;",
+                "    }",
+            ]
+            parts += [group.phase(_lines(join, indent)), group.barrier(indent + "    ")]
+        parts.append(_lines(["}"], indent))
+        return "\n".join(parts)
+
+    def jacobi_residual(self, out: str, indent: str) -> str:
+        """``float out = b'_i + J_i w``, in coordinate order from ``b'_i``."""
+        lines = [
+            "const float* Ji = Jr;",
+            f"float {out} = s_rhs[i];",
+            "#pragma unroll",
+            f"for (int d = 0; d < {self.support}; ++d) {out} += Ji[d] * s_dv[d];",
+        ]
+        return _lines(lines, indent)
+
+    def publish(self, indent: str = "    ", *, applied: Callable[[str], str]) -> str:
+        """``v = v_hat + P^T L^-T sum_i Z_i applied_i`` in row order from the staged block."""
+        return self.walked.publish(lambda row: self.factor(row, "d"), applied, indent)
+
+    def push_prologue(self, indent: str) -> str:
+        """``w = Y^T x`` (``s_dv``) before the pushes of the last word, lane-strided over the coordinates, each a sum
+        over the rows in order; synchronized."""
+        lane, width = self.lanes.lane, self.lanes.width
+        lines = [
+            f"for (int d = {lane}; d < {self.support}; d += {width}) {{",
+            "    float acc = 0.0f;",
+            f"    for (int j = 0; j < {self.rows}; ++j) acc += {self.factor('j', 'd')} * s_x[j];",
+            "    s_dv[d] = acc;",
+            "}",
+        ]
+        return self.group.phase(_lines(lines, indent)) + "\n" + self.group.barrier(indent)
