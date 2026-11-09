@@ -497,7 +497,9 @@ class TestExitLaw(unittest.TestCase):
             self.assertIn(f"(!(fabsf(excess) <= {bound(rhs, 'fabsf(dot)', '0.0f', diagonal='1.0f')}))", snippet)
             self.assertIn("unsigned pending = s_selected_words[word];", snippet)
             self.assertIn("(spin >= 0 && s_lam_dense[spin] != 0.0f)", snippet)
-            self.assertEqual("SUM(unit_jv0, unit_jv1, unit_jv2, gram_n1, gram_n2, unit_cross);" in snippet, units)
+            # Under contact torsion the unit's couplings are its contact's record, formed once a launch.
+            self.assertEqual("SUM(unit_jv0, unit_jv1, unit_jv2);" in snippet, units)
+            self.assertEqual("const float gram_n1 = coupling.x, gram_n2 = coupling.y;" in snippet, units)
         plain = sweep_routes.GeneralSweep(64, 32, 12, "120", torsion=True)
         body, _ = plain.source()
         self.assertNotIn("s_selected_words", body)
