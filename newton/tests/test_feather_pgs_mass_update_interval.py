@@ -413,7 +413,7 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
         paired = object()
         dynamics = object()
         solver.sweep = SimpleNamespace(claim_streams=(paired,))
-        solver.factor = SimpleNamespace(dynamics_stream=dynamics)
+        solver.factor = SimpleNamespace(dynamics=dynamics)
         solver.model = mock.Mock(device=object())
         with (
             mock.patch.object(wp, "synchronize_stream", side_effect=AssertionError("finalized handle")),
@@ -427,7 +427,7 @@ class TestFeatherPGSMassUpdateInterval(unittest.TestCase):
         # Prevent a second meaningful synchronization when Python collects the
         # deliberately uninitialized instance after this regression returns.
         solver.sweep = None
-        solver.factor.dynamics_stream = None
+        solver.factor.dynamics = None
         solver.model = None
 
     def test_mass_refresh_has_no_obsolete_limit_count_state(self):

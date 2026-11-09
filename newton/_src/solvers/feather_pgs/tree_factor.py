@@ -179,7 +179,7 @@ class TreeFactor:
         self.block_capacity = 0
         self.block_count = 0
         self.held = None
-        self.dynamics_stream = None
+        self.dynamics = None
         self.walk_arts = None
         self.walk_classes: tuple[WalkClass, ...] = ()
         self.walk_half_host = None
@@ -517,13 +517,13 @@ class TreeFactor:
             self.dof_armature.assign(self.armature.astype(np.float32))
 
     def install(self, solver) -> None:
-        """Hold the dynamics (:func:`.held_tree.install`); the drive rows' preparation overlaps FK/ID on a stream of
-        its own."""
+        """Hold the dynamics (:func:`.held_tree.install`); the drive rows' preparation overlaps FK/ID beside the step's
+        stream (:class:`.core.execution.Beside`)."""
         from . import held_tree  # noqa: PLC0415
 
         self.held = held_tree.install(solver)
         model = self.model
-        self.dynamics_stream = wp.Stream(model.device) if self.parallel_drives and model.device.is_cuda else None
+        self.dynamics = execution.Beside(model.device) if self.parallel_drives and model.device.is_cuda else None
 
     def record(self, classes, placement) -> dict:
         """The dynamics' route record (``routes.dynamics``), the packed rows ``placement``'s."""
