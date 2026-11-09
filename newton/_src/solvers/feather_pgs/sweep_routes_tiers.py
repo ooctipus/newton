@@ -25,7 +25,7 @@ import warp as wp
 from ...core.execution import Work, device_lanes, shape
 from ...core.memory import Buffer, Staging, built_for
 from . import kernel_template
-from .device_preludes import VirtualLanes
+from .device_preludes import VirtualLanes, substitute
 from .factor.walk import WALK_FRAME, WALK_LINK, walk_prelude, walk_row_prelude, walk_tables
 from .kernel_template import Dispatch
 from .law_source import law_preludes
@@ -36,7 +36,7 @@ from .solve_policy import block_argmax
 from .sweep import SPLIT, JacobiRows, SweepConfig, dense_tier_world, jacobi_limit_pass, jacobi_scale, jacobi_sweeps
 from .sweep_routes import MF_GS_ABI, worlds
 from .tree_scan import WALK_BOTH, WalkClass, classes_half
-from .walk_rows import RowSeeds
+from .walk_rows import RowSeeds, emit_rows
 
 PARALLEL_ABI = kernel_template.params(
     *MF_GS_ABI[:-1],
@@ -136,11 +136,12 @@ def _seeded_row(weighted: bool, material: bool) -> str:
                 WALK_WRENCH(seed, end == 0 ? 1.0f : -1.0f, d.c, p.c, origin.c, o, d[3] != 0.0f);
                 TIER_WALK(side, joint - walk.joint_start.data[art], -1, seed);
             }}
-            const float restitution = row_seeds.restitution.data[at];
+            const float restitution = row_seeds.rows.restitution.data[at];
             if (restitution > 0.0f && world_row_type.data[at] == {ROW_CONTACT}{eps}) {{
-                const float target = row_seeds.target.data[at];
-                const auto bounce = RowLaw::contact_restitution_rhs(row_seeds.phi.data[at], incident - target, target,
-                                                                    restitution, row_seeds.dt, row_seeds.threshold);
+                const float target = row_seeds.rows.target.data[at];
+                const auto bounce = RowLaw::contact_restitution_rhs(row_seeds.rows.phi.data[at], incident - target,
+                                                                    target, restitution, row_seeds.dt,
+                                                                    row_seeds.threshold);
                 if (bounce.v0) {{ s_rhs[i] = bounce.v1;{weight} }}
             }}
         }}"""
@@ -252,12 +253,10 @@ def parallel_source(tier: TierSweep) -> tuple[str, Staging]:
 
 
 def emits(tier: TierSweep) -> bool:
-    """Whether the tier's worlds take the one writer's EMIT sink, by data and the device: the tier stages its rows and
-    alone reads them, so it walks them where, bound at its register line, it keeps the stored tier's resident blocks
-    within the line's stack allowance. Where shared memory binds the line (the PRO's wide worlds), or no line holds
-    (the CPU's one thread), the walk's registers cost no warp; past a warp's rows the bound spills at most 16 B (the
-    GB300's 64-row tier 98 -> 80 registers, 10.3% faster); a warp's rows bound where registers bind spill 104 B, and
-    their tier keeps the store (SINK G1)."""
+    """Whether the tier's worlds take the one writer's EMIT sink, by data and the device: where, bound at its register
+    line, it keeps the stored tier's resident blocks within the line's stack allowance. Where shared memory binds the
+    line (the PRO's wide worlds) or no line holds (the CPU) the walk costs no warp; past a warp's rows the bound spills
+    at most 16 B (the GB300's 64-row tier 10.3% faster); a warp's rows bound by registers spill 104 B (SINK G1)."""
     stored, found = dataclasses.replace(tier, emit=False), built_for(tier.device_arch)
     if int(tier.rows) > TIER_ROWS or not found.cuda:
         return True
@@ -350,7 +349,14 @@ class TierSweep(SweepConfig):
     source = parallel_source
 
     def dispatch(self, staging: Staging) -> Dispatch:
-        return worlds()
+        """A world of the bucket a block; an emitting tier runs its rows' law first (:func:`.walk_rows.emit_rows`)."""
+        queue = worlds()
+        if not self.emit:
+            return queue
+        lanes = device_lanes(self.device_arch, self.threads)
+        at = next(line for line in queue.body.splitlines() if "$CALL" in line).removesuffix("$CALL")
+        body = substitute(queue.body, CALL=f"emit_rows(world, _lane, {lanes}, row_seeds)\n{at}$CALL")
+        return dataclasses.replace(queue, body=body, constants=(*queue.constants, ("emit_rows", emit_rows)))
 
     def operands(self) -> tuple[RowArgument, ...]:
         seeds = (RowArgument("row_seeds", RowSeeds, after="cfm"),) if self.emit else ()

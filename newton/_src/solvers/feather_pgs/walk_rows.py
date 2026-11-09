@@ -60,7 +60,7 @@ from .joint_table import FreeBodies
 from .kernel_template import python_kernel
 from .packed_rows import RowClasses, class_rank
 from .projection_laws import friction_ball_metric, friction_pair_metric
-from .row_build import write_contact_row
+from .row_build import contact_row_kind, contact_row_law, write_contact_row
 from .row_kernels import RIGID_SPEED_ROWS, RowBias, row_bias
 from .row_laws import LINK_ROWS
 from .row_records import (
@@ -161,11 +161,11 @@ def joint_seeds(seeds: JointSeeds, kind: int, index: int):
 @wp.struct
 class RowSeeds:
     """The one writer's EMIT sink: a world whose Jacobi tier walks its rows in its prologue (bit ``t`` of ``tiers``: the
-    tier of ``(width t, width (t + 1)]`` rows, :func:`.sweep_levels.tier_world` within ``bound``) keeps each row's
-    seed, world-major a lane a row: its articulations and bodies (``ids``; a covector's ``(art, -2, dof0, dof1)``), its
-    direction and torque flag (a covector's two values) and its point. The tier's prologue adds the incident's part of
-    the row law, a contact's bounce, from its records (``phi``, ``target``, ``restitution``) and the step's ``dt`` and
-    ``threshold``."""
+    tier of ``(width t, width (t + 1)]`` rows, :func:`.sweep_levels.tier_world` within ``bound``) runs their law there
+    (:func:`emit_rows`, on the rows' unit sources, counts and records and the law's inputs) and keeps each row's seed,
+    world-major a lane a row: its articulations and bodies (``ids``; a covector's ``(art, -2, dof0, dof1)``), its
+    direction and torque flag (a covector's two values) and its point. The tier's walk adds a contact's bounce from its
+    records and the step's ``dt`` and ``threshold``."""
 
     tiers: int
     bound: int
@@ -175,11 +175,15 @@ class RowSeeds:
     ids: wp.array2d[wp.vec4i]
     direction: wp.array2d[wp.vec4]
     point: wp.array2d[wp.vec4]
-    phi: wp.array2d[float]
-    target: wp.array2d[float]
-    restitution: wp.array2d[float]
     dt: float
     threshold: float
+    rows: DenseRows
+    units: wp.array2d[int]
+    counts: wp.array[int]
+    data: ContactInput
+    law: PatchRowLaw
+    joint: JointSeeds
+    bias: RowBias
 
 
 @wp.func
@@ -282,14 +286,15 @@ WRITERS = MappingProxyType(
 
 
 @cache
-def unit_reader(links: bool, unit_rows: int = 1, contacts: bool = True) -> wp.Function:
+def unit_reader(links: bool, unit_rows: int = 1, contacts: bool = True, kinds: bool = True) -> wp.Function:
     """Every placement's unit reader (:func:`row_unit`). A contact's unit is its rows from its first, at most
     ``unit_rows``, from the contact's frame: the support placement's, whose unit list holds a contact's rows as one unit
     and whose first launch wrote their records (:func:`support_units_kernel`). With ``unit_rows`` 1 it is the row
-    alone, its records written here by the contact law: the world-major writers', a lane a row (the producer's, folded
-    into the writer). ``links``: with the link rows' seeds, where the writer closes bilateral blocks (the general
-    placement's block variants; the sparse diagonal and the support placement admit none); ``contacts``: with the
-    contact rows' (not the topology part's, :data:`WRITE_TOPOLOGY`)."""
+    alone, its records written here by the contact law: the world-major writers', a lane a row. ``links``: with the link
+    rows' seeds, where the writer closes bilateral blocks (the general placement's block variants); ``contacts``: with
+    the contact rows' (not the topology part's, :data:`WRITE_TOPOLOGY`); ``kinds``: a contact row writes its kind too
+    (not in a tier's prologue, :func:`emit_rows`, whose writer wrote it)."""
+    read_contact = contact_unit(kinds)
 
     def row_unit(
         rows: DenseRows, data: ContactInput, law: PatchRowLaw, seeds: JointSeeds, line: int, slot: int, source: int
@@ -327,7 +332,7 @@ def unit_reader(links: bool, unit_rows: int = 1, contacts: bool = True) -> wp.Fu
                 if unit.row == CONTACT_SPIN_ROW:
                     unit.torque = 1
             else:
-                unit = contact_row_unit(data, law, frame, c, index - 4 * c, line, slot)
+                unit = read_contact(data, law, frame, c, index - 4 * c, line, slot)
         elif wp.static(links) and kind == UNIT_LINK:
             k = index // LINK_ROWS
             row = index - LINK_ROWS * k
@@ -358,7 +363,7 @@ def unit_reader(links: bool, unit_rows: int = 1, contacts: bool = True) -> wp.Fu
         return unit
 
     name = "row_unit" + ("_links" if links else "") + (f"_{unit_rows}" if unit_rows > 1 else "")
-    name += "" if contacts else "_topology"
+    name += ("" if contacts else "_topology") + ("" if kinds else "_law")
     row_unit.__name__ = row_unit.__qualname__ = name
     return wp.func(row_unit)
 
@@ -406,8 +411,8 @@ def walked_rows_kernel(
     ``classes``: each row stored by its support class (:func:`.packed_rows.row_classes`, :func:`packed_walker`), its
     classes' word beside it (which its record takes, :func:`.response_builds_rows.write_row_record`).
 
-    ``emit``: a tier of the class takes the EMIT sink (:class:`RowSeeds`): a world's rows are walked here (STORE) or
-    keep their seeds where its Jacobi tier walks them in its prologue (:func:`emits`, the claims' predicate)."""
+    ``emit``: a tier of the class takes the EMIT sink (:class:`RowSeeds`): a world's rows are walked here (STORE), or
+    its Jacobi tier runs their law and walks them in its prologue (:func:`emits`, the claims' predicate)."""
     has_blocks = blocks > 0
     capacity = max(blocks, 1)
     mimics = int(mimic_blocks)
@@ -470,19 +475,19 @@ def walked_rows_kernel(
                 for slot in range(start, start + rows_here):
                     row_bias(rows, bias, line, slot, sink.row_incident[line, slot])
             return
-        # The sink, by the reading tier (emits): STORE walks the row here, EMIT keeps its seed for the tier's prologue
-        # and its rhs without the incident's part, which the tier adds (the relative incident 0 fires no bounce).
-        seeded = False
+        # The sink, by the reading tier (emits): STORE walks the row here; EMIT leaves its law to the tier's prologue
+        # (emit_rows), and writes here a contact row's kind, which the patch link and the warm start read before it.
         if wp.static(emit):
-            seeded = part != WRITE_TOPOLOGY and emits(sink_seeds, world, count)
+            if part != WRITE_TOPOLOGY and emits(sink_seeds, world, count):
+                for slot in range(first + lane, end, lanes):
+                    source = support.units[line, slot]
+                    if source >> UNIT_SHIFT == UNIT_CONTACT:
+                        index = source & ((1 << UNIT_SHIFT) - 1)
+                        contact_row_kind(data, law, ContactFrame(), index // 4, index - 4 * (index // 4), False)
+                return
         for slot in range(first + lane, end, lanes):
             source = support.units[line, slot]
             unit = read_unit(rows, data, law, seeds, line, slot, source)
-            if wp.static(emit):
-                if unit.rows > 0 and seeded:
-                    store_seed(sink_seeds, line, slot, unit)
-                    row_bias(rows, bias, line, slot, rows.target[line, slot])
-                    continue
             if unit.rows > 0:
                 walk(sink, unit)
                 incident = sink.row_incident[line, slot]
@@ -924,32 +929,41 @@ class RowUnit:
     value1: float
 
 
-@wp.func
-def contact_row_unit(
-    data: ContactInput, law: PatchRowLaw, frame: ContactFrame, c: int, row: int, line: int, slot: int
-) -> RowUnit:
+@cache
+def contact_unit(kinds: bool = True) -> wp.Function:
     """Contact ``c``'s row ``row`` as its own unit at row ``slot``, from the contact's front end ``frame``: its records
-    by the contact law (:func:`.row_build.write_contact_row`), its bodies, direction and point (the spin row a torque
-    about the normal)."""
-    body_a, body_b, direction, point = write_contact_row(data, law, frame, c, row, False)
-    unit = RowUnit()
-    unit.line = line
-    unit.slot = slot
-    unit.rows = 1
-    unit.row = row
-    unit.frame = wp.matrix_from_rows(direction, direction, direction)
-    unit.art_a = data.art0[c]
-    unit.body_a = body_a
-    unit.art_b = data.art1[c]
-    unit.body_b = body_b
-    unit.point = point
-    unit.point_b = point
-    unit.friction_point = point
-    unit.dof0 = -1
-    unit.dof1 = -1
-    if row == CONTACT_SPIN_ROW:
-        unit.torque = 1
-    return unit
+    by the contact law (:func:`.row_build.write_contact_row`; without ``kinds`` its law alone, whose kind the one writer
+    wrote), its bodies, direction and point (the spin row a torque about the normal)."""
+    write = write_contact_row if kinds else contact_row_law
+
+    def contact_row_unit(
+        data: ContactInput, law: PatchRowLaw, frame: ContactFrame, c: int, row: int, line: int, slot: int
+    ) -> RowUnit:
+        body_a, body_b, direction, point = write(data, law, frame, c, row, False)
+        unit = RowUnit()
+        unit.line = line
+        unit.slot = slot
+        unit.rows = 1
+        unit.row = row
+        unit.frame = wp.matrix_from_rows(direction, direction, direction)
+        unit.art_a = data.art0[c]
+        unit.body_a = body_a
+        unit.art_b = data.art1[c]
+        unit.body_b = body_b
+        unit.point = point
+        unit.point_b = point
+        unit.friction_point = point
+        unit.dof0 = -1
+        unit.dof1 = -1
+        if row == CONTACT_SPIN_ROW:
+            unit.torque = 1
+        return unit
+
+    contact_row_unit.__name__ = contact_row_unit.__qualname__ = "contact_row_unit" if kinds else "contact_law_unit"
+    return wp.func(contact_row_unit)
+
+
+contact_row_unit = contact_unit(True)
 
 
 @wp.func
@@ -1682,6 +1696,21 @@ def slot_header(keys: bool) -> wp.Function:
 read_row_unit = unit_reader(False)
 """The unit reader of a row a unit, without link rows (:func:`unit_reader`): the sparse diagonal's and the free
 bodies'."""
+read_law_unit = unit_reader(False, kinds=False)
+
+
+@wp.func
+def emit_rows(world: int, lane: int, lanes: int, seeds: RowSeeds):
+    """A world's rows by their law in its Jacobi tier's prologue (:meth:`.sweep_routes_tiers.TierSweep.dispatch`), its
+    ``lanes`` lanes striding over them: each row's seed (:func:`store_seed`; a contact's kind the one writer wrote) and
+    its rhs without the incident's part, which the tier's walk adds (the relative incident 0 fires no bounce)."""
+    rows = seeds.rows
+    line = rows.first[world]
+    count = wp.min(seeds.counts[world], seeds.units.shape[1])
+    for slot in range(lane, count, lanes):
+        unit = read_law_unit(rows, seeds.data, seeds.law, seeds.joint, line, slot, seeds.units[line, slot])
+        store_seed(seeds, line, slot, unit)
+        row_bias(rows, seeds.bias, line, slot, rows.target[line, slot])
 
 
 @cache
@@ -1873,16 +1902,15 @@ def free_body_sink(solver) -> RowSink:
 
 def row_seeds(placement, tiers: int, bound: int, width: int) -> RowSeeds:
     """The one writer's EMIT sink (:class:`RowSeeds`) for the tiers of mask ``tiers`` within ``bound`` rows, ``width``
-    rows a tier; without tiers its seeds are one-entry placeholders. The step binds ``dt`` and ``threshold``."""
+    rows a tier; without tiers its seeds are one-entry placeholders. The step binds ``dt``, ``threshold``, the law."""
     seeds = RowSeeds()
     seeds.tiers, seeds.bound, seeds.width = int(tiers), int(bound), int(width)
     device = placement.dense_first.device
     if not tiers:
         seeds.free_body_rows = seeds.speed_first = wp.zeros(1, dtype=int, device=device)
-        seeds.phi = seeds.target = seeds.restitution = wp.zeros((1, 1), dtype=float, device=device)
     else:
         seeds.free_body_rows, seeds.speed_first = placement.mf_constraint_count, placement.speed_first
-        seeds.phi, seeds.target, seeds.restitution = placement.phi, placement.target_velocity, placement.row_restitution
+        seeds.units, seeds.counts = placement.unit_source, placement.constraint_count
     shape = placement.phi.shape if tiers else (1, 1)
     seeds.ids = wp.empty(shape, dtype=wp.vec4i, device=device)
     seeds.direction = wp.empty(shape, dtype=wp.vec4, device=device)

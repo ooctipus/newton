@@ -11,6 +11,8 @@ the patch law with beta 0, a disabled view and a zero phi: its tangent rows act 
 
 from __future__ import annotations
 
+from functools import cache
+
 import warp as wp
 
 from .contact_input import ContactFrame, ContactInput
@@ -90,114 +92,136 @@ def contact_normal_beta(data: ContactInput, c: int, body_a: int, body_b: int, ph
     return contact_capped_beta(phi, data.beta, cap, data.dt)
 
 
-@wp.func
-def write_contact_row(data: ContactInput, law: PatchRowLaw, frame: ContactFrame, c: int, row: int, with_rhs: bool):
-    """Write contact ``c``'s row ``row`` (0 the normal, 1 and 2 the tangents, 3 the spin row under contact torsion)
-    at ``slot + row`` from its front end ``frame`` (:func:`.contact_input.contact_frame`, formed once for the
-    contact's rows): its dense records and, ``with_rhs``, its position-pass ``rhs`` and the CFM seed of its diagonal;
-    return its bodies and frame ``(body_a, body_b, direction, row_point)``.
+@cache
+def contact_row_writer(kinds: bool = True, laws: bool = True) -> wp.Function:
+    """Write contact ``c``'s row ``row`` (0 the normal, 1 and 2 the tangents, 3 the spin row under contact torsion) at
+    ``slot + row``: with ``kinds`` its kind (its type and parent, what the patch link and the warm start read before
+    any reader; a normal's parent -1, which the link replaces), with ``laws`` its other records from its front end
+    ``frame`` (:func:`.contact_input.contact_frame`) and, ``with_rhs``, its position-pass ``rhs`` and CFM seed,
+    returning ``(body_a, body_b, direction, row_point)``; both, :data:`write_contact_row`.
 
-    Every contact row producer writes its records here; the general route forms its rhs later. A tangent row follows
-    the friction row law (:func:`.friction_patches.patch_tangent_row`): the anchor's tangential displacement as its
-    gap, the law's beta and the undivided coefficient ``mu``. A normal row's rhs is
-    :func:`.row_laws.contact_rhs` at its capped beta (:func:`contact_normal_beta`), and a bouncing one's the restitution target from its incident velocity summed per
-    body (:func:`incident_projection`). A spin row (:data:`.contact_laws.CONTACT_SPIN_ROW`) turns about the normal:
-    its coefficient is :func:`contact_torsion_mu`, its target the prescribed bodies' spin
-    (:func:`.contact_laws.prescribed_spin_target`) and its rhs ``-target``.
-
-    With ``contact_compliance`` a contact of positive stiffness is a material contact: its normal row's rhs and
-    compliance are :func:`.row_laws.contact_material_rhs`'s (``row_eps``, zero on every other contact row), written
-    whether or not ``with_rhs``, it takes no restitution, and its tangents' coefficient takes the contact's friction
-    scale (zero meaning one).
+    A tangent row follows the friction row law (:func:`.friction_patches.patch_tangent_row`): the anchor's tangential
+    displacement as its gap, the law's beta and the undivided coefficient ``mu``. A normal row's rhs is
+    :func:`.row_laws.contact_rhs` at its capped beta (:func:`contact_normal_beta`), a bouncing one's the restitution
+    target from its incident velocity summed per body (:func:`incident_projection`). A spin row
+    (:data:`.contact_laws.CONTACT_SPIN_ROW`) turns about the normal: its coefficient :func:`contact_torsion_mu`, its
+    target the prescribed bodies' spin (:func:`.contact_laws.prescribed_spin_target`), its rhs ``-target``. Under
+    ``contact_compliance`` a contact of positive stiffness is a material contact: its normal row's rhs and compliance
+    are :func:`.row_laws.contact_material_rhs`'s (``row_eps``, zero on every other contact row), written whether or not
+    ``with_rhs``; it takes no restitution, and its tangents' coefficient takes its friction scale (zero meaning one).
     """
-    body_a = frame.body_a
-    body_b = frame.body_b
-    normal = frame.normal
-    point = frame.point
-    phi = frame.phi
-    art_a = data.art0[c]
-    art_b = data.art1[c]
-    world = data.world[c]
-    line = data.first[world]
-    slot = data.slot[c]
-    mu, restitution = contact_materials(data.shape0[c], data.shape1[c], data.material_mu, data.material_restitution)
-    stiffness = float(0.0)
-    if data.material != 0:
-        stiffness = data.stiffness[c]
-    if stiffness > 0.0:
-        restitution = 0.0
-    direction, row_point = contact_row_frame(row, normal, frame.tangent0, frame.tangent1, point, frame.friction_point)
-    target = prescribed_target(
-        body_a, art_a, body_b, art_b, row_point, direction, data.prescribed, data.origin, data.body_v
-    )
-    if row == CONTACT_SPIN_ROW:
-        target = prescribed_spin_target(body_a, art_a, body_b, art_b, normal, data.prescribed, data.body_v)
-    r = slot + row
-    normal_beta = float(0.0)
-    friction_mu = mu
-    if stiffness > 0.0 and data.friction_weight[c] > 0.0:
-        friction_mu *= data.friction_weight[c]
-    if row == CONTACT_SPIN_ROW:
-        spin_phi, spin_beta, spin_mu = patch_spin_row(law, c, friction_mu, contact_torsion_mu(data, c))
-        data.row_type[line, r] = ROW_TORSION
-        data.row_parent[line, r] = slot
-        data.row_mu[line, r] = spin_mu
-        data.row_beta[line, r] = spin_beta
-        data.phi[line, r] = spin_phi
-        data.restitution[line, r] = 0.0
-    elif row == 0:
-        normal_beta = contact_normal_beta(data, c, body_a, body_b, phi)
-        data.row_type[line, r] = ROW_CONTACT
-        data.row_parent[line, r] = -1
-        data.row_mu[line, r] = mu
-        data.row_beta[line, r] = normal_beta
-        data.phi[line, r] = phi
-        data.restitution[line, r] = restitution
-    else:
-        tangent_phi, beta = patch_tangent_row(law, c, row)
-        data.row_type[line, r] = ROW_FRICTION
-        data.row_parent[line, r] = slot
-        data.row_mu[line, r] = friction_mu
-        data.row_beta[line, r] = beta
-        data.phi[line, r] = tangent_phi
-        data.restitution[line, r] = 0.0
-    if data.material != 0:
-        eps = float(0.0)
-        if row == 0 and stiffness > 0.0:
-            material_rhs, eps = contact_material_rhs(phi, target, stiffness, data.damping[c], data.dt)
-            data.rhs[line, r] = material_rhs
-        data.row_eps[line, r] = eps
-    data.target[line, r] = target
-    data.sides[line, r] = row_sides(art_a, art_b, data.response_dofs)
-    if with_rhs:
-        inv_dt = 1.0 / data.dt
-        rhs = float(0.0)
-        weight = float(1.0)
-        if row == 0 and stiffness > 0.0:
-            rhs = data.rhs[line, r]
+
+    def writer(data: ContactInput, law: PatchRowLaw, frame: ContactFrame, c: int, row: int, with_rhs: bool):
+        body_a = frame.body_a
+        body_b = frame.body_b
+        normal = frame.normal
+        point = frame.point
+        phi = frame.phi
+        art_a = data.art0[c]
+        art_b = data.art1[c]
+        world = data.world[c]
+        line = data.first[world]
+        slot = data.slot[c]
+        mu, restitution = contact_materials(data.shape0[c], data.shape1[c], data.material_mu, data.material_restitution)
+        stiffness = float(0.0)
+        if data.material != 0:
+            stiffness = data.stiffness[c]
+        if stiffness > 0.0:
+            restitution = 0.0
+        if wp.static(laws):
+            direction, row_point = contact_row_frame(
+                row, normal, frame.tangent0, frame.tangent1, point, frame.friction_point
+            )
+            target = prescribed_target(
+                body_a, art_a, body_b, art_b, row_point, direction, data.prescribed, data.origin, data.body_v
+            )
+            if row == CONTACT_SPIN_ROW:
+                target = prescribed_spin_target(body_a, art_a, body_b, art_b, normal, data.prescribed, data.body_v)
+        r = slot + row
+        normal_beta = float(0.0)
+        friction_mu = mu
+        if stiffness > 0.0 and data.friction_weight[c] > 0.0:
+            friction_mu *= data.friction_weight[c]
+        if row == CONTACT_SPIN_ROW:
+            spin_phi, spin_beta, spin_mu = patch_spin_row(law, c, friction_mu, contact_torsion_mu(data, c))
+            if wp.static(kinds):
+                data.row_type[line, r] = ROW_TORSION
+                data.row_parent[line, r] = slot
+            if wp.static(laws):
+                data.row_mu[line, r] = spin_mu
+                data.row_beta[line, r] = spin_beta
+                data.phi[line, r] = spin_phi
+                data.restitution[line, r] = 0.0
         elif row == 0:
-            rhs, weight = contact_rhs(
-                phi, normal_beta, target, inv_dt, data.bias_scale, data.speculative_scale, data.contact_w
-            )
-            if restitution > 0.0:
-                relative = incident_projection(data, body_a, art_a, row_point, direction)
-                relative -= incident_projection(data, body_b, art_b, row_point, direction)
-                relative -= target
-                fires, bounce = contact_restitution_rhs(
-                    phi, relative, target, restitution, data.dt, data.restitution_threshold
-                )
-                if fires:
-                    rhs = bounce
-                    weight = 1.0
-        elif row == CONTACT_SPIN_ROW:
-            rhs, _w = row_rhs(
-                ROW_TORSION, data.phi[line, r], data.row_beta[line, r], target, inv_dt, data.bias_scale, 0.0, 0.0, 1.0
-            )
+            if wp.static(laws):
+                normal_beta = contact_normal_beta(data, c, body_a, body_b, phi)
+            if wp.static(kinds):
+                data.row_type[line, r] = ROW_CONTACT
+                data.row_parent[line, r] = -1
+            if wp.static(laws):
+                data.row_mu[line, r] = mu
+                data.row_beta[line, r] = normal_beta
+                data.phi[line, r] = phi
+                data.restitution[line, r] = restitution
         else:
             tangent_phi, beta = patch_tangent_row(law, c, row)
-            rhs, _w = row_rhs(ROW_FRICTION, tangent_phi, beta, target, inv_dt, data.bias_scale, 0.0, 0.0, 1.0)
-        data.rhs[line, slot + row] = rhs
-        data.diag[line, slot + row] = data.cfm
-        if data.contact_w < 1.0:
-            data.row_w[line, slot + row] = weight
-    return body_a, body_b, direction, row_point
+            if wp.static(kinds):
+                data.row_type[line, r] = ROW_FRICTION
+                data.row_parent[line, r] = slot
+            if wp.static(laws):
+                data.row_mu[line, r] = friction_mu
+                data.row_beta[line, r] = beta
+                data.phi[line, r] = tangent_phi
+                data.restitution[line, r] = 0.0
+        if wp.static(laws):
+            if data.material != 0:
+                eps = float(0.0)
+                if row == 0 and stiffness > 0.0:
+                    material_rhs, eps = contact_material_rhs(phi, target, stiffness, data.damping[c], data.dt)
+                    data.rhs[line, r] = material_rhs
+                data.row_eps[line, r] = eps
+            data.target[line, r] = target
+            data.sides[line, r] = row_sides(art_a, art_b, data.response_dofs)
+        if wp.static(laws):
+            if with_rhs:
+                inv_dt = 1.0 / data.dt
+                rhs = float(0.0)
+                weight = float(1.0)
+                if row == 0 and stiffness > 0.0:
+                    rhs = data.rhs[line, r]
+                elif row == 0:
+                    rhs, weight = contact_rhs(
+                        phi, normal_beta, target, inv_dt, data.bias_scale, data.speculative_scale, data.contact_w
+                    )
+                    if restitution > 0.0:
+                        relative = incident_projection(data, body_a, art_a, row_point, direction)
+                        relative -= incident_projection(data, body_b, art_b, row_point, direction)
+                        relative -= target
+                        fires, bounce = contact_restitution_rhs(
+                            phi, relative, target, restitution, data.dt, data.restitution_threshold
+                        )
+                        if fires:
+                            rhs = bounce
+                            weight = 1.0
+                elif row == CONTACT_SPIN_ROW:
+                    rhs, _w = row_rhs(
+                        ROW_TORSION, data.phi[line, r], data.row_beta[line, r], target, inv_dt, data.bias_scale, 0.0,
+                        0.0, 1.0,
+                    )  # fmt: skip
+                else:
+                    tangent_phi, beta = patch_tangent_row(law, c, row)
+                    rhs, _w = row_rhs(ROW_FRICTION, tangent_phi, beta, target, inv_dt, data.bias_scale, 0.0, 0.0, 1.0)
+                data.rhs[line, slot + row] = rhs
+                data.diag[line, slot + row] = data.cfm
+                if data.contact_w < 1.0:
+                    data.row_w[line, slot + row] = weight
+            return body_a, body_b, direction, row_point
+
+    name = {(True, True): "write_contact_row", (True, False): "contact_row_kind"}.get((kinds, laws), "contact_row_law")
+    writer.__name__ = writer.__qualname__ = name
+    return wp.func(writer)
+
+
+write_contact_row = contact_row_writer()
+contact_row_kind = contact_row_writer(laws=False)
+contact_row_law = contact_row_writer(kinds=False)
