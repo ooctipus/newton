@@ -101,6 +101,16 @@ JOINT_ROW_WARPS = 4
 """Articulations (warps) a block of the joint row families' producers on CUDA (:func:`prefix_shape`)."""
 
 _CONTACT_BUILD_THREAD_CAP = 65536
+# The contact-parallel row launches' register line: the slot allocator's (allocate_world_contact_slots), the heaviest.
+CONTACT_LINE = 48
+
+
+def _contact_threads(rows: int, device) -> int:
+    # One wave of the blocks the line keeps resident a multiprocessor (the execution layer's rule, from the device), and
+    # at least the cap's threads, which keep the CPU's one a contact in contact order.
+    found = memory.device(device)
+    wave = shape(Work(rows, most=1, registers=CONTACT_LINE, cap=False), found)
+    return min(rows, max(_CONTACT_BUILD_THREAD_CAP, wave.blocks_per_sm * wave.block * found.sms))
 
 
 def _holds_contact_rows(contacts: Contacts | None) -> bool:
@@ -811,7 +821,7 @@ class RowLaws:
             # Sized for the bound in a capture whose launches bind: every replay runs them at the live
             # count and strides with the captured threads (ContactPool.launch); otherwise for the ready rows.
             rows = pool.launch_rows()
-            contact_build_threads = min(rows, _CONTACT_BUILD_THREAD_CAP)
+            contact_build_threads = _contact_threads(rows, model.device)
 
             self._build_friction_patches(solver, state_in, contacts)
 
@@ -1134,7 +1144,7 @@ class RowLaws:
         marker = solver.sweep.sparse_contact_marker
         if marker is not None and _holds_contact_rows(contacts):
             pool = placement.contact_pool
-            threads = min(pool.launch_rows(), _CONTACT_BUILD_THREAD_CAP)
+            threads = _contact_threads(pool.launch_rows(), solver.model.device)
             pool.launch(
                 marker,
                 threads,
