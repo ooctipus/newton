@@ -1115,6 +1115,7 @@ class GeneralSweep(SweepConfig):
     - the row record: ``places`` (:class:`RowPlaces`, the plan's storage choice): the dense rows' metadata staged or
       their records streamed; the free rows' records always stream;
     - the enumeration: ``active_rows`` (:func:`.sweep.active_scan`), else slot order (``coordinate_levels`` first);
+      the friction triples after the rows (:func:`.sweep.triple_phase`, K1's order) where each world holds ``one_tree``;
     - the support class: ``max_row_dofs`` (the placement's packed support), ``support_classes`` (the rows' sides by
       their classes, :func:`.packed_rows.row_classes`), ``wide_rows`` (the bilateral block's), and the free bodies' 6 +
       6 class: ``free_rows`` their own run, else rows of the line, their ``speed_rows`` the line's last;
