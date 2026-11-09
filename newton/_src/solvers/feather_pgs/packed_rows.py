@@ -30,13 +30,15 @@ import numpy as np
 import warp as wp
 
 from . import field_group, host_index
-from .device_preludes import DevicePrelude
+from .device_preludes import DevicePrelude, substitute
 from .field_group import Field, FieldGroup
 
 __all__ = [
     "CLASS_SIDES",
     "PACKED_ROWS",
     "PACKED_SIDES",
+    "PACKED_SIDES_BY_SIDE",
+    "PACKED_SIDES_DENSE",
     "WIDE",
     "RowClasses",
     "SupportTable",
@@ -57,7 +59,7 @@ _PACKED_SIDES = """    // A packed row's entries (packed_rows): SIDES_COORDINATE
     // e of a row whose sides start at world coordinates off0 and off1 and hold n0 and n1 coordinates, -1 past them.
     // Dense: entry e is coordinate e, held inside a side's coordinates; else the first side's entries, then the second's.
     const auto SIDES_COORDINATE = [&](const int off0, const int n0, const int off1, const int n1, const int e) {
-        if (packed_dense != 0) return ((e >= off0 && e < off0 + n0) || (e >= off1 && e < off1 + n1)) ? e : -1;
+        if ($dense) return ((e >= off0 && e < off0 + n0) || (e >= off1 && e < off1 + n1)) ? e : -1;
         return e < n0 ? off0 + e : (e < n0 + n1 ? off1 + e - n0 : -1);
     };
     // PACKED_COORDINATE(sides, e): from the row's sides (-1 for none).
@@ -77,14 +79,23 @@ _PACKED_SIDES = """    // A packed row's entries (packed_rows): SIDES_COORDINATE
     // is not one of them (dense_rows.jacobian_row).
     const auto PACKED_FIRST = [&](const wp::vec2i sides, const int art) {
         if (art < 0 || (art != sides[0] && art != sides[1])) return -1;
-        if (packed_dense != 0) return articulation_world_dof_offset.data[art];
+        if ($dense) return articulation_world_dof_offset.data[art];
         return art == sides[0] ? 0 : response_dofs.data[sides[0]];
     };"""
 
-PACKED_SIDES = DevicePrelude("packed_sides", _PACKED_SIDES, _PACKED_SIDES)
+
+def _packed_sides(name: str, dense: str) -> DevicePrelude:
+    text = substitute(_PACKED_SIDES, dense=dense)
+    return DevicePrelude(name, text, text)
+
+
+PACKED_SIDES = _packed_sides("packed_sides", "packed_dense != 0")
 """``PACKED_COORDINATE(sides, e)``, ``RECORD_COORDINATE(firsts, widths, e)`` and ``PACKED_FIRST(sides, art)`` for native
 sources that take ``response_dofs``, ``articulation_world_dof_offset`` and ``packed_dense``: a packed row's coordinates
 from its sides or from its record's words (no stored coordinates), and where a side starts."""
+# The same, the rows' layout known where the kernel is built: at their coordinates (dense), or by side.
+PACKED_SIDES_DENSE = _packed_sides("packed_sides_dense", "true")
+PACKED_SIDES_BY_SIDE = _packed_sides("packed_sides_by_side", "false")
 
 
 def support_width(response_dofs: np.ndarray, art_to_world: np.ndarray, world_count: int) -> int:
