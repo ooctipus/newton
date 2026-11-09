@@ -396,7 +396,7 @@ class TreeFactor:
         """The bilateral blocks (:data:`.factor.fields.Preelim`) the one writer's block phase closes."""
         return field_group.bind(Preelim, factor=self)
 
-    def seed_blocks(self, *, first, rhs, impulses) -> None:
+    def seed_blocks(self, first, rhs, impulses) -> None:
         """The closure's seed, once the warm start has gathered the rows' impulses: each block's kept rows take
         ``-r_Q`` (:func:`.factor.closure.seed_blocks_kernel`); the one writer closed the blocks and corrected the
         other rows."""
