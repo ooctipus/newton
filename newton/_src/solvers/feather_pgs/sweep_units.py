@@ -133,13 +133,11 @@ class SlotLayout(NamedTuple):
     torsional coefficient (``spin_mu``). ``words`` words: each row ``r``'s bits of its stored inverse diagonal, of its
     right-hand side, and its type and parent word (its header's words 1 to 3, :func:`.row_metadata.pack_row_record`) at ``r * 3``, then from
     ``ring`` a friction unit's patch ring: the other normal rows of its ring in ring order (two 16-bit rows a word,
-    0xFFFF past the last), then their count (-1 for a ring larger than :data:`RING_MEMBERS`). ``metric`` floats: a
-    friction unit's cached metric and Gram couplings (:func:`.sweep_routes._colored_metrics`)."""
+    0xFFFF past the last), then their count (-1 for a ring larger than :data:`RING_MEMBERS`)."""
 
     rows: int
     fields: int
     words: int
-    metric: int
     mu: int
     weight: int
     spin_mu: int
@@ -151,8 +149,7 @@ def slot_layout(torsion: bool) -> SlotLayout:
     rows = 4 if torsion else 3
     entries, ring = 12 * rows, 3 * rows
     words = ring + RING_MEMBERS // 2 + 1
-    # The friction metric and the normal's couplings: the pair's metric (4) and two, or under torsion eight and three.
-    return SlotLayout(rows, entries + 2 + torsion, words, 11 if torsion else 6, entries, entries + 1, entries + 2, ring)
+    return SlotLayout(rows, entries + 2 + torsion, words, entries, entries + 1, entries + 2, ring)
 
 
 _RING_MEMBERS = wp.constant(RING_MEMBERS)
@@ -162,9 +159,6 @@ SLOT_FIELDS = FieldGroup(
     # Slot-major: field f of unit p at [slot, f, p], so a warp's units read each field in one transaction.
     Field("slot_data", wp.float32, ("slot", "slot_field", "unit")),
     Field("slot_words", wp.int32, ("slot", "slot_word", "unit")),
-    # The friction metric and Gram couplings of each staged friction unit (SlotLayout.metric), formed by the
-    # colored sweep once per launch.
-    Field("slot_metric", wp.float32, ("slot", "slot_metric", "unit")),
 )
 """A world's units' rows as the colored sweep reads them: by color slot, field by field (:func:`stage_slots`), in a
 :class:`SlotLayout`."""
@@ -303,7 +297,6 @@ class UnitPlan:
             "color": self.units + 1,
             "slot_field": layout.fields,
             "slot_word": layout.words,
-            "slot_metric": layout.metric,
         }
 
 

@@ -30,6 +30,7 @@ from .solve_policy import QUIET_LITERAL, block_argmax, sweep_exit
 from .sweep import (
     EXACT,
     FORMED_RECORD,
+    FRICTION_METRIC_FLOATS,
     ITERATION,
     SEQUENTIAL,
     Diagonal,
@@ -44,7 +45,6 @@ from .sweep import (
     active_violation,
     active_words,
     cached_pair_law,
-    cached_triple_law,
     contact_unit,
     end_sweep,
     formed_friction_laws,
@@ -291,6 +291,9 @@ BLOCK_WARPS, WARP_LINE = 2, 64
 COLORED_THREADS = 256
 """Threads of a colored world's block: a color's units beyond them run in turns."""
 
+COLOR_SLOT = "LOAD_slots(reinterpret_cast<const int4*>(&color_slot.data[(off_unit + {}) * 4]))"
+"""The colored unit at a place of its world's colors: its first row, rows and bodies (:data:`.sweep_units.UNIT_FIELDS`)."""
+
 COLORS = Levels("color_count.data[world]", lambda color: f"color_offset.data[off_color + {color}]", chunk=256)
 """A colored world's free-body units by color (the exact level law, :mod:`.sweep_units`), a thread a unit of the block:
 256 colors' offsets staged at a time, since a world's colors are bounded by its units, not by the block."""
@@ -303,7 +306,6 @@ COLORED_ABI = kernel_template.params(
     ("color_slot", wp.array3d[int]),
     ("slot_data", wp.array3d[float]),
     ("slot_words", wp.array3d[int]),
-    ("slot_metric", wp.array3d[float]),
     ("v_out", wp.array[float]),
 )
 """The colored mapping's native ABI: the matrix-free sweep's, then each world's storage slot, the worlds' color counts, their slots' colors and staged units (:data:`.sweep_units.WORLD_FIELDS`, :data:`.sweep_units.UNIT_FIELDS`,
@@ -320,36 +322,13 @@ def _unit_rows(torsion: bool) -> tuple:
     return (*_UNIT_ROWS, _SPIN_ROW) if torsion else _UNIT_ROWS
 
 
-_PAIR_METRIC = ("metric.v0", "metric.v1", "metric.v2[0]", "metric.v2[1]")
-"""A colored friction unit's cached pair metric (``ProjectionLaw::friction_pair_metric``): the two eigenvalues, the
-larger's axis."""
-TRIPLE_METRIC = 8
-"""Under contact torsion a friction unit's cached metric takes eight floats: the friction triple's
-(``ProjectionLaw::friction_ball_metric``: three eigenvalues and an unused value, the eigenbasis as a rotation
-quaternion), or a unit without a spin row the pair's (:data:`_PAIR_METRIC`) and four unused."""
-_PAIR_COUPLINGS = (("gram_n1", 0, 1), ("gram_n2", 0, 2))
-"""The Gram couplings a colored friction unit caches after its pair's metric: each one's name and rows (``E``'s
-``12 r``), the pair's tangents with the normal."""
-_SPIN_COUPLINGS = (("gram_n3", 0, 3),)
-"""Under contact torsion the spin row's coupling with the normal, cached after the pair's."""
-_TRIPLE_COUPLINGS = (("unit_cross", 1, 2), ("unit_cross13", 1, 3), ("unit_cross23", 2, 3))
-"""Under contact torsion the friction rows' couplings, which form the unit's friction metric before the sweeps."""
-
-
-def _unit_couplings(torsion: bool) -> tuple[int, tuple]:
-    """A colored unit's cached Gram couplings and their start in its metric: after the friction pair's metric
-    (:data:`_PAIR_METRIC`), or under contact ``torsion`` after the friction metric's :data:`TRIPLE_METRIC` floats, with
-    the spin row's."""
-    return (TRIPLE_METRIC, (*_PAIR_COUPLINGS, *_SPIN_COUPLINGS)) if torsion else (len(_PAIR_METRIC), _PAIR_COUPLINGS)
-
-
 def _unit_terms(pad: str, *, torsion: bool = False) -> str:
-    """Native statements, after a unit's ``E``, ``metric``, ``rows`` and ``dof_a``, ``dof_b`` are declared: the unit's
-    velocity at its staged rows' entries (``velocities``, :func:`_staged_rows`), its rows' velocity terms from it (each
-    side's six products, then the sides added) and the cached Gram couplings of the pair with the normal; under
-    ``torsion`` the spin row's term too and its coupling with the normal (:attr:`.sweep_units.SlotLayout.metric`)."""
+    """Native statements, after a unit's ``E``, ``rows``, ``dof_a``, ``dof_b`` and its record (its couplings in
+    ``friction_m3``) are declared: the unit's velocity at its staged rows' entries (``velocities``,
+    :func:`_staged_rows`), its rows' velocity terms from it (each side's six products, then the sides added) and the
+    normal's couplings with its pair (and under ``torsion`` its spin row, whose term it reduces too)."""
     rows = _unit_rows(torsion)
-    start, couplings = _unit_couplings(torsion)
+    couplings = zip(("gram_n1", "gram_n2", "gram_n3")[: len(rows) - 1], "yzw", strict=False)
     lines = [
         "float velocities[12];",
         "#pragma unroll",
@@ -372,7 +351,7 @@ def _unit_terms(pad: str, *, torsion: bool = False) -> str:
         "    }",
         *(f"    {term} += {part};" for part, term, _ in rows),
         "}",
-        f"const float {', '.join(f'{name} = metric[{start + f}]' for f, (name, _, _) in enumerate(couplings))};",
+        f"const float {', '.join(f'{name} = {FORMED_RECORD[3]}.{c}' for name, c in couplings)};",
     ]
     return indent("\n".join(lines), pad)
 
@@ -412,10 +391,11 @@ def _unit_apply(pad: str, *, torsion: bool = False) -> str:
 _SLOTS = Operand("slots")
 
 
-def _colored_units(free: WorldRows, laws: RowLaws, M_MF: int, units: int) -> str:
+def _colored_units(free: WorldRows, laws: RowLaws, M_MF: int, units: int, record: Callable[[str], str]) -> str:
     """A color's units, one thread each, at block stride: each loads its slot's fields at once
-    (:data:`.sweep_units.SLOT_FIELDS`, field by field across the color's ``units`` slots) and runs the free-body row
-    law, unrolled over the unit's rows, on the world's staged velocity. No other unit of the color shares a body."""
+    (:data:`.sweep_units.SLOT_FIELDS`, field by field across the color's ``units`` slots) and its contact's ``record``
+    (:func:`.sweep.friction_record_stage`), and runs the free-body row law, unrolled over the unit's rows, on the
+    world's staged velocity. No other unit of the color shares a body."""
     unit_rows = WorldRows(M_MF, Place.STREAMED, free=True, stream=free.stream, lanes=Lanes(1))
     torsion = laws.torsion
     layout = sweep_units.slot_layout(torsion)
@@ -438,9 +418,8 @@ def _colored_units(free: WorldRows, laws: RowLaws, M_MF: int, units: int) -> str
         row="i",
         kind="mf_rt",
         # One thread per unit, every row's velocity term reduced from the unit's velocity ``u`` before the unit's first
-        # row (_unit_terms), the normal's Gram couplings and the friction metric (the pair's, or the triple's with a
-        # spin row) from the unit's cache formed once per launch (_colored_metrics), one pass over the unit's
-        # coordinates after its rows (_unit_apply).
+        # row (_unit_terms), the normal's couplings and the friction metric from its contact's record, formed once per
+        # launch (sweep.friction_record_stage), one pass over the unit's coordinates after its rows (_unit_apply).
         operator=UnitZ(cached=True),
         diagonal=Diagonal(
             inverse=lambda row: "mf_diag" if row == "i" else f"__int_as_float(W[{unit_offset(row)} * 3])"
@@ -455,9 +434,22 @@ def _colored_units(free: WorldRows, laws: RowLaws, M_MF: int, units: int) -> str
         ring_load=ring_load,
         lanes=Lanes(1),
         contact_kinds=(ROW_CONTACT,),
-        pair_law="FRICTION_PAIR_CACHED(place, ",
-        triple_law="FRICTION_TRIPLE_CACHED(place, ",
+        pair_law="FRICTION_PAIR_CACHED(0, ",
+        triple_law="FRICTION_TRIPLE_CACHED(0, ",
     )
+    # The friction laws on the unit's record as it loaded it with its rows: the pair metric's (friction_m1), and under
+    # torsion the triple's cone law on the ball metric every contact with a spin row has (a zero coefficient pins it).
+    laws_text = cached_pair_law(
+        "FRICTION_PAIR_CACHED", "friction_m1.x", "friction_m1.y", ("friction_m1.z", "friction_m1.w"), ""
+    )
+    if torsion:
+        laws_text += """
+const auto FRICTION_TRIPLE_CACHED = [&](int, const wp::mat33&, wp::vec3 residual, wp::vec3 old, float mu, float mu_t,
+                                        float load, float relaxation) -> wp::vec3 {
+    return ConeLaw::friction_triple_from_metric(wp::vec3(friction_m0.x, friction_m0.y, friction_m0.z),
+        wp::mat33(friction_m1.x, friction_m1.y, friction_m1.z, friction_m1.w, friction_m2.x, friction_m2.y, friction_m2.z,
+                  friction_m2.w, friction_m3.x), residual, old, mu, mu_t, load, relaxation);
+};"""
     lam = unit_rows.load
     ring_sum = "\n".join(
         [
@@ -476,16 +468,6 @@ def _colored_units(free: WorldRows, laws: RowLaws, M_MF: int, units: int) -> str
             "                    if (k < members) load += member[k];",
             "                return load;",
             "            };",
-            "            // A friction pair's law from its unit's cached metric (formed once per launch, before the sweeps), which",
-            "            // the unit loads with its fields"
-            + ("; under contact torsion the triple's law likewise, with a spin row." if torsion else "."),
-            f"            float metric[{layout.metric}];",
-            cached_pair_law("FRICTION_PAIR_CACHED", "metric[0]", "metric[1]", ("metric[2]", "metric[3]"), " " * 12),
-            *(
-                (cached_triple_law("FRICTION_TRIPLE_CACHED", " " * 12, metric=tuple(f"metric[{f}]" for f in range(8))),)
-                if torsion
-                else ()
-            ),
         ]
     )
     fields, words = layout.fields, layout.words
@@ -508,21 +490,23 @@ const float mf_diag = __int_as_float(meta.y);"""
         check="mf_diag",
         pad=" " * 20,
     )
-    visit = f"""                    const int4 slot = LOAD_slots(reinterpret_cast<const int4*>(&color_slot.data[(off_unit + place) * 4]));
+    visit = f"""                    const int4 slot = {COLOR_SLOT.format("place")};
                     const int unit_row = slot.x, rows = slot.y, dof_a = slot.z, dof_b = slot.w;
                     const int slot_base = unit_slot * {fields * units} + place;
                     const int word_base = unit_slot * {words * units} + place;
-                    // Every field of the slot and its metric at once, beside the slot's own load: one round of
-                    // memory latency per unit. A unit without a friction pair never reads its pair's fields.
+                    // Every field of the slot at once, beside the slot's own load: one round of memory latency per
+                    // unit. A unit without a friction pair never reads its pair's fields.
                     float E[{fields}];
                     int W[{words}];
 #pragma unroll
                     for (int f = 0; f < {fields}; ++f) E[f] = slot_data.data[slot_base + f * {units}];
 #pragma unroll
                     for (int f = 0; f < {words}; ++f) W[f] = slot_words.data[word_base + f * {units}];
-#pragma unroll
-                    for (int f = 0; f < {layout.metric}; ++f)
-                        metric[f] = slot_metric.data[unit_slot * {layout.metric * units} + place + f * {units}];
+                    // Its contact's record by place, beside the slot (sweep.friction_record_stage): the friction
+                    // metric, then the normal's couplings with its friction rows; unread without a friction pair.
+                    const float* const unit_record = {record("place")};
+                    const float4 {", ".join(f"{name} = make_float4({', '.join('0.0f' if 4 * k + c == 3 else f'unit_record[{(4 * k + c) * units}]' for c in range(4))})" for k, name in enumerate(FORMED_RECORD))};
+{indent(laws_text, " " * 20)}
 {_unit_terms(" " * 20, torsion=torsion)}
 {unit}
 {_unit_apply(" " * 20, torsion=torsion)}"""
@@ -572,111 +556,6 @@ def dense_units(
         record=(loads, after),
         pad=pad,
     )
-
-
-def _colored_diagonal(r: int) -> str:
-    """A colored unit's row ``r``'s diagonal ``A_rr`` from its stored inverse (``W[3 r]``; zero for a zero one)."""
-    return f"(__int_as_float(W[{3 * r}]) > 0.0f ? 1.0f / __int_as_float(W[{3 * r}]) : 0.0f)"
-
-
-def _colored_pair_metric(pad: str) -> str:
-    """Native statements, after a unit's ``W`` and its pair's coupling ``unit_cross`` are declared: its friction pair's
-    metric (``ProjectionLaw::friction_pair_metric`` of the first tangent's diagonal, the pair's coupling and the
-    second tangent's diagonal), formed exactly as the visit's pair law forms it."""
-    return f"{pad}const auto metric = ProjectionLaw::friction_pair_metric({_colored_diagonal(1)}, unit_cross, {_colored_diagonal(2)});"
-
-
-def _colored_friction_metric(layout: sweep_units.SlotLayout, pad: str) -> list[str]:
-    """Native statements under contact torsion, after a unit's ``E``, ``W``, ``slot`` and its rows' couplings are
-    declared: its friction metric (``friction_metric``, :data:`TRIPLE_METRIC` floats), the friction triple's
-    (``ProjectionLaw::friction_ball_metric`` of its friction rows' block) with a spin row, else the pair's
-    (``ProjectionLaw::friction_pair_metric``), each formed from the diagonals the visit reads."""
-    lines = [
-        f"float friction_metric[{TRIPLE_METRIC}] = {{}};",
-        "if ((slot.y & 7) == 4) {",
-        "    const auto triple = ProjectionLaw::friction_ball_metric(",
-        f"        wp::mat33({_colored_diagonal(1)}, unit_cross, unit_cross13,",
-        f"                  unit_cross, {_colored_diagonal(2)}, unit_cross23,",
-        f"                  unit_cross13, unit_cross23, {_colored_diagonal(3)}),",
-        f"        E[{layout.mu}], E[{layout.spin_mu}]);",
-        "    const wp::quat basis = wp::quat_from_matrix(triple.v1);",
-        "    for (int f = 0; f < 3; ++f) friction_metric[f] = triple.v0[f];",
-        "    for (int f = 0; f < 4; ++f) friction_metric[4 + f] = basis[f];",
-        "} else {",
-        _colored_pair_metric("    "),
-        *(f"    friction_metric[{f}] = {value};" for f, value in enumerate(_PAIR_METRIC)),
-        "}",
-    ]
-    return [pad + line for line in lines]
-
-
-def _colored_metrics(units: int, *, torsion: bool = False) -> str:
-    """Before the sweeps, every thread forms the cached metric of the world's staged friction units at block stride
-    and stores it in its slot's metric cache (``slot_metric``, field by field across the units), which the unit's law
-    and terms read at every visit: a friction pair's metric (the two eigenvalues and the larger's axis), or
-    under contact ``torsion`` the friction metric of :func:`_colored_friction_metric`, then its Gram couplings
-    (:func:`_unit_couplings`)."""
-    layout = sweep_units.slot_layout(torsion)
-    fields, words = layout.fields, layout.words
-    couplings = _unit_couplings(torsion)[1]
-    names = [name for name, _, _ in couplings]
-    head = [
-        "    {",
-        "        const int staged = color_offset.data[off_color + color_count.data[world]];",
-        "        for (int p = tid; p < staged; p += blockDim.x) {",
-        "            const int4 slot = LOAD_slots(reinterpret_cast<const int4*>(&color_slot.data[(off_unit + p) * 4]));",
-        # A friction unit: three rows, or four with its spin row where spin rows may appear (sweep.spin_row).
-        "            if ((slot.y & 7) < 3) continue;"
-        if torsion
-        else f"            if ((slot.y & 3) != {layout.rows}) continue;",
-        "            const int dof_a = slot.z, dof_b = slot.w;",
-        f"            const int slot_base = unit_slot * {fields * units} + p;",
-    ]
-    stage = [
-        "#pragma unroll",
-        f"            for (int f = 0; f < {fields}; ++f) E[f] = slot_data.data[slot_base + f * {units}];",
-    ]
-    # The friction rows' couplings too, which form the friction metric with the rows' diagonals: the pair's, and under
-    # torsion the spin row's with each tangent.
-    couplings = (*couplings, *(_TRIPLE_COUPLINGS if torsion else _TRIPLE_COUPLINGS[:1]))
-    metric = _colored_friction_metric(layout, " " * 12) if torsion else [_colored_pair_metric(" " * 12)]
-    values = [*((f"friction_metric[{f}]" for f in range(TRIPLE_METRIC)) if torsion else _PAIR_METRIC), *names]
-    rows = [
-        *head,
-        f"            const int word_base = unit_slot * {words * units} + p;",
-        f"            float E[{fields}];",
-        f"            int W[{words}];",
-        *stage,
-        "#pragma unroll",
-        f"            for (int f = 0; f < {layout.ring}; ++f) W[f] = slot_words.data[word_base + f * {units}];",
-        "            // The Gram couplings of the unit's rows: per coordinate, body a's then b's products.",
-    ]
-
-    def products(side: int) -> list[str]:
-        entry = lambda row: f"E[{12 * row + 6 * side} + k]" if 12 * row + 6 * side else "E[k]"  # noqa: E731
-        return [f"                    {name} += {entry(a)} * {entry(b)};" for name, a, b in couplings]
-
-    rows += [
-        f"            float {', '.join(f'{name} = 0.0f' for name, _, _ in couplings)};",
-        "            for (int k = 0; k < 6; ++k) {",
-        "                if (dof_a >= 0) {",
-        *products(0),
-        "                }",
-        "                if (dof_b >= 0) {",
-        *products(1),
-        "                }",
-        "            }",
-        *metric,
-        f"            const int at = unit_slot * {layout.metric * units} + p;",
-        *(
-            f"            slot_metric.data[at{f' + {f * units}' if f else ''}] = {value};"
-            for f, value in enumerate(values)
-        ),
-        "        }",
-        "    }",
-        "    __syncthreads();",
-    ]
-    return "\n".join(rows)
 
 
 def coordinate_levels(
@@ -848,11 +727,13 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         )
 
     # Where spin rows may appear, every friction contact's record (its Gram couplings and metric) is formed once per
-    # launch before the sweeps (sweep.friction_record_stage), the dense rows' and the free bodies' in the warp mapping
-    # (the colored units cache theirs in their slots, _colored_metrics), and its visits only reduce velocity terms and
-    # project. A contact holds three rows at least: a slot each.
+    # launch before the sweeps (sweep.friction_record_stage), the dense rows' and the free bodies', and its visits only
+    # reduce velocity terms and project; the colored units read their contacts' records whatever the laws. A contact
+    # holds three rows at least: a slot each.
     metric = dense_record = free_record = None
     friction_laws = metric_stage = ""
+    # A free row's coordinates are its sides', from its header.
+    sides = free.visit("normal") + "\n" + unpack_mf_header("rec_a", "")
     if contact_torsion:
         metric = "FRICTION"
 
@@ -867,8 +748,6 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
                 # The free bodies' rows follow the dense ones in the line.
                 return friction_metric(row, str(M_D), rows=3)
 
-            # A free row's coordinates are its sides', from its header.
-            sides = free.visit("normal") + "\n" + unpack_mf_header("rec_a", "")
             stage = friction_record_stage(
                 free, free_op, end="mf_contact_end", record=free_record, declare=sides, pad="    "
             )
@@ -887,7 +766,20 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         head = "    const int lane = LANE;\n    const int tid = (int)threadIdx.x;\n    const int warp = tid >> 5;"
         first_warp, end_first_warp, barrier = "    if (warp == 0) {\n", "    }\n", "__syncthreads();"
         units = sweep_units.unit_capacity(M_MF)
-        free_phase = _colored_units(free, laws, M_MF, units)
+
+        def unit_metric(place: str) -> str:
+            # A unit's record by its place in the colors' order, slot-major from the free rows' first record (every
+            # dense contact's normal precedes row M_D - 2): its visit's loads do not wait for its color slot, and a
+            # color's units read each float together.
+            first = M_D // 3 * FRICTION_METRIC_FLOATS
+            return f"(friction_metric.data + static_cast<size_t>(line) * friction_metric.shape[1] * {FRICTION_METRIC_FLOATS} + {first} + ({place}))"
+
+        free_phase = _colored_units(free, laws, M_MF, units, unit_metric)
+        # The units' records at the block's stride, with the normal's couplings a unit moves its rows' terms by.
+        listed = ("color_offset.data[off_color + color_count.data[world]]", COLOR_SLOT, units)
+        metric_build = friction_record_stage(
+            free, free_op, end="mf_contact_end", record=unit_metric, declare=sides, units=listed, pad="    "
+        )
         trace_reduction = ""
         if solve_policy.traces:
             trace_reduction = block_argmax(COLORED_THREADS // 32, warp="warp", lane="lane")[0]
@@ -908,10 +800,9 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
             free_phase = rows_block(
                 free, free_op, laws, admission=_MF_ADMISSION, metric=metric, formed=free_record, pad="    "
             )
-        offsets = trace_reduction = ""
+        offsets = trace_reduction = metric_build = ""
 
     thread, threads = ("tid", "(int)blockDim.x") if colored else ("lane", "STRIDE")
-    metric_build = _colored_metrics(sweep_units.unit_capacity(M_MF), torsion=contact_torsion) if colored else ""
     seed = ""
     if seeded:
         seeds = (
@@ -1248,8 +1139,12 @@ class GeneralSweep(SweepConfig):
 
     def operands(self) -> tuple[RowArgument, ...]:
         return (
-            # Where spin rows may appear, every friction contact's metric (sweep.friction_metric_stage).
-            *((RowArgument("friction_metric", wp.array3d[float], after="omega"),) if self.torsion else ()),
+            # Where spin rows may appear, or the colored units read them, the friction contacts' records.
+            *(
+                (RowArgument("friction_metric", wp.array3d[float], after="omega"),)
+                if self.torsion or self.colored
+                else ()
+            ),
             # Where the rows are stored by their support classes, the classes' tables and each row's classes.
             *(
                 (
