@@ -699,6 +699,7 @@ class Sweep:
                 self.claim_general,
                 self.claim_candidate,
                 claims.region,
+                self.placement.world_acts,
             ],
             outputs=[claims.items, claims.count],
             device=self.model.device,
@@ -941,7 +942,9 @@ class Sweep:
         if self.leaves and not factor_change:
             self.factor.walk_view().du.zero_()
         # Under a readout, count the worlds without rows of any family, which no sweep enters.
-        self.readout.count_skipped(self.placement.constraint_count, self.placement.mf_constraint_count)
+        self.readout.count_skipped(
+            self.placement.constraint_count, self.placement.mf_constraint_count, self.placement.world_acts
+        )
         streams = self.claim_streams
         if not streams:
             for launch in self.launches:
@@ -999,8 +1002,10 @@ class Sweep:
         )
 
     def patch_routes(self):
-        """Pack the routes that can hold patch rows into one launch argument."""
-        return patch_routes(row for row in self.patch_row_arrays() if row[1] is not None)
+        """Pack the routes that can hold patch rows into one launch argument, with the worlds' acts words."""
+        routes = patch_routes(row for row in self.patch_row_arrays() if row[1] is not None)
+        routes.acts = self.placement.world_acts
+        return routes
 
     def patch_row_arrays(self):
         """Yield the contact routes that can hold patch rows: ``(route, parents, mu, impulses, first)``."""
@@ -1169,6 +1174,12 @@ class Sweep:
             "resolved_worlds": {
                 "enabled": self.resolved_worlds_owner is not None,
                 "reason": self.resolved_worlds_reason,
+            },
+            # A world none of whose rows can act at the predictor keeps zero impulse (Placement.hold_acts).
+            "separated_worlds": {
+                "enabled": self.placement.acts_reason is None,
+                "contacts": self.placement.acts_twists.shape[0] > 0,
+                "reason": self.placement.acts_reason or "Every row is separable and the claims take the worlds.",
             },
             "free_rigid_bodies": {
                 "count": count,

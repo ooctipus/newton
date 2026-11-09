@@ -39,6 +39,9 @@ class Pins:
     whatever the device (:func:`.sweep_routes_tiers.emits`)."""
     claims: tuple[str, ...] = ("resolved_worlds",)
     """The runtime claims kept, of ``("resolved_worlds",)``."""
+    separated_worlds: bool = True
+    """``False``: a world none of whose rows can act at the predictor takes its sweeps too
+    (:meth:`.placement.Placement.hold_acts`)."""
     active_rows: bool = True
     """``False``: full-order sparse sweeps."""
     contact_units: str | None = "triplets"

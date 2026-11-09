@@ -112,8 +112,10 @@ def _allocate_overflowing_contacts(device, contact_count, row_capacity):
             1,
             anchored_patches(contact_count, device),
             wp.empty(0, dtype=wp.int32, device=device),
+            wp.empty(0, dtype=wp.spatial_vector, device=device),
         ],
         outputs=[
+            wp.empty(0, dtype=wp.int32, device=device),
             counter,
             wp.zeros((1,), dtype=wp.int32, device=device),
             dropped,

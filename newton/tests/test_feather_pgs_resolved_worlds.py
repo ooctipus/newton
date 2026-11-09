@@ -149,6 +149,8 @@ def _allocate(kernel, resolved):
         "row_capacity_telemetry": 0,
         "friction_patches": patches,
         "resolved_worlds": integers(resolved),
+        "twists": wp.empty(0, dtype=wp.spatial_vector, device="cpu"),
+        "acts": wp.empty(0, dtype=wp.int32, device="cpu"),
         "contact_world": integers([-9] * count),
         "contact_slot": integers([-9] * count),
         "contact_art_a": integers([-9] * count),
@@ -519,8 +521,12 @@ def _rollout(
     solver_kwargs=None,
     toss_every=2,
     friction_anchor_beta=0.2,
+    separated=True,
+    pins=None,
 ):
-    """Swing the arms and toss every ``toss_every``-th free body; return the solver, poses and resolved masks.
+    """Swing the arms and toss every ``toss_every``-th free body; return the solver, poses and the masks of the worlds
+    left at zero impulse: the classifier's, or else the worlds with rows none of which can act (``separated``: the
+    switch on, :meth:`.placement.Placement.hold_acts`).
 
     ``history`` collects one record per step: the stored anchor validity (``valid``), the count of
     contacts the classifier marked CONTACT_PATH_RESOLVED (``marked``), how many of those held an
@@ -529,7 +535,7 @@ def _rollout(
     """
     # The classifier evaluates the serial matrix-free sweep's law: the pin keeps the Jacobi tiers (case K4, an arm
     # beside a free body) off these worlds.
-    pins = {"storage": "dense", "tiers": 0}
+    pins = {"storage": "dense", "tiers": 0, "separated_worlds": separated, **(pins or {})}
     if not classifier:
         pins["claims"] = ()
     solver = SolverFeatherPGS(
@@ -574,7 +580,12 @@ def _rollout(
         solver.step(states[0], states[1], control, contacts, DT)
         states.reverse()
         poses.append(states[0].body_q.numpy().copy())
-        masks.append(solver.sweep.resolved_worlds.numpy().copy())
+        mask = solver.sweep.resolved_worlds.numpy().copy()
+        acts = solver.placement.world_acts.numpy()
+        if not mask.size and acts.size:
+            rows = solver.placement.constraint_count.numpy() + solver.placement.mf_constraint_count.numpy()
+            mask = (acts == 0) & (rows > 0)
+        masks.append(mask)
         if history is not None:
             count = int(contacts.rigid_contact_count.numpy()[0])
             marked = solver.placement.contact_path.numpy()[:count] == int(CONTACT_PATH_RESOLVED)
@@ -741,6 +752,31 @@ class TestResolvedWorldsDevice(unittest.TestCase):
             np.testing.assert_array_equal(record["valid"], expected["valid"], err_msg=f"previous.valid at step {step}")
         assert_history_close(solver, plain_solver)
         np.testing.assert_allclose(poses, plain, atol=1.0e-5, rtol=0.0)
+
+
+@unittest.skipUnless(wp.get_device().is_cuda, "The predictor publishes its body twists on CUDA")
+class TestSeparatedWorldsDevice(unittest.TestCase):
+    """The switch (:meth:`.placement.Placement.hold_acts`) against the complete path on the default device."""
+
+    def test_separated_worlds_match_the_complete_path(self):
+        """Fixed-base arms over free boxes: a world none of whose rows can act at the predictor (a tossed box's) takes
+        no sweep, and every world steps as on the complete path, anchors included: arms of three links on the general
+        sweep, of seventeen as the rules place them (the tiers where they take the worlds)."""
+        for links, pins, kwargs in ((3, {}, {}), (17, {"tiers": None}, {"dense_max_constraints": 128})):
+            with self.subTest(links=links):
+                model = _build(wp.get_device(), worlds=6, links=links)
+                options = {"classifier": False, "pins": pins, "solver_kwargs": kwargs, "friction_anchor_beta": None}
+                complete_history, history = [], []
+                plain_solver, plain, plain_masks = _rollout(model, separated=False, history=complete_history, **options)
+                self.assertEqual(plain_masks.shape[1], 0)
+                solver, poses, masks = _rollout(model, history=history, **options)
+                self.assertTrue(solver.get_path_selection()["routes"]["separated_worlds"]["contacts"])
+                self.assertGreater(int(masks.sum()), 0)
+                self.assertLess(int(masks.sum()), masks.size)
+                for step, (record, expected) in enumerate(zip(history, complete_history, strict=True)):
+                    np.testing.assert_array_equal(record["valid"], expected["valid"], err_msg=f"anchors at {step}")
+                assert_history_close(solver, plain_solver)
+                np.testing.assert_array_equal(poses, plain)
 
 
 def _walkers(device, worlds=4):

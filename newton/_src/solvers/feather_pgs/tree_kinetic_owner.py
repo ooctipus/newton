@@ -360,8 +360,9 @@ class TreeKineticState:
 
         solver = self.solver
         twists = getattr(solver, "_predicted_twist", None)
-        # Publish only when the classifier, built after this owner, consumes them.
-        consumer = solver.sweep.resolved_worlds_owner
+        # Publish only when the classifier or the contacts' residuals (Placement.hold_acts), decided after this owner,
+        # consume them.
+        consumer = solver.sweep.resolved_worlds_owner is not None or solver.placement.acts_twists.shape[0] > 0
         return field_group.bind(
             ForceInput,
             solver=solver,
@@ -374,7 +375,7 @@ class TreeKineticState:
             dt=dt,
             stage_clocks=cached_state_binding.stage_clocks(solver),
             predicted_twist=self._no_twists if twists is None else twists,
-            publish_twists=int(self.publishes_twists and consumer is not None),
+            publish_twists=int(self.publishes_twists and consumer),
         )
 
     def _dimensions(self):

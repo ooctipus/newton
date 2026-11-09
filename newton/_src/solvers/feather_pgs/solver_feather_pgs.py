@@ -561,6 +561,9 @@ class SolverFeatherPGS(SolverBase):
         self.sweep.resolved_worlds_owner = classifier if classifier.enabled else None
         self.sweep.resolved_worlds = classifier.resolved
         self.sweep.resolved_worlds_reason = classifier.reason
+        # A world none of whose rows can act at the predictor solves to zero impulse: its allocators say which
+        # (Placement.hold_acts).
+        self.placement.hold_acts(self)
 
         self.placement.place_dense_response()
         # The route: the row of the route table the class takes. The step plan and the route record read it. Its

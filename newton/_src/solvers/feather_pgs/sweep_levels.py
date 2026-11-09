@@ -160,6 +160,7 @@ def claim_worlds(
     general: int,
     candidate: int,
     region: int,
+    acts: wp.array[int],
     # outputs: a Queue's (execution.Queue), a bucket a tier, then the general sweep's and the colored candidates'
     items: wp.array[int],
     count: wp.array[int],
@@ -168,7 +169,8 @@ def claim_worlds(
     are dense only and at most ``bound`` into its Jacobi tier's, ``(rows - 1) // width``; any other world with a colored
     storage ``slot`` (``slot[world] >= 0``, :class:`.sweep_units.ColoredUnits`) into ``candidate``, which the unit
     builder walks and splits into the colored bucket and the general one (``candidate`` negative: no colored mapping,
-    and ``slot`` is not read); the rest into ``general``, the general sweep's. A world without rows takes none. A free
+    and ``slot`` is not read); the rest into ``general``, the general sweep's. A world without rows takes none, nor one
+    none of whose rows can act (its ``acts`` word, :data:`.placement.WORLD_ACTS`). A free
     body's rows are not dense only: those in the free bodies' run (``free_body_rows``) and the line's speed rows (its
     rows from ``speed_first``).
 
@@ -180,7 +182,7 @@ def claim_worlds(
     world = wp.tid()
     m = rows[world]
     mf = free_body_rows[world]
-    if m <= 0 and mf <= 0:
+    if (m <= 0 and mf <= 0) or (acts.shape[0] > 0 and acts[world] == 0):
         return
     bucket = general
     if tier_world(m, mf, speed_first, world, bound):

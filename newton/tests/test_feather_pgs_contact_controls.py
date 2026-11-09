@@ -96,8 +96,10 @@ def _launch_contact_allocator(
             0,
             anchored_patches(1, device),
             wp.array([int(resolved)], dtype=wp.int32, device=device),
+            wp.empty(0, dtype=wp.spatial_vector, device=device),
         ],
         outputs=[
+            wp.empty(0, dtype=wp.int32, device=device),
             counters["dense_count"],
             counters["mf_count"],
             counters["dense_dropped"],
@@ -174,8 +176,10 @@ def _launch_articulation_pair_contact_allocator(
             0,
             anchored_patches(2, device),
             wp.empty(0, dtype=wp.int32, device=device),
+            wp.empty(0, dtype=wp.spatial_vector, device=device),
         ],
         outputs=[
+            wp.empty(0, dtype=wp.int32, device=device),
             dense_count,
             wp.zeros((1,), dtype=wp.int32, device=device),
             dense_dropped,

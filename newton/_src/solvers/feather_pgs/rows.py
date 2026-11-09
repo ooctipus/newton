@@ -777,7 +777,7 @@ class RowLaws:
     def write_velocity_limits(self, solver, state_in: State, dt: float) -> None:
         """The joint velocity-limit rows (a per-DOF clamp on ``|qdot_i|``), one warp per articulation; the contact rows
         follow them, and the sweeps visit them in a final pass whatever their slots."""
-        law = self._prefix_law(solver, prefix_rows.PrefixVelocityLaw, state_in, dt, vhat=solver.v_hat)
+        law = self._prefix_law(solver, prefix_rows.PrefixVelocityLaw, state_in, dt)
         support = solver.placement.row_support()
         for size, warp_kernel in self.velocity_limit_warp_kernels.items():
             self._launch_prefix_warp(solver, warp_kernel, size, law, support)
@@ -832,7 +832,8 @@ class RowLaws:
             # reserved.
             units = solver.placement.unit_source if producer == "walk" else solver.placement.no_units
             # Under persistent patch friction, contacts of resolved worlds that the complete path would
-            # give rows are marked so the patch finish releases their anchors (row_slots.py).
+            # give rows are marked so the patch finish releases their anchors (row_slots.py); elsewhere a contact whose
+            # rows may act at the predictor marks its world (Placement.world_acts).
             pool.launch(
                 allocate_world_contact_slots,
                 contact_build_threads,
@@ -855,8 +856,10 @@ class RowLaws:
                     1,
                     self.friction_patches.view,
                     solver.sweep.resolved_worlds,
+                    solver.placement.acts_twists,
                 ],
                 outputs=[
+                    solver.placement.world_acts,
                     solver.placement.slot_counter,
                     mf_slot_counter,
                     dense_dropped_rows,
@@ -923,7 +926,14 @@ class RowLaws:
                 solver.sweep.resolved_worlds,
                 base,
             ],
-            outputs=[placement.rigid_velocity_limit_slot, counter, rejected, bind_dense_rows(placement), units],
+            outputs=[
+                placement.world_acts,
+                placement.rigid_velocity_limit_slot,
+                counter,
+                rejected,
+                bind_dense_rows(placement),
+                units,
+            ],
             device=model.device,
         )
 
@@ -1057,6 +1067,7 @@ class RowLaws:
             placement.dense_phase_bounds,
             int(part),
             self.row_seeds(solver, dt, *law),
+            placement.world_acts,
         ]
         wp.launch(
             walk_rows.writer_kernel(solver, part),
