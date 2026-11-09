@@ -69,8 +69,7 @@ class Diagnostics:
             ``_debug_stage3_qd_work``, ``_debug_stage3_joint_qdd`` and ``_debug_stage3_v_hat``, which external NaN
             dumpers read; three copies a substep.
         row_watermark: Accumulate each row family's whole-run high-water mark, read back by
-            :meth:`~newton.solvers.SolverFeatherPGS.constraint_row_watermarks`, and the most rows a world the
-            resolved-world classifier resolved skipped (its checked limits and three rows a checked contact).
+            :meth:`~newton.solvers.SolverFeatherPGS.constraint_row_watermarks`.
         overflow_warning: Emit a device-side warning the first time each dense or matrix-free row family exceeds its
             per-world capacity: the world, requested rows, row limit and dropped contact and friction rows, without a
             host synchronization, so it stays compatible with CUDA graph capture.

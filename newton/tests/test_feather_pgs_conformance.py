@@ -1382,16 +1382,16 @@ REFERENCE_CUDA = Route(
     "reference",
     "cuda",
     # The plain matrix-free Gauss-Seidel sweep over the held tree and rows: the general placement declines the
-    # tiers and the sparse-diagonal owner, and every world is solved (no resolved-world claim). The tree factor itself
-    # answers to the float64 mass matrix (test_feather_pgs_factor).
+    # tiers and the sparse-diagonal owner, and every world with rows is swept (separated_worlds=False). The tree factor
+    # itself answers to the float64 mass matrix (test_feather_pgs_factor).
     options=_MF,
-    pins={**_DENSE, **_FULL_SWEEP, "placement": "general", "claims": ()},
+    pins={**_DENSE, **_FULL_SWEEP, "placement": "general", "separated_worlds": False},
     expect={
         "sweep.route": "matrix_free_gs",
         "sweep.tiers": None,
         "sparse_diagonal.enabled": False,
         "held_tree.owner": "mixed",
-        "resolved_worlds.enabled": False,
+        "separated_worlds.enabled": False,
     },
 )
 MF_DEFAULT = Route("mf_default", "cuda", options=_MF, expect={"sweep.route": "matrix_free_gs"})
@@ -1461,7 +1461,7 @@ MF_KINEMATIC = Route(
     expect={"sweep.route": "matrix_free_gs", "held_tree.owner": "forest", "held_tree.groups.0.operator": "forest"},
 )
 # The kuka recipes' class, a hub (a hand beside its cube): the Jacobi tiers step its rows at once, by the one writer's
-# rows (the resolved-world claim keeps its worlds whose rows all separate, or the class holds no joint limits).
+# rows (a world whose rows all separate takes no sweep, or the class holds no joint limits).
 HUB = Route(
     "hub",
     "cuda",
@@ -1482,7 +1482,7 @@ REFERENCE_CPU = Route(
     "reference_cpu",
     "cpu",
     options=_MF,
-    pins={**_DENSE, **_FULL_SWEEP, "placement": "general", "claims": ()},
+    pins={**_DENSE, **_FULL_SWEEP, "placement": "general", "separated_worlds": False},
     expect={"sweep.route": "matrix_free_gs", "held_tree.owner": "mixed"},
 )
 CPU = Route("cpu", "cpu", options=_MF, expect={"sweep.route": "matrix_free_gs"})

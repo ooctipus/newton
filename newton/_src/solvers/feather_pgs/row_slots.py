@@ -11,7 +11,7 @@ from .contact_filters import contact_normal_gap_limit
 from .contact_input import ContactInput
 from .contact_laws import contact_endpoints, contact_materials, contact_points, contact_responds, jacobian_entry
 from .device_preludes import dual_native, lane_group, lane_scan, lane_sum, lane_sync, reserve, reserved_count
-from .friction_patches import CONTACT_PATH_RESOLVED, FrictionPatches, patch_spin_rows
+from .friction_patches import FrictionPatches, patch_spin_rows
 from .row_laws import contact_capped_beta, contact_depenetration_cap, contact_restitution_rhs, contact_rhs, separates
 from .row_records import UNIT_CONTACT, unit_source
 
@@ -166,7 +166,6 @@ def allocate_world_contact_slots(
     contact_friction_gap_threshold: float,
     row_capacity_telemetry: int,
     friction_patches: FrictionPatches,
-    resolved_worlds: wp.array[int],
     twists: wp.array[wp.spatial_vector],
     # outputs
     acts: wp.array[int],
@@ -203,32 +202,14 @@ def allocate_world_contact_slots(
     raced with concurrent reservations and left accepted rows past the count,
     which the friction patch links then chained into.
 
-    In a world the resolved-world classifier skips, no contact gets rows. A
-    contact the allocator would give rows there takes CONTACT_PATH_RESOLVED and no slot, so the patch finish
-    releases its anchor, as the complete path releases an anchor whose rows solve zero load; every other contact
-    keeps path -1, and its anchor history. Elsewhere an admitted contact whose rows may act at the predictor marks its
-    world's ``acts`` word (:data:`.placement.WORLD_ACTS`; empty: no word).
+    An admitted contact whose rows may act at the predictor marks its world's ``acts`` word
+    (:data:`.placement.WORLD_ACTS`; empty: no word).
     """
     thread = wp.tid()
     # A collision pass clamps the count to the rows it wrote, all of them, and flags the overflow itself.
     total_contacts = data.count[0]
 
     for c in range(thread, total_contacts, total_num_threads):
-        resolved = False
-        if resolved_worlds.shape[0] > 0:
-            _body_a, _body_b, art_a, art_b, world = contact_endpoints(
-                data.shape0[c], data.shape1[c], data.shape_body, body_to_articulation, art_to_world
-            )
-            if world >= 0 and world < resolved_worlds.shape[0] and resolved_worlds[world] != 0:
-                # Refresh every active mapping each solve. The original force
-                # converter publishes zero before reading any row for this path.
-                data.world[c] = world
-                data.art0[c] = art_a
-                data.art1[c] = art_b
-                data.slot[c] = -1
-                data.path[c] = -1
-                data.slots_needed[c] = 0
-                resolved = True
         admitted, separating, art_a, art_b, world, phi = _admit_contact(
             c,
             data,
@@ -242,10 +223,6 @@ def allocate_world_contact_slots(
             articulation_pair_contact_gap_gate,
             twists,
         )
-        if resolved:
-            if admitted:
-                data.path[c] = CONTACT_PATH_RESOLVED
-            continue
         if not admitted:
             data.slot[c] = -1
             data.path[c] = -1

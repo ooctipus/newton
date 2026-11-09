@@ -152,7 +152,7 @@ class TreeKineticState:
         arts = getattr(sparse_owner, "forest_arts", None)
         arts = np.asarray(arts, np.int32) if arts is not None else group_to_art.reshape(-1, 1).astype(np.int32)
         self._root_arts = arts
-        # Predicted body twists for the resolved-world classifier: the predictor holds their publication for
+        # Predicted body twists for the contacts' residuals at allocation: the predictor holds their publication for
         # warp-sized trees whose scans keep to their lane groups (a CUDA register scan).
         self.publishes_twists = native.publishes_twists(self.layout, self.schedules, cuda=device.is_cuda)
         self._no_twists = solver._arrays.placeholder(wp.spatial_vector)
@@ -360,9 +360,8 @@ class TreeKineticState:
 
         solver = self.solver
         twists = getattr(solver, "_predicted_twist", None)
-        # Publish only when the classifier or the contacts' residuals (Placement.hold_acts), decided after this owner,
-        # consume them.
-        consumer = solver.sweep.resolved_worlds_owner is not None or solver.placement.acts_twists.shape[0] > 0
+        # Publish only when the contacts' residuals (Placement.hold_acts), decided after this owner, read them.
+        consumer = solver.placement.acts_twists.shape[0] > 0
         return field_group.bind(
             ForceInput,
             solver=solver,

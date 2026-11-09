@@ -37,8 +37,6 @@ class Pins:
     sink: str | None = None
     """``"store"``: the Jacobi tiers read the one writer's stored rows; ``"emit"``: every tier walks its rows' seeds,
     whatever the device (:func:`.sweep_routes_tiers.emits`)."""
-    claims: tuple[str, ...] = ("resolved_worlds",)
-    """The runtime claims kept, of ``("resolved_worlds",)``."""
     separated_worlds: bool = True
     """``False``: a world none of whose rows can act at the predictor takes its sweeps too
     (:meth:`.placement.Placement.hold_acts`)."""

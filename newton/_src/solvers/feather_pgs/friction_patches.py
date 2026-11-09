@@ -83,9 +83,6 @@ _BUILD_BLOCKS_PER_SM = 8
 # The patch extent: the slots to visit, then the live sort's extent (live_sort.publish_sort_extent).
 _SORT_EXTENT = wp.constant(1)
 # Contact paths 0 and 1 hold dense and matrix-free rows, and -1 holds none.
-# CONTACT_PATH_RESOLVED marks a contact without rows in a world the resolved-world classifier
-# skipped, where the complete path would have reserved them: its patch anchor releases.
-CONTACT_PATH_RESOLVED = wp.constant(-2)
 # A region's spin arm over the polar radius of gyration of its contacts' hull: the mean radius of a convex patch under
 # uniform pressure over its gyration radius is 0.937 on a square, 0.943 on a disc and 0.866 on a line, and 0.94 holds
 # every convex footprint within 4% of quadrature (core-docs/WRENCH/VERDICT.md section 6).
@@ -1939,9 +1936,8 @@ def _finish_and_store(
     Finishing writes only the contact's own validity and tangent impulse and
     reads other contacts only through the row arrays, so finishing and storing
     contact by contact matches finishing every route before storing. A contact
-    the resolved-world classifier left without rows (CONTACT_PATH_RESOLVED), or one on its route in a world none of
-    whose rows can act (the routes' ``acts`` word: the sweeps left its rows unwritten at zero), releases its anchor, as
-    its zero load does on the complete path. Other
+    on its route in a world none of whose rows can act (the routes' ``acts`` word: the sweeps left its rows unwritten
+    at zero) releases its anchor, as its zero load does on the complete path. Other
     anchors without rows (capacity rejection, or a disabled route) keep their
     history. Thread 0 publishes the stored count, which this launch never reads.
     """
@@ -1953,9 +1949,7 @@ def _finish_and_store(
     for c in range(thread, extent[0], threads):
         if finishing and c < live and frame.valid[c] != 0:
             route = _contact_route(routes, slot, path, c)
-            if slot[c] < 0 and path[c] == CONTACT_PATH_RESOLVED:
-                frame.valid[c] = 0
-            elif route >= 0 and routes.acts.shape[0] > 0 and routes.acts[world[c]] == 0:
+            if route >= 0 and routes.acts.shape[0] > 0 and routes.acts[world[c]] == 0:
                 frame.valid[c] = 0
             elif route >= 0:
                 parents = _route_parents(routes, route)

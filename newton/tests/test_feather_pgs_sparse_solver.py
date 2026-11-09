@@ -205,12 +205,12 @@ def _make_solver(model, sparse, *, pins=None, **overrides):
 def _case(sparse, *, robot_count=1, prescribed=False, pins=None):
     """Allocate a stable input state for eager and captured cache reuse."""
     model = _build_model(robot_count=robot_count, prescribed=prescribed)
-    # Row-level comparisons need every world's rows: the resolved-world classifier, which skips the
-    # rows of worlds that all separate, stays off on the dense reference.
+    # Row-level comparisons need every world's rows written: the dense reference sweeps the worlds whose rows all
+    # separate too.
     solver = _make_solver(
         model,
         sparse,
-        pins={"claims": (), **(pins or {})},
+        pins={"separated_worlds": False, **(pins or {})},
         **({"dense_max_constraints": 96, "mf_max_constraints": 64} if robot_count > 1 else {}),
     )
     state, out = model.state(), model.state()

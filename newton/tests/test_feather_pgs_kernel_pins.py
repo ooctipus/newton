@@ -561,7 +561,6 @@ class TestFeatherPGSKernelPins(unittest.TestCase):
             "row_slots.allocate_world_contact_slots",
             "walk_rows.slot_rows_kernel",
             "walk_rows.walked_rows_kernel",
-            "resolved_worlds.finalize_resolved_worlds",
         ):
             with self.subTest(family=family):
                 self.assertIn(family, families)

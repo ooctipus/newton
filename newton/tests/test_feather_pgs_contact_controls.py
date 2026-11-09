@@ -12,7 +12,6 @@ import newton
 from newton._src.solvers.feather_pgs import field_group
 from newton._src.solvers.feather_pgs.contact_forces import compute_contact_linear_force_from_impulses
 from newton._src.solvers.feather_pgs.contact_input import ContactInput, ContactRoutes
-from newton._src.solvers.feather_pgs.friction_patches import CONTACT_PATH_RESOLVED
 from newton._src.solvers.feather_pgs.row_records import DenseRows
 from newton._src.solvers.feather_pgs.row_slots import allocate_world_contact_slots
 from newton.solvers import SolverFeatherPGS
@@ -32,7 +31,6 @@ def _launch_contact_allocator(
     pair_gate: float = 0.0,
     enable_friction: bool = False,
     friction_gap: float = float("inf"),
-    resolved: bool = False,
 ):
     """Allocate one contact and return its route metadata and counters."""
     device = "cpu"
@@ -95,7 +93,6 @@ def _launch_contact_allocator(
             friction_gap,
             0,
             anchored_patches(1, device),
-            wp.array([int(resolved)], dtype=wp.int32, device=device),
             wp.empty(0, dtype=wp.spatial_vector, device=device),
         ],
         outputs=[
@@ -175,7 +172,6 @@ def _launch_articulation_pair_contact_allocator(
             friction_gap,
             0,
             anchored_patches(2, device),
-            wp.empty(0, dtype=wp.int32, device=device),
             wp.empty(0, dtype=wp.spatial_vector, device=device),
         ],
         outputs=[
@@ -262,25 +258,6 @@ class TestFeatherPGSContactControls(unittest.TestCase):
             device=device,
         )
         np.testing.assert_array_equal(force.numpy(), np.zeros((1, 3), dtype=np.float32))
-
-    def test_resolved_world_skips_all_contact_routes_and_refreshes_mapping(self):
-        """Zero-world allocation must overwrite stale mappings without producing rows."""
-        for route in (PATH_DENSE, PATH_MATRIX_FREE):
-            with self.subTest(route=route):
-                fallback = _launch_contact_allocator(route=route, gap=-0.01, gate=0.0)
-                self.assertGreaterEqual(fallback["slot"], 0)
-                self.assertEqual(fallback["path"], route)
-                skipped = _launch_contact_allocator(route=route, gap=float("nan"), gate=0.0, resolved=True)
-                self.assertEqual(skipped["world"], 0)
-                self.assertEqual(skipped["art_a"], 0)
-                self.assertEqual(skipped["art_b"], -1)
-                self.assertEqual(skipped["slot"], -1)
-                # The contact the allocator would give rows takes the resolved path, so the patch finish releases
-                # its anchor.
-                self.assertEqual(skipped["path"], CONTACT_PATH_RESOLVED)
-                self.assertEqual(skipped["slots_needed"], 0)
-                for name in ("dense_count", "mf_count", "dense_dropped", "mf_dropped"):
-                    self.assertEqual(skipped[name], 0, name)
 
     def test_solver_validates_and_stores_contact_controls(self):
         """Accept finite non-negative controls and reject malformed values."""

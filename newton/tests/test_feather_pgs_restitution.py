@@ -19,7 +19,6 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs.friction_patches import CONTACT_PATH_RESOLVED
 from newton.tests.unittest_utils import add_function_test, get_selected_cuda_test_devices
 
 RADIUS = 0.05
@@ -30,9 +29,6 @@ IMPACT_FRACTION = 0.4
 # Values written into ``SolverFeatherPGS.contact_path``.
 PATH_DENSE = 0
 PATH_MATRIX_FREE = 1
-# No rows: the resolved-world classifier skipped the contact's world, whose
-# every candidate row separates at the predictor.
-PATH_RESOLVED = int(CONTACT_PATH_RESOLVED)
 # A free body is a one-node tree: a world's lone free body's contacts are rows of the line (only worlds that can take
 # the colored mapping keep the free bodies' own run, PATH_MATRIX_FREE).
 PATH_FREE_BODY = PATH_DENSE
@@ -712,16 +708,15 @@ def test_dense_and_free_body_rows_enforce_restitution(test, device):
 def test_multiworld_restitution_keeps_case_data_isolated(test, device):
     """Apply each world's coefficient and crossing state without cross-world leakage.
 
-    The non-crossing world's contact separates at the predictor. By default the
-    resolved-world classifier skips that world: its contact takes no rows, since
-    zero impulse solves the world exactly. A test pin drops the classifier's claim,
-    so the contact takes a matrix-free row beside the crossing worlds' rows. Both
-    routes must give every world its own result.
+    The non-crossing world's contact separates at the predictor. By default no
+    claim takes that world: its contact's rows stay at zero impulse, which solves the
+    world exactly. A test pin sweeps it beside the crossing worlds. Both routes must
+    give every world its own result.
     """
     # (e, speed, mass, toi/dt); the third case is deliberately non-crossing.
     cases = ((0.25, 2.0, 1.0, 0.4), (0.75, 4.0, 10.0, 0.7), (1.0, 3.0, 0.5, 1.25), (0.0, 5.0, 2.0, 0.2))
-    for resolved in ("1", "0"):
-        with test.subTest(resolved_worlds=resolved):
+    for separated in (True, False):
+        with test.subTest(separated_worlds=separated):
             scene = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
             for restitution, speed, mass, impact_fraction in cases:
                 world = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
@@ -737,12 +732,9 @@ def test_multiworld_restitution_keeps_case_data_isolated(test, device):
                 world.add_ground_plane(cfg=cfg)
                 scene.add_world(world)
             model = scene.finalize(device=device)
-            # The solver admits the classifier only at construction.
-            pins = {} if resolved == "1" else {"claims": ()}
-            solver = _make_solver(model, pins=pins)
-            classified = resolved == "1"
-            classifier = solver.get_path_selection()["routes"]["resolved_worlds"]
-            test.assertEqual(classifier["enabled"], classified, classifier["reason"])
+            solver = _make_solver(model, pins={"separated_worlds": separated})
+            switch = solver.get_path_selection()["routes"]["separated_worlds"]
+            test.assertEqual(switch["enabled"], separated, switch["reason"])
             state_in, state_out = model.state(), model.state()
             joint_qd = np.zeros((len(cases), 6), dtype=np.float32)
             joint_qd[:, 2] = [-case[1] for case in cases]
@@ -766,11 +758,9 @@ def test_multiworld_restitution_keeps_case_data_isolated(test, device):
             for world, (restitution, speed, _mass, impact_fraction) in enumerate(cases):
                 with test.subTest(world=world):
                     crossing = impact_fraction < 1.0
-                    # A contact that cannot reach the surface this step separates at the predictor.
-                    expected_path = PATH_FREE_BODY if crossing or not classified else PATH_RESOLVED
                     test.assertEqual(
                         paths[contact_world == world].tolist(),
-                        [expected_path],
+                        [PATH_FREE_BODY],
                         f"multiworld contacts of worlds {contact_world.tolist()} used paths {paths.tolist()}",
                     )
                     if crossing and restitution > 0.0:

@@ -450,8 +450,8 @@ class TestFeatherPGSTreeBodyFlags(unittest.TestCase):
     def test_moving_kinematic_body_keeps_its_contact_rows(self):
         """A kinematic body closing on a dynamic one keeps its world's contact rows under the owner.
 
-        In matrix-free mode the resolved-world classifier reads the twists the
-        owner's predictor publishes, with its row bound. It took a kinematic body of a
+        In matrix-free mode the contact allocator reads the twists the owner's
+        predictor publishes (the separated worlds). It took a kinematic body of a
         responding tree as still, where the ordinary route keeps the world's
         rows: a free box made kinematic at runtime, which the owner now
         absorbs, and a kinematic floating root built with a dynamic link. The
@@ -470,8 +470,8 @@ class TestFeatherPGSTreeBodyFlags(unittest.TestCase):
                     solver = _solver(model, cached)
                     if cached == "auto":
                         self.assertIsInstance(solver.factor.held, HeldTree)
-                        classifier = solver.sweep.resolved_worlds_owner
-                        self.assertIsNotNone(classifier, solver.sweep.resolved_worlds_reason)
+                        separated = solver.get_path_selection()["routes"]["separated_worlds"]
+                        self.assertTrue(separated["contacts"], separated["reason"])
                     if toggle:
                         self._notify(model, solver, driver, KINEMATIC)
                     runs[cached] = self._drive(model, solver, driver, axis, steps=8)
