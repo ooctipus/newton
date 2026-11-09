@@ -1202,6 +1202,32 @@ def run_live_sort_cases(test, device, capacities, extra_counts=()):
 
 
 class TestPatchLiveSort(unittest.TestCase):
+    def test_world_buckets_follow_any_body_world_layout(self):
+        """Build and store bitwise as the reference whatever the bodies' worlds: globals, all global, out of order."""
+        for name in ("ends", "global", "reversed"):
+            scene = _Scene("cpu", 41, worlds=4, bodies=5, contacts=160)
+            worlds = scene.body_world.copy()
+            worlds = {
+                "ends": np.where(np.isin(np.arange(worlds.size), (0, 1, 18, 19)), -1, worlds),
+                "global": np.full_like(worlds, -1),
+                "reversed": worlds[::-1],
+            }[name]
+            scene.model.body_world = wp.array(worlds.astype(np.int32), dtype=int, device="cpu")
+            patches, reference = _pair(scene, 192)
+            carried = 0
+            for step, mode in enumerate(("live", "live", "sparse", "live", "empty", "live", "overflow", "live")):
+                with self.subTest(layout=name, step=step):
+                    scene.move()
+                    live = scene.frame(mode)
+                    for state in (patches, reference):
+                        state.build(scene.model, scene.state, scene.contacts)
+                    assert_same_patches(patches, reference, live, "build")
+                    carried += int(np.count_nonzero(reference.current.source.numpy()[:live] >= 0))
+                    store_frame(patches, scene.state)
+                    reference.store(scene.state)
+                    assert_same_patches(patches, reference, live, "store")
+            self.assertGreater(carried, 0, "the frames must carry anchor history")
+
     def test_live_sort_matches_stable_argsort_and_radix_sort(self):
         """Sort the live prefix exactly as a stable sort, from no contacts, which no slot sees, through merges."""
         run_live_sort_cases(self, "cpu", (128, 2047, 3000, 4096, 10000, 16_384))
@@ -2144,9 +2170,8 @@ class TestPatchFrameModes(unittest.TestCase):
     def test_capture_kernels_load_at_construction(self):
         """Load the modules of the kernels that captured builds may launch first when a CUDA patch state is built.
 
-        Without it, the first capture would load those modules. A stand-in
-        CUDA device lets the CPU check which modules load; a CPU state loads
-        none, since CPU captures build as eager ones do.
+        Without it, the first capture would load those modules. A stand-in CUDA device lets the CPU check which
+        modules load; a CPU state loads none, since CPU captures build as eager ones do.
         """
         scene = _Scene("cpu", 49)
         phi = wp.zeros(128, dtype=wp.vec2, device="cpu")
