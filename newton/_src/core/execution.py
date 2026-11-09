@@ -48,6 +48,7 @@ __all__ = [
     "Use",
     "Work",
     "append",
+    "barrier",
     "device_lanes",
     "fill_lanes",
     "launch",
@@ -218,6 +219,20 @@ def append(items: wp.array[int], count: wp.array[int], bucket: int, region: int,
     atomic of the lowest of them. The counter keeps the demand; an append past the bucket's ``region`` slots is dropped
     (:func:`.device_preludes.reserve`'s contract). Every lane of the warp that reaches the call may append, to any
     bucket; a lane that does not reach it takes no part."""
+
+
+@wp.func_native(
+    """
+#if defined(__CUDA_ARCH__)
+    if (lanes > 32) __syncthreads();
+    else __syncwarp((0xffffffffu >> (32 - lanes)) << (threadIdx.x & (31 & ~(lanes - 1))));
+#else
+    (void)lanes;  // The CPU's one thread is the lane group: no lane to wait for.
+#endif
+"""
+)
+def barrier(lanes: int):
+    """A lane group's barrier (none on the CPU)."""
 
 
 @dataclasses.dataclass(frozen=True)

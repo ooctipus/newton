@@ -526,6 +526,20 @@ class TestExitLaw(unittest.TestCase):
             self.assertEqual("s_lam_dense[spin] != 0.0f" in body, not one_tree)
             self.assertEqual("triple_residual" in body, not one_tree)
 
+    def test_general_sweep_solve_group_runs_each_world_in_turn(self):
+        """Where the general sweep runs alone and nothing seeds the impulses, one kernel over the sweep's bucket runs on a
+        world's lanes the impulses' clear, the lanes' barrier, and the sweep."""
+        from newton._src.solvers.feather_pgs import sweep_plan  # noqa: PLC0415
+
+        config = sweep_routes.GeneralSweep(192, 32, 49, "120", torsion=True, free_rows=False, block_warps=2)
+        fused = sweep_plan.solve_group(config)
+        names = ("clear_world_impulses", "sweep_mf_gs_native", "barrier")
+        calls = [line.strip().split("(")[0] for line in fused.template.dispatch.body.splitlines()]
+        self.assertEqual(
+            [call for call in calls if call in names], ["clear_world_impulses", "barrier", "sweep_mf_gs_native"]
+        )
+        self.assertIn("world = general_worlds[world_at]", fused.template.dispatch.body)
+
     def test_general_sweep_holds_two_worlds_a_block(self):
         """Two warps a block of the warp mapping (``block_warps``): a world each with its own copy of the stage, the
         dispatch's lane groups walking the claim's queue, at the sparse sweeps' register line; one thread a world on

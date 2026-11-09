@@ -76,6 +76,8 @@
   "sweep_levels._get_sparse_contact_levels_kernel(64, 10, '120', build_serial_contacts=True)": "0852ca59478811d3947faed59bd5ece9a30b3a50174e86ea9874b265052e89f9",
   "sweep_levels.claim_worlds": "7240aba5ff949b4c25f407219cde5ea6dcffad312bc1254ecfb765fb62a0a3f0",
   "sweep_levels.coordinate_levels_kernel(64, 64, 12, '120')": "17ac9103544bac089ceee6c3de2aeb580c373a3560143f14f713dce491459c53",
+  "sweep_plan.solve_group(GeneralSweep(solve_policy=SolvePolicy(), weighted=False, material=False, torsion=False, levels=LevelLaw(law='sequential', budget=0), active_rows=False, max_constraints=64, mf_max_constraints=32, max_world_dofs=12, device_arch='120', max_row_dofs=12, places=RowPlaces(SHARED, SHARED), has_dense_velocity_limit_rows=True, seeded=False, wide_rows=False, support_classes=False, contact_units=False, coordinate_levels=False, lanes_per_world=16, block_warps=2, pitch=None, free_rows=False, speed_rows=False, one_tree=False))": "6ee8cc9fe96a8cd8ccc6d70feea8311cb1a524a7201387433df6564f44038ba0",
+  "sweep_plan.solve_group(GeneralSweep(solve_policy=SolvePolicy(), weighted=False, material=False, torsion=False, levels=LevelLaw(law='sequential', budget=0), active_rows=False, max_constraints=64, mf_max_constraints=32, max_world_dofs=12, device_arch='120', max_row_dofs=12, places=RowPlaces(SHARED, SHARED), has_dense_velocity_limit_rows=True, seeded=False, wide_rows=False, support_classes=False, contact_units=False, coordinate_levels=False, lanes_per_world=32, block_warps=2, pitch=None, free_rows=False, speed_rows=False, one_tree=False))": "fda091a7b401ca60a89d107445358c7a580e0feca82d4bc859ba40801f8c3337",
   "sweep_routes.GeneralSweep(192, 64, 22, '120')": "5ab9a9054143a196a402843c365043e7c1fdb0867460d708820b489f150753fe",
   "sweep_routes.GeneralSweep(192, 64, 22, '120', free_rows=False, solve_policy=SolvePolicy(readout='sweeps'), speed_rows=True)": "18c0f71b16ced359c9f19fa8e92a53cc198a9f10588c2b109c9dacfafd34957e",
   "sweep_routes.GeneralSweep(192, 64, 22, '120', free_rows=False, speed_rows=True)": "33caabba092bca78dd7baae00ea4f837d24353116e99aaad4c31a8de0844553e",
@@ -427,7 +429,7 @@
   "warm_start.carry_contacts": "3f7495842117f2aa0ab731c5d1b75a54dc3e1d9e6721b444b3d9246c9b8a770c",
   "warm_start.forget_carried_contacts": "aca3e2aa48e35b6b5d4b1bfa00a374383fe8466ee1157669f2f7e478324cba20",
   "warm_start.gather_carried_normals": "b933dada24b619638508aa30cca8d699ea6c0f5210f44899954d8fbb33feae52",
-  "warm_start.prepare_world_impulses": "ef95f5e2e4ffaa5e28b1cf712eecd97c6294c59ed9fa8a7bb66e77561996a381",
+  "warm_start.prepare_world_impulses": "8e76ee203d76adb28bb43681ccca2685d636c312d9b403cbe580fb50b3fcee42",
   "warm_start.reset_world_impulses": "eaff9d7e371f52a8e01e264aac4b43427fb7b35d5681420bc0ae82cb50466b3e"
  },
  "warp": "1.17.0"
