@@ -46,6 +46,7 @@ from .execution_plan import _MFGSStorage, _select_mfgs_storage
 from .field_group import Field, FieldGroup
 from .friction_patches import patch_routes
 from .path_selection import json_value, kernel_key
+from .placement import SPARSE_CONTACT_LEVELS
 from .response_builds_rows import bind_row_records, store_row_records
 from .row_records import bind as bind_dense_rows
 from .solve_policy import QUIET_UNITS, UNIT_ROUNDOFF, SolvePolicy, SolveReadoutRecord
@@ -69,6 +70,7 @@ _COLORED = {
     "levels": LevelLaw(EXACT),
     "active_rows": False,
     "contact_units": False,
+    "coordinate_levels": False,
     "lanes_per_world": 32,
     "block_warps": 1,
 }
@@ -486,7 +488,10 @@ class Sweep:
             active_rows, self.general_active_reason = class_plan.active_rows_rule(
                 self.pins, small_world_lanes=small, fits=lambda: staging(active_rows=True).fits(budget)
             )
-            staging = functools.partial(staging, active_rows=active_rows)
+            # A tree of one coordinate (forest.diagonal_mass_sizes) holds units of one entry where the rows keep their
+            # support classes: in the full ordered sweep they step by level (the builder's schedule), before the order.
+            coordinate_levels = bool(self.forest.diagonal_mass_sizes and self.placement.classed and not active_rows)
+            staging = functools.partial(staging, active_rows=active_rows, coordinate_levels=coordinate_levels)
             lanes, block_warps = 32, 1
             if model.device.is_cuda:
                 if staging(lanes=support_lanes, groups=32 // support_lanes).fits(budget):
@@ -508,6 +513,7 @@ class Sweep:
                 support_classes=self.placement.classed,
                 active_rows=active_rows,
                 contact_units=self.pins.contact_units == "triplets" and not small,
+                coordinate_levels=coordinate_levels,
                 lanes_per_world=lanes,
                 block_warps=block_warps,
                 free_rows=bool(self.placement.free_contact_rows),
@@ -533,6 +539,18 @@ class Sweep:
                     self.forest.free_rigid_per_world, self.placement.mf_max_constraints, rule
                 )
             colored = bool(model.device.is_cuda and capable.size > 0)
+            if coordinate_levels:
+                rows = self.placement.dense_max_constraints
+                self.placement.arrays.allocate(
+                    SPARSE_CONTACT_LEVELS, world=self.forest.world_count, level=rows + 1, unit=rows
+                )
+                self.sparse_contact_schedule = sweep_levels.coordinate_levels_kernel(
+                    rows,
+                    self.placement.row_pitch,
+                    self.forest.max_world_dofs,
+                    device_arch,
+                    torsion=bool(self.laws.spin_rows),
+                )
             self.mf_gs_kernel = self.sweep("mf_gs", self.general_sweep)
             if colored:
                 self.colored_sweep = dataclasses.replace(self.general_sweep, **_COLORED)
@@ -718,28 +736,29 @@ class Sweep:
         )
 
     def schedule_diagonal(self) -> None:
-        """Case K2: publish the sparse diagonal's schedule of the rows the row pass wrote (run after every producer):
-        unit heads from the row types, a world's warp, several a block (their levels' shared working set)."""
+        """Publish the levels of the rows written (after every producer and the records): K2's from its slots, the
+        general sweep's from the rows' classes; a world's warp, several a block (their levels' shared working set)."""
+        placement = self.placement
         dim, block = sweep_levels.levels_launch(
             self.forest.world_count, self.forest.max_world_dofs, self.model.device.arch
         )
+        levels = [placement.sparse_contact_level_count, placement.sparse_contact_level_offsets]
+        levels += [placement.sparse_contact_level_units]
+        counts = [placement.constraint_count, placement.dense_first]
+        if self.diagonal_sweep is None:
+            classes = placement.row_classes
+            inputs = [*counts, placement.row_type, placement.row_sides, classes.row_class, classes.class_dof]
+            inputs += [classes.class_count, self.forest.articulation_world_dof_offset]
+            outputs = levels
+        else:
+            inputs = [*counts, placement.dense_phase_bounds, placement.row_type]
+            outputs = [placement.sparse_diagonal_row_dof, *levels, placement.sparse_contact_serial_count]
+            outputs += [placement.sparse_contact_serial_normals]
         wp.launch(
             self.sparse_contact_schedule,
             dim=dim,
-            inputs=[
-                self.placement.constraint_count,
-                self.placement.dense_first,
-                self.placement.dense_phase_bounds,
-                self.placement.row_type,
-            ],
-            outputs=[
-                self.placement.sparse_diagonal_row_dof,
-                self.placement.sparse_contact_level_count,
-                self.placement.sparse_contact_level_offsets,
-                self.placement.sparse_contact_level_units,
-                self.placement.sparse_contact_serial_count,
-                self.placement.sparse_contact_serial_normals,
-            ],
+            inputs=inputs,
+            outputs=outputs,
             block_dim=block,
             device=self.model.device,
         )
@@ -791,6 +810,9 @@ class Sweep:
             "packed_Z": placement.packed_Z,
             "row_sides": placement.row_sides,
             "row_classes": placement.row_classes.row_class,
+            "sparse_contact_level_count": placement.sparse_contact_level_count,
+            "sparse_contact_level_offsets": placement.sparse_contact_level_offsets,
+            "sparse_contact_level_units": placement.sparse_contact_level_units,
             "class_dof": placement.row_classes.class_dof,
             "class_count": placement.row_classes.class_count,
             "world_row_type": placement.row_type,

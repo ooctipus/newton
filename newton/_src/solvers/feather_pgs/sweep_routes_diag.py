@@ -309,11 +309,9 @@ def sparse_diagonal_source(sweep: DiagonalSweep) -> tuple[str, Staging]:
     the coupled rows, and its one-product residual rounds as the warp's sum of it does), then the coupled rows in row order with
     :func:`slot_rows`' warp layout, all on the velocity change in factor coordinates, from zero, or with ``seeded``
     from the response of the impulses the rows carry (:func:`.sweep.impulse_seed`: the warm start's; the fused limits
-    start from zero), left once before it is added to the predictor. The exact level law (``levels``) schedules the contacts (a normal, and its
-    tangent pair only when it owns an anchor): it skips an independent contact in the serial order and a pair whose patch carries no load. Every schedule, the plain
-    one at a normal row that owns the tangent pair after it, solves a loaded coupled contact unit by the unit law
-    (:func:`.sweep.contact_unit`) and visits an unloaded one, and a level's contacts, row by row: a level runs one lane
-    per contact, whose row visits reduce nothing, and a unit branch there splits the warp's lanes. With
+    start from zero), left once before it is added to the predictor. The exact level law (``levels``) schedules the
+    contacts (:func:`.sweep_levels._sparse_contact_levels_kernel`). Every schedule solves a loaded coupled contact unit
+    by the unit law (:func:`.sweep.contact_unit`) and visits an unloaded one, and a level's contacts a lane each. With
     ``speculative_contact_batches`` the coupled contacts come from the world's serial list, and a batch of them
     (one per segment of the warp) is tested first: a batch whose normals stay zero without load is skipped whole,
     otherwise the sweep enters the batch at its first active contact. With ``velocity_limits`` the coupled visits

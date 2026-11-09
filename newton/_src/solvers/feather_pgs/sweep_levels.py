@@ -32,7 +32,8 @@ from . import kernel_template
 from .contact_input import ContactInput
 from .device_preludes import LANE_WORDS, SHARED_STORAGE, group_native, lane_group
 from .kernel_template import KernelTemplate, items, python_kernel
-from .row_laws import ROW_FRICTION, ROW_TORSION
+from .packed_rows import CLASS_SIDES
+from .row_laws import ROW_CONTACT, ROW_FRICTION, ROW_JOINT_LIMIT, ROW_JOINT_VELOCITY_LIMIT, ROW_TORSION
 
 
 def level_pass(*, units: str, resources: str, counts: str, store: str, lanes: int = 32) -> str:
@@ -322,30 +323,92 @@ def levels_launch(world_count: int, max_world_dofs: int, device_arch) -> tuple[i
     return int(world_count) * lanes, lanes * levels_staging(int(max_world_dofs), lanes).groups
 
 
+def _levels_kernel(
+    name: str,
+    params: tuple,
+    M: int,
+    D: int,
+    L: int,
+    *,
+    units: str,
+    reserve: str,
+    resources: str,
+    tail: str = "",
+    preludes: tuple = (),
+) -> "wp.Kernel":
+    """A world's units by level (:func:`level_pass`, a coordinate each), a world's lane group (a warp, several a block;
+    the CPU's one thread: :func:`levels_launch`). ``units`` declares ``contact_start``, ``contact_end``, ``line`` and
+    ``row_base``, ``reserve`` reserves the coordinates no level holds, ``resources`` a unit's coordinate, ``tail``
+    follows. Level ``l`` lists its heads in row order, ``level_units[world, level_offsets[world, l]:level_offsets[world,
+    l + 1]]`` of ``level_count[world]``; a unit's level and rank wait for the offsets in its lane's ``unit_place``."""
+    staging = levels_staging(D, L)
+    counts = f"level_offsets.data[world * {M + 1} + {{}}]"
+    level = level_pass(
+        units="units",
+        resources=resources,
+        counts=counts,
+        store=f"unit_place[base / {L}] = (level << 16) | rank;",
+        lanes=L,
+    )
+    offsets = level_offsets(levels="levels", counts=counts, lanes=L, sync="SYNC()")
+    snippet = f"""    const int lane = LANE;
+    const int tid = lane, warp = 0;
+{units}
+{staging.declarations("    ")}
+    int unit_place[{-(-M // L)}];
+    for (int coordinate = lane; coordinate < {D}; coordinate += {L}) {{
+        node_owner[coordinate] = 32;
+        node_level[coordinate] = -1;
+    }}
+    for (int l = lane; l <= units; l += {L}) {counts.format("l")} = 0;
+    SYNC();
+
+{reserve}
+    SYNC();
+
+{level}
+    SYNC();
+{offsets}
+    for (int unit = lane; unit < units; unit += {L}) {{
+        const int place = unit_place[unit / {L}];
+        if (place >= 0)
+            level_units.data[world * {M} + {counts.format("(place >> 16)")} + (place & 0xFFFF)] = contact_start + unit;
+    }}
+    if (lane == 0) level_count.data[world] = levels;
+{tail}"""
+    defines = f"#define THREADS {L}\n#define WARPS 1\n#define RESERVED (-2)\n"
+    source = f"{defines}{snippet}\n#undef THREADS\n#undef WARPS\n#undef RESERVED\n"
+    return KernelTemplate(
+        name,
+        kernel_template.params(*params),
+        group_native(
+            source, preludes=(lane_group(L), SHARED_STORAGE, *preludes, *(() if L == 32 else (LANE_WORDS,))), lanes=L
+        ),
+        dispatch=items("world", lanes=L, flat=True),
+        composed=True,
+        native_name="sparse_contact_levels_native",
+    ).kernel()
+
+
+_LEVELS_OUTPUTS = (
+    ("level_count", wp.array[int]),
+    ("level_offsets", wp.array2d[int]),
+    ("level_units", wp.array2d[int]),
+)
+
+
 def _sparse_contact_levels_kernel(
     M: int, D: int, build_serial_contacts: bool, torsion: bool = False, lanes: int = 32
 ) -> "wp.Kernel":
-    """Build the sparse-diagonal contact schedule over the contact units: the levels of the scalar contacts and the
+    """Case K2's contact schedule over its slots (:func:`_levels_kernel`): the levels of the scalar contacts and the
     serial list of the rest.
 
     Under patch friction a contact's rows form a unit: its normal row, followed by its two tangent rows only when it
-    owns an anchor (and its spin row, where it has one, under ``torsion``), each naming the normal as parent; every row
-    of the contact segment other than such a member heads a unit (the row writer's layout). A unit the marker left
-    with a marked slot (below ``-1``) is a *scalar contact*, on the coordinate of its other slot.
-
-    The resources are the world's coordinates. A coupled unit (no marked slot) reserves its coordinates, and a scalar
-    contact on a reserved coordinate loses its mark (``-1``): it stays in the serial order. The others are leveled in
-    row order (:func:`level_pass`, one resource each): a coordinate's ``k``-th contact is level ``k``, so a level holds
-    at most one contact a coordinate, and a coordinate's contacts keep their row order. Each level's contacts are
-    listed in row order (:func:`level_offsets`): ``level_count[world]`` levels, level ``l`` the heads
-    ``level_units[world, level_offsets[world, l]:level_offsets[world, l + 1]]``. The serial list
-    (:func:`_list_serial_contacts_source`) holds the other unit heads in row order.
-
-    A contact position's packed level and rank wait for the offsets in its lane's own words (``unit_place``, a word a
-    batch of the group's positions: local memory, cached), so the shared working set is the coordinates' only.
-
-    One warp a world, :func:`levels_staging`'s ``groups`` worlds a block; on the CPU (``lanes`` 1) one thread a world:
-    launch flat by :func:`levels_launch`.
+    owns an anchor (and its spin row under ``torsion``), each naming the normal as parent. A unit the marker left with a
+    marked slot (below ``-1``) is a *scalar contact*, on its other slot's coordinate. A coupled unit reserves its
+    coordinates, and a scalar contact on a reserved one loses its mark (``-1``): it stays in the serial order
+    (:func:`_list_serial_contacts_source`, the other unit heads in row order). The others are leveled in row order: a
+    coordinate's ``k``-th contact is level ``k``.
     """
     L = lanes
     if M >= 1 << 15:
@@ -354,8 +417,7 @@ def _sparse_contact_levels_kernel(
     kind = "world_row_type.data[row_base + normal]"
     # A unit's members (a tangent, or a spin row) follow its head; every other row of the segment heads a unit.
     unit_head = f"({kind} != {friction} && {kind} != {spin})" if torsion else f"{kind} != {friction}"
-    staging = levels_staging(D, L)
-    staging.check("the sparse-diagonal contact schedule")
+    levels_staging(D, L).check("the sparse-diagonal contact schedule")
     resources = f"""            const int normal = contact_start + unit;
             int node_a = -1;
             const int node_b = -1;
@@ -375,39 +437,19 @@ def _sparse_contact_levels_kernel(
                 }}
             }}
             unit_place[base / {L}] = -1;"""
-    counts = f"level_offsets.data[world * {M + 1} + {{}}]"
-    level = level_pass(
-        units="units",
-        resources=resources,
-        counts=counts,
-        store=f"unit_place[base / {L}] = (level << 16) | rank;",
-        lanes=L,
-    )
-    offsets = level_offsets(levels="levels", counts=counts, lanes=L, sync="SYNC()")
     serial = (
         _list_serial_contacts_source(count="units", stride=1, head=unit_head, serial_capacity=M, lanes=L)
         if build_serial_contacts
         else ""
     )
-    snippet = f"""    const int lane = LANE;
-    const int tid = lane, warp = 0;
-    const int contact_start = dense_phase_bounds.data[world * 2 + 1];
+    units = f"""    const int contact_start = dense_phase_bounds.data[world * 2 + 1];
     const int contact_end = min(world_constraint_count.data[world], {M});
     const int units = contact_end - contact_start;
     const int line = dense_first.data[world];
     __builtin_assume(line >= 0);
     const int row_base = line * {M};
-    const int sparse_world_base = line * {M} * 2;
-{staging.declarations("    ")}
-    int unit_place[{-(-M // L)}];
-    for (int coordinate = lane; coordinate < {D}; coordinate += {L}) {{
-        node_owner[coordinate] = 32;
-        node_level[coordinate] = -1;
-    }}
-    for (int l = lane; l <= units; l += {L}) {counts.format("l")} = 0;
-    SYNC();
-
-    // A coupled unit reserves every coordinate it holds: a scalar contact sharing one stays in the serial order.
+    const int sparse_world_base = line * {M} * 2;"""
+    reserve = f"""    // A coupled unit reserves every coordinate it holds: a scalar contact sharing one stays in the serial order.
     for (int normal = contact_start + lane; normal < contact_end; normal += {L}) {{
         const int sparse_row = sparse_world_base + normal * 2;
         const int coord_0 = sparse_row_dof.data[sparse_row];
@@ -415,41 +457,96 @@ def _sparse_contact_levels_kernel(
         if (!({unit_head}) || coord_0 < -1 || coord_1 < -1) continue;
         if (coord_0 >= 0) node_level[coord_0] = RESERVED;
         if (coord_1 >= 0) node_level[coord_1] = RESERVED;
-    }}
-    SYNC();
-
-{level}
-    SYNC();
-{offsets}
-    for (int unit = lane; unit < units; unit += {L}) {{
-        const int place = unit_place[unit / {L}];
-        if (place >= 0)
-            level_units.data[world * {M} + {counts.format("(place >> 16)")} + (place & 0xFFFF)] = contact_start + unit;
-    }}
-    if (lane == 0) level_count.data[world] = levels;
-{serial}"""
-    defines = f"#define THREADS {L}\n#define WARPS 1\n#define RESERVED (-2)\n"
-    source = f"{defines}{snippet}\n#undef THREADS\n#undef WARPS\n#undef RESERVED\n"
+    }}"""
     name = f"sparse_contact_levels_{M}_{D}"
     if build_serial_contacts:
         name += "_serial_contacts"
     name += "_units" + ("_torsion" if torsion else "") + ("" if L == 32 else f"_lanes{L}")
-    return KernelTemplate(
-        name,
-        kernel_template.params(
-            ("world_constraint_count", wp.array[int]),
-            ("dense_first", wp.array[int]),
-            ("dense_phase_bounds", wp.array2d[int]),
-            ("world_row_type", wp.array2d[int]),
-            ("sparse_row_dof", wp.array3d[int]),
-            ("level_count", wp.array[int]),
-            ("level_offsets", wp.array2d[int]),
-            ("level_units", wp.array2d[int]),
-            ("serial_count_out", wp.array[int]),
-            ("serial_normals", wp.array2d[int]),
-        ),
-        group_native(source, preludes=(lane_group(L), SHARED_STORAGE, *(() if L == 32 else (LANE_WORDS,))), lanes=L),
-        dispatch=items("world", lanes=L, flat=True),
-        composed=True,
-        native_name="sparse_contact_levels_native",
-    ).kernel()
+    params = (
+        ("world_constraint_count", wp.array[int]),
+        ("dense_first", wp.array[int]),
+        ("dense_phase_bounds", wp.array2d[int]),
+        ("world_row_type", wp.array2d[int]),
+        ("sparse_row_dof", wp.array3d[int]),
+        *_LEVELS_OUTPUTS,
+        ("serial_count_out", wp.array[int]),
+        ("serial_normals", wp.array2d[int]),
+    )
+    return _levels_kernel(name, params, M, D, L, units=units, reserve=reserve, resources=resources, tail=serial)
+
+
+@cache
+def coordinate_levels_kernel(M: int, P: int, D: int, device_arch: str, *, torsion: bool = False) -> "wp.Kernel":
+    """The levels of the units on one coordinate no wider unit holds, over a world's rows by support class
+    (:func:`.packed_rows.row_classes`, ``P`` rows a line), which the general sweep steps first (``coordinate_levels``).
+
+    A unit heads its contact's rows (its pair and spin row name it as parent) or is any other row but a velocity limit
+    (the last word's). A contact or joint limit of one entry ahead of every other unit on its coordinate is leveled in
+    row order (:func:`_levels_kernel`), so it commutes with every row stepped in order: the order's iterate.
+    """
+    L = device_lanes(device_arch, 32)
+    if M >= 1 << 15:
+        raise ValueError(f"a world's level schedule packs a unit's level and rank in 16 bits each: {M} rows")
+    levels_staging(D, L).check("the coordinate levels")
+    kind = "world_row_type.data[row_base + row]"
+    head = f"{kind} != {int(ROW_FRICTION)}" + (f" && {kind} != {int(ROW_TORSION)}" if torsion else "")
+    entries = """const int classes = row_classes.data[row_base + row];
+            const int c1 = (classes >> 13) & 0x1FFF;
+            const int entries = ((classes >> 26) & 0x3F) + (c1 == 0x1FFF ? 0 : class_count.data[c1]);"""
+    unit = f"({head} && {kind} != {int(ROW_JOINT_VELOCITY_LIMIT)})"
+    # A level holds contacts and joint limits (the sweep compiles their laws apart).
+    kinds = f"({kind} == {int(ROW_CONTACT)} || {kind} == {int(ROW_JOINT_LIMIT)})"
+    units = f"""    const int contact_start = 0;
+    const int contact_end = min(world_constraint_count.data[world], {M});
+    const int units = contact_end;
+    const int line = dense_first.data[world];
+    __builtin_assume(line >= 0);
+    const int row_base = line * {P};"""
+    # Each coordinate's first row of a unit no level holds (node_owner, reset for the level pass): a contact or joint
+    # limit of one entry before it on its coordinate keeps that coordinate for the pass (unit_coordinate, 0 for none).
+    reserve = f"""    for (int c = lane; c < {D}; c += {L}) node_owner[c] = {M};
+    SYNC();
+    for (int row = lane; row < contact_end; row += {L}) {{
+        if (!{unit}) continue;
+        {entries}
+        if (entries < 2 && {kinds}) continue;
+        const wp::vec2i sides = row_sides.data[row_base + row];
+        for (int e = 0; e < entries; ++e) {{
+            const int coordinate = CLASS_COORDINATE(sides, classes, e);
+            if (coordinate >= 0) atomicMin(&node_owner[coordinate], row);
+        }}
+    }}
+    SYNC();
+    int unit_coordinate[{-(-M // L)}];
+    for (int base = 0; base < units; base += {L}) {{
+        const int row = base + lane;
+        int leveled = 0;
+        if (row < units && {unit} && {kinds}) {{
+            {entries}
+            const int coordinate = CLASS_COORDINATE(row_sides.data[row_base + row], classes, 0);
+            if (entries == 1 && coordinate >= 0 && row < node_owner[coordinate]) leveled = coordinate + 1;
+        }}
+        unit_coordinate[base / {L}] = leveled;
+    }}
+    SYNC();
+    for (int c = lane; c < {D}; c += {L}) node_owner[c] = 32;"""
+    resources = f"""            int node_a = -1;
+            const int node_b = -1;
+            if (valid) valid = unit_coordinate[base / {L}] > 0;
+            if (valid) node_a = unit_coordinate[base / {L}] - 1;
+            unit_place[base / {L}] = -1;"""
+    name = f"coordinate_levels_{M}_{P}_{D}" + ("_torsion" if torsion else "") + ("" if L == 32 else f"_lanes{L}")
+    params = (
+        ("world_constraint_count", wp.array[int]),
+        ("dense_first", wp.array[int]),
+        ("world_row_type", wp.array2d[int]),
+        ("row_sides", wp.array2d[wp.vec2i]),
+        ("row_classes", wp.array2d[int]),
+        ("class_dof", wp.array2d[int]),
+        ("class_count", wp.array[int]),
+        ("articulation_world_dof_offset", wp.array[int]),
+        *_LEVELS_OUTPUTS,
+    )
+    return _levels_kernel(
+        name, params, M, D, L, units=units, reserve=reserve, resources=resources, preludes=(CLASS_SIDES,)
+    )

@@ -339,6 +339,11 @@ def _solver_factory_calls():
     for places in (sweep_routes.RowPlaces(), sweep_routes.RowPlaces(Place.GLOBAL)):
         kwargs = {"places": places, "support_classes": True, "max_row_dofs": 7}
         yield "sweep_routes.GeneralSweep", built(sweep_routes.GeneralSweep), (64, 32, 12, _ARCH), kwargs
+    # The coordinate levels: their schedule over the rows' classes, and the general sweep that steps them first.
+    yield name + "coordinate_levels_kernel", sweep_levels.coordinate_levels_kernel.__wrapped__, (64, 64, 12, _ARCH), {}
+    for places in (sweep_routes.RowPlaces(), sweep_routes.RowPlaces(Place.GLOBAL)):
+        kwargs = {"places": places, "support_classes": True, "max_row_dofs": 7, "coordinate_levels": True}
+        yield "sweep_routes.GeneralSweep", built(sweep_routes.GeneralSweep), (64, 32, 12, _ARCH), kwargs
     # The colored units' slot staging, under each law (the weights a constant of the plan).
     for weighted in (False, True):
         yield "sweep_units.stage_slots", sweep_units.stage_slots.__wrapped__, (weighted,), {}
