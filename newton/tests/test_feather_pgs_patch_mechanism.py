@@ -2162,7 +2162,7 @@ class TestPatchFrameModes(unittest.TestCase):
         scene = _Scene("cpu", 49)
         phi = wp.zeros(128, dtype=wp.vec2, device="cpu")
         cuda = SimpleNamespace(is_cuda=True)
-        worlds = ["_scan_worlds", "_copy_by_world", "_sort_worlds"]
+        worlds = ["_scan_worlds", "_place_worlds", "_copy_by_world", "_sort_worlds"]
         for reuse, expected in ((False, worlds), (True, [*worlds, "_prepare_frame"])):
             with self.subTest(reuse=reuse), contextlib.ExitStack() as stack:
                 loaded = []

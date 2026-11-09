@@ -86,13 +86,13 @@ _SORT_EXTENT = wp.constant(2)
 _WORLD_EXTENT = wp.constant(2 + EXTENT_SIZE)
 # A frame whose worlds hold at most this many contacts each sorts every world on its own lanes, each lane holding
 # _WORLD_HELD of them at a time and ranking them in one pass over its world's; a frame with a larger world sorts the
-# stream, unless its pair keys are too wide for the stream sort. The scan of the worlds' counts takes one block.
+# stream, unless its pair keys are too wide for the stream sort. A block scans a run of _SCAN_THREADS worlds' counts.
 _WORLD_CONTACTS = 512
 _WORLD_LANES = 32
 _WORLD_HELD = wp.constant(8)
 _HeldKeys = wp.types.vector(length=_WORLD_HELD, dtype=wp.int64)
 _HeldIndices = wp.types.vector(length=_WORLD_HELD, dtype=wp.int32)
-_SCAN_THREADS = 1024
+_SCAN_THREADS = wp.constant(1024)
 # Contact paths 0 and 1 hold dense and matrix-free rows, and -1 holds none.
 # A region's spin arm over the polar radius of gyration of its contacts' hull: the mean radius of a convex patch under
 # uniform pressure over its gyration radius is 0.937 on a square, 0.943 on a disc and 0.866 on a line, and 0.94 holds
@@ -520,28 +520,57 @@ def _prepare_frame(
 
 
 @wp.kernel(enable_backward=False, module="unique")
-def _scan_worlds(worlds: _PatchWorlds, extent: wp.array[int], limit: int):
-    """Start each world's slots past the lower worlds' contacts and clear the counts, in one block; publish whether
-    the worlds sort on their own lanes (none holds more than ``limit`` contacts) or the stream sort runs."""
-    _block, lane = wp.tid()
+def _scan_worlds(worlds: _PatchWorlds, runs: wp.array[int]):
+    """Start each world's slots past the contacts of the lower worlds of its run and clear the counts, a block a run
+    of worlds; record each run's contacts, then its largest world's (:func:`_place_worlds` adds the lower runs')."""
+    run, lane = wp.tid()
     buckets = worlds.count.shape[0]
-    run = (buckets + wp.block_dim() - 1) // wp.block_dim()
-    first = wp.min(lane * run, buckets)
-    last = wp.min(first + run, buckets)
+    first = wp.min(run * _SCAN_THREADS + lane * (_SCAN_THREADS // wp.block_dim()), buckets)
+    last = wp.min(first + _SCAN_THREADS // wp.block_dim(), buckets)
     total = int(0)
     largest = int(0)
     for bucket in range(first, last):
         total += worlds.count[bucket]
         largest = wp.max(largest, worlds.count[bucket])
-    start = wp.untile(wp.tile_scan_exclusive(wp.tile(total)))
-    live = wp.tile_sum(wp.tile(total))[0]
+    counts = wp.tile(total)
+    start = wp.untile(wp.tile_scan_exclusive(counts))
+    total = wp.tile_sum(counts)[0]
     largest = wp.tile_max(wp.tile(largest))[0]
     for bucket in range(first, last):
         worlds.start[bucket] = start
-        worlds.cursor[bucket] = start
         start += worlds.count[bucket]
         worlds.count[bucket] = 0
     if lane == 0:
+        runs[run] = total
+        runs[runs.shape[0] // 2 + run] = largest
+
+
+@wp.kernel(enable_backward=False, module="unique")
+def _place_worlds(worlds: _PatchWorlds, runs: wp.array[int], extent: wp.array[int], limit: int):
+    """Add the lower runs' contacts to each world's start; publish whether the worlds sort on their own lanes (none
+    holds more than ``limit`` contacts) or the stream sort runs."""
+    run, lane = wp.tid()
+    buckets = worlds.count.shape[0]
+    count = runs.shape[0] // 2
+    below = int(0)
+    live = int(0)
+    largest = int(0)
+    for lower in range(0, count, wp.block_dim()):
+        other = lower + lane
+        total = int(0)
+        most = int(0)
+        if other < count:
+            total = runs[other]
+            most = runs[count + other]
+        below += wp.tile_sum(wp.tile(wp.where(other < run, total, 0)))[0]
+        live += wp.tile_sum(wp.tile(total))[0]
+        largest = wp.max(largest, wp.tile_max(wp.tile(most))[0])
+    first = wp.min(run * _SCAN_THREADS + lane * (_SCAN_THREADS // wp.block_dim()), buckets)
+    for bucket in range(first, wp.min(first + _SCAN_THREADS // wp.block_dim(), buckets)):
+        start = worlds.start[bucket] + below
+        worlds.start[bucket] = start
+        worlds.cursor[bucket] = start
+    if run == 0 and lane == 0:
         worlds.start[buckets] = live
         on_lanes = largest <= limit
         publish_sort_extent(extent, _SORT_EXTENT, wp.where(on_lanes, 0, live))
@@ -1287,6 +1316,7 @@ class _FrictionPatchState:
         self.worlds.cursor = wp.zeros(buckets, dtype=int, device=device)
         self.worlds.start = wp.zeros(buckets + 1, dtype=int, device=device)
         self.worlds.stored = wp.zeros(buckets + 1, dtype=int, device=device)
+        self.world_runs = wp.zeros(2 * (-(-buckets // _SCAN_THREADS)), dtype=int, device=device)
         # The live contacts copied by world, each world's in any order: the per-world sort's input.
         self._world_rows = pool.rows(
             (ContactField("world_keys", wp.int64), ContactField("world_indices", wp.int32)),
@@ -1372,6 +1402,7 @@ class _FrictionPatchState:
         if not self.device.is_cuda:
             return
         _scan_worlds.module.load(self.device, _SCAN_THREADS)
+        _place_worlds.module.load(self.device, _SCAN_THREADS)
         _copy_by_world.module.load(self.device)
         _sort_worlds.module.load(self.device)
         if self.reuse_frames:
@@ -1699,17 +1730,18 @@ class _FrictionPatchState:
 
         A kept build skips exactly this, so work added here must leave outputs that
         stay valid while later builds reuse the frame. Each world sorts on its own
-        lanes, or the stream sort orders the frame (:func:`_scan_worlds`).
+        lanes, or the stream sort orders the frame (:func:`_place_worlds`).
         """
         buckets = self.worlds.count.shape[0]
-        wp.launch_tiled(
-            _scan_worlds,
-            dim=1,
-            inputs=[self.worlds, self.extent, _WORLD_CONTACTS if self.live_sort else 2**31 - 1],
-            block_dim=_SCAN_THREADS,
-            device=self.device,
-            record_tape=False,
-        )
+        runs = self.world_runs.shape[0] // 2
+        limit = _WORLD_CONTACTS if self.live_sort else 2**31 - 1
+        for kernel, inputs in (
+            (_scan_worlds, [self.worlds, self.world_runs]),
+            (_place_worlds, [self.worlds, self.world_runs, self.extent, limit]),
+        ):
+            wp.launch_tiled(
+                kernel, dim=runs, inputs=inputs, block_dim=_SCAN_THREADS, device=self.device, record_tape=False
+            )
         self.pool.begin_updates()
         self.pool.launch(
             _copy_by_world,
