@@ -1969,14 +1969,12 @@ def friction_record_stage(
     rows: RowStore, op, *, end: str, record: Callable[[str], str], declare: str = "", pad: str
 ) -> str:
     """Before the sweeps, form the record of every friction contact of a class's rows ``[0, end)`` at
-    ``record(normal)``: the lanes find the first tangents by ballot and reduce each contact's Gram couplings in one
-    ladder of the operator's own products. A pair (or a zero spin coefficient) stores ``W_nt1, W_nt2, W_t1t2`` and its
-    pair metric, a triple its ball metric, eigenvalues then eigenbasis (:mod:`.projection_laws`); the visits reduce
-    velocity terms alone (:func:`formed_friction_laws`). ``declare`` declares what the operator's coordinates read."""
+    ``record(normal)``, a lane a contact (as K1's writer forms its records, a lane a unit): its Gram couplings summed
+    over its support in entry order, then the pair metric (with ``W_nt1, W_nt2, W_t1t2``), or a triple's ball metric,
+    eigenvalues then eigenbasis (:mod:`.projection_laws`); the visits reduce velocity terms alone
+    (:func:`formed_friction_laws`). ``declare`` declares what the operator's coordinates read."""
     kind, parent = rows.scan()
-    heads = BallotHeads(
-        end, rows.lanes, lambda row: f"{row} < {end} && {kind(row)} == {ROW_FRICTION} && ({parent(row)}) + 1 == {row}"
-    )
+    serial = dataclasses.replace(op, lanes=Lanes(1, "0"))
     sums = (
         ("gram_n1", "normal", "tangent"),
         ("gram_n2", "normal", "sibling"),
@@ -1985,7 +1983,7 @@ def friction_record_stage(
         ("spin_cross_sibling", "sibling", "spin"),
     )
     names = {name: name for name in ("normal", "tangent", "sibling", "spin")}
-    diag, store = rows.diagonal("").value, rows.lanes.first
+    diag = rows.diagonal("").value
     block = (
         f"wp::mat33({diag('tangent')}, unit_cross, spin_cross, unit_cross, {diag('sibling')}, spin_cross_sibling,\n"
         f"              spin_cross, spin_cross_sibling, {diag('spin')})"
@@ -1995,23 +1993,27 @@ def friction_record_stage(
         # A contact without a spin row reads its tangent in its place: every operand a row of the contact.
         "const int spin = spun >= 0 ? spun : tangent;",
         declare,
-        op.dot(sums, names, "", exists={"spin": "spun >= 0"}),
+        serial.dot(sums, names, "", exists={"spin": "spun >= 0"}),
         f"float* const stored = {record('normal')};",
         f"const float mu = {rows.mu('tangent')}, mu_t = spun >= 0 ? {rows.mu('spin')} : 0.0f;",
         "if (mu_t > 0.0f) {",
         f"    const auto formed = ProjectionLaw::friction_ball_metric({block}, mu, mu_t);",
-        "    " + store("for (int f = 0; f < 3; ++f) stored[f] = formed.v0[f];"),
-        "    " + store("for (int f = 0; f < 9; ++f) stored[4 + f] = formed.v1.data[f / 3][f % 3];"),
+        "    for (int f = 0; f < 3; ++f) stored[f] = formed.v0[f];",
+        "    for (int f = 0; f < 9; ++f) stored[4 + f] = formed.v1.data[f / 3][f % 3];",
         "} else {",
         f"    const auto formed = ProjectionLaw::friction_pair_metric({diag('tangent')}, unit_cross, {diag('sibling')});",
-        "    "
-        + store(
-            "{ stored[0] = gram_n1; stored[1] = gram_n2; stored[2] = unit_cross; stored[4] = formed.v0; "
-            "stored[5] = formed.v1; stored[6] = formed.v2[0]; stored[7] = formed.v2[1]; }"
-        ),
+        "    stored[0] = gram_n1; stored[1] = gram_n2; stored[2] = unit_cross;",
+        "    stored[4] = formed.v0; stored[5] = formed.v1; stored[6] = formed.v2[0]; stored[7] = formed.v2[1];",
         "}",
     ]
-    return heads.wrap(indent("\n".join(line for line in lines if line), heads.inner(pad)), pad) + f"\n{pad}SYNC();"
+    head = [
+        "const int head = first + LANE;",
+        f"if (head < {end} && {kind('head')} == {ROW_FRICTION} && ({parent('head')}) + 1 == head) {{",
+        indent("\n".join(line for line in lines if line), "    "),
+        "}",
+    ]
+    text = f"for (int first = 0; first < {end}; first += STRIDE) " + _block(head, "")
+    return indent(text + "\nSYNC();", pad)
 
 
 def formed_friction_laws(name: str, pad: str) -> str:
