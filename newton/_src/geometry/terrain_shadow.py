@@ -631,7 +631,6 @@ class TerrainLawShadow:
         model: A finalized model.
         classes: Partner classes to run (:func:`parse_terrain_law_shadow`); each must have a kernel.
         pairs: The collision pipeline's explicit shape pairs, or ``None`` for the model's filter.
-        surfaces: The model's law surfaces when already classified (:class:`TerrainSurfaces`), or ``None``.
         status: The narrow phase's sticky buffer status word, or ``None`` for one of the shadow's own.
         spill_rows: Rows of the spill region, or ``None`` for :meth:`default_spill_rows` (from the listed pairs'
             bounds on their rows).
@@ -645,7 +644,6 @@ class TerrainLawShadow:
         classes,
         *,
         pairs=None,
-        surfaces: TerrainSurfaces | None = None,
         status: wp.array | None = None,
         spill_rows: int | None = None,
         job_scale: float | None = None,
@@ -658,8 +656,8 @@ class TerrainLawShadow:
             raise ValueError(f"The terrain law has no kernel for partner classes {missing}")
         if job_scale is not None and not (np.isfinite(float(job_scale)) and float(job_scale) > 0.0):
             raise ValueError(f"The terrain law's job capacities need a positive finite factor, not {job_scale!r}")
-        self.surfaces = TerrainSurfaces(model) if surfaces is None else surfaces
-        """The shapes the law reads as surfaces: heightfields and the static meshes it reads whole."""
+        self.surfaces = TerrainSurfaces(model)
+        """The shapes the law reads as surfaces: the heightfields."""
         self.shape_surface = wp.array(
             self.surfaces.shape_surface if model.shape_count else np.full(1, -1, np.int32),
             dtype=wp.int32,
@@ -830,21 +828,17 @@ class TerrainLawShadow:
         """Host time of the construction [s]: features, pair table, kernel modules imported and buffers."""
 
     def written_pairs(self, model) -> tuple[np.ndarray, np.ndarray]:
-        """Return what the law writes when it feeds the solver (the default; see ``NEWTON_TERRAIN_LAW``): per shape its
-        role (:meth:`~newton._src.geometry.narrow_phase.NarrowPhase.set_terrain_law_roles`: 1 for a partner whose surface
-        pairs it writes, 2 for a static mesh it reads as a surface, else 0), and the table indices of those pairs: every
-        listed pair (every partner of a listed class has a core).
+        """Return what the law writes when it feeds the solver (the default; see ``NEWTON_TERRAIN_LAW``): per shape, 1
+        for a partner whose heightfield pairs it writes (else 0), and the table indices of those pairs: every listed
+        pair (every partner of a listed class has a core).
 
         Args:
             model: The finalized model the law was built for.
         """
-        from .narrow_phase import TERRAIN_LAW_MESH_SURFACE, TERRAIN_LAW_PARTNER  # noqa: PLC0415
-
         listed = self._listed
-        role = np.zeros(model.shape_count, np.int32)
-        role[np.asarray(self.surfaces.mesh_shapes, np.int64)] = int(TERRAIN_LAW_MESH_SURFACE)
-        role[self.table.pairs_host[listed, 1].astype(np.int64)] = int(TERRAIN_LAW_PARTNER)
-        return role, listed.astype(np.int32)
+        partner = np.zeros(model.shape_count, np.int32)
+        partner[self.table.pairs_host[listed, 1].astype(np.int64)] = 1
+        return partner, listed.astype(np.int32)
 
     def default_spill_rows(self) -> int:
         """Return the spill region's rows by default, from the listed pairs' own bounds on their rows

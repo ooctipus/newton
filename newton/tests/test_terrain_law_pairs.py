@@ -287,8 +287,8 @@ class TestTerrainLawPairs(unittest.TestCase):
         self.assertEqual(len(TERRAIN_PARTNER_WALK_SLOTS), TERRAIN_PARTNER_CLASSES)
 
     def test_terrain_surface_pairs_explicit_pairs(self):
-        """Orient explicit pairs surface-first and drop meshes, non-surface and two-surface pairs; a static mesh the
-        law reads is a surface like a heightfield."""
+        """Orient explicit pairs surface-first and drop meshes, non-surface and two-surface pairs; a heightfield the
+        law does not read is no surface."""
         hfield, mesh, sphere, box = (
             int(newton.GeoType.HFIELD),
             int(newton.GeoType.MESH),
@@ -299,9 +299,9 @@ class TestTerrainLawPairs(unittest.TestCase):
         explicit = np.array([[1, 0], [0, 2], [3, 0], [1, 3], [0, 4], [3, 4], [9, 0], [2, 1]])
         table = terrain_surface_pairs(types, None, np.ones(5, bool), explicit_pairs=explicit)
         np.testing.assert_array_equal(table, [[0, 1], [0, 3], [4, 3]])
-        surface = np.array([True, False, True, False, True])
+        surface = np.array([True, False, False, False, False])
         table = terrain_surface_pairs(types, None, np.ones(5, bool), surface=surface, explicit_pairs=explicit)
-        np.testing.assert_array_equal(table, [[0, 1], [0, 3], [2, 1], [4, 3]])
+        np.testing.assert_array_equal(table, [[0, 1], [0, 3]])
 
 
 devices = get_test_devices()

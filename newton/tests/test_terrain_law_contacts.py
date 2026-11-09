@@ -190,7 +190,7 @@ def test_default_writes_with_the_law(test, device):
     selection = default.get_collision_selection()["heightfield"]
     test.assertFalse(selection["law_shadow"]["enabled"])
     test.assertEqual(_law_record(explicit)["decision"], "explicit")
-    partner = default.narrow_phase._terrain_law_role.numpy()
+    partner = default.narrow_phase._terrain_law_partner.numpy()
     kind = model.shape_type.numpy()
     np.testing.assert_array_equal(partner != 0, kind != int(newton.GeoType.HFIELD))
     contacts = _collide(default, state)
@@ -252,7 +252,7 @@ class TestTerrainLawContacts(unittest.TestCase):
         self.assertEqual(record["classes"], ["point"])
         self.assertTrue(record["reason"].startswith("NEWTON_TERRAIN_LAW=point: the terrain law writes"))
         # The narrow phase drops the heightfield pairs of spheres and capsules only.
-        partner = pipeline.narrow_phase._terrain_law_role.numpy()
+        partner = pipeline.narrow_phase._terrain_law_partner.numpy()
         kind = model.shape_type.numpy()
         point = (kind == int(newton.GeoType.SPHERE)) | (kind == int(newton.GeoType.CAPSULE))
         np.testing.assert_array_equal(partner != 0, point)
@@ -272,7 +272,7 @@ class TestTerrainLawContacts(unittest.TestCase):
         state = model.state()
         route = _pipeline(model, TERRAIN_ROUTE, **PIPELINE)
         self.assertIsNone(route._terrain_law_shadow)
-        self.assertEqual(route.narrow_phase._terrain_law_role.shape[0], 0)
+        self.assertEqual(route.narrow_phase._terrain_law_partner.shape[0], 0)
         record = _law_record(route)
         self.assertEqual(
             {k: record[k] for k in ("writes", "decision", "classes")},
@@ -294,7 +294,7 @@ class TestTerrainLawContacts(unittest.TestCase):
             narrow_phase=law.narrow_phase,
         )
         self.assertEqual(_law_record(expert)["decision"], "opted_out")
-        self.assertEqual(law.narrow_phase._terrain_law_role.shape[0], 0)
+        self.assertEqual(law.narrow_phase._terrain_law_partner.shape[0], 0)
         _assert_same_contacts(self, expected, _arrays(_collide(expert, state)))
 
     def test_fallbacks_keep_the_terrain_route_cpu(self):
@@ -321,7 +321,7 @@ class TestTerrainLawContacts(unittest.TestCase):
                     {"writes": False, "decision": "unsupported", "classes": []},
                 )
                 self.assertTrue(record["reason"].startswith(reason), msg=record["reason"])
-                self.assertEqual(pipeline.narrow_phase._terrain_law_role.shape[0], 0)
+                self.assertEqual(pipeline.narrow_phase._terrain_law_partner.shape[0], 0)
                 self.assertEqual(pipeline._terrain_law_shadow is not None, name == "shadow")
                 self.assertEqual(
                     pipeline.get_collision_selection()["heightfield"]["law_shadow"]["enabled"], name == "shadow"
@@ -375,7 +375,7 @@ class TestTerrainLawContacts(unittest.TestCase):
         record = _law_record(pipeline)
         self.assertEqual((record["writes"], record["decision"]), (False, "no_partner"))
         self.assertIsNone(pipeline._terrain_law_shadow)
-        self.assertEqual(pipeline.narrow_phase._terrain_law_role.shape[0], 0)
+        self.assertEqual(pipeline.narrow_phase._terrain_law_partner.shape[0], 0)
         builder = newton.ModelBuilder()
         builder.add_shape_heightfield(heightfield=terrain, cfg=cfg)
         builder.add_shape_box(builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.05))), hx=0.03, hy=0.03, hz=0.03)
@@ -404,7 +404,7 @@ class TestTerrainLawContacts(unittest.TestCase):
         model = builder.finalize(device="cpu")
         pipeline = _pipeline(model, {}, **PIPELINE)
         self.assertEqual(_law_record(pipeline)["decision"], "default")
-        partner = pipeline.narrow_phase._terrain_law_role.numpy()
+        partner = pipeline.narrow_phase._terrain_law_partner.numpy()
         self.assertEqual((int(partner[barrel]), int(partner[plate])), (1, 1))
         state = model.state()
         rows = tu.contact_rows(model, state, _collide(pipeline, state), hfield)
