@@ -757,7 +757,7 @@ class TestCoordinateTreesRule(unittest.TestCase):
             self.assertTrue(owner.validate_model(joint))
         self.assertEqual(proofs.call_count, 2)
         frames = model.joint_X_p.numpy()
-        frames[model.articulation_start.numpy()[owner.coordinate_trees.group_to_art.numpy()[1]], 2] += 0.01
+        frames[model.articulation_start.numpy()[owner.coordinate_trees.trees.group_to_art.numpy()[1]], 2] += 0.01
         model.joint_X_p.assign(frames)
         self.assertFalse(owner.validate_model(joint))
         self.assertTrue(owner.validate_model(joint))
@@ -770,7 +770,7 @@ class TestCoordinateTreesRule(unittest.TestCase):
         model.joint_axis.assign(axes)
         self.assertTrue(owner.validate_model(joint))
         parents = model.joint_parent.numpy()
-        parents[model.articulation_start.numpy()[owner.coordinate_trees.group_to_art.numpy()[0]] + 2] = -1
+        parents[model.articulation_start.numpy()[owner.coordinate_trees.trees.group_to_art.numpy()[0]] + 2] = -1
         model.joint_parent.assign(parents)
         with self.assertRaisesRegex(RuntimeError, "joint_parent changed"):
             owner.validate_model(newton.ModelFlags.JOINT_PROPERTIES)

@@ -48,11 +48,12 @@ import numpy as np
 import warp as wp
 
 from ...sim import BodyFlags, JointType
-from . import cached_state_binding, host_index
+from . import cached_state_binding, field_group, host_index
 from .factor.fields import drive_terms
 from .factor.kernels import Clock, clock_changed
 from .kernel_template import python_kernel
 from .path_selection import kernel_key
+from .publication_data import PublicationData
 from .spatial_laws import (
     axis_transform,
     coordinate_force,
@@ -69,6 +70,7 @@ from .spatial_laws import (
     wrench_shift,
 )
 from .tree_kinetic_owner import proof_runs
+from .tree_kinetic_state import ForceInput, GroupTrees
 
 _LEAF_JOINTS = (int(JointType.PRISMATIC), int(JointType.REVOLUTE), int(JointType.D6))
 """The joints a leaf of one coordinate stands on."""
@@ -177,30 +179,13 @@ def class_kernels(turns: bool, welded: bool) -> tuple[wp.Kernel, wp.Kernel, wp.K
 
     def repair(
         n: int,
-        group_to_art: wp.array[int],
-        dof_joint_offset: wp.array[int],
-        articulation_start: wp.array[int],
-        articulation_dof_start: wp.array[int],
-        current_valid: wp.array[int],
+        p: GroupTrees,
+        data: PublicationData,
+        weld_start: wp.array[int],
+        weld_joint_offset: wp.array[int],
         source: wp.array[wp.uint64],
         bank: wp.uint64,
         clock: wp.array[Clock],
-        dt: float,
-        joint_child: wp.array[int],
-        joint_parent: wp.array[int],
-        joint_q_start: wp.array[int],
-        joint_dof_dim: wp.array2d[int],
-        joint_X_p: wp.array[wp.transform],
-        joint_X_c: wp.array[wp.transform],
-        joint_axis: wp.array[wp.vec3],
-        weld_start: wp.array[int],
-        weld_joint_offset: wp.array[int],
-        body_com: wp.array[wp.vec3],
-        joint_q: wp.array[float],
-        # outputs
-        body_q: wp.array[wp.transform],
-        joint_S_s: wp.array[wp.spatial_vector],
-        articulation_origin: wp.array[wp.vec3],
     ):
         """Publish the input state of articulations whose cache does not stand for the input bank ``bank`` (its
         coordinates' address), one warp per articulation: an invalid cache, one stamped with another bank (``source``),
@@ -211,79 +196,53 @@ def class_kernels(turns: bool, welded: bool) -> tuple[wp.Kernel, wp.Kernel, wp.K
         tid = wp.tid()
         group = tid // _REPAIR_LANES
         lane = tid - group * _REPAIR_LANES
-        art = group_to_art[group]
-        if current_valid[art] != 0 and source[group] == bank and clock_changed(clock[0], dt) == 0:
+        art = p.group_to_art[group]
+        if data.fk_id_cache_valid[art] != 0 and source[group] == bank and clock_changed(clock[0], data.dt) == 0:
             return
-        root_joint = articulation_start[art]
-        root = joint_child[root_joint]
-        X_root = _root_pose(joint_X_p, joint_X_c, root_joint)
-        origin = wp.transform_point(X_root, body_com[root])
+        root_joint = p.art_joint_start[art]
+        root = p.joint_child[root_joint]
+        X_root = _root_pose(data.joint_X_p, data.joint_X_c, root_joint)
+        origin = wp.transform_point(X_root, data.body_com[root])
         if lane == 0:
-            body_q[root] = X_root
-            articulation_origin[art] = origin
-        coordinate_start = joint_q_start[root_joint]
-        dof_start = articulation_dof_start[art]
+            data.body_q[root] = X_root
+            data.articulation_origin[art] = origin
+        coordinate_start = data.joint_q_start[root_joint]
+        dof_start = p.art_dof_start[art]
         for local in range(lane, n, _REPAIR_LANES):
-            joint = root_joint + dof_joint_offset[local]
+            joint = root_joint + p.dof_joint[local]
             dof = dof_start + local
-            X_wpj = X_root * joint_X_p[joint]
-            axis = joint_axis[dof]
-            q = joint_q[coordinate_start + local]
-            child = joint_child[joint]
+            X_wpj = X_root * data.joint_X_p[joint]
+            axis = data.joint_axis[dof]
+            q = data.joint_q[coordinate_start + local]
+            child = p.joint_child[joint]
             angular = False
             if wp.static(turns):
-                angular = joint_dof_dim[joint, 1] != 0
-            body_q[child] = _leaf_pose(X_root, joint_X_p[joint], angular, axis, q, joint_X_c[joint])
-            joint_S_s[dof] = _leaf_motion(X_wpj, origin, angular, axis)
+                angular = data.joint_dof_dim[joint, 1] != 0
+            data.body_q[child] = _leaf_pose(X_root, data.joint_X_p[joint], angular, axis, q, data.joint_X_c[joint])
+            data.joint_S_s[dof] = _leaf_motion(X_wpj, origin, angular, axis)
             if wp.static(welded):
                 for k in range(weld_start[local], weld_start[local + 1]):
                     weld = root_joint + weld_joint_offset[k]
-                    body_q[joint_child[weld]] = _weld_pose(body_q[joint_parent[weld]], joint_X_p[weld], joint_X_c[weld])
+                    data.body_q[p.joint_child[weld]] = _weld_pose(
+                        data.body_q[data.joint_parent[weld]], data.joint_X_p[weld], data.joint_X_c[weld]
+                    )
 
     def predict(
         n: int,
-        group_to_art: wp.array[int],
-        dof_joint_offset: wp.array[int],
-        articulation_start: wp.array[int],
-        articulation_dof_start: wp.array[int],
-        joint_child: wp.array[int],
-        joint_q_start: wp.array[int],
+        p: GroupTrees,
+        data: PublicationData,
+        f: ForceInput,
         weld_start: wp.array[int],
         weld_joint_offset: wp.array[int],
-        joint_S_s: wp.array[wp.spatial_vector],
-        body_q: wp.array[wp.transform],
-        body_com: wp.array[wp.vec3],
-        body_mass: wp.array[float],
-        body_inertia: wp.array[wp.mat33],
-        body_flags: wp.array[int],
-        body_f: wp.array[wp.spatial_vector],
-        articulation_origin: wp.array[wp.vec3],
-        gravity: wp.array[wp.vec3],
-        joint_f: wp.array[float],
-        joint_q: wp.array[float],
-        joint_qd: wp.array[float],
-        predictor_qd: wp.array[float],
-        spring_stiffness: wp.array[float],
-        spring_ref: wp.array[float],
-        damping: wp.array[float],
-        kinematic_dof_mask: wp.array[int],
         mass_update_mask: wp.array[int],
-        armature: wp.array[float],
-        drive_row_by_dof: wp.array[int],
         drive_target_index_by_dof: wp.array[int],
         joint_target_ke: wp.array[float],
         joint_target_kd: wp.array[float],
         joint_target_pos: wp.array[float],
         joint_target_vel: wp.array[float],
         joint_effort_limit: wp.array[float],
-        dt: float,
-        v_out: wp.array[float],
         # in/out
         diagonal_inverse_mass: wp.array[float],
-        row_K: wp.array[float],
-        # outputs
-        joint_qdd: wp.array[float],
-        v_hat: wp.array[float],
     ):
         """Predict each leaf: the force, the masked inverse-mass refresh, ``qdd`` and ``v_hat``.
 
@@ -293,89 +252,98 @@ def class_kernels(turns: bool, welded: bool) -> tuple[wp.Kernel, wp.Kernel, wp.K
         element = wp.tid()
         group = element // n
         local = element - group * n
-        art = group_to_art[group]
-        root_joint = articulation_start[art]
-        joint = root_joint + dof_joint_offset[local]
-        dof = articulation_dof_start[art] + local
-        child = joint_child[joint]
-        motion = joint_S_s[dof]
+        art = p.group_to_art[group]
+        root_joint = p.art_joint_start[art]
+        joint = root_joint + p.dof_joint[local]
+        dof = p.art_dof_start[art] + local
+        child = p.joint_child[joint]
+        motion = data.joint_S_s[dof]
         body_force = wp.spatial_vector()
         leaf_inertia = float(0.0)
         if wp.static(turns):
             # The moments about the articulation origin, from each body's pose.
-            origin = articulation_origin[art]
+            origin = data.articulation_origin[art]
             body_force, tree_inertia = _turning_load(
-                child, motion, origin, gravity[0], body_q, body_com, body_mass, body_inertia, body_f, body_flags
+                child,
+                motion,
+                origin,
+                data.gravity[0],
+                data.body_q,
+                data.body_com,
+                data.body_mass,
+                data.body_inertia,
+                f.body_f,
+                f.body_flags,
             )
             if wp.static(welded):
                 for k in range(weld_start[local], weld_start[local + 1]):
                     wrench, inertia = _turning_load(
-                        joint_child[root_joint + weld_joint_offset[k]],
+                        p.joint_child[root_joint + weld_joint_offset[k]],
                         motion,
                         origin,
-                        gravity[0],
-                        body_q,
-                        body_com,
-                        body_mass,
-                        body_inertia,
-                        body_f,
-                        body_flags,
+                        data.gravity[0],
+                        data.body_q,
+                        data.body_com,
+                        data.body_mass,
+                        data.body_inertia,
+                        f.body_f,
+                        f.body_flags,
                     )
                     body_force += wrench
                     tree_inertia += inertia
-            leaf_inertia = tree_inertia + armature[dof]
+            leaf_inertia = tree_inertia + data.armature[dof]
         else:
-            mass = body_mass[child]
+            mass = data.body_mass[child]
             if wp.static(welded):
                 for k in range(weld_start[local], weld_start[local + 1]):
-                    mass += body_mass[joint_child[root_joint + weld_joint_offset[k]]]
-            force = mass * gravity[0]
+                    mass += data.body_mass[p.joint_child[root_joint + weld_joint_offset[k]]]
+            force = mass * data.gravity[0]
             body_force = -wp.spatial_vector(force, wp.vec3()) - _external_at_origin(
-                child, wp.vec3(), body_f, body_flags
+                child, wp.vec3(), f.body_f, f.body_flags
             )
             if wp.static(welded):
                 for k in range(weld_start[local], weld_start[local + 1]):
-                    body = joint_child[root_joint + weld_joint_offset[k]]
-                    body_force -= _external_at_origin(body, wp.vec3(), body_f, body_flags)
+                    body = p.joint_child[root_joint + weld_joint_offset[k]]
+                    body_force -= _external_at_origin(body, wp.vec3(), f.body_f, f.body_flags)
             linear = wp.spatial_top(motion)
-            leaf_inertia = mass * wp.dot(linear, linear) + armature[dof]
-        q = joint_q[joint_q_start[root_joint] + local]
-        qd = joint_qd[dof]
-        row = drive_row_by_dof[dof]
+            leaf_inertia = mass * wp.dot(linear, linear) + data.armature[dof]
+        q = f.joint_q[data.joint_q_start[root_joint] + local]
+        qd = f.joint_qd[dof]
+        row = f.drive_row[dof]
         u0, stiffness = drive_terms(
             row,
             dof,
-            joint_q_start[root_joint] + local,
-            joint_q,
-            joint_qd,
-            dt,
+            data.joint_q_start[root_joint] + local,
+            f.joint_q,
+            f.joint_qd,
+            f.dt,
             drive_target_index_by_dof,
             joint_target_ke,
             joint_target_kd,
             joint_target_pos,
             joint_target_vel,
-            damping,
+            f.damping,
         )
         value = coordinate_force(
             motion,
             body_force,
-            joint_f[dof],
-            spring_stiffness[dof],
-            spring_ref[joint_q_start[root_joint] + local],
-            damping[dof],
+            f.joint_f[dof],
+            f.stiffness[dof],
+            f.reference[data.joint_q_start[root_joint] + local],
+            f.damping[dof],
             q,
             qd,
         )
         refresh = mass_update_mask[art] != 0
         if row >= 0:
-            if row_K[row] != stiffness:
+            if f.row_K[row] != stiffness:
                 refresh = True
         inverse = float(0.0)
         if refresh:
             inverse = 1.0 / (leaf_inertia + stiffness)
         else:
             inverse = diagonal_inverse_mass[dof]
-        passive = spring_damper_stiffness(0.0, damping[dof], 0.0, dt)
+        passive = spring_damper_stiffness(0.0, f.damping[dof], 0.0, f.dt)
         drive = stiffness - passive
         limit = joint_effort_limit[dof]
         if drive > 0.0 and limit > 0.0:
@@ -388,51 +356,25 @@ def class_kernels(turns: bool, welded: bool) -> tuple[wp.Kernel, wp.Kernel, wp.K
                 inverse = 1.0 / (leaf_inertia + stiffness)
                 refresh = True
             elif u0 != limited:
-                rows = (v_out[dof] - v_hat[dof]) / dt
+                rows = (data.v_out[dof] - f.vhat[dof]) / f.dt
                 u0 = free_drive_force(u0, limited, drive, trial, rows, leaf_inertia + passive, limit)
         if refresh:
             diagonal_inverse_mass[dof] = inverse
         if row >= 0:
-            row_K[row] = stiffness
+            f.row_K[row] = stiffness
         qdd = (value + u0) * inverse
-        if kinematic_dof_mask[dof] != 0:
+        if data.kinematic_dof_mask[dof] != 0:
             qdd = 0.0
-        joint_qdd[dof] = qdd
-        v_hat[dof] = predictor_qd[dof] + qdd * dt
+        f.qdd[dof] = qdd
+        f.vhat[dof] = f.predictor_qd[dof] + qdd * f.dt
 
     def finish(
         n: int,
-        group_to_art: wp.array[int],
-        dof_joint_offset: wp.array[int],
-        articulation_start: wp.array[int],
-        articulation_dof_start: wp.array[int],
-        joint_child: wp.array[int],
-        joint_parent: wp.array[int],
-        joint_q_start: wp.array[int],
-        joint_dof_dim: wp.array2d[int],
-        joint_X_p: wp.array[wp.transform],
-        joint_X_c: wp.array[wp.transform],
-        joint_axis: wp.array[wp.vec3],
+        p: GroupTrees,
+        data: PublicationData,
         weld_start: wp.array[int],
         weld_joint_offset: wp.array[int],
-        body_com: wp.array[wp.vec3],
-        kinematic_dof_mask: wp.array[int],
-        kinematic_joint_mask: wp.array[int],
-        joint_q: wp.array[float],
-        joint_qd: wp.array[float],
-        dt: float,
         inv_dt: float,
-        # in/out
-        v_out: wp.array[float],
-        # outputs
-        joint_qdd: wp.array[float],
-        joint_q_new: wp.array[float],
-        joint_qd_new: wp.array[float],
-        body_q: wp.array[wp.transform],
-        body_qd: wp.array[wp.spatial_vector],
-        joint_S_s: wp.array[wp.spatial_vector],
-        articulation_origin: wp.array[wp.vec3],
-        current_valid: wp.array[int],
         source: wp.array[wp.uint64],
         bank: wp.uint64,
     ):
@@ -441,61 +383,71 @@ def class_kernels(turns: bool, welded: bool) -> tuple[wp.Kernel, wp.Kernel, wp.K
         element = wp.tid()
         group = element // n
         local = element - group * n
-        art = group_to_art[group]
-        root_joint = articulation_start[art]
-        joint = root_joint + dof_joint_offset[local]
-        dof = articulation_dof_start[art] + local
-        coordinate = joint_q_start[root_joint] + local
-        qd = joint_qd[dof]
+        art = p.group_to_art[group]
+        root_joint = p.art_joint_start[art]
+        joint = root_joint + p.dof_joint[local]
+        dof = p.art_dof_start[art] + local
+        coordinate = data.joint_q_start[root_joint] + local
+        qd = data.joint_qd[dof]
         qdd = float(0.0)
-        if kinematic_dof_mask[dof] != 0:
-            v_out[dof] = qd
+        if data.kinematic_dof_mask[dof] != 0:
+            data.v_out[dof] = qd
         else:
-            qdd = (v_out[dof] - qd) * inv_dt
-        joint_qdd[dof] = qdd
-        q = joint_q[coordinate]
+            qdd = (data.v_out[dof] - qd) * inv_dt
+        data.joint_qdd[dof] = qdd
+        q = data.joint_q[coordinate]
         q_new = q
         qd_new = qd
-        if kinematic_joint_mask[joint] == 0:
-            qd_new = qd + qdd * dt
-            q_new = q + qd_new * dt
-        joint_q_new[coordinate] = q_new
-        joint_qd_new[dof] = qd_new
-        X_root = _root_pose(joint_X_p, joint_X_c, root_joint)
-        X_wpj = X_root * joint_X_p[joint]
-        axis = joint_axis[dof]
-        child = joint_child[joint]
+        if data.kinematic_joint_mask[joint] == 0:
+            qd_new = qd + qdd * data.dt
+            q_new = q + qd_new * data.dt
+        data.joint_q_new[coordinate] = q_new
+        data.joint_qd_new[dof] = qd_new
+        X_root = _root_pose(data.joint_X_p, data.joint_X_c, root_joint)
+        X_wpj = X_root * data.joint_X_p[joint]
+        axis = data.joint_axis[dof]
+        child = p.joint_child[joint]
         angular = False
         origin = wp.vec3()
         if wp.static(turns):
-            angular = joint_dof_dim[joint, 1] != 0
-            origin = wp.transform_point(X_root, body_com[joint_child[root_joint]])
-        pose = _leaf_pose(X_root, joint_X_p[joint], angular, axis, q_new, joint_X_c[joint])
-        body_q[child] = pose
+            angular = data.joint_dof_dim[joint, 1] != 0
+            origin = wp.transform_point(X_root, data.body_com[p.joint_child[root_joint]])
+        pose = _leaf_pose(X_root, data.joint_X_p[joint], angular, axis, q_new, data.joint_X_c[joint])
+        data.body_q[child] = pose
         motion = _leaf_motion(X_wpj, origin, angular, axis)
-        joint_S_s[dof] = motion
+        data.joint_S_s[dof] = motion
         twist = motion * qd_new
         velocity = twist
         if wp.static(turns):
             # The centre of mass's velocity: the twist about the origin at the body's centre of mass.
-            radius = wp.transform_point(pose, body_com[child]) - origin
+            radius = wp.transform_point(pose, data.body_com[child]) - origin
             velocity = wp.spatial_vector(point_velocity(twist, radius), wp.spatial_bottom(twist))
-        body_qd[child] = velocity
+        data.body_qd[child] = velocity
         if wp.static(welded):
             # The welded bodies ride on the leaf's twist.
             for k in range(weld_start[local], weld_start[local + 1]):
                 weld = root_joint + weld_joint_offset[k]
-                body = joint_child[weld]
-                welded_pose = _weld_pose(body_q[joint_parent[weld]], joint_X_p[weld], joint_X_c[weld])
-                body_q[body] = welded_pose
+                body = p.joint_child[weld]
+                welded_pose = _weld_pose(
+                    data.body_q[data.joint_parent[weld]], data.joint_X_p[weld], data.joint_X_c[weld]
+                )
+                data.body_q[body] = welded_pose
                 if wp.static(turns):
-                    radius = wp.transform_point(welded_pose, body_com[body]) - origin
-                    body_qd[body] = wp.spatial_vector(point_velocity(twist, radius), wp.spatial_bottom(twist))
+                    radius = wp.transform_point(welded_pose, data.body_com[body]) - origin
+                    data.body_qd[body] = wp.spatial_vector(point_velocity(twist, radius), wp.spatial_bottom(twist))
                 else:
-                    body_qd[body] = twist
+                    data.body_qd[body] = twist
         if local == 0:
             _publish_root(
-                art, root_joint, X_root, joint_child, body_com, body_q, body_qd, articulation_origin, current_valid
+                art,
+                root_joint,
+                X_root,
+                p.joint_child,
+                data.body_com,
+                data.body_q,
+                data.body_qd,
+                data.articulation_origin,
+                data.fk_id_cache_valid,
             )
             source[group] = bank
 
@@ -661,9 +613,18 @@ class CoordinateTrees:
         self.sparse = self
         device = solver.model.device
         self.group_count = int(group.trees.size)
-        self.group_to_art = wp.array(group.trees, dtype=int, device=device)
-        self.dof_joint_offset = solver.forest.crba_dof_joint_offset_by_size[group.size]
-        self._cache_to_art = self.group_to_art.reshape((self.group_count, 1))
+        # The group's trees as every held group binds them (GROUP_TREES): each coordinate's joint is its leaf's.
+        self.trees = field_group.upload(
+            GroupTrees,
+            device,
+            dof_joint=solver.forest.crba_dof_joint_offset_by_size[group.size],
+            group_to_art=group.trees,
+            art_to_world=solver.forest.art_to_world,
+            art_dof_start=solver.forest.articulation_dof_start,
+            art_joint_start=solver.model.articulation_start,
+            joint_child=solver.model.joint_child,
+        )
+        self._cache_to_art = self.trees.group_to_art.reshape((self.group_count, 1))
         # The family holds no geometry cache; invalidation clears this flag only.
         self._geometry_valid = wp.zeros(self.group_count, dtype=int, device=device)
         # Each articulation's stamp: the address of the coordinates its cache was published into (0: none).
@@ -764,36 +725,22 @@ class CoordinateTrees:
         (``bank_compare`` is ``False``).
         """
         del stage3_qd, state_out
-        solver, model = self.solver, self.solver.model
+        solver = self.solver
         wp.launch(
             self.repair_kernel,
             dim=self.group_count * _REPAIR_LANES,
             inputs=[
                 self.size,
-                self.group_to_art,
-                self.dof_joint_offset,
-                model.articulation_start,
-                solver.forest.articulation_dof_start,
-                solver.factor.fk_id_cache_valid,
+                self.trees,
+                cached_state_binding.publication(solver, state_in, state_aug, state_in, dt),
+                self.weld_start,
+                self.weld_joint_offset,
                 self._source,
                 wp.uint64(state_in.joint_q.ptr),
                 solver.factor.clock,
-                dt,
-                model.joint_child,
-                model.joint_parent,
-                model.joint_q_start,
-                model.joint_dof_dim,
-                model.joint_X_p,
-                model.joint_X_c,
-                model.joint_axis,
-                self.weld_start,
-                self.weld_joint_offset,
-                model.body_com,
-                state_in.joint_q,
             ],
-            outputs=[state_in.body_q, state_aug.joint_S_s, solver.factor.articulation_origin],
             block_dim=REPAIR_BLOCK_DIM,
-            device=model.device,
+            device=solver.model.device,
         )
 
     def refresh(self, state_aug):
@@ -802,97 +749,57 @@ class CoordinateTrees:
     def predict(self, state_in, state_aug, control, stage3_qd, dt):
         """Form each leaf's force and refresh, solve and predict its coordinate, deciding its drive's saturation."""
         solver, model = self.solver, self.solver.model
-        inputs = [
-            self.size,
-            self.group_to_art,
-            self.dof_joint_offset,
-            model.articulation_start,
-            solver.forest.articulation_dof_start,
-            model.joint_child,
-            model.joint_q_start,
-            self.weld_start,
-            self.weld_joint_offset,
-            state_aug.joint_S_s,
-            state_in.body_q,
-            model.body_com,
-            model.body_mass,
-            model.body_inertia,
-            model.body_flags,
-            state_in.body_f,
-            solver.factor.articulation_origin,
-            model.gravity,
-            control.joint_f,
-            state_in.joint_q,
-            state_in.joint_qd,
-            stage3_qd,
-            solver.factor.passive_spring_stiffness,
-            solver.factor.passive_spring_ref,
-            solver.factor.passive_joint_damping,
-            solver.factor.kinematic_dof_mask,
-            solver.factor.mass_update_mask,
-            solver.factor.dof_armature,
-            solver.factor.drive_row_by_dof,
-            solver.factor.drive_target_index_by_dof,
-            model.joint_target_ke,
-            model.joint_target_kd,
-            control.joint_target_q,
-            control.joint_target_qd,
-            model.joint_effort_limit,
-            dt,
-            solver.v_out,
-            solver.factor.diagonal_inverse_mass,
-            solver.factor.aug_row_K,
-        ]
+        force = field_group.bind(
+            ForceInput,
+            solver=solver,
+            factor=solver.factor,
+            model=model,
+            state_in=state_in,
+            state_aug=state_aug,
+            control=control,
+            predictor_qd=stage3_qd,
+            dt=dt,
+            stage_clocks=cached_state_binding.stage_clocks(solver),
+            predicted_twist=solver._arrays.placeholder(wp.spatial_vector),
+            publish_twists=0,
+        )
         wp.launch(
             self.predictor_kernel,
             dim=self.group_count * self.size,
-            inputs=inputs,
-            outputs=[state_aug.joint_qdd, solver.v_hat],
+            inputs=[
+                self.size,
+                self.trees,
+                cached_state_binding.publication(solver, state_in, state_aug, state_in, dt),
+                force,
+                self.weld_start,
+                self.weld_joint_offset,
+                solver.factor.mass_update_mask,
+                solver.factor.drive_target_index_by_dof,
+                model.joint_target_ke,
+                model.joint_target_kd,
+                control.joint_target_q,
+                control.joint_target_qd,
+                model.joint_effort_limit,
+                solver.factor.diagonal_inverse_mass,
+            ],
             device=model.device,
         )
 
     def finish(self, state_in, state_aug, state_out, dt):
         """Convert the solved velocity, integrate once and publish the next state."""
-        solver, model = self.solver, self.solver.model
-        inputs = [
-            self.size,
-            self.group_to_art,
-            self.dof_joint_offset,
-            model.articulation_start,
-            solver.forest.articulation_dof_start,
-            model.joint_child,
-            model.joint_parent,
-            model.joint_q_start,
-            model.joint_dof_dim,
-            model.joint_X_p,
-            model.joint_X_c,
-            model.joint_axis,
-            self.weld_start,
-            self.weld_joint_offset,
-            model.body_com,
-            solver.factor.kinematic_dof_mask,
-            solver.factor.kinematic_joint_mask,
-            state_in.joint_q,
-            state_in.joint_qd,
-            dt,
-            1.0 / dt,
-            solver.v_out,
-        ]
+        solver = self.solver
         wp.launch(
             self.finish_kernel,
             dim=self.group_count * self.size,
-            inputs=inputs,
-            outputs=[
-                state_aug.joint_qdd,
-                state_out.joint_q,
-                state_out.joint_qd,
-                state_out.body_q,
-                state_out.body_qd,
-                state_aug.joint_S_s,
-                solver.factor.articulation_origin,
-                solver.factor.fk_id_cache_valid,
+            inputs=[
+                self.size,
+                self.trees,
+                cached_state_binding.publication(solver, state_in, state_aug, state_out, dt),
+                self.weld_start,
+                self.weld_joint_offset,
+                1.0 / dt,
                 self._source,
                 wp.uint64(state_out.joint_q.ptr),
             ],
-            device=model.device,
+            device=solver.model.device,
         )
