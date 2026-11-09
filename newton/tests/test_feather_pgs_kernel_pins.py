@@ -36,7 +36,7 @@ import warp as wp
 
 from newton._src.solvers.feather_pgs import environment_flags
 from newton._src.solvers.feather_pgs.sweep import EXACT, LevelLaw
-from newton.tests.feather_pgs_law_harness import built, keyed_classes
+from newton.tests.feather_pgs_law_harness import built, tier_classes
 
 _PINS = os.path.join(os.path.dirname(__file__), "golden_data", "test_feather_pgs_kernel_pins", "pins.json")
 _PACKAGE = "newton._src.solvers.feather_pgs"
@@ -67,21 +67,16 @@ def _linked_tier_calls():
         yield "sweep_routes_tiers.TierSweep", (64, 32, 18, _ARCH), kwargs
 
 
-def _keyed_layout(*, velocity_limits=False):
-    """The 16+6 coordinate layout of the keyed-row sweeps.
+def _emit_tier(*args, **kwargs):
+    """A parallel tier that walks its rows' seeds (the one writer's EMIT sink), over chains of its trees' sizes."""
+    from newton._src.solvers.feather_pgs import sweep_routes_tiers  # noqa: PLC0415
 
-    ``velocity_limits`` gives the 16 primary coordinates joint velocity limits, as a
-    solver with ``enable_joint_velocity_limits`` plans them (the free block has none).
-    """
-    from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout  # noqa: PLC0415
-
-    if velocity_limits:
-        return KeyedLayout(16, 6, 0, 16, 128, True, (1 << 16) - 1)
-    return KeyedLayout(16, 6, 0, 16, 128, False, 0)
+    sizes = kwargs["inkernel_response"][:2]
+    return built(sweep_routes_tiers.TierSweep)(*args, emit=True, classes=tier_classes(sizes), **kwargs)
 
 
-def _keyed_tier_kwargs(*, linked):
-    """Keyed parallel tiers; ``linked`` selects the patch row law and the ring-pooled projection."""
+def _emit_tier_kwargs(*, linked):
+    """Seeded parallel tiers of a 16+6 coordinate world; ``linked`` selects the ring-pooled projection."""
     for rows in (32, 64, 96, 128):
         kwargs = {"rows": rows, "levels": LevelLaw.split(24), "inkernel_response": (16, 6, 0, 16)}
         if linked:
@@ -129,14 +124,11 @@ def _suite_diagonal_sweeps():
         yield shape, {"speculative_contact_batches": True, "levels": LevelLaw(EXACT)}
 
 
-def _keyed_last_word_calls():
-    """Linked keyed tiers of a velocity-limited layout with the last-word pass.
-
-    The solver builds the pass for linked tiers only with joint velocity limits, so these
-    tiers read a layout that plans velocity-limit rows.
-    """
-    for kwargs in _keyed_tier_kwargs(linked=True):
-        yield (_keyed_layout(velocity_limits=True), 128, 32, 22, _ARCH), {**kwargs, "velocity_limit_pass": True}
+def _emit_last_word_calls():
+    """Linked seeded tiers with the last-word pass, which the solver builds for linked tiers with joint velocity
+    limits."""
+    for kwargs in _emit_tier_kwargs(linked=True):
+        yield (128, 32, 22, _ARCH), {**kwargs, "velocity_limit_pass": True}
 
 
 def _audit_calls():
@@ -281,6 +273,14 @@ def _dense_build_calls():
             (0, False, True, tables, *tail),
             {},
         )
+    # The EMIT sink's variant, where a class's tiers walk their rows' seeds: plain and by support classes.
+    for classes in (False, True):
+        yield (
+            "walk_rows.walked_rows_kernel",
+            walk_rows.walked_rows_kernel.__wrapped__,
+            (0, False, True, tables, 0, classes, True),
+            {},
+        )
     # The sparse diagonal's one writer, the star's walker on the same classes.
     yield "walk_rows.slot_rows_kernel", walk_rows.slot_rows_kernel.__wrapped__, (True, tables), {}
     # With velocity-limit rows: a key's joint row is one step to the world, into a slot.
@@ -356,19 +356,15 @@ def _suite_shape_calls():
 
     Each call reproduces the kernel name its route records and, where a head
     profile ran the route, the profile's kernel suffix: the matrix-free
-    Gauss-Seidel, sparse, sparse-diagonal and keyed parallel sweeps, the keyed
-    limit rows, the sparse mass factors and the sparse contact responses. A byte-identical
+    Gauss-Seidel, sparse, sparse-diagonal and seeded parallel sweeps, the sparse
+    mass factors and the sparse contact responses. A byte-identical
     rewrite of their generators then keeps the binaries the suite runs.
     """
     from newton._src.solvers.feather_pgs import (  # noqa: PLC0415
-        keyed_row_layout,
-        keyed_rows,
         sweep_routes,
         sweep_routes_diag,
         sweep_routes_sparse,
-        sweep_routes_tiers,
     )
-    from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout  # noqa: PLC0415
 
     no_limits = {"has_dense_velocity_limit_rows": False}
     factory = built(sweep_routes.GeneralSweep)
@@ -385,41 +381,24 @@ def _suite_shape_calls():
     for args, kwargs in _suite_diagonal_sweeps():
         yield "sweep_routes_diag.DiagonalSweep", factory, args, kwargs
 
-    def parallel(layout, *args, **kwargs):
-        return built(sweep_routes_tiers.TierSweep)(*args, keyed=layout, classes=keyed_classes(layout), **kwargs)
-
-    def limit_prefix(layout):
-        return keyed_row_layout.prefix_kernel.__wrapped__(layout, keyed_rows.PrefixInput, keyed_rows.KineticRows)
-
-    # The tiers read only a layout's coordinate blocks; its limit masks shape the limit rows.
-    limited = KeyedLayout(16, 6, 0, 16, 128, True, 0xFFFF, 0xFFFF)
-    single = KeyedLayout(18, 0, 0, 0, 48, False, 0)
-    for layout, shape, tiers in (
-        (limited, (192, 64, 22, _ARCH), (32, 64, 96, 128)),
-        (single, (72, 32, 18, _ARCH), (32, 48)),
+    for shape, blocks, tiers in (
+        ((192, 64, 22, _ARCH), (16, 6, 0, 16), (32, 64, 96, 128)),
+        ((72, 32, 18, _ARCH), (18, 0, 0, 0), (32, 48)),
     ):
-        blocks = (layout.primary, layout.secondary, layout.primary_offset, layout.secondary_offset)
         for rows in tiers:
             kwargs = {"rows": rows, "levels": LevelLaw.split(24), "inkernel_response": blocks}
-            yield "sweep_routes_tiers.TierSweep[keyed]", parallel, (layout, *shape), kwargs
-    yield "keyed_row_layout.prefix_kernel", limit_prefix, (limited,), {}
+            yield "sweep_routes_tiers.TierSweep[emit]", _emit_tier, shape, kwargs
 
 
-def _keyed_row_calls():
-    """Keyed rows of a 16+6 coordinate world (keyed_rows.py), including their parallel tiers."""
-    from newton._src.solvers.feather_pgs import sweep_routes_tiers  # noqa: PLC0415
-
-    def parallel(layout, *args, **kwargs):
-        return built(sweep_routes_tiers.TierSweep)(*args, keyed=layout, classes=keyed_classes(layout), **kwargs)
-
-    layout = _keyed_layout()
-    for kwargs in _keyed_tier_kwargs(linked=False):
-        yield "sweep_routes_tiers.TierSweep[keyed]", parallel, (layout, 128, 32, 22, _ARCH), kwargs
+def _emit_tier_calls():
+    """The seeded parallel tiers of a 16+6 coordinate world, plain, linked and with the last-word pass."""
+    for kwargs in _emit_tier_kwargs(linked=False):
+        yield "sweep_routes_tiers.TierSweep[emit]", _emit_tier, (128, 32, 22, _ARCH), kwargs
     # The same rows linked into their patch rings.
-    for kwargs in _keyed_tier_kwargs(linked=True):
-        yield "sweep_routes_tiers.TierSweep[keyed]", parallel, (layout, 128, 32, 22, _ARCH), kwargs
-    for args, kwargs in _keyed_last_word_calls():
-        yield "sweep_routes_tiers.TierSweep[keyed]", parallel, args, kwargs
+    for kwargs in _emit_tier_kwargs(linked=True):
+        yield "sweep_routes_tiers.TierSweep[emit]", _emit_tier, (128, 32, 22, _ARCH), kwargs
+    for args, kwargs in _emit_last_word_calls():
+        yield "sweep_routes_tiers.TierSweep[emit]", _emit_tier, args, kwargs
 
 
 def _factory_kernels():
@@ -432,7 +411,7 @@ def _factory_kernels():
         _dense_build_calls(),
         _solver_factory_calls(),
         _suite_shape_calls(),
-        _keyed_row_calls(),
+        _emit_tier_calls(),
         _readout_calls(),
         _audit_calls(),
     ):
@@ -570,7 +549,7 @@ class TestFeatherPGSKernelPins(unittest.TestCase):
             "sweep_levels._get_sparse_contact_levels_kernel",
             "sweep_levels._get_mark_independent_sparse_contact_candidates_kernel",
             "sweep_routes_tiers.TierSweep",
-            "sweep_routes_tiers.TierSweep[keyed]",
+            "sweep_routes_tiers.TierSweep[emit]",
             "row_slots.allocate_world_contact_slots",
             "walk_rows.slot_rows_kernel",
             "walk_rows.walked_rows_kernel",
@@ -593,9 +572,9 @@ class TestFeatherPGSKernelPins(unittest.TestCase):
         # The linked tiers are pinned.
         linked = [name for name in self.current if "linked_rows=True" in name]
         self.assertTrue(linked)
-        # Their last-word velocity-limit pass, in the plain and the keyed-row tiers.
+        # Their last-word velocity-limit pass, in the plain and the seeded tiers.
         last_word = {name.split("(", 1)[0] for name in linked if "velocity_limit_pass=True" in name}
-        self.assertEqual(last_word, {"sweep_routes_tiers.TierSweep", "sweep_routes_tiers.TierSweep[keyed]"})
+        self.assertEqual(last_word, {"sweep_routes_tiers.TierSweep", "sweep_routes_tiers.TierSweep[emit]"})
 
     def test_inventory_builds_the_suite_shapes(self):
         """Build every factory call at the suite's shapes; the suite's routes build them, so none may be rejected."""

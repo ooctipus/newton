@@ -3,7 +3,7 @@
 """The contact row's law: its records, its position-pass rhs and its Jacobian entries.
 
 Every contact row producer writes a contact's rows here (:func:`write_contact_row`): the one writer
-(:mod:`.walk_rows`), the keyed rows and the compact contact boundary. Each producer forms the
+(:mod:`.walk_rows`) and the compact contact boundary. Each producer forms the
 contact's front end once (:func:`.contact_input.contact_frame`) and takes the friction row law (:class:`PatchRowLaw`):
 a contact owns tangent rows where the allocation reserved them, and they follow the patch row law. Point friction is
 the patch law with beta 0, a disabled view and a zero phi: its tangent rows act at the contact's point.

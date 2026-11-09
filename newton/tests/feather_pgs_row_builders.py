@@ -7,30 +7,23 @@
 size, the kernels that build the dense contact rows outside the sweep, in launch
 order. :func:`assert_row_builders_named` requires those names to be exactly the
 contact-row builders among the kernels one recorded step launched, in that order
-and with one launch per step. The module also holds the keyed-row CPU
-stand-in the record tests share. It defines no tests.
+and with one launch per step. It defines no tests.
 """
 
 import collections
 import contextlib
-import dataclasses
 from unittest import mock
 
 import warp as wp
 
-from newton._src.solvers.feather_pgs import class_plan, keyed_rows
-from newton._src.solvers.feather_pgs.step_plan import StepPlan
-
 # Every kernel a contact-row producer launches to write dense contact rows outside the sweep: the one writer, the
-# compact contact boundary and keyed rows. The free-body matrix-free rows follow the allocation path, not a producer.
+# compact contact boundary. The free-body matrix-free rows follow the allocation path, not a producer.
 # Add every new producer kernel here: a launched builder missing from this list is invisible to the check below.
 ROW_BUILDER_KERNELS = frozenset(
     (
         "write_walked_rows",
         "write_slot_rows",
         "produce_contacts",
-        "scatter_contact_keys",
-        "keyed_general_units",
     )
 )
 # Kernels their factories name: the support placement's writer (its units and its walkers), the sparse-diagonal
@@ -62,33 +55,6 @@ def launched_kernels():
 
     with mock.patch.multiple(wp, launch=recording(wp.launch), launch_tiled=recording(wp.launch_tiled)):
         yield keys
-
-
-def install_cpu_keyed_rows(solver):
-    """Install keyed rows on a CPU solver, with stand-ins for the matrix-free world layout they read.
-
-    The CUDA admission (keyed_rows.create_owner) needs the in-kernel parallel sweep's class (case K4); these
-    stand-ins give the solver that case, one articulation per world and no matrix-free rows. A solver that
-    shares another's friction patches must take them before this call, since the owner binds the patch law here.
-    """
-    model = solver.model
-    solver.forest = dataclasses.replace(
-        solver.forest,
-        max_world_dofs=int(model.joint_dof_count) // solver.forest.world_count,
-        articulation_world_dof_offset=wp.zeros(model.articulation_count, dtype=int, device=model.device),
-    )
-    solver.placement.mf_constraint_count = wp.zeros(solver.forest.world_count, dtype=int, device=model.device)
-    # Case K4's tiers of four rows; its class walks: the tiers walk their keyed rows in the kernel, the one writer the
-    # general worlds' rows.
-    sizes, meta, _ = class_plan.tier_response(solver.forest.shape)
-    classes = dataclasses.replace(solver.spec.classes, tiers=class_plan.Tiers(sizes, meta, rows=4))
-    solver.spec = dataclasses.replace(solver.spec, classes=classes)
-    solver.placement.classes = solver.sweep.classes = classes
-    solver.placement.walks = True
-    route = dataclasses.replace(solver._plan.route, support="dense", producer="keyed_rows")
-    solver.placement.keyed_rows = keyed_rows.KeyedRows(solver)
-    # The step's stages are chosen from the class at construction: the keyed class stages its own.
-    solver._plan = StepPlan.build(solver.spec, route, solver)
 
 
 def assert_row_builders_named(test, contact_rows, keys):

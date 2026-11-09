@@ -556,9 +556,8 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
     # The row pass, its families in the launch order that is the slot order (rows.py): each family a class holds. The
     # joint families' rows are seeds the one writer walks: a class that walks no rows has no responding coordinate, and
     # holds none (no contact is admitted there either).
-    keyed = placement.keyed_rows is not None
     holds = placement.walks
-    limit_sizes = laws.limit_sizes(solver) if solver.options.enable_joint_limits and holds and not keyed else ()
+    limit_sizes = laws.limit_sizes(solver) if solver.options.enable_joint_limits and holds else ()
 
     def begin_rows(step):
         laws.begin(solver, step.state_in, factor, step.dt)
@@ -605,18 +604,14 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
     def claim_worlds(step):
         sweep.claim_worlds()
 
-    def finish_keyed(step):
-        placement.keyed_rows.finish_rows()
-
-    # The dense rows' family bounds exist where the row pass holds the dense rows' order (no keyed rows).
-    bounds = not keyed
     run = placement.free_contact_rows
 
     # The rows a world's topology fixes (links, mimics, limits) are known once their families are written, before the
-    # contacts: where the family bound holds them and the one writer walks the general placement's rows, it walks them
-    # beside the contact pass (Beside) and the rest after it, the two parts joined before the rest. Their diagonals
-    # start from zero before them.
-    topology = Beside(model.device) if holds and bounds and route.support == "dense" else None
+    # contacts: where the one writer walks the general placement's rows and its sink does not wait for the counts (no
+    # tier walks its rows), it walks them beside the contact pass (Beside) and the rest after it, the two parts joined
+    # before the rest. Their diagonals start from zero before them.
+    split = holds and route.support == "dense" and placement.row_seeds.tiers == 0
+    topology = Beside(model.device) if split else None
 
     def write_topology_rows(step):
         if placement.clears_diagonals:
@@ -629,9 +624,9 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
         *((write_links,) if laws.link_count > 0 and holds else ()),
         *((prepare_fused_limits,) if spec.classes.fused_sizes else ()),
         *((write_limits,) if limit_sizes else ()),
-        *((bound_limits,) if bounds else ()),
-        *((write_velocity_limits,) if laws.velocity_limit_warp_kernels and holds and not keyed else ()),
-        *((bound_velocity_limits,) if bounds else ()),
+        bound_limits,
+        *((write_velocity_limits,) if laws.velocity_limit_warp_kernels and holds else ()),
+        bound_velocity_limits,
         *((write_topology_rows,) if topology is not None else ()),
         write_contacts,
         # The free bodies' run (their contacts and speed rows) where a colored world holds one, else the line's speed
@@ -645,10 +640,9 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
         ),
         *((write_free_bodies,) if run else ()),
         finalize_dense,
-        # The claim stage: each world into its claim's bucket once the counts are final; the keyed rows' hand-off, the
-        # one writer, the unit builder and the sweeps walk their buckets.
+        # The claim stage: each world into its claim's bucket once the counts are final; the unit builder and the
+        # sweeps walk their buckets.
         *((claim_worlds,) if sweep.claims is not None else ()),
-        *((finish_keyed,) if keyed else ()),
     )
 
     def link_patches(step):

@@ -253,40 +253,6 @@ class TestFeatherPGSJointNotification(unittest.TestCase):
         model.joint_axis.assign(axes)
         self.assertEqual(invalidating_launches(JOINT), [])
 
-    def test_refused_notification_stores_no_moved_frame(self):
-        """Store no moved frame in the held-tree proof when a row owner refuses the notification.
-
-        The proof stores a moved frame as its new reference, so it runs after every check that can
-        still refuse the notification. A refusal changes no cache, and the next notification still
-        finds the frame moved and invalidates every cache instead of keeping caches built from the
-        old frame.
-        """
-        model = _build(wp.get_device("cpu"), worlds=2)
-        solver = SolverFeatherPGS(model)
-        owner = solver.factor.held
-        self.assertIsInstance(owner, HeldTree)
-        validity_arrays = [solver.factor.fk_id_cache_valid, *(group.geometry_valid for group in owner.groups)]
-
-        def refuse(flags):
-            raise RuntimeError("Row topology changed; reconstruct the solver")
-
-        refusal = SimpleNamespace(validate_notification=refuse)
-        frames = model.joint_X_p.numpy().copy()
-        moved = frames.copy()
-        moved[_fixed_root(model, 1), 2] += 0.25
-        # Move the root: a move the refused notification must not store.
-        for array in validity_arrays:
-            array.fill_(1)
-        model.joint_X_p.assign(moved)
-        with (
-            patch.object(solver.placement, "keyed_rows", refusal),
-            self.assertRaisesRegex(RuntimeError, "Row topology"),
-        ):
-            solver.notify_model_changed(JOINT)
-        self.assertEqual([int(array.numpy().min()) for array in validity_arrays], [1] * len(validity_arrays))
-        solver.notify_model_changed(JOINT)
-        self.assertEqual([int(array.numpy().max()) for array in validity_arrays], [0] * len(validity_arrays))
-
     @unittest.skipUnless(wp.is_cuda_available(), "Held-tree owners are a CUDA path")
     def test_cuda_joint_notification_every_step_repairs_nothing(self):
         """Repair no group when a proven joint notification precedes every step, for every owner kind.

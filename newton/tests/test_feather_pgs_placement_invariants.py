@@ -28,7 +28,9 @@ def _gaps(scene, device, steps, pins=None, solvers=None):
     model = scene.build(device)
     pipeline = newton.CollisionPipeline(model, growable_contacts=True)
     contacts = pipeline.contacts()
-    solver = SolverFeatherPGS(model, pins=SolverFeatherPGS.Pins(**(pins or {})), **scene.solver_options)
+    # The invariant reads the stored rows: the tiers' worlds take the one writer's STORE sink.
+    pins = {"sink": "store", **(pins or {})}
+    solver = SolverFeatherPGS(model, pins=SolverFeatherPGS.Pins(**pins), **scene.solver_options)
     if solvers is not None:
         solvers.append(solver)
     state, out, control = model.state(), model.state(), model.control()

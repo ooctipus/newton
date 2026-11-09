@@ -17,8 +17,8 @@ An entry's world coordinate is not stored; it follows from the layout, chosen fr
   its sides (:mod:`.factor.closure`);
 - by support class (:func:`row_classes`): each side its seeds' root paths, where only the general sweep reads the rows.
 
-Entries ascend with the world's coordinates in every layout; the rows are never cleared (the keyed tiers walk their
-worlds' rows in the kernel).
+Entries ascend with the world's coordinates in every layout; the rows are never cleared (a tier that walks its
+worlds' rows reads their seeds).
 """
 
 from __future__ import annotations

@@ -1362,9 +1362,9 @@ def report_walk() -> None:
 
 UNITS = (1, 2, 3, 4)
 """Rows a lane walks: a limit, a velocity limit's pair, a point contact, a contact with spin."""
-UNSTORED = ("sparse", "sparse_triplets", "keyed_parallel")
+UNSTORED = ("sparse", "sparse_triplets", "emit_parallel")
 """The CUDA catalogue's routes whose rows no store holds as ``J``, packed ``Z`` or the walk's slots: native sparse
-factors (rows in factor coordinates, whitened from a ``J`` in shared scratch) and the keyed rows."""
+factors (rows in factor coordinates, whitened from a ``J`` in shared scratch) and the tiers' seeded rows."""
 
 
 def devices() -> list:

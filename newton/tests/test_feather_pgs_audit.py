@@ -335,9 +335,9 @@ class TestAuditCUDA(TestAudit):
 
     def test_worlds_without_stored_rows_read_nan(self):
         """A world whose rows exist only inside its sweep reads NaN and is named, not skipped in silence."""
-        audit, record = self._route(scenes.legged(), conformance.KEYED_PARALLEL, 16)
-        self.assertTrue(np.all(np.isnan(audit["gap"])))
-        self.assertIn("keyed rows", record["reason"])
+        audit, record = self._route(scenes.legged(), conformance.EMIT_PARALLEL, 16)
+        self.assertTrue(np.any(np.isnan(audit["gap"])))
+        self.assertIn("tier walks their rows", record["reason"])
 
 
 if __name__ == "__main__":

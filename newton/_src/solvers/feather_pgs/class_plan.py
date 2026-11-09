@@ -168,7 +168,7 @@ def general_reason(pins) -> str | None:
     """Why every class keeps the general placement, or ``None``: the test pin ``placement="general"``. Each case's body
     runs on both devices (the CPU's one thread runs its lane group), so the device is no datum of the case.
     The bilateral pre-elimination is no general datum: its blocks close in the one writer's block phase, so each case
-    whose writer lacks that phase declines it in its own rule (K1's support writer, the keyed layout)."""
+    whose writer lacks that phase declines it in its own rule (K1's support writer)."""
     return first_failed(
         ((pins.placement != "general", "A test pin keeps the general placement (placement='general')."),)
     )

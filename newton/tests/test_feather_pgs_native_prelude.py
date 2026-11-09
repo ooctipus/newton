@@ -20,7 +20,6 @@ import unittest
 from pathlib import Path
 
 from newton._src.solvers.feather_pgs import device_preludes
-from newton._src.solvers.feather_pgs.contact_laws import CONTACT_LAW
 from newton._src.solvers.feather_pgs.device_preludes import (
     ARCHITECTURE_GUARD,
     CUDA_ONLY,
@@ -35,8 +34,8 @@ from newton._src.solvers.feather_pgs.projection_laws import PROJECTION_LAW
 from newton._src.solvers.feather_pgs.row_laws import ROW_LAW
 
 _PACKAGE = "newton._src.solvers.feather_pgs"
-# Law families whose structs native sweeps call (``Family::law(...)``).
-_FAMILIES = (CONTACT_LAW, ROW_LAW, PROJECTION_LAW)
+# Law families whose structs native sweeps call (``Family::law(...)``); the contact laws run in the one writer only.
+_FAMILIES = (ROW_LAW, PROJECTION_LAW)
 # Helper names a body may call only after declaring the prelude that defines them.
 _HELPERS = {
     **{f"{family.name}::": family.name for family in _FAMILIES},

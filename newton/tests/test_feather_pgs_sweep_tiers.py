@@ -20,7 +20,6 @@ from unittest import mock
 from newton._src.core.execution import Work, shape
 from newton._src.core.memory import Buffer, Staging, built_for
 from newton._src.solvers.feather_pgs import kernel_template, sweep_routes, sweep_routes_tiers
-from newton._src.solvers.feather_pgs.keyed_row_layout import KeyedLayout
 from newton._src.solvers.feather_pgs.response_operator import Lanes, TransposedResponse, WalkedRows
 from newton._src.solvers.feather_pgs.solve_policy import SolvePolicy, bound
 from newton._src.solvers.feather_pgs.sweep import (
@@ -36,7 +35,7 @@ from newton._src.solvers.feather_pgs.sweep import (
     sweep_kernel,
 )
 from newton._src.solvers.feather_pgs.sweep_routes_diag import DiagonalSweep
-from newton.tests.feather_pgs_law_harness import built, keyed_classes
+from newton.tests.feather_pgs_law_harness import built, tier_classes
 
 _TIER = built(sweep_routes_tiers.TierSweep)
 
@@ -51,8 +50,7 @@ _EXIT = "const bool sweep_stop = BALLOT(iteration_changed != 0) == 0u;"
 _BLOCK_EXIT = "const bool sweep_stop = !ANY(iteration_changed != 0);"
 _EXIT_TEXT = f"        {{\n            {_EXIT}\n            if (sweep_stop) break;\n        }}\n"
 
-_LAYOUT = KeyedLayout(12, 6, 0, 12, 32, False, 0, None)
-_CLASSES = keyed_classes(_LAYOUT)
+_CLASSES = tier_classes((12, 6))
 
 
 _INK = {"inkernel_response": (12, 6, 0, 12)}
@@ -61,15 +59,11 @@ CALLS = (
     # The conformance routes' configurations (32 rows, one warp), then the wider tiers and the other variants.
     ("whitened", (64, 32, 18, "120"), {"rows": 32, "levels": LevelLaw.split(112), **_INK}),
     ("whitened_linked", (64, 32, 18, "120"), {"rows": 32, "levels": LevelLaw.split(112), **_INK, "linked_rows": True}),
+    ("emit", (64, 32, 18, "120"), {"rows": 32, "levels": LevelLaw.split(112), **_INK, "emit": True, "classes": _CLASSES}),
     (
-        "keyed",
+        "emit_linked",
         (64, 32, 18, "120"),
-        {"rows": 32, "levels": LevelLaw.split(112), **_INK, "keyed": _LAYOUT, "classes": _CLASSES},
-    ),
-    (
-        "keyed_linked",
-        (64, 32, 18, "120"),
-        {"rows": 32, "levels": LevelLaw.split(112), **_INK, "keyed": _LAYOUT, "classes": _CLASSES, "linked_rows": True},
+        {"rows": 32, "levels": LevelLaw.split(112), **_INK, "emit": True, "classes": _CLASSES, "linked_rows": True},
     ),
     ("one_group", (64, 32, 18, "120"), {"rows": 32, "levels": LevelLaw.split(42), "inkernel_response": (18, 0, 0, 0)}),
     ("rows_64", (96, 32, 18, "120"), {"rows": 64, "levels": LevelLaw.split(60), **_INK}),
@@ -254,16 +248,16 @@ class TestResponseOperators(unittest.TestCase):
                 source = _source(args, kwargs)
                 self.assertNotIn("s_L", source)
                 # The change goes to the step's one leave in the walk's coordinates (no walk down in the sweep); the
-                # keyed rows walk their seeds, the others read the one writer's.
+                # seeded rows walk the seeds of the one writer's EMIT sink, the others read its stored rows.
                 self.assertIn("if (global_dof >= 0) walk.du.data[global_dof] += u;", source)
                 self.assertNotIn("WALK_DOWN", source)
-                keyed = "keyed" in kwargs
-                self.assertEqual("TIER_WALK(" in source, keyed)
-                self.assertEqual("incident = row_incident.data[off_dense + i];" in source, not keyed)
+                emit = "emit" in kwargs
+                self.assertEqual("TIER_WALK(" in source, emit)
+                self.assertEqual("incident = row_incident.data[off_dense + i];" in source, not emit)
                 self.assertIn("s_rhs[i] += incident;", source)
 
     def test_the_release_compiles_where_a_tree_can_slip(self):
-        """A slipping drive's release ``R`` (the walk's ``WALK_RELEASE``) on the keyed rows, only on the trees of the
+        """A slipping drive's release ``R`` (the walk's ``WALK_RELEASE``) on the seeded rows, only on the trees of the
         capacity the tier names; the stored rows carry ``R`` from their writer. Its transpose is the step's one leave's
         (``factor.walk.walk_leave_kernel``), never the tier's."""
         for label, args, kwargs in (CALLS[0], CALLS[2]):
@@ -271,8 +265,8 @@ class TestResponseOperators(unittest.TestCase):
                 self.assertNotIn("WALK_RELEASE(walk.release", _source(args, kwargs))
                 framed = _source(args, {**kwargs, "frame": (4, 0)})
                 self.assertNotIn("WALK_RELEASE_T(", framed)
-                keyed = "keyed" in kwargs
-                self.assertEqual(framed.count("WALK_RELEASE(walk.release, art_a"), 1 if keyed else 0)
+                emit = "emit" in kwargs
+                self.assertEqual(framed.count("WALK_RELEASE(walk.release, art_a"), 1 if emit else 0)
 
 
 def _kernel_sass():

@@ -28,8 +28,8 @@ corrected rows and targets agree on a closure; native sparse rows (:func:`sparse
 their own ``J_i v_hat + Z_i^T du``; the free bodies' (:func:`free_class`) are the 6 + 6 class over the walk's
 coordinates, its twelve entries one chain as the sweep's one thread sums them. One law kernel (:func:`audit_world`) then
 reads both stores and adds each contact normal's ``eps_i lambda_i``. The sparse diagonal's fused limits, which no store
-holds, read their law in place (:func:`fused_limits`). A world whose rows exist only inside its sweep (keyed rows) has
-none to read: it reports NaN and is not summed.
+holds, read their law in place (:func:`fused_limits`). A world whose rows exist only inside its sweep (its tier walks
+their seeds, the one writer's EMIT sink) has none to read: it reports NaN and is not summed.
 """
 
 from __future__ import annotations
@@ -57,9 +57,9 @@ from .row_laws import (
 from .row_records import DenseRows
 from .row_records import bind as bind_dense_rows
 from .sparse_mass_matrix import _SparseRowSupport
-from .sweep_levels import tier_world
 from .sweep_routes import free_body_rows, packed_operator
 from .sweep_routes_diag import slot_rows
+from .walk_rows import RowSeeds, emits
 
 __all__ = ["AUDIT_FIELDS", "AUDIT_SLOTS", "Audit"]
 
@@ -86,17 +86,13 @@ AuditRows = struct(
         Field("counts", int, ("line",), owner="placement", attr="constraint_count"),
         Field("mf_counts", int, ("line",), owner="placement", attr="mf_constraint_count"),
         Field("speed_first", int, ("line",), owner="placement"),
-        Field("tier_rows", int, owner="classes"),
-        Field("keyed", int, owner="step"),
         Field("weighted", int, owner="step"),
         Field("material", int, owner="options", attr="contact_compliance"),
         Field("capacity", int, owner="placement", attr="dense_max_constraints"),
     ),
     __name__,
 )
-"""What the law reads: the row store's records and impulses, the dense and free-body counts, whether the tiers form
-the rows of their worlds in their kernel (:func:`.sweep_levels.tier_world`) and keyed rows hold them, and the laws in
-play."""
+"""What the law reads: the row store's records and impulses, the dense and free-body counts, and the laws in play."""
 
 
 @wp.func
@@ -438,6 +434,7 @@ def audit_store(a: AuditRows, world: int, line: int, base: int, count: int, velo
 @wp.kernel(enable_backward=False)
 def audit_world(
     a: AuditRows,
+    seeds: RowSeeds,
     base: int,
     velocity: wp.array2d[float],
     mf_velocity: wp.array2d[float],
@@ -447,8 +444,8 @@ def audit_world(
     """One thread per world: the row laws of both stores over the rows' velocity terms, into :data:`AUDIT_SLOTS`; the
     free bodies' rows from ``base`` of the world's line."""
     world = wp.tid()
-    # A keyed tier's world: its rows live only inside its sweep.
-    if a.keyed != 0 and tier_world(a.counts[world], a.mf_counts[world], a.speed_first, world, a.tier_rows):
+    # A world whose tier walks its rows' seeds: its rows live only inside its sweep.
+    if emits(seeds, world, a.counts[world]):
         readout[world, 0] = wp.nan
         readout[world, 1] = wp.nan
         readout[world, 2] = wp.nan
@@ -487,15 +484,14 @@ class Audit:
     def record(self) -> dict:
         """Which rows the audit reads, for ``routes.diagnostics.audit``."""
         reason = "Reads every row of every world."
-        if self.solver.placement.keyed_rows is not None:
-            reason = "Reads NaN in keyed rows' worlds: no store holds their rows after the sweep."
+        if self.solver.placement.row_seeds.tiers != 0:
+            reason = "Reads NaN in the worlds whose tier walks their rows: no store holds them after the sweep."
         return {"enabled": True, "slots": list(AUDIT_SLOTS), "reason": reason}
 
     def _operands(self):
         solver, placement = self.solver, self.solver.placement
         owners = {"placement": placement, "classes": solver.spec.classes, "options": solver.options}
-        keyed, weighted = placement.keyed_rows is not None, solver.laws.set.weighted
-        return bind(AuditRows, rows=bind_dense_rows(placement), keyed=keyed, weighted=weighted, **owners)
+        return bind(AuditRows, rows=bind_dense_rows(placement), weighted=solver.laws.set.weighted, **owners)
 
     def _walk_coordinates(self, velocity: wp.array, coordinates: wp.array) -> None:
         """The walked trees' coordinates of ``velocity`` in the walk's frame, at their world coordinates
@@ -575,7 +571,8 @@ class Audit:
             mf = [first, placement.mf_constraint_count, placement.mf_max_constraints, self.mf_velocity]
             free = self._operands_of(free_class(), v)
             wp.launch(rows_kernel(free_class()), dim=worlds, inputs=[*mf, *free], device=device)
-        inputs = [self._operands(), int(placement.body_base), self.velocity, self.mf_velocity, self.fused]
+        inputs = [self._operands(), placement.row_seeds, int(placement.body_base)]
+        inputs += [self.velocity, self.mf_velocity, self.fused]
         wp.launch(audit_world, dim=worlds, inputs=inputs, outputs=[self.readout], device=device)
 
     def read(self) -> dict:
