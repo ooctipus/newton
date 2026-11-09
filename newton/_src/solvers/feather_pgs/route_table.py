@@ -35,7 +35,8 @@ class Pins:
     star: str | None = None
     """``"held"``: the compact diagonal family in a held tree group, never the one-coordinate class."""
     sink: str | None = None
-    """``"store"``: the Jacobi tiers read the one writer's stored rows, never its EMIT sink."""
+    """``"store"``: the Jacobi tiers read the one writer's stored rows; ``"emit"``: every tier walks its rows' seeds,
+    whatever the device (:func:`.sweep_routes_tiers.emits`)."""
     claims: tuple[str, ...] = ("resolved_worlds",)
     """The runtime claims kept, of ``("resolved_worlds",)``."""
     active_rows: bool = True

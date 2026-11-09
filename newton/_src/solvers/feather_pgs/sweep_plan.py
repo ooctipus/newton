@@ -561,7 +561,8 @@ class Sweep:
                         pitch=self.placement.row_pitch,
                         **self.law_fields,
                     )
-                    config = dataclasses.replace(config, emit=emit and sweep_routes_tiers.emits(config))
+                    emits = self.pins.sink == "emit" or sweep_routes_tiers.emits(config)
+                    config = dataclasses.replace(config, emit=emit and emits)
                     sinks |= int(config.emit) << tier_index
                     kernel = self.sweep("parallel_tier", config, readout_budget=sweeps_)
                     # On its own list, a tier takes a block a world of the list's capacity (its work's shape); it

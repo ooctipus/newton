@@ -323,7 +323,9 @@ class TestAuditCUDA(TestAudit):
             (scenes.keyboard, (conformance.SPARSE_DIAGONAL,)),
         ):
             scene = build()
-            for route in routes:
+            for routed in routes:
+                # The stored rows are readable: the tiers' worlds take the one writer's STORE sink.
+                route = routed.but(routed.name, pins={"sink": "store"})
                 with self.subTest(scene=scene.name, route=route.name):
                     coarse, record = self._route(scene, route, 8)
                     fine, _record = self._route(scene, route, 512)

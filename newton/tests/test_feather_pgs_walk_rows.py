@@ -392,12 +392,12 @@ class TestTierSlipFrame(unittest.TestCase):
         self.assertFalse(general.sweep.tiers)
         self.assertEqual(int(general.factor.walk_view().release.count.numpy()[0]), 3)
         scale = float(np.linalg.norm(reference))
-        for sink in (None, "store"):
+        for sink in ("emit", "store"):
             # The tiers on any class whose rows they hold, walking the seeds of the writer's EMIT sink or its rows.
             with self.subTest(sink=sink or "emit"):
                 solver, qd = _hinges_step({"tiers": 32, "sink": sink})
                 self.assertTrue(solver.sweep.tiers)
-                self.assertEqual(solver.placement.row_seeds.tiers != 0, sink is None)
+                self.assertEqual(solver.placement.row_seeds.tiers != 0, sink == "emit")
                 # The seeded rows and the writer's rows release their slips along their paths (R).
                 self.assertEqual(int(solver.factor.walk_view().release.count.numpy()[0]), 3)
                 self.assertLess(np.linalg.norm(qd - reference) / scale, 1.0e-4, f"{qd} {reference}")
@@ -408,7 +408,7 @@ class TestTierSlipFrame(unittest.TestCase):
         factor's rows missed it while the predictor took the decided step)."""
         general, reference = _hinges_step({"tiers": 0}, enable_joint_velocity_limits=True)
         scale = float(np.linalg.norm(reference))
-        solver, qd = _hinges_step({"tiers": 4}, enable_joint_velocity_limits=True)
+        solver, qd = _hinges_step({"tiers": 4, "sink": "emit"}, enable_joint_velocity_limits=True)
         self.assertNotEqual(solver.placement.row_seeds.tiers, 0)
         self.assertGreater(int(solver.placement.constraint_count.numpy()[0]), solver.placement.row_seeds.bound)
         self.assertEqual(int(solver.factor.walk_view().release.count.numpy()[0]), 3)
@@ -887,7 +887,7 @@ class TestRowSink(unittest.TestCase):
         """The tiers walking their rows' seeds step as the tiers on the stored rows, to the walk's rounding."""
         for device in ("cpu", *(("cuda:0",) if wp.is_cuda_available() else ())):
             with self.subTest(device=device):
-                emit, emitted = _sink_rollout(device, None)
+                emit, emitted = _sink_rollout(device, "emit")
                 store, stored = _sink_rollout(device, "store")
                 self.assertNotEqual(emit.placement.row_seeds.tiers, 0)
                 self.assertEqual(store.placement.row_seeds.tiers, 0)
@@ -902,7 +902,7 @@ class TestRowSink(unittest.TestCase):
         to the classes with joint limits for this rebuild alone; the keyed owner refused the notification)."""
         for device in ("cpu", *(("cuda:0",) if wp.is_cuda_available() else ())):
             with self.subTest(device=device):
-                emit, emitted = _sink_rollout(device, None, kinematic_at=6)
+                emit, emitted = _sink_rollout(device, "emit", kinematic_at=6)
                 _store, stored = _sink_rollout(device, "store", kinematic_at=6)
                 self.assertNotEqual(emit.placement.row_seeds.tiers, 0)
                 for (q, qd), (q_ref, qd_ref) in zip(emitted, stored, strict=True):

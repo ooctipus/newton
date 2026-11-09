@@ -1499,12 +1499,14 @@ class TestPatchParallelRoutes(unittest.TestCase):
         with patch.dict(os.environ):
             for law, beta in (("patch", 0.2),):
                 with self.subTest(law=law):
-                    solver = _matrix_free_solver(model, beta=beta, parallel_rows=32, enable_joint_limits=True)
+                    solver = _matrix_free_solver(
+                        model, beta=beta, parallel_rows=32, pins={**_DENSE, "sink": "emit"}, enable_joint_limits=True
+                    )
                     routes = solver.get_path_selection()["routes"]
                     record = routes["contact_rows"]
                     self.assertEqual([tier["sink"] for tier in routes["sweep"]["tiers"]["tiers"]], ["emit"])
                     self.assertEqual(record["producer"], "walk")
-                    builder = {"method": "walk", "kernels": ["write_walked_rows"]}
+                    builder = {"method": "walk", "kernels": ["write_walked_rows_emit"]}
                     self.assertEqual(record["builder_by_dof"], dict.fromkeys(record["builder_by_dof"], builder))
                     with launched_kernels() as keys:
                         _rollout(model, solver, 1)
@@ -1531,7 +1533,9 @@ class TestPatchParallelRoutes(unittest.TestCase):
                 os.environ.pop("FEATHER_PGS_PATCH_FRAME_REUSE", None)
                 if reuse is not None:
                     os.environ["FEATHER_PGS_PATCH_FRAME_REUSE"] = reuse
-                solver = _matrix_free_solver(model, beta=0.2, parallel_rows=32, enable_joint_limits=True)
+                solver = _matrix_free_solver(
+                    model, beta=0.2, parallel_rows=32, pins={**_DENSE, "sink": "emit"}, enable_joint_limits=True
+                )
                 tiers = solver.get_path_selection()["routes"]["sweep"]["tiers"]
                 self.assertEqual((tiers["tiers"][0]["sink"], tiers["linked_rows"]), ("emit", True))
                 self.assertEqual(solver.laws.friction_patches.reuse_frames, reuse is None)
