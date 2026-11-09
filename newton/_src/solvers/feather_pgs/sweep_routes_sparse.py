@@ -16,7 +16,7 @@ acts on is the factor-coordinate delta from ``v_hat``, staged per world and publ
 - the **schedule**: every row in slot order, or (``active_rows``) the rows selected at sweep entry, popped from
   a bitset (:func:`.sweep.active_scan`); patch rings (``linked_rows``) select their friction pairs through the ring; under
   contact ``torsion`` the friction triples (a contact's pair and its spin row) in a phase of their own after each
-  sweep's rows (:func:`triple_phase`), so the row loop carries none of their code;
+  sweep's rows (:func:`.sweep.triple_phase`), so the row loop carries none of their code;
 - the **contact unit** (``contact_triplets``): a contact normal and its friction pair in one visit on their Gram
   block (:func:`contact_units`): one load group with the triplet's block record, one reduction of the three
   residuals, the normal step, the pair's residuals moved by the normal change through the record's couplings, the
@@ -48,7 +48,6 @@ from .sparse_contact import CONTACT_RECORD_FLOATS, CONTACT_RING_FLOATS
 from .sparse_mass_matrix import _SparseRowSupport
 from .sweep import (
     ITERATION,
-    BallotHeads,
     Diagonal,
     RowContext,
     RowLaws,
@@ -63,11 +62,11 @@ from .sweep import (
     active_words,
     cached_pair_law,
     end_sweep,
-    friction_triple_visit,
     impulse_seed,
     indent,
     level_loop,
     row_step,
+    triple_phase,
     unit_visit,
     velocity_limit_pass,
 )
@@ -313,7 +312,7 @@ def contact_units(sweep: SparseSweep, rows: StagedRows, op: SparseFactor, laws: 
     eigenbasis): its setup and its visit of row ``i``. With ``linked`` a pass at entry stores each anchor's other ring
     members, at most three, behind its record in the order the pair update pools them (-1: a longer ring, which keeps
     the walk). Under contact torsion a friction triple (its pair staged as spin rows) is declined: its normal takes the
-    row step and the triple phase its pair and spin row (:func:`triple_phase`).
+    row step and the triple phase its pair and spin row (:func:`.sweep.triple_phase`).
     """
     width = CONTACT_RECORD_FLOATS + (CONTACT_RING_FLOATS if sweep.linked_rows else 0)
     pair_rows = f"s_type[normal + 1] != {ROW_FRICTION} || s_type[normal + 2] != {ROW_FRICTION}"
@@ -426,72 +425,6 @@ SYNC();"""
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# Friction triples: a contact's pair and its spin row, in a phase of their own after each sweep's rows
-# ---------------------------------------------------------------------------------------------------------------------
-
-
-def triple_phase(sweep: SparseSweep, rows: StagedRows, op: SparseFactor, laws: RowLaws, pad: str) -> str:
-    """The friction triples after a sweep's rows (contact torsion), in row order, each by
-    :func:`.sweep.friction_triple_visit` on the pooled normal load of its patch ring. A triple's normal is a contact
-    whose next row is staged as a spin row (:class:`.sweep.StagedRows`), found by the lanes together.
-
-    Its metric is its contact's record's (eigenvalues and eigenbasis quaternion), formed once a solve by the writer
-    (:func:`.walk_rows.support_rows_kernel`) and loaded with the ring ahead of the reduction; a linked sweep's units
-    store each normal's ring members behind its record (:func:`contact_units`), else the visit walks the ring.
-    """
-    record = _record("contact_records.shape[2]", "head")
-    ring = rows.ring_load("head", "pooled")
-    metric = [
-        f"const float* const record = {record};",
-        "const float4 triple_metric = *reinterpret_cast<const float4*>(record);",
-        "const float4 triple_basis = *reinterpret_cast<const float4*>(record + 4);",
-    ]
-    pool = [f"float pooled = {rows.load('head')};"]
-    if sweep.linked_rows and sweep.contact_triplets:
-        metric.append(f"const int4 ring = *reinterpret_cast<const int4*>(record + {CONTACT_RECORD_FLOATS});")
-        pool += [
-            f"if (ring.w < 0) pooled = {ring};",
-            "if (ring.w > 0) pooled += s_impulse[ring.x];",
-            "if (ring.w > 1) pooled += s_impulse[ring.y];",
-            "if (ring.w > 2) pooled += s_impulse[ring.z];",
-        ]
-    else:
-        pool.append(f"pooled = {ring};")
-    law = (
-        "ConeLaw::friction_triple_from_metric(wp::vec3(triple_metric.x, triple_metric.y, triple_metric.z),\n"
-        "    wp::quat_to_matrix(wp::quat(triple_basis.x, triple_basis.y, triple_basis.z, triple_basis.w)), "
-    )
-    ctx = RowContext(
-        row="tangent",
-        kind=str(ROW_FRICTION),
-        operator=op,
-        diagonal=Diagonal(rows.diag),
-        load=rows.load,
-        store=rows.store,
-        rhs=rows.rhs_of,
-        mu=rows.mu,
-        weight=rows.weight,
-        parent="head",
-        ring_load=rows.ring_load,
-        lanes=rows.lanes,
-    )
-    # A triple's normal is a contact whose next row is staged as a spin row; only a world whose staging found a
-    # triple (world_triples, uniform over its lanes) scans for them.
-    heads = BallotHeads(
-        "count",
-        rows.lanes,
-        lambda row: (
-            f"{row} + 1 < count && {rows.kind(row)} == {ROW_CONTACT} && {rows.kind(f'{row} + 1')} == {ROW_TORSION}"
-        ),
-        guard="world_triples",
-    )
-    visit = friction_triple_visit(
-        ctx, laws, head="head", metric="\n".join(metric), pool="\n".join(pool), load="pooled", law=law, pad=""
-    )
-    return heads.wrap(indent(visit, heads.inner(pad)), pad)
-
-
-# ---------------------------------------------------------------------------------------------------------------------
 # The sweep
 # ---------------------------------------------------------------------------------------------------------------------
 
@@ -556,7 +489,41 @@ def _source(sweep: SparseSweep) -> tuple[str, Staging]:
         rows, op, laws, end="count", admission=admission, held=True, triple_phase=sweep.torsion, pad=body_pad
     )
     row_loop = order.wrap(f"{unit}\n{update}", "        ")
-    triples = triple_phase(sweep, rows, op, laws, "        ") if sweep.torsion else ""
+    triples = ""
+    if sweep.torsion:
+        # A triple's metric is its contact's record's (eigenvalues and eigenbasis quaternion), formed once a solve by
+        # the writer (:func:`.walk_rows.support_rows_kernel`); a linked sweep's units store each normal's ring members
+        # behind it (:func:`contact_units`). Its normal is a contact whose next row is staged as a spin row, and only a
+        # world whose staging found a triple scans for them.
+        record = [
+            f"const float* const record = {_record('contact_records.shape[2]', 'head')};",
+            "const float4 triple_metric = *reinterpret_cast<const float4*>(record);",
+            "const float4 triple_basis = *reinterpret_cast<const float4*>(record + 4);",
+        ]
+        pool = ""
+        if sweep.linked_rows and sweep.contact_triplets:
+            record.append(f"const int4 ring = *reinterpret_cast<const int4*>(record + {CONTACT_RECORD_FLOATS});")
+            pool = (
+                f"if (ring.w < 0) pooled = {rows.ring_load('head', 'pooled')};\n"
+                "if (ring.w > 0) pooled += s_impulse[ring.x];\n"
+                "if (ring.w > 1) pooled += s_impulse[ring.y];\n"
+                "if (ring.w > 2) pooled += s_impulse[ring.z];"
+            )
+        triples = triple_phase(
+            rows,
+            op,
+            laws,
+            count="count",
+            record="\n".join(record),
+            law="ConeLaw::friction_triple_from_metric(wp::vec3(triple_metric.x, triple_metric.y, triple_metric.z),\n"
+            "    wp::quat_to_matrix(wp::quat(triple_basis.x, triple_basis.y, triple_basis.z, triple_basis.w)), ",
+            pool=pool,
+            heads=lambda row: (
+                f"{row} + 1 < count && {rows.kind(row)} == {ROW_CONTACT} && {rows.kind(f'{row} + 1')} == {ROW_TORSION}"
+            ),
+            guard="world_triples",
+            pad="        ",
+        )
     passes = ""
     if sweep.velocity_limits:
         passes = velocity_limit_pass(rows, op, laws, end="count", pad="        ")
