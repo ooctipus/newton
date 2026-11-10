@@ -27,10 +27,11 @@ collision matcher or shape-type rules. Unloaded regions and saturated friction
 with opposing slip release history; saturation alone does not. All matching
 tolerances are internal so correction strength is the only new user control.
 
-Sorting body pairs, each world's on its own lanes, makes construction local to a
-pair and preserves CUDA graph capture: all buffers have a fixed capacity, the
+Sorting body pairs makes construction local to a pair and preserves CUDA graph
+capture: all buffers and the radix-sort workspace have a fixed capacity, the
 ready rows of the solver's contact pool, which only change between captures.
-Growth keeps the frames' contents and gives the new slots the empty record. Launches
+Growth keeps the frames' contents and gives the new slots the empty record.
+Launches
 stride over the live contacts and the slots earlier frames used, so their work
 follows the live contact count rather than the capacity. With frame reuse, the
 solver's default, a captured build skips the pair sort when the previous build
@@ -79,20 +80,8 @@ _LIGHT_BLOCKS_PER_SM = 6
 # grid leaves no thread a second run below 8 * SMs * 256 live slots.
 _BUILD_BLOCK_DIM = 32
 _BUILD_BLOCKS_PER_SM = 8
-# The patch extent: the slots to visit, the live count, the stream sort's extent (live_sort.publish_sort_extent) and
-# the live contacts the worlds sort on their own lanes.
-_LIVE = wp.constant(1)
-_SORT_EXTENT = wp.constant(2)
-_WORLD_EXTENT = wp.constant(2 + EXTENT_SIZE)
-# A frame whose worlds hold at most this many contacts each sorts every world on its own lanes, each lane holding
-# _WORLD_HELD of them at a time and ranking them in one pass over its world's; a frame with a larger world sorts the
-# stream, unless its pair keys are too wide for the stream sort. A block scans a run of _SCAN_THREADS worlds' counts.
-_WORLD_CONTACTS = 512
-_WORLD_LANES = 32
-_WORLD_HELD = wp.constant(8)
-_HeldKeys = wp.types.vector(length=_WORLD_HELD, dtype=wp.int64)
-_HeldIndices = wp.types.vector(length=_WORLD_HELD, dtype=wp.int32)
-_SCAN_THREADS = wp.constant(1024)
+# The patch extent: the slots to visit, then the live sort's extent (live_sort.publish_sort_extent).
+_SORT_EXTENT = wp.constant(1)
 # Contact paths 0 and 1 hold dense and matrix-free rows, and -1 holds none.
 # A region's spin arm over the polar radius of gyration of its contacts' hull: the mean radius of a convex patch under
 # uniform pressure over its gyration radius is 0.937 on a square, 0.943 on a disc and 0.866 on a line, and 0.94 holds
@@ -203,28 +192,6 @@ class _PatchFrame:
     pressure: wp.array[wp.vec3]
     pressured: wp.array[int]
     twist: wp.array[float]
-
-
-@wp.struct
-class _PatchWorlds:
-    """Contacts by world: a key's bucket, its lower code's body's (the greatest world up to it) or the last for two
-    static codes, rises with the key, and ``start`` (``stored``) holds each bucket's first sorted (stored) slot."""
-
-    body_bucket: wp.array[int]
-    key_stride: int
-    count: wp.array[int]
-    start: wp.array[int]
-    cursor: wp.array[int]
-    stored: wp.array[int]
-
-
-@wp.func
-def _key_bucket(key: wp.int64, worlds: _PatchWorlds):
-    code = int(key // wp.int64(worlds.key_stride))
-    bucket = worlds.count.shape[0] - 1
-    if code <= worlds.body_bucket.shape[0]:
-        bucket = worlds.body_bucket[code - 1]
-    return bucket
 
 
 @wp.func
@@ -400,9 +367,15 @@ def _prepare_contact_fields(c: int, live: int, inputs: _PatchContacts, frame: _P
 # defined when it is decorated, and a later definition would rename it after its first load.
 @wp.func
 def _publish_extent(extent: wp.array[int], end: int, live: int):
-    """Publish the slots to visit, ``extent[0]``, and the live count, ``extent[1]``."""
+    """Publish the slots to visit, then the live sort's extent of the live slots.
+
+    ``extent[0]`` holds the slots to visit and ``extent[1:]`` the sort extent
+    (:func:`~newton._src.core.live_sort.publish_sort_extent`), whose first entry
+    is the live count: a captured live sort follows it, launching no work past
+    the live slots.
+    """
     extent[0] = end
-    extent[_LIVE] = live
+    publish_sort_extent(extent, _SORT_EXTENT, live)
 
 
 @wp.kernel(enable_backward=False)
@@ -414,10 +387,9 @@ def _prepare(
     threads: int,
     frame: _PatchFrame,
     patches: FrictionPatches,
-    worlds: _PatchWorlds,
     extent: wp.array[int],
 ):
-    """Fill this frame's contact slots, count the live ones by world, and clear every slot an earlier frame used.
+    """Fill this frame's contact slots and clear every slot an earlier frame used.
 
     A collision pass clamps the count to the rows it wrote, so every slot below
     it is live. Slots past the stored and the last built frame already hold the empty
@@ -433,10 +405,7 @@ def _prepare(
         _publish_extent(extent, end, live)
     for c in range(thread, end, threads):
         frame.indices[c] = c
-        key = _prepare_contact_fields(c, live, inputs, frame, patches)
-        frame.keys[c] = key
-        if c < live:
-            wp.atomic_add(worlds.count, _key_bucket(key, worlds), 1)
+        frame.keys[c] = _prepare_contact_fields(c, live, inputs, frame, patches)
 
 
 # The frame-reuse variants compile in modules of their own, so the base patch
@@ -452,7 +421,6 @@ def _prepare_frame(
     threads: int,
     frame: _PatchFrame,
     patches: FrictionPatches,
-    worlds: _PatchWorlds,
     generation: wp.array[wp.int32],
     stream: wp.int64,
     mode: int,
@@ -515,121 +483,6 @@ def _prepare_frame(
         if recorded == 0 or c >= live:
             frame.indices[c] = c
             frame.keys[c] = key
-            if c < live:
-                wp.atomic_add(worlds.count, _key_bucket(key, worlds), 1)
-
-
-@wp.kernel(enable_backward=False, module="unique")
-def _scan_worlds(worlds: _PatchWorlds, runs: wp.array[int]):
-    """Start each world's slots past the contacts of the lower worlds of its run and clear the counts, a block a run
-    of worlds; record each run's contacts, then its largest world's (:func:`_place_worlds` adds the lower runs')."""
-    run, lane = wp.tid()
-    buckets = worlds.count.shape[0]
-    first = wp.min(run * _SCAN_THREADS + lane * (_SCAN_THREADS // wp.block_dim()), buckets)
-    last = wp.min(first + _SCAN_THREADS // wp.block_dim(), buckets)
-    total = int(0)
-    largest = int(0)
-    for bucket in range(first, last):
-        total += worlds.count[bucket]
-        largest = wp.max(largest, worlds.count[bucket])
-    counts = wp.tile(total)
-    start = wp.untile(wp.tile_scan_exclusive(counts))
-    total = wp.tile_sum(counts)[0]
-    largest = wp.tile_max(wp.tile(largest))[0]
-    for bucket in range(first, last):
-        worlds.start[bucket] = start
-        start += worlds.count[bucket]
-        worlds.count[bucket] = 0
-    if lane == 0:
-        runs[run] = total
-        runs[runs.shape[0] // 2 + run] = largest
-
-
-@wp.kernel(enable_backward=False, module="unique")
-def _place_worlds(worlds: _PatchWorlds, runs: wp.array[int], extent: wp.array[int], limit: int):
-    """Add the lower runs' contacts to each world's start; publish whether the worlds sort on their own lanes (none
-    holds more than ``limit`` contacts) or the stream sort runs."""
-    run, lane = wp.tid()
-    buckets = worlds.count.shape[0]
-    count = runs.shape[0] // 2
-    below = int(0)
-    live = int(0)
-    largest = int(0)
-    for lower in range(0, count, wp.block_dim()):
-        other = lower + lane
-        total = int(0)
-        most = int(0)
-        if other < count:
-            total = runs[other]
-            most = runs[count + other]
-        below += wp.tile_sum(wp.tile(wp.where(other < run, total, 0)))[0]
-        live += wp.tile_sum(wp.tile(total))[0]
-        largest = wp.max(largest, wp.tile_max(wp.tile(most))[0])
-    first = wp.min(run * _SCAN_THREADS + lane * (_SCAN_THREADS // wp.block_dim()), buckets)
-    for bucket in range(first, wp.min(first + _SCAN_THREADS // wp.block_dim(), buckets)):
-        start = worlds.start[bucket] + below
-        worlds.start[bucket] = start
-        worlds.cursor[bucket] = start
-    if run == 0 and lane == 0:
-        worlds.start[buckets] = live
-        on_lanes = largest <= limit
-        publish_sort_extent(extent, _SORT_EXTENT, wp.where(on_lanes, 0, live))
-        extent[_WORLD_EXTENT] = wp.where(on_lanes, live, 0)
-
-
-@wp.kernel(enable_backward=False, module="unique")
-def _copy_by_world(
-    extent: wp.array[int],
-    keys: wp.array[wp.int64],
-    worlds: _PatchWorlds,
-    threads: int,
-    world_keys: wp.array[wp.int64],
-    world_indices: wp.array[int],
-):
-    """Copy each live contact's key and index into the next slot of its world, in any order within the world."""
-    thread = wp.tid()
-    for c in range(thread, extent[_WORLD_EXTENT], threads):
-        key = keys[c]
-        slot = wp.atomic_add(worlds.cursor, _key_bucket(key, worlds), 1)
-        world_keys[slot] = key
-        world_indices[slot] = c
-
-
-@wp.kernel(enable_backward=False, module="unique")
-def _sort_worlds(
-    extent: wp.array[int],
-    worlds: _PatchWorlds,
-    lanes: int,
-    world_keys: wp.array[wp.int64],
-    world_indices: wp.array[int],
-    keys: wp.array[wp.int64],
-    indices: wp.array[int],
-):
-    """Sort each world's contacts by (key, contact) into its slots: a lane ranks the contacts it holds by the world's."""
-    bucket, lane = wp.tid()
-    if extent[_WORLD_EXTENT] == 0:
-        return
-    start = worlds.start[bucket]
-    count = worlds.start[bucket + 1] - start
-    for first in range(lane * _WORLD_HELD, count, lanes * _WORLD_HELD):
-        held = _HeldKeys()
-        contact = _HeldIndices()
-        rank = _HeldIndices()
-        for k in range(_WORLD_HELD):
-            held[k] = wp.int64(0x7FFFFFFFFFFFFFFF)
-            if first + k < count:
-                held[k] = world_keys[start + first + k]
-                contact[k] = world_indices[start + first + k]
-        for j in range(count):
-            other = world_keys[start + j]
-            other_contact = world_indices[start + j]
-            for k in range(_WORLD_HELD):
-                if other < held[k] or (other == held[k] and other_contact < contact[k]):
-                    rank[k] += 1
-        for k in range(_WORLD_HELD):
-            if first + k < count:
-                keys[start + rank[k]] = held[k]
-                indices[start + rank[k]] = contact[k]
 
 
 @wp.func
@@ -845,7 +698,6 @@ def _build_pair(
     frame: _PatchFrame,
     prev: _PatchFrame,
     patches: FrictionPatches,
-    worlds: _PatchWorlds,
 ):
     """Build the body pair whose sorted run starts at ``start``; other positions return."""
     if start > 0 and frame.keys[start - 1] == frame.keys[start]:
@@ -857,11 +709,10 @@ def _build_pair(
     while stop < end and frame.keys[stop] == key:
         stop += 1
 
-    # Binary search the previous pair among its world's stored slots: the stored frame sorts its worlds in order.
+    # Binary search the previous pair, avoiding a scan over other worlds/pairs.
     # Positions from previous_end on hold no stored record.
-    bucket = _key_bucket(key, worlds)
-    lo = wp.min(worlds.stored[bucket], previous_end)
-    hi = wp.min(worlds.stored[bucket + 1], previous_end)
+    lo = int(0)
+    hi = previous_end
     while lo < hi:
         mid = (lo + hi) // 2
         if prev.keys[mid] < key:
@@ -1112,7 +963,6 @@ def _build(
     frame: _PatchFrame,
     prev: _PatchFrame,
     patches: FrictionPatches,
-    worlds: _PatchWorlds,
     built: wp.array[int],
 ):
     """Stride over the live sorted positions; body pairs write disjoint current/previous records.
@@ -1121,14 +971,12 @@ def _build(
     when no store follows this build.
     """
     thread = wp.tid()
-    live = extent[_LIVE]
+    live = extent[1]
     if thread == 0:
         built[0] = live
     previous_end = stored[0]
     for start in range(thread, live, threads):
-        _build_pair(
-            start, live, previous_end, q, previous_q, shape_transform, shape_radius, frame, prev, patches, worlds
-        )
+        _build_pair(start, live, previous_end, q, previous_q, shape_transform, shape_radius, frame, prev, patches)
 
 
 @wp.func
@@ -1221,16 +1069,14 @@ def _pair_key_layout(bodies, shapes):
     return stride, (stride * stride - 1).bit_length()
 
 
-def _body_buckets(body_world):
-    """Return each body's bucket, the greatest world of the bodies up to it (0 for leading globals), and the count."""
-    buckets = np.maximum.accumulate(np.maximum(np.asarray(body_world, dtype=np.int32), 0))
-    return buckets, int(buckets[-1]) + 1 if buckets.size else 1
-
-
 def _uses_live_sort(key_bits):
-    """Whether the stream sort can order a frame's pairs: a chunk key, the pair key with an 11-bit slot appended,
-    stays below the pad bit (pair keys up to 51 bits: about 47 million bodies and shapes). With wider keys every world
-    sorts on its own lanes, whatever it holds; both leave the unique (key, slot) order.
+    """Whether the pair sort orders only the live slots instead of the whole capacity.
+
+    It does whenever a chunk key, the pair key with an 11-bit slot appended,
+    stays below the pad bit (pair keys up to 51 bits: about 47 million bodies
+    and shapes); wider keys take the radix sort of the whole capacity. Both sorts
+    leave the unique (key, slot) order. The live sort's cost follows the live
+    contacts, the radix sort's the capacity.
     """
     return slot_keys_fit(key_bits)
 
@@ -1308,20 +1154,6 @@ class _FrictionPatchState:
             on_rows=self._on_view_rows,
         )
         self._current_rows = pool.rows(self._frame_fields(), on_rows=self._on_current_rows)
-        body_bucket, buckets = _body_buckets(model.body_world.numpy())
-        self.worlds = _PatchWorlds()
-        self.worlds.body_bucket = wp.array(body_bucket, dtype=int, device=device)
-        self.worlds.key_stride = self.key_stride
-        self.worlds.count = wp.zeros(buckets, dtype=int, device=device)
-        self.worlds.cursor = wp.zeros(buckets, dtype=int, device=device)
-        self.worlds.start = wp.zeros(buckets + 1, dtype=int, device=device)
-        self.worlds.stored = wp.zeros(buckets + 1, dtype=int, device=device)
-        self.world_runs = wp.zeros(2 * (-(-buckets // _SCAN_THREADS)), dtype=int, device=device)
-        # The live contacts copied by world, each world's in any order: the per-world sort's input.
-        self._world_rows = pool.rows(
-            (ContactField("world_keys", wp.int64), ContactField("world_indices", wp.int32)),
-            on_rows=self._on_world_rows,
-        )
         self._previous_rows = pool.rows(
             (*self._frame_fields(stored=True), ContactField("previous_world", wp.int32, -1)),
             on_rows=self._on_previous_rows,
@@ -1334,7 +1166,7 @@ class _FrictionPatchState:
         # reads a count it writes, so blocks never race on them.
         self.stored = wp.zeros(1, dtype=int, device=device)
         self.built = wp.zeros(1, dtype=int, device=device)
-        self.extent = wp.zeros(_WORLD_EXTENT + 1, dtype=int, device=device)
+        self.extent = wp.zeros(_SORT_EXTENT + EXTENT_SIZE, dtype=int, device=device)
         self._load_capture_modules()
 
     def _on_view_rows(self, rows):
@@ -1342,9 +1174,6 @@ class _FrictionPatchState:
 
     def _on_current_rows(self, rows):
         rows.publish(self.current)
-
-    def _on_world_rows(self, rows):
-        rows.publish(self)
 
     def _on_previous_rows(self, rows):
         for field in rows.fields:
@@ -1355,26 +1184,22 @@ class _FrictionPatchState:
         self._set_capacity(rows.rows)
 
     def _set_capacity(self, capacity):
-        """Hold the slots' capacity: the rows eager grids follow."""
+        """Hold the slots' capacity: the rows the radix fallback sorts and eager grids follow."""
         self.capacity = capacity
         self.build_block_dim = _BUILD_BLOCK_DIM
         self.live_sort = _uses_live_sort(self.key_bits)
         self._grids(capacity)
 
     def record(self) -> dict:
-        """The pair sort's record (``routes.friction.pair_sort``): by world, else the stream's live slots."""
-        reason = (
-            f"Each world sorts its own contacts on its lanes while no world holds more than {_WORLD_CONTACTS}; "
-            "a frame with a larger world sorts the stream, ordering only the live slots."
-        )
-        if not self.live_sort:
+        """The pair sort's record (``routes.friction.pair_sort``): the live slots' sort, or the radix sort's."""
+        if self.live_sort:
+            reason = "The pair sort orders only the live slots, so its cost follows the live contacts."
+        else:
             reason = (
-                f"{self.key_bits}-bit pair keys leave no room for the stream sort's {SLOT_BITS} slot bits: every "
-                "world sorts its own contacts on its lanes, whatever it holds."
+                f"{self.key_bits}-bit pair keys leave no room for the live sort's {SLOT_BITS} slot bits: the "
+                "radix sort orders the whole capacity."
             )
         return {
-            "worlds": int(self.worlds.count.shape[0]),
-            "world_contacts": int(_WORLD_CONTACTS),
             "live": bool(self.live_sort),
             "capacity": int(self.capacity),
             "key_bits": int(self.key_bits),
@@ -1393,18 +1218,15 @@ class _FrictionPatchState:
         return self
 
     def _load_capture_modules(self):
-        """Load the modules of their own that captured builds launch, on a CUDA device.
+        """Load the module of the kernel that captured builds launch first, on a CUDA device.
 
-        With frame reuse only captured builds launch _prepare_frame, and the worlds'
-        kernels may first launch in a capture too. Loading these compiles nothing
-        else. CPU captures build as eager ones do.
+        With frame reuse only captured builds launch _prepare_frame, so its module
+        would otherwise first load inside a graph capture. The kernel has a module
+        of its own: loading it compiles nothing else. CPU captures build as eager
+        ones do.
         """
         if not self.device.is_cuda:
             return
-        _scan_worlds.module.load(self.device, _SCAN_THREADS)
-        _place_worlds.module.load(self.device, _SCAN_THREADS)
-        _copy_by_world.module.load(self.device)
-        _sort_worlds.module.load(self.device)
         if self.reuse_frames:
             _prepare_frame.module.load(self.device)
 
@@ -1490,7 +1312,7 @@ class _FrictionPatchState:
         Every slot starts as the empty record _prepare writes: the sentinel key,
         its own index, and no owner or source. Bounded launches never revisit
         slots that still hold it. A built frame's keys and indices hold a second,
-        scratch half for the stream sort. The stored frame keeps what the next
+        scratch half for the radix sort. The stored frame keeps what the next
         build reads (_build_pair, _seed_contact; _store_contact writes it): one
         key and index a slot, which no sort visits, and none of the fields only
         a build reads (:data:`_BUILD_FIELDS`).
@@ -1597,7 +1419,6 @@ class _FrictionPatchState:
                 # The previous build of this capture scope sorted this stream's frame
                 # and the host issued no write of it since.
                 self._launch_prepare_frame(prepare_inputs, generation, stream, _FRAME_KEEP)
-                self.pool.begin_updates()
             elif scope is None:
                 # Eager builds sort as without frame reuse: no later build keeps
                 # their pairs, so their frame needs no record.
@@ -1632,16 +1453,17 @@ class _FrictionPatchState:
         self._order_pairs()
 
     def _launch_prepare(self, kernel, inputs, outputs):
-        """Prepare the slots, a pass over every slot an earlier frame used.
+        """Prepare the slots, a pass over every slot an earlier frame used, then follow its published extent.
 
         The pass visits the live slots and those of the stored and the last built
         frame, all among the rows the contact stream ever used (``rows_used``,
-        when the slots share the stream's pool). It publishes the slots to visit
-        and the live count (:func:`_publish_extent`); in a capture whose launches
-        bind, the launches after the next updater follow them.
+        when the slots share the stream's pool). It publishes the live count and
+        the sort's work (:func:`_publish_extent`); in a capture whose launches
+        bind, the launches after it follow them through a new updater.
         """
         used = self._rows_used if self._rows_used is not None else self.pool.ready_rows
         self.pool.launch(kernel, self.threads, inputs=inputs, outputs=outputs, extent=used, clamp=True)
+        self.pool.begin_updates()
 
     def _launch_build(self, model, state):
         """Build the pairs of the prepared, sorted slots."""
@@ -1662,7 +1484,6 @@ class _FrictionPatchState:
                 self.current,
                 self.previous,
                 self.view,
-                self.worlds,
             ],
             outputs=[self.built],
             # The slots to visit, not the live ones: thread 0 publishes the live count, also when it drops to zero.
@@ -1710,7 +1531,6 @@ class _FrictionPatchState:
             self.threads,
             self.current,
             self.view,
-            self.worlds,
         ]
 
     def _launch_prepare_frame(self, prepare_inputs, generation, stream, mode):
@@ -1729,55 +1549,29 @@ class _FrictionPatchState:
         """Sort the prepared slots by pair key, the work that only a new contact frame needs.
 
         A kept build skips exactly this, so work added here must leave outputs that
-        stay valid while later builds reuse the frame. Each world sorts on its own
-        lanes, or the stream sort orders the frame (:func:`_place_worlds`).
+        stay valid while later builds reuse the frame.
         """
-        buckets = self.worlds.count.shape[0]
-        runs = self.world_runs.shape[0] // 2
-        limit = _WORLD_CONTACTS if self.live_sort else 2**31 - 1
-        for kernel, inputs in (
-            (_scan_worlds, [self.worlds, self.world_runs]),
-            (_place_worlds, [self.worlds, self.world_runs, self.extent, limit]),
-        ):
-            wp.launch_tiled(
-                kernel, dim=runs, inputs=inputs, block_dim=_SCAN_THREADS, device=self.device, record_tape=False
-            )
-        self.pool.begin_updates()
-        self.pool.launch(
-            _copy_by_world,
-            self.threads,
-            inputs=[self.extent, self.current.keys, self.worlds, self.threads, self.world_keys, self.world_indices],
-            extent=self.extent[_WORLD_EXTENT : _WORLD_EXTENT + 1],
-            clamp=True,
-        )
-        lanes = _WORLD_LANES if self.device.is_cuda else 1
-        wp.launch(
-            _sort_worlds,
-            dim=(buckets, lanes),
-            inputs=[
-                self.extent,
-                self.worlds,
-                lanes,
-                self.world_keys,
-                self.world_indices,
-                self.current.keys,
-                self.current.indices,
-            ],
-            device=self.device,
-            record_tape=False,
-        )
         if self.live_sort:
             self._sort_live()
+        else:
+            # Empty slots hold INT64_MAX, whose low key_bits are all ones: no pair
+            # key exceeds them, and the stable sort keeps live slots ahead of a tie.
+            # The radix sort covers today's rows: a capture of it is recaptured after growth.
+            self.pool.note_unbound()
+            wp.utils.radix_sort_pairs(self.current.keys, self.current.indices, self.capacity, end_bit=self.key_bits)
 
     def _sort_live(self):
         """Stably sort the live slots by pair key and leave every other slot untouched.
 
-        A stable sort of slots [0, live) from indices c is the unique order by (key, c), which each world's sort on
-        its lanes also gives; slots past live already hold the empty record. The launches follow the
-        sort's work that the worlds' scan published: a capture launches the chunk sort over the live chunks and only
-        the merges the live slots need. The scratch half starts at the ready rows, which a capture's updater rewrites
-        on every replay, and the kernels address the whole reservation, of which the live slots, the scratch half
-        and one chunk of slack are mapped.
+        A stable sort of slots [0, live) from indices c is the unique order by
+        (key, c), which the full radix sort produces; slots past live already
+        hold the empty record that sort leaves there. The launches follow the
+        sort's work that the prepare published: a capture launches the chunk
+        sort over the live chunks and only the merges the live slots need. The
+        scratch half starts at the ready rows, which a capture's updater
+        rewrites on every replay, and the kernels address the whole
+        reservation, of which the live slots, the scratch half and one chunk of
+        slack are mapped.
         """
         launch_live_sort(
             self.pool,
@@ -1838,8 +1632,6 @@ class _FrictionPatchState:
             extent=self.extent[0:1],
             clamp=True,
         )
-        # The stored frame's worlds start where the stored slots' worlds did.
-        wp.copy(self.worlds.stored, self.worlds.start)
 
     def reset(self, world_mask):
         """Drop the stored anchors of the masked worlds (all worlds without a mask)."""

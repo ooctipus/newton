@@ -732,7 +732,7 @@ def run_reference_differential(
     live_states = [state for state in (patches, twin) if state is not None]
     states = [*live_states, reference]
     rows = _Rows(scene, capacity, rng)
-    coverage = {"carried": 0, "released": 0, "unstored": 0, "live": 0, "by_world": 0, "by_stream": 0}
+    coverage = {"carried": 0, "released": 0, "unstored": 0, "live": 0}
     fraction = 0.1
     dt = 1.0 / 240.0
     for step, event in enumerate(plan):
@@ -791,9 +791,6 @@ def run_reference_differential(
         assert_same_patches(patches, reference, live, f"{context} build", twin)
         assert_empty_tail(patches, f"{context} build")
         coverage["live"] = max(coverage["live"], live)
-        extent = patches.extent.numpy()
-        coverage["by_world"] += int(extent[friction_patches._WORLD_EXTENT] > 0)
-        coverage["by_stream"] += int(extent[friction_patches._SORT_EXTENT] > 0)
         coverage["carried"] += int(np.count_nonzero(reference.current.source.numpy()[:live] >= 0))
         routes_present = (0, 1, 2) if rng.random() < 0.7 else (0, 1)
         rows.generate(reference, live, routes_present)
@@ -830,6 +827,19 @@ def _assert_live_rows(mine, theirs, context):
 
 
 class TestPatchSortKeys(unittest.TestCase):
+    def test_host_sort_honors_end_bit(self):
+        """Ignore key bits at and above ``end_bit`` and keep equal keys in input order on the host."""
+        rng = np.random.default_rng(3)
+        count = 1000
+        low = rng.integers(0, 1 << 12, size=count)
+        keys = (rng.integers(0, 1 << 20, size=count) << 40) | low
+        array = wp.array(np.concatenate((keys, keys)), dtype=wp.int64, device="cpu")
+        values = wp.array(np.tile(np.arange(count, dtype=np.int32), 2), dtype=int, device="cpu")
+        wp.utils.radix_sort_pairs(array, values, count, end_bit=12)
+        expected = np.argsort(low, kind="stable")
+        np.testing.assert_array_equal(values.numpy()[:count], expected)
+        np.testing.assert_array_equal(array.numpy()[:count], keys[expected])
+
     def test_compressed_keys_keep_the_reference_order(self):
         """Sort compressed pair keys into the shifted-key permutation and build identical frames."""
         for seed, capacity in ((0, 96), (1, 128), (2, 160)):
@@ -838,6 +848,7 @@ class TestPatchSortKeys(unittest.TestCase):
                 patches, reference = _pair(scene, capacity)
                 patches.live_sort = False
                 self.assertLessEqual(patches.key_bits, 62)
+                self.assertLess(patches.key_bits, 64 - 8, "the sort must skip at least one byte")
                 carried = 0
                 for step, mode in enumerate(
                     ("live", "live", "live", "sparse", "live", "empty", "live", "overflow", "live", "live")
@@ -905,7 +916,7 @@ class TestPatchLiveExtent(unittest.TestCase):
     def test_live_extent_matches_the_full_capacity_reference(self):
         """Match the full-capacity mechanism bitwise through rising, dropping, overflowing and missing frames."""
         totals = {"carried": 0, "released": 0, "unstored": 0}
-        # Small capacities take the live sort where a world exceeds the lanes' limit; forced off, every world sorts.
+        # Small capacities take the live sort; the radix sort runs where forced.
         for seed, contacts, capacity, threads, live_sort in (
             (0, 96, 96, None, None),
             (1, 96, 128, (7, 5), False),
@@ -1142,13 +1153,13 @@ def _fill_sort_case(patches, live, rng, codes):
 
 
 def _patch_extent(end, live, size):
-    """Return the patch extent of a frame the stream sorts: the slots to visit, the live count, the live sort's extent."""
+    """Return the patch extent a prepare publishes: the slots to visit, then the live sort's extent."""
     extent = np.zeros(size, dtype=np.int32)
     rounds = 0
     while (int(SORT_CHUNK) << rounds) < live and rounds < int(MAX_MERGES):
         rounds += 1
-    extent[:4] = end, live, live, -(-live // int(SORT_CHUNK))
-    extent[4 : 4 + rounds] = live
+    extent[:3] = end, live, -(-live // int(SORT_CHUNK))
+    extent[3 : 3 + rounds] = live
     return extent
 
 
@@ -1188,32 +1199,6 @@ def run_live_sort_cases(test, device, capacities, extra_counts=()):
 
 
 class TestPatchLiveSort(unittest.TestCase):
-    def test_world_buckets_follow_any_body_world_layout(self):
-        """Build and store bitwise as the reference whatever the bodies' worlds: globals, all global, out of order."""
-        for name in ("ends", "global", "reversed"):
-            scene = _Scene("cpu", 41, worlds=4, bodies=5, contacts=160)
-            worlds = scene.body_world.copy()
-            worlds = {
-                "ends": np.where(np.isin(np.arange(worlds.size), (0, 1, 18, 19)), -1, worlds),
-                "global": np.full_like(worlds, -1),
-                "reversed": worlds[::-1],
-            }[name]
-            scene.model.body_world = wp.array(worlds.astype(np.int32), dtype=int, device="cpu")
-            patches, reference = _pair(scene, 192)
-            carried = 0
-            for step, mode in enumerate(("live", "live", "sparse", "live", "empty", "live", "overflow", "live")):
-                with self.subTest(layout=name, step=step):
-                    scene.move()
-                    live = scene.frame(mode)
-                    for state in (patches, reference):
-                        state.build(scene.model, scene.state, scene.contacts)
-                    assert_same_patches(patches, reference, live, "build")
-                    carried += int(np.count_nonzero(reference.current.source.numpy()[:live] >= 0))
-                    store_frame(patches, scene.state)
-                    reference.store(scene.state)
-                    assert_same_patches(patches, reference, live, "store")
-            self.assertGreater(carried, 0, "the frames must carry anchor history")
-
     def test_live_sort_matches_stable_argsort_and_radix_sort(self):
         """Sort the live prefix exactly as a stable sort, from no contacts, which no slot sees, through merges."""
         run_live_sort_cases(self, "cpu", (128, 2047, 3000, 4096, 10000, 16_384))
@@ -1225,7 +1210,7 @@ class TestPatchLiveSort(unittest.TestCase):
         self.assertTrue(_FrictionPatchState(scene.model, 96, phi).live_sort)
         self.assertTrue(_FrictionPatchState(scene.model, 64, phi[:64]).live_sort)
         self.assertTrue(friction_patches._uses_live_sort(51))
-        # Pair keys of 52 bits and more sort on their worlds' lanes: their 11-bit
+        # Pair keys of 52 bits and more fall back to the radix sort: their 11-bit
         # slot would reach the chunk keys' pad bit.
         self.assertFalse(friction_patches._uses_live_sort(52))
 
@@ -1234,15 +1219,12 @@ class TestPatchLiveSort(unittest.TestCase):
         for seed, threads in ((4, None), (5, (7, 5))):
             with self.subTest(seed=seed, threads=threads):
                 run_reference_differential("cpu", seed, capacity=160, threads=threads, live_sort=True)
-        # Small worlds sort on their own lanes; worlds past _WORLD_CONTACTS sort the stream, and more than one chunk
-        # of live contacts runs the merges.
+        # More than one chunk of live contacts runs the merges.
         plan = ("grow", "grow", "grow", "live", "sparse", "grow", "overflow", "live", "rebuild", "masked", "live")
-        for worlds, bodies, kind in ((110, 4, "by_world"), (2, 400, "by_stream")):
-            coverage = run_reference_differential(
-                "cpu", 6, worlds=worlds, bodies=bodies, contacts=4096, capacity=4600, threads=(97, 61), plan=plan
-            )
-            self.assertGreater(coverage["live"], 2048)
-            self.assertGreater(coverage[kind], 0)
+        coverage = run_reference_differential(
+            "cpu", 6, worlds=110, contacts=4096, capacity=4600, threads=(97, 61), live_sort=True, plan=plan
+        )
+        self.assertGreater(coverage["live"], 2048)
 
     @unittest.skipUnless(wp.is_cuda_available(), "the device sort needs CUDA")
     def test_live_sort_matches_on_the_device(self):
@@ -1600,10 +1582,9 @@ class TestPatchLaunchShapes(unittest.TestCase):
         original = wp.launch
 
         def record(kernel, **kwargs):
-            # Each launch over the slots strides by its own thread count; the worlds' sort takes a lane group a world.
+            # Each launch strides over the slots by its own thread count.
             arguments = [*kwargs.get("inputs", ()), *kwargs.get("outputs", ())]
-            named = dict(zip((arg.label for arg in kernel.adj.args), arguments, strict=True))
-            stride = named.get("threads", named.get("lanes"))
+            stride = dict(zip((arg.label for arg in kernel.adj.args), arguments, strict=True))["threads"]
             launched.add((kernel.key, kwargs["dim"], stride, kwargs.get("block_dim")))
             return original(kernel, **kwargs)
 
@@ -1611,14 +1592,7 @@ class TestPatchLaunchShapes(unittest.TestCase):
         with mock.patch.object(wp, "launch", record):
             state.build(scene.model, scene.state, scene.contacts)
         self.assertEqual(
-            launched,
-            {
-                ("_prepare", 1536, 1536, None),
-                ("_copy_by_world", 1536, 1536, None),
-                ("_sort_worlds", (110, 1), 1, None),
-                ("_merge_runs", 1024, 1024, None),
-                ("_build", 2048, 2048, 32),
-            },
+            launched, {("_prepare", 1536, 1536, None), ("_merge_runs", 1024, 1024, None), ("_build", 2048, 2048, 32)}
         )
 
     def test_launch_shapes_match_bitwise(self):
@@ -1945,7 +1919,7 @@ class TestPatchFrameReuse(unittest.TestCase):
                 launched.clear()
                 with mock.patch.object(wp, "launch", record):
                     patches.build(scene.model, scene.state, contacts)
-                self.assertEqual(launched, ["_prepare", "_copy_by_world", "_sort_worlds", "_build"])
+                self.assertEqual(launched, ["_prepare", "_build"])
                 np.testing.assert_array_equal(patches.sorted_frame.numpy(), -1)
 
 
@@ -2154,31 +2128,28 @@ class TestPatchFrameModes(unittest.TestCase):
         np.testing.assert_array_equal(patches.frame_status.numpy(), [0])
 
     def test_capture_kernels_load_at_construction(self):
-        """Load the modules of the kernels that captured builds may launch first when a CUDA patch state is built.
+        """Load the module of the kernel that captured builds launch first when a CUDA patch state is built.
 
-        Without it, the first capture would load those modules. A stand-in CUDA device lets the CPU check which
-        modules load; a CPU state loads none, since CPU captures build as eager ones do.
+        Without it, the first capture would load that module. A stand-in
+        CUDA device lets the CPU check which modules load; a CPU state loads
+        none, since CPU captures build as eager ones do.
         """
         scene = _Scene("cpu", 49)
         phi = wp.zeros(128, dtype=wp.vec2, device="cpu")
         cuda = SimpleNamespace(is_cuda=True)
-        worlds = ["_scan_worlds", "_place_worlds", "_copy_by_world", "_sort_worlds"]
-        for reuse, expected in ((False, worlds), (True, [*worlds, "_prepare_frame"])):
-            with self.subTest(reuse=reuse), contextlib.ExitStack() as stack:
+        for reuse, expected in ((False, []), (True, ["_prepare_frame"])):
+            with self.subTest(reuse=reuse):
                 loaded = []
-                for name in (*worlds, "_prepare_frame"):
-                    kernel = getattr(friction_patches, name)
-                    stack.enter_context(
-                        mock.patch.object(
-                            kernel.module,
-                            "load",
-                            side_effect=lambda device, *_, key=kernel.key, loaded=loaded: loaded.append((key, device)),
-                        )
-                    )
-                patches = _FrictionPatchState(scene.model, 128, phi, reuse_frames=reuse)
-                self.assertEqual(loaded, [], "a CPU state loads no module")
-                patches.device = cuda
-                patches._load_capture_modules()
+                kernel = friction_patches._prepare_frame
+                with mock.patch.object(
+                    kernel.module,
+                    "load",
+                    side_effect=lambda device, key=kernel.key, loaded=loaded: loaded.append((key, device)),
+                ):
+                    patches = _FrictionPatchState(scene.model, 128, phi, reuse_frames=reuse)
+                    self.assertEqual(loaded, [], "a CPU state loads no module")
+                    patches.device = cuda
+                    patches._load_capture_modules()
                 self.assertEqual([key for key, _ in loaded], expected)
                 self.assertTrue(all(device is cuda for _, device in loaded))
 
@@ -2670,7 +2641,7 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
         self.assertEqual(routes[None], routes["0"])
 
     def test_route_records_the_pair_sort(self):
-        """Record the live sort, or every world's sort with the reason when the pair keys are too wide."""
+        """Record the live sort, or the radix sort with the reason when the pair keys are too wide."""
         cases = (
             # (live_sort, capacity, key_bits, reason)
             (True, 16_384, 51, "only the live slots"),
@@ -2679,8 +2650,7 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
         )
         for live, capacity, key_bits, reason in cases:
             with self.subTest(capacity=capacity, key_bits=key_bits):
-                worlds = SimpleNamespace(count=np.zeros(3))
-                patches = SimpleNamespace(live_sort=live, capacity=capacity, key_bits=key_bits, worlds=worlds)
+                patches = SimpleNamespace(live_sort=live, capacity=capacity, key_bits=key_bits)
                 self.assertEqual(friction_patches._uses_live_sort(key_bits), live)
                 record = friction_patches._FrictionPatchState.record(patches)
                 self.assertEqual(
@@ -2895,7 +2865,7 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
         cover every transition. With frame reuse the boxes' 128 contact slots take
         the live sort, which skips empty frames.
         """
-        graph = _graph_twin(boxes=True)
+        graph = _graph_twin(boxes=True, radix=False)
         self.assertTrue(graph.patches.live_sort)
         eager, control = (_SolverTwin("cuda:0", boxes=True) for _ in range(2))
         twins = (graph, eager, control)
@@ -2939,13 +2909,15 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
 
 
 def _poison_sort_scratch(twin):
-    """Fill the worlds' cursors, which only a sorting build's scan of the worlds writes."""
-    twin.patches.worlds.cursor.fill_(-12345)
+    """Fill the second half of the radix sort's keys, which only the sort writes."""
+    keys = twin.patches.current.keys.numpy()
+    keys[twin.patches.capacity :] = -12345
+    twin.patches.current.keys.assign(keys)
 
 
 def _sort_scratch_intact(twin):
-    """Whether no build sorted since :func:`_poison_sort_scratch`."""
-    return bool(np.all(twin.patches.worlds.cursor.numpy() == -12345))
+    """Whether no radix sort ran since :func:`_poison_sort_scratch`."""
+    return bool(np.all(twin.patches.current.keys.numpy()[twin.patches.capacity :] == -12345))
 
 
 @wp.kernel(enable_backward=False)
@@ -2954,43 +2926,45 @@ def _fill_flags(flags: wp.array[wp.int32], value: int):
 
 
 @wp.kernel(enable_backward=False)
-def _poison_scratch(cursor: wp.array[int], poison: int):
-    """Fill the worlds' cursors, which only a sorting build's scan of the worlds writes."""
-    cursor[wp.tid()] = poison
+def _poison_scratch(keys: wp.array[wp.int64], capacity: int, poison: wp.int64):
+    """Fill the second half of the pair keys, which only the radix sort writes."""
+    keys[capacity + wp.tid()] = poison
 
 
 @wp.kernel(enable_backward=False)
-def _check_scratch(cursor: wp.array[int], poison: int, intact: wp.array[wp.int32], slot: int):
-    """Clear ``intact[slot]`` if a sorting build overwrote the poisoned cursors."""
-    if cursor[wp.tid()] != poison:
+def _check_scratch(keys: wp.array[wp.int64], capacity: int, poison: wp.int64, intact: wp.array[wp.int32], slot: int):
+    """Clear ``intact[slot]`` if a radix sort overwrote the poisoned second half of the pair keys."""
+    if keys[capacity + wp.tid()] != poison:
         intact[slot] = 0
 
 
 class _SortProbe:
-    """Record on the device whether a build sorted between the builds a graph captures.
+    """Record on the device whether the radix sort ran between the builds a graph captures.
 
-    :meth:`mark` poisons the worlds' cursors, which only a sorting build's scan
-    writes, and :meth:`check` records in ``intact[slot]`` whether they still
-    hold the poison. Both launch on the capturing stream, so each replay
+    :meth:`mark` poisons the second half of the pair keys, which only the radix
+    sort writes, and :meth:`check` records in ``intact[slot]`` whether it still
+    holds the poison. Both launch on the capturing stream, so each replay
     evaluates them between the same builds; :meth:`start` resets ``intact``.
     """
 
     def __init__(self, patches, slots):
-        self.cursor, self.device = patches.worlds.cursor, patches.device
+        self.keys, self.capacity, self.device = patches.current.keys, patches.capacity, patches.device
         self.intact = wp.zeros(slots, dtype=wp.int32, device=self.device)
-        self.poison = -12345
+        self.poison = wp.int64(-12345)
 
     def start(self):
         wp.launch(_fill_flags, dim=self.intact.shape[0], inputs=[self.intact, 1], device=self.device)
 
     def mark(self):
-        wp.launch(_poison_scratch, dim=self.cursor.shape[0], inputs=[self.cursor, self.poison], device=self.device)
+        wp.launch(
+            _poison_scratch, dim=self.capacity, inputs=[self.keys, self.capacity, self.poison], device=self.device
+        )
 
     def check(self, slot):
         wp.launch(
             _check_scratch,
-            dim=self.cursor.shape[0],
-            inputs=[self.cursor, self.poison, self.intact, slot],
+            dim=self.capacity,
+            inputs=[self.keys, self.capacity, self.poison, self.intact, slot],
             device=self.device,
         )
 
@@ -3062,15 +3036,18 @@ def _capture(device="cuda:0"):
         yield stack.enter_context(wp.ScopedCapture(device=device))
 
 
-def _graph_twin(**options):
+def _graph_twin(*, radix=True, **options):
     """Return a CUDA twin with frame reuse, to capture graphs of.
 
-    Its worlds' poisoned cursors show whether a replay sorted (:func:`_poison_sort_scratch`).
+    ``radix`` keeps the radix sort, whose poisoned scratch half shows whether a
+    replay sorted (:func:`_poison_sort_scratch`).
     """
     with _flags(reuse=None):
         twin = _SolverTwin("cuda:0", **options)
     if not twin.patches.reuse_frames:
         raise AssertionError("the twin must reuse frames")
+    if radix:
+        twin.patches.live_sort = False
     return twin
 
 
@@ -3190,7 +3167,7 @@ _COLLISION_PASSES = {
 def run_captured_collision_passes(test, device, replays):
     """Replay graphs of collision passes bitwise as the eager always-sort chain, sorting once per pass.
 
-    A sorting build's scan of the worlds also records into CPU captures: a probe captured between the builds
+    The graph twin takes the radix sort, which also records into CPU captures: a probe captured between the builds
     shows on every replay that each pass's first substep sorts and its later
     substeps do not (:class:`_SortProbe`), as the sorts the capture records do.
     """
@@ -3206,6 +3183,7 @@ def run_captured_collision_passes(test, device, replays):
                 for twin in (graph, eager):
                     twin.pair(collide=True)
             eager.sort_every_build()
+            graph.patches.live_sort = False
             probe = _SortProbe(graph.patches, 2 * len(passes))
             outcomes, sorts = _admitted_modes(graph.patches), _counted_sort_calls(graph.patches)
             with _capture(device) as capture:
