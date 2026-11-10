@@ -21,6 +21,7 @@ from newton._src.solvers.feather_pgs.device_preludes import (
     LANE_WORDS,
     RING,
     SHARED_STORAGE,
+    DevicePrelude,
     cuda_native,
     dual_native,
     lane_all,
@@ -327,8 +328,8 @@ _WORDS_SOURCE = """    SHARED float scratch_value[32];
 
 @cache
 def _words_kernel(lanes):
-    memory = memory_words(Place.GLOBAL, Place.STREAMED, Place.PERSISTING, Operand("keys", Place.READ_ONLY))
-    preludes = (lane_group(lanes), LANE_WORDS, HELD, memory, SHARED_STORAGE)
+    named = DevicePrelude("memory", *toolkit.words("LDG", "ST", "ADD", "TOUCH", "FETCH", "LDCG", "STCG"))
+    preludes = (lane_group(lanes), LANE_WORDS, HELD, named, memory_words(Operand("keys")), SHARED_STORAGE)
 
     @wp.func_native(dual_native(_WORDS_SOURCE, preludes=preludes))
     def words(
@@ -415,18 +416,31 @@ class TestLaneWords(unittest.TestCase):
 
 
 class TestMemoryToolkit(unittest.TestCase):
-    def test_places_declare_their_words_once(self):
-        """Each place's words once, in one order; an operand's own words name its place's."""
-        cuda, cpu = toolkit.access(Place.GLOBAL, Place.STREAMED, Place.PERSISTING, Operand("rows", Place.READ_ONLY))
-        for name in ("LDG", "LD", "ST", "ADD", "TOUCH", "FETCH", "LDCG", "STCG"):
-            self.assertEqual(cuda.count(f"const auto {name} ="), 1, name)
+    def test_read_rule_places_operands(self):
+        """LDG where no thread writes an operand, LD and ST where one does, a measured place over the rule's."""
+        lambdas = {name: toolkit.words(name)[0].split(" = ", 1)[1] for name in ("LDG", "LD", "ST", "LDCG", "STCG")}
+        rows, sums, keys = Operand("rows"), Operand("sums", writes=True), Operand("keys", measured=Place.GLOBAL)
+        cuda, cpu = toolkit.read(rows, sums, keys)
+        for name, word in (("LOAD_rows", "LDG"), ("LOAD_sums", "LD"), ("STORE_sums", "ST"), ("LOAD_keys", "LD")):
+            self.assertEqual(cuda.count(f"const auto {name} = {lambdas[word]}"), 1, name)
             self.assertEqual(cpu.count(f"const auto {name} ="), 1, name)
-        self.assertIn("const auto LOAD_rows = LDG;", cuda)
-        self.assertNotIn("STORE_rows", cpu)
-        self.assertIn("const auto STORE_cache = STCG;", toolkit.access(Operand("cache", Place.PERSISTING))[0])
-        self.assertEqual(toolkit.access(Place.REGISTERS, Place.SHARED), ("", ""))
-        with self.assertRaisesRegex(ValueError, "global memory"):
-            Operand("stage", Place.SHARED)
+        self.assertNotIn("STORE_rows", cuda)
+        self.assertNotIn("STORE_keys", cpu)
+        cache = toolkit.read(Operand("cache", writes=True, measured=Place.PERSISTING))[0]
+        self.assertIn(f"const auto LOAD_cache = {lambdas['LDCG']}", cache)
+        self.assertIn(f"const auto STORE_cache = {lambdas['STCG']}", cache)
+        for place in (Place.SHARED, Place.READ_ONLY):
+            with self.assertRaisesRegex(ValueError, "global place"):
+                Operand("stage", writes=True, measured=place)
+
+    def test_words_are_declared_once_in_one_order(self):
+        """The named words alone, each once, in the toolkit's order, on both devices."""
+        cuda, cpu = toolkit.words("STCG", "LDCG", "FETCH", "TOUCH", "ADD", "ST", "LD", "LDG")
+        names = ("LDG", "LD", "ST", "ADD", "TOUCH", "FETCH", "LDCG", "STCG")
+        for text in (cuda, cpu):
+            starts = [text.index(f"const auto {name} =") for name in names]
+            self.assertEqual(starts, sorted(starts))
+            self.assertEqual(sum(line.startswith("    const auto ") for line in text.splitlines()), len(names))
 
     def test_constant_table_is_one_text(self):
         """A constant table: one declaration in CONSTANT storage, CUDA's constant memory or the CPU's constant data."""
