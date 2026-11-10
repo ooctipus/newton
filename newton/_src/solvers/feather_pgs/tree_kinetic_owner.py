@@ -302,8 +302,9 @@ class TreeKineticState:
         if not layout.dofs:
             return
         classes = self._walk_classes()
+        arch = self.solver.model.device.arch
         self.force_kernel = native.get_force_kernel(
-            self.schedules, layout=layout, response=self._response, classes=classes
+            self.schedules, layout=layout, response=self._response, classes=classes, device_arch=arch
         )
         self.walk_solve_kernel = (
             native.get_walk_solve_kernel(layout=layout, classes=classes) if native.walk_solves(layout) else None
@@ -317,6 +318,7 @@ class TreeKineticState:
             classes=classes,
             slips=self.solver.factor.walk_slip_capacity,
             side=self.solver.factor.walk_side,
+            device_arch=arch,
         )
         # The trial's words between the predictor's halves and the walk's solve, at their global coordinates.
         if getattr(self, "trial", None) is None:

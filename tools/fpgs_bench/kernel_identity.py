@@ -372,6 +372,7 @@ def held_tree_calls():
                     "twists": twists,
                     "classes": walk_classes(tree),
                     "slips": RELEASE_SLIPS,
+                    "device_arch": ARCH,
                     **options,
                 }
                 yield "tree_kinetic_state.get_predictor_kernel", predictor, (schedules,), kwargs
@@ -472,7 +473,7 @@ def walk_calls():
     for name in ("franka", "g1", "chain106"):
         tree = layout(name, roots[name])
         schedules = Named("schedules", _schedules(tree.value, False))
-        kwargs = {"layout": tree, "response": "sparse", "classes": named[name]}
+        kwargs = {"layout": tree, "response": "sparse", "classes": named[name], "device_arch": ARCH}
         yield "tree_kinetic_state.get_force_kernel", force, (schedules,), kwargs
         twists = native.publishes_twists(tree.value, schedules.value, cuda=True)
         kwargs = {**kwargs, "twists": twists, "slips": factor_walk.RELEASE_SLIPS}

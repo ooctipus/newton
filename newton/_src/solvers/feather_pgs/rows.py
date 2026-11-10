@@ -184,12 +184,13 @@ _PREFIX_FAMILIES = {
 
 
 @cache
-def _prefix_warp_kernel(size: int, groups: int, family: str, mimics: int = 0) -> wp.Kernel:
+def _prefix_warp_kernel(size: int, family: str, device_arch, mimics: int = 0) -> wp.Kernel:
     """A joint row family of the one writer, one warp per articulation of ``size`` coordinates
-    (:func:`.prefix_rows.prefix_rows`), ``groups`` a block (:func:`prefix_shape`'s, one on the CPU): its joint limits, its joint
-    velocity limits, or its mimics (at most ``mimics`` an articulation). The warp takes each candidate's law, reserves
-    the active rows on the world's counter, writes their records and publishes each row's seed, its unit source, which
-    the one writer walks (a mimic's slot in ``mimic_slot`` too); a limit that may act marks its world's acts word."""
+    (:func:`.prefix_rows.prefix_rows`), built for ``device_arch`` (its groups a block and bound; one on the CPU): its
+    joint limits, its joint velocity limits, or its mimics (at most ``mimics`` an articulation). The warp takes each
+    candidate's law, reserves the active rows on the world's counter, writes their records and publishes each row's
+    seed, its unit source, which the one writer walks (a mimic's slot in ``mimic_slot`` too); a limit that may act
+    marks its world's acts word."""
     name, native, law, kind = _PREFIX_FAMILIES[family]
     kind = int(kind)
     if family == "mimics":
@@ -222,33 +223,33 @@ def _prefix_warp_kernel(size: int, groups: int, family: str, mimics: int = 0) ->
     const int world = art_to_world.data[art];
 {first_dof}{rows}"""
     suffix = f"_m{mimics}" if family == "mimics" else ""
+    found = shape(_prefix_work(0), memory.built_for(device_arch))
     return KernelTemplate(
-        f"{name}_{size}_{groups}{suffix}",
+        f"{name}_{size}_{found.groups}{suffix}",
         _prefix_warp_params(law),
         body,
-        items("group", groups=groups, lanes=32, guard="articulation_count"),
+        items("group", groups=found.groups, lanes=32, guard="articulation_count"),
         preludes=(lane_group(32), *ROW_LAW.preludes()),
         dual=True,
         native_name=native,
-        # The bound of the architecture the build is sized for, whatever the device at hand.
-        launch_bounds=shape(_prefix_work(0), memory.built_for(None)).bounds,
+        launch_bounds=found.bounds,
     ).kernel()
 
 
-def joint_limit_warp_kernel(size: int, groups: int) -> wp.Kernel:
+def joint_limit_warp_kernel(size: int, device_arch) -> wp.Kernel:
     """The one writer's joint-limit rows, one warp per articulation (:func:`_prefix_warp_kernel`)."""
-    return _prefix_warp_kernel(size, groups, "limits")
+    return _prefix_warp_kernel(size, "limits", device_arch)
 
 
-def velocity_limit_warp_kernel(size: int, groups: int) -> wp.Kernel:
+def velocity_limit_warp_kernel(size: int, device_arch) -> wp.Kernel:
     """The one writer's joint velocity-limit rows, one warp per articulation (:func:`_prefix_warp_kernel`)."""
-    return _prefix_warp_kernel(size, groups, "velocity")
+    return _prefix_warp_kernel(size, "velocity", device_arch)
 
 
-def mimic_warp_kernel(size: int, groups: int, mimics: int) -> wp.Kernel:
+def mimic_warp_kernel(size: int, mimics: int, device_arch) -> wp.Kernel:
     """The one writer's mimic rows, at most ``mimics`` an articulation, one warp per articulation
     (:func:`_prefix_warp_kernel`)."""
-    return _prefix_warp_kernel(size, groups, "mimics", mimics)
+    return _prefix_warp_kernel(size, "mimics", device_arch, mimics)
 
 
 _BETA_REASONS = {
@@ -422,11 +423,11 @@ class RowLaws:
         )
         self.joint_limit_q_index = wp.array(limit_q_index, dtype=wp.int32, device=model.device)
         self.joint_limit_q_index_host = limit_q_index
-        groups = prefix_shape(1, model.device).groups
-        self.joint_limit_warp_kernels = {size: joint_limit_warp_kernel(size, groups) for size in self.joint_limit_sizes}
+        arch = model.device.arch
+        self.joint_limit_warp_kernels = {size: joint_limit_warp_kernel(size, arch) for size in self.joint_limit_sizes}
         # The velocity limits sit on the same coordinates (limit_q_index >= 0), so on the same sizes.
         self.velocity_limit_warp_kernels = (
-            {size: velocity_limit_warp_kernel(size, groups) for size in self.joint_limit_sizes}
+            {size: velocity_limit_warp_kernel(size, arch) for size in self.joint_limit_sizes}
             if self.options.enable_joint_velocity_limits
             else {}
         )
@@ -528,7 +529,7 @@ class RowLaws:
         per_art = np.diff(art_start)
         sizes = self.forest.response_dof_count[: model.articulation_count]
         self.mimic_warp_kernels = {
-            size: mimic_warp_kernel(size, prefix_shape(1, model.device).groups, int(per_art[sizes == size].max()))
+            size: mimic_warp_kernel(size, int(per_art[sizes == size].max()), model.device.arch)
             for size in self.mimic_sizes
         }
 
