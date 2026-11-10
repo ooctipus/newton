@@ -25,7 +25,6 @@ from .device_preludes import (
     STATUS_CLOCK,
     device_branches,
     dual_native,
-    memory_words,
     substitute,
 )
 from .factor import kernels
@@ -622,7 +621,7 @@ body's frame (:data:`_EXTERNAL_FRAME`), the walk's carry takes each to its paren
 coordinate reads its column there (:data:`_EXTERNAL_PROJECT`): every lever is one link long, so a coordinate's rounding
 is the size of its own force. The frames, levers and columns are the rows' seeds' (``WALK_UP``)."""
 
-_EXTERNAL_FRAME = r"""float P[4];WALK_READ_POINT(WALK_LDG,P,walk.now_link.data+$WALK_LINK*(js+local)+$WALK_FRAME);
+_EXTERNAL_FRAME = r"""float P[4];WALK_READ_POINT(LDG,P,walk.now_link.data+$WALK_LINK*(js+local)+$WALK_FRAME);
             const wp::vec3 c=cache.com_offset.data[js+local];
             input=Spatial::wrench_shift(input,wp::vec3(c[0]-P[0],c[1]-P[1],c[2]-P[2]));"""
 """A body's external wrench at its frame: the force keeps, the moment gains the centre of mass less the frame point
@@ -635,7 +634,7 @@ _EXTERNAL_CARRY = r"""    if(nonzero) {
                 const int up=plan.parent.data[local];
                 if(up<0)continue;
                 float l[6];
-                WALK_READ_LINK(WALK_LDG,l,walk.now_link.data,js+local,js+up);
+                WALK_READ_LINK(LDG,l,walk.now_link.data,js+local,js+up);
                 const float* q=s+6*local;
                 float* w=s+6*up;
                 $EDGE
@@ -658,7 +657,7 @@ its step column ``WALK_NOW`` its joint moves along (a turn's angular half, else 
 record names the same half, :func:`.factor.walk.pack_walk_records`), with no record to read."""
 
 _EXTERNAL_PROJECT = r"""float S[6];
-            WALK_READ_COLUMN(WALK_LDG,S,reinterpret_cast<const float*>(walk.now.data)+$WALK_NOW*dof,walk.data.data+$WALK_COORDINATE*dof,$HALF);
+            WALK_READ_COLUMN(LDG,S,reinterpret_cast<const float*>(walk.now.data)+$WALK_NOW*dof,walk.data.data+$WALK_COORDINATE*dof,$HALF);
             const float* w=s+6*body;
             value+=$DOT;"""
 """A coordinate's share of the subtree wrench at its body's frame: its step column there (``WALK_READ_COLUMN``, the
@@ -1544,7 +1543,7 @@ _HELD = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step o
             const int x = lane + k * WIDTH;
             if (x < n) {
                 float d[$unpacked];
-                WALK_READ(WALK_LDG, d, data + $coordinate * x, $half);
+                WALK_READ(LDG, d, data + $coordinate * x, $half);
                 #pragma unroll
                 for (int m = 0; m < 13; ++m) h.r[k][m] = d[m];
             } else {
@@ -1553,7 +1552,7 @@ _HELD = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step o
             }
             if (x < nb) {
                 float l[6];
-                WALK_READ_LINK(WALK_LDG, l, link, x, parent[x]);
+                WALK_READ_LINK(LDG, l, link, x, parent[x]);
                 h.l[k][0] = l[0];
                 h.l[k][1] = l[1];
                 h.l[k][2] = l[2];
@@ -1668,7 +1667,7 @@ $passes
             if (i >= 0) {
                 alphas[m] = -released[i];
                 keeps[m] = kept[i];
-                pivots[m] = WALK_LOAD_PIVOT(data + $coordinate * i);
+                pivots[m] = WALK_READ_PIVOT(LDG, data + $coordinate * i);
             }
             #pragma unroll
             for (int k = 0; k < 6; ++k) ps[m][k] = 0.0f;
@@ -1934,7 +1933,7 @@ _HELD_PASS = """        #pragma unroll
                 if (mine[m] && $guard) {
                     int c;
                     float b, ar, g;
-                    WALK_STEP(steps[m] + t, c, b, ar, g);
+                    WALK_STEP(LD, steps[m] + t, c, b, ar, g);
                     float& r = rs[m];
                     $step
                 }
@@ -2087,7 +2086,7 @@ def get_force_kernel(schedules: HeldSchedules, *, layout: TreeLayout = REFERENCE
         classes,
         "nonzero",
         _FORCE_HALF,
-        (walk_loads_prelude(),),
+        (walk_loads_prelude("LDG"),),
         CLEAR_SLIPS="".join(
             f"walk.release.count.data[{_root_articulation(layout, r)}]=0;" for r, _, _ in _walk_roots(layout)
         ),
@@ -2222,7 +2221,7 @@ def get_predictor_kernel(
         classes,
         "moved",
         _RESPONSE_HALF,
-        (walk_loads_prelude(), HELD, memory_words(memory.Place.READ_ONLY)),
+        (walk_loads_prelude("LDG", "LD"), HELD),
         TRIAL=held_lambdas(layout, slips, ts.record_half(side))
         + stage("float value=s[$WHITE+col];", clocks["CLOCK2"] + clocks["CLOCK3"], QUIET_DRIVE),
         RESPONSE=(
