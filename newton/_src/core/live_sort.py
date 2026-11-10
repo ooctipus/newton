@@ -9,8 +9,8 @@ second is scratch, and the chunk past it lets a chunk's tile load stay in the
 buffer. A kernel that knows the live count writes the sort's extent with
 :func:`publish_sort_extent`: ``[live slots, chunks, work of each merge]``.
 :func:`launch_live_sort` then sorts each chunk of :data:`SORT_CHUNK` live slots
-in shared memory and merges sorted runs pairwise until one run holds every
-live slot, ending in the first half.
+in shared memory and merges sorted runs pairwise, its last round every run
+left, until one run holds every live slot, ending in the first half.
 
 Order: by key; a merge keeps the slots of its earlier run first among equal
 keys. Chunks of *slot keys* (``slot_keys``, keys of at most 51 bits) sort by
@@ -127,15 +127,16 @@ def _chunk_sort(order_key, stored_key):
         extent: wp.array[int],
         capacity: int,
         blocks: int,
+        merges: int,
     ):
-        """Sort each chunk of the live slots in shared memory, into the half from which the merges end in the first.
+        """Sort each chunk of the live slots in shared memory, into the half where ``merges`` rounds end in the first.
 
         Chunks load through ``slot_keys`` and ``slot_indices``; a block stores
         only the chunk it loaded, so no block reads what another writes.
         """
         block = wp.tid()
         live = extent[0]
-        output = capacity * (merge_rounds(live) % 2)
+        output = capacity * (wp.min(merge_rounds(live), merges) % 2)
         for start in range(block * SORT_CHUNK, live, blocks * SORT_CHUNK):
             loaded = wp.tile_load(slot_keys, shape=SORT_CHUNK, offset=start)
             local = wp.tile_arange(SORT_CHUNK, dtype=int)
@@ -169,39 +170,47 @@ def _merge_runs(
     extent: wp.array[int],
     capacity: int,
     merge: int,
+    merges: int,
     threads: int,
 ):
-    """Merge sorted runs pairwise; each slot moves past the smaller keys of its partner run.
+    """Merge sorted runs pairwise, in the last of the ``merges`` rounds every run left; slots move past smaller keys.
 
-    Among equal keys the earlier run's slots go first: a slot of the earlier run
-    counts its partner's smaller keys, one of the later run also the equal ones,
-    so every target position is distinct. Launches past the needed merges return.
+    Among equal keys an earlier run's slots go first: a slot also counts an earlier run's equal keys, so every target
+    position is distinct. Launches past the needed merges return.
     """
     thread = wp.tid()
     live = extent[0]
-    rounds = merge_rounds(live)
+    rounds = wp.min(merge_rounds(live), merges)
     if merge >= rounds:
         return
     source = capacity * ((rounds + merge) % 2)
     target = capacity * ((rounds + merge + 1) % 2)
     width = int(SORT_CHUNK) << merge
+    runs = (live - 1) // width + 1
+    last = merge == rounds - 1
     for i in range(thread, live, threads):
         key = keys[source + i]
         index = indices[source + i]
         run = i // width
-        partner = run ^ 1
-        later = run > partner
-        lo = partner * width
-        hi = wp.min(lo + width, live)
-        first = lo
-        while lo < hi:
-            mid = (lo + hi) // 2
-            other = keys[source + mid]
-            if other < key or (later and other == key):
-                lo = mid + 1
-            else:
-                hi = mid
-        position = wp.min(run, partner) * width + (i - run * width) + (lo - first)
+        group = int(0)
+        end = runs
+        if not last:
+            group = run - run % 2
+            end = wp.min(group + 2, runs)
+        position = i - (run - group) * width
+        for other in range(group, end):
+            if other != run:
+                lo = other * width
+                hi = wp.min(lo + width, live)
+                first = lo
+                while lo < hi:
+                    mid = (lo + hi) // 2
+                    value = keys[source + mid]
+                    if value < key or (other < run and value == key):
+                        lo = mid + 1
+                    else:
+                        hi = mid
+                position += lo - first
         keys[target + position] = key
         indices[target + position] = index
 
@@ -211,14 +220,14 @@ def sort_grid(device, rows: int) -> tuple[int, int, int]:
 
     The grids are fixed so CUDA graphs replay them, and launches stride over
     their extent entry, so a grid only has to fill the device; the merge rounds
-    are those ``rows`` slots may need.
+    are those ``rows`` slots may need, at least the one that can join every run.
     """
     device = wp.get_device(device)
     sms = device.sm_count if device.is_cuda else 1
     rows = max(int(rows), 1)
     blocks = max(1, min(-(-rows // int(SORT_CHUNK)), _SORT_BLOCKS_PER_SM * sms))
     merge_threads = max(1, min(rows, _MERGE_BLOCKS_PER_SM * sms * _BLOCK_THREADS))
-    merges = 0
+    merges = 1
     while int(SORT_CHUNK) << merges < rows:
         merges += 1
     return blocks, merges, merge_threads
@@ -240,16 +249,17 @@ def launch_live_sort(
         indices: Slot indices of the same layout, ``indices[i] == i`` for the live slots.
         extent: The sort extent (:data:`EXTENT_SIZE` entries) a kernel wrote with :func:`publish_sort_extent`.
         capacity: The rows of each half; in a capture whose launches bind, the ready rows rewrite it.
-        blocks: Blocks of the chunk sort (:func:`sort_grid` for :meth:`ContactPool.launch_rows` slots).
-        merges: Merge rounds to launch, at least those the live slots need.
+        blocks: Blocks of the chunk sort (:func:`sort_grid`).
+        merges: Merge rounds to launch; a capture notes the slots they pair (:meth:`ContactPool.note_cover`).
         merge_threads: Threads of each merge.
         slot_keys: Keys of at most 51 bits, which sort stably (:func:`slot_keys_fit`).
     """
     kernel = _sort_slot_chunks if slot_keys else _sort_key_chunks
+    pool.note_cover(int(SORT_CHUNK) << merges)
     pool.launch(
         kernel,
         blocks,
-        inputs=[keys, indices, keys, indices, extent, capacity, blocks],
+        inputs=[keys, indices, keys, indices, extent, capacity, blocks, merges],
         extent=extent[1:2],
         clamp=True,
         row_args=(6,),
@@ -260,7 +270,7 @@ def launch_live_sort(
         pool.launch(
             _merge_runs,
             merge_threads,
-            inputs=[keys, indices, extent, capacity, merge, merge_threads],
+            inputs=[keys, indices, extent, capacity, merge, merges, merge_threads],
             extent=extent[2 + merge : 3 + merge],
             clamp=True,
             row_args=(4,),

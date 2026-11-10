@@ -1130,14 +1130,12 @@ class _FrictionPatchState:
         }
 
     def _grids(self, rows):
-        """Size the grids for ``rows`` slots: the ready rows, or the bound of a capture whose launches bind.
-
-        Every launch strides over its device count, so a grid only has to fill the device.
-        """
+        """Size the grids for ``rows`` slots, the ready rows or the bound of a capture whose launches bind, the sort's
+        for the capacity; every launch strides over its device count, so a grid only has to fill the device."""
         blocks = self.device.sm_count if self.device.is_cuda else 1
         self.threads = max(1, min(rows, _LIGHT_BLOCKS_PER_SM * blocks * _BLOCK_THREADS))
         self.build_threads = max(1, min(rows, _BUILD_BLOCKS_PER_SM * blocks * _BLOCK_THREADS))
-        self.sort_blocks, self.merges, self.merge_threads = sort_grid(self.device, rows)
+        self.sort_blocks, self.merges, self.merge_threads = sort_grid(self.device, self.capacity)
         return self
 
     def update_geometry(self, model):
