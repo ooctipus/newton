@@ -135,25 +135,6 @@ class TreeLayout:
         """Threads per block."""
         return 64 if self.lanes == 64 else 32
 
-    @property
-    def reverse(self):
-        """Whether factor coordinates run in reverse physical order."""
-        return self.permutation == tuple(range(self.dofs - 1, -1, -1))
-
-    def physical(self, index):
-        """Native expression of the physical coordinate of factor coordinate ``index``.
-
-        A permutation other than the reverse order reads the table that
-        :meth:`physical_table` declares.
-        """
-        return f"{self.dofs - 1}-{index}" if self.reverse else f"physical[{index}]"
-
-    def physical_table(self):
-        """Native declaration of the factor-to-physical coordinate table :meth:`physical` reads."""
-        if self.reverse:
-            return ""
-        return f"constexpr int physical[{self.dofs}]={{{','.join(map(str, self.permutation))}}};"
-
     def sizes(self):
         """Every size a native template names, by its ``$NAME``."""
         return {

@@ -1890,7 +1890,7 @@ def both_ways_kernel(table: tuple):
         }}
     }};"""
 
-    # The loop form's tables take the one access's WALK_CONSTANT.
+    # The loop form's tables take the walk prelude's CONSTANT storage.
     prelude = DevicePrelude(f"walk_both_{walk.tag}", text, cpu=text)
     preludes = (factor_walk.walk_loads_prelude(), prelude)
     return KernelTemplate(

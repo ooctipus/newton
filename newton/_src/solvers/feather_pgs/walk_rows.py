@@ -36,7 +36,7 @@ from typing import NamedTuple
 import warp as wp
 
 from ...core.execution import Buckets, Queue, Work, append, bucket_item, shape
-from ...core.memory import built_for
+from ...core.memory import built_for, table
 from . import field_group
 from .contact_input import ContactFrame, ContactInput, contact_frame
 from .contact_laws import CONTACT_SPIN_ROW, contact_row_entry, contact_seed, spin_seed
@@ -557,8 +557,6 @@ def writer_kernel(solver, part: int = WRITE_ROWS) -> wp.Kernel:
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-_SUPPORT_TABLE = """    static WALK_CONSTANT int SUPPORT_NODE[$n] = {$node};"""
-
 _SUPPORT = """    // One unit's rows into the support sink (walk_rows.support_rows_kernel): its seeds walked through the class's
     // path table (WALK_ROW), each footprint stored at its rank in the row's support (SUPPORT_NODE: a
     // coordinate's factor coordinate, the support mask's bit), the unit's Gram and incident from the same walk.
@@ -783,9 +781,9 @@ _SPIN_RECORD = """    // A contact with a spin row: its friction rows' couplings
 
 @cache
 def _support_table(node: tuple[int, ...]) -> DevicePrelude:
-    """The class's factor coordinate of each tree coordinate, in constant memory (``WALK_CONSTANT``, after the walk's
-    prelude): the support mask's bit."""
-    text = substitute(_SUPPORT_TABLE, n=len(node), node=", ".join(str(int(k)) for k in node))
+    """The class's factor coordinate of each tree coordinate, in constant memory (the memory toolkit's ``table``, after
+    the walk's prelude): the support mask's bit."""
+    text = f"    {table('SUPPORT_NODE', node)}"
     return DevicePrelude(f"support_table_{len(node)}", text, cpu=text)
 
 

@@ -31,6 +31,7 @@ import functools
 import warp as wp
 
 __all__ = [
+    "CONSTANT_STORAGE",
     "CPU",
     "CPU_STAGING_BYTES",
     "HELD",
@@ -436,13 +437,15 @@ from the lane that holds it; on the CPU the one lane holds every item. The same 
 group's words."""
 
 
-def table(name: str, values, ctype: str = "int") -> tuple[str, str]:
-    """A constant table ``name`` of ``values`` that every thread reads at one index: ``(cuda, cpu)`` declarations in
-    CUDA's constant memory or the CPU's constant data, one text."""
-    entries = ", ".join(str(value) for value in values)
-    return tuple(
-        f"    static {space} {ctype} {name}[{len(values)}] = {{{entries}}};" for space in ("__constant__", "const")
-    )
+CONSTANT_STORAGE = ("    #define CONSTANT __constant__", "    #define CONSTANT const")
+"""``CONSTANT``, the storage of a constant table (:func:`table`): CUDA's constant memory, or the CPU's constant data."""
+
+
+def table(name: str, values, ctype: str = "int") -> str:
+    """A constant table ``name`` of ``values`` (one entry at least) that every thread reads at one index, in ``CONSTANT``
+    storage (:data:`CONSTANT_STORAGE`): one declaration for both devices."""
+    entries = [str(int(value) if ctype == "int" else value) for value in values]
+    return f"static CONSTANT {ctype} {name}[{max(len(entries), 1)}] = {{{', '.join(entries)}}};"
 
 
 # ---------------------------------------------------------------------------------------------------------------------
