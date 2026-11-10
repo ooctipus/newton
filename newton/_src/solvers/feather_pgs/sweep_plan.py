@@ -638,6 +638,7 @@ class Sweep:
             self.claim_colored = self.claim_general + 2 if colored else -1
             buckets = self.claim_general + (3 if colored else 1)
             self.claims = Queue(buckets * worlds, model.device, buckets=buckets)
+            self.no_impulses = wp.zeros((0, 0), dtype=float, device=model.device)
             # The claim stage runs beside the step's stream until its first reader (claim_worlds).
             self.claims_beside = Beside(model.device)
             if colored:
@@ -730,8 +731,10 @@ class Sweep:
                 self.claim_candidate,
                 claims.region,
                 self.placement.world_acts,
+                self.placement.dense_first,
             ],
-            outputs=[claims.items, claims.count],
+            # The solve group clears only its claim's worlds: the claim clears those it leaves out.
+            outputs=[claims.items, claims.count, self.placement.impulses if self.group else self.no_impulses],
             device=self.model.device,
         )
 
