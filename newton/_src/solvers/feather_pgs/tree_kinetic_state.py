@@ -22,6 +22,7 @@ from . import tree_scan as ts
 from .device_preludes import (
     CUDA_ONLY,
     HELD,
+    SHARED_STORAGE,
     STATUS_CLOCK,
     device_branches,
     dual_native,
@@ -577,7 +578,7 @@ _HALF = r"""
     const int lane=LANE,stride=STRIDE;
 #if defined(__CUDA_ARCH__)
     $SCRATCH
-    __shared__ int ${FLAG}_all[$PACK];int& $FLAG=${FLAG}_all[SUB];
+    $FLAG_STAGE
 #else
     float s[$PRED_SCRATCH];int $FLAG=0;
 #endif
@@ -774,15 +775,21 @@ def _root_articulation(layout: TreeLayout, r: int) -> str:
     return f"plan.arts.data[group*{len(layout.roots)}+{r}]" if layout.forest else "art"
 
 
-def _placed_block(layout: TreeLayout, name: str, words: str) -> str:
+def _packed(layout: TreeLayout, name: str, ctype: str, words: int) -> str:
+    """The packed trees' ``words`` of ``ctype`` each, in consecutive blocks of one shared array ``name_all`` (a
+    :class:`~newton._src.core.memory.Staging`, in ``SHARED`` storage)."""
+    return memory.Staging((memory.Buffer(f"{name}_all", ctype, words * layout.pack),)).declarations("")
+
+
+def _placed_block(layout: TreeLayout, name: str, words: int) -> str:
     """Native statements binding ``float* name`` to this tree's block of ``words`` floats, the one placement rule: shared
-    memory, packed trees in consecutive blocks of one array, unless the device has no room for the group's state
+    memory (:func:`_packed`), unless the device has no room for the group's state
     (:attr:`.TreeLayout.global_block`), then the tree's words of the plan's global scratch. Every barrier the stages
     take fences global memory too, so no stage reads where its block lies; both hold the same values. ``plan`` and
     ``group`` are in scope."""
     if layout.global_block:
         return f"float* {name}=plan.scratch.data+group*{words};"
-    return f"__shared__ float {name}_all[{words}*$PACK];float* {name}={name}_all+SUB*{words};"
+    return f"{_packed(layout, name, 'float', words)}float* {name}={name}_all+SUB*{words};"
 
 
 # A CPU launch runs its blocks one after another on the launching thread, each done with the block before the next, so
@@ -858,7 +865,9 @@ def get_helpers(
         **_native_clocks(clocked, "cache", stages=2, column=13),
     )
 
-    @wp.func_native(layout.native(_STORAGE_SOURCE, BLOCK=_placed_block(layout, "values", "$TOTAL")))
+    @wp.func_native(
+        layout.native(_STORAGE_SOURCE, preludes=(SHARED_STORAGE,), BLOCK=_placed_block(layout, "values", layout.total))
+    )
     def _storage(plan: HeldPlan, group: int) -> wp.uint64: ...
 
     @wp.func_native(pose_source)
@@ -2021,8 +2030,9 @@ def _half_kernel(prefix, schedules, layout, response, classes, flag, body, prelu
 
     source = layout.native(
         _HALF + body,
-        preludes=(*SPATIAL.preludes(), STATUS_CLOCK, *preludes),
-        SCRATCH=_placed_block(layout, "s", "$PRED_SCRATCH"),
+        preludes=(*SPATIAL.preludes(), STATUS_CLOCK, SHARED_STORAGE, *preludes),
+        SCRATCH=_placed_block(layout, "s", layout.sizes()["PRED_SCRATCH"]),
+        FLAG_STAGE=f"{_packed(layout, flag, 'int', 1)}int& {flag}={flag}_all[SUB];",
         FLAG=flag,
         **fragments,
     )
