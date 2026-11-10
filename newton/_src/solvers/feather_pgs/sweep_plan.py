@@ -28,8 +28,8 @@ from collections.abc import Callable
 import numpy as np
 import warp as wp
 
-from ...core.execution import Beside, Buckets, Queue, Work, shape
-from ...core.memory import Place, arch_budget, built_for, device
+from ...core.execution import Beside, Buckets, Queue, shape
+from ...core.memory import Place, arch_budget, device
 from . import (
     class_plan,
     packed_rows,
@@ -46,7 +46,6 @@ from .contact_input import bind_routes as bind_contact_routes
 from .execution_plan import _MFGSStorage, _select_mfgs_storage
 from .field_group import Field, FieldGroup
 from .friction_patches import patch_routes
-from .kernel_template import Dispatch, Fused, KernelTemplate, Phase, compose, items
 from .path_selection import json_value, kernel_key
 from .placement import SPARSE_CONTACT_LEVELS
 from .response_builds_rows import bind_row_records, store_row_records
@@ -54,7 +53,7 @@ from .row_records import bind as bind_dense_rows
 from .solve_policy import QUIET_UNITS, UNIT_ROUNDOFF, SolvePolicy, SolveReadoutRecord
 from .sparse_contact import CONTACT_RECORD_FLOATS, CONTACT_RING_FLOATS
 from .sparse_mass_matrix import _SparseRowSupport, row_supports
-from .sweep import EXACT, FRICTION_METRIC_FLOATS, LevelLaw, SweepConfig, sweep_kernel, sweep_template
+from .sweep import EXACT, FRICTION_METRIC_FLOATS, LevelLaw, SweepConfig, sweep_kernel
 from .sweep_levels import (
     _get_mark_independent_sparse_contact_candidates_kernel,
     _get_sparse_contact_levels_kernel,
@@ -63,7 +62,6 @@ from .tree_scan import classes_half
 from .warm_start import (
     bind_carry,
     carry_contacts,
-    clear_world_impulses,
     forget_carried_contacts,
     gather_carried_normals,
     reset_world_impulses,
@@ -113,31 +111,6 @@ class SweepLaunch:
     grid: int
     block: int
     named: Callable[[], dict]
-
-
-@functools.cache
-def solve_group(config: sweep_routes.GeneralSweep) -> Fused:
-    """The general sweep's solve group where it runs alone and nothing seeds the impulses: one kernel over the sweep's
-    own bucket and grid (the worlds with rows, packed; :func:`.kernel_template.compose`) whose lane groups clear a
-    world's impulses on its lanes, then run its sweep, whose work sets the line. Each phase is its kernel's text on its
-    world's data, so the group computes what they did; a world without rows has no impulse to clear (a cold solve
-    clears its active rows). The walk's change keeps its memset, the step's leave its kernel (4 lanes a tree)."""
-    sweep, staging = sweep_template(config)
-    lanes, groups, alone = config.lanes, config.groups, config.work(0, staging.bytes)
-    own = Work(0, lanes=alone.lanes, block=alone.block)
-    dispatch = Dispatch("", leading=(("world", int), ("lane", int), ("lanes", int)))
-    abi = tuple(clear_world_impulses.input_types.items())
-    clear = KernelTemplate.from_abi(
-        "clear_world_impulses", abi, "", dispatch, function=clear_world_impulses, native_name="clear_world_impulses"
-    )
-    phases = (
-        Phase(clear, ("world", f"lane % {lanes}", str(lanes)), own),
-        Phase(sweep, ("world",), dataclasses.replace(alone, shared=staging.bytes)),
-    )
-    queue = ("general_world_count", "general_world_grid_stride", "general_worlds")
-    dispatch = items("world", groups=groups if groups > 1 else None, lanes=lanes, lane=groups <= 1, queue=queue)
-    bounds = shape(alone, built_for(config.device_arch)).bounds
-    return compose(f"solve_{config.name}", phases, dispatch, line=1, launch_bounds=bounds)
 
 
 class Sweep:
@@ -365,9 +338,15 @@ class Sweep:
         }
 
     def sweep(self, route: str, config: SweepConfig, readout_budget: int | None = None) -> wp.Kernel:
-        """Build the sweep of ``config`` (:func:`.sweep.sweep_kernel`, its laws :attr:`law_fields`) for ``route`` (its
-        owner in the records) and allocate its readout counters outside any graph capture, at ``readout_budget``
-        sweeps (a parallel tier's) or the solver's iteration counts."""
+        """Build the sweep of ``config`` (:func:`.sweep.sweep_kernel`) and allocate its readout counters, outside any
+        graph capture.
+
+        Args:
+            route: Owner of the sweep in the records, such as ``"sparse_pgs"``.
+            config: The sweep's configuration, its laws :attr:`law_fields`.
+            readout_budget: The sweep budget the kernel compiles in (a parallel tier's), or ``None`` for the
+                solver's iteration counts.
+        """
         kernel = sweep_kernel(config)
         self._register(route, kernel, readout_budget)
         return kernel
@@ -444,10 +423,6 @@ class Sweep:
                 metric=FRICTION_METRIC_FLOATS,
             )
         self.mf_gs_kernel = None
-        # The general sweep's solve group (_solve_group): the composer's group, its launch, whether it clears the
-        # impulses (the stage's kernel does not run then).
-        self.group = self.group_launch = None
-        self.starts_impulses = False
         # The colored mapping of the matrix-free sweep and its units, when a world can take it.
         self.mf_colored_kernel = None
         self.colored_units = None
@@ -578,19 +553,7 @@ class Sweep:
                     device_arch,
                     torsion=bool(self.laws.spin_rows),
                 )
-            # Where the general sweep runs alone, leaves by the walk and starts the impulses, its solve group is its
-            # kernel (_solve_group).
-            if (
-                not parallel_rows
-                and not colored
-                and self.factor.walk_arts is not None
-                and self.placement.walks
-                and not self.seeded
-                and self.options.pgs_iterations > 0
-            ):
-                self.mf_gs_kernel = self._solve_group(self.general_sweep)
-            else:
-                self.mf_gs_kernel = self.sweep("mf_gs", self.general_sweep)
+            self.mf_gs_kernel = self.sweep("mf_gs", self.general_sweep)
             if colored:
                 self.colored_sweep = dataclasses.replace(self.general_sweep, **_COLORED)
                 self.mf_colored_kernel = self.sweep("mf_colored", self.colored_sweep)
@@ -638,7 +601,6 @@ class Sweep:
             self.claim_colored = self.claim_general + 2 if colored else -1
             buckets = self.claim_general + (3 if colored else 1)
             self.claims = Queue(buckets * worlds, model.device, buckets=buckets)
-            self.no_impulses = wp.zeros((0, 0), dtype=float, device=model.device)
             # The claim stage runs beside the step's stream until its first reader (claim_worlds).
             self.claims_beside = Beside(model.device)
             if colored:
@@ -656,11 +618,8 @@ class Sweep:
                     support=self.placement.packed_support,
                 )
             # The general sweep walks its bucket on a persistent grid, a warp a world (its work's shape); the colored
-            # bucket a block a world of its slots, a color's units at once; the solve group also reads the clear's.
+            # bucket a block a world of its slots, a color's units at once.
             general = self._claim_launch(self.general_sweep, self.mf_gs_kernel, worlds, self.claim_general)
-            if self.group is not None:
-                clear, named = {"max_constraints": self.placement.dense_max_constraints, "warmstart": 0}, general.named
-                general = self.group_launch = dataclasses.replace(general, named=lambda: {**named(), **clear})
             mapped = (general,)
             if colored:
                 slots = self.colored_units.slot_count
@@ -687,12 +646,20 @@ class Sweep:
         self.leaves = self.factor.walk_arts is not None and bool(self.placement.walks or self.tiers)
 
     def open_streams(self, *, overlap: bool) -> None:
-        """Open the claims' streams, a stream a tier: the Jacobi tiers run beside the matrix-free sweep, whose worlds
-        and rows they never touch (a tier's world holds no free-body or speed row), after the rows are published and
-        the claims written (:func:`.sweep_levels.claim_worlds`), joined before the leave. The other side streams
-        (inertia, dynamics, memset) read no contact row nor the pool's ready count; the tiers do, between the fork and
-        the join only, and the launch stream the pool registers waits for the join, so a trim waiting for the launch
-        stream waits for them too (:meth:`ContactPool.add_reader_stream`)."""
+        """Open the claims' streams: the sweeps that own their worlds run on them beside the matrix-free sweep.
+
+        The claims touch nothing the matrix-free sweep touches, so they fork after the rows are published and join
+        before the leave: the Jacobi tiers, whose worlds hold no free-body row (nor a speed row of the line), none of
+        the matrix-free sweep's. A tier's worlds are those of its row count, so each tier is a claim of its own.
+
+        The claims' worlds are written before the fork (:func:`.sweep_levels.claim_worlds`), since the matrix-free sweep
+        walks its bucket of them too. A stream a tier.
+
+        The other side streams (inertia, dynamics, memset) read no contact rows nor the contact pool's ready count:
+        they run factorizations and articulation data. The claims do (the tiers), between the fork and the join
+        only, and the launch stream, which the pool registers, waits for the join before it goes on. A trim that waits
+        for the launch stream therefore waits for them too (:meth:`ContactPool.add_reader_stream`).
+        """
         model = self.model
         claims = len(self.tiers) if wp.get_device(model.device).is_cuda and overlap else 0
         self.claim_streams = tuple(wp.Stream(model.device) for _ in range(claims))
@@ -700,10 +667,13 @@ class Sweep:
         self.claims_done = tuple(wp.Event(model.device) for _ in range(claims))
 
     def claim_worlds(self) -> None:
-        """The claim stage, once the row counts are final (after the status latch): every world with rows into its
-        claim's bucket of :attr:`claims` (:func:`.sweep_levels.claim_worlds`), a tier's (only dense rows, inside the
-        tiers' row bound), the colored candidates' (a colored storage slot) or the general sweep's, which the one
-        writer, the unit builder and the sweeps read; beside the stage's stream until :meth:`join_claims`."""
+        """The claim stage: every world with rows into its claim's bucket of :attr:`claims`
+        (:func:`.sweep_levels.claim_worlds`), once the row counts are final (after the status latch): a tier's (only dense
+        rows, inside the tiers' row bound), the colored candidates' (a world with a colored storage slot) or the
+        general sweep's. The one writer, the unit builder and every sweep read their buckets.
+
+        Its first reader is the unit builder or the sweep: it runs beside the stage's stream until
+        :meth:`join_claims`."""
         if self.claims_beside is not None:
             self.claims_beside.start(self._claim_worlds)
         else:
@@ -731,10 +701,8 @@ class Sweep:
                 self.claim_candidate,
                 claims.region,
                 self.placement.world_acts,
-                self.placement.dense_first,
             ],
-            # The solve group clears only its claim's worlds: the claim clears those it leaves out.
-            outputs=[claims.items, claims.count, self.placement.impulses if self.group else self.no_impulses],
+            outputs=[claims.items, claims.count],
             device=self.model.device,
         )
 
@@ -888,14 +856,6 @@ class Sweep:
             layout.block,
             functools.partial(self._mapped_operands, bucket, layout.grid * layout.groups),
         )
-
-    def _solve_group(self, config: sweep_routes.GeneralSweep) -> wp.Kernel:
-        """The solve group (:func:`solve_group`), its readout registered as the general sweep's."""
-        self.starts_impulses = True
-        self.group = solve_group(config)
-        kernel = self.group.template.kernel()
-        self._register("mf_gs", kernel, None)
-        return kernel
 
     def _walk(self) -> dict:
         """The walk's view, where the sweeps leave by the walk and find a free body's tree in it."""
@@ -1250,8 +1210,6 @@ class Sweep:
             **{name: plan.kernels[name] for name in ("sparse", "sparse_diagonal", "mf_gs")},
             "mf_gs_storage": self._record_storage(),
             "mf_gs_active_reason": self.general_active_reason,
-            # The general sweep's solve group (solve_group): its kernel, phases, line and grid.
-            "solve_group": self._record_group(),
             "mf_colored": self._record_colored(plan),
             "tiers": self._record_tiers(plan.route),
             "readout": {
@@ -1273,19 +1231,6 @@ class Sweep:
                     "terms of its velocity sum and its own impulse times A_ii."
                 ),
             },
-        }
-
-    def _record_group(self) -> dict | None:
-        """The general sweep's solve group (MEGA §3.8): its kernel, phases, line, shared bytes and grid."""
-        if self.group is None:
-            return None
-        group, launch = self.group, self.group_launch
-        return {
-            "kernel": kernel_key(launch.kernel),
-            "phases": [phase.name for phase in group.template.phases],
-            "registers": group.work.registers,
-            "shared": int(group.work.shared),
-            "grid": [int(launch.grid), int(launch.block)],
         }
 
     def _record_storage(self) -> dict | None:

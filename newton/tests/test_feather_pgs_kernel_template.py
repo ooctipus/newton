@@ -13,15 +13,12 @@ import unittest
 import numpy as np
 import warp as wp
 
-from newton._src.core.execution import Work
 from newton._src.solvers.feather_pgs import field_group
 from newton._src.solvers.feather_pgs.device_preludes import CUDA_ONLY, RING
 from newton._src.solvers.feather_pgs.field_group import Field
 from newton._src.solvers.feather_pgs.kernel_template import (
     Dispatch,
     KernelTemplate,
-    Phase,
-    compose,
     items,
     operands,
     params,
@@ -187,39 +184,6 @@ class TestItems(unittest.TestCase):
         out = wp.zeros(2, dtype=float, device="cpu")
         wp.launch(kernel, dim=(2, 4), inputs=[rows, out], device="cpu")
         np.testing.assert_array_equal(out.numpy(), [15.0, 51.0])
-
-
-@wp.func
-def _count_world(world: int, lane: int, lanes: int, visits: wp.array[float]):
-    visits[world] = visits[world] + 1.0
-
-
-def _phase(name, body="", function=None, params=(("out", wp.array[float]),)):
-    leading = (("world", int), ("lane", int), ("lanes", int)) if function else (("world", int),)
-    dispatch = Dispatch("", leading=leading)
-    template = KernelTemplate(name, params, body, dispatch, dual=True, native_name=name, function=function)
-    return Phase(template, ("world", "lane % 1", "1") if function else ("world",), Work(0, lanes=1, block=1))
-
-
-class TestCompose(unittest.TestCase):
-    """The composer: phases of one item in turn, the lanes' barrier between them, their operands bound once."""
-
-    def test_phases_run_each_world_in_turn(self):
-        """Two native phases and a Warp function phase on each world of a guarded grid."""
-        first = _phase("place", "    out.data[world] = (float)world;\n")
-        second = _phase("scale", "    out.data[world] = 2.0f * out.data[world] + 1.0f;\n")
-        visit = _phase("visit", function=_count_world, params=(("visits", wp.array[float]),))
-        dispatch = items("world", groups=1, lanes=1, guard="count")
-        fused = compose("fused_cpu", (first, second, visit), dispatch, line=0)
-        self.assertEqual([name for name, _ in fused.template.signature], ["count", "out", "visits"])
-        calls = [row.strip().split("(")[0] for row in fused.template.dispatch.body.splitlines()[3:]]
-        self.assertEqual(calls, ["place", "barrier", "scale", "barrier", "visit"])
-        out, seen = wp.zeros(5, dtype=float, device="cpu"), wp.zeros(5, dtype=float, device="cpu")
-        wp.launch_tiled(fused.template.kernel(), dim=[6], inputs=[5, out, seen], block_dim=1, device="cpu")
-        np.testing.assert_array_equal(out.numpy(), [1, 3, 5, 7, 9])
-        np.testing.assert_array_equal(seen.numpy(), [1, 1, 1, 1, 1])
-        with self.assertRaisesRegex(ValueError, "operand 'out'"):
-            compose("clash", (first, _phase("other", params=(("out", wp.array[int]),))), dispatch, line=0)
 
 
 if __name__ == "__main__":

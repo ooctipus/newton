@@ -22,20 +22,24 @@ from .field_group import Field
 from .row_laws import ROW_CONTACT
 
 
-@wp.func
-def clear_world_impulses(
-    world: int,
-    lane: int,
-    lanes: int,
+@wp.kernel
+def prepare_world_impulses(
     dense_first: wp.array[int],
     world_constraint_count: wp.array[int],
     max_constraints: int,
     warmstart: int,
+    # in/out
     world_impulses: wp.array2d[float],
 ):
-    """Cold-initialize a world's dense rows before identity-gathering contact impulses, ``lane`` of ``lanes``. No
-    non-contact row family has a cross-step identity (limits are activation-allocated, mimic and link rows can be
-    enabled dynamically): the warm start clears the full capacity, a cold solve the active prefix."""
+    """Cold-initialize dense rows before identity-gathering contact impulses.
+
+    No current non-contact row family has a cross-step identity contract:
+    limits are activation-allocated, while mimic and link rows can be enabled
+    dynamically and allocated atomically. Warm start therefore clears the
+    full capacity before the contact/friction identity gather; cold solves only
+    need to clear the current active prefix.
+    """
+    world = wp.tid()
     line = dense_first[world]
     m = world_constraint_count[world]
 
@@ -47,21 +51,8 @@ def clear_world_impulses(
     if warmstart == 0:
         clear_count = m
 
-    for i in range(lane, clear_count, lanes):
+    for i in range(clear_count):
         world_impulses[line, i] = 0.0
-
-
-@wp.kernel
-def prepare_world_impulses(
-    dense_first: wp.array[int],
-    world_constraint_count: wp.array[int],
-    max_constraints: int,
-    warmstart: int,
-    # in/out
-    world_impulses: wp.array2d[float],
-):
-    world = wp.tid()
-    clear_world_impulses(world, 0, 1, dense_first, world_constraint_count, max_constraints, warmstart, world_impulses)
 
 
 ContactCarry = field_group.struct(
