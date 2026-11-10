@@ -70,8 +70,12 @@ Kernels call :func:`ordered_tile` or :func:`ordered_next`, then
 
 from __future__ import annotations
 
+from string import Template
+
 import numpy as np
 import warp as wp
+
+from .memory import SHARED_STORAGE, Buffer, Staging
 
 __all__ = [
     "ORDERED_CPU",
@@ -98,7 +102,8 @@ _COMMON = r"""
         return epoch >= 0x7fffffffu ? 1ull : (unsigned long long)(epoch + 1u);
     };"""
 
-ORDERED_CUDA = (
+ORDERED_CUDA = Template(
+    f"{SHARED_STORAGE[0]}\n"
     r"""    // ---- ordered reservation: tiles in input order, decoupled look-back with epoch-tagged states ----"""
     + _COMMON
     + r"""
@@ -121,7 +126,7 @@ ORDERED_CUDA = (
     // for its block would hold up the look-backs of the tiles after it.
     const auto ORDERED_NEXT = [&](unsigned long long* site, int block, int live_tiles, int blocks,
                                   int* counter) -> OrderedClaim {
-        __shared__ long long s_ordered_claim;
+$claim
         const int active = blocks < live_tiles ? blocks : live_tiles;
         OrderedClaim claim{-1, 0, 0};
         if (block >= active) return claim;
@@ -131,14 +136,14 @@ ORDERED_CUDA = (
             const int start = *((volatile int*)counter);
             if ((int)tile < live_tiles) {
                 claim.start = tile == 0u ? start : 0;
-                s_ordered_claim = ((long long)epoch << 32) | (long long)tile;
+                s_ordered_claim[0] = ((long long)epoch << 32) | (long long)tile;
             } else {
                 if (tile == (unsigned)(live_tiles + active - 1)) *((volatile unsigned*)site) = 0u;
-                s_ordered_claim = -1;
+                s_ordered_claim[0] = -1;
             }
         }
         __syncthreads();
-        const long long word = s_ordered_claim;
+        const long long word = s_ordered_claim[0];
         if (word >= 0) {
             claim.tile = (int)(word & 0xffffffffll);
             claim.epoch = (int)(word >> 32);
@@ -181,7 +186,7 @@ ORDERED_CUDA = (
     // The last tile writes the new count and, in a launch of several tiles, opens the next epoch.
     const auto ORDERED_SCAN = [&](unsigned long long* site, OrderedClaim claim, int count, bool last,
                                   int* counter) -> int {
-        __shared__ unsigned s_ordered_warp[32];
+$warps
         const unsigned full = 0xffffffffu;
         const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, warps = blockDim.x >> 5;
         const int tile = claim.tile;
@@ -222,6 +227,9 @@ ORDERED_CUDA = (
         __syncthreads();
         return first;
     };"""
+).substitute(
+    claim=Staging((Buffer("s_ordered_claim", "long long", 1),)).declarations("        "),
+    warps=Staging((Buffer("s_ordered_warp", "unsigned", 32),)).declarations("        "),
 )
 """CUDA text of the ordered reservation (statements inside a native body, ahead of the body's own)."""
 
