@@ -3,10 +3,8 @@
 
 from __future__ import annotations
 
-import itertools
 import warnings
-import weakref
-from typing import Any, Literal, NamedTuple
+from typing import Any, Literal
 
 import warp as wp
 from warp import DeviceLike as Devicelike
@@ -19,22 +17,6 @@ GENERATION_SENTINEL = -1
 """Value reserved as an impossible generation; the increment kernel skips it."""
 
 
-class ContactFrameWrite(NamedTuple):
-    """The last write of a contact stream's frame that the host issued (:func:`note_contact_frame_write`)."""
-
-    tick: int
-    """Position of the write in host program order; ticks are never reused."""
-    scope: tuple[int, int | None] | None
-    """Capture scope the write's launches were recorded in (:func:`capture_scope`); ``None`` when eager."""
-
-
-_FRAME_TICKS = itertools.count(1)
-_CAPTURE_SERIALS = itertools.count(1)
-# Keyed by a contact stream's generation counter, the array that names the
-# stream for its consumers; an entry dies with its counter.
-_FRAME_WRITES: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
-
-
 def _registered_capture(device):
     """Return the Warp graph recording ``device``'s current CUDA stream, if any."""
     if not device.is_cuda:
@@ -44,54 +26,6 @@ def _registered_capture(device):
     # Reading the registry avoids a CUDA driver is-capturing query on every
     # ordinary solver step.
     return getattr(device, "captures", {}).get(wp.get_stream(device))
-
-
-def capture_scope(device) -> tuple[int, int | None] | None:
-    """Return the scope that launches on ``device``'s current stream are captured in, or ``None`` when eager.
-
-    A scope is one Warp graph capture, named by a serial attached to its
-    :class:`warp.Graph` that is never reused, together with the raw graph its
-    launches go to. Warp swaps that raw graph while it records the body of a
-    conditional node (:func:`warp.capture_if`, :func:`warp.capture_while`), so
-    each body is a scope of its own; the main graph's handle reads ``None``
-    until the capture first pauses. CPU captures and captures Warp does not
-    know about count as eager.
-    """
-    graph = _registered_capture(device)
-    if graph is None:
-        return None
-    serial = getattr(graph, "_newton_capture_serial", None)
-    if serial is None:
-        serial = graph._newton_capture_serial = next(_CAPTURE_SERIALS)
-    handle = getattr(graph, "graph", None)
-    return serial, getattr(handle, "value", handle)
-
-
-def note_contact_frame_write(generation: wp.array) -> ContactFrameWrite:
-    """Record that launches issued now rewrite the contact frame counted by ``generation``.
-
-    Every Newton writer of a contact stream notes its writes here, keyed by the
-    stream's ``contact_generation`` array: :meth:`newton.CollisionPipeline.collide`,
-    :meth:`Contacts.clear` (also where a converter such as Kamino's clears its
-    output first), :meth:`newton.solvers.SolverMuJoCo.update_contacts` and the
-    contact filters of the coupled solvers. Code outside Newton that rewrites a
-    contact stream in place notes nothing; it calls :meth:`Contacts.clear` first.
-    Consumers that reuse work derived from one frame across captured steps
-    (FeatherPGS patch friction) compare ticks to learn whether the host issued
-    a write since. Captured writes repeat on every replay, so a tick says only
-    that the host issued one; the scope says where it was recorded.
-
-    Args:
-        generation: The contact stream's ``contact_generation`` array.
-    """
-    write = ContactFrameWrite(next(_FRAME_TICKS), capture_scope(generation.device))
-    _FRAME_WRITES[generation] = write
-    return write
-
-
-def contact_frame_write(generation: wp.array) -> ContactFrameWrite | None:
-    """Return the last write noted for the contact stream counted by ``generation``, or ``None``."""
-    return _FRAME_WRITES.get(generation)
 
 
 _RIGID_CONTACT_DIFF_REPLACEMENTS = {
@@ -761,8 +695,6 @@ class Contacts:
                 generation via another fused kernel (e.g. :func:`compute_shape_aabbs`) can pass
                 ``False`` to avoid an unnecessary double-bump per collision pass.
         """
-        # Zeroing the counts rewrites the frame whether or not the generation advances.
-        note_contact_frame_write(self.contact_generation)
         # Clear all counters and (optionally) bump generation in a single kernel launch.
         num_counters = self.contact_counters.shape[0]
         wp.launch(
