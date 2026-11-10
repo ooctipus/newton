@@ -18,7 +18,6 @@ from ...core.contact_pool import ContactField, ContactPool, ContactRows
 from ...core.reset import reset_world_selected as _reset_world_selected
 from ...geometry import ParticleFlags, ShapeFlags
 from ...sim import JointType, Model, ModelFlags, StateFlags
-from ...sim.contacts import note_contact_frame_write
 from ..solver import SolverBase
 from .interface import (
     CouplingEndpointKind,
@@ -3589,9 +3588,6 @@ class SolverCoupled(SolverBase, CouplingInterface):
         contact_update_dim = max(
             contacts.rigid_contact_max, contacts.soft_contact_max, filtered.contact_counters.shape[0]
         )
-        # The filter rewrites the entry's frame whenever its source advanced, which
-        # only the device knows; the host notes every filter pass.
-        note_contact_frame_write(filtered.contact_generation)
         if contact_update_dim > 0:
             wp.launch(
                 _prepare_filtered_contact_update_kernel,

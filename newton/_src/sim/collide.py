@@ -78,7 +78,7 @@ from ..geometry.terrain_contacts import (
 )
 from ..geometry.tri_mesh_collision import TriMeshCollisionDetector
 from ..geometry.types import GeoType
-from ..sim.contacts import GENERATION_SENTINEL, Contacts, note_contact_frame_write
+from ..sim.contacts import GENERATION_SENTINEL, Contacts
 from ..sim.enums import BodyFlags, JointType, ModelFlags
 from ..sim.model import Model
 from ..sim.shape_contact_pairs import (
@@ -5143,7 +5143,6 @@ class CollisionPipeline:
 
         # Compute AABBs for all shapes, zero counters, bump generation.
         # Fuses contacts.clear() + broad_phase_pair_count.zero_() + AABB update.
-        note_contact_frame_write(contacts.contact_generation)
         aabb_kernel = compute_shape_aabbs
         aabb_dim = model.shape_count
         aabb_index_inputs = []

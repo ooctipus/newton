@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import contextlib
-import ctypes
 import gc
 import itertools
 import math
@@ -11,7 +10,6 @@ import unittest
 import warnings
 from collections import Counter
 from enum import IntFlag, auto
-from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -45,7 +43,6 @@ from newton._src.geometry.soft_contacts_sdf import (
     optimize_edge_sdf,
     optimize_face_sdf,
 )
-from newton._src.sim import contacts as contacts_module
 from newton._src.sim.collide import (
     _GENERIC_CONVEX_PAIR_LOOKUP,
     _CONVEX_PAIR_MAX_CONTACTS,
@@ -66,7 +63,6 @@ from newton._src.sim.collide import (
     _estimate_rigid_contact_max,
     write_contact,
 )
-from newton._src.sim.contacts import capture_scope, contact_frame_write
 from newton._src.utils.heightfield import HeightfieldData
 from newton.examples import test_body_state
 from newton.geometry import BroadPhaseAllPairs, BroadPhaseExplicit, NarrowPhase
@@ -548,115 +544,41 @@ def _sphere_over_ground(device):
     return builder.finalize(device=device)
 
 
-def _frame_tick(contacts):
-    write = contact_frame_write(contacts.contact_generation)
-    return None if write is None else write.tick
-
-
-class TestContactFrameLedger(unittest.TestCase):
-    def test_collide_notes_a_write_of_its_contacts_only(self):
-        """Advance the frame-write tick of the collided buffer on every pass, eagerly without a scope."""
+class TestContactFrameGeneration(unittest.TestCase):
+    def test_collide_advances_its_contacts_generation_only(self):
+        """Advance the collided buffer's generation on every pass, the word that frame consumers key reuse by."""
         model = _sphere_over_ground("cpu")
         pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
         collided, other = pipeline.contacts(), pipeline.contacts()
         state = model.state()
-        self.assertIsNone(contact_frame_write(collided.contact_generation))
-        ticks = []
+        generations = []
         for _ in range(2):
             pipeline.collide(state, collided)
-            write = contact_frame_write(collided.contact_generation)
-            self.assertIsNone(write.scope)
-            ticks.append(write.tick)
-        self.assertLess(ticks[0], ticks[1])
-        self.assertIsNone(contact_frame_write(other.contact_generation), "another buffer was not written")
+            generations.append(int(collided.contact_generation.numpy()[0]))
+        self.assertEqual(generations[1], generations[0] + 1)
+        np.testing.assert_array_equal(other.contact_generation.numpy(), [0], "another buffer was not written")
         self.assertGreater(int(collided.rigid_contact_count.numpy()[0]), 0)
 
-    def test_clear_notes_a_write_with_or_without_a_new_generation(self):
-        """Advance the frame-write tick on every clear(), which zeroes the counts either way."""
-        contacts = newton.Contacts(8, 0, device="cpu")
-        ticks = [_frame_tick(contacts)]
-        for bump in (True, False):
-            contacts.clear(bump_generation=bump)
-            ticks.append(_frame_tick(contacts))
-            self.assertIsNone(contact_frame_write(contacts.contact_generation).scope)
-        self.assertIsNone(ticks[0])
-        self.assertLess(ticks[1], ticks[2])
-        np.testing.assert_array_equal(contacts.contact_generation.numpy(), [1])
 
-    def test_capture_scope_names_each_graph_and_conditional_body(self):
-        """Name a capture by its graph's serial and the raw graph it records into; eager launches have none.
-
-        The registry is mocked on a stand-in CUDA device: Warp registers the graph
-        recording each stream, and swaps the graph's raw handle while it records a
-        conditional body.
-        """
-        stream = object()
-        device = SimpleNamespace(is_cuda=True, captures={})
-        with mock.patch.object(wp, "get_stream", return_value=stream):
-            self.assertIsNone(capture_scope(device), "an eager launch has no scope")
-            graph = SimpleNamespace(graph=None)
-            device.captures[stream] = graph
-            main = capture_scope(device)
-            self.assertEqual(main, capture_scope(device))
-            graph.graph = ctypes.c_void_p(0x1000)
-            body = capture_scope(device)
-            self.assertEqual(body[0], main[0])
-            self.assertNotEqual(body, main)
-            graph.graph = ctypes.c_void_p(0x2000)
-            self.assertNotEqual(capture_scope(device), body, "the resumed main graph is not the body")
-            # A new graph is a new capture, even when it reuses a freed graph's handle.
-            device.captures[stream] = SimpleNamespace(graph=ctypes.c_void_p(0x1000))
-            self.assertNotEqual(capture_scope(device)[0], main[0])
-        self.assertIsNone(capture_scope(SimpleNamespace(is_cuda=False)))
-
-    def test_noted_writes_carry_the_current_scope(self):
-        """Record the capture scope current at the write."""
-        contacts = newton.Contacts(8, 0, device="cpu")
-        with mock.patch.object(contacts_module, "capture_scope", return_value=(7, None)) as scope:
-            contacts.clear()
-        scope.assert_called_once_with(contacts.contact_generation.device)
-        self.assertEqual(contact_frame_write(contacts.contact_generation).scope, (7, None))
-
-
-def test_captured_frame_writes_carry_their_scope(test, device):
-    """Record captured writes in their graph's scope, a conditional body in its own, eager ones in none."""
+def test_captured_collision_passes_advance_the_generation(test, device):
+    """Advance the generation on every replay of a captured collision pass."""
     model = _sphere_over_ground(device)
     pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
     contacts = pipeline.contacts()
     state = model.state()
     pipeline.collide(state, contacts)
-    condition = wp.ones(1, dtype=wp.int32, device=device)
-    scopes = {}
     with wp.ScopedCapture(device=device) as capture:
-        scopes["main"] = capture_scope(wp.get_device(device))
         pipeline.collide(state, contacts)
-        scopes["collide"] = contact_frame_write(contacts.contact_generation).scope
-        if wp.is_conditional_graph_supported():
-
-            def body():
-                scopes["body"] = capture_scope(wp.get_device(device))
-                contacts.clear()
-                scopes["clear"] = contact_frame_write(contacts.contact_generation).scope
-
-            wp.capture_if(condition, on_true=body)
-    with wp.ScopedCapture(device=device):
-        scopes["other"] = capture_scope(wp.get_device(device))
-    test.assertIsNotNone(scopes["main"])
-    test.assertEqual(scopes["collide"], scopes["main"])
-    test.assertNotEqual(scopes["other"][0], scopes["main"][0], "each capture has its own serial")
-    if "body" in scopes:
-        test.assertEqual(scopes["clear"], scopes["body"])
-        test.assertEqual(scopes["body"][0], scopes["main"][0])
-        test.assertNotEqual(scopes["body"], scopes["main"])
-    wp.capture_launch(capture.graph)
-    pipeline.collide(state, contacts)
-    test.assertIsNone(contact_frame_write(contacts.contact_generation).scope)
+    first = int(contacts.contact_generation.numpy()[0])
+    for replay in range(1, 4):
+        wp.capture_launch(capture.graph)
+        test.assertEqual(int(contacts.contact_generation.numpy()[0]), first + replay)
 
 
 add_function_test(
-    TestContactFrameLedger,
-    "test_captured_frame_writes_carry_their_scope",
-    test_captured_frame_writes_carry_their_scope,
+    TestContactFrameGeneration,
+    "test_captured_collision_passes_advance_the_generation",
+    test_captured_collision_passes_advance_the_generation,
     devices=get_cuda_test_devices(mode="basic"),
 )
 
@@ -8178,6 +8100,8 @@ add_function_test(
     test_plane_convex_support,
     devices=get_test_devices(),
 )
+
+
 def _expert_mesh_box_model(device):
     """Static mesh cube overlapping a box on a body, for expert-component construction."""
     builder = newton.ModelBuilder()
