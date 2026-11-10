@@ -1540,68 +1540,64 @@ class TestPatchParallelRoutes(unittest.TestCase):
                         _rollout(model, solver, 1)
                     assert_row_builders_named(self, record, keys)
 
-    def test_emitting_linked_tiers_replay_alike_with_and_without_frame_reuse(self):
+    def test_emitting_linked_tiers_replay_alike_whether_a_frame_is_kept_or_sorted(self):
         """Replay captured seeded linked-tier steps bit for bit whether a shared contact frame is kept or sorted again.
 
-        Patch friction runs seeded rows into the linked tiers by default, and a captured build that shares the
-        previous captured build's contact frame keeps its sorted pairs (``FEATHER_PGS_PATCH_FRAME_REUSE``, default
-        on). Neither the source A/B nor the tier probes ran the two together. A graph of one collision pass and two
-        substeps sorts its first build and keeps the second; under ``=0`` it sorts both. Frame reuse keeps the
-        patch state bitwise, so every replay must leave the same joint coordinates, velocities and impulses
-        under both settings.
+        Patch friction runs seeded rows into the linked tiers by default, and a build whose contact frame the slots
+        already hold sorted keeps its pairs. Neither the source A/B nor the tier probes ran the two together. A graph
+        of one collision pass and two substeps sorts its first build and keeps the second; a twin that forgets the
+        frame before every build sorts both. Keeping the pairs keeps the patch state bitwise, so every replay must
+        leave the same joint coordinates, velocities and impulses in both.
         """
-        from newton.tests.test_feather_pgs_patch_mechanism import _admitted_modes  # noqa: PLC0415
+        from newton.tests.test_feather_pgs_patch_mechanism import _DecisionProbe, _sort_every_build  # noqa: PLC0415
         from newton.tests.unittest_utils import scoped_capture_after_gc  # noqa: PLC0415
 
         model = standing_model()
         dt = 1.0 / 240.0
         replays = {}
-        for reuse in (None, "0"):
-            with patch.dict(os.environ):
-                os.environ.pop("FEATHER_PGS_PATCH_FRAME_REUSE", None)
-                if reuse is not None:
-                    os.environ["FEATHER_PGS_PATCH_FRAME_REUSE"] = reuse
-                solver = _matrix_free_solver(
-                    model, beta=0.2, parallel_rows=32, pins={**_DENSE, "sink": "emit"}, enable_joint_limits=True
-                )
-                tiers = solver.get_path_selection()["routes"]["sweep"]["tiers"]
-                self.assertEqual((tiers["tiers"][0]["sink"], tiers["linked_rows"]), ("emit", True))
-                self.assertEqual(solver.laws.friction_patches.reuse_frames, reuse is None)
-                states, control = [model.state(), model.state()], model.control()
-                newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
-                pipeline = newton.CollisionPipeline(
-                    model, rigid_contact_max=64, deterministic=True, growable_contacts=True
-                )
-                contacts = pipeline.contacts()
+        for keep in (True, False):
+            solver = _matrix_free_solver(
+                model, beta=0.2, parallel_rows=32, pins={**_DENSE, "sink": "emit"}, enable_joint_limits=True
+            )
+            tiers = solver.get_path_selection()["routes"]["sweep"]["tiers"]
+            self.assertEqual((tiers["tiers"][0]["sink"], tiers["linked_rows"]), ("emit", True))
+            patches = solver.laws.friction_patches
+            if not keep:
+                _sort_every_build(patches)
+            states, control = [model.state(), model.state()], model.control()
+            newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+            pipeline = newton.CollisionPipeline(model, rigid_contact_max=64, deterministic=True, growable_contacts=True)
+            contacts = pipeline.contacts()
+            probe = _DecisionProbe(patches, 2)
 
-                def pair(states=states, solver=solver, pipeline=pipeline, contacts=contacts, control=control):
-                    """One collision pass, then two substeps that share its contact frame and return to states[0]."""
-                    pipeline.collide(states[0], contacts)
-                    for state, following in ((states[0], states[1]), (states[1], states[0])):
-                        state.clear_forces()
-                        solver.step(state, following, control, contacts, dt)
+            def pair(states=states, solver=solver, pipeline=pipeline, contacts=contacts, control=control, probe=probe):
+                """One collision pass, then two substeps that share its contact frame and return to states[0]."""
+                pipeline.collide(states[0], contacts)
+                for slot, (state, following) in enumerate(((states[0], states[1]), (states[1], states[0]))):
+                    state.clear_forces()
+                    solver.step(state, following, control, contacts, dt)
+                    probe.mark(slot)
 
-                # Eager pairs load every kernel and buffer the graph launches; eager builds always sort.
-                for _ in range(2):
-                    pair()
-                outcomes = _admitted_modes(solver.laws.friction_patches)
-                wp.synchronize_device(model.device)
-                with scoped_capture_after_gc(device=model.device) as capture:
-                    pair()
-                self.assertEqual(outcomes, ["sort", "keep"] if reuse is None else ["sort", "sort"], reuse)
-                replays[reuse] = []
-                for _ in range(3):
-                    wp.capture_launch(capture.graph)
-                    replays[reuse].append(
-                        {
-                            "joint_q": states[0].joint_q.numpy(),
-                            "joint_qd": states[0].joint_qd.numpy(),
-                            "impulses": solver.placement.impulses.numpy(),
-                        }
-                    )
-                self.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0, "the feet must touch the ground")
-        self.assertTrue(np.any(replays[None][-1]["impulses"] != 0.0), "the feet must carry impulses")
-        for replay, (kept, sorted_every_build) in enumerate(zip(replays[None], replays["0"], strict=True)):
+            # Eager pairs load every kernel and buffer the graph launches.
+            for _ in range(2):
+                pair()
+            wp.synchronize_device(model.device)
+            with scoped_capture_after_gc(device=model.device) as capture:
+                pair()
+            replays[keep] = []
+            for _ in range(3):
+                wp.capture_launch(capture.graph)
+                self.assertEqual(probe.read(), ["sort", "keep" if keep else "sort"], keep)
+                replays[keep].append(
+                    {
+                        "joint_q": states[0].joint_q.numpy(),
+                        "joint_qd": states[0].joint_qd.numpy(),
+                        "impulses": solver.placement.impulses.numpy(),
+                    }
+                )
+            self.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0, "the feet must touch the ground")
+        self.assertTrue(np.any(replays[True][-1]["impulses"] != 0.0), "the feet must carry impulses")
+        for replay, (kept, sorted_every_build) in enumerate(zip(replays[True], replays[False], strict=True)):
             for name, value in kept.items():
                 np.testing.assert_array_equal(value, sorted_every_build[name], f"replay {replay}: {name}")
 

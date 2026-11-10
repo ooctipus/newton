@@ -992,8 +992,6 @@ class Placement:
             raise RuntimeError("Constraint capacity status must be read outside CUDA graph capture")
         dense, matrix_free = map(bool, self.constraint_capacity_status.numpy())
         result = {"dense": dense, "matrix_free": matrix_free}
-        frame_status = self.laws.patch_frame_status()
-        result["patch_frames"] = frame_status is not None and bool(frame_status.numpy()[0])
         pool = getattr(self, "contact_pool", None)
         result["contact_launches"] = pool is not None and pool.launch_failed(clear=clear)
         # The predictor's border (tree_kinetic_state.border_solve): bit 0, a tree slipped past its frame's capacity; bit 2,
@@ -1002,8 +1000,6 @@ class Placement:
         if clear:
             self.constraint_capacity_status.zero_()
             self.factor.walk_release_status.zero_()
-            if frame_status is not None:
-                frame_status.zero_()
         return result
 
     def check_capacity(self) -> None:
@@ -1023,14 +1019,6 @@ class Placement:
             raise RuntimeError(
                 f"FeatherPGS constraint/contact capacity exceeded in worlds {worlds[:16].tolist()}"
                 f" ({worlds.size} invalid worlds); increase capacities and reset before accepting transitions."
-            )
-        frame_status = self.laws.patch_frame_status()
-        if frame_status is not None and frame_status.numpy()[0]:
-            raise RuntimeError(
-                "FeatherPGS solved captured steps without patch friction: their contact generation or count changed "
-                "since the previous captured step of the same graph without a collision pass or Contacts.clear(). "
-                "Call Contacts.clear() before rewriting contacts between captured steps, or set "
-                "FEATHER_PGS_PATCH_FRAME_REUSE=0; constraint_capacity_status(clear=True) clears the flag."
             )
 
     def row_watermarks(self) -> dict:

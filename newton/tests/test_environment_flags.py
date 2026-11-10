@@ -38,6 +38,7 @@ _REMOVED_NAMES = [
     "FEATHER_PGS_GROUPED_HINV_MAX",
     "FEATHER_PGS_GROUP_LANES",
     "FEATHER_PGS_KUKA_JOINT_WORLD",
+    "FEATHER_PGS_PATCH_FRAME_REUSE",
     "FEATHER_PGS_SIMPLE_WORLD_ZERO",
     "FEATHER_PGS_SINGLE_FACTOR",
     "FEATHER_PGS_SPARSE_BRANCH_SWEEPS",
@@ -348,7 +349,6 @@ class TestEnvironmentRecord(unittest.TestCase):
     def test_record_classifies_names(self):
         """Record declared values, undeclared names, retired names and Isaac Lab-owned names separately."""
         environ = {
-            "FEATHER_PGS_PATCH_FRAME_REUSE": "0",
             "FEATHER_PGS_NOT_DECLARED": "0",
             "FEATHER_PGS_COUPLED_JACOBI": "1",
             "IL_NEWTON_FPGS_MF_WARMSTART": "0",
@@ -358,7 +358,7 @@ class TestEnvironmentRecord(unittest.TestCase):
         self.assertEqual(
             fpgs_flags.record(environ),
             {
-                "applied": {"FEATHER_PGS_PATCH_FRAME_REUSE": "0"},
+                "applied": {},
                 "unknown": ["FEATHER_PGS_COUPLED_JACOBI", "FEATHER_PGS_NOT_DECLARED", "IL_NEWTON_FPGS_MF_WARMSTART"],
                 "retired": [],
                 "isaac_lab": {},
@@ -411,7 +411,6 @@ class TestSelectionEnvironment(unittest.TestCase):
     def test_solver_reports_construction_environment(self):
         """Report the FEATHER_PGS_ environment read at construction, detached from later changes."""
         flags = {
-            "FEATHER_PGS_PATCH_FRAME_REUSE": "1",
             "FEATHER_PGS_NOT_DECLARED": "0",
             "FEATHER_PGS_SPARSE_BRANCH_SWEEPS": "0",
             "FEATHER_PGS_COUPLED_JACOBI": "1",
@@ -421,7 +420,7 @@ class TestSelectionEnvironment(unittest.TestCase):
         with _environment(flags):
             solver = newton.solvers.SolverFeatherPGS(model)
         expected = {
-            "applied": {"FEATHER_PGS_PATCH_FRAME_REUSE": "1"},
+            "applied": {},
             "unknown": ["FEATHER_PGS_COUPLED_JACOBI", "FEATHER_PGS_NOT_DECLARED", "FEATHER_PGS_SPARSE_BRANCH_SWEEPS"],
             "retired": [],
             "isaac_lab": {},
@@ -429,8 +428,7 @@ class TestSelectionEnvironment(unittest.TestCase):
         selected = solver.get_path_selection()
         self.assertEqual(selected["environment"], expected)
         selected["environment"]["unknown"].append("edited")
-        selected["environment"]["applied"].clear()
-        with _environment({"FEATHER_PGS_PATCH_FRAME_REUSE": "0"}):
+        with _environment({"FEATHER_PGS_NOT_DECLARED": "1"}):
             self.assertEqual(solver.get_path_selection()["environment"], expected)
 
     def test_solver_records_removed_switches_silently(self):

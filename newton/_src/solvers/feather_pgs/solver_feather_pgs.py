@@ -298,26 +298,18 @@ class SolverFeatherPGS(SolverBase):
                 row capacity) retain supported history. Patch reduction approximates the friction
                 wrench with two locations; faceted wheels still experience facet-impact losses.
                 A gain that is zero, negative or not finite raises ``ValueError``.
-                Each step sorts its patch contact pairs, except a step captured in a CUDA graph
-                right after another captured step of the same graph over the same contact stream
-                (the same ``contact_generation`` array, which every object wrapping the arrays of
-                one :class:`~newton.Contacts` shares), with no write of that stream by Newton in
-                between (a collision pass, :meth:`~newton.Contacts.clear`, a coupled-solver
-                contact filter or :meth:`~newton.solvers.SolverMuJoCo.update_contacts`): it
-                reuses that step's sorted pairs, which saves the sort on every substep that
-                shares a collision pass. Code that rewrites contact arrays between two such
-                captured steps, including passing other contact arrays with the same
-                ``contact_generation`` array, must call :meth:`~newton.Contacts.clear` first,
-                which makes the next step sort, or set ``FEATHER_PGS_PATCH_FRAME_REUSE=0``.
-                Otherwise only a change of ``contact_generation`` or of the contact count is
-                detected: that step is solved without patch friction rows and its anchors are
-                released; :meth:`constraint_capacity_status` reports it as ``patch_frames`` and
-                :meth:`check_constraint_capacity` raises. A rewrite that keeps both but changes
-                which shapes a contact slot pairs, or reorders contacts, is not detected: that
-                step groups its contacts by the previous step's sorted pairs. Rewriting only
-                contact points, normals or margins is exact, since pairs depend on the shapes
-                alone and every step recomputes the rest. ``FEATHER_PGS_PATCH_FRAME_REUSE=0``
-                sorts every step.
+                A step sorts its patch contact pairs unless the previous step left this contact
+                frame's pairs sorted: the same contact stream (the same ``contact_generation``
+                array, which every object wrapping the arrays of one :class:`~newton.Contacts`
+                shares) at the same ``contact_generation`` value and contact count, as on every
+                substep that shares a collision pass. The device decides it, in eager and captured
+                steps alike. Code that rewrites contact arrays itself, including passing other
+                contact arrays with the same ``contact_generation`` array, calls
+                :meth:`~newton.Contacts.clear` first, which advances the generation. A rewrite that
+                keeps the generation and the count but changes which shapes a contact slot pairs,
+                or reorders contacts, is not detected: that step groups its contacts by the
+                previous step's sorted pairs. Rewriting only contact points, normals or margins is
+                exact, since pairs depend on the shapes alone and every step recomputes the rest.
                 Defaults to None.
             contact_speculative_scale (float, optional): Multiplies the positive-gap position RHS
                 for normal contact rows on the dense and matrix-free free-rigid paths. A value of
@@ -696,9 +688,6 @@ class SolverFeatherPGS(SolverBase):
             if flags & (ModelFlags.BODY_PROPERTIES | ModelFlags.JOINT_DOF_PROPERTIES)
             else None
         )
-        # The next captured build sorts its pairs again rather than reusing the
-        # sorted contact frame across a model change.
-        self.laws.friction_patches.forget_frame()
         if flags & ModelFlags.SHAPE_PROPERTIES:
             # Geometry edits retire affected material points; unrelated shape
             # properties keep their history and live materials are checked per step.
@@ -882,13 +871,7 @@ class SolverFeatherPGS(SolverBase):
         The keys ``dense`` and ``matrix_free`` identify row buffers whose
         capacity omitted constraints. A contact stream's count never exceeds its
         rows: a collision pass clamps it and flags the drop in its own capacity
-        status.
-        ``patch_frames`` identifies a captured step of patch friction whose
-        ``contact_generation`` or contact count changed since the previous
-        captured step of the same graph without a write Newton noted (such as
-        a collision pass or :meth:`~newton.Contacts.clear`), and which was
-        solved without patch friction rows (see ``friction_anchor_beta``); only
-        patch frame reuse sets it. ``contact_launches`` identifies a contact-sized
+        status. ``contact_launches`` identifies a contact-sized
         launch of a captured graph, the solver's or the collision pipeline's
         sharing its contact rows, that the graph's last replay skipped: its
         device graph updater failed closed after the capture emitted it, or its
@@ -903,8 +886,7 @@ class SolverFeatherPGS(SolverBase):
 
         Call outside CUDA graph capture, on the solver's execution stream or
         after explicitly joining that stream. This copies two integers to the
-        host, and a third with patch frame reuse. Graph replays update the same
-        device flags without host reads.
+        host. Graph replays update the same device flags without host reads.
 
         Args:
             clear: Clear the flags after reading, returning their previous
@@ -926,8 +908,7 @@ class SolverFeatherPGS(SolverBase):
         inspect it without host synchronization. Status remains set until
         :meth:`reset` clears the affected worlds. Increasing capacity requires
         constructing a solver and recapturing graphs before restarting the
-        invalidated transition. Also raises while the ``patch_frames`` flag of
-        :meth:`constraint_capacity_status` is set, until that method clears it.
+        invalidated transition.
         """
         self.placement.check_capacity()
 

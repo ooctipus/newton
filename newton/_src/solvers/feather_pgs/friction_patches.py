@@ -33,12 +33,10 @@ ready rows of the solver's contact pool, which only change between captures.
 Growth keeps the frames' contents and gives the new slots the empty record.
 Launches
 stride over the live contacts and the slots earlier frames used, so their work
-follows the live contact count rather than the capacity. With frame reuse, the
-solver's default, a captured build skips the pair sort when the previous build
-was captured in the same graph over the same contact stream (its
-``contact_generation`` array) and the host issued no write of that stream in
-between, which is the case on every solver substep that shares
-a collision frame (see :class:`_FrictionPatchState`).
+follows the live contact count rather than the capacity. A build whose contact
+frame the slots already hold sorted, as on every solver substep that shares a
+collision pass, keeps those pairs: the device decides it from the stream's
+``contact_generation`` word (see :class:`_FrictionPatchState`).
 """
 
 import itertools
@@ -57,7 +55,7 @@ from ...core.live_sort import (
     slot_keys_fit,
     sort_grid,
 )
-from ...sim.contacts import GENERATION_SENTINEL, capture_scope, contact_frame_write
+from ...sim.contacts import GENERATION_SENTINEL
 from . import field_group
 from .contact_filters import contact_normal_gap_limit
 from .contact_laws import contact_bodies, contact_point, contact_points, contact_tangent_basis
@@ -80,21 +78,15 @@ _LIGHT_BLOCKS_PER_SM = 6
 # grid leaves no thread a second run below 8 * SMs * 256 live slots.
 _BUILD_BLOCK_DIM = 32
 _BUILD_BLOCKS_PER_SM = 8
-# The patch extent: the slots to visit, then the live sort's extent (live_sort.publish_sort_extent).
-_SORT_EXTENT = wp.constant(1)
+# The patch extent: the slots to visit, the live slots, then the live sort's extent (live_sort.publish_sort_extent).
+_SORT_EXTENT = wp.constant(2)
 # Contact paths 0 and 1 hold dense and matrix-free rows, and -1 holds none.
 # A region's spin arm over the polar radius of gyration of its contacts' hull: the mean radius of a convex patch under
 # uniform pressure over its gyration radius is 0.937 on a square, 0.943 on a disc and 0.866 on a line, and 0.94 holds
 # every convex footprint within 4% of quadrature (core-docs/WRENCH/VERDICT.md section 6).
 _SPIN_ARM = wp.constant(0.94)
-# The contact generation no frame has: a recorded frame with it never matches.
-_FRAME_SENTINEL = wp.constant(wp.int64(GENERATION_SENTINEL))
-# Modes of _prepare_frame, the host's admission of a frame-reusing build: the
-# pair sort follows unconditionally, or the slots keep the sorted pairs of the
-# frame an earlier build recorded. No build launches the kernel's detect mode.
-_FRAME_SORT = wp.constant(0)
-_FRAME_DETECT = wp.constant(1)
-_FRAME_KEEP = wp.constant(2)
+# The contact generation no stream takes: contacts without a generation, and a forgotten record.
+_NO_GENERATION = wp.constant(wp.int32(GENERATION_SENTINEL))
 
 
 @wp.struct
@@ -240,8 +232,8 @@ def _local_surface(q: wp.array[wp.transform], body: int, translation: wp.vec3, o
 
 @wp.struct
 class _PatchContacts:
-    """The contacts a frame build reads and the gates it applies, which :func:`_prepare` and :func:`_prepare_frame`
-    share (the host's :meth:`_FrictionPatchState._prepare_inputs`)."""
+    """The contacts a frame build reads and the gates it applies, which :func:`_prepare` reads (the host's
+    :meth:`_FrictionPatchState._prepare_inputs`)."""
 
     shape0: wp.array[int]
     shape1: wp.array[int]
@@ -363,19 +355,19 @@ def _prepare_contact_fields(c: int, live: int, inputs: _PatchContacts, frame: _P
     return wp.int64(ka) * wp.int64(inputs.key_stride) + wp.int64(kb)
 
 
-# Defined ahead of _prepare_frame: a kernel of a unique module is named after the functions
-# defined when it is decorated, and a later definition would rename it after its first load.
 @wp.func
-def _publish_extent(extent: wp.array[int], end: int, live: int):
-    """Publish the slots to visit, then the live sort's extent of the live slots.
+def _publish_extent(extent: wp.array[int], end: int, live: int, sort: int):
+    """Publish the slots to visit, the live slots, then the live sort's extent of ``sort`` slots.
 
-    ``extent[0]`` holds the slots to visit and ``extent[1:]`` the sort extent
-    (:func:`~newton._src.core.live_sort.publish_sort_extent`), whose first entry
-    is the live count: a captured live sort follows it, launching no work past
-    the live slots.
+    ``extent[0]`` holds the slots to visit, ``extent[1]`` the live count and
+    ``extent[_SORT_EXTENT:]`` the sort extent
+    (:func:`~newton._src.core.live_sort.publish_sort_extent`): the live slots of
+    a frame to sort, none of a kept one. A captured live sort follows it,
+    launching no work past the slots it sorts.
     """
     extent[0] = end
-    publish_sort_extent(extent, _SORT_EXTENT, live)
+    extent[1] = live
+    publish_sort_extent(extent, _SORT_EXTENT, sort)
 
 
 @wp.kernel(enable_backward=False)
@@ -387,100 +379,40 @@ def _prepare(
     threads: int,
     frame: _PatchFrame,
     patches: FrictionPatches,
+    generation: wp.array[wp.int32],
+    stream: wp.int64,
+    sorted_frame: wp.array[wp.int64],
     extent: wp.array[int],
 ):
-    """Fill this frame's contact slots and clear every slot an earlier frame used.
+    """Fill this frame's contact slots and clear every slot an earlier frame used; keep a recorded frame's pairs.
 
     A collision pass clamps the count to the rows it wrote, so every slot below
     it is live. Slots past the stored and the last built frame already hold the empty
-    record. Thread 0 publishes the slots to visit and the live count; this
-    launch reads neither.
+    record. ``sorted_frame`` names the frame whose pairs the slots hold sorted
+    (its generation, live count and contact stream; :func:`_build` records it).
+    That frame keeps its live slots' keys and indices and publishes no sort;
+    any other writes them and publishes the sort of its live slots. Thread 0
+    publishes the extent, which this launch reads nowhere.
     """
     thread = wp.tid()
     live = count[0]
     if live < 0:
         live = 0
     end = wp.max(live, wp.max(stored[0], built[0]))
-    if thread == 0:
-        _publish_extent(extent, end, live)
-    for c in range(thread, end, threads):
-        frame.indices[c] = c
-        frame.keys[c] = _prepare_contact_fields(c, live, inputs, frame, patches)
-
-
-# The frame-reuse variants compile in modules of their own, so the base patch
-# kernels keep their module and generated code. Pairs are built by the base
-# _build kernel itself: a second kernel that inlines _build_pair rounds the
-# carried displacements differently on CUDA.
-@wp.kernel(enable_backward=False, module="unique")
-def _prepare_frame(
-    count: wp.array[int],
-    inputs: _PatchContacts,
-    stored: wp.array[int],
-    built: wp.array[int],
-    threads: int,
-    frame: _PatchFrame,
-    patches: FrictionPatches,
-    generation: wp.array[wp.int32],
-    stream: wp.int64,
-    mode: int,
-    sorted_frame: wp.array[wp.int64],
-    extent: wp.array[int],
-    sort_pairs: wp.array[wp.int32],
-    frame_status: wp.array[wp.int32],
-):
-    """Prepare as :func:`_prepare` does, in the host's admission ``mode`` of a frame-reusing build.
-
-    ``sorted_frame`` records the contact frame whose pairs the slots hold
-    sorted: its generation, raw count and contact stream. ``_FRAME_SORT``
-    prepares a frame the pair sort follows unconditionally, so thread 0
-    records it. ``_FRAME_KEEP`` reuses the pairs an earlier build sorted: live
-    slots keep their keys and indices, which other modes overwrite. Its frame
-    must be the recorded one. A frame rewritten since then, without a write
-    the host noted, is left empty instead: no contact is live, the record is
-    dropped and ``frame_status`` latches, because stale pairs would group
-    other contacts. ``_FRAME_DETECT`` keeps the recorded frame's pairs the same
-    way and publishes in ``sort_pairs`` whether another frame's live contacts
-    need sorting; it drops the record of such a frame and records a new frame
-    without live contacts, which needs no sort. Threads agree on the frame
-    whether they read the record before or after thread 0 writes it.
-    """
-    thread = wp.tid()
-    raw = count[0]
-    live = raw
-    if live < 0:
-        live = 0
-    end = wp.max(live, wp.max(stored[0], built[0]))
-    recorded = int(0)
+    kept = int(0)
     if (
-        mode != _FRAME_SORT
+        generation[0] != _NO_GENERATION
         and sorted_frame[0] == wp.int64(generation[0])
-        and sorted_frame[1] == wp.int64(raw)
+        and sorted_frame[1] == wp.int64(live)
         and sorted_frame[2] == stream
     ):
-        recorded = 1
-    if mode == _FRAME_KEEP and recorded == 0:
-        live = 0
+        kept = 1
     if thread == 0:
-        _publish_extent(extent, end, live)
-        # The slots hold a frame without live contacts sorted as soon as it is
-        # prepared; a thread that reads its record keeps no slot.
-        if mode == _FRAME_SORT or (mode == _FRAME_DETECT and recorded == 0 and live == 0):
-            sorted_frame[0] = wp.int64(generation[0])
-            sorted_frame[1] = wp.int64(raw)
-            sorted_frame[2] = stream
-        elif recorded == 0:
-            sorted_frame[0] = _FRAME_SENTINEL
-            if mode == _FRAME_KEEP:
-                frame_status[0] = 1
-        if mode == _FRAME_DETECT:
-            sort_pairs[0] = 0
-            if recorded == 0 and live > 0:
-                sort_pairs[0] = 1
+        _publish_extent(extent, end, live, live * (1 - kept))
     for c in range(thread, end, threads):
         key = _prepare_contact_fields(c, live, inputs, frame, patches)
         # A kept slot holds the sorted pair at position c, not contact c's key.
-        if recorded == 0 or c >= live:
+        if kept == 0 or c >= live:
             frame.indices[c] = c
             frame.keys[c] = key
 
@@ -963,17 +895,24 @@ def _build(
     frame: _PatchFrame,
     prev: _PatchFrame,
     patches: FrictionPatches,
+    generation: wp.array[wp.int32],
+    stream: wp.int64,
     built: wp.array[int],
+    sorted_frame: wp.array[wp.int64],
 ):
     """Stride over the live sorted positions; body pairs write disjoint current/previous records.
 
     Thread 0 records the live count, so the next _prepare clears these slots even
-    when no store follows this build.
+    when no store follows this build, and the frame whose pairs the slots now hold
+    sorted, which the next _prepare keeps; no _prepare thread reads it while it changes.
     """
     thread = wp.tid()
     live = extent[1]
     if thread == 0:
         built[0] = live
+        sorted_frame[0] = wp.int64(generation[0])
+        sorted_frame[1] = wp.int64(live)
+        sorted_frame[2] = stream
     previous_end = stored[0]
     for start in range(thread, live, threads):
         _build_pair(start, live, previous_end, q, previous_q, shape_transform, shape_radius, frame, prev, patches)
@@ -1088,29 +1027,22 @@ _BUILD_FIELDS = frozenset(("center", "radius", "support_gap_limit", "flipped", "
 class _FrictionPatchState:
     """Own preallocated patch frames; never read device counters on the host.
 
-    With ``reuse_frames``, the host admits each captured build statically. A
-    build keeps the sorted pairs the previous build left in the slots when that
-    build was captured in the same scope (one graph, or one conditional body;
-    :func:`~newton._src.sim.contacts.capture_scope`) over the same
-    ``contact_generation`` array, and no write of that contact stream was noted
-    since (:func:`~newton._src.sim.contacts.note_contact_frame_write`) nor
-    :meth:`forget_frame` called. Every other build sorts. The device checks each
-    kept build's contact generation and raw count against the frame the last
-    sort recorded: a writer the host never saw that changed either leaves that
-    build empty and latches ``frame_status``. One that kept both but changed the
-    shapes of a contact slot, or the contacts' order, goes unseen, and the kept
+    The device decides whether a build sorts its pairs, eager and captured builds
+    alike. :func:`_build` records the contact frame whose pairs the slots then hold
+    sorted, and :func:`_prepare` keeps that frame's pairs and sorts any other. A
+    frame is the stream's ``Contacts.contact_generation``, which every collision
+    pass, :meth:`newton.Contacts.clear` and a coupled entry's contact filter
+    advance, the live count, and the contact stream, a token of the generation
+    counter array that is never reused (see :meth:`stream_token`). Contacts
+    without a generation sort every build, and :meth:`forget_frame` makes the
+    next build sort. A writer that keeps the generation and the count but changes
+    the shapes of a contact slot, or the contacts' order, goes unseen, and the kept
     build groups its contacts by the stale pairs; its kept indices still lie
     below the live count. Rewrites of points, normals or margins alone are
     exact: pair keys follow the shapes, and a kept build prepares the rest anew.
-
-    Contact frames are identified by ``Contacts.contact_generation``, which every
-    collision pass and :meth:`newton.Contacts.clear` advance, together with the
-    raw contact count and the contact stream, a token of the generation counter
-    array that is never reused (see :meth:`stream_token`). Eager builds always
-    sort.
     """
 
-    def __init__(self, model, capacity, phi, *, reuse_frames=False, pool=None):
+    def __init__(self, model, capacity, phi, *, pool=None):
         self.view = FrictionPatches()
         self.view.phi = phi
         device = model.device
@@ -1119,25 +1051,17 @@ class _FrictionPatchState:
         self.pool = pool
         self._rows_used = None
         self.capacity = pool.ready
-        self.reuse_frames = bool(reuse_frames)
-        # (capture scope, weak generation array, frame-write tick) of the previous
-        # captured build, which a build in the same scope may keep the pairs of.
-        self._last_build = None
         self.device = device
         # The pair sort skips the key bits no pair key can set.
         self.key_stride, self.key_bits = _pair_key_layout(model.body_count, model.shape_body.shape[0])
         self.body_world = model.body_world
         self.body_radius = wp.zeros(model.body_count, dtype=float, device=device)
         # The contact frame whose pairs the current slots hold sorted, as
-        # (generation, raw count, contact stream); the sentinel generation makes
-        # the next build sort. _prepare_frame records a frame the sort follows
-        # and compares a reused one. sort_pairs receives its sort flag, which
-        # only its detect mode writes and no build launches.
+        # (generation, live count, contact stream); the sentinel generation makes
+        # the next build sort. _build records it and _prepare compares it.
         self.sorted_frame = wp.full(3, GENERATION_SENTINEL, dtype=wp.int64, device=device)
-        self.sort_pairs = wp.zeros(1, dtype=wp.int32, device=device)
-        # Latched when a build that reuses sorted pairs finds another contact
-        # frame than the recorded one and is left empty; only the host clears it.
-        self.frame_status = wp.zeros(1, dtype=wp.int32, device=device)
+        # The generation of contacts without one, which no record matches.
+        self._no_generation = wp.full(1, GENERATION_SENTINEL, dtype=wp.int32, device=device)
         self._stream_tokens = weakref.WeakKeyDictionary()
         self._next_stream_token = itertools.count(1)
         # Per-contact slots hold the contact pool's ready rows and grow with it.
@@ -1167,7 +1091,6 @@ class _FrictionPatchState:
         self.stored = wp.zeros(1, dtype=int, device=device)
         self.built = wp.zeros(1, dtype=int, device=device)
         self.extent = wp.zeros(_SORT_EXTENT + EXTENT_SIZE, dtype=int, device=device)
-        self._load_capture_modules()
 
     def _on_view_rows(self, rows):
         rows.publish(self.view)
@@ -1216,19 +1139,6 @@ class _FrictionPatchState:
         self.build_threads = max(1, min(rows, _BUILD_BLOCKS_PER_SM * blocks * _BLOCK_THREADS))
         self.sort_blocks, self.merges, self.merge_threads = sort_grid(self.device, rows)
         return self
-
-    def _load_capture_modules(self):
-        """Load the module of the kernel that captured builds launch first, on a CUDA device.
-
-        With frame reuse only captured builds launch _prepare_frame, so its module
-        would otherwise first load inside a graph capture. The kernel has a module
-        of its own: loading it compiles nothing else. CPU captures build as eager
-        ones do.
-        """
-        if not self.device.is_cuda:
-            return
-        if self.reuse_frames:
-            _prepare_frame.module.load(self.device)
 
     def update_geometry(self, model):
         """Refresh scales and retire affected history after explicit geometry edits."""
@@ -1286,12 +1196,8 @@ class _FrictionPatchState:
         self.forget_frame()
 
     def forget_frame(self):
-        """Make the next build sort its pairs, as it does for a new contact frame.
-
-        The device record stays: a kept build follows a sort of its own capture
-        scope, which records its frame.
-        """
-        self._last_build = None
+        """Make the next build sort its pairs, as it does for a new contact frame: the record names no frame."""
+        self.sorted_frame.fill_(GENERATION_SENTINEL)
 
     def stream_token(self, generation):
         """Return the token that names the contact stream whose generation counter is ``generation``.
@@ -1375,12 +1281,8 @@ class _FrictionPatchState:
         articulation_pair_gap_gate=0.0,
         friction_gap=float("inf"),
     ):
-        """Build the current patch frame from ``contacts``.
-
-        With frame reuse, a captured build whose contact frame the previous
-        build of its capture scope sorted keeps those pairs instead of sorting
-        (see :class:`_FrictionPatchState`).
-        """
+        """Build the current patch frame from ``contacts``, sorting its pairs unless the slots hold them (see
+        :class:`_FrictionPatchState`)."""
         bodies = 0 if state.body_q is None else state.body_q.shape[0]
         if bodies + model.shape_body.shape[0] + 2 != self.key_stride:
             raise ValueError(
@@ -1401,58 +1303,16 @@ class _FrictionPatchState:
             articulation_pair_gap_gate=articulation_pair_gap_gate,
             friction_gap=friction_gap,
         )
-        generation = getattr(contacts, "contact_generation", None) if self.reuse_frames else None
-        scope = None
-        tick = None
+        generation = getattr(contacts, "contact_generation", None)
         if generation is None:
-            # The slots receive a frame no record can name.
-            self.forget_frame()
-            self._prepare_and_sort(prepare_inputs)
-        else:
-            # The token identifies the contact stream, also across graphs captured
-            # with other Contacts instances.
-            stream = self.stream_token(generation)
-            write = contact_frame_write(generation)
-            tick = None if write is None else write.tick
-            scope = self._capture_scope()
-            if self._keeps_pairs(scope, generation, tick):
-                # The previous build of this capture scope sorted this stream's frame
-                # and the host issued no write of it since.
-                self._launch_prepare_frame(prepare_inputs, generation, stream, _FRAME_KEEP)
-            elif scope is None:
-                # Eager builds sort as without frame reuse: no later build keeps
-                # their pairs, so their frame needs no record.
-                self._prepare_and_sort(prepare_inputs)
-            else:
-                # The prepare records the frame that the sort then orders.
-                self._launch_prepare_frame(prepare_inputs, generation, stream, _FRAME_SORT)
-                self._order_pairs()
-        self._last_build = None if scope is None else (scope, weakref.ref(generation), tick)
-        self._launch_build(model, state)
-
-    def _keeps_pairs(self, scope, generation, tick):
-        """Whether a build in capture ``scope`` keeps the sorted pairs the previous build left in the slots.
-
-        The previous build must be captured in the same scope over the same
-        generation array, with ``tick``, the stream's last noted frame write,
-        unchanged since and no :meth:`forget_frame` in between.
-        """
-        last = self._last_build
-        return (
-            self.reuse_frames
-            and scope is not None
-            and last is not None
-            and last[0] == scope
-            and last[1]() is generation
-            and last[2] == tick
-        )
-
-    def _prepare_and_sort(self, prepare_inputs):
-        """Prepare and sort a frame that no record names, as builds without frame reuse do."""
-        self._launch_prepare(_prepare, prepare_inputs, [self.extent])
+            generation = self._no_generation
+        # The token identifies the contact stream, also across graphs captured with other Contacts instances.
+        stream = self.stream_token(generation)
+        self._launch_prepare([*prepare_inputs, generation, stream, self.sorted_frame])
         self._order_pairs()
+        self._launch_build(model, state, generation, stream)
 
-    def _launch_prepare(self, kernel, inputs, outputs):
+    def _launch_prepare(self, inputs):
         """Prepare the slots, a pass over every slot an earlier frame used, then follow its published extent.
 
         The pass visits the live slots and those of the stored and the last built
@@ -1462,11 +1322,11 @@ class _FrictionPatchState:
         bind, the launches after it follow them through a new updater.
         """
         used = self._rows_used if self._rows_used is not None else self.pool.ready_rows
-        self.pool.launch(kernel, self.threads, inputs=inputs, outputs=outputs, extent=used, clamp=True)
+        self.pool.launch(_prepare, self.threads, inputs=inputs, outputs=[self.extent], extent=used, clamp=True)
         self.pool.begin_updates()
 
-    def _launch_build(self, model, state):
-        """Build the pairs of the prepared, sorted slots."""
+    def _launch_build(self, model, state, generation, stream):
+        """Build the pairs of the prepared, sorted slots and record their frame: ``generation``'s, of ``stream``."""
         # Warp compiles this module once more for _build's block size; the
         # variants differ only in the tile block size, which no _build
         # arithmetic reads.
@@ -1484,8 +1344,10 @@ class _FrictionPatchState:
                 self.current,
                 self.previous,
                 self.view,
+                generation,
+                stream,
             ],
-            outputs=[self.built],
+            outputs=[self.built, self.sorted_frame],
             # The slots to visit, not the live ones: thread 0 publishes the live count, also when it drops to zero.
             extent=self.extent[0:1],
             clamp=True,
@@ -1505,7 +1367,7 @@ class _FrictionPatchState:
         articulation_pair_gap_gate=0.0,
         friction_gap=float("inf"),
     ):
-        """Return the inputs that :func:`_prepare` and :func:`_prepare_frame` share, with :meth:`build`'s gates."""
+        """Return the inputs of :func:`_prepare` that ``contacts`` and :meth:`build`'s gates give."""
         inputs = _PatchContacts()
         inputs.shape0, inputs.shape1 = contacts.rigid_contact_shape0, contacts.rigid_contact_shape1
         inputs.point0, inputs.point1 = contacts.rigid_contact_point0, contacts.rigid_contact_point1
@@ -1533,29 +1395,19 @@ class _FrictionPatchState:
             self.view,
         ]
 
-    def _launch_prepare_frame(self, prepare_inputs, generation, stream, mode):
-        """Prepare a frame-reusing build in ``mode`` (``_FRAME_SORT`` or ``_FRAME_KEEP``)."""
-        self._launch_prepare(
-            _prepare_frame,
-            [*prepare_inputs, generation, stream, int(mode), self.sorted_frame],
-            [self.extent, self.sort_pairs, self.frame_status],
-        )
-
-    def _capture_scope(self):
-        """Return the capture scope that this device's current stream records into, ``None`` when eager."""
-        return capture_scope(self.device)
-
     def _order_pairs(self):
         """Sort the prepared slots by pair key, the work that only a new contact frame needs.
 
-        A kept build skips exactly this, so work added here must leave outputs that
-        stay valid while later builds reuse the frame.
+        The live sort follows the work the prepare published, none for a kept
+        frame, so work added here must leave outputs that stay valid while later
+        builds keep the frame.
         """
         if self.live_sort:
             self._sort_live()
         else:
             # Empty slots hold INT64_MAX, whose low key_bits are all ones: no pair
-            # key exceeds them, and the stable sort keeps live slots ahead of a tie.
+            # key exceeds them, and the stable sort keeps live slots ahead of a tie,
+            # so the slots of a kept frame, already in that order, keep it.
             # The radix sort covers today's rows: a capture of it is recaptured after growth.
             self.pool.note_unbound()
             wp.utils.radix_sort_pairs(self.current.keys, self.current.indices, self.capacity, end_bit=self.key_bits)
