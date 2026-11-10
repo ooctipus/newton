@@ -236,7 +236,8 @@ class Sweep:
         node = tuple(int(k) for k in factor.sparse_pattern.inverse_permutation)
         torsion = bool(self.laws.spin_rows)
         self.support_lanes = walk_rows.SUPPORT_UNIT_LANES if wp.get_device(model.device).is_cuda else 1
-        self.support_units_kernel = walk_rows.support_units_kernel(4 if torsion else 3, self.support_lanes)
+        arch = model.device.arch
+        self.support_units_kernel = walk_rows.support_units_kernel(4 if torsion else 3, self.support_lanes, arch)
         self.support_rows = walk_rows.support_rows_kernel(
             parent,
             first,
@@ -244,6 +245,7 @@ class Sweep:
             records=self.placement.sparse_contact_records is not None,
             torsion=torsion,
             half=classes_half(walk for walk in factor.walk_classes if (walk.parent, walk.first) == (parent, first)),
+            device_arch=arch,
         )
         # Where the step's one leave reads each coordinate's change (factor.walk.walk_leave_kernel): the sparse sweep
         # publishes it in factor coordinates (factor_velocity_delta), so a tree's changes start at its offset in its

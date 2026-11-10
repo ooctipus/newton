@@ -243,10 +243,10 @@ def _support_writer_calls():
 
     tree = ((-1, 0, 1, 0, 3, 0), (0, 6, 7, 8, 9, 10, 11), tuple(range(10, -1, -1)))
     for records, torsion in ((False, False), (True, False), (True, True)):
-        kwargs = {"records": records, "torsion": torsion}
+        kwargs = {"records": records, "torsion": torsion, "device_arch": _ARCH}
         yield "walk_rows.support_rows_kernel", walk_rows.support_rows_kernel.__wrapped__, tree, kwargs
     for unit_rows in (3, 4):
-        yield "walk_rows.support_units_kernel", walk_rows.support_units_kernel.__wrapped__, (unit_rows, 16), {}
+        yield "walk_rows.support_units_kernel", walk_rows.support_units_kernel.__wrapped__, (unit_rows, 16, _ARCH), {}
     from newton._src.solvers.feather_pgs import tree_scan  # noqa: PLC0415
     from newton._src.solvers.feather_pgs.factor import walk as factor_walk  # noqa: PLC0415
 
@@ -262,19 +262,20 @@ def _dense_build_calls():
 
     # Its trees' classes: a branched tree of a free root and three limbs, and a free body.
     tables = (((-1, 0, 1, 0, 3, 0), (0, 6, 7, 8, 9, 10, 11)), ((-1,), (0, 6)))
+    arch = {"device_arch": _ARCH}
     for args in ((0, False), (8, False), (8, True)):
-        yield "walk_rows.walked_rows_kernel", walk_rows.walked_rows_kernel.__wrapped__, (*args, True, tables), {}
+        yield "walk_rows.walked_rows_kernel", walk_rows.walked_rows_kernel.__wrapped__, (*args, True, tables), arch
     # Its topology part, the rows walked in blocks: plain and with blocks.
     for args in ((0, False), (8, True)):
         block = (*args, True, tables, walk_rows.WRITER_BLOCK_ROWS)
-        yield "walk_rows.walked_rows_kernel", walk_rows.walked_rows_kernel.__wrapped__, block, {}
+        yield "walk_rows.walked_rows_kernel", walk_rows.walked_rows_kernel.__wrapped__, block, arch
     # By the rows' support classes (packed_rows.row_classes): every row, and the topology part.
     for tail in ((0, True), (walk_rows.WRITER_BLOCK_ROWS, True)):
         yield (
             "walk_rows.walked_rows_kernel",
             walk_rows.walked_rows_kernel.__wrapped__,
             (0, False, True, tables, *tail),
-            {},
+            arch,
         )
     # The EMIT sink's variants, where a class's tiers walk their rows' seeds: the rest (plain and by support classes),
     # and the topology part, which stores a world's few topology rows.
@@ -283,12 +284,14 @@ def _dense_build_calls():
             "walk_rows.walked_rows_kernel",
             walk_rows.walked_rows_kernel.__wrapped__,
             (0, False, True, tables, block, classes, True),
-            {},
+            arch,
         )
     # The sparse diagonal's one writer, the star's walker on the same classes.
-    yield "walk_rows.slot_rows_kernel", walk_rows.slot_rows_kernel.__wrapped__, (True, tables), {}
+    yield "walk_rows.slot_rows_kernel", walk_rows.slot_rows_kernel.__wrapped__, (True, tables), arch
     # With velocity-limit rows: a key's joint row is one step to the world, into a slot.
-    yield "walk_rows.slot_rows_kernel", walk_rows.slot_rows_kernel.__wrapped__, (True, tables, True), {}
+    yield "walk_rows.slot_rows_kernel", walk_rows.slot_rows_kernel.__wrapped__, (True, tables, True), arch
+    # The free bodies' rows.
+    yield "walk_rows.write_free_body_rows", walk_rows.write_free_body_rows.__wrapped__, (_ARCH,), {}
 
 
 def _solver_factory_calls():

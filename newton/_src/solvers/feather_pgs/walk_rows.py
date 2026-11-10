@@ -246,24 +246,22 @@ registers, 24 warps a multiprocessor, for a latency-bound walk whose speed follo
 
 class WriterShape(NamedTuple):
     """One writer's iteration shape (a row of :data:`WRITERS`): its block and the register line its walk holds. Its
-    launch bound is the block at the line, the blocks a multiprocessor keeps there, and its register budget a lane the
-    line the bound leaves (:class:`.core.execution.Work`, for the architecture the build is sized for)."""
+    launch bound on an architecture is the block at the line, the blocks a multiprocessor keeps there, and its register
+    budget a lane the line the bound leaves (:class:`.core.execution.Work`)."""
 
     block: int
     line: int
 
-    def _shape(self):
-        return shape(Work(0, block=self.block, registers=self.line), built_for(None))
+    def _shape(self, device_arch):
+        return shape(Work(0, block=self.block, registers=self.line), built_for(device_arch))
 
-    @property
-    def bounds(self) -> tuple[int, int]:
-        """The launch bound ``(block, blocks a multiprocessor)``."""
-        return self._shape().bounds
+    def bounds(self, device_arch) -> tuple[int, int]:
+        """The launch bound ``(block, blocks a multiprocessor)`` of a build for the architecture ``device_arch``."""
+        return self._shape(device_arch).bounds
 
-    @property
-    def registers(self) -> int:
-        """The register budget a lane the bound leaves."""
-        return self._shape().registers
+    def registers(self, device_arch) -> int:
+        """The register budget a lane the bound leaves there."""
+        return self._shape(device_arch).registers
 
 
 WRITERS = MappingProxyType(
@@ -276,7 +274,8 @@ WRITERS = MappingProxyType(
         "free_body": WriterShape(256, 128),
     }
 )
-"""Every writer's iteration shape, by sink: what its lanes take, its block and its register line.
+"""Every writer's iteration shape, by sink: what its lanes take, its block and its register line. Each writer's factory
+takes the architecture its build is for (``device_arch``), its launch bound the line's there.
 
 - **World lanes**, a world's lane group striding over its rows, a row a lane: the general writer's packed rows
   (:func:`walked_rows_kernel`; a group of :func:`writer_lanes`, whole groups a block of 128) at the walker's line; with
@@ -383,6 +382,8 @@ def walked_rows_kernel(
     block: int = 0,
     classes: bool = False,
     emit: bool = False,
+    *,
+    device_arch,
 ) -> wp.Kernel:
     """The one writer of the general placement, world-major: a world's group of ``lanes`` lanes (:func:`writer_lanes`)
     writes its rows in the block primitive's phases (FL3_design §1.4, W9), the group synchronized between them:
@@ -533,7 +534,8 @@ def walked_rows_kernel(
     name += f"_topology{block}" if block else ""
     name += "_classes" if classes else ""
     name += "_emit" if emit else ""
-    return python_kernel(kernel, name, launch_bounds=WRITERS["packed_blocks" if has_blocks else "packed"].bounds)
+    bounds = WRITERS["packed_blocks" if has_blocks else "packed"].bounds(device_arch)
+    return python_kernel(kernel, name, launch_bounds=bounds)
 
 
 def writer_kernel(solver, part: int = WRITE_ROWS) -> wp.Kernel:
@@ -548,8 +550,8 @@ def writer_kernel(solver, part: int = WRITE_ROWS) -> wp.Kernel:
     mimics = bool(blocks and solver.options.enable_bilateral_preelimination)
     block = WRITER_BLOCK_ROWS if part == WRITE_TOPOLOGY else 0
     tables = walk_tables(factor.walk_classes)
-    emit = bool(solver.placement.row_seeds.tiers)
-    return walked_rows_kernel(blocks, mimics, factor.walk_side, tables, block, solver.placement.classed, emit)
+    emit, classes, arch = bool(solver.placement.row_seeds.tiers), solver.placement.classed, solver.model.device.arch
+    return walked_rows_kernel(blocks, mimics, factor.walk_side, tables, block, classes, emit, device_arch=arch)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -792,12 +794,6 @@ _RELEASE_IN_PLACE = """            WALK_RELEASE_ON(release, art, Z, rows, S, [&]
                 return ((mask >> SUPPORT_NODE[c]) & 1ull) != 0ull ? rank(c) : -1;
             });"""
 
-SUPPORT_REGISTERS = WRITERS["support"].registers
-"""The support writer's register budget a thread, from its launch bound: what a unit's held side must fit
-(:func:`.tree_scan.held_fits`, :data:`_RELEASE_HELD`).
-
-The held side is a unit's at most four rows over its class's coordinates."""
-
 
 _SUPPORT_SIDE = """        unsigned long long mask = 0ull;
         int seeds = 0;
@@ -842,11 +838,12 @@ _SUPPORT_WRENCH = """                    const auto& at = r == 0 ? unit.point : 
                                 $spin && r == 3);"""
 
 
-def _support_snippet(parent: tuple, first: tuple, node: tuple, rows: int, records: bool, spin: bool, half: int) -> str:
+def _support_snippet(parent, first, node, rows: int, records: bool, spin: bool, half: int, registers: int) -> str:
     record = ""
     if records:
         record = _SPIN_RECORD if spin else _SUPPORT_RECORD
-    held = held_fits(4 * first[-1], SUPPORT_REGISTERS)
+    # A unit's held side, its at most four rows over the class's coordinates, fits the writer's registers (_RELEASE_HELD).
+    held = held_fits(4 * first[-1], registers)
     release = substitute(_RELEASE_HELD, rows=rows, coordinates=first[-1]) if held else _RELEASE_IN_PLACE
     body = substitute(
         _SUPPORT,
@@ -1371,7 +1368,7 @@ def unit_entry(units: UnitList, item: int) -> int:
 
 
 @cache
-def support_units_kernel(max_rows: int, lanes: int) -> wp.Kernel:
+def support_units_kernel(max_rows: int, lanes: int, device_arch) -> wp.Kernel:
     """The support placement's units (case K1, the writer's first launch): ``dim = (worlds, lanes)``, a world's lane
     group of ``lanes`` striding over its rows, a lane a row: each contact row's records by the contact law
     (:func:`.row_build.write_contact_row`, its unit source written where its slot is reserved,
@@ -1415,7 +1412,8 @@ def support_units_kernel(max_rows: int, lanes: int) -> wp.Kernel:
             elif unit_rows > 1:
                 append(units.wide.items, units.wide.count, bucket, units.wide.region, entry)
 
-    return python_kernel(kernel, f"support_units_{max_rows}_{lanes}", launch_bounds=WRITERS["support_units"].bounds)
+    bounds = WRITERS["support_units"].bounds(device_arch)
+    return python_kernel(kernel, f"support_units_{max_rows}_{lanes}", launch_bounds=bounds)
 
 
 @cache
@@ -1427,6 +1425,7 @@ def support_rows_kernel(
     records: bool,
     torsion: bool,
     half: int = WALK_BOTH,
+    device_arch,
 ) -> wp.Kernel:
     """The support placement's walkers (case K1, the writer's second launch): ``threads`` lanes, sized to the GPU,
     striding over the step's :class:`UnitList` (:func:`support_units_kernel`) kind by kind, units of four rows, of
@@ -1446,7 +1445,8 @@ def support_rows_kernel(
     unit_rows = 4 if torsion else 3
 
     def walker(rows: int, with_records: bool):
-        snippet = _support_snippet(parent, first, node, rows, with_records, torsion and rows == 4, half)
+        registers = WRITERS["support"].registers(device_arch)
+        snippet = _support_snippet(parent, first, node, rows, with_records, torsion and rows == 4, half, registers)
         return unit_walker(f"support_walk_{rows}", snippet)
 
     walk_one = walker(1, False)
@@ -1525,7 +1525,7 @@ def support_rows_kernel(
     name = f"support_rows_{len(node)}_{abs(hash((parent, first, node))) % (1 << 32):08x}"
     name += ("_records" if records else "") + ("_torsion" if torsion else "")
     # The writer's line, at which no walker spills.
-    return python_kernel(kernel, name, launch_bounds=WRITERS["support"].bounds)
+    return python_kernel(kernel, name, launch_bounds=WRITERS["support"].bounds(device_arch))
 
 
 def support_threads(units: int, device, writer: WriterShape = WRITERS["support"]) -> int:
@@ -1535,7 +1535,7 @@ def support_threads(units: int, device, writer: WriterShape = WRITERS["support"]
     device = wp.get_device(device)
     if not device.is_cuda:
         return 1
-    block, blocks = writer.bounds
+    block, blocks = writer.bounds(device.arch)
     return max(min(2 * blocks * block * int(device.sm_count), int(units)), 1)
 
 
@@ -1713,7 +1713,7 @@ def emit_rows(world: int, lane: int, lanes: int, seeds: RowSeeds):
 
 
 @cache
-def slot_rows_kernel(side: bool, tables: tuple, keys: bool = False) -> wp.Kernel:
+def slot_rows_kernel(side: bool, tables: tuple, keys: bool = False, *, device_arch) -> wp.Kernel:
     """The one writer on the sparse diagonal: a world's ``lanes`` threads stride over its rows (``dim = (worlds,
     lanes)``), every row up to the allocation's watermark (``counts``) within the capacity, a row a lane: a contact
     row's records by the contact law, then each row as its own unit (:data:`read_row_unit`), walked by the one unit
@@ -1746,7 +1746,7 @@ def slot_rows_kernel(side: bool, tables: tuple, keys: bool = False) -> wp.Kernel
                 header(rows, slots, data, v_hat, unit, bias)
 
     name = "write_slot_rows" + ("_keys" if keys else "")
-    return python_kernel(write_slot_rows, name, launch_bounds=WRITERS["slots"].bounds)
+    return python_kernel(write_slot_rows, name, launch_bounds=WRITERS["slots"].bounds(device_arch))
 
 
 def slot_writer(solver) -> wp.Kernel:
@@ -1754,8 +1754,8 @@ def slot_writer(solver) -> wp.Kernel:
     walked joint can have two halves (:attr:`.tree_factor.TreeFactor.walk_side`) and the walking classes' paths
     (:attr:`.tree_factor.TreeFactor.walk_classes`); a key's joint rows where the step writes velocity-limit rows."""
     factor = solver.factor
-    keys = bool(solver.options.enable_joint_velocity_limits)
-    return slot_rows_kernel(factor.walk_side, walk_tables(factor.walk_classes), keys)
+    keys, arch = bool(solver.options.enable_joint_velocity_limits), solver.model.device.arch
+    return slot_rows_kernel(factor.walk_side, walk_tables(factor.walk_classes), keys, device_arch=arch)
 
 
 def row_sink(factor, forest, placement, v_hat: wp.array) -> RowSink:
@@ -1862,29 +1862,33 @@ def free_body_speed_rows(
         row_bias(rows, bias, line, row, speed_axis(sink, line, row, art, unit.dof0))
 
 
-@wp.kernel(enable_backward=False, launch_bounds=WRITERS["free_body"].bounds)
-def write_free_body_rows(
-    sink: RowSink,
-    rows: DenseRows,
-    data: ContactInput,
-    law: PatchRowLaw,
-    bodies: FreeBodies,
-    speed_slot: wp.array[int],
-    speed_bodies: int,
-    threads: int,
-    bias: RowBias,
-):
-    """The free bodies' rows (the line's packed rows from ``body_base``), once their families' slots are reserved:
-    ``threads`` lanes stride over their units, the step's contacts (:func:`free_body_contact_rows`, those the
-    allocation routed to the free bodies), then the ``speed_bodies`` free rigid bodies' speed rows
-    (:func:`free_body_speed_rows`). Every unit's seeds walk into the free-body sink with the row law after the walk; a
-    unit's rows are its own, so the stride changes no row."""
-    contacts = data.count[0]
-    for item in range(wp.tid(), contacts + speed_bodies, threads):
-        if item < contacts:
-            free_body_contact_rows(sink, rows, data, law, bias, item)
-        else:
-            free_body_speed_rows(bodies, rows, sink, speed_slot, bias, item - contacts)
+@cache
+def write_free_body_rows(device_arch) -> wp.Kernel:
+    """The free bodies' rows (the line's packed rows from ``body_base``), once their families' slots are reserved, built
+    for the architecture ``device_arch``: ``threads`` lanes stride over their units, the step's contacts
+    (:func:`free_body_contact_rows`, those the allocation routed to the free bodies), then the ``speed_bodies`` free
+    rigid bodies' speed rows (:func:`free_body_speed_rows`). Every unit's seeds walk into the free-body sink with the
+    row law after the walk; a unit's rows are its own, so the stride changes no row."""
+
+    def kernel(
+        sink: RowSink,
+        rows: DenseRows,
+        data: ContactInput,
+        law: PatchRowLaw,
+        bodies: FreeBodies,
+        speed_slot: wp.array[int],
+        speed_bodies: int,
+        threads: int,
+        bias: RowBias,
+    ):
+        contacts = data.count[0]
+        for item in range(wp.tid(), contacts + speed_bodies, threads):
+            if item < contacts:
+                free_body_contact_rows(sink, rows, data, law, bias, item)
+            else:
+                free_body_speed_rows(bodies, rows, sink, speed_slot, bias, item - contacts)
+
+    return python_kernel(kernel, "write_free_body_rows", launch_bounds=WRITERS["free_body"].bounds(device_arch))
 
 
 def free_body_sink(solver) -> RowSink:
