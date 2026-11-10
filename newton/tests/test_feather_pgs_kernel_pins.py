@@ -330,22 +330,22 @@ def _solver_factory_calls():
     # Streamed row records, which large dense capacities select; limits add the limit pass's record reads.
     for limits in (False, True):
         kwargs = {
-            "places": sweep_routes.RowPlaces(Place.GLOBAL),
+            "places": sweep_routes.RowPlaces(Place.STREAMED),
             "has_dense_velocity_limit_rows": limits,
         }
         factory = built(sweep_routes.GeneralSweep)
         yield "sweep_routes.GeneralSweep", factory, (64, 32, 12, _ARCH), kwargs
     # A line past the stage: every impulse read and written in place.
     factory = built(sweep_routes.GeneralSweep)
-    places = {"places": sweep_routes.RowPlaces(Place.GLOBAL, Place.GLOBAL, Place.GLOBAL)}
+    places = {"places": sweep_routes.RowPlaces(Place.STREAMED, Place.GLOBAL, Place.GLOBAL)}
     yield "sweep_routes.GeneralSweep", factory, (64, 32, 12, _ARCH), places
     # Rows by their support classes (packed_rows.row_classes), staged and streamed.
-    for places in (sweep_routes.RowPlaces(), sweep_routes.RowPlaces(Place.GLOBAL)):
+    for places in (sweep_routes.RowPlaces(), sweep_routes.RowPlaces(Place.STREAMED)):
         kwargs = {"places": places, "support_classes": True, "max_row_dofs": 7}
         yield "sweep_routes.GeneralSweep", built(sweep_routes.GeneralSweep), (64, 32, 12, _ARCH), kwargs
     # The coordinate levels: their schedule over the rows' classes, and the general sweep that steps them first.
     yield name + "coordinate_levels_kernel", sweep_levels.coordinate_levels_kernel.__wrapped__, (64, 64, 12, _ARCH), {}
-    for places in (sweep_routes.RowPlaces(), sweep_routes.RowPlaces(Place.GLOBAL)):
+    for places in (sweep_routes.RowPlaces(), sweep_routes.RowPlaces(Place.STREAMED)):
         kwargs = {"places": places, "support_classes": True, "max_row_dofs": 7, "coordinate_levels": True}
         yield "sweep_routes.GeneralSweep", built(sweep_routes.GeneralSweep), (64, 32, 12, _ARCH), kwargs
     # The colored units' slot staging, under each law (the weights a constant of the plan).
@@ -576,7 +576,7 @@ class TestFeatherPGSKernelPins(unittest.TestCase):
             with self.subTest(flag=flag):
                 self.assertTrue(any(flag in name for name in sparse))
         # The MF-GS kernels that stream their row records are pinned.
-        self.assertTrue([name for name in self.current if "RowPlaces(GLOBAL, SHARED)" in name])
+        self.assertTrue([name for name in self.current if "RowPlaces(STREAMED, SHARED)" in name])
         # The linked tiers are pinned.
         linked = [name for name in self.current if "linked_rows=True" in name]
         self.assertTrue(linked)

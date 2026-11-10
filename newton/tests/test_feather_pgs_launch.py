@@ -17,8 +17,8 @@ import warp as wp
 
 from newton._src.core import execution, memory
 from newton._src.core.execution import Queue, Use, Work, shape
-from newton._src.core.memory import CPU, Device, carveout
-from newton._src.solvers.feather_pgs import tree_kinetic_state, walk_rows
+from newton._src.core.memory import CPU, Device, Place, carveout
+from newton._src.solvers.feather_pgs import sweep_routes, tree_kinetic_state, walk_rows
 from newton._src.solvers.feather_pgs.factor import walk as factor_walk
 
 PRO = Device.of(120, 188, 101_376)
@@ -169,6 +169,24 @@ class TestShapeAgainstTodaysRules(unittest.TestCase):
         self.assertEqual(carveout(GB300, 256, 28672), 228)
         got = shape(Work(4096, lanes=32, block=32, shared=1664), PRO)
         self.assertEqual((got.carveout_kb, got.l1_kb), (64, 64))
+
+    def test_stage_pays_in_warps(self):
+        """franka-cabinet's general sweep streams its records (6 and 14 warps staged, 32 streamed), g1's stages them at
+        16 warps, and a grid of a block an SM and the CPU stage everything: the warps rule (memory.stage)."""
+        cabinet = sweep_routes.GeneralSweep(
+            256, 32, 13, "120", max_row_dofs=13, free_rows=False, lanes_per_world=16, block_warps=2, torsion=True
+        )
+        g1 = sweep_routes.GeneralSweep(
+            192, 32, 49, "120", max_row_dofs=29, free_rows=False, block_warps=2, support_classes=True, active_rows=True
+        )
+
+        def placed(config, device, worlds=16384):
+            return config.places.placed(shape(config.work(worlds, config.staging()), device).staging)
+
+        for device in (PRO, GB300):
+            self.assertIs(placed(cabinet, device).metadata, Place.STREAMED)
+        for config, device, worlds in ((g1, PRO, 16384), (cabinet, PRO, 128), (cabinet, CPU, 16384)):
+            self.assertEqual(placed(config, device, worlds), sweep_routes.STAGED_ROWS)
 
     def test_fill_differs_only_where_named(self):
         # The rule fills the device's resident threads (1,536 or 2,048 a multiprocessor), fill_lanes 1,024.

@@ -111,15 +111,18 @@ line; the streamed rows' records the line's (``row_record``, :func:`.row_metadat
 where the line's speed rows start."""
 
 
+_ROW_BUFFERS = {"metadata": "s_rec_dense", "impulses": "s_lam_mf", "dense_impulses": "s_lam_dense"}
+"""Each row operand's buffer in the block's stage (:func:`mf_gs_staging`)."""
+
+
 @dataclasses.dataclass(frozen=True)
 class RowPlaces:
-    """Where the matrix-free sweep's row operands live, chosen once in the plan
-    (:func:`.execution_plan._select_mfgs_storage`): each in the block's shared stage or global memory, with identical
-    values.
+    """Where the matrix-free sweep's row operands live, each in the block's stage or at the alternative place the stage
+    gives it where it declines it (:func:`.memory.stage`), with identical values.
 
     Args:
-        metadata: The dense rows' metadata: staged, or their records streamed (:class:`.sweep.WorldRows`).
-        impulses: The free bodies' impulses.
+        metadata: The dense rows' metadata (with their sides): staged, or their records streamed.
+        impulses: The free bodies' impulses: staged, or in place.
         dense_impulses: The dense rows' impulses (the line's): staged, or in place.
     """
 
@@ -127,18 +130,15 @@ class RowPlaces:
     impulses: Place = Place.SHARED
     dense_impulses: Place = Place.SHARED
 
-    def __post_init__(self):
-        if {self.metadata, self.impulses, self.dense_impulses} - {Place.SHARED, Place.GLOBAL}:
-            raise ValueError(f"row operands live in shared or global memory: {self}")
-
     def __repr__(self) -> str:
         dense = f", {self.dense_impulses.name}" if self.dense_impulses is not Place.SHARED else ""
         return f"RowPlaces({self.metadata.name}, {self.impulses.name}{dense})"
 
-    @property
-    def staging(self) -> str:
-        """The dense rows' staging policy (:class:`.sweep.WorldRows`): staged, or their records streamed."""
-        return "shared" if self.metadata is Place.SHARED else "record"
+    def placed(self, staging: Staging) -> RowPlaces:
+        """These places, each operand the stage held (:meth:`.memory.Staging.place`) at the place it got."""
+        held = {buffer.name for buffer in (*staging.buffers, *staging.declined)}
+        moved = {field: staging.place(name) for field, name in _ROW_BUFFERS.items() if name in held}
+        return dataclasses.replace(self, **moved)
 
     @property
     def suffix(self) -> str:
@@ -157,15 +157,15 @@ STAGED_ROWS = RowPlaces()
 def record_first(max_constraints: int, places: RowPlaces) -> int:
     """The line's first row with a record (:func:`.row_metadata.pack_row_record`): the dense rows' first where their
     metadata streams, else the free bodies' (from the dense capacity ``max_constraints``), which always stream."""
-    return 0 if places.staging == "record" else int(max_constraints)
+    return 0 if places.metadata is Place.STREAMED else int(max_constraints)
 
 
 ROW_PLACES = (
     STAGED_ROWS,
     RowPlaces(impulses=Place.GLOBAL),
-    RowPlaces(Place.GLOBAL),
-    RowPlaces(Place.GLOBAL, Place.GLOBAL),
-    RowPlaces(Place.GLOBAL, Place.GLOBAL, Place.GLOBAL),
+    RowPlaces(Place.STREAMED),
+    RowPlaces(Place.STREAMED, Place.GLOBAL),
+    RowPlaces(Place.STREAMED, Place.GLOBAL, Place.GLOBAL),
 )
 """Every placement of the sweep's row operands (the census's axis)."""
 
@@ -410,7 +410,7 @@ def _colored_units(free: WorldRows, laws: RowLaws, M_MF: int, units: int) -> str
     """A color's units, one thread each, at block stride: each loads its slot's fields at once
     (:data:`.sweep_units.SLOT_FIELDS`, field by field across the color's ``units`` slots) and runs the free-body row
     law, unrolled over the unit's rows, on the world's staged velocity. No other unit of the color shares a body."""
-    unit_rows = WorldRows(M_MF, staging="record", free=True, stream=free.stream, lanes=Lanes(1))
+    unit_rows = WorldRows(M_MF, Place.STREAMED, free=True, stream=free.stream, lanes=Lanes(1))
     torsion = laws.torsion
     layout = sweep_units.slot_layout(torsion)
 
@@ -751,18 +751,19 @@ def mf_gs_staging(
     groups: int = 1,
     lanes: int = 32,
 ) -> Staging:
-    """The shared working set of a world's matrix-free sweep block (:func:`mf_gs_source` declares it): the world's
-    velocity, its dense rows' impulses and staged metadata, the free bodies' run's impulses (``free_rows``) unless they
-    stream, ``colored`` the colors' staged offsets (and its trace's warp maxima), ``active_rows`` the active
-    enumeration's bitsets, ``coordinate_levels`` the leveled units' marks, for ``groups`` worlds of ``lanes`` lanes."""
+    """The shared working set of a world's matrix-free sweep block (:func:`mf_gs_source` declares it), in order of
+    reuse: the world's velocity, its dense rows' and the free bodies' run's (``free_rows``) impulses at ``places``, the
+    dense rows' staged metadata, ``colored`` the colors' staged offsets (and its trace's warp maxima), ``active_rows``
+    the active enumeration's bitsets, ``coordinate_levels`` the leveled units' marks, for ``groups`` worlds of ``lanes``
+    lanes."""
     # A packed row's sides stage with its metadata (the classes' word takes the widths' place).
     sides = None if wide_rows else "widths"
-    dense = WorldRows(
-        max_constraints, staging=places.staging, stream=places.dense_impulses is Place.GLOBAL, sides=sides
-    )
+    dense = WorldRows(max_constraints, places.metadata, stream=places.dense_impulses is Place.GLOBAL, sides=sides)
     free = WorldRows(
-        mf_max_constraints, staging="record", free=True, stream=places.impulses is Place.GLOBAL or not free_rows
+        mf_max_constraints, Place.STREAMED, free=True, stream=places.impulses is Place.GLOBAL or not free_rows
     )
+    # The impulses each visit reads and writes, then the record words it only reads (streamed where declined).
+    rows = sorted((*dense.buffers(), *free.buffers()), key=lambda buffer: buffer.alternative is not Place.GLOBAL)
     levels = ()
     if colored:
         levels = COLORS.buffers()
@@ -772,8 +773,7 @@ def mf_gs_staging(
         (
             Buffer("s_v", "float", max_world_dofs),
             *((Buffer("s_sweep_v", "float", max_world_dofs),) if wide_rows else ()),
-            *dense.buffers(),
-            *free.buffers(),
+            *rows,
             *levels,
             *(active_words(max_constraints) if active_rows else ()),
             *((Buffer("s_level_mark", "int", (max_constraints + 31) // 32),) if coordinate_levels else ()),
@@ -801,26 +801,11 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     laws = sweep.laws
     # A packed row's coordinates decode from its staged sides, as a streamed record's do.
     sides = None if wide_rows else "classes" if sweep.support_classes else "widths"
-    dense = WorldRows(
-        M_D, staging=places.staging, stream=places.dense_impulses is Place.GLOBAL, lanes=row_lanes, sides=sides
-    )
-    free = WorldRows(M_MF, staging="record", free=True, stream=places.impulses is Place.GLOBAL, lanes=row_lanes)
+    dense = WorldRows(M_D, places.metadata, stream=places.dense_impulses is Place.GLOBAL, lanes=row_lanes, sides=sides)
+    free = WorldRows(M_MF, Place.STREAMED, free=True, stream=places.impulses is Place.GLOBAL, lanes=row_lanes)
     dense_op = packed_operator(max_row_dofs, row_lanes, wide=wide_rows, rows=dense, classes=sweep.support_classes)
     free_op = free_body_rows(row_lanes, max_row_dofs)
-    staging = mf_gs_staging(
-        M_D,
-        M_MF,
-        D,
-        colored=colored,
-        places=places,
-        traces=solve_policy.traces,
-        wide_rows=wide_rows,
-        free_rows=free_rows,
-        active_rows=sweep.active_rows,
-        coordinate_levels=sweep.coordinate_levels,
-        groups=sweep.groups,
-        lanes=lanes,
-    )
+    staging = sweep.staging()
 
     dense_count = "int m_dense = world_constraint_count.data[world];"
     dense_loads = indent(dense.loads("i"), "        ")
@@ -1227,6 +1212,23 @@ class GeneralSweep(SweepConfig):
 
     source = mf_gs_source
 
+    def staging(self) -> Staging:
+        """The block's working set at its places (:func:`mf_gs_staging`): each staged operand with its alternative."""
+        return mf_gs_staging(
+            self.max_constraints,
+            self.mf_max_constraints,
+            self.max_world_dofs,
+            colored=self.colored,
+            places=self.places,
+            traces=self.solve_policy.traces,
+            wide_rows=self.wide_rows,
+            free_rows=self.free_rows,
+            active_rows=self.active_rows,
+            coordinate_levels=self.coordinate_levels,
+            groups=self.groups,
+            lanes=self.lanes,
+        )
+
     def dispatch(self, staging: Staging) -> Dispatch:
         return worlds(self.groups, self.lanes) if self.groups > 1 else worlds()
 
@@ -1257,13 +1259,12 @@ class GeneralSweep(SweepConfig):
             *self.law_operands(),
         )
 
-    def work(self, items: int = 0, shared: int = 0) -> Work:
+    def work(self, items: int = 0, shared: int | Staging = 0) -> Work:
         """The colored mapping: a block a world of :data:`COLORED_THREADS`, every register a thread may hold (one block
         a multiprocessor). The warp mapping: ``lanes_per_world`` lanes a world on a persistent grid, at the register
         line :data:`WARP_LINE` in blocks of :data:`BLOCK_WARPS` warps."""
         if self.colored:
-            return Work(int(items), lanes=COLORED_THREADS, registers=REGISTERS_PER_THREAD, shared=int(shared))
+            return Work(int(items), lanes=COLORED_THREADS, registers=REGISTERS_PER_THREAD, shared=shared)
         block, lanes = 32 * self.block_warps, self.lanes_per_world
-        if self.block_warps > 1:
-            return Work(int(items), lanes=lanes, block=block, registers=WARP_LINE, persistent=True, shared=int(shared))
-        return Work(int(items), lanes=lanes, block=block, persistent=True)
+        line = WARP_LINE if self.block_warps > 1 else None
+        return Work(int(items), lanes=lanes, block=block, registers=line, persistent=True, shared=shared)

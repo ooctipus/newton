@@ -43,7 +43,6 @@ from . import (
 )
 from .contact_forces import compute_contact_linear_force_from_impulses, pack_contact_linear_force_as_spatial
 from .contact_input import bind_routes as bind_contact_routes
-from .execution_plan import _MFGSStorage, _select_mfgs_storage
 from .field_group import Field, FieldGroup
 from .friction_patches import patch_routes
 from .path_selection import json_value, kernel_key
@@ -426,8 +425,6 @@ class Sweep:
         # The colored mapping of the matrix-free sweep and its units, when a world can take it.
         self.mf_colored_kernel = None
         self.colored_units = None
-        # Storage classes of the MF-GS kernel (_MFGSStorage); recorded by get_path_selection().
-        self.mf_gs_storage = None
         self.general_active_reason = None
         # The Jacobi tiers ahead of the matrix-free sweep (their SweepLaunch each).
         self.tiers = []
@@ -438,89 +435,66 @@ class Sweep:
         # The one writer's EMIT sink (walk_rows.RowSeeds): none until a tier walks its rows.
         self.placement.row_seeds = walk_rows.row_seeds(self.placement, 0, 0, sweep_routes_tiers.TIER_ROWS)
         if self.classes.mf_sweeps:
-            # A test pin streams the impulses, the free bodies' or every row's (storage is part of the kernel
-            # specialization key); the selection sizes the resident row metadata with its choice.
-            stream_line = self.pins.mf_storage == "line"
-            force_stream_mf_impulses = stream_line or self.pins.mf_storage == "streamed"
-            on_cpu = Place.GLOBAL if force_stream_mf_impulses else Place.SHARED
-            storage = _MFGSStorage(
-                sweep_routes.RowPlaces(Place.GLOBAL, on_cpu, Place.GLOBAL if stream_line else Place.SHARED),
-                "Without CUDA no shared-memory storage applies.",
+            # Test pins put row operands in place: the free bodies' impulses ("streamed"), or every row's record and
+            # impulses ("line"); the stage places the others (memory.stage, through the layer's shape).
+            line = self.pins.mf_storage == "line"
+            in_place = Place.GLOBAL if line or self.pins.mf_storage == "streamed" else Place.SHARED
+            pinned = sweep_routes.RowPlaces(
+                Place.STREAMED if line else Place.SHARED, in_place, Place.GLOBAL if line else Place.SHARED
             )
-            if model.device.is_cuda:
-                storage = _select_mfgs_storage(
-                    functools.partial(
-                        sweep_routes.mf_gs_staging,
-                        self.placement.dense_max_constraints,
-                        self.placement.mf_max_constraints,
-                        self.forest.max_world_dofs,
-                        free_rows=self.placement.free_contact_rows,
-                    ),
-                    arch_budget(device_arch),
-                    force_stream_mf_impulses=force_stream_mf_impulses,
-                    force_stream_line=stream_line,
-                )
-            self.mf_gs_storage = storage
             parallel_rows = self.classes.tier_rows
-            # The streamed rows' records, in the worlds the general sweep and the unit builder read.
-            self.placement.allocate_row_records(
-                sweep_routes.record_first(self.placement.dense_max_constraints, storage.places)
-            )
             # The records' pass: a warp of lanes per 256 rows of the line, at most a block, over a wave of the device.
             self.record_lanes = min(256, 32 * -(-self.placement.row_pitch // 256))
             threads = max(int(model.device.sm_count), 1) * 512
             self.record_grid = min(self.forest.world_count, max(threads // self.record_lanes, 1))
-            # The warp mapping: the storage's places, the placement's rows, lanes by the rows' support where a warp's
-            # stages fit (two warps a block where theirs do), the sparse sweep's rule for the enumeration and units.
+            # The warp mapping: the placement's rows, the sparse sweep's rule for the enumeration and units, lanes by the
+            # rows' support where the stage a world keeps alone fits a warp's worlds (two warps a block where theirs
+            # do), and the places the stage gives the mapping's launch.
             budget = arch_budget(device_arch)
-            staging = functools.partial(
-                sweep_routes.mf_gs_staging,
-                self.placement.dense_max_constraints,
-                self.placement.mf_max_constraints,
-                self.forest.max_world_dofs,
-                places=storage.places,
-                free_rows=self.placement.free_contact_rows,
-                wide_rows=self.placement.packed_dense == packed_rows.WIDE,
-            )
             support_lanes = sweep_routes.world_lanes(
                 self.placement.packed_support, free_rows=bool(self.placement.free_contact_rows)
             )
             small = support_lanes if support_lanes < 32 else 0
-            active_rows, self.general_active_reason = class_plan.active_rows_rule(
-                self.pins, small_world_lanes=small, fits=lambda: staging(active_rows=True).fits(budget)
-            )
-            # A tree of one coordinate (forest.diagonal_mass_sizes) holds units of one entry where the rows keep their
-            # support classes: in the full ordered sweep they step by level (the builder's schedule), before the order.
-            coordinate_levels = bool(self.forest.diagonal_mass_sizes and self.placement.classed and not active_rows)
-            staging = functools.partial(staging, active_rows=active_rows, coordinate_levels=coordinate_levels)
-            lanes, block_warps = 32, 1
-            if model.device.is_cuda:
-                if staging(lanes=support_lanes, groups=32 // support_lanes).fits(budget):
-                    lanes = support_lanes
-                staging = functools.partial(staging, lanes=lanes)
-                if staging(groups=32 * sweep_routes.BLOCK_WARPS // lanes).fits(budget):
-                    block_warps = sweep_routes.BLOCK_WARPS
-            self.general_sweep = sweep_routes.GeneralSweep(
+            general = functools.partial(
+                sweep_routes.GeneralSweep,
                 self.placement.dense_max_constraints,
                 self.placement.mf_max_constraints,
                 self.forest.max_world_dofs,
                 device_arch,
                 pitch=self.placement.row_pitch,
                 has_dense_velocity_limit_rows=bool(self.options.enable_joint_velocity_limits),
-                places=storage.places,
+                places=pinned,
                 max_row_dofs=self.placement.packed_support,
                 seeded=self.seeded,
                 wide_rows=self.placement.packed_dense == packed_rows.WIDE,
                 support_classes=self.placement.classed,
-                active_rows=active_rows,
                 contact_units=self.pins.contact_units == "triplets" and not small,
-                coordinate_levels=coordinate_levels,
-                lanes_per_world=lanes,
-                block_warps=block_warps,
                 free_rows=bool(self.placement.free_contact_rows),
                 speed_rows=speed_rows,
                 one_tree=self._one_tree(),
                 **self.law_fields,
+            )
+            active_rows, self.general_active_reason = class_plan.active_rows_rule(
+                self.pins, small_world_lanes=small, fits=lambda: general(active_rows=True).staging().fits(budget)
+            )
+            # A tree of one coordinate (forest.diagonal_mass_sizes) holds units of one entry where the rows keep their
+            # support classes: in the full ordered sweep they step by level (the builder's schedule), before the order.
+            coordinate_levels = bool(self.forest.diagonal_mass_sizes and self.placement.classed and not active_rows)
+            general = functools.partial(general, active_rows=active_rows, coordinate_levels=coordinate_levels)
+            worlds = self.forest.world_count
+            alone = self._staged(general(), worlds)
+            lanes, block_warps = 32, 1
+            if model.device.is_cuda:
+                if dataclasses.replace(alone, lanes_per_world=support_lanes).staging().fits(budget):
+                    lanes = support_lanes
+                pair = dataclasses.replace(alone, lanes_per_world=lanes, block_warps=sweep_routes.BLOCK_WARPS)
+                if pair.staging().fits(budget):
+                    block_warps = pair.block_warps
+            declared = general(lanes_per_world=lanes, block_warps=block_warps)
+            self.general_sweep = self._staged(declared, worlds)
+            # The streamed rows' records, in the worlds the general sweep and the unit builder read.
+            self.placement.allocate_row_records(
+                sweep_routes.record_first(self.placement.dense_max_constraints, self.general_sweep.places)
             )
             # The colored mapping takes the worlds the unit builder's rule picks at every pack
             # (sweep_units.COLORED_RULE), among those whose free bodies and row capacity admit it: built, with a
@@ -555,7 +529,7 @@ class Sweep:
                 )
             self.mf_gs_kernel = self.sweep("mf_gs", self.general_sweep)
             if colored:
-                self.colored_sweep = dataclasses.replace(self.general_sweep, **_COLORED)
+                self.colored_sweep = self._staged(dataclasses.replace(declared, **_COLORED), capable.size)
                 self.mf_colored_kernel = self.sweep("mf_colored", self.colored_sweep)
             if parallel_rows > 0:
                 # The producer's sink, a tier's by data and the device (sweep_routes_tiers.emits): a tier that takes EMIT
@@ -595,7 +569,6 @@ class Sweep:
             # Each sweep walks its bucket of the claims' worlds (claim_worlds), a bucket of every world's slots: a tier's,
             # the general sweep's, and with the colored mapping its candidates' (which the unit builder walks) and the
             # colored worlds' (which it appends).
-            worlds = self.forest.world_count
             self.claim_general = len(self.tiers)
             self.claim_candidate = self.claim_general + 1 if colored else -1
             self.claim_colored = self.claim_general + 2 if colored else -1
@@ -843,12 +816,21 @@ class Sweep:
         worlds = self.forest.articulation_world[self.forest.response_dof_count > 0]
         return worlds.size == 0 or int(np.bincount(worlds).max()) <= 1
 
+    def _launch_work(self, config: SweepConfig, items: int):
+        """A matrix-free mapping's work over ``items`` (its bucket's capacity) with its stage: persistent where tiers run
+        beside it, whose launches then start without waiting for its exiting blocks; alone, a full grid, which the
+        device balances as blocks finish."""
+        work = config.work(items, config.staging())
+        return work if self.classes.tier_rows else dataclasses.replace(work, persistent=False)
+
+    def _staged(self, config: SweepConfig, items: int) -> SweepConfig:
+        """``config`` at the places the stage gives its operands on its launch over ``items`` (:func:`.memory.stage`)."""
+        layout = shape(self._launch_work(config, items), device(self.model.device))
+        return dataclasses.replace(config, places=config.places.placed(layout.staging))
+
     def _claim_launch(self, config: SweepConfig, kernel: wp.Kernel, items: int, bucket: int) -> SweepLaunch:
-        """The launch of a matrix-free mapping over its claim's ``bucket``, its grid the layer's shape of its work over
-        ``items`` (the bucket's capacity): persistent where tiers run beside it, whose launches then start without
-        waiting for its exiting blocks; alone, a full grid, which the device balances as blocks finish."""
-        work = config.work(items)
-        layout = shape(work if self.tiers else dataclasses.replace(work, persistent=False), device(self.model.device))
+        """The launch of a matrix-free mapping over its claim's ``bucket``: the layer's shape of :meth:`_launch_work`."""
+        layout = shape(self._launch_work(config, items), device(self.model.device))
         return SweepLaunch(
             config,
             kernel,
@@ -1234,14 +1216,13 @@ class Sweep:
         }
 
     def _record_storage(self) -> dict | None:
-        """The storage classes of the general sweep, chosen by :func:`.execution_plan._select_mfgs_storage`."""
-        storage = self.mf_gs_storage
-        if storage is None:
+        """The places of the general sweep's row operands, the stage's (:func:`.memory.stage`)."""
+        if self.mf_gs_kernel is None:
             return None
-        places = storage.places
+        places = self.general_sweep.places
         names = {"metadata": places.metadata, "mf_impulses": places.impulses, "dense_impulses": places.dense_impulses}
         record = {name: "resident" if place is Place.SHARED else "streamed" for name, place in names.items()}
-        return {**record, "reason": storage.reason}
+        return {**record, "reason": "The stage rule (memory.stage) on the sweep's launch."}
 
     def _record_colored(self, plan) -> dict | None:
         """The colored mapping of the matrix-free sweep: its kernel and the worlds it takes, or ``None`` unbuilt."""

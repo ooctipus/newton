@@ -38,7 +38,7 @@ class TestFreeBodyRowsBuild(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_record_rows(70000)
 
-    def _box_step(self, armature: float = 0.0):
+    def _box_step(self, armature: float = 0.0, pins=None):
         """A 1 kg, 0.2 m box resting tilted on the ground (its lowest edge 5 mm into it), one step: the solver."""
         import newton  # noqa: PLC0415
 
@@ -55,7 +55,7 @@ class TestFreeBodyRowsBuild(unittest.TestCase):
         builder.joint_armature[-6:] = [armature] * 6
         builder.add_ground_plane()
         model = builder.finalize(device=DEVICE)
-        solver = newton.solvers.SolverFeatherPGS(model)
+        solver = newton.solvers.SolverFeatherPGS(model, pins=newton.solvers.SolverFeatherPGS.Pins(**(pins or {})))
         pipeline = newton.CollisionPipeline(model, growable_contacts=True)
         contacts = pipeline.contacts()
         state, out = model.state(), model.state()
@@ -66,8 +66,8 @@ class TestFreeBodyRowsBuild(unittest.TestCase):
     def test_writers_store_the_rows_records(self):
         """Every streamed row's record (:func:`.row_metadata.pack_row_record`), which the one writer stores, holds the
         row as the step left it: its sides' first coordinates and widths, its diagonal, its residual at ``du = 0``, its
-        kind, parent and friction coefficient. The CPU streams the dense rows' metadata, so every row has one."""
-        solver = self._box_step()
+        kind, parent and friction coefficient. Under the pin ``mf_storage='line'`` every row streams its record."""
+        solver = self._box_step(pins={"mf_storage": "line"})
         p = solver.placement
         self.assertTrue(p.writes_records)
         self.assertEqual(p.record_first, 0)
@@ -175,7 +175,7 @@ class TestLineImpulses(unittest.TestCase):
         for device in devices:
             with self.subTest(device=device):
                 _, solver, q, qd = _box_run(device, {"mf_storage": "line"})
-                self.assertIs(solver.sweep.mf_gs_storage.places.dense_impulses, Place.GLOBAL)
+                self.assertIs(solver.sweep.general_sweep.places.dense_impulses, Place.GLOBAL)
                 rows, _, q0, qd0 = _box_run(device)
                 self.assertGreater(rows, 0, "the box must touch the ground")
                 np.testing.assert_array_equal(q, q0)

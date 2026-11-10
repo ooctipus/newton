@@ -22,6 +22,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.core.memory import Place
 from newton._src.solvers.feather_pgs import (
     kernel_template,
     row_laws,
@@ -396,7 +397,7 @@ class TestExitLaw(unittest.TestCase):
             body = max(_native_snippets(plain), key=len)
             law_sites = len(_LAW_SITE.findall(body))
             places = kwargs.get("places")
-            if places is not None and places.staging == "record" and "s_rec_dense" in body:
+            if places is not None and places.metadata is Place.STREAMED and "s_rec_dense" in body:
                 self.fail(f"{plain.key} {kwargs}: streamed rows stage their metadata")
             for policy in (DEFAULT_POLICY, SWEEPS, TRACE):
                 kernel = factory(*args, solve_policy=policy, **kwargs)

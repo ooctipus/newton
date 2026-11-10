@@ -64,13 +64,13 @@ _GENERATORS = {
     "mf_gs_global_metadata": (
         built(sweep_routes.GeneralSweep),
         (64, 32, 12, "120"),
-        {"places": sweep_routes.RowPlaces(Place.GLOBAL)},
+        {"places": sweep_routes.RowPlaces(Place.STREAMED)},
         (_DENSE_PASS, _SPEED_PASS),
     ),
     "mf_gs_line_impulses": (
         built(sweep_routes.GeneralSweep),
         (64, 32, 12, "120"),
-        {"places": sweep_routes.RowPlaces(Place.GLOBAL, Place.GLOBAL, Place.GLOBAL)},
+        {"places": sweep_routes.RowPlaces(Place.STREAMED, Place.GLOBAL, Place.GLOBAL)},
         (_DENSE_PASS, _SPEED_PASS),
     ),
     "sparse_limits": (
