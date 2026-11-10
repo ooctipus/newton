@@ -121,7 +121,7 @@ def sweep_free_body_rows(
             6,
             str(wp.get_device(device).arch),
             has_dense_velocity_limit_rows=False,
-            places=sweep_routes.RowPlaces(Place.GLOBAL),
+            places=sweep_routes.RowPlaces(Place.STREAMED),
             seeded=True,
             weighted=regularize,
         )

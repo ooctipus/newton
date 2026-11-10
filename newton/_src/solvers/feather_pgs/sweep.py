@@ -42,7 +42,7 @@ from typing import ClassVar, Protocol
 import warp as wp
 
 from ...core.execution import Work, shape
-from ...core.memory import Buffer, Staging, arch_budget, built_for
+from ...core.memory import Buffer, Place, Staging, arch_budget, built_for
 from .device_preludes import BLOCK_THREADS, RING, SHARED_STORAGE, DevicePrelude, VirtualLanes, group_native, lane_group
 from .kernel_template import Dispatch, KernelTemplate
 from .law_source import law_preludes
@@ -77,13 +77,13 @@ class WorldRows:
     """A world's rows of one class in the row store's line: the dense class's from ``off_dense``, the free bodies'
     (``free``) from ``off_mf``, ``capacity`` slots each, read by the class's staging policy.
 
-    ``staging`` says where a row's record (:func:`.row_metadata.pack_row_record`) is read:
+    ``metadata`` says where a row's record (:func:`.row_metadata.pack_row_record`) is read:
 
-    - ``"shared"``: the record's words a staged row reads are staged in shared memory, word-major (``s_rec_dense``,
-      :attr:`staged_words`): its right-hand side (the law's bias plus the row's incident velocity ``row_incident``: its
-      residual at ``du = 0``), its diagonal, its kind and parent word and its friction coefficient; its sides are the
-      row store's (``row_sides``);
-    - ``"record"``: the rows' records stream (``row_record``, :func:`.row_metadata.pack_row_record`), the class's from
+    - :attr:`~.memory.Place.SHARED`: the record's words a staged row reads are staged in shared memory, word-major
+      (``s_rec_dense``, :attr:`staged_words`): its right-hand side (the law's bias plus the row's incident velocity
+      ``row_incident``: its residual at ``du = 0``), its diagonal, its kind and parent word and its friction
+      coefficient; its sides are the row store's (``row_sides``);
+    - :attr:`~.memory.Place.STREAMED`: the rows' records stream (``row_record``), the class's from
       ``off_rec_dense`` or ``off_rec_mf``. A row loop loads the visited row's record a row ahead into registers
       (``rec_a``, ``rec_b``: :func:`rows_block`, or :meth:`visit`), which every read of row ``i`` takes; any other
       row's read takes its record's word. The free rows always stream their headers (``rec_a``,
@@ -96,7 +96,7 @@ class WorldRows:
     """
 
     capacity: int
-    staging: str = "shared"
+    metadata: Place = Place.SHARED
     free: bool = False
     stream: bool = False
     lanes: Lanes = dataclasses.field(default_factory=Lanes)
@@ -105,22 +105,19 @@ class WorldRows:
     """A staged row's sides staged too, its record's two words (first coordinates, then ``"widths"`` or the support
     ``"classes"``): a visit's coordinates decode from the stage, as a streamed record's do."""
 
-    STAGINGS: ClassVar[tuple[str, ...]] = ("shared", "record")
     VISITED: ClassVar[str] = "i"
     """The row a row loop visits, whose record the loop holds in registers."""
 
     def __post_init__(self):
         validate_record_rows(self.capacity)
-        if self.staging not in self.STAGINGS:
-            raise ValueError(f"staging must be one of {self.STAGINGS}, got {self.staging!r}")
-        if self.free and self.staging != "record":
-            raise ValueError("the free bodies' rows stream their records")
+        if self.metadata not in (Place.SHARED, Place.STREAMED) or (self.free and not self.record):
+            raise ValueError(f"a row's metadata is staged or streams (the free bodies' streams), got {self.metadata}")
         if self.stream and self.every_lane:
             raise ValueError("a class whose every lane reads its own stores stages its impulses")
 
     @property
     def record(self) -> bool:
-        return self.staging == "record"
+        return self.metadata is Place.STREAMED
 
     @property
     def staged_words(self) -> tuple[int, ...]:
@@ -271,9 +268,10 @@ class WorldRows:
     # -- staging ---------------------------------------------------------------------------------------------------
 
     def buffers(self) -> tuple[Buffer, ...]:
-        impulses = () if self.stream else (Buffer(self.impulses, "float", self.capacity),)
-        staged = len(self.staged_words) * self.capacity
-        return impulses if self.record else (*impulses, Buffer("s_rec_dense", "int", staged))
+        """The rows' stage, each buffer with its place where the stage declines it: impulses in place, records streamed."""
+        impulses = () if self.stream else (Buffer(self.impulses, "float", self.capacity, alternative=Place.GLOBAL),)
+        staged = Buffer("s_rec_dense", "int", len(self.staged_words) * self.capacity, alternative=Place.STREAMED)
+        return impulses if self.record else (*impulses, staged)
 
     def declaration(self) -> str:
         """The streamed impulses' view of the world's line."""

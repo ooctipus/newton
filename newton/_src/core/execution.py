@@ -38,7 +38,16 @@ import string
 
 import warp as wp
 
-from .memory import REGISTER_GRANULE, REGISTER_PARTITIONS, REGISTERS_PER_THREAD, Device, carveout, granules
+from .memory import (
+    REGISTER_GRANULE,
+    REGISTER_PARTITIONS,
+    REGISTERS_PER_THREAD,
+    Device,
+    Staging,
+    carveout,
+    granules,
+    stage,
+)
 
 __all__ = [
     "Beside",
@@ -236,7 +245,8 @@ class Work:
         cap: The line caps the kernel's registers. Without, it is the least a bound must leave: the kernel is bound
             only where shared memory keeps no more blocks than the line would, so a bound gives registers and never
             takes them (a kernel whose variants compile on both sides of its line, and spill under a cap).
-        shared: Static shared memory a block [B] (a :class:`~.memory.Staging`'s bytes).
+        shared: Static shared memory a block [B], or its working set (:class:`~.memory.Staging`), whose places
+            :func:`shape` resolves.
         persistent: The kernel strides over its items, so its grid is capped at ``waves`` waves of resident blocks.
         waves: Waves of resident blocks of a persistent grid.
         grid_per_sm: A measured persistent grid in blocks a multiprocessor, in place of ``waves``.
@@ -251,7 +261,7 @@ class Work:
     block: int | None = None
     registers: int | None = None
     cap: bool = True
-    shared: int = 0
+    shared: int | Staging = 0
     persistent: bool = False
     waves: float = 1.0
     grid_per_sm: int | None = None
@@ -288,6 +298,7 @@ class Shape:
         grid: Blocks of the launch.
         carveout_kb: The driver's shared-memory carveout step [KiB].
         l1_kb: The L1 the carveout leaves [KiB].
+        staging: The working set as staged, where the work declares one.
     """
 
     lanes: int
@@ -299,6 +310,7 @@ class Shape:
     grid: int
     carveout_kb: int
     l1_kb: int
+    staging: Staging | None = None
 
 
 def _pow2_ceil(x: float) -> int:
@@ -340,11 +352,23 @@ def _lanes(work: Work, device: Device, resident_threads: int) -> int:
     return max(work.least, min(lanes, cap))
 
 
+def _warps(work: Work, device: Device) -> int:
+    """Warps a multiprocessor keeps of ``work``'s launch: its resident blocks, at most the grid's."""
+    found = shape(work, device)
+    return min(found.blocks_per_sm, -(-found.grid // device.sms)) * (found.block // 32)
+
+
 def shape(work: Work, device: Device) -> Shape:
-    """The launch of ``work`` on ``device`` by the one rule (module docstring). The CPU takes one lane and one thread
-    a block, its grid an item."""
+    """The launch of ``work`` on ``device`` by the one rule (module docstring), its working set staged with it
+    (:func:`~.memory.stage`). The CPU takes one lane and one thread a block, its grid an item."""
+    staging = work.shared if isinstance(work.shared, Staging) else None
+    if staging is not None:
+        staging = stage(
+            staging, lambda size: _warps(dataclasses.replace(work, shared=size), device), device.shared_per_block
+        )
+        work = dataclasses.replace(work, shared=staging.bytes)
     if not device.cuda:
-        return Shape(1, 1, 1, 1, None, REGISTERS_PER_THREAD, work.count, 0, 0)
+        return Shape(1, 1, 1, 1, None, REGISTERS_PER_THREAD, work.count, 0, 0, staging)
     line = work.registers
     resident_threads = min(device.threads_per_sm, 32 * _line_warps(device, line) if line else device.threads_per_sm)
     lanes = _lanes(work, device, resident_threads)
@@ -359,9 +383,8 @@ def shape(work: Work, device: Device) -> Shape:
         cap = (work.grid_per_sm or round(work.waves * per_sm)) * device.sms
         grid = min(grid, max(cap, 1))
     step = carveout(device, block, work.shared)
-    return Shape(
-        lanes, groups, block, per_sm, (block, per_sm) if line else None, registers, grid, step, device.unified_kb - step
-    )
+    bounds = (block, per_sm) if line else None
+    return Shape(lanes, groups, block, per_sm, bounds, registers, grid, step, device.unified_kb - step, staging)
 
 
 def launch(

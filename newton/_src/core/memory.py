@@ -11,7 +11,7 @@ the one place every such concept lives:
 
 - the device: :class:`Device`, its memory hierarchy and occupancy, read once (:func:`device`);
 - the shared stage: :class:`Staging` (a block's working set, declared buffer by buffer) under the device's static
-  budget (:func:`static_budget`) and its carveout step (:func:`carveout`, the L1 it leaves);
+  budget (:func:`static_budget`), the rule that stages what pays (:func:`stage`) and the carveout (:func:`carveout`);
 - the access words, one text each with its CPU twin: ``LDG`` (L1's non-coherent path), ``LD``/``ST``/``ADD``
   (coherent global loads, stores and adds), ``TOUCH`` and ``FETCH`` (loads ahead: one L1 hint a line, and a lane
   group's fetch of a byte range), ``LDCG``/``STCG`` (L2 past L1), ``HELD`` (a distributed array over a lane group's
@@ -27,6 +27,7 @@ from __future__ import annotations
 import dataclasses
 import enum
 import functools
+from collections.abc import Callable
 
 import warp as wp
 
@@ -35,6 +36,7 @@ __all__ = [
     "CPU",
     "CPU_STAGING_BYTES",
     "HELD",
+    "HIDING_WARPS",
     "L1_LINE_BYTES",
     "REFERENCE_ARCH",
     "REGISTERS_PER_THREAD",
@@ -57,6 +59,7 @@ __all__ = [
     "carveout",
     "device",
     "granules",
+    "stage",
     "static_budget",
     "table",
     "words",
@@ -485,12 +488,14 @@ class Buffer:
         ctype: Its CUDA element type (one of the scalar or vector types of :data:`_SIZES`).
         count: Its element count (a compile-time constant).
         align: Byte alignment of the array (default: its element type's).
+        alternative: The place the body reads it at where the stage declines it (:func:`stage`); ``None``: staged.
     """
 
     name: str
     ctype: str
     count: int
     align: int | None = None
+    alternative: Place | None = None
 
     def __post_init__(self):
         if self.ctype not in _SIZES:
@@ -537,6 +542,7 @@ class Staging:
         layout: How several groups' copies lie: ``"struct"``, one struct of the buffers per group, or
             ``"arrays"``, one array per buffer that holds every group's copy in group order (a buffer's
             elements of the groups that share a warp then fall in distinct banks).
+        declined: The buffers :func:`stage` left at their alternative place.
     """
 
     buffers: tuple[Buffer, ...] = ()
@@ -544,6 +550,7 @@ class Staging:
     threads: int = 0
     name: str = "Scratch"
     layout: str = "struct"
+    declined: tuple[Buffer, ...] = ()
 
     def __post_init__(self):
         names = [buffer.name for buffer in self.buffers]
@@ -564,6 +571,18 @@ class Staging:
     def plus(self, *buffers: Buffer) -> Staging:
         """This staging with ``buffers`` appended."""
         return dataclasses.replace(self, buffers=(*self.buffers, *buffers))
+
+    def only(self, names) -> Staging:
+        """This staging with the buffers ``names`` names, the others declined."""
+        kept = tuple(buffer for buffer in self.buffers if buffer.name in names)
+        out = tuple(buffer for buffer in self.buffers if buffer.name not in names)
+        return dataclasses.replace(self, buffers=kept, declined=(*self.declined, *out))
+
+    def place(self, name: str) -> Place:
+        """Where buffer ``name`` lives: the stage, or the alternative place of a declined one."""
+        if name in self:
+            return Place.SHARED
+        return next(buffer.alternative for buffer in self.declined if buffer.name == name)
 
     @property
     def group_bytes(self) -> int:
@@ -636,3 +655,24 @@ class Staging:
         if self.groups == 1 or self.layout == "arrays":
             return ""
         return "\n".join(f"#undef {buffer.name}" for buffer in self.buffers)
+
+
+HIDING_WARPS = 4
+"""Resident warps a scheduler keeps to hide a latency-bound chain (:func:`stage`), measured on the general sweep's row
+record and impulses (CACHE and STAGE1, 2026-11-10): a stage pays at 16 to 28 warps a multiprocessor (g1, kuka,
+franka-reach, go2-flat, allegro on the GB300) and costs at 4 to 14 (franka-cabinet, keyboard-so101, allegro on the PRO)."""
+
+
+def stage(staging: Staging, warps: Callable[[int], int], budget: int) -> Staging:
+    """The staging rule: ``staging``'s buffers without an alternative place, then each with one in order of reuse while
+    the stage fits ``budget`` [B] and pays: the resident warps it leaves a multiprocessor (``warps(bytes)``) are at
+    least the fewer of those without it and :data:`HIDING_WARPS` a scheduler. The rest keep their alternative place."""
+    names = {buffer.name for buffer in staging if buffer.alternative is None}
+    kept = staging.only(names)
+    for buffer in (buffer for buffer in staging if buffer.alternative is not None):
+        trial = staging.only(names | {buffer.name})
+        if not trial.fits(budget) or warps(trial.bytes) < min(warps(kept.bytes), HIDING_WARPS * REGISTER_PARTITIONS):
+            break
+        names.add(buffer.name)
+        kept = trial
+    return kept
