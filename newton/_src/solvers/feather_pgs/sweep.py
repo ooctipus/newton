@@ -1667,6 +1667,7 @@ def active_scan(
     linked: bool,
     torsion: bool,
     spin: Callable[[str], str] | None = None,
+    parallel: bool = True,
     pad: str,
 ) -> str:
     """The active enumeration's scan at a sweep's entry into the bitsets :data:`ACTIVE_WORDS`, one lane per row: a
@@ -1712,21 +1713,35 @@ def active_scan(
     select = f"!select_active || (kind != {ROW_CONTACT} && kind != {ROW_JOINT_LIMIT}) || {rows.peek('row')} != 0.0f"
     # Spin rows are their pair's (or a triple phase's): never selected.
     rowed = f"kind != {ROW_FRICTION} && kind != {ROW_TORSION}" if torsion else f"kind != {ROW_FRICTION}"
+    tests = ""
+    if parallel:
+        # A tested row's residual reduced over the row's lanes, one tested row at a time, as a visit reduces its own.
+        first_sweep = "" if seeded else "iter != 0 && "
+        pdot = op.dot((("dot", "row", None),), {"row": "tested_row"}, "        ")
+        own = "selected = residual < 0.0f || !isfinite(residual);"
+        tests = f"""
+    for (unsigned pending = BALLOT({first_sweep}tested); pending != 0u; pending &= pending - 1u) {{
+        const int tested_row = first + FIRST(pending);
+{pdot}
+        const float residual = dot + {rows.rhs_of("tested_row")};
+        if (row == tested_row) {own}
+    }}"""
+        dot = f"tested = {'true' if seeded else 'iter != 0'};\nconst float residual = {rows.rhs_of('row')};\n{own}"
     text = f"""for (int first = 0; first < {count}; first += {L}) {{
     const int row = first + lane;
-    bool selected = false;
+    bool selected = false{", tested = false" if parallel else ""};
     if (row < {count}) {{
         const int kind = {rows.kind("row")};
         if ({rowed}) {{
             selected = {select};
             if (!selected && {rows.diag("row")} > 0.0f) {{
-                float dot = 0.0f;
+{"" if parallel else "                float dot = 0.0f;"}
 {indent(dot, "                ")}
-                const float residual = dot + {rows.rhs_of("row")};
-                selected = residual < 0.0f || !isfinite(residual);
+{"" if parallel else "                const float residual = dot + " + rows.rhs_of("row") + ";"}
+{"" if parallel else "                selected = residual < 0.0f || !isfinite(residual);"}
             }}
         }}
-    }}
+    }}{tests}
     const unsigned mask = BALLOT(selected);
     {lane_zero(fill("s_normal_words"))}
 }}
@@ -1748,13 +1763,41 @@ SYNC();"""
     return indent(text, pad)
 
 
-def active_violation(rows: RowStore, op, *, count: str) -> tuple[str, str, str, str]:
+def active_violation(rows: RowStore, op, *, count: str, parallel: bool = True) -> tuple[str, str, str, str]:
     """The exit law on the rows an active sweep leaves unvisited (:func:`.solve_policy.sweep_exit`): whether a visit
     of some zero-impulse unilateral row would make a loud change (its violation times ``omega``, as the row's own
     update would), and the largest such change with its row's kind."""
     serial = dataclasses.replace(op, lanes=Lanes(1, "0"))
     # A visit would change the row's own velocity by its excess, at a zero impulse: velocity units on both sides.
     visit = Change("excess", bound(rows.rhs_of("row"), "fabsf(dot)", "0.0f", diagonal="1.0f"), "kind", "1.0f")
+    if parallel:
+        # A tested row's residual reduced over the row's lanes, one tested row at a time, as the scan's.
+        pdot = op.dot((("dot", "row", None),), {"row": "tested_row"}, "        ")
+        tested = visit.loud.replace(rows.rhs_of("row"), rows.rhs_of("tested_row"))
+        code = f"""float sweep_violation = 0.0f;
+int sweep_violation_kind = -1;
+int sweep_violation_loud = 0;
+for (int first = 0; first < {count}; first += {op.lanes.width}) {{
+    const int row = first + lane;
+    const int kind = row < {count} ? static_cast<int>({rows.kind("row")}) : -1;
+    const bool tested = (kind == {ROW_CONTACT} || kind == {ROW_JOINT_LIMIT}) && {rows.peek("row")} == 0.0f && {rows.diag("row")} > 0.0f;
+    for (unsigned pending = BALLOT(tested); pending != 0u; pending &= pending - 1u) {{
+        const int tested_row = first + FIRST(pending);
+{pdot}
+        const float residual = dot + {rows.rhs_of("tested_row")};
+        const float excess = isfinite(residual) ? omega * fmaxf(-residual, 0.0f) : __int_as_float(0x7f800000);
+        if (row == tested_row) {{
+            if (excess != 0.0f && ({tested})) sweep_violation_loud = 1;
+            if (excess > sweep_violation) {{
+                sweep_violation = excess;
+                sweep_violation_kind = kind;
+            }}
+        }}
+    }}
+}}
+ARGMAX(sweep_violation, sweep_violation_kind);
+const bool sweep_violation_any = BALLOT(sweep_violation_loud != 0) != 0u;"""
+        return code, "sweep_violation_any", "sweep_violation", "sweep_violation_kind"
     code = f"""float sweep_violation = 0.0f;
 int sweep_violation_kind = -1;
 int sweep_violation_loud = 0;
