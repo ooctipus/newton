@@ -133,14 +133,14 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
             wp.capture_launch(capture.graph)
             self.assertEqual(solver.constraint_capacity_status()["dense"], expected)
 
-    def test_status_without_articulations_reads_no_patch_frames(self):
+    def test_status_without_articulations_reads_clear_flags(self):
         """Read, clear and check capacity status of a solver whose model has no articulation.
 
         Such a solver allocates no row buffers and no patch friction state, even
-        under the default patch friction, so no patch frame can be left empty.
+        under the default patch friction.
         """
         solver = SolverFeatherPGS(newton.ModelBuilder().finalize(device="cpu"))
-        clear = dict.fromkeys(("dense", "matrix_free", "patch_frames", "contact_launches", "slip_frames"), False)
+        clear = dict.fromkeys(("dense", "matrix_free", "contact_launches", "slip_frames"), False)
         self.assertEqual(solver.constraint_capacity_status(), clear)
         self.assertEqual(solver.constraint_capacity_status(clear=True), clear)
         solver.check_constraint_capacity()

@@ -23,7 +23,6 @@ The device law functions stay in :mod:`.row_laws`, :mod:`.row_build` and :mod:`.
 
 from __future__ import annotations
 
-import os
 import warnings
 from functools import cache
 
@@ -351,7 +350,6 @@ class RowLaws:
             )
         else:
             laws.velocity_prescale_lanes, laws.velocity_prescale_threads = 1, 0
-        laws.patch_frame_reuse, laws.patch_frame_reuse_reason = laws._patch_frame_reuse()
         laws.friction_patches = None
         return laws
 
@@ -580,13 +578,7 @@ class RowLaws:
         arrays = self._arrays
         # Persistent state is owned by the body-pair patch builder, independently
         # of collision matching and the contact warm-start tables.
-        self.friction_patches = FrictionPatchState(
-            model,
-            pool.ready,
-            phi,
-            reuse_frames=self.patch_frame_reuse,
-            pool=pool,
-        )
+        self.friction_patches = FrictionPatchState(model, pool.ready, phi, pool=pool)
         # Joint velocity-limit buffers (per-DOF tracking). Independent from the
         # joint-position-limit buffers so the two flags can be used separately.
         # Both rows of a finite limit are allocated every step, so the velocity box
@@ -595,36 +587,6 @@ class RowLaws:
             arrays.allocate(VELOCITY_LIMIT_SLOTS, limit_row=2 * model.joint_dof_count)
         else:
             arrays.release(VELOCITY_LIMIT_SLOTS)
-
-    def _patch_frame_reuse(self) -> tuple[bool, str]:
-        """Return whether captured patch builds keep the sorted pairs of a reused contact frame, with the reason.
-
-        A captured build keeps them when the previous build was captured in the same
-        graph over the same contact stream, its ``contact_generation`` array, and the
-        host issued no write of that stream in between (see :class:`.FrictionPatchState`).
-        On by default;
-        ``FEATHER_PGS_PATCH_FRAME_REUSE=0`` sorts every build.
-        """
-        if os.environ.get("FEATHER_PGS_PATCH_FRAME_REUSE", "1") == "0":
-            return False, "FEATHER_PGS_PATCH_FRAME_REUSE=0 sorts the patch pairs of every build."
-        return True, (
-            "A captured build keeps the sorted patch pairs of the previous build captured in the same graph over the "
-            "same contact stream (its contact_generation array, which wrappers of one Contacts share) when the host "
-            "noted no write of that stream in between (such as a collision pass, Contacts.clear() or a "
-            "coupled-solver filter); other builds sort."
-        )
-
-    def patch_frame_status(self):
-        """Return the device flag of patch frames left empty by a stale reuse, or ``None`` when none can be.
-
-        Only a build that keeps its pairs through frame reuse sets the flag, so
-        without frame reuse the host reads it never. A model without
-        articulations allocates no patch state at all.
-        """
-        patches = self.friction_patches
-        if patches is None or not patches.reuse_frames:
-            return None
-        return patches.frame_status
 
     # --- the row pass ---------------------------------------------------------------------------------------------------
     @staticmethod
@@ -1214,7 +1176,6 @@ class RowLaws:
                 "torsion": bool(self.spin_rows),
                 "compliance": bool(self.options.contact_compliance),
                 "reason": _BETA_REASONS[self.friction_anchor_beta_source],
-                "frame_reuse": {"enabled": self.friction_patches.reuse_frames, "reason": self.patch_frame_reuse_reason},
                 "pair_sort": self.friction_patches.record(),
             },
         }
