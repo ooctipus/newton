@@ -345,11 +345,11 @@ def friction_ball_metric(block: wp.mat33, mu: float, mu_t: float) -> tuple[wp.ve
     """Return the eigen-decomposition :func:`friction_ball` solves in: ``(values, vectors)``.
 
     ``block`` is the Delassus block of the rows ``(t1, t2, s)``. In the scaled impulse
-    ``y = (t1 / mu, t2 / mu, s / mu_t)`` it is ``C block C``, ``C = diag(mu, mu, mu_t)``. ``vectors`` holds its unit
-    eigenvectors in columns and ``values`` their eigenvalues, clamped at zero: ``wp.eig3``'s, polished by
-    :data:`BALL_POLISH` exact Jacobi sweeps, on the block divided by its largest diagonal (which keeps the products in
-    range), then scaled back, so the law reads the block's own and divides by no scale. A sweep whose block stays fixed
-    computes it once and calls :func:`friction_ball_from_metric`.
+    ``y = (t1 / mu, t2 / mu, s / mu_t)`` it is ``C block C``, ``C = diag(mu, mu, mu_t)``. ``vectors`` holds its
+    orthonormal eigenvectors in columns and ``values`` their eigenvalues, clamped at zero: ``wp.eig3``'s, polished by
+    :data:`BALL_POLISH` exact Jacobi sweeps and made orthonormal by one Newton-Schulz step, on the block divided by its
+    largest diagonal (which keeps the products in range), then scaled back, so the law reads the block's own and divides
+    by no scale. A sweep whose block stays fixed computes it once and calls :func:`friction_ball_from_metric`.
     """
     coefficients = wp.vec3(mu, mu, mu_t)
     scaled = wp.cw_mul(block, wp.outer(coefficients, coefficients))
@@ -362,7 +362,10 @@ def friction_ball_metric(block: wp.mat33, mu: float, mu_t: float) -> tuple[wp.ve
         diagonal, vectors = jacobi_rotation(diagonal, vectors, 0, 2)
         diagonal, vectors = jacobi_rotation(diagonal, vectors, 1, 2)
     values = wp.vec3(wp.max(diagonal[0, 0], 0.0), wp.max(diagonal[1, 1], 0.0), wp.max(diagonal[2, 2], 0.0))
-    return values * scale, vectors
+    # wp.eig3 builds its basis from a quaternion it never normalizes: columns off unit length and orthogonality by up to
+    # 4e-6 move a sliding triple off its cone. V (3 I - V^T V) / 2 is the nearest orthonormal basis to rounding.
+    identity = wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+    return values * scale, vectors * (1.5 * identity - 0.5 * (wp.transpose(vectors) * vectors))
 
 
 @PROJECTION_LAW.law(inline="default")
