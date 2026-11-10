@@ -39,6 +39,7 @@ import string
 import warp as wp
 
 from .memory import (
+    HIDING_WARPS,
     REGISTER_GRANULE,
     REGISTER_PARTITIONS,
     REGISTERS_PER_THREAD,
@@ -250,6 +251,7 @@ class Work:
         persistent: The kernel strides over its items, so its grid is capped at ``waves`` waves of resident blocks.
         waves: Waves of resident blocks of a persistent grid.
         grid_per_sm: A measured persistent grid in blocks a multiprocessor, in place of ``waves``.
+        hiding: Resident warps a scheduler the kernel's chain needs to hide its latency, its stage's level.
     """
 
     items: int | Queue
@@ -265,6 +267,7 @@ class Work:
     persistent: bool = False
     waves: float = 1.0
     grid_per_sm: int | None = None
+    hiding: int = HIDING_WARPS
 
     def __post_init__(self):
         for name in ("least", "most", "lanes"):
@@ -364,7 +367,10 @@ def shape(work: Work, device: Device) -> Shape:
     staging = work.shared if isinstance(work.shared, Staging) else None
     if staging is not None:
         staging = stage(
-            staging, lambda size: _warps(dataclasses.replace(work, shared=size), device), device.shared_per_block
+            staging,
+            lambda size: _warps(dataclasses.replace(work, shared=size), device),
+            device.shared_per_block,
+            work.hiding,
         )
         work = dataclasses.replace(work, shared=staging.bytes)
     if not device.cuda:

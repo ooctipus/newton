@@ -41,7 +41,7 @@ import warp as wp
 import newton
 from newton._src.core import memory
 from newton._src.sim.enums import JointType
-from newton._src.solvers.feather_pgs import field_group, tree_kinetic_plan, tree_kinetic_state
+from newton._src.solvers.feather_pgs import field_group, tree_kinetic_state
 from newton._src.solvers.feather_pgs import tree_scan as ts
 from newton._src.solvers.feather_pgs.device_preludes import DevicePrelude, substitute
 from newton._src.solvers.feather_pgs.device_proof import _WORDS_PER_THREAD, DeviceProof
@@ -580,15 +580,14 @@ class TestStateBlockPlacement(unittest.TestCase):
     def test_both_placements_step_alike(self):
         """Step two different trees with their state blocks in shared and in global memory: the same state to rounding."""
         scene, steps, finals = scenes.sprawl(worlds=2), 8, []
-        for budget in (None, 64):
-            with (
-                mock.patch.object(tree_kinetic_plan, "static_budget", return_value=budget)
-                if budget
-                else contextlib.nullcontext()
-            ):
+        declined = mock.patch.object(
+            tree_kinetic_state, "held_stage", lambda layout, *_: dataclasses.replace(layout, staged=False)
+        )
+        for staged in (True, False):
+            with contextlib.nullcontext() if staged else declined:
                 model = scene.build("cuda:0")
                 solver = SolverFeatherPGS(model, **scene.solver_options)
-            self.assertEqual(solver.factor.held.groups[0].layout.global_block, budget is not None)
+            self.assertEqual(solver.factor.held.groups[0].layout.staged, staged)
             # The row order must not follow thread scheduling: sorted contacts order the rows, and the scene's row limit
             # keeps them all, since a thread race picks the rows that survive a limit.
             pipeline = newton.CollisionPipeline(

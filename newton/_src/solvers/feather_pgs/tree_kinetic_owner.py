@@ -140,7 +140,9 @@ class TreeKineticState:
         # within a warp a tree group keeps the warp scans and the predictor's twist publication.
         lanes = native.held_lanes(tree, self.group_count, memory.device(device))
         self.chains = not self.layout.forest and (complete or lanes > 32)
-        self.layout = dataclasses.replace(self.layout, lanes=lanes)
+        self.layout = native.held_stage(
+            dataclasses.replace(self.layout, lanes=lanes), self.group_count, memory.device(device)
+        )
         self.schedules = native.held_schedules(tree, lanes, chains=self.chains)
         if self.group_count % self.layout.pack:
             raise ValueError("Tree kinetic lane packing requires whole blocks of trees")
@@ -191,7 +193,7 @@ class TreeKineticState:
             free_root_local=free_root_local,
             free_root_dof=free_root_dof,
             dof_passive=dof_passive,
-            scratch=np.zeros(self.group_count * self.layout.total if self.layout.global_block else 1, np.float32),
+            scratch=np.zeros(1 if self.layout.staged else self.group_count * self.layout.total, np.float32),
         )
         groups = self.group_count
         # Whether the group's refresh reads H's diagonal (a compact diagonal's inverse): its collection keeps H_ii.
@@ -249,6 +251,8 @@ class TreeKineticState:
             "lanes": int(layout.lanes),
             "trees_per_block": int(layout.pack),
             "block_dim": int(self.block_dim),
+            # Where a block's state lies: the stage's place on the group's launch (tree_kinetic_state.held_stage).
+            "state": "shared" if layout.staged else "global",
             "roots": json_value(layout.roots),
             "root_coordinates": json_value(layout.root_coordinates),
             # Per root, whether it stands on a free joint (a joint root's coordinates are a descendant's).
