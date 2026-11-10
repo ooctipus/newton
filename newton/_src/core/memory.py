@@ -641,20 +641,21 @@ class Staging:
 
 
 HIDING_WARPS = 4
-"""Resident warps a scheduler keeps to hide a latency-bound chain (:func:`stage`), measured on the general sweep's row
-record and impulses (CACHE and STAGE1, 2026-11-10): a stage pays at 16 to 28 warps a multiprocessor (g1, kuka,
-franka-reach, go2-flat, allegro on the GB300) and costs at 4 to 14 (franka-cabinet, keyboard-so101, allegro on the PRO)."""
+"""Resident warps a scheduler the general sweep's chain needs (:func:`stage`, STAGE1): a stage pays at 16 to 28 warps
+(g1, kuka, franka-reach, go2-flat, allegro on the GB300), costs at 4 to 14 (franka-cabinet, keyboard, PRO allegro)."""
 
 
-def stage(staging: Staging, warps: Callable[[int], int], budget: int, hiding: int = HIDING_WARPS) -> Staging:
-    """The staging rule: ``staging``'s buffers without an alternative place, then each with one in order of reuse while
-    the stage fits ``budget`` [B] and pays: the resident warps it leaves a multiprocessor (``warps(bytes)``) are at
-    least the fewer of those without it and ``hiding`` a scheduler, the kernel's level. The rest keep their alternative."""
+def stage(staging: Staging, warps: Callable[[int], int], budget: int, hiding: int, filled: Callable) -> Staging:
+    """The staging rule: buffers without an alternative place, then each with one in order of reuse while the stage fits
+    ``budget`` [B] and leaves (``warps(bytes)``) at least the fewer of the warps without it and ``hiding`` a scheduler;
+    one that streams otherwise pays only in throughput: only where the live items fill them (``filled``)."""
     names = {buffer.name for buffer in staging if buffer.alternative is None}
     kept = staging.only(names)
     for buffer in (buffer for buffer in staging if buffer.alternative is not None):
         trial = staging.only(names | {buffer.name})
         if not trial.fits(budget) or warps(trial.bytes) < min(warps(kept.bytes), hiding * REGISTER_PARTITIONS):
+            break
+        if buffer.alternative is Place.STREAMED and not filled(trial.bytes):
             break
         names.add(buffer.name)
         kept = trial

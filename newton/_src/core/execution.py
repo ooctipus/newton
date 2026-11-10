@@ -252,6 +252,7 @@ class Work:
         waves: Waves of resident blocks of a persistent grid.
         grid_per_sm: A measured persistent grid in blocks a multiprocessor, in place of ``waves``.
         hiding: Resident warps a scheduler the kernel's chain needs to hide its latency, its stage's level.
+        live: The items the launch is sure to find live (by default all; a bucket other claims fill first: none).
     """
 
     items: int | Queue
@@ -268,6 +269,7 @@ class Work:
     waves: float = 1.0
     grid_per_sm: int | None = None
     hiding: int = HIDING_WARPS
+    live: int | None = None
 
     def __post_init__(self):
         for name in ("least", "most", "lanes"):
@@ -355,22 +357,23 @@ def _lanes(work: Work, device: Device, resident_threads: int) -> int:
     return max(work.least, min(lanes, cap))
 
 
-def _warps(work: Work, device: Device) -> int:
-    """Warps a multiprocessor keeps of ``work``'s launch: its resident blocks, at most the grid's."""
-    found = shape(work, device)
+def _warps(work: Work, device: Device, size: int) -> int:
+    """Warps a multiprocessor keeps of ``work``'s launch at ``size`` bytes of stage, at most the grid's."""
+    found = shape(dataclasses.replace(work, shared=size), device)
     return min(found.blocks_per_sm, -(-found.grid // device.sms)) * (found.block // 32)
 
 
 def shape(work: Work, device: Device) -> Shape:
-    """The launch of ``work`` on ``device`` by the one rule (module docstring), its working set staged with it
-    (:func:`~.memory.stage`). The CPU takes one lane and one thread a block, its grid an item."""
+    """``work``'s launch on ``device`` by the one rule, staged (:func:`~.memory.stage`); a thread an item on the CPU."""
     staging = work.shared if isinstance(work.shared, Staging) else None
     if staging is not None:
+        live = work if work.live is None else dataclasses.replace(work, items=work.live)
         staging = stage(
             staging,
-            lambda size: _warps(dataclasses.replace(work, shared=size), device),
+            lambda size: _warps(work, device, size),
             device.shared_per_block,
             work.hiding,
+            lambda size: _warps(live, device, size) >= _warps(work, device, size),
         )
         work = dataclasses.replace(work, shared=staging.bytes)
     if not device.cuda:

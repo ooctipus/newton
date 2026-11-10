@@ -819,11 +819,13 @@ class Sweep:
         return worlds.size == 0 or int(np.bincount(worlds).max()) <= 1
 
     def _launch_work(self, config: SweepConfig, items: int):
-        """A matrix-free mapping's work over ``items`` (its bucket's capacity) with its stage: persistent where tiers run
-        beside it, whose launches then start without waiting for its exiting blocks; alone, a full grid, which the
-        device balances as blocks finish."""
+        """A matrix-free mapping's work over ``items`` (its bucket's capacity) with its stage: beside the tiers, which claim
+        their worlds first (none of its own is sure to be live), persistent, so the tiers' launches start without waiting
+        for its exiting blocks; alone, a full grid, which the device balances as blocks finish."""
         work = config.work(items, config.staging())
-        return work if self.classes.tier_rows else dataclasses.replace(work, persistent=False)
+        return (
+            dataclasses.replace(work, live=0) if self.classes.tier_rows else dataclasses.replace(work, persistent=False)
+        )
 
     def _staged(self, config: SweepConfig, items: int) -> SweepConfig:
         """``config`` at the places the stage gives its operands on its launch over ``items`` (:func:`.memory.stage`)."""
