@@ -1199,7 +1199,7 @@ def walk_texts(
     ``source``), the caller's ``sink`` after the output and before the state's update; ``end`` a body's
     statements after its coordinates. Each step's record and input (``value``, and ``prior``, its output's prior value)
     and each joint's link are fetched ahead of the chain (``WALK_IN``, ``WALK_LINK_IN``) and asked of L1 before that
-    (``WALK_TOUCH``); ``coordinate`` and ``link`` are the floats of a record and a link."""
+    (the memory toolkit's ``TOUCH``); ``coordinate`` and ``link`` are the floats of a record and a link."""
     up = combine.direction is Direction.UP
     # The enter's output is its sink (the coordinate's u); the others' a named value the sink reads.
     out = sink if combine.inverted else "const float z" if up else "const float q"
@@ -1213,8 +1213,8 @@ def walk_texts(
         "root_first": not up,
         "fetch_joint": "WALK_LINK_IN(link, $b, $up)",
         "fetch_step": f"WALK_IN(data + {coordinate} * ($c), {value}, {prior}, $half)",
-        "touch_joint": f"WALK_TOUCH(link + {link} * ($b));",
-        "touch_step": f"WALK_TOUCH(data + {coordinate} * ($c));",
+        "touch_joint": f"TOUCH(link + {link} * ($b));",
+        "touch_step": f"TOUCH(data + {coordinate} * ($c));",
     }
     return texts
 
