@@ -480,13 +480,13 @@ def walk_calls():
         yield "tree_kinetic_state.get_predictor_kernel", predictor, (schedules,), kwargs
         if name == "g1":
             yield "tree_kinetic_state.get_predictor_kernel", predictor, (schedules,), {**kwargs, "side": False}
-    support = _unwrapped(walk_rows.support_rows_kernel)
+    support, arch = _unwrapped(walk_rows.support_rows_kernel), {"device_arch": ARCH}
     for name in ("g1", "kuka"):
         cls = classes[name]
         node = tuple(range(cls.coordinates - 1, -1, -1))
         for records, torsion in ((False, False), (True, True)):
             args = (Named(f"{name} parent", cls.parent), Named(f"{name} first", cls.first), Named(f"{name} node", node))
-            yield "walk_rows.support_rows_kernel", support, args, {"records": records, "torsion": torsion}
+            yield "walk_rows.support_rows_kernel", support, args, {"records": records, "torsion": torsion, **arch}
     tables = {
         "g1": (classes["g1"].parent, classes["g1"].first),
         "franka": (classes["franka"].parent, classes["franka"].first),
@@ -494,9 +494,9 @@ def walk_calls():
     }
     for side in (False, True):
         table = Named("(g1,)", (tables["g1"],))
-        yield "walk_rows.walked_rows_kernel", _unwrapped(walk_rows.walked_rows_kernel), (8, True, side, table), {}
+        yield "walk_rows.walked_rows_kernel", _unwrapped(walk_rows.walked_rows_kernel), (8, True, side, table), arch
     pair = Named("(franka, cube)", (tables["franka"], tables["cube"]))
-    yield "walk_rows.walked_rows_kernel", _unwrapped(walk_rows.walked_rows_kernel), (0, False, False, pair), {}
+    yield "walk_rows.walked_rows_kernel", _unwrapped(walk_rows.walked_rows_kernel), (0, False, False, pair), arch
     mf_gs = _unwrapped(built(sweep_routes.GeneralSweep))
     free = {"free_rows": False, "speed_rows": True, "has_dense_velocity_limit_rows": False}
     yield "sweep_routes.GeneralSweep", mf_gs, (64, 32, 12, ARCH), free

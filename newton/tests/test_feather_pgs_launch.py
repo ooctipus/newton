@@ -27,9 +27,9 @@ WORLDS = (64, 128, 512, 1024, 4096, 16384, 65536)
 
 
 def _current_device(device: Device):
-    """Warp's current device as a stand-in of ``device`` for today's rules, which read ``is_cuda`` and ``sm_count``. A
-    device asked for by name stays Warp's own: the writers' table sizes its shapes for the CUDA device at hand."""
-    stand_in = types.SimpleNamespace(is_cuda=device.cuda, sm_count=device.sms)
+    """Warp's current device as a stand-in of ``device`` for today's rules, which read ``is_cuda``, ``sm_count`` and
+    ``arch``. A device asked for by name stays Warp's own."""
+    stand_in = types.SimpleNamespace(is_cuda=device.cuda, sm_count=device.sms, arch=device.arch)
     get_device = wp.get_device
 
     def current(ident=None):
@@ -111,8 +111,8 @@ class TestShapeAgainstTodaysRules(unittest.TestCase):
                 work = Work(10**7, lanes=1, block=128, registers=168, persistent=True, waves=2)
                 got = shape(work, device)
                 self.assertEqual(got.grid * got.block, walk_rows.support_threads(10**7, None))
-                self.assertEqual(got.bounds, walk_rows.WRITERS["support"].bounds)
-                self.assertEqual(got.registers, walk_rows.SUPPORT_REGISTERS)
+                self.assertEqual(got.bounds, walk_rows.WRITERS["support"].bounds(device.arch))
+                self.assertEqual(got.registers, walk_rows.WRITERS["support"].registers(device.arch))
 
     def test_bounds_follow_the_register_line(self):
         cases = (
@@ -135,24 +135,25 @@ class TestShapeAgainstTodaysRules(unittest.TestCase):
                     work = Work(10**6, lanes=min(block, 32), block=block, registers=registers)
                     bounds = shape(work, device).bounds
                     if device is GB300 and name == "predictor 32":
-                        # ZP7's case: sm_103 keeps 32 blocks a multiprocessor, today's bound copies sm_120's 24.
+                        # ZP7's case: sm_103 keeps 32 blocks a multiprocessor, the predictor built for it (B3).
                         self.assertEqual(bounds, (32, 32))
                     else:
                         self.assertEqual(bounds, old)
-        # The writers' bounds, built for the reference architecture whatever the device at hand: the measured lines.
-        bounds = {name: writer.bounds for name, writer in walk_rows.WRITERS.items()}
-        self.assertEqual(
-            bounds,
-            {
-                "packed": (128, 6),
-                "packed_blocks": (128, 5),
-                "slots": (256, 3),
-                "support_units": (256, 4),
-                "support": (128, 3),
-                "free_body": (256, 2),
-            },
-        )
-        self.assertEqual(walk_rows.SUPPORT_REGISTERS, 170)
+        # The writers' bounds, built for each device: the measured lines, which bind on both.
+        for device in (PRO, GB300):
+            bounds = {name: writer.bounds(device.arch) for name, writer in walk_rows.WRITERS.items()}
+            self.assertEqual(
+                bounds,
+                {
+                    "packed": (128, 6),
+                    "packed_blocks": (128, 5),
+                    "slots": (256, 3),
+                    "support_units": (256, 4),
+                    "support": (128, 3),
+                    "free_body": (256, 2),
+                },
+            )
+            self.assertEqual(walk_rows.WRITERS["support"].registers(device.arch), 170)
 
     def test_carveout_steps(self):
         # H8: a predictor block over 1,664 B moves the PRO from 64 KiB to 100 KiB; ZY: 1 KiB at 256 threads keeps 16.

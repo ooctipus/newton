@@ -905,7 +905,7 @@ class RowLaws:
         speed_bodies = solver.forest.free_rigid_body_count if speed else 0
         threads = walk_rows.support_threads(rows + speed_bodies, model.device, walk_rows.WRITERS["free_body"])
         wp.launch(
-            walk_rows.write_free_body_rows,
+            walk_rows.write_free_body_rows(model.device.arch),
             dim=threads,
             inputs=[
                 walk_rows.free_body_sink(solver),
