@@ -161,11 +161,9 @@ def claim_worlds(
     candidate: int,
     region: int,
     acts: wp.array[int],
-    dense_first: wp.array[int],
     # outputs: a Queue's (execution.Queue), a bucket a tier, then the general sweep's and the colored candidates'
     items: wp.array[int],
     count: wp.array[int],
-    impulses: wp.array2d[float],
 ):
     """Write each world with rows into its class's bucket of one queue of ``region`` slots a bucket: a world whose rows
     are dense only and at most ``bound`` into its Jacobi tier's, ``(rows - 1) // width``; any other world with a colored
@@ -185,11 +183,6 @@ def claim_worlds(
     m = rows[world]
     mf = free_body_rows[world]
     if (m <= 0 and mf <= 0) or (acts.shape[0] > 0 and acts[world] == 0):
-        # Where the solve group starts the impulses of its claim's worlds (``impulses`` not empty), a world left out
-        # starts its active rows' here, as prepare_world_impulses would have (a cold solve).
-        if impulses.shape[0] > 0:
-            for i in range(m):
-                impulses[dense_first[world], i] = 0.0
         return
     bucket = general
     if tier_world(m, mf, speed_first, world, bound):

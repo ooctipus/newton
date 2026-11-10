@@ -542,10 +542,9 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
         (s4r, "schedule_diagonal", sweep.sparse_contact_schedule is not None, (sweep, "schedule_diagonal")),
         # Stages 5 and 6: the impulses' start (the warm start's normals, the closures' seeds: the one writer closed the
         # bilateral blocks and corrected the other rows, the blocks' kept rows start at -r_Q, after the warm start's
-        # gather; the general sweep's solve group clears its worlds' where nothing seeds them), the claims that follow
-        # the published rows, and the sweep, which adds its velocity change to the predictor's (a world without rows
-        # keeps it).
-        (s5, "prepare_impulses", not sweep.starts_impulses, (placement, "prepare_impulses")),
+        # gather), the claims that follow the published rows, and the sweep, which adds its velocity change to the
+        # predictor's (a world without rows keeps it).
+        (s5, "prepare_impulses", True, (placement, "prepare_impulses")),
         (s5, "warm_start", warm, (sweep, "warm_start", CONTACTS)),
         (s5j, "seed_blocks", preelimination, seeds),
         (s5j, "start_velocity", True, (wp, "copy", v_out, v_hat)),

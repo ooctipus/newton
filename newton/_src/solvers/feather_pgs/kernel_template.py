@@ -13,9 +13,10 @@ Every generated kernel is a :class:`KernelTemplate`:
   generated struct's fields (:func:`params`). The native function's ABI and the Warp kernel's signature are both
   derived from them, with the :class:`Dispatch` that maps the launch's threads to native calls, one declaration of
   the one dispatch :func:`items` (a thread's item directly, behind a tail guard, or from a device queue);
-- :meth:`KernelTemplate.kernel` builds the Warp kernel; a sweep's launch facts travel with its configuration
-  (:class:`.sweep.SweepConfig`), a solve readout with :meth:`.solve_policy.SolveReadoutRecord.register`;
-- :func:`compose` runs phases (:class:`Phase`) of one item in one kernel.
+- :meth:`KernelTemplate.kernel` builds the Warp kernel. What a launch site needs to know about a sweep travels with
+  its configuration (:class:`.sweep.SweepConfig`: its work, its operands besides its signature's), and a solve readout
+  is registered with the kernel by :meth:`.solve_policy.SolveReadoutRecord.register`, in place of attributes set on the
+  kernel.
 
 A Python body is a ``wp.func`` under the same dispatch (:attr:`KernelTemplate.function`); a Python kernel not yet
 split into one is a function renamed per variant: :func:`python_kernel`.
@@ -31,16 +32,12 @@ from typing import Any
 
 import warp as wp
 
-from ...core import execution
 from . import field_group
 from .device_preludes import DevicePrelude, cuda_native, dual_native, substitute
 
 __all__ = [
     "Dispatch",
-    "Fused",
     "KernelTemplate",
-    "Phase",
-    "compose",
     "items",
     "operands",
     "params",
@@ -199,7 +196,6 @@ class KernelTemplate:
             ``"unique"`` for a variant in a module of its own.
         function: A Warp function (``wp.func``) body in place of a native one (``source`` empty): the dispatch calls
             it as it calls a native function, so a Python kernel is the same dispatch over a ``wp.func``.
-        phases: A fused kernel's phases (:func:`compose`), whose bodies its dispatch calls in place of ``source``.
     """
 
     name: str
@@ -214,7 +210,6 @@ class KernelTemplate:
     composed: bool = False
     module: str = "unique"
     function: Any = None
-    phases: tuple[Phase, ...] = ()
 
     @classmethod
     def from_abi(cls, name: str, abi, source: str, dispatch: Dispatch, extra=(), **options) -> KernelTemplate:
@@ -259,15 +254,6 @@ class KernelTemplate:
 
     def declaration(self) -> str:
         """The Python source of the native function and its Warp wrapper (annotations by ``type_<name>`` alias)."""
-        if self.phases:
-            natives = (
-                f"@wp.func_native(snippet_{k})\n"
-                f"def {phase.template.native_name}({_annotated(phase.template.native_params, f'{k}_')}): ...\n\n"
-                for k, phase in enumerate(self.phases)
-                if phase.template.function is None
-            )
-            lines = "".join(f"    {line}\n" for line in self.dispatch.body.splitlines())
-            return "".join(natives) + f"def kernel_template({_annotated(self.signature)}):\n" + lines
         operands = (name for name, _ in self.params if name not in self.dispatch.private)
         call = f"{self.native_name}({', '.join((*self.dispatch.arguments, *operands))})"
         body = substitute(self.dispatch.body, CALL=call)
@@ -280,7 +266,7 @@ class KernelTemplate:
 
     def kernel(self) -> wp.Kernel:
         """Build the Warp kernel (backward disabled)."""
-        source, snippet = self.declaration(), "" if self.function is not None or self.phases else self.snippet
+        source, snippet = self.declaration(), "" if self.function is not None else self.snippet
         # The functions belong to the kernel's Python module, or to this one for a variant in a module of its own.
         owner = __name__ if self.module == "unique" else self.module
         namespace = {"__name__": owner, "wp": wp, "snippet": snippet, **dict(self.dispatch.constants)}
@@ -288,14 +274,6 @@ class KernelTemplate:
             if self.source:
                 raise ValueError(f"{self.name}: a Warp function body takes no native source")
             namespace[self.native_name] = self.function
-        for k, phase in enumerate(self.phases):
-            body = phase.template
-            if body.function is None:
-                namespace[f"snippet_{k}"] = body.snippet
-                snippet += body.snippet
-            else:
-                namespace[body.native_name] = body.function
-            namespace.update({f"type_{k}_{name}": annotation for name, annotation in body.native_params})
         namespace.update({f"type_{name}": annotation for name, annotation in (*self.native_params, *self.signature)})
         digest = hashlib.sha256((source + snippet).encode()).hexdigest()
         filename = f"<fpgs-kernel-{digest}>"
@@ -311,56 +289,8 @@ class KernelTemplate:
         return wp.kernel(enable_backward=False, **options)(function)
 
 
-def _annotated(items, prefix: str = "") -> str:
-    return ", ".join(f"{name}: type_{prefix}{name}" for name, _ in items)
-
-
-@dataclasses.dataclass(frozen=True)
-class Phase:
-    """A phase of a fused kernel (:func:`compose`): its own kernel's body, called with ``leading`` (expressions of the
-    fused item and ``lane``), and its work on the group's lanes."""
-
-    template: KernelTemplate
-    leading: tuple[str, ...]
-    work: execution.Work
-
-    @property
-    def name(self) -> str:
-        return self.template.native_name
-
-
-@dataclasses.dataclass(frozen=True)
-class Fused:
-    """A fused kernel (:func:`compose`): its template and work."""
-
-    template: KernelTemplate
-    work: execution.Work
-
-
-def compose(name: str, phases: tuple[Phase, ...], dispatch: Dispatch, *, line: int, **options) -> Fused:
-    """One kernel of ``phases`` on each item of ``dispatch``: each body in turn on the item's lanes, the lanes' barrier
-    between them, an operand one parameter of one type. Phase ``line``'s work sets the group's lanes and block, under
-    the largest register line declared and the phases' shared bytes summed."""
-    params = {}
-    for phase in phases:
-        for key, annotation in phase.template.params:
-            if key not in phase.template.dispatch.private and params.setdefault(key, annotation) != annotation:
-                raise ValueError(f"{name}: phases bind operand {key!r} to {params[key]} and {annotation}")
-    lines = [phase.work.registers for phase in phases if phase.work.registers]
-    shared = sum(phase.work.shared for phase in phases)
-    work = dataclasses.replace(phases[line].work, registers=max(lines, default=None), shared=shared)
-    calls = []
-    for phase in phases:
-        body = phase.template
-        operands = (key for key, _ in body.params if key not in body.dispatch.private)
-        calls += [f"{body.native_name}({', '.join((*phase.leading, *operands))})", f"barrier({work.lanes})"]
-    text = "\n".join(
-        "\n".join(row.replace("$CALL", call) for call in calls[:-1]) if "$CALL" in row else row
-        for row in dispatch.body.splitlines()
-    )
-    constants = (*dispatch.constants, ("barrier", execution.barrier))
-    fused = dataclasses.replace(dispatch, body=text, arguments=(), leading=(), constants=constants)
-    return Fused(KernelTemplate(name, tuple(params.items()), "", fused, phases=phases, **options), work)
+def _annotated(items) -> str:
+    return ", ".join(f"{name}: type_{name}" for name, _ in items)
 
 
 def python_kernel(function, name: str, **options) -> wp.Kernel:

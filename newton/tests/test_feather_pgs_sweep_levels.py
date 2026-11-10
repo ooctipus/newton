@@ -223,13 +223,10 @@ class TestWorldLists(unittest.TestCase):
         # The worlds' acts words: a world none of whose rows can act takes no bucket (empty: every world acts).
         words = (rng.random(worlds) < 0.8).astype(np.int32)
         tiers = -(-bound // width)
-        # Where the solve group starts the impulses, the claim clears the active rows of every world it leaves out.
-        first = np.arange(worlds, dtype=np.int32)
         for device, candidates, acts in itertools.product(_devices(), (False, True), (words[:0], words)):
             with self.subTest(device=device, candidates=candidates, acts=acts.size):
                 buckets = tiers + 1 + int(candidates)
                 claims = Queue(buckets * worlds, device, buckets=buckets)
-                impulses = wp.full((worlds, 140), 1.0, dtype=float, device=device)
                 wp.launch(
                     sweep_levels.claim_worlds,
                     dim=worlds,
@@ -244,14 +241,11 @@ class TestWorldLists(unittest.TestCase):
                         tiers + 1 if candidates else -1,
                         claims.region,
                         wp.array(acts, dtype=int, device=device),
-                        wp.array(first, dtype=int, device=device),
                     ],
-                    outputs=[claims.items, claims.count, impulses],
+                    outputs=[claims.items, claims.count],
                     device=device,
                 )
                 acting = acts != 0 if acts.size else np.ones(worlds, dtype=bool)
-                cleared = np.arange(140)[None, :] < np.where(~acting & (rows > 0), rows, 0)[:, None]
-                np.testing.assert_array_equal(impulses.numpy(), np.where(cleared, 0.0, 1.0))
                 tiered = (rows > 0) & (rows <= bound) & (free == 0) & (rows <= speed_first) & acting
                 rest = ~tiered & ((rows > 0) | (free > 0)) & acting
                 slotted = (slot >= 0) & candidates
@@ -289,9 +283,8 @@ class TestWorldLists(unittest.TestCase):
                         -1,
                         lists.region,
                         wp.zeros(0, dtype=int, device=device),
-                        wp.zeros(0, dtype=int, device=device),
                     ],
-                    outputs=[lists.items, lists.count, wp.zeros((0, 0), dtype=float, device=device)],
+                    outputs=[lists.items, lists.count],
                     device=device,
                 )
                 for tier in range(3):

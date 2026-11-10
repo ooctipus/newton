@@ -3350,18 +3350,16 @@ class SweepConfig:
 
 @functools.cache
 def sweep_kernel(config: SweepConfig) -> wp.Kernel:
-    """The one sweep factory: the kernel of ``config`` (:class:`SweepConfig`, :func:`sweep_template`)."""
-    return sweep_template(config)[0].kernel()
+    """The one sweep factory: the kernel of ``config`` (:class:`SweepConfig`).
 
-
-@functools.cache
-def sweep_template(config: SweepConfig) -> tuple[KernelTemplate, Staging]:
-    """The sweep of ``config`` and its working set, checked against the static budget of the device it is built for
-    (:func:`.memory.arch_budget`), its launch bound its work's shape (:func:`~newton._src.core.execution.shape`)."""
+    The configuration's body and working set, the working set checked against the static budget of the device it is
+    built for (:func:`.memory.arch_budget`), the launch bound the layer's shape of its work there
+    (:func:`~newton._src.core.execution.shape`), the kernel its native ABI under its dispatch.
+    """
     snippet, staging = config.source()
     staging.check(config.label, arch_budget(config.device_arch))
     bounds = shape(config.work(0, staging.bytes), built_for(config.device_arch)).bounds
-    template = KernelTemplate.from_abi(
+    return KernelTemplate.from_abi(
         config.name,
         config.ABI,
         snippet,
@@ -3370,5 +3368,4 @@ def sweep_template(config: SweepConfig) -> tuple[KernelTemplate, Staging]:
         composed=True,
         native_name=config.NATIVE,
         launch_bounds=bounds,
-    )
-    return template, staging
+    ).kernel()
