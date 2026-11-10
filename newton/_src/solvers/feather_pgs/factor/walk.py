@@ -509,13 +509,13 @@ def walk_table(tables: tuple[tuple[tuple[int, ...], tuple[int, ...]], ...], join
         slot, up = ts.WalkClass(parent, first).slots[0], TreePlan.build(parent).up_flags
         slots += slot
         into += [slot[p] | WALK_JOIN_SLOTS * bool(up[b] & UP_FIRST) if p >= 0 else -1 for b, p in enumerate(parent)]
-    into = ts.constant_table("WALK_INTO", into)
-    joins = substitute(_WALK_JOINS, join_table=ts.constant_table("WALK_JOIN", slots), into_table=into) if joins else ""
+    into = memory.table("WALK_INTO", into)
+    joins = substitute(_WALK_JOINS, join_table=memory.table("WALK_JOIN", slots), into_table=into) if joins else ""
     return substitute(
         _WALK_TABLE,
-        parent_table=ts.constant_table("WALK_PARENT", [p for parent, _ in tables for p in parent]),
-        first_table=ts.constant_table("WALK_FIRST", [f for _, first in tables for f in first]),
-        class_table=ts.constant_table("WALK_CLASS", starts),
+        parent_table=memory.table("WALK_PARENT", [p for parent, _ in tables for p in parent]),
+        first_table=memory.table("WALK_FIRST", [f for _, first in tables for f in first]),
+        class_table=memory.table("WALK_CLASS", starts),
         joins=joins,
     )
 
@@ -880,7 +880,6 @@ _WALK_DEVICE = {
 #define WALK_FLOAT(i) __int_as_float(i)
 #define WALK_ABS(x) fabsf(x)
 #define WALK_MUL(a, b) __fmul_rn((a), (b))
-#define WALK_CONSTANT __constant__
 // WALK_UNROLLED: a loop over a walk's rows unrolled, so their states stay registers (none on the CPU).
 #define WALK_UNROLLED _Pragma("unroll")
 // WALK_TOUCH(p): ask L1 for the line of p, a hint ahead of the load that reads it (no register, no scoreboard).
@@ -898,13 +897,11 @@ _WALK_DEVICE = {
 #define WALK_FLOAT(i) __builtin_bit_cast(float, i)
 #define WALK_ABS(x) __builtin_fabsf(x)
 #define WALK_MUL(a, b) ([](const float walk_a_, const float walk_b_) -> float { return walk_a_ * walk_b_; }((a), (b)))
-#define WALK_CONSTANT const
 #define WALK_UNROLLED
 #define WALK_TOUCH(p) ((void)(p))""",
 }
 """The device's words of :data:`_WALK_LOADS`: its quad, its load kinds, the record's pivot, the bit and absolute
-value, the step's pin, the tables' constant memory and the L1 hint (none on the CPU). Everything else of the access is
-one text."""
+value, the step's pin and the L1 hint (none on the CPU). Everything else of the access is one text."""
 
 WALK_LINK_FRAME = 3
 """Where a body's link, as a walk reads it (``WALK_READ_LINK``'s registers), holds its frame point: after its offset to
@@ -912,10 +909,14 @@ its parent's frame."""
 
 
 def _walk_package(name: str, *texts: str) -> DevicePrelude:
-    """A walk prelude ``name`` for both devices: the walk's one access (:data:`_WALK_LOADS`) and the step's pin
-    ``WALK_MUL`` at the device layout, under its one guard, then ``texts``: every walk prelude carries it."""
-    text = {cuda: substitute(_WALK_LOADS, link=WALK_LINK, device=_WALK_DEVICE[cuda]) for cuda in (True, False)}
-    return DevicePrelude(name, "\n".join((text[True], *texts)), cpu="\n".join((text[False], *texts)))
+    """A walk prelude ``name`` for both devices: the walk's one access (:data:`_WALK_LOADS`), the step's pin ``WALK_MUL``
+    and the tables' storage (:data:`.memory.CONSTANT_STORAGE`) at the device layout, under its one guard, then
+    ``texts``: every walk prelude carries it."""
+    text = [
+        substitute(_WALK_LOADS, link=WALK_LINK, device=f"{_WALK_DEVICE[cuda]}\n{storage}")
+        for cuda, storage in zip((True, False), memory.CONSTANT_STORAGE, strict=True)
+    ]
+    return DevicePrelude(name, "\n".join((text[0], *texts)), cpu="\n".join((text[1], *texts)))
 
 
 @functools.cache
@@ -1223,7 +1224,7 @@ def _leave_class(k: int, walk: WalkClass, node: tuple[int, ...] | None, release:
     """The leave of a tree of class ``k``: its read of the change, the release where the class can slip, the unit."""
     n = walk.coordinates
     at = "c" if node is None else f"LEAVE_NODE_{k}[c]"
-    table = "" if node is None else f"    {ts.constant_table(f'LEAVE_NODE_{k}', node)}\n"
+    table = "" if node is None else f"    {memory.table(f'LEAVE_NODE_{k}', node)}\n"
     span = "n * 4" if node is None else str(4 * (max(node, default=-1) + 1))
     if not release:
         head = substitute(_LEAVE_PLAIN, node=at)

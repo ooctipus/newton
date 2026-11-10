@@ -68,7 +68,7 @@ from string import Template
 import numpy as np
 import warp as wp
 
-from ...core.memory import REGISTERS_PER_THREAD
+from ...core.memory import REGISTERS_PER_THREAD, table
 from . import field_group
 from .device_preludes import DevicePrelude, device_branches
 from .field_group import Field
@@ -111,7 +111,6 @@ __all__ = [
     "channels",
     "choose_schedule",
     "classes_half",
-    "constant_table",
     "cross",
     "device_plan",
     "dot",
@@ -1301,13 +1300,6 @@ def _walk_slots(parent: tuple[int, ...]) -> tuple[tuple[int, ...], int]:
     return tuple(slot), count
 
 
-def constant_table(name: str, values) -> str:
-    """A native table of ints in the walk's constant memory (``WALK_CONSTANT``: CUDA's ``__constant__``, the CPU's
-    ``const``), at least one entry long: a class's path, its emitter's steps, a placement's nodes."""
-    values = [str(int(v)) for v in values]
-    return f"static WALK_CONSTANT int {name}[{max(len(values), 1)}] = {{{', '.join(values)}}};"
-
-
 def _fill(text: str, **values) -> str:
     """``text`` with its ``$`` slots filled from ``values``: a walk text names only the slots it reads."""
     template = Template(text)
@@ -1736,19 +1728,17 @@ class WalkClass:
         name = f"WALK_CLASS_{self.tag}"
         slots, count = self.slots
         tables = [
-            constant_table(f"{name}_PARENT", self.parent),
-            constant_table(
-                f"{name}_STEP", [s.b | s.first << 16 | s.last << 17 | s.leading << 18 | s.sums << 19 for s in steps]
-            ),
-            constant_table(f"{name}_COORDINATE", [s.c for s in steps]),
+            table(f"{name}_PARENT", self.parent),
+            table(f"{name}_STEP", [s.b | s.first << 16 | s.last << 17 | s.leading << 18 | s.sums << 19 for s in steps]),
+            table(f"{name}_COORDINATE", [s.c for s in steps]),
         ]
         # The class's column halves (half_of): a table where none has both, so the walk's fetch takes no side; else
         # each record's own.
         one_half = bool(self.half) and max(self.half) < WALK_BOTH
         if one_half:
-            tables.append(constant_table(f"{name}_HALF", self.half))
+            tables.append(table(f"{name}_HALF", self.half))
         if count:
-            tables.append(constant_table(f"{name}_SLOT", slots))
+            tables.append(table(f"{name}_SLOT", slots))
         n = len(steps)
         half = f"({name}_HALF[{{}}] & 1)".format if one_half else lambda c: WALK_BOTH
         ring = (n, self.ahead(n, ahead) if fetches else 0, self.touch(n) if touches else 0)

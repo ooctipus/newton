@@ -572,8 +572,7 @@ _FORCE = cached_force.ForceOperands(
     dt="f.dt",
 )
 
-_HALF = r"""    $PHYSICAL_TABLE
-
+_HALF = r"""
     const int art=p.group_to_art.data[group];
     const int ds=p.art_dof_start.data[art],js=p.art_joint_start.data[art];
     const int lane=LANE,stride=STRIDE;
@@ -1879,8 +1878,8 @@ def border_solve(layout: TreeLayout, classes: tuple) -> str:
     hold = "const int nb=walk.joint_end.data[a]-j0;WalkHold h;HOLD_LOAD(h,data,link,HOLD_PARENT_{r},n,nb);"
     # Each walked root's path, its class's table in constant memory.
     tables = "".join(
-        f"        {ts.constant_table(f'HOLD_PARENT_{r}', classes[r].parent)}\n"
-        f"        {ts.constant_table(f'HOLD_FIRST_{r}', classes[r].first)}\n"
+        f"        {memory.table(f'HOLD_PARENT_{r}', classes[r].parent)}\n"
+        f"        {memory.table(f'HOLD_FIRST_{r}', classes[r].first)}\n"
         for r, _ in roots
     )
     # A tree the walk does not hold keeps its trial and flags bit 2.
@@ -2024,7 +2023,6 @@ def _half_kernel(prefix, schedules, layout, response, classes, flag, body, prelu
     source = layout.native(
         _HALF + body,
         preludes=(*SPATIAL.preludes(), STATUS_CLOCK, *preludes),
-        PHYSICAL_TABLE=layout.physical_table(),
         SCRATCH=_placed_block(layout, "s", "$PRED_SCRATCH"),
         FLAG=flag,
         **fragments,

@@ -429,11 +429,10 @@ class TestMemoryToolkit(unittest.TestCase):
             Operand("stage", Place.SHARED)
 
     def test_constant_table_is_one_text(self):
-        """A constant table: CUDA's constant memory, the CPU's constant data."""
-        self.assertEqual(
-            toolkit.table("PARENT", (-1, 0, 1)),
-            ("    static __constant__ int PARENT[3] = {-1, 0, 1};", "    static const int PARENT[3] = {-1, 0, 1};"),
-        )
+        """A constant table: one declaration in CONSTANT storage, CUDA's constant memory or the CPU's constant data."""
+        self.assertEqual(toolkit.table("PARENT", (-1, 0, True)), "static CONSTANT int PARENT[3] = {-1, 0, 1};")
+        self.assertEqual(toolkit.table("NONE", ()), "static CONSTANT int NONE[1] = {};")
+        self.assertEqual(toolkit.CONSTANT_STORAGE, ("    #define CONSTANT __constant__", "    #define CONSTANT const"))
 
 
 @cache
