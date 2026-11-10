@@ -1155,8 +1155,11 @@ def _patch_extent(end, live, size):
     return extent
 
 
-def run_live_sort_cases(test, device, capacities, extra_counts=()):
-    """Sort live prefixes of several sizes and compare with numpy's stable argsort and the radix sort."""
+def run_live_sort_cases(test, device, capacities, extra_counts=(), merges=None):
+    """Sort live prefixes of several sizes and compare with numpy's stable argsort and the radix sort.
+
+    ``merges`` launches that many merge rounds, fewer than the live slots may need, as a replay past its capture's rows.
+    """
     rng = np.random.default_rng(17)
     scene = _Scene(device, 0)
     # Pair codes of several worlds, including the smallest and largest ones a
@@ -1168,6 +1171,7 @@ def run_live_sort_cases(test, device, capacities, extra_counts=()):
     test.assertLess(int(codes.max()), 1 << 51)
     for capacity in capacities:
         patches = _FrictionPatchState(scene.model, capacity, wp.zeros(capacity, dtype=wp.vec2, device=device))
+        patches.merges = patches.merges if merges is None else merges
         counts = {0, 1, 2047, 2048, 2049, capacity // 2, capacity - 1, capacity, *extra_counts}
         for live in sorted(count for count in counts if 0 <= count <= capacity):
             with test.subTest(capacity=capacity, live=live):
@@ -1218,11 +1222,18 @@ class TestPatchLiveSort(unittest.TestCase):
         )
         self.assertGreater(coverage["live"], 2048)
 
+    def test_live_sort_past_its_merge_rounds_joins_every_run_left(self):
+        """Sort exactly with fewer merge rounds than the live slots need: the last round joins every run left."""
+        for merges in (1, 2):
+            run_live_sort_cases(self, "cpu", (16_384,), (6000, 9000), merges=merges)
+
     @unittest.skipUnless(wp.is_cuda_available(), "the device sort needs CUDA")
     def test_live_sort_matches_on_the_device(self):
         """Sort live prefixes on the device, from capacities below one chunk to hundreds of chunks and nine merges."""
         capacities = (128, 3000, 10000, 16_384, 1_000_000)
         run_live_sort_cases(self, "cuda:0", capacities, (300_000,))
+        run_live_sort_cases(self, "cuda:0", (16_384,), (6000, 9000), merges=1)
+        run_live_sort_cases(self, "cuda:0", (1_000_000,), (300_000,), merges=3)
 
     @unittest.skipUnless(wp.is_cuda_available(), "multi-block grids need CUDA")
     def test_live_sort_builds_match_on_many_blocks(self):
@@ -3041,6 +3052,55 @@ def run_captured_entry_filter(test, device, replays):
         test.assertGreater(int(filtered.rigid_contact_count.numpy()[0]), 0, f"replay {replay}: the boxes must touch")
 
 
+def run_replay_past_the_sort_rounds(test, device, replays=3):
+    """Replay a build captured at 2,048 slots, whose one merge round pairs two chunks, after the pool grew past them.
+
+    Each replay of more live slots than that round pairs joins every run in it, and sorts and builds the live slots
+    bitwise as an eager build at the grown rows, which merges pairwise over every round; so do the stale state's
+    eager builds. The pool asks for the recapture from the growth on.
+    """
+    rows = 16_384
+    scene = _Scene(device, 31, worlds=200, contacts=rows)
+    states = [
+        _FrictionPatchState(scene.model, size, wp.zeros(rows, dtype=wp.vec2, device=device)) for size in (2048, rows)
+    ]
+    stale, fresh = states
+    if not stale.pool.bindable:
+        test.skipTest("bound captures need CUDA virtual memory")
+    test.assertEqual((stale.merges, fresh.merges), (1, 3))
+    scene.frame("sparse")
+    for state in states:
+        state.build(scene.model, scene.state, scene.contacts)
+    with wp.ScopedCapture(device=device) as capture:
+        stale.build(scene.model, scene.state, scene.contacts)
+    test.assertFalse(stale.pool.needs_recapture)
+    stale.pool.grow(rows)
+    test.assertTrue(stale.pool.needs_recapture, "the pool grew past the slots the captured round pairs")
+    scene.active[:] = True
+    for replay in range(replays + 1):
+        scene.move()
+        live = scene.frame("live", churn=False)
+        test.assertGreater(live, 4 * 2048, "the live slots must outgrow the captured round by several runs")
+        if replay < replays:
+            wp.capture_launch(capture.graph)
+        else:
+            stale.build(scene.model, scene.state, scene.contacts)
+        fresh.build(scene.model, scene.state, scene.contacts)
+        context = f"replay {replay}" if replay < replays else "eager"
+        for name in _PatchFrame.vars:
+            np.testing.assert_array_equal(
+                getattr(stale.current, name).numpy()[:live],
+                getattr(fresh.current, name).numpy()[:live],
+                f"{context} {name}",
+            )
+        for name in ("weight", "next_contact", "point", "phi"):
+            np.testing.assert_array_equal(
+                getattr(stale.view, name).numpy()[:live], getattr(fresh.view, name).numpy()[:live], f"{context} {name}"
+            )
+        np.testing.assert_array_equal(stale.built.numpy(), fresh.built.numpy(), f"{context} built")
+    test.assertGreater(stale.merges, 1, "an eager build sizes the rounds for the grown rows")
+
+
 class TestPatchCapturedFrameReuse(unittest.TestCase):
     """Graphs captured as Isaac Lab captures them, replayed on the CPU and on CUDA."""
 
@@ -3079,6 +3139,11 @@ class TestPatchCapturedFrameReuse(unittest.TestCase):
     def test_coupled_entry_filters_start_new_frames_on_the_device(self):
         """Sort after each coupled entry filter pass in a CUDA graph and keep the pairs on later substeps."""
         run_captured_entry_filter(self, "cuda:0", replays=100)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "graph capture needs CUDA")
+    def test_replays_past_the_captured_merge_rounds_sort_exactly(self):
+        """Sort and build bitwise as eager builds in replays whose live slots outgrew the captured merge rounds."""
+        run_replay_past_the_sort_rounds(self, "cuda:0")
 
 
 if __name__ == "__main__":

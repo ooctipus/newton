@@ -105,9 +105,10 @@ the ready rows drops the excess, and the capacity status flags it.
 A capture is *unbound* when something in it sized work by the host's row count
 instead: an unconverted consumer reading
 :attr:`newton.Contacts.rigid_contact_max` while capturing, a launch with no
-virtual memory to bind, or rows that growth reallocates.
+virtual memory to bind, or rows that growth reallocates. A bound capture may
+size the count of its launches by rows (:meth:`ContactPool.note_cover`).
 :meth:`ContactPool.service` reports that such graphs must be recaptured once
-the pool holds more rows than they were captured with.
+the pool holds more rows than they were captured for.
 
 Fixed buffers: a pool built ``fixed`` holds its initial rows for good, as Newton's contact buffers do: ordinary
 arrays, which publish no more rows, grow no more from demand and never trim; writers drop the contacts past the
@@ -1022,8 +1023,10 @@ class ContactPool:
         self._tables: weakref.WeakSet = weakref.WeakSet()
         # Status words of collected updaters, which a later updater may claim before its first replay writes them.
         self._stale_status: list[tuple[int, int]] = []
-        # Live captures that sized work by the host's rows, with the ready rows they sized it by.
+        # Live captures that sized work by the host's rows, with the ready rows they sized it by, and live bound ones
+        # with the rows their launch structure covers (note_cover).
         self._unbound_captures: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+        self._covers: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
         self._stale_on_growth = False
         vm = _virtual_memory() if self.device.is_cuda and self.ready_rows is not None else None
         if vm is not None:
@@ -1196,12 +1199,12 @@ class ContactPool:
     def needs_recapture(self) -> bool:
         """Whether graphs that captured this pool's or its followers' buffers must be recaptured after growth.
 
-        True when a live capture sized work by fewer rows than the pool holds
-        now, or when growth reallocated rows; a graph whose contact launches are
-        all bound follows the rows without a recapture.
+        True when a live capture sized work, or its launch structure (:meth:`note_cover`), by fewer rows than the
+        pool holds now, or when growth reallocated rows; other bound graphs follow the rows without a recapture.
         """
         return any(
-            pool._stale_on_growth or any(rows < pool.ready for rows in pool._unbound_captures.values())
+            pool._stale_on_growth
+            or any(rows < pool.ready for rows in (*pool._unbound_captures.values(), *pool._covers.values()))
             for pool in self._closure()
         )
 
@@ -1210,7 +1213,7 @@ class ContactPool:
         recorded a collision pass or sized a launch by the host's rows."""
         graphs = {}
         for pool in self._closure():
-            for graph in (*pool._captured_passes.keys(), *pool._unbound_captures.keys()):
+            for graph in (*pool._captured_passes.keys(), *pool._unbound_captures.keys(), *pool._covers.keys()):
                 graphs[id(graph)] = weakref.ref(graph)
         return tuple(graphs.values())
 
@@ -1738,12 +1741,15 @@ class ContactPool:
             # A capture Warp does not own: nothing to follow, so every growth asks for a recapture.
             self._stale_on_growth = True
 
-    def launch_rows(self) -> int:
-        """Return the rows a contact-sized launch is sized for now.
+    def note_cover(self, rows: int) -> None:
+        """Note that the current capture's launch count covers ``rows`` rows (merge rounds): recapture past them."""
+        owner = _capture_owner(self.device)
+        if owner is not None and rows < self.bound:
+            self._covers[owner] = min(int(rows), self._covers.get(owner, rows))
 
-        The bound in a capture whose launches bind (each replay then shrinks
-        them, see :meth:`launch`), otherwise the ready rows.
-        """
+    def launch_rows(self) -> int:
+        """Return the rows a contact-sized launch is sized for now: the bound in a capture whose launches bind (each
+        replay then shrinks them, see :meth:`launch`), otherwise the ready rows."""
         return self.bound if self._binding_owner() is not None else self.ready
 
     def begin_updates(self) -> None:
