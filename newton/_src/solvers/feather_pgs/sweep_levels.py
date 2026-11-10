@@ -27,7 +27,7 @@ from functools import cache
 import warp as wp
 
 from ...core.execution import append, device_lanes
-from ...core.memory import STATIC_SHARED_BYTES, Buffer, Staging
+from ...core.memory import Buffer, Staging, arch_budget
 from . import kernel_template
 from .contact_input import ContactInput
 from .device_preludes import LANE_WORDS, SHARED_STORAGE, group_native, lane_group
@@ -262,7 +262,7 @@ def _get_sparse_contact_levels_kernel(
     """The sparse-diagonal contact schedule over the contact units (:func:`_sparse_contact_levels_kernel`), a world a
     warp on CUDA and a thread on the CPU (:func:`.execution.device_lanes`)."""
     return _sparse_contact_levels_kernel(
-        int(max_constraints), int(max_world_dofs), build_serial_contacts, torsion, device_lanes(device_arch, 32)
+        int(max_constraints), int(max_world_dofs), build_serial_contacts, torsion, device_arch
     )
 
 
@@ -304,17 +304,18 @@ multiprocessor at its block limit (24 warps on sm_120, half its 48)."""
 
 
 @cache
-def levels_staging(max_world_dofs: int, lanes: int = 32) -> Staging:
+def levels_staging(max_world_dofs: int, device_arch) -> Staging:
     """The contact schedule's shared working set: a world's lane group's coordinates' owner and level
     (:func:`level_pass`) and the offsets' warp sum; on CUDA as many worlds a block, a warp each and up to
-    :data:`LEVELS_WORLDS`, as the static shared budget holds (the CPU's one thread runs one). Each contact position's
-    packed level and rank are its lane's (:func:`_sparse_contact_levels_kernel`), not shared."""
+    :data:`LEVELS_WORLDS`, as the device's static budget holds (:func:`.memory.arch_budget`; the CPU's one thread runs
+    one). Each contact position's packed level and rank are its lane's (:func:`_sparse_contact_levels_kernel`)."""
     buffers = (
         Buffer("node_owner", "int", max_world_dofs),
         Buffer("node_level", "int", max_world_dofs),
         Buffer("warp_count", "int", 1),
     )
-    groups = max(1, min(LEVELS_WORLDS, STATIC_SHARED_BYTES // Staging(buffers).group_bytes)) if lanes > 1 else 1
+    fit = arch_budget(device_arch) // Staging(buffers).group_bytes
+    groups = max(1, min(LEVELS_WORLDS, fit)) if device_lanes(device_arch, 32) > 1 else 1
     return Staging(buffers, groups=groups, layout="arrays")
 
 
@@ -322,7 +323,7 @@ def levels_launch(world_count: int, max_world_dofs: int, device_arch) -> tuple[i
     """The contact schedule's launch, ``(dim, block_dim)``: a world's lane group (a warp, or the CPU's one thread,
     :func:`.execution.device_lanes`), :func:`levels_staging`'s groups a block."""
     lanes = device_lanes(device_arch, 32)
-    return int(world_count) * lanes, lanes * levels_staging(int(max_world_dofs), lanes).groups
+    return int(world_count) * lanes, lanes * levels_staging(int(max_world_dofs), device_arch).groups
 
 
 def _levels_kernel(
@@ -330,7 +331,7 @@ def _levels_kernel(
     params: tuple,
     M: int,
     D: int,
-    L: int,
+    device_arch,
     *,
     units: str,
     reserve: str,
@@ -343,7 +344,7 @@ def _levels_kernel(
     ``row_base``, ``reserve`` reserves the coordinates no level holds, ``resources`` a unit's coordinate, ``tail``
     follows. Level ``l`` lists its heads in row order, ``level_units[world, level_offsets[world, l]:level_offsets[world,
     l + 1]]`` of ``level_count[world]``; a unit's level and rank wait for the offsets in its lane's ``unit_place``."""
-    staging = levels_staging(D, L)
+    staging, L = levels_staging(D, device_arch), device_lanes(device_arch, 32)
     counts = f"level_offsets.data[world * {M + 1} + {{}}]"
     level = level_pass(
         units="units",
@@ -400,7 +401,7 @@ _LEVELS_OUTPUTS = (
 
 
 def _sparse_contact_levels_kernel(
-    M: int, D: int, build_serial_contacts: bool, torsion: bool = False, lanes: int = 32
+    M: int, D: int, build_serial_contacts: bool, torsion: bool = False, device_arch=None
 ) -> "wp.Kernel":
     """Case K2's contact schedule over its slots (:func:`_levels_kernel`): the levels of the scalar contacts and the
     serial list of the rest.
@@ -412,14 +413,14 @@ def _sparse_contact_levels_kernel(
     (:func:`_list_serial_contacts_source`, the other unit heads in row order). The others are leveled in row order: a
     coordinate's ``k``-th contact is level ``k``.
     """
-    L = lanes
+    L = device_lanes(device_arch, 32)
     if M >= 1 << 15:
         raise ValueError(f"a world's contact schedule packs a unit's level and rank in 16 bits each: {M} rows")
     friction, spin = int(ROW_FRICTION), int(ROW_TORSION)
     kind = "world_row_type.data[row_base + normal]"
     # A unit's members (a tangent, or a spin row) follow its head; every other row of the segment heads a unit.
     unit_head = f"({kind} != {friction} && {kind} != {spin})" if torsion else f"{kind} != {friction}"
-    levels_staging(D, L).check("the sparse-diagonal contact schedule")
+    levels_staging(D, device_arch).check("the sparse-diagonal contact schedule", arch_budget(device_arch))
     resources = f"""            const int normal = contact_start + unit;
             int node_a = -1;
             const int node_b = -1;
@@ -474,7 +475,9 @@ def _sparse_contact_levels_kernel(
         ("serial_count_out", wp.array[int]),
         ("serial_normals", wp.array2d[int]),
     )
-    return _levels_kernel(name, params, M, D, L, units=units, reserve=reserve, resources=resources, tail=serial)
+    return _levels_kernel(
+        name, params, M, D, device_arch, units=units, reserve=reserve, resources=resources, tail=serial
+    )
 
 
 @cache
@@ -489,7 +492,7 @@ def coordinate_levels_kernel(M: int, P: int, D: int, device_arch: str, *, torsio
     L = device_lanes(device_arch, 32)
     if M >= 1 << 15:
         raise ValueError(f"a world's level schedule packs a unit's level and rank in 16 bits each: {M} rows")
-    levels_staging(D, L).check("the coordinate levels")
+    levels_staging(D, device_arch).check("the coordinate levels", arch_budget(device_arch))
     kind = "world_row_type.data[row_base + row]"
     head = f"{kind} != {int(ROW_FRICTION)}" + (f" && {kind} != {int(ROW_TORSION)}" if torsion else "")
     entries = """const int classes = row_classes.data[row_base + row];
@@ -550,5 +553,5 @@ def coordinate_levels_kernel(M: int, P: int, D: int, device_arch: str, *, torsio
         *_LEVELS_OUTPUTS,
     )
     return _levels_kernel(
-        name, params, M, D, L, units=units, reserve=reserve, resources=resources, preludes=(CLASS_SIDES,)
+        name, params, M, D, device_arch, units=units, reserve=reserve, resources=resources, preludes=(CLASS_SIDES,)
     )
