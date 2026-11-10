@@ -2035,6 +2035,41 @@ class TestFeatherPGSConformanceCUDA(_ConformanceCase):
 _add_group_tests(TestFeatherPGSConformanceCUDA, cuda_groups())
 
 
+class TestUnclaimedWorldsCUDA(_ConformanceCase):
+    """The solve group's impulses' start reaches every world the stage's kernel did."""
+
+    device = _cuda_device()
+
+    def test_a_world_left_out_of_the_claims_starts_at_zero_impulse(self):
+        """Between bounces a dropped ball's world holds rows none of which can act: it takes no claim, so the solve
+        group neither clears nor sweeps it, and its active rows' impulses still read zero after each step (the claim
+        clears them), so no readout of the step reads an impulse left from an earlier one."""
+        physics = _physics(scenes.ball_drop(), "patch", 16)
+        scene, route = physics.scene, MF_HELD
+        model = scene.build(self.device)
+        pipeline = newton.CollisionPipeline(model, growable_contacts=True)
+        contacts = pipeline.contacts()
+        merged = {**BASE_OPTIONS, **scene.solver_options, **physics.options(physics.iterations), **route.options}
+        left_out = 0
+        with route_context(route):
+            solver = SolverFeatherPGS(model, pins=route.solver_pins(), **merged)
+            self.assertIsNotNone(solver.get_path_selection()["routes"]["sweep"]["solve_group"])
+            state, out, control = model.state(), model.state(), model.control()
+            newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+            placement = solver.placement
+            for _ in range(scene.steps):
+                state.clear_forces()
+                pipeline.collide(state, contacts)
+                solver.step(state, out, control, contacts, scene.dt)
+                state, out = out, state
+                rows, acts = placement.constraint_count.numpy(), placement.world_acts.numpy()
+                first, impulses = placement.dense_first.numpy(), placement.impulses.numpy()
+                for world in np.flatnonzero((rows > 0) & (acts == 0)) if acts.size else ():
+                    left_out += 1
+                    np.testing.assert_array_equal(impulses[first[world], : rows[world]], 0.0)
+        self.assertGreater(left_out, 0)
+
+
 OWNERSHIP = (
     # (scene, law, iterations, route, owners that together solve every world and each solve one, counted owners that
     # must solve none). A sweep without counters (the parallel tiers) owns a world when no counted sweep solves it.
