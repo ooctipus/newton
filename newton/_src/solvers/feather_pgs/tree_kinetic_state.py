@@ -2001,8 +2001,7 @@ out of every block)."""
 
 def predictor_work(layout: TreeLayout) -> Work:
     """A predictor half's work: a packed group of trees a block of :attr:`.TreeLayout.block` threads at
-    :data:`PREDICTOR_REGISTERS`. Its launch bound is sized for :data:`~.memory.REFERENCE_ARCH` on every device (24
-    blocks of 32 threads, 18 of 64 on sm_120), as the kernel's builder takes no device."""
+    :data:`PREDICTOR_REGISTERS`."""
     return Work(0, block=layout.block, registers=PREDICTOR_REGISTERS)
 
 
@@ -2024,9 +2023,9 @@ def _predictor_name(prefix: str, layout: TreeLayout, schedules: HeldSchedules | 
     return name + "_w" + hashlib.sha256(repr(walked).encode()).hexdigest()[:8]
 
 
-def _half_kernel(prefix, schedules, layout, response, classes, flag, body, preludes=(), **fragments):
+def _half_kernel(prefix, schedules, layout, response, classes, flag, body, preludes=(), *, device_arch, **fragments):
     """A half of the predictor (:data:`_HALF` and its ``body``, a packed group of trees a block, its launch bound
-    :func:`predictor_work`'s): the force half or the response half."""
+    :func:`predictor_work`'s on the architecture ``device_arch``): the force half or the response half."""
 
     source = layout.native(
         _HALF + body,
@@ -2052,16 +2051,19 @@ def _half_kernel(prefix, schedules, layout, response, classes, flag, body, prelu
         # A packed group of trees per block: the block's group and this thread's tree in it.
         items("group", groups=layout.pack, lanes=layout.lanes),
         composed=True,
-        launch_bounds=shape(predictor_work(layout), memory.built_for(None)).bounds,
+        launch_bounds=shape(predictor_work(layout), memory.built_for(device_arch)).bounds,
     ).kernel()
 
 
 @functools.cache
-def get_force_kernel(schedules: HeldSchedules, *, layout: TreeLayout = REFERENCE_LAYOUT, response="sparse", classes):
+def get_force_kernel(
+    schedules: HeldSchedules, *, layout: TreeLayout = REFERENCE_LAYOUT, response="sparse", classes, device_arch
+):
     """The predictor's force half (Z4.2, :data:`_FORCE_HALF`): the force on every coordinate into ``trial.force``; it
     clears each root's slip count for the response half's border. The columns' half is the walked classes'
     (:func:`.tree_scan.classes_half`), a diagonal root's its joint's (:data:`_DIAGONAL_PROJECT`). A group none of whose
-    roots responds (prescribed roots, rest trees) takes no external wrench, which no coordinate of it answers."""
+    roots responds (prescribed roots, rest trees) takes no external wrench, which no coordinate of it answers. Both
+    halves are built for the architecture ``device_arch`` (their launch bound)."""
 
     walked = tuple(cls for cls in classes if cls is not None)
     diagonal = _diagonal_roots(layout)
@@ -2097,6 +2099,7 @@ def get_force_kernel(schedules: HeldSchedules, *, layout: TreeLayout = REFERENCE
         "nonzero",
         _FORCE_HALF,
         (walk_loads_prelude("LDG"),),
+        device_arch=device_arch,
         CLEAR_SLIPS="".join(
             f"walk.release.count.data[{_root_articulation(layout, r)}]=0;" for r, _, _ in _walk_roots(layout)
         ),
@@ -2198,6 +2201,7 @@ def get_predictor_kernel(
     classes: tuple,
     slips: int,
     side: bool = True,
+    device_arch,
 ):
     """The predictor's response half (Z4.2, :data:`_RESPONSE_HALF`), after the force half (:func:`get_force_kernel`) and
     the walk's solve (:func:`get_walk_solve_kernel`): the trial's response read back into the block, ``qdd`` and
@@ -2232,6 +2236,7 @@ def get_predictor_kernel(
         "moved",
         _RESPONSE_HALF,
         (walk_loads_prelude("LDG", "LD"), HELD),
+        device_arch=device_arch,
         TRIAL=held_lambdas(layout, slips, ts.record_half(side))
         + stage("float value=s[$WHITE+col];", clocks["CLOCK2"] + clocks["CLOCK3"], QUIET_DRIVE),
         RESPONSE=(

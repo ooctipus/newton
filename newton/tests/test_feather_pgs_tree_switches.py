@@ -55,6 +55,7 @@ def _kernels(clocked):
             twists=tree_kinetic_state.publishes_twists(_LAYOUT, schedules, cuda=True),
             classes=(WalkClass(tuple(int(p) for p in _TREE.parent), tuple(int(f) for f in _TREE.dof_start)),),
             slips=RELEASE_SLIPS,
+            device_arch=wp.get_device().arch,
         ),
     )
 

@@ -778,11 +778,11 @@ def prefix_warp_rows(device, arts: int, size: int, rows: int, *, family="limits"
     from newton._src.solvers.feather_pgs import prefix_rows  # noqa: PLC0415
     from newton._src.solvers.feather_pgs import rows as producers  # noqa: PLC0415
 
-    shape = producers.prefix_shape(arts, device)
+    shape, arch = producers.prefix_shape(arts, device), wp.get_device(device).arch
     struct_type, kernel = {
-        "limits": (prefix_rows.PrefixLaw, producers.joint_limit_warp_kernel(size, shape.groups)),
-        "velocity": (prefix_rows.PrefixVelocityLaw, producers.velocity_limit_warp_kernel(size, shape.groups)),
-        "mimics": (prefix_rows.PrefixMimicLaw, producers.mimic_warp_kernel(size, shape.groups, mimics)),
+        "limits": (prefix_rows.PrefixLaw, producers.joint_limit_warp_kernel(size, arch)),
+        "velocity": (prefix_rows.PrefixVelocityLaw, producers.velocity_limit_warp_kernel(size, arch)),
+        "mimics": (prefix_rows.PrefixMimicLaw, producers.mimic_warp_kernel(size, mimics, arch)),
     }[family]
 
     dofs = arts * size
