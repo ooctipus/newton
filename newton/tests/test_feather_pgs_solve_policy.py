@@ -487,7 +487,7 @@ class TestExitLaw(unittest.TestCase):
         sparse sweep runs, on the general sweep's own row store (its friction pair selected while its spin row holds
         impulse too), the exit law's bound on the rows it leaves unvisited, and a contact's normal and pair visited as
         one unit on their Gram block; the colored mapping keeps every row in turn."""
-        rhs = WorldRows(64).rhs_of("row")
+        rhs = WorldRows(64).rhs_of("tested_row")
         for units in (False, True):
             config = sweep_routes.GeneralSweep(64, 32, 12, "120", torsion=True, active_rows=True, contact_units=units)
             self.assertIn("_active_units_" if units else "_active_", config.name)

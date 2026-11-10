@@ -478,6 +478,7 @@ def _source(sweep: SparseSweep) -> tuple[str, Staging]:
                 seeded=sweep.warm_start,
                 linked=sweep.linked_rows,
                 torsion=sweep.torsion,
+                parallel=False,
                 pad="        ",
             )
         )
@@ -530,7 +531,7 @@ def _source(sweep: SparseSweep) -> tuple[str, Staging]:
     exit_ = end_sweep(
         sweep.solve_policy,
         iteration=ITERATION,
-        violation=active_violation(rows, op, count="count") if sweep.active_rows else None,
+        violation=active_violation(rows, op, count="count", parallel=False) if sweep.active_rows else None,
     )
     sweeps = level_loop((*scan, row_loop, triples), (passes,), exit=exit_)
     body = f"""    const int lane = LANE;
