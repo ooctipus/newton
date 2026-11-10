@@ -36,11 +36,11 @@ from typing import NamedTuple
 import warp as wp
 
 from ...core.execution import Buckets, Queue, Work, append, bucket_item, shape
-from ...core.memory import built_for, table
+from ...core.memory import Operand, Place, built_for, table
 from . import field_group
 from .contact_input import ContactFrame, ContactInput, contact_frame
 from .contact_laws import CONTACT_SPIN_ROW, contact_row_entry, contact_seed, spin_seed
-from .device_preludes import DevicePrelude, dual_native, lane_group, substitute
+from .device_preludes import DevicePrelude, dual_native, lane_group, memory_words, substitute
 from .factor.closure import close_block, close_row
 from .factor.fields import Preelim
 from .factor.walk import (
@@ -574,23 +574,6 @@ _SUPPORT = """    // One unit's rows into the support sink (walk_rows.support_ro
         return __builtin_ctzll(bits);
 #endif
     };
-    // The writer's own accesses, typed (no generic LD.E / ST.E): its inputs read-only (RD, the non-coherent path;
-    // nothing here writes them), its outputs stored (ST), and the footprints it adds into read back (RW).
-#if defined(__CUDA_ARCH__)
-    const auto RD = [](const auto* p) { return $rd; };
-    const auto ST = [](auto* p, const auto v) {
-        __builtin_assume(__isGlobal(p));
-        *p = v;
-    };
-    const auto RW = [](const float* p) -> float {
-        __builtin_assume(__isGlobal(p));
-        return *p;
-    };
-#else
-    const auto RD = [](const auto* p) { return *p; };
-    const auto ST = [](auto* p, const auto v) { *p = v; };
-    const auto RW = [](const float* p) -> float { return *p; };
-#endif
     const auto& walk = sink.walk;
     const auto& release = sink.release;
     const auto& support = sink.support;
@@ -625,8 +608,8 @@ _SUPPORT = """    // One unit's rows into the support sink (walk_rows.support_ro
     bool reread = false;
 $start    for (int side = 0; side < 2; ++side) {
         const int art = $art;
-        if (art < 0 || (side == 1 && art == $first) || RD(sink.response_dofs.data + art) <= 0) continue;
-        const int j0 = RD(walk.joint_start.data + art), d0 = RD(walk.dof_start.data + art);
+        if (art < 0 || (side == 1 && art == $first) || LOAD_inputs(sink.response_dofs.data + art) <= 0) continue;
+        const int j0 = LOAD_inputs(walk.joint_start.data + art), d0 = LOAD_inputs(walk.dof_start.data + art);
 $side
         const float* data = walk.data.data + (size_t)d0 * $coordinate;
         const float* link = walk.link.data + (size_t)j0 * $link;
@@ -649,9 +632,9 @@ $side
             float* entry = Z + rank(c);
             for (int k = 0; k < rows; ++k) {
                 if (add)
-                    ST(entry + k * S, RW(entry + k * S) + footprint[k]);
+                    STORE_rows(entry + k * S, LOAD_rows(entry + k * S) + footprint[k]);
                 else
-                    ST(entry + k * S, footprint[k]);
+                    STORE_rows(entry + k * S, footprint[k]);
             }
             if (!add && rows >= 3) gram();
         };
@@ -663,8 +646,8 @@ $side
                 x[0] = k == 0 ? unit.value0 : unit.value1;
                 // A covector enters at its coordinate: its body's coordinates after it (below it in factor order) are
                 // the row's zeros.
-$below                WALK_ROW(data, link, nullptr, nullptr, nullptr, RD(walk.dof_body.data + d0 + c), c, x, store);
-                incident[0] += x[0] * RD(vh + c);
+$below                WALK_ROW(data, link, nullptr, nullptr, nullptr, LOAD_inputs(walk.dof_body.data + d0 + c), c, x, store);
+                incident[0] += x[0] * LOAD_inputs(vh + c);
             }
         } else {
             float seed[6 * $rows];
@@ -672,14 +655,14 @@ $below                WALK_ROW(data, link, nullptr, nullptr, nullptr, RD(walk.do
                 const int body = k == 0 ? body_a : body_b;
                 if (body < 0 || (k == 0 ? art_a : art_b) != art) continue;
                 const float sign = k == 0 ? 1.0f : -1.0f;
-                const int j = RD(walk.body_joint.data + body);
+                const int j = LOAD_inputs(walk.body_joint.data + body);
                 const int local = j - j0;
                 // The seeds' wrenches at the body's frame (the factor's), where the walk's shifted columns are J's: the
                 // frame point is the articulation's, so the world point meets it through the articulation's origin.
                 const float* o = walk.link.data + (size_t)j * $link + $frame;
                 const float* origin = reinterpret_cast<const float*>(walk.origin.data + art);
-                const float frame_o[3] = {RD(o), RD(o + 1), RD(o + 2)};
-                const float origin_o[3] = {RD(origin), RD(origin + 1), RD(origin + 2)};
+                const float frame_o[3] = {LOAD_inputs(o), LOAD_inputs(o + 1), LOAD_inputs(o + 2)};
+                const float origin_o[3] = {LOAD_inputs(origin), LOAD_inputs(origin + 1), LOAD_inputs(origin + 2)};
                 for (int r = 0; r < $rows; ++r) {
                     float* q = seed + 6 * r;
                     if (r >= rows) {
@@ -690,7 +673,7 @@ $wrench
                 }
                 // The step's J entry of each footprint against v_hat: the rows' incident velocity.
                 const auto sink = [&](int r, int c, float z, float j) {
-                    if (r < rows) incident[r] += j * RD(vh + c);
+                    if (r < rows) incident[r] += j * LOAD_inputs(vh + c);
                     store(r, c, z, j);
                 };
                 float shift[3];
@@ -700,7 +683,7 @@ $wrench
         }
         // A slipping tree's release (the predictor's border), root-most slip first, on the side's entries along each
         // slip's path (WALK_RELEASE_ON): entries off the row's support stay zero, so the side keeps its support.
-        if (RD(release.count.data + art) > 0) {
+        if (LOAD_inputs(release.count.data + art) > 0) {
             reread = true;
 $release
         }
@@ -710,47 +693,54 @@ $close    if (reread) {
         for (int k = 0; k < 6; ++k) cross[k] = 0.0f;
         for (int e = 0; e < $entries_end; ++e) {
             for (int r = 0; r < rows; ++r) {
-                zc[r] = RW(Z + r * S + e);
+                zc[r] = LOAD_rows(Z + r * S + e);
                 norm[r] += zc[r] * zc[r];
             }
             if (rows >= 3) gram();
         }
     }
     for (int r = 0; r < rows; ++r) {
-        ST(sink.diag.data + rec0 + r, $diag);
-        ST(sink.row_incident.data + rec0 + r, incident[r]);
+        STORE_rows(sink.diag.data + rec0 + r, $diag);
+        STORE_rows(sink.row_incident.data + rec0 + r, incident[r]);
     }
 $record"""
 """The support sink's unit walker, ``$rows`` rows a lane (:func:`support_rows_kernel`)."""
 
+# The writers' operands, placed by the memory toolkit's read rule: their inputs (the walk and the sink's tables, which no
+# thread writes while a writer runs) and the rows they store, add into and read back (a row's sides among them: its
+# records' writer, the unit reader, wrote them). The packed writers read their inputs coherently, a measured exception:
+# the K2 writer's non-coherent path was 1.4% slower on sm_120 (ZR1 h11, write_slot_rows on franka-cabinet).
+_INPUTS, _ROWS = Operand("inputs"), Operand("rows", writes=True)
+_PACKED_INPUTS = Operand("inputs", measured=Place.GLOBAL)
+
 _SUPPORT_CLOSE = """    // The pad past the support; the rows' coordinates (explicit) or their support class (the table).
     for (int r = 0; r < rows; ++r)
-        for (int e = count; e < S; ++e) ST(Z + r * S + e, 0.0f);
+        for (int e = count; e < S; ++e) STORE_rows(Z + r * S + e, 0.0f);
     if (support.enabled == 0) {
         int* const D = sink.row_dof.data + (size_t)row0 * S;
         for (int side = 0; side < 2; ++side) {
             if (masks[side] == 0ull) continue;
             int e = bases[side];
-            const int offset = RD(sink.world_offset.data + (side == 0 ? art_a : art_b));
+            const int offset = LOAD_inputs(sink.world_offset.data + (side == 0 ? art_a : art_b));
             for (unsigned long long bits = masks[side]; bits != 0ull; bits &= bits - 1ull, ++e)
-                for (int r = 0; r < rows; ++r) ST(D + r * S + e, offset + LOW(bits));
+                for (int r = 0; r < rows; ++r) STORE_rows(D + r * S + e, offset + LOW(bits));
         }
         for (int r = 0; r < rows; ++r)
-            for (int e = count; e < S; ++e) ST(D + r * S + e, -1);
+            for (int e = count; e < S; ++e) STORE_rows(D + r * S + e, -1);
     } else {
         int cls = 0;
         if (covector) {
-            cls = RD(support.limit_class.data + (dof0 - RD(walk.dof_start.data + art_a)));
+            cls = LOAD_inputs(support.limit_class.data + (dof0 - LOAD_inputs(walk.dof_start.data + art_a)));
         } else {
             const auto side_of = [&](int body, int art) {
-                return body >= 0 && art >= 0 && RD(sink.response_dofs.data + art) > 0 && RD(sink.body_mask.data + body) != 0ull;
+                return body >= 0 && art >= 0 && LOAD_inputs(sink.response_dofs.data + art) > 0 && LOAD_inputs(sink.body_mask.data + body) != 0ull;
             };
             const bool a = side_of(body_a, art_a), b = side_of(body_b, art_b);
-            const int class_a = a ? RD(support.body_class.data + body_a) : 0;
-            const int class_b = b ? RD(support.body_class.data + body_b) : 0;
-            cls = RD(support.pair_class.data + (class_a * support.pair_class.shape[1] + class_b));
+            const int class_a = a ? LOAD_inputs(support.body_class.data + body_a) : 0;
+            const int class_b = b ? LOAD_inputs(support.body_class.data + body_b) : 0;
+            cls = LOAD_inputs(support.pair_class.data + (class_a * support.pair_class.shape[1] + class_b));
         }
-        for (int r = 0; r < rows; ++r) ST(support.row_class.data + row0 + r, cls);
+        for (int r = 0; r < rows; ++r) STORE_rows(support.row_class.data + row0 + r, cls);
     }
 """
 
@@ -760,10 +750,10 @@ _SUPPORT_RECORD = """    // A friction unit's block record from its Gram (sparse
     if (rows >= 3) {
         float* record = sink.records.data + ((size_t)unit.line * sink.records.shape[1] + unit.slot / 3)
                         * sink.records.shape[2];
-        ST(record + 0, cross[0]);
-        ST(record + 1, cross[1]);
-        ST(record + 2, cross[2]);
-        ST(record + 3, 1.0f / (norm[0] + sink.cfm));
+        STORE_rows(record + 0, cross[0]);
+        STORE_rows(record + 1, cross[1]);
+        STORE_rows(record + 2, cross[2]);
+        STORE_rows(record + 3, 1.0f / (norm[0] + sink.cfm));
 
     }
 """
@@ -772,9 +762,9 @@ _SPIN_RECORD = """    // A contact with a spin row: its friction rows' couplings
     if (rows == 4) {
         float* record = sink.records.data + ((size_t)unit.line * sink.records.shape[1] + unit.slot / 3)
                         * sink.records.shape[2];
-        ST(record + 0, cross[2]);
-        ST(record + 1, cross[4]);
-        ST(record + 2, cross[5]);
+        STORE_rows(record + 0, cross[2]);
+        STORE_rows(record + 1, cross[4]);
+        STORE_rows(record + 2, cross[5]);
     }
 """
 
@@ -792,12 +782,12 @@ _RELEASE_HELD = """            // The side's entries held in the thread's own ar
             float held[$rows * $coordinates];
             const int span = count - base;
             for (int r = 0; r < rows; ++r)
-                for (int e = 0; e < span; ++e) held[r * $coordinates + e] = RW(Z + r * S + base + e);
+                for (int e = 0; e < span; ++e) held[r * $coordinates + e] = LOAD_rows(Z + r * S + base + e);
             WALK_RELEASE_ON(release, art, held, rows, $coordinates, [&](const int c) -> int {
                 return ((mask >> SUPPORT_NODE[c]) & 1ull) != 0ull ? rank(c) - base : -1;
             });
             for (int r = 0; r < rows; ++r)
-                for (int e = 0; e < span; ++e) ST(Z + r * S + base + e, held[r * $coordinates + e]);"""
+                for (int e = 0; e < span; ++e) STORE_rows(Z + r * S + base + e, held[r * $coordinates + e]);"""
 _RELEASE_IN_PLACE = """            WALK_RELEASE_ON(release, art, Z, rows, S, [&](const int c) -> int {
                 return ((mask >> SUPPORT_NODE[c]) & 1ull) != 0ull ? rank(c) : -1;
             });"""
@@ -812,19 +802,19 @@ The held side is a unit's at most four rows over its class's coordinates."""
 _SUPPORT_SIDE = """        unsigned long long mask = 0ull;
         int seeds = 0;
         if (covector) {
-            mask = RD(sink.dof_mask.data + (dof0 - d0));
+            mask = LOAD_inputs(sink.dof_mask.data + (dof0 - d0));
             seeds = 1;
             if (dof1 >= 0) {
-                mask |= RD(sink.dof_mask.data + (dof1 - d0));
+                mask |= LOAD_inputs(sink.dof_mask.data + (dof1 - d0));
                 seeds = 2;
             }
         } else {
             if (body_a >= 0 && art_a == art) {
-                mask |= RD(sink.body_mask.data + body_a);
+                mask |= LOAD_inputs(sink.body_mask.data + body_a);
                 ++seeds;
             }
             if (body_b >= 0 && art_b == art) {
-                mask |= RD(sink.body_mask.data + body_b);
+                mask |= LOAD_inputs(sink.body_mask.data + body_b);
                 ++seeds;
             }
         }
@@ -838,13 +828,13 @@ _SUPPORT_SIDE = """        unsigned long long mask = 0ull;
         if (add) {
             reread = true;
             for (int r = 0; r < rows; ++r)
-                for (int e = base; e < count; ++e) ST(Z + r * S + e, 0.0f);
+                for (int e = base; e < count; ++e) STORE_rows(Z + r * S + e, 0.0f);
         }"""
 
 _HEADER_DIAG = "norm[r] + sink.cfm"
 
 _SUPPORT_BELOW = """                if (!add)
-                    for (int e = base; e < rank(c); ++e) ST(Z + e, 0.0f);
+                    for (int e = base; e < rank(c); ++e) STORE_rows(Z + e, 0.0f);
 """
 
 _SUPPORT_WRENCH = """                    const auto& at = r == 0 ? unit.point : unit.friction_point;
@@ -878,10 +868,10 @@ def _support_snippet(parent: tuple, first: tuple, node: tuple, rows: int, record
         entries_end="count",
         zrow="row0",
         diag=_HEADER_DIAG,
-        rd="__ldg(p)",
     )
     walk = walk_prelude(((parent, first),), rows, half)
-    return dual_native(body, preludes=(walk, walk_row_prelude(rows), _support_table(node)))
+    words = memory_words(_INPUTS, _ROWS)
+    return dual_native(body, preludes=(walk, walk_row_prelude(rows), _support_table(node), words))
 
 
 @wp.struct
@@ -1007,9 +997,9 @@ def unit_walker(name: str, snippet: str) -> wp.Function:
 
 _PACKED_START = """    // The unit's packed rows cleared: each side's walk stores its path's entries, the rest of the row stays zero.
     for (int r = 0; r < rows; ++r)
-        for (int e = 0; e < S; ++e) ST(Z + r * S + e, 0.0f);
+        for (int e = 0; e < S; ++e) STORE_rows(Z + r * S + e, 0.0f);
     // The row's first side (its layout, dense_rows.row_sides), read after its records' writer wrote it.
-    const int first = RD(sink.layout.sides.data + ((size_t)unit.line * sink.layout.sides.shape[1] + unit.slot)).c[0];
+    const int first = LOAD_rows(sink.layout.sides.data + ((size_t)unit.line * sink.layout.sides.shape[1] + unit.slot)).c[0];
 """
 
 _PACKED_SIDE = """$skip$tree
@@ -1028,10 +1018,10 @@ _PACKED_SIDE = """$skip$tree
         const bool add = seeds > 1;
         if (add) reread = true;"""
 
-_PACKED_BASE = """sink.layout.dense != 0 ? RD(sink.layout.offset.data + art) : (art == first ? 0 : RD(sink.layout.dofs.data + first))"""
+_PACKED_BASE = """sink.layout.dense != 0 ? LOAD_inputs(sink.layout.offset.data + art) : (art == first ? 0 : LOAD_inputs(sink.layout.dofs.data + first))"""
 
 _STAR_SKIP = """        // A key of the star is one step to the world, into the row's slot (star_step): the writer's, not the walk's.
-        if (RD(sink.response_dofs.data + art) == sink.star) continue;
+        if (LOAD_inputs(sink.response_dofs.data + art) == sink.star) continue;
 """
 
 _PACKED_WRENCH = """                    const auto& at = r == 0 ? (k == 0 ? unit.point : unit.point_b) : unit.friction_point;
@@ -1044,15 +1034,15 @@ _PACKED_RELEASE = (
 
 
 _CLASS_TREE = """        // The tree's class: its path from the classes' tables in constant memory.
-        WALK_TREE(RD(walk.cls.data + art));"""
+        WALK_TREE(LOAD_inputs(walk.cls.data + art));"""
 
 _UNIT_ART = "side == 0 ? art_a : art_b"
 
 _CLASS_START = """    // The unit's packed rows cleared: each side's walk stores its class's entries, the rest of the row stays zero.
     for (int r = 0; r < rows; ++r)
-        for (int e = 0; e < S; ++e) ST(Z + r * S + e, 0.0f);
+        for (int e = 0; e < S; ++e) STORE_rows(Z + r * S + e, 0.0f);
     // The row's sides in their order (row_records.row_sides): the first side's class's entries, then the second's.
-    const wp::vec2i sides = RD(sink.layout.sides.data + ((size_t)unit.line * sink.layout.sides.shape[1] + unit.slot));
+    const wp::vec2i sides = LOAD_rows(sink.layout.sides.data + ((size_t)unit.line * sink.layout.sides.shape[1] + unit.slot));
     int side_class[2] = {-1, -1};
 """
 
@@ -1060,25 +1050,25 @@ _CLASS_SIDE = """$tree
         // The side's support class (packed_rows.row_classes): its seeds' endpoints (their root paths) and their union.
         int seeds = 0, e0 = -1, e1 = -1;
         if (covector) {
-            e0 = e1 = RD(sink.classes.limit_class.data + dof0);
+            e0 = e1 = LOAD_inputs(sink.classes.limit_class.data + dof0);
             seeds = 1;
             if (dof1 >= 0) {
-                e1 = RD(sink.classes.limit_class.data + dof1);
+                e1 = LOAD_inputs(sink.classes.limit_class.data + dof1);
                 seeds = 2;
             }
         } else {
             if (body_a >= 0 && art_a == art) {
-                e0 = e1 = RD(sink.classes.body_class.data + body_a);
+                e0 = e1 = LOAD_inputs(sink.classes.body_class.data + body_a);
                 ++seeds;
             }
             if (body_b >= 0 && art_b == art) {
-                e1 = RD(sink.classes.body_class.data + body_b);
+                e1 = LOAD_inputs(sink.classes.body_class.data + body_b);
                 if (seeds++ == 0) e0 = e1;
             }
         }
         if (seeds == 0) continue;
         const int cls = CLASS_OF(sink.classes, e0, e1), base = count;
-        count += RD(sink.classes.class_count.data + cls);
+        count += LOAD_inputs(sink.classes.class_count.data + cls);
         side_class[side] = cls;
         int at = -1;
         // Two seeds on one tree add where their paths meet, then the rows are re-read for their norms.
@@ -1091,7 +1081,7 @@ _CLASS_RELEASE = """            WALK_RELEASE_ON(release, art, Z, rows, S, [&](co
             });"""
 
 _CLASS_CLOSE = """    // The row's classes, its first side's then its second's (packed_rows.CLASS_SIDES).
-    for (int r = 0; r < rows; ++r) ST(sink.classes.row_class.data + row0 + r, CLASS_WORD(sink.classes, side_class[0], side_class[1]));
+    for (int r = 0; r < rows; ++r) STORE_rows(sink.classes.row_class.data + row0 + r, CLASS_WORD(sink.classes, side_class[0], side_class[1]));
 """
 
 
@@ -1138,15 +1128,14 @@ def packed_walker(
         entries_end="S",
         zrow="(unit.group * sink.entries.shape[1] + unit.slot)" if star else "row0",
         diag="norm[r]" if star else _HEADER_DIAG,
-        # RD a plain load here, not the support writer's non-coherent __ldg.
-        rd="*p",
     )
     half = record_half(side)
     walk = walk_prelude(tables, rows, half)
     tag = ("_spin" if spin else "") + walk.name.removeprefix(f"walk_{rows}")
     tag += "_star" if star else ""
     tag += "_classes" if classes else ""
-    snippet = dual_native(body, preludes=(walk, walk_row_prelude(rows), *((class_rank(),) if classes else ())))
+    words = memory_words(_PACKED_INPUTS, _ROWS)
+    snippet = dual_native(body, preludes=(walk, walk_row_prelude(rows), *((class_rank(),) if classes else ()), words))
     return unit_walker(f"packed_walk_{rows}{tag}", snippet)
 
 
@@ -1154,19 +1143,6 @@ _BLOCK = """    // A block of up to $rows covector rows of the packed sink from 
     // cleared, then each tree's rows walked together (WALK_SWEEP), a walk a seed (a mimic's second its own, adding
     // where the two meet), then each row's slips released, its diagonal |z|^2 + cfm and its incident J v_hat. A row's
     // arithmetic is the unit walker's (_SUPPORT) on the row alone.
-#if defined(__CUDA_ARCH__)
-    const auto ST = [](auto* p, const auto v) {
-        __builtin_assume(__isGlobal(p));
-        *p = v;
-    };
-    const auto RW = [](const float* p) -> float {
-        __builtin_assume(__isGlobal(p));
-        return *p;
-    };
-#else
-    const auto ST = [](auto* p, const auto v) { *p = v; };
-    const auto RW = [](const float* p) -> float { return *p; };
-#endif
     const auto& walk = sink.walk;
     const auto& release = sink.release;
     const int S = sink.entries.shape[2];
@@ -1179,7 +1155,7 @@ WALK_UNROLLED
         norm[r] = incident[r] = 0.0f;
         if (r >= count || dof0[r] < 0) continue;
         pending |= 1 << r;
-        for (int e = 0; e < S; ++e) ST(Z + r * S + e, 0.0f);
+        for (int e = 0; e < S; ++e) STORE_rows(Z + r * S + e, 0.0f);
     }
     // The block's trees in turn: the first row still pending names the next.
 #pragma unroll 1
@@ -1192,11 +1168,11 @@ WALK_UNROLLED
         for (int r = 0; r < $rows; ++r)
             if (((pending >> r) & 1) != 0 && arts[r] == art) mine |= 1 << r;
         pending &= ~mine;
-        if (*(sink.response_dofs.data + art) <= 0) continue;
-        const int j0 = walk.joint_start.data[art], d0 = walk.dof_start.data[art];
+        if (LOAD_inputs(sink.response_dofs.data + art) <= 0) continue;
+        const int j0 = LOAD_inputs(walk.joint_start.data + art), d0 = LOAD_inputs(walk.dof_start.data + art);
 $tree
         // A covector row's one side: its tree's first world coordinate (dense) or entry 0.
-        const int base = sink.layout.dense != 0 ? sink.layout.offset.data[art] : 0;$classes
+        const int base = sink.layout.dense != 0 ? LOAD_inputs(sink.layout.offset.data + art) : 0;$classes
         const float* data = walk.data.data + (size_t)d0 * $coordinate;
         const float* link = walk.link.data + (size_t)j0 * $link;
         const float* vh = sink.v_hat.data + d0;
@@ -1211,25 +1187,25 @@ WALK_UNROLLED
             seed[2 * r] = value0[r];
             seed[2 * r + 1] = value1[r];
             if (at[2 * r + 1] >= 0) adds |= 1 << r;
-            body[2 * r] = at[2 * r] >= 0 ? walk.dof_body.data[d0 + at[2 * r]] : -1;
-            body[2 * r + 1] = at[2 * r + 1] >= 0 ? walk.dof_body.data[d0 + at[2 * r + 1]] : -1;
+            body[2 * r] = at[2 * r] >= 0 ? LOAD_inputs(walk.dof_body.data + (d0 + at[2 * r])) : -1;
+            body[2 * r + 1] = at[2 * r + 1] >= 0 ? LOAD_inputs(walk.dof_body.data + (d0 + at[2 * r + 1])) : -1;
         }
         reread |= adds;
         WALK_SWEEP(data, link, at, body, seed, [&](const int w, const int c, const float z) {
             const int r = w >> 1;
             float* const entry = Z + r * S + $entry;
             if (((adds >> r) & 1) != 0) {
-                ST(entry, RW(entry) + z);
+                STORE_rows(entry, LOAD_rows(entry) + z);
             } else {
-                ST(entry, z);
+                STORE_rows(entry, z);
                 norm[r] += z * z;
             }
         });
 WALK_UNROLLED
         for (int k = 0; k < 2 * $rows; ++k)
-            if (at[k] >= 0) incident[k >> 1] += seed[k] * vh[at[k]];
+            if (at[k] >= 0) incident[k >> 1] += seed[k] * LOAD_inputs(vh + at[k]);
         // A slipping tree's release (the predictor's border) on each of its rows (WALK_RELEASE_ON).
-        if (release.count.data[art] > 0) {
+        if (LOAD_inputs(release.count.data + art) > 0) {
             reread |= mine;
 WALK_UNROLLED
             for (int r = 0; r < $rows; ++r)
@@ -1243,12 +1219,12 @@ WALK_UNROLLED
         if (((reread >> r) & 1) != 0) {
             norm[r] = 0.0f;
             for (int e = 0; e < S; ++e) {
-                const float zc = RW(Z + r * S + e);
+                const float zc = LOAD_rows(Z + r * S + e);
                 norm[r] += zc * zc;
             }
         }
-        ST(sink.diag.data + rec0 + r, norm[r] + sink.cfm);
-        ST(sink.row_incident.data + rec0 + r, incident[r]);$close
+        STORE_rows(sink.diag.data + rec0 + r, norm[r] + sink.cfm);
+        STORE_rows(sink.row_incident.data + rec0 + r, incident[r]);$close
     }"""
 
 _BLOCK_CLASSES = """
@@ -1258,8 +1234,8 @@ WALK_UNROLLED
         for (int r = 0; r < $rows; ++r) {
             cls[r] = cursor[r] = -1;
             if (((mine >> r) & 1) == 0) continue;
-            const int e0 = sink.classes.limit_class.data[dof0[r]];
-            cls[r] = row_class[r] = CLASS_OF(sink.classes, e0, dof1[r] >= 0 ? sink.classes.limit_class.data[dof1[r]] : e0);
+            const int e0 = LOAD_inputs(sink.classes.limit_class.data + dof0[r]);
+            cls[r] = row_class[r] = CLASS_OF(sink.classes, e0, dof1[r] >= 0 ? LOAD_inputs(sink.classes.limit_class.data + dof1[r]) : e0);
         }"""
 
 
@@ -1277,7 +1253,7 @@ def block_walker(rows: int, side: bool, tables: tuple, classes: bool = False) ->
         rows=rows,
         coordinate=WALK_COORDINATE,
         link=WALK_LINK,
-        tree="        WALK_TREE(walk.cls.data[art]);" if len(tables) > 1 else "",
+        tree="        WALK_TREE(LOAD_inputs(walk.cls.data + art));" if len(tables) > 1 else "",
         declare=f"\n    int row_class[{rows}];\n    for (int r = 0; r < {rows}; ++r) row_class[r] = -1;"
         if classes
         else "",
@@ -1285,7 +1261,7 @@ def block_walker(rows: int, side: bool, tables: tuple, classes: bool = False) ->
         entry="CLASS_NEXT(sink.classes, cls[r], cursor[r], c)" if classes else "base + c",
         place="CLASS_RANK(sink.classes, cls[r], c)" if classes else "base + c",
         close=(
-            "\n        ST(sink.classes.row_class.data + rec0 + r, CLASS_WORD(sink.classes, row_class[r], -1));"
+            "\n        STORE_rows(sink.classes.row_class.data + rec0 + r, CLASS_WORD(sink.classes, row_class[r], -1));"
             if classes
             else ""
         ),
@@ -1308,7 +1284,8 @@ def block_walker(rows: int, side: bool, tables: tuple, classes: bool = False) ->
     }
     name = f"block_walk_{rows}" + walk.name.removeprefix(f"walk_{2 * rows}") + ("_classes" if classes else "")
     native.__name__ = native.__qualname__ = name
-    return wp.func_native(dual_native(body, preludes=(walk, *((class_rank(),) if classes else ()))))(native)
+    preludes = (walk, *((class_rank(),) if classes else ()), memory_words(_PACKED_INPUTS, _ROWS))
+    return wp.func_native(dual_native(body, preludes=preludes))(native)
 
 
 SUPPORT_UNIT_LANES = 16

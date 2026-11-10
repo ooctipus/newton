@@ -5,8 +5,8 @@
 
 The math and physics of a kernel never name a cache detail. A kernel declares each operand's :class:`Place` (a lane's
 registers, a block's shared stage, a constant table, global memory read-only, coherent, streamed ahead or kept in
-L2) and its body reads and writes the operand through that place's words (:func:`access`):
-the place is data, chosen in the plan, and the body's text does not change with it. This module is
+L2) and its body reads and writes the operand through that place's words (:func:`read`):
+the place is data, chosen by a rule, and the body's text does not change with it. This module is
 the one place every such concept lives:
 
 - the device: :class:`Device`, its memory hierarchy and occupancy, read once (:func:`device`);
@@ -53,12 +53,12 @@ __all__ = [
     "Operand",
     "Place",
     "Staging",
-    "access",
     "arch_budget",
     "built_for",
     "carveout",
     "device",
     "granules",
+    "read",
     "stage",
     "static_budget",
     "table",
@@ -289,90 +289,74 @@ class Place(enum.Enum):
     load and store kind only; like a carveout move, it is refused without a measurement (none uses it)."""
 
 
-# Each word: its CUDA text and its CPU twin (the CPU's one thread: plain loads and stores, no hint).
+# Each word's lambda: its CUDA text and its CPU twin (the CPU's one thread: plain loads and stores, no hint), declared
+# under its own name (words) or as an operand's (read).
 _WORDS = {
-    "LDG": (
-        "const auto LDG = [](const auto* p) { return __ldg(p); };",
-        "const auto LDG = [](const auto* p) { return *p; };",
-    ),
+    "LDG": ("[](const auto* p) { return __ldg(p); }", "[](const auto* p) { return *p; }"),
     "LD": (
-        """const auto LD = [](const auto* p) {
+        """[](const auto* p) {
         __builtin_assume(__isGlobal(p));
         return *p;
-    };""",
-        "const auto LD = [](const auto* p) { return *p; };",
+    }""",
+        "[](const auto* p) { return *p; }",
     ),
     "ST": (
-        """const auto ST = [](auto* p, const auto v) {
+        """[](auto* p, const auto v) {
         __builtin_assume(__isGlobal(p));
         *p = v;
-    };""",
-        "const auto ST = [](auto* p, const auto v) { *p = v; };",
+    }""",
+        "[](auto* p, const auto v) { *p = v; }",
     ),
     "ADD": (
-        "const auto ADD = [](auto& word, auto n) { return atomicAdd(&word, n); };",
-        """const auto ADD = [](auto& word, auto n) {
+        "[](auto& word, auto n) { return atomicAdd(&word, n); }",
+        """[](auto& word, auto n) {
         const auto old = word;
         word += n;
         return old;
-    };""",
+    }""",
     ),
-    "TOUCH": (
-        'const auto TOUCH = [](const auto p) { asm volatile("prefetch.global.L1 [%0];" ::"l"(p)); };',
-        "const auto TOUCH = [](const auto) {};",
-    ),
+    "TOUCH": ('[](const auto p) { asm volatile("prefetch.global.L1 [%0];" ::"l"(p)); }', "[](const auto) {}"),
     "FETCH": (
-        f"""const auto FETCH = [&](const void* start, const int bytes, const int lane, const int lanes) {{
+        f"""[&](const void* start, const int bytes, const int lane, const int lanes) {{
         const size_t end = reinterpret_cast<size_t>(start) + (size_t)bytes;
         for (size_t line = (reinterpret_cast<size_t>(start) & ~(size_t){L1_LINE_BYTES - 1}) + (size_t){L1_LINE_BYTES} * lane;
              line < end; line += (size_t){L1_LINE_BYTES} * lanes)
             TOUCH(line);
-    }};""",
-        "const auto FETCH = [](const void*, const int, const int, const int) {};",
+    }}""",
+        "[](const void*, const int, const int, const int) {}",
     ),
-    "LDCG": (
-        "const auto LDCG = [](const auto* p) { return __ldcg(p); };",
-        "const auto LDCG = [](const auto* p) { return *p; };",
-    ),
-    "STCG": (
-        "const auto STCG = [](auto* p, const auto v) { __stcg(p, v); };",
-        "const auto STCG = [](auto* p, const auto v) { *p = v; };",
-    ),
+    "LDCG": ("[](const auto* p) { return __ldcg(p); }", "[](const auto* p) { return *p; }"),
+    "STCG": ("[](auto* p, const auto v) { __stcg(p, v); }", "[](auto* p, const auto v) { *p = v; }"),
 }
-
-_PLACE_WORDS = {
-    Place.REGISTERS: (),
-    Place.SHARED: (),
-    Place.CONSTANT: (),
-    Place.READ_ONLY: ("LDG",),
-    Place.GLOBAL: ("LD", "ST", "ADD"),
-    Place.STREAMED: ("LDG", "TOUCH", "FETCH"),
-    Place.PERSISTING: ("LDCG", "STCG"),
-}
-"""The words of each place's global accesses. Registers, the shared stage and constant tables are read by name (their
-storage is :data:`HELD`, :data:`SHARED_STORAGE` and :func:`table`)."""
 
 _LOAD = {Place.READ_ONLY: "LDG", Place.GLOBAL: "LD", Place.STREAMED: "LDG", Place.PERSISTING: "LDCG"}
 _STORE = {Place.GLOBAL: "ST", Place.PERSISTING: "STCG"}
 
 
+def _declare(declared) -> tuple[str, str]:
+    # Each (name, word) of declared as the native statement const auto name = word's lambda, for CUDA and the CPU.
+    declared = tuple(declared)
+    return tuple("\n".join(f"    const auto {n} = {_WORDS[w][cpu]};" for n, w in declared) for cpu in (0, 1))
+
+
 @dataclasses.dataclass(frozen=True)
 class Operand:
-    """An operand of a kernel in global memory and the place the plan gives it.
+    """An operand of a kernel in global memory, as the read rule takes it (:func:`read`).
 
     Args:
-        name: The operand's name in the body: it loads ``LOAD_<name>(p)`` and, at a place that stores, stores
+        name: The operand's name in the body: it loads ``LOAD_<name>(p)`` and, where the kernel writes it, stores
             ``STORE_<name>(p, v)``.
-        place: Where it lives: :attr:`Place.READ_ONLY`, :attr:`Place.GLOBAL`, :attr:`Place.STREAMED` or
-            :attr:`Place.PERSISTING`.
+        writes: Whether a thread writes it while the kernel runs.
+        measured: The global place a measurement chose over the rule's, or ``None``.
     """
 
     name: str
-    place: Place
+    writes: bool = False
+    measured: Place | None = None
 
     def __post_init__(self):
-        if self.place not in _LOAD:
-            raise ValueError(f"operand {self.name}: {self.place} is not a place in global memory")
+        if self.measured is not None and self.measured not in (_STORE if self.writes else _LOAD):
+            raise ValueError(f"operand {self.name}: {self.measured} is not a global place for it")
 
 
 def words(*names: str) -> tuple[str, str]:
@@ -381,22 +365,21 @@ def words(*names: str) -> tuple[str, str]:
     unknown = set(names) - set(_WORDS)
     if unknown:
         raise ValueError(f"no memory words {sorted(unknown)}")
-    return tuple("\n".join(f"    {_WORDS[name][cpu]}" for name in _WORDS if name in names) for cpu in (0, 1))
+    return _declare((name, name) for name in _WORDS if name in names)
 
 
-def access(*declared: Place | Operand) -> tuple[str, str]:
-    """The words a body declares: each place's words once, in one order, and each operand's own load and store
-    (``LOAD_<name>``, ``STORE_<name>``), as ``(cuda, cpu)`` native statements. A body that reads an operand by its own
-    words keeps its text when the plan moves the operand to another place."""
-    places = {getattr(d, "place", d) for d in declared}
-    names = [name for name in _WORDS if any(name in _PLACE_WORDS[place] for place in places)]
-    own = []
-    for d in declared:
-        if isinstance(d, Operand):
-            own.append(f"const auto LOAD_{d.name} = {_LOAD[d.place]};")
-            if d.place in _STORE:
-                own.append(f"const auto STORE_{d.name} = {_STORE[d.place]};")
-    return tuple("\n".join(f"    {text}" for text in (*(_WORDS[name][cpu] for name in names), *own)) for cpu in (0, 1))
+def read(*operands: Operand) -> tuple[str, str]:
+    """The read rule: each operand's words by its place, ``LDG`` (:attr:`Place.READ_ONLY`) where no thread writes it
+    while the kernel runs, ``LD`` and ``ST`` (:attr:`Place.GLOBAL`) where one does, or the place a measurement chose
+    (``LDCG`` and ``STCG`` for data read once). As ``(cuda, cpu)`` native statements: each operand's ``LOAD_<name>``
+    and, where the kernel writes it, ``STORE_<name>``, so its text does not change with its place."""
+    declared = []
+    for operand in operands:
+        place = operand.measured or (Place.GLOBAL if operand.writes else Place.READ_ONLY)
+        declared.append((f"LOAD_{operand.name}", _LOAD[place]))
+        if operand.writes:
+            declared.append((f"STORE_{operand.name}", _STORE[place]))
+    return _declare(declared)
 
 
 SHARED_STORAGE = ("    #define SHARED __shared__", "    #define SHARED")

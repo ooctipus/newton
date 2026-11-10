@@ -50,9 +50,8 @@ from the same text:
     block group's ``BLOCK_SUM``, ``BLOCK_MAXIMUM``, ``BLOCK_ARGMAX``), ``HELD``
     (a distributed array over the lanes: ``HELD_PICK``, ``HELD_ROW``,
     ``HELD_LOAD``), ``LANE_FEED`` (``FEED``, a held batch feeding one chain)
-    and the memory toolkit's words of the places a body declares, ``memory_words(...)`` (:mod:`.memory`'s
-    ``LDG``, ``ST``, ``ADD``, ``TOUCH``, ``FETCH``, ...). Warp functions over the words take their snippet from
-    :func:`lane_word`.
+    and the words of the operands a body declares, ``memory_words(...)`` (the memory toolkit's read rule,
+    :func:`.memory.read`). Warp functions over the words take their snippet from :func:`lane_word`.
 
 ``ORDERED_TILES``
     Ordered reservation across a launch's blocks (:mod:`newton._src.core.ordered_reserve`):
@@ -420,12 +419,10 @@ the lane group's, as :data:`STATUS_CLOCK`'s. After a lane-group prelude."""
 
 
 @cache
-def memory_words(*declared: memory.Place | memory.Operand) -> DevicePrelude:
-    """The memory toolkit's words of the places and operands a body declares (:func:`.memory.access`): ``LDG`` read
-    only, ``LD``/``ST``/``ADD`` global, ``LDG``/``TOUCH``/``FETCH`` streamed, ``LDCG``/``STCG`` persisting, and each
-    operand's ``LOAD_<name>`` (and ``STORE_<name>``). The CPU's are plain loads and stores, no hint."""
-    cuda, cpu = memory.access(*declared)
-    return DevicePrelude("memory_" + "_".join(d.name for d in declared), cuda, cpu)
+def memory_words(*operands: memory.Operand) -> DevicePrelude:
+    """The words of the operands a body declares, as the read rule places them (:func:`.memory.read`): each operand's
+    ``LOAD_<name>`` and, where the kernel writes it, ``STORE_<name>``. The CPU's are plain loads and stores, no hint."""
+    return DevicePrelude("memory_" + "_".join(operand.name for operand in operands), *memory.read(*operands))
 
 
 STATUS_CLOCK = DevicePrelude(
