@@ -438,8 +438,8 @@ def held_lanes(tree: TreePlan, groups: int, device: Device) -> int:
     return lanes
 
 
-HELD_HIDING = 3
-"""Warps a scheduler the held tree's stages need (``Work.hiding``): global scratch puts each access on its chain."""
+HELD_HIDING = 2
+"""Warps a scheduler the held tree's chain needs (``Work.hiding``): kuka's staged state beats global scratch at 8."""
 
 
 def held_stage(layout: TreeLayout, groups: int, device: Device) -> TreeLayout:
