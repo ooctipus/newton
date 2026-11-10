@@ -8,6 +8,7 @@ the held lanes, the support walkers' grid, the launch bounds and H8's and ZY's c
 names it (the fill at 512-4,096 worlds, the writer's lanes at 16,384 worlds, the predictor's bound on sm_103).
 """
 
+import dataclasses
 import types
 import unittest
 from unittest import mock
@@ -189,6 +190,29 @@ class TestShapeAgainstTodaysRules(unittest.TestCase):
             self.assertIs(placed(cabinet, device).metadata, Place.STREAMED)
         for config, device, worlds in ((g1, PRO, 16384), (cabinet, PRO, 128), (cabinet, CPU, 16384)):
             self.assertEqual(placed(config, device, worlds), sweep_routes.STAGED_ROWS)
+
+    def test_a_bucket_beside_the_tiers_streams_its_record(self):
+        """allegro's record stages over every world on the GB300 and streams beside the tiers, sure of no live world."""
+        allegro = sweep_routes.GeneralSweep(
+            258,
+            30,
+            22,
+            "103",
+            pitch=288,
+            max_row_dofs=22,
+            free_rows=False,
+            block_warps=2,
+            active_rows=True,
+            torsion=True,
+        )
+
+        def placed(device, live):
+            work = dataclasses.replace(allegro.work(16384, allegro.staging()), live=live)
+            return allegro.places.placed(shape(work, device).staging).metadata
+
+        expected = {GB300: (Place.SHARED, Place.STREAMED), PRO: (Place.STREAMED,) * 2, CPU: (Place.SHARED,) * 2}
+        for device, places in expected.items():
+            self.assertEqual((placed(device, None), placed(device, 0)), places)
 
     def test_the_held_tree_stages_at_its_own_level(self):
         """kuka's held forest keeps its state staged on the PRO at 14 of 24 warps, which the general level declines."""
