@@ -32,7 +32,6 @@ from newton._src.solvers.feather_pgs.friction_patches import (
     _finish_contact,
     _local_surface,
     _PatchFrame,
-    _PatchWorlds,
     patch_routes,
 )
 
@@ -199,17 +198,14 @@ def _build(
     frame: _PatchFrame,
     prev: _PatchFrame,
     patches: FrictionPatches,
-    history: _PatchWorlds,
 ):
     """One thread per sorted body pair, over the whole capacity; the pair's build is the module's (the one-wrench law),
-    its previous pairs searched over the whole history, one world of every slot (``history``)."""
+    its previous pairs searched over the whole history."""
     start = wp.tid()
     end = wp.min(count[0], frame.center.shape[0])
     if start >= end:
         return
-    _build_pair(
-        start, end, prev.center.shape[0], q, previous_q, shape_transform, shape_radius, frame, prev, patches, history
-    )
+    _build_pair(start, end, prev.center.shape[0], q, previous_q, shape_transform, shape_radius, frame, prev, patches)
 
 
 @wp.kernel(enable_backward=False)
@@ -388,12 +384,6 @@ class ReferencePatches:
         self.previous = self._frame(capacity, device)
         self.previous_world = wp.full(capacity, -1, dtype=int, device=device)
         self.previous_q = wp.zeros(model.body_count, dtype=wp.transform, device=device)
-        # The whole history as one world: _build_pair searches every stored slot.
-        self.history = _PatchWorlds()
-        self.history.body_bucket = wp.zeros(0, dtype=int, device=device)
-        self.history.key_stride = 1
-        self.history.count = self.history.cursor = wp.zeros(1, dtype=int, device=device)
-        self.history.start = self.history.stored = wp.array([0, capacity], dtype=int, device=device)
 
     def update_geometry(self, model):
         """Refresh scales and retire affected history after explicit geometry edits."""
@@ -531,7 +521,6 @@ class ReferencePatches:
                 self.current,
                 self.previous,
                 self.view,
-                self.history,
             ],
             device=model.device,
         )
