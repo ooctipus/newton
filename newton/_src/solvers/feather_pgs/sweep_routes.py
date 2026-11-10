@@ -16,8 +16,9 @@ from collections.abc import Callable
 import warp as wp
 
 from ...core.execution import Work, device_lanes
-from ...core.memory import REGISTERS_PER_THREAD, Buffer, Place, Staging
+from ...core.memory import REGISTERS_PER_THREAD, Buffer, Operand, Place, Staging
 from . import kernel_template, sweep_units
+from .device_preludes import memory_words
 from .factor.walk import FREE_BODY_WALK, WALK_COORDINATE, WALK_LINK, WalkTrees, walk_down_prelude
 from .kernel_template import Dispatch
 from .packed_rows import CLASS_SIDES, PACKED_SIDES_BY_SIDE, PACKED_SIDES_DENSE
@@ -406,6 +407,11 @@ def _unit_apply(pad: str, *, torsion: bool = False) -> str:
     return indent("\n".join(lines), pad)
 
 
+# The colored units' slots (sweep_units.SlotLayout): the unit builder writes them a launch before the sweep, and no thread
+# of the sweep does, so the memory toolkit's read rule reads them by LDG.
+_SLOTS = Operand("slots")
+
+
 def _colored_units(free: WorldRows, laws: RowLaws, M_MF: int, units: int) -> str:
     """A color's units, one thread each, at block stride: each loads its slot's fields at once
     (:data:`.sweep_units.SLOT_FIELDS`, field by field across the color's ``units`` slots) and runs the free-body row
@@ -502,7 +508,7 @@ const float mf_diag = __int_as_float(meta.y);"""
         check="mf_diag",
         pad=" " * 20,
     )
-    visit = f"""                    const int4 slot = __ldg(reinterpret_cast<const int4*>(&color_slot.data[(off_unit + place) * 4]));
+    visit = f"""                    const int4 slot = LOAD_slots(reinterpret_cast<const int4*>(&color_slot.data[(off_unit + place) * 4]));
                     const int unit_row = slot.x, rows = slot.y, dof_a = slot.z, dof_b = slot.w;
                     const int slot_base = unit_slot * {fields * units} + place;
                     const int word_base = unit_slot * {words * units} + place;
@@ -618,7 +624,7 @@ def _colored_metrics(units: int, *, torsion: bool = False) -> str:
         "    {",
         "        const int staged = color_offset.data[off_color + color_count.data[world]];",
         "        for (int p = tid; p < staged; p += blockDim.x) {",
-        "            const int4 slot = __ldg(reinterpret_cast<const int4*>(&color_slot.data[(off_unit + p) * 4]));",
+        "            const int4 slot = LOAD_slots(reinterpret_cast<const int4*>(&color_slot.data[(off_unit + p) * 4]));",
         # A friction unit: three rows, or four with its spin row where spin rows may appear (sweep.spin_row).
         "            if ((slot.y & 7) < 3) continue;"
         if torsion
@@ -1084,7 +1090,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
 {end_first_warp}"""
     # The rows' layout is the configuration's: rows as wide as the world (and no classes) sit at their coordinates.
     packed = PACKED_SIDES_DENSE if not sweep.support_classes and max_row_dofs == D else PACKED_SIDES_BY_SIDE
-    sides = (packed, *((CLASS_SIDES,) if sweep.support_classes else ()))
+    sides = (packed, *((CLASS_SIDES,) if sweep.support_classes else ()), *((memory_words(_SLOTS),) if colored else ()))
     return sweep.native(body, lanes=lanes, rows=sides, walks=(FREE_BODY_WALKS,)), staging
 
 
