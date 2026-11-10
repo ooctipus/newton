@@ -5,7 +5,6 @@
 
 from dataclasses import dataclass
 
-from ...core.memory import STATIC_SHARED_BYTES
 from .device_preludes import dual_native, lane_group, substitute
 
 
@@ -41,9 +40,10 @@ class TreeLayout:
     # (linear and angular axes, or several angular ones). The motion scan
     # then reads each joint's own bias instead of taking it as zero.
     own_bias: bool = False
-    # Static shared memory a block may declare on the group's device [B]
-    # (:func:`.staging.static_budget`): the state block's placement reads it.
-    shared_budget: int = STATIC_SHARED_BYTES
+    # Whether a block's state lies in shared memory, as the stage keeps it on
+    # the group's launch (:func:`.tree_kinetic_state.held_stage`), else in the
+    # plan's global scratch.
+    staged: bool = True
 
     def __post_init__(self):
         if not (self.bodies >= 1 and self.dofs >= 0 and 0 <= self.max_depth < self.bodies):
@@ -102,11 +102,6 @@ class TreeLayout:
     def total(self):
         """Words of a tree's state block."""
         return self.origin_offset + 6 * len(self.roots)
-
-    @property
-    def global_block(self):
-        """Whether a block of state exceeds the device's shared memory and lives in the plan's global scratch."""
-        return 4 * self.total * self.pack > self.shared_budget
 
     @property
     def rounds(self):

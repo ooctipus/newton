@@ -20,6 +20,7 @@ from newton._src.core.execution import Queue, Use, Work, shape
 from newton._src.core.memory import CPU, Device, Place, carveout
 from newton._src.solvers.feather_pgs import sweep_routes, tree_kinetic_state, walk_rows
 from newton._src.solvers.feather_pgs.factor import walk as factor_walk
+from newton._src.solvers.feather_pgs.tree_kinetic_layout import TreeLayout
 
 PRO = Device.of(120, 188, 101_376)
 GB300 = Device.of(103, 152, 232_448)
@@ -188,6 +189,15 @@ class TestShapeAgainstTodaysRules(unittest.TestCase):
             self.assertIs(placed(cabinet, device).metadata, Place.STREAMED)
         for config, device, worlds in ((g1, PRO, 16384), (cabinet, PRO, 128), (cabinet, CPU, 16384)):
             self.assertEqual(placed(config, device, worlds), sweep_routes.STAGED_ROWS)
+
+    def test_the_held_tree_stages_at_its_own_level(self):
+        """kuka's held forest keeps its state staged on the PRO at 14 of 24 warps, which the general level declines."""
+        roots = {"roots": (0, 30, 31), "root_coordinates": (0, 6, 6), "root_offsets": (0, 23, 29)}
+        layout = TreeLayout(32, 35, 35, 1, 0, 0, tuple(range(35)), lanes=32, root_families=(35, 0, 0), **roots)
+        self.assertTrue(tree_kinetic_state.held_stage(layout, 16384, PRO).staged)
+        with mock.patch.object(tree_kinetic_state, "HELD_HIDING", memory.HIDING_WARPS):
+            self.assertFalse(tree_kinetic_state.held_stage(layout, 16384, PRO).staged)
+        self.assertTrue(tree_kinetic_state.held_stage(layout, 16384, GB300).staged)
 
     def test_fill_differs_only_where_named(self):
         # The rule fills the device's resident threads (1,536 or 2,048 a multiprocessor), fill_lanes 1,024.

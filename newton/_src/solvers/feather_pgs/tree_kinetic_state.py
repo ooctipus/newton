@@ -77,7 +77,7 @@ HELD_PLAN = (
     Field("free_root_local", wp.int32, ("free_root",), owner="plan"),
     Field("free_root_dof", wp.int32, ("free_root",), owner="plan"),
     Field("dof_passive", wp.int32, ("dof",), owner="plan"),
-    # The trees' state blocks where they exceed shared memory (TreeLayout.global_block): a tree's TOTAL words.
+    # The trees' state blocks where the stage declines them (TreeLayout.staged): a tree's TOTAL words.
     Field("scratch", wp.float32, ("scratch",), owner="plan"),
 )
 """A held group's template tree as its kernels read it: the scan plan (:data:`.tree_scan.SCAN_PLAN`) and the
@@ -438,6 +438,18 @@ def held_lanes(tree: TreePlan, groups: int, device: Device) -> int:
     return lanes
 
 
+HELD_HIDING = 3
+"""Warps a scheduler the held tree's stages need (``Work.hiding``): global scratch puts each access on its chain."""
+
+
+def held_stage(layout: TreeLayout, groups: int, device: Device) -> TreeLayout:
+    """``layout`` with its state's place on ``device``: :func:`~.memory.stage` on its launch, at :data:`HELD_HIDING`."""
+    state = memory.Buffer("values_all", "float", layout.total * layout.pack, alternative=memory.Place.GLOBAL)
+    shared = memory.Staging((state,))
+    work = Work(groups // layout.pack, lanes=layout.block, block=layout.block, shared=shared, hiding=HELD_HIDING)
+    return dataclasses.replace(layout, staged=state.name in shape(work, device).staging)
+
+
 def held_schedules(tree: TreePlan, lanes: int, *, chains: bool) -> HeldSchedules:
     """The schedules of a held group's scans at ``lanes`` lanes per tree, from its tree's data
     (:func:`.tree_scan.choose_schedule`).
@@ -782,12 +794,9 @@ def _packed(layout: TreeLayout, name: str, ctype: str, words: int) -> str:
 
 
 def _placed_block(layout: TreeLayout, name: str, words: int) -> str:
-    """Native statements binding ``float* name`` to this tree's block of ``words`` floats, the one placement rule: shared
-    memory (:func:`_packed`), unless the device has no room for the group's state
-    (:attr:`.TreeLayout.global_block`), then the tree's words of the plan's global scratch. Every barrier the stages
-    take fences global memory too, so no stage reads where its block lies; both hold the same values. ``plan`` and
-    ``group`` are in scope."""
-    if layout.global_block:
+    """Native statements binding ``float* name`` to this tree's block of ``words`` floats: shared memory (:func:`_packed`)
+    where the stage keeps it (:attr:`.TreeLayout.staged`), else the plan's global scratch: every barrier fences both."""
+    if not layout.staged:
         return f"float* {name}=plan.scratch.data+group*{words};"
     return f"{_packed(layout, name, 'float', words)}float* {name}={name}_all+SUB*{words};"
 

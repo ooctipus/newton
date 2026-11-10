@@ -646,15 +646,15 @@ record and impulses (CACHE and STAGE1, 2026-11-10): a stage pays at 16 to 28 war
 franka-reach, go2-flat, allegro on the GB300) and costs at 4 to 14 (franka-cabinet, keyboard-so101, allegro on the PRO)."""
 
 
-def stage(staging: Staging, warps: Callable[[int], int], budget: int) -> Staging:
+def stage(staging: Staging, warps: Callable[[int], int], budget: int, hiding: int = HIDING_WARPS) -> Staging:
     """The staging rule: ``staging``'s buffers without an alternative place, then each with one in order of reuse while
     the stage fits ``budget`` [B] and pays: the resident warps it leaves a multiprocessor (``warps(bytes)``) are at
-    least the fewer of those without it and :data:`HIDING_WARPS` a scheduler. The rest keep their alternative place."""
+    least the fewer of those without it and ``hiding`` a scheduler, the kernel's level. The rest keep their alternative."""
     names = {buffer.name for buffer in staging if buffer.alternative is None}
     kept = staging.only(names)
     for buffer in (buffer for buffer in staging if buffer.alternative is not None):
         trial = staging.only(names | {buffer.name})
-        if not trial.fits(budget) or warps(trial.bytes) < min(warps(kept.bytes), HIDING_WARPS * REGISTER_PARTITIONS):
+        if not trial.fits(budget) or warps(trial.bytes) < min(warps(kept.bytes), hiding * REGISTER_PARTITIONS):
             break
         names.add(buffer.name)
         kept = trial

@@ -5,7 +5,6 @@
 
 import numpy as np
 
-from ...core.memory import static_budget
 from ...sim import BodyFlags, JointType
 from .tree_kinetic_layout import TreeLayout
 from .tree_plan import TreePlan
@@ -119,7 +118,6 @@ def make_plan(model, operator, *, complete=True):
         root_offsets=offsets,
         root_families=tuple(int(v) for v in getattr(operator, "root_families", ())) or (dofs,),
         free_roots=tuple(free_roots),
-        shared_budget=static_budget(model.device.arch),
         own_bias=own_bias,
     )
     return layout, parent
