@@ -238,12 +238,12 @@ def _linked_sweep_calls():
 
 def _support_writer_calls():
     """The support placement's writer (case K1, walk_rows.py) on a branched tree of a free root and three limbs, under
-    each record and torsion law, and the step's one leave of that tree's class (factor/walk.py)."""
+    each torsion law, and the step's one leave of that tree's class (factor/walk.py)."""
     from newton._src.solvers.feather_pgs import walk_rows  # noqa: PLC0415
 
     tree = ((-1, 0, 1, 0, 3, 0), (0, 6, 7, 8, 9, 10, 11), tuple(range(10, -1, -1)))
-    for records, torsion in ((False, False), (True, False), (True, True)):
-        kwargs = {"records": records, "torsion": torsion, "device_arch": _ARCH}
+    for torsion in (False, True):
+        kwargs = {"torsion": torsion, "device_arch": _ARCH}
         yield "walk_rows.support_rows_kernel", walk_rows.support_rows_kernel.__wrapped__, tree, kwargs
     for unit_rows in (3, 4):
         yield "walk_rows.support_units_kernel", walk_rows.support_units_kernel.__wrapped__, (unit_rows, 16, _ARCH), {}

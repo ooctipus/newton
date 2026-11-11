@@ -1040,7 +1040,8 @@ class RowLaws:
     def write_support(self, solver, state_in, contact_input: ContactInput, dt: float) -> None:
         """Case K1's writer in two launches: the step's units listed, with the contact rows' records
         (:func:`.walk_rows.support_units_kernel`), then the walkers over the list into the support sink, a lane a unit
-        (:func:`.walk_rows.support_rows_kernel`), each row of a slipping tree released by the predictor's border."""
+        (:func:`.walk_rows.support_rows_kernel`), each row of a slipping tree released by the predictor's border, and
+        each contact's friction record formed after its walk."""
         placement, model, sweep = solver.placement, solver.model, solver.sweep
         dense_rows, law = bind_dense_rows(placement), patch_row_law(solver)
         sink = sweep.support_sink(solver.v_hat)
@@ -1066,6 +1067,7 @@ class RowLaws:
                 sink,
                 self.joint_seeds(solver, state_in),
                 self.bias(solver.options, dt),
+                placement.friction_metric if placement.friction_metric is not None else sweep.no_records,
             ],
             device=model.device,
         )

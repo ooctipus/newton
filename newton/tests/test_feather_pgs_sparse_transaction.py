@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Check the sparse sweep's contact units: their block records, their kernels and their twins.
+"""Check the sparse sweep's contact units: their records, their kernels and their twins.
 
 A contact unit solves a normal and its friction pair on their Gram block, in exact arithmetic the ordinary sweep's
 row-by-row updates, so its CUDA twins match the ordinary sweep and the physical reference to rounding, not bitwise.
@@ -18,8 +18,7 @@ import newton
 from newton._src.solvers.feather_pgs import environment_flags
 from newton._src.solvers.feather_pgs.row_laws import ROW_CONTACT as CONTACT
 from newton._src.solvers.feather_pgs.row_laws import ROW_FRICTION as FRICTION
-from newton._src.solvers.feather_pgs.sparse_contact import CONTACT_RECORD_FLOATS, CONTACT_RING_FLOATS
-from newton._src.solvers.feather_pgs.sweep import sweep_kernel
+from newton._src.solvers.feather_pgs.sweep import FRICTION_METRIC_FLOATS, sweep_kernel
 from newton._src.solvers.feather_pgs.sweep_routes_sparse import SparseSweep
 from newton.solvers import SolverFeatherPGS
 from newton.tests import test_feather_pgs_sparse_contact_triplets as triplets
@@ -81,19 +80,6 @@ def _assert_twins(test, data, unit, ordinary, *, rtol=1.0e-5):
         np.testing.assert_allclose(actual, expected, rtol=rtol, atol=rtol * magnitude, err_msg=name)
 
 
-def _ring_members(parents, normal):
-    """Return the other normals of ``normal``'s ring in the order the pair update pools them."""
-    members, row = [], int(parents[normal])
-    while row >= 0 and row != normal:
-        members.append(row)
-        row = int(parents[row])
-    return members
-
-
-class TestContactRecordBuilder(unittest.TestCase):
-    """The sparse contact builder writes each contact triplet's block record beside its rows."""
-
-
 class TestContactUnits(unittest.TestCase):
     """The sparse sweep's contact units: factory, sweep body and route record."""
 
@@ -112,43 +98,35 @@ class TestContactUnits(unittest.TestCase):
                     self.assertEqual(blocks == 16, capacity <= 128, (capacity, blocks))
                     # The records follow the scalar inputs, before the outputs.
                     names = list(kernel.adj.arg_types)
-                    self.assertEqual(names[names.index("omega") + 1], "contact_records")
+                    self.assertEqual(names[names.index("omega") + 1], "friction_metric")
         with self.assertRaises(TypeError):
             sweep_kernel(SparseSweep(64, 18, 12, **TRIPLETS, contact_transaction="single"))
 
     def test_contact_unit_reduces_once_from_records_cpu(self):
         """Reduce a unit's three residuals once, its pair's moved through the record's couplings; no metric cache.
 
-        Only rings of more than four members walk their parents on a visit. Lane 0 writes the
-        impulses every lane read only after a warp barrier.
+        A linked unit pools its ring by the walk. Lane 0 writes the impulses every lane read only after a warp barrier.
         """
         for linked in (False, True):
             with self.subTest(linked=linked):
                 snippet = _snippet(sweep_kernel(SparseSweep(256, 18, 12, linked_rows=linked, **TRIPLETS)))
                 for text in ("metric_map", "metric_count", "friction_pair_cached(", "contact_metric_slot("):
                     self.assertNotIn(text, snippet)
-                width = CONTACT_RECORD_FLOATS + CONTACT_RING_FLOATS * linked
-                self.assertRegex(snippet, rf"(normal|i) / 3\) \* {width}")
+                self.assertRegex(snippet, rf"\(i\) / 3\) \* {FRICTION_METRIC_FLOATS}")
                 start = snippet.index("const int tangent_parent = world_row_parent.data[offset + tangent];")
                 unit = snippet[start : snippet.index("consumed_tangent = tangent;", start)]
                 # One reduction of the three residuals together, and no other; the rows then run the row law on the
                 # unit's operator (sweep.contact_unit): the pair's terms moved through the record's couplings, the
-                # normal stepped by the record's 1/W_nn, the pair's law from the record's metric.
+                # normal stepped by its staged reciprocal, the pair's law from the record's metric.
                 self.assertEqual(unit.count("SUM("), 1)
                 self.assertIn("SUM(unit_jv0, unit_jv1, unit_jv2);", unit)
                 self.assertNotIn("__shfl", unit)
                 self.assertIn("ProjectionLaw::friction_pair_from_metric(basis.x, basis.y,", unit)
-                self.assertIn(
-                    "const float gram_n1 = coupling.x, gram_n2 = coupling.y, unit_inverse = coupling.w;", unit
-                )
+                self.assertIn("const float gram_n1 = coupling.x, gram_n2 = coupling.y;", unit)
                 self.assertIn("float jv = r == 0 ? unit_jv0 : unit_jv1 + gram_n1 * unit_dn;", unit)
-                self.assertIn(
-                    "r == 0 ? -residual * unit_inverse : -residual / (r == 0 ? unit_diag0 : unit_diag1)", unit
-                )
+                self.assertIn("-residual * s_inverse[i]", unit)
                 self.assertEqual("normal_parent < 0" in unit, not linked)
-                # Linked visits pool listed members and walk only rings longer than four members.
-                self.assertEqual("ring.w < 0" in unit, linked)
-                self.assertEqual("make_int4(first, second, third, others)" in snippet, linked)
+                # Linked visits walk their ring.
                 self.assertEqual(unit.count("RING_LOAD("), int(linked))
                 # Every lane reads the unit's staged values (impulses, right-hand sides, diagonals) with its rows,
                 # before the reduction; each row's law then orders every lane's reads before lane 0's writes with a
@@ -234,39 +212,6 @@ class TestContactUnitTwins(unittest.TestCase):
                 unit, ordinary, _ = self._twins(data, linked=True, active=active)
                 _assert_twins(self, data, unit, ordinary)
                 triplets.assert_output(self, data, *unit, physical=physical)
-
-    def test_ring_members_follow_the_pooling_walk_cuda(self):
-        """List up to three other members of each anchor's ring in walk order, and mark longer rings to walk.
-
-        Rings of one to six members load anchors whose radii pool the whole ring, so a
-        missing, repeated or reordered member changes the impulses beyond rounding.
-        """
-        for name in (
-            "self_loop",
-            "two_member_ring",
-            "three_member_ring",
-            "far_ring",
-            "loaded_ring",
-            "long_loaded_ring",
-        ):
-            for capacity, active in product(CAPACITIES, (True, False)):
-                with self.subTest(layout=name, capacity=capacity, active=active):
-                    data, physical = triplets.linked_fixture(triplets._LINKED_LAYOUTS[name], pad=30, active=active)
-                    data = _resized(data, capacity)
-                    unit, ordinary, solve = self._twins(data, linked=True, active=active)
-                    _assert_twins(self, data, unit, ordinary)
-                    triplets.assert_output(self, data, *unit, physical=physical)
-                    rings = solve.records.numpy()[..., CONTACT_RECORD_FLOATS:].view(np.int32)
-                    for world, count in enumerate(data["world_constraint_count"]):
-                        kinds, parents = data["row_type"][world], data["row_parent"][world]
-                        for row in range(int(count) - 2):
-                            if (kinds[row], kinds[row + 1], kinds[row + 2]) != (CONTACT, FRICTION, FRICTION):
-                                continue
-                            members = _ring_members(parents, row)
-                            ring = rings[world, row // 3]
-                            listed = len(members) if len(members) <= 3 else -1
-                            self.assertEqual(int(ring[3]), listed)
-                            self.assertEqual(list(ring[: max(listed, 0)]), members[: max(listed, 0)])
 
     def test_seventeen_loaded_triplets_cuda(self):
         """Solve 17 loaded triplets in one world from their records."""
@@ -426,23 +371,17 @@ class TestContactUnitTwins(unittest.TestCase):
                     "omega": np.array(1.0),
                     "reference_factor_delta": np.zeros((3, dofs), dtype=np.float32),
                 }
-                unit, ordinary, solve = self._twins(data, linked=True, active=active)
+                unit, ordinary, _ = self._twins(data, linked=True, active=active)
                 _assert_twins(self, data, unit, ordinary)
                 triplets.assert_output(self, data, *unit, physical=oracle[active])
-                rings = solve.records.numpy()[..., CONTACT_RECORD_FLOATS:].view(np.int32)
-                for row in anchor_rows:
-                    members = _ring_members(parents, row)
-                    self.assertEqual(list(rings[0, row // 3, : len(members)]), members)
-                    self.assertEqual(int(rings[0, row // 3, 3]), len(members))
 
-    def test_fused_visits_step_the_normal_with_the_record_cuda(self):
-        """Step a fused normal with its record's ``1/W_nn``: zeroed, it holds the normal the ordinary sweep moves.
+    def test_fused_visits_read_their_record_cuda(self):
+        """Solve a fused triplet on its record: a record whose pair metric is scaled moves that triplet's tangents.
 
-        A triplet the unit's guards decline takes the ordinary update, so matching the ordinary twin
-        to rounding cannot show that the fused branch ran. Zeroing ``1/W_nn`` in the record of one
-        loaded triplet holds that normal at its initial impulse through every sweep, which only the
-        fused branch can do, for point triplets and linked anchors in the active scan and the full
-        sweep.
+        A triplet the unit's guards decline takes the ordinary update, which reads no record, so matching the
+        ordinary twin to rounding cannot show that the fused branch ran. The same launch with one loaded triplet's
+        pair eigenvalues scaled tenfold in its record moves that triplet's tangent impulses beyond rounding, for point
+        triplets and linked anchors in the active scan and the full sweep: only the fused branch reads the record.
         """
         fixtures = [("point", True, triplets.fixture(offset=30, seeded=True)[0])]
         for active in (True, False):
@@ -452,29 +391,26 @@ class TestContactUnitTwins(unittest.TestCase):
             with self.subTest(law=law, active=active, capacity=capacity):
                 data = _resized(fixture, capacity)
                 linked = law == "patch"
-                ordinary = triplets.DeviceSolve(data, candidate=False, active=active, linked=linked)
-                ordinary.launch()
-                initial = data["initial_impulses"]
-                moved = np.abs(ordinary.result()[1] - initial)
                 kinds, parents = data["row_type"][0], data["row_parent"][0]
                 loaded = [
                     row
                     for row in range(int(data["world_constraint_count"][0]) - 2)
                     if (kinds[row], kinds[row + 1], kinds[row + 2]) == (CONTACT, FRICTION, FRICTION)
                     and parents[row + 1] == parents[row + 2] == row
-                    and moved[0, row] > 1.0e-3
                 ]
                 self.assertTrue(loaded)
                 row = loaded[0]
-                unit = triplets.DeviceSolve(data, candidate=True, active=active, linked=linked)
-                records = unit.records.numpy()
-                records[:, row // 3, 3] = 0.0
-                unit.records.assign(records)
-                unit.launch()
-                impulses = unit.result()[1]
+                runs = []
+                for scale in (1.0, 10.0):
+                    unit = triplets.DeviceSolve(data, candidate=True, active=active, linked=linked)
+                    records = unit.records.numpy()
+                    records[:, row // 3, 4:6] *= scale
+                    unit.records.assign(records)
+                    unit.launch()
+                    runs.append(unit.result()[1])
                 live = np.flatnonzero(data["world_constraint_count"])
-                np.testing.assert_array_equal(impulses[live, row], initial[live, row])
-                self.assertTrue(np.all(moved[live, row] > 1.0e-3))
+                clean, scaled = (run[live, row + 1 : row + 3] for run in runs)
+                self.assertGreater(float(np.max(np.abs(scaled - clean))), 1.0e-4 * (1.0 + float(np.max(np.abs(clean)))))
 
     @staticmethod
     def _rollout(solver, model, *, steps=20, dt=1.0 / 400.0):
