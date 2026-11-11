@@ -163,6 +163,20 @@ _sort_key_chunks = wp.Kernel(
 )
 
 
+@wp.func
+def _placed_before(keys: wp.array[wp.int64], source: int, lo: int, hi: int, key: wp.int64, earlier: bool):
+    """Count the slots of the sorted run [lo, hi) placed before ``key``: smaller keys, and an ``earlier`` run's equal ones."""
+    first = lo
+    while lo < hi:
+        mid = (lo + hi) // 2
+        value = keys[source + mid]
+        if value < key or (earlier and value == key):
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo - first
+
+
 @wp.kernel(enable_backward=False)
 def _merge_runs(
     keys: wp.array[wp.int64],
@@ -175,8 +189,7 @@ def _merge_runs(
 ):
     """Merge sorted runs pairwise, in the last of the ``merges`` rounds every run left; slots move past smaller keys.
 
-    Among equal keys an earlier run's slots go first: a slot also counts an earlier run's equal keys, so every target
-    position is distinct. Launches past the needed merges return.
+    An earlier run's slots go first among equal keys; launches past the needed merges return.
     """
     thread = wp.tid()
     live = extent[0]
@@ -198,19 +211,11 @@ def _merge_runs(
             group = run - run % 2
             end = wp.min(group + 2, runs)
         position = i - (run - group) * width
-        for other in range(group, end):
-            if other != run:
-                lo = other * width
-                hi = wp.min(lo + width, live)
-                first = lo
-                while lo < hi:
-                    mid = (lo + hi) // 2
-                    value = keys[source + mid]
-                    if value < key or (other < run and value == key):
-                        lo = mid + 1
-                    else:
-                        hi = mid
-                position += lo - first
+        # The runs before this slot's are full; the last run may hold fewer slots.
+        for other in range(group, run):
+            position += _placed_before(keys, source, other * width, other * width + width, key, True)
+        for other in range(run + 1, end):
+            position += _placed_before(keys, source, other * width, wp.min(other * width + width, live), key, False)
         keys[target + position] = key
         indices[target + position] = index
 
