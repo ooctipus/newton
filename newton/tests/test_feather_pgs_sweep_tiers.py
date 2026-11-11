@@ -304,8 +304,9 @@ class TestOfflineCompile(unittest.TestCase):
                 config = sweep_routes_tiers.TierSweep(*args, **kwargs)
                 new = sass.compile_kernel(sweep_kernel(config), arch=120, block_dim=config.threads)
                 # A tier that runs its rows' law in its prologue keeps a few words there, outside the sweeps: a friction
-                # row's anchor displacement read by its row, and the world queue's index across the law.
-                self.assertLessEqual(new["stack"], 24 if config.emit else 0)
+                # row's anchor displacement read by its row, and the world queue's index across the law. Warp 1.19's
+                # NVRTC 13.4 keeps 32 bytes there at the same 96 registers (Warp 1.17: 24).
+                self.assertLessEqual(new["stack"], 32 if config.emit else 0)
                 self.assertEqual(new["local"], 0)
 
 
