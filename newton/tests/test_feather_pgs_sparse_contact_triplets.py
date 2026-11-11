@@ -16,9 +16,8 @@ from newton._src.core.memory import arch_budget
 from newton._src.solvers.feather_pgs import class_plan
 from newton._src.solvers.feather_pgs.row_laws import ROW_CONTACT as CONTACT
 from newton._src.solvers.feather_pgs.row_laws import ROW_FRICTION as FRICTION
-from newton._src.solvers.feather_pgs.sparse_contact import CONTACT_RECORD_FLOATS, CONTACT_RING_FLOATS
 from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseRowSupport
-from newton._src.solvers.feather_pgs.sweep import sweep_kernel
+from newton._src.solvers.feather_pgs.sweep import FRICTION_METRIC_FLOATS, sweep_kernel
 from newton._src.solvers.feather_pgs.sweep_routes_sparse import SparseSweep
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_law_harness import row_lines
@@ -58,14 +57,11 @@ def pair_metric(a, c, d):
     return (largest, smallest, vx / norm, vy / norm) if norm > 0.0 else (largest, smallest, 1.0, 0.0)
 
 
-def contact_records(data, *, linked=False):
-    """Return the block records the sparse contact builder writes for every contact triplet of ``data``.
-
-    The contact units read them; the ring members of a linked sweep are its own.
-    """
-    worlds, capacity, _ = data["row_factor"].shape
+def contact_records(data):
+    """Return, by world and contact slot, the record of every contact triplet of ``data`` in float64: its couplings
+    ``W_nt1, W_nt2, W_t1t2``, then its pair's metric (:func:`.projection_laws.friction_record`'s pair layout)."""
     dofs = data["reference_factor_delta"].shape[1]
-    records = np.zeros((worlds, capacity // 3, CONTACT_RECORD_FLOATS + CONTACT_RING_FLOATS * linked), np.float32)
+    records = {}
     for world, count in enumerate(data["world_constraint_count"]):
         kinds = data["row_type"][world]
         for row in range(int(count) - 2):
@@ -78,11 +74,23 @@ def contact_records(data, *, linked=False):
                 rows[k, indices[valid]] = data["row_factor"][world, row + k, valid]
             block = rows @ rows.T
             diagonal = data["diagonal"][world, row : row + 3].astype(np.float64)
-            # A normal without a positive diagonal keeps the ordinary update; its record is never read.
-            inverse = 1.0 / diagonal[0] if diagonal[0] > 0.0 else 0.0
-            records[world, row // 3, :4] = (block[0, 1], block[0, 2], block[1, 2], inverse)
-            records[world, row // 3, 4:8] = pair_metric(diagonal[1], block[1, 2], diagonal[2])
+            records[world, row // 3] = (
+                block[0, 1],
+                block[0, 2],
+                block[1, 2],
+                *pair_metric(diagonal[1], block[1, 2], diagonal[2]),
+            )
     return records
+
+
+def record_array(data):
+    """The records the support writer forms for ``data``'s triplets, as the sweep reads them: by world, a slot per three
+    rows (:func:`.sweep.friction_metric`), the couplings in floats 0-2 and the pair's metric in 4-7."""
+    worlds, capacity, _ = data["row_factor"].shape
+    out = np.zeros((worlds, (capacity + 2) // 3, FRICTION_METRIC_FLOATS), np.float32)
+    for (world, slot), record in contact_records(data).items():
+        out[world, slot, [0, 1, 2, 4, 5, 6, 7]] = record
+    return out
 
 
 def fixture(*, offset=0, activity=None, seeded=False, omega=1.0, linked=False):
@@ -161,8 +169,8 @@ def fixture(*, offset=0, activity=None, seeded=False, omega=1.0, linked=False):
 class DeviceSolve:
     """One ABI adapter shared by synthetic and preserved actual-input tests.
 
-    A kernel with contact units also reads the triplets' block records
-    (:func:`contact_records`), which follow the scalar inputs.
+    A kernel with contact units also reads its triplets' records (:func:`record_array`), which follow the scalar
+    inputs.
     """
 
     def __init__(self, data, *, candidate, device="cuda:0", active=True, linked=False):
@@ -211,8 +219,8 @@ class DeviceSolve:
             int(data["iterations"]),
             float(data["omega"]),
         ]
-        if "contact_records" in self.kernel.adj.arg_types:
-            self.records = array(contact_records(data, linked=self.linked))
+        if "friction_metric" in self.kernel.adj.arg_types:
+            self.records = array(record_array(data))
             self.inputs.append(self.records)
 
     @property
@@ -221,9 +229,9 @@ class DeviceSolve:
         return self.records is not None
 
     def rebuild_records(self, data):
-        """Write the records of changed rows, as the contact builder does each step."""
+        """Write the records of changed rows, as the support writer does each step."""
         if self.records is not None:
-            self.records.assign(contact_records(data, linked=self.linked))
+            self.records.assign(record_array(data))
 
     def launch(self):
         wp.launch_tiled(
@@ -645,7 +653,7 @@ class TestSparseContactTriplets(unittest.TestCase):
                     (8, "row_incident"),
                 ):
                     runner.inputs[slot].assign(data[key])
-                # The contact builder rewrites the records with the rows each step.
+                # The support writer forms the records with the rows each step.
                 runner.rebuild_records(data)
                 runner.reset_impulses()
             control.launch()
@@ -666,7 +674,7 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
         self.assertTrue(full.key.endswith("_12_12_support_table_contact_triplets_linked"), full.key)
         self.assertTrue(point.key.endswith("_active_support_table_contact_triplets"))
         for kernel in (active, full, point):
-            self.assertIn("contact_records", kernel.adj.arg_types)
+            self.assertIn("friction_metric", kernel.adj.arg_types)
         # Point friction fuses only in the active sweep, and nothing fuses without support tables.
         for unfused in ({"use_support_table": True}, {"active_rows": True, "linked_rows": True}):
             with self.subTest(options=unfused):

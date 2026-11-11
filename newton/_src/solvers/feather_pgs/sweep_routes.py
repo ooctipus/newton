@@ -982,7 +982,8 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     # The rows' layout is the configuration's: rows as wide as the world (and no classes) sit at their coordinates.
     packed = PACKED_SIDES_DENSE if not sweep.support_classes and max_row_dofs == D else PACKED_SIDES_BY_SIDE
     sides = (packed, *((CLASS_SIDES,) if sweep.support_classes else ()), *((memory_words(_SLOTS),) if colored else ()))
-    return sweep.native(body, lanes=lanes, rows=sides, walks=(FREE_BODY_WALKS,)), staging
+    records = bool(metric_stage or colored)
+    return sweep.native(body, lanes=lanes, rows=sides, walks=(FREE_BODY_WALKS,), records=records), staging
 
 
 @dataclasses.dataclass(frozen=True)

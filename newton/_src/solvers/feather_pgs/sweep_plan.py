@@ -50,7 +50,6 @@ from .placement import SPARSE_CONTACT_LEVELS
 from .response_builds_rows import bind_row_records, store_row_records
 from .row_records import bind as bind_dense_rows
 from .solve_policy import QUIET_UNITS, UNIT_ROUNDOFF, SolvePolicy, SolveReadoutRecord
-from .sparse_contact import CONTACT_RECORD_FLOATS, CONTACT_RING_FLOATS
 from .sparse_mass_matrix import _SparseRowSupport, row_supports
 from .sweep import EXACT, FRICTION_METRIC_FLOATS, LevelLaw, SweepConfig, sweep_kernel
 from .sweep_levels import (
@@ -84,15 +83,10 @@ SPARSE_ROWS = FieldGroup(
 """Each sparse row's factor coordinates (unless the support table holds them) and factor entries, and each world's
 factor velocity change."""
 
-SPARSE_CONTACT_RECORDS = FieldGroup(
-    Field("sparse_contact_records", wp.float32, ("world", "triplet", "record"), owner="placement")
-)
-"""The single-stage transaction's per-triplet block records (``sparse_contact.CONTACT_RECORD_FLOATS``)."""
-
 FRICTION_METRIC = FieldGroup(Field("friction_metric", wp.float32, ("world", "contact", "metric"), owner="placement"))
-"""Where spin rows may appear or a world can take the colored mapping, each friction contact's record, formed once per
-launch by the sweeps that read it (:func:`.sweep.friction_record_stage`, :func:`.sweep.friction_metric_stage`): a slot
-per three rows of the row store's line, a contact's rows."""
+"""Where spin rows may appear, a world can take the colored mapping or K1 fuses contact units, each friction contact's
+record, formed once per launch (:func:`.sweep.friction_record_stage`, :func:`.walk_rows.contact_record`,
+:func:`.sweep.friction_metric_stage`): a slot per three rows of the row store's line, a contact's rows."""
 
 
 __all__ = ["Sweep"]
@@ -160,8 +154,6 @@ class Sweep:
         self.support_du_base = None
         self.leaves = False
         self.placement.sparse_row_support = _SparseRowSupport()
-        # The admitted contact units' block records.
-        self.placement.sparse_contact_records = None
         self.placement.friction_metric = None
         self.sparse_sweep = self.sparse_kernel = None
         if choice is None:
@@ -173,14 +165,6 @@ class Sweep:
         if sweep["use_support_table"]:
             self.placement.sparse_row_support = row_supports(
                 choice.support_classes, self.forest.world_count, self.placement.dense_max_constraints, model.device
-            )
-        if sweep["contact_triplets"] or self.laws.spin_rows:
-            # Static storage for graph capture: the builder writes the block records of each step's
-            # contact units, every friction triple's metric among them where spin rows may appear; linked sweeps add
-            # each anchor's ring members once per call.
-            width = CONTACT_RECORD_FLOATS + CONTACT_RING_FLOATS
-            self.placement.arrays.allocate(
-                SPARSE_CONTACT_RECORDS, world=self.forest.world_count, triplet=choice.triplet_capacity, record=width
             )
         index_shape = choice.index_shape
         self.placement.arrays.allocate(
@@ -242,7 +226,6 @@ class Sweep:
             parent,
             first,
             node,
-            records=self.placement.sparse_contact_records is not None,
             torsion=torsion,
             half=classes_half(walk for walk in factor.walk_classes if (walk.parent, walk.first) == (parent, first)),
             device_arch=arch,
@@ -265,8 +248,8 @@ class Sweep:
 
     def support_sink(self, v_hat: wp.array) -> walk_rows.RowSink:
         """Case K1: what its writer reads and writes besides each unit's seeds (:class:`.walk_rows.RowSink`): the
-        support table, the support masks, the articulations' first world coordinates, and the rows' factor entries,
-        coordinates and block records, bound once: every array is the placement's for the solver's life."""
+        support table, the support masks, the articulations' first world coordinates, and the rows' factor entries and
+        coordinates, bound once: every array is the placement's for the solver's life."""
         if self._support_sink is None:
             placement, factor, forest = self.placement, self.factor, self.forest
             sink = walk_rows.row_sink(factor, forest, placement, v_hat)
@@ -275,14 +258,14 @@ class Sweep:
             sink.dof_mask = factor.sparse_ancestor_mask
             sink.world_offset = forest.articulation_world_dof_offset
             sink.entries, sink.row_dof = placement.sparse_row_factor, placement.sparse_row_dof
-            records = placement.sparse_contact_records
-            sink.records = records if records is not None else placement.sparse_row_factor
             self._support_sink = sink
             worlds, capacity = sink.entries.shape[0], sink.entries.shape[1]
             self.support_units = walk_rows.unit_list(
                 worlds, capacity, self.model.device, spin_rows=bool(self.laws.spin_rows)
             )
             self.support_threads = walk_rows.support_threads(worlds * capacity, self.model.device)
+            # Where the sweep reads no record, the writer forms none: a stand-in it never writes.
+            self.no_records = wp.zeros((1, 1, 1), dtype=wp.float32, device=self.model.device)
         return self._support_sink
 
     def place_tiers(self, choice) -> None:
@@ -414,9 +397,10 @@ class Sweep:
             self.sweep("sparse_diagonal", self.diagonal_sweep) if self.diagonal_sweep is not None else None
         )
         row_by_row = self.sparse_diagonal_kernel is not None
-        if (self.laws.spin_rows or self.placement.free_contact_rows) and (self.classes.mf_sweeps or row_by_row):
-            # Static storage for graph capture: the friction contacts' metrics, formed per launch by the sweeps that
-            # visit a contact's rows one by one (sweep.friction_record_stage).
+        mapped = (self.laws.spin_rows or self.placement.free_contact_rows) and (self.classes.mf_sweeps or row_by_row)
+        if mapped or (self.sparse_sweep is not None and self.sparse_sweep.records):
+            # Static storage for graph capture: the friction contacts' records, formed per launch by the sweeps that
+            # read them (sweep.friction_record_stage) or by K1's writer (walk_rows.contact_record).
             self.placement.arrays.allocate(
                 FRICTION_METRIC,
                 world=self.forest.world_count,
@@ -871,8 +855,7 @@ class Sweep:
         return {**self._walk(), **colored, **self._queued(bucket, grid)}
 
     def _sparse_operands(self) -> dict:
-        """Case K1's operands: its rows' factor entries, coordinates and records, and its change in factor
-        coordinates."""
+        """Case K1's operands: its rows' factor entries and coordinates, and its change in factor coordinates."""
         placement = self.placement
         return {
             "world_count": self.forest.world_count,
@@ -880,7 +863,6 @@ class Sweep:
             "row_factor": placement.sparse_row_factor,
             "factor_velocity_delta": placement.sparse_factor_velocity_delta,
             "support": placement.sparse_row_support,
-            "contact_records": placement.sparse_contact_records,
         }
 
     def _diagonal_operands(self) -> dict:

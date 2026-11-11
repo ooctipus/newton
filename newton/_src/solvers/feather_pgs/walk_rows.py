@@ -8,9 +8,8 @@ rows walked together from its first (1, 3, or 4 under contact torsion), or a joi
 (:func:`unit_reader`); its seeds, a wrench at a body's frame or a covector at a coordinate (``WALK_WRENCH``,
 :func:`joint_seeds`), walk up their root paths (``WALK_ROW``) into the placement's sink:
 
-- **the support placement** (case K1, FL3.4): each footprint at its rank in the row's support and the unit's Gram for
-  its block record; the walkers stride over the step's unit list (:func:`support_units_kernel`,
-  :func:`support_rows_kernel`);
+- **the support placement** (case K1, FL3.4): each footprint at its rank in the row's support; the walkers stride
+  over the step's unit list (:func:`support_units_kernel`, :func:`support_rows_kernel`);
 - **the general placement** (case K6, FL3.3): each side's entries in the packed rows, at its coordinates or its
   support class's (:func:`packed_walker`), world-major with the bilateral blocks' closure (:func:`walked_rows_kernel`);
 - **the sparse diagonal** (case K2, FL3.5): the arm's side into the row's dense part, a key of the star one step to
@@ -59,7 +58,7 @@ from .friction_patches import PatchRowLaw
 from .joint_table import FreeBodies
 from .kernel_template import python_kernel
 from .packed_rows import RowClasses, class_rank
-from .projection_laws import friction_ball_metric, friction_pair_metric
+from .projection_laws import friction_record
 from .row_build import contact_row_kind, contact_row_law, write_contact_row
 from .row_kernels import RIGID_SPEED_ROWS, RowBias, row_bias
 from .row_laws import LINK_ROWS
@@ -587,23 +586,8 @@ _SUPPORT = """    // One unit's rows into the support sink (walk_rows.support_ro
     const int rec0 = unit.line * sink.diag.shape[1] + unit.slot;
     float* const Z = sink.entries.data + (size_t)$zrow * S;
     const bool covector = dof0 >= 0;
-    float incident[$rows], norm[$rows], zc[$rows], cross[6];
-    for (int r = 0; r < $rows; ++r) incident[r] = norm[r] = zc[r] = 0.0f;
-    for (int k = 0; k < 6; ++k) cross[k] = 0.0f;
-    // A friction unit's Gram couplings: its pair's with its normal and each other, and its spin row's where it has one
-    // (a unit of three rows leaves its fourth zero, whose couplings stay zero).
-    const auto gram = [&]() {
-        if ($rows >= 3) {
-            cross[0] += zc[0] * zc[1];
-            cross[1] += zc[0] * zc[2];
-            cross[2] += zc[1] * zc[2];
-        }
-        if ($rows >= 4) {
-            cross[3] += zc[0] * zc[$last];
-            cross[4] += zc[1] * zc[$last];
-            cross[5] += zc[2] * zc[$last];
-        }
-    };
+    float incident[$rows], norm[$rows];
+    for (int r = 0; r < $rows; ++r) incident[r] = norm[r] = 0.0f;
     unsigned long long masks[2] = {0ull, 0ull};
     int bases[2] = {0, 0};
     int count = 0;
@@ -625,10 +609,7 @@ $side
         const auto store = [&](int r, int c, float z, float) {
             if (r < rows) {
                 footprint[r] = z;
-                if (!add) {
-                    norm[r] += z * z;
-                    zc[r] = z;
-                }
+                if (!add) norm[r] += z * z;
             }
             if (r != $last) return;
             float* entry = Z + rank(c);
@@ -638,7 +619,6 @@ $side
                 else
                     STORE_rows(entry + k * S, footprint[k]);
             }
-            if (!add && rows >= 3) gram();
         };
         if (covector) {
             for (int k = 0; k < seeds; ++k) {
@@ -691,21 +671,19 @@ $release
         }
     }
 $close    if (reread) {
-        for (int r = 0; r < $rows; ++r) norm[r] = zc[r] = 0.0f;
-        for (int k = 0; k < 6; ++k) cross[k] = 0.0f;
+        for (int r = 0; r < $rows; ++r) norm[r] = 0.0f;
         for (int e = 0; e < $entries_end; ++e) {
             for (int r = 0; r < rows; ++r) {
-                zc[r] = LOAD_rows(Z + r * S + e);
-                norm[r] += zc[r] * zc[r];
+                const float z = LOAD_rows(Z + r * S + e);
+                norm[r] += z * z;
             }
-            if (rows >= 3) gram();
         }
     }
     for (int r = 0; r < rows; ++r) {
         STORE_rows(sink.diag.data + rec0 + r, $diag);
         STORE_rows(sink.row_incident.data + rec0 + r, incident[r]);
     }
-$record"""
+"""
 """The support sink's unit walker, ``$rows`` rows a lane (:func:`support_rows_kernel`)."""
 
 # The writers' operands, placed by the memory toolkit's read rule: their inputs (the walk and the sink's tables, which no
@@ -743,30 +721,6 @@ _SUPPORT_CLOSE = """    // The pad past the support; the rows' coordinates (expl
             cls = LOAD_inputs(support.pair_class.data + (class_a * support.pair_class.shape[1] + class_b));
         }
         for (int r = 0; r < rows; ++r) STORE_rows(support.row_class.data + row0 + r, cls);
-    }
-"""
-
-_SUPPORT_RECORD = """    // A friction unit's block record from its Gram (sparse_contact.CONTACT_RECORD_FLOATS): its couplings W_nt1,
-    // W_nt2, W_t1t2 and 1 / W_nn, then the spin row's couplings W_ns, W_t1s, W_t2s where it has a spin row or,
-    // written by the kernel from these, the tangent pair's metric (projection_laws.friction_pair_metric).
-    if (rows >= 3) {
-        float* record = sink.records.data + ((size_t)unit.line * sink.records.shape[1] + unit.slot / 3)
-                        * sink.records.shape[2];
-        STORE_rows(record + 0, cross[0]);
-        STORE_rows(record + 1, cross[1]);
-        STORE_rows(record + 2, cross[2]);
-        STORE_rows(record + 3, 1.0f / (norm[0] + sink.cfm));
-
-    }
-"""
-_SPIN_RECORD = """    // A contact with a spin row: its friction rows' couplings W_t1t2, W_t1s and W_t2s, which the kernel replaces by
-    // the friction triple's metric (sparse_contact.CONTACT_RECORD_FLOATS, projection_laws.friction_ball_metric).
-    if (rows == 4) {
-        float* record = sink.records.data + ((size_t)unit.line * sink.records.shape[1] + unit.slot / 3)
-                        * sink.records.shape[2];
-        STORE_rows(record + 0, cross[2]);
-        STORE_rows(record + 1, cross[4]);
-        STORE_rows(record + 2, cross[5]);
     }
 """
 
@@ -838,10 +792,7 @@ _SUPPORT_WRENCH = """                    const auto& at = r == 0 ? unit.point : 
                                 $spin && r == 3);"""
 
 
-def _support_snippet(parent, first, node, rows: int, records: bool, spin: bool, half: int, registers: int) -> str:
-    record = ""
-    if records:
-        record = _SPIN_RECORD if spin else _SUPPORT_RECORD
+def _support_snippet(parent, first, node, rows: int, spin: bool, half: int, registers: int) -> str:
     # A unit's held side, its at most four rows over the class's coordinates, fits the writer's registers (_RELEASE_HELD).
     held = held_fits(4 * first[-1], registers)
     release = substitute(_RELEASE_HELD, rows=rows, coordinates=first[-1]) if held else _RELEASE_IN_PLACE
@@ -853,7 +804,6 @@ def _support_snippet(parent, first, node, rows: int, records: bool, spin: bool, 
         coordinate=WALK_COORDINATE,
         link=WALK_LINK,
         frame=WALK_FRAME,
-        record=record,
         start="",
         art=_UNIT_ART,
         first="art_a",
@@ -877,7 +827,7 @@ class RowSink:
     and its release, each articulation's response coordinates, the predictor ``v_hat``, and the rows' ``cfm``, entries,
     incident velocities and diagonals; the support placement's (case K1, :func:`support_rows_kernel`) support table,
     each body's and coordinate's support mask (factor coordinates), each articulation's first world coordinate, and the
-    rows' coordinates and block records; the packed rows' layout, where each side's entries sit in a packed row
+    rows' coordinates; the packed rows' layout, where each side's entries sit in a packed row
     (:class:`.dense_rows.RowSupport`, :func:`packed_walker`), the star's coordinates (the sparse diagonal's), the
     free bodies' first row in the store's line (``base``: their slots count from it), and the rows' support classes
     where the packed rows are stored by them (``classes``, :func:`.packed_rows.row_classes`). A placement binds what
@@ -896,7 +846,6 @@ class RowSink:
     dof_mask: wp.array[wp.uint64]
     world_offset: wp.array[int]
     row_dof: wp.array3d[int]
-    records: wp.array3d[float]
     layout: RowSupport
     star: int
     base: int
@@ -1113,7 +1062,6 @@ def packed_walker(
         coordinate=WALK_COORDINATE,
         link=WALK_LINK,
         frame=WALK_FRAME,
-        record="",
         start=start,
         art="sides[side]" if classes else _UNIT_ART,
         first="sides[0]" if classes else "art_a",
@@ -1416,13 +1364,55 @@ def support_units_kernel(max_rows: int, lanes: int, device_arch) -> wp.Kernel:
     return python_kernel(kernel, f"support_units_{max_rows}_{lanes}", launch_bounds=bounds)
 
 
+@wp.func
+def contact_record(rows: DenseRows, sink: RowSink, records: wp.array3d[float], line: int, slot: int, count: int):
+    """The record of the contact whose unit of ``count`` rows (three, four with its spin row) starts at ``slot``, formed
+    where its rows are written, at slot ``slot / 3`` (:func:`.sweep.friction_metric`): its Gram couplings summed over
+    its stored support in entry order, as the sweeps' record stage sums them (:func:`.sweep.friction_record_stage`), and
+    the one formation law (:func:`.projection_laws.friction_record`)."""
+    n1 = float(0.0)
+    n2 = float(0.0)
+    cross = float(0.0)
+    s1 = float(0.0)
+    s2 = float(0.0)
+    for e in range(sink.entries.shape[2]):
+        zn = sink.entries[line, slot, e]
+        z1 = sink.entries[line, slot + 1, e]
+        z2 = sink.entries[line, slot + 2, e]
+        zs = float(0.0)
+        if count == 4:
+            zs = sink.entries[line, slot + 3, e]
+        n1 += zn * z1
+        n2 += zn * z2
+        cross += z1 * z2
+        s1 += z1 * zs
+        s2 += z2 * zs
+    spin = slot + 1
+    mu_t = float(0.0)
+    if count == 4:
+        spin = slot + 3
+        mu_t = rows.row_mu[line, spin]
+    diagonals = wp.vec3(sink.diag[line, slot + 1], sink.diag[line, slot + 2], sink.diag[line, spin])
+    m0, m1, m2, m3 = friction_record(
+        wp.vec3(n1, n2, cross), wp.vec3(s1, s2, 0.0), diagonals, rows.row_mu[line, slot + 1], mu_t, mu_t > 0.0
+    )
+    k = slot // 3
+    for f in range(3):
+        records[line, k, f] = m0[f]
+    for f in range(4):
+        records[line, k, 4 + f] = m1[f]
+    if mu_t > 0.0:
+        for f in range(4):
+            records[line, k, 8 + f] = m2[f]
+        records[line, k, 12] = m3[0]
+
+
 @cache
 def support_rows_kernel(
     parent: tuple[int, ...],
     first: tuple[int, ...],
     node: tuple[int, ...],
     *,
-    records: bool,
     torsion: bool,
     half: int = WALK_BOTH,
     device_arch,
@@ -1434,8 +1424,8 @@ def support_rows_kernel(
 
     The class's tree (``parent``, ``first``: :func:`.factor.walk.walk_prelude`'s table) and each coordinate's factor
     coordinate ``node`` (the support masks' bit) are baked into constant memory. A contact unit of three rows (four
-    with its spin row, where ``torsion`` lets spin rows appear; each count its own walker) is walked together and its Gram writes its block record where ``records`` (the
-    triplet sweeps'); a unit of one row (a normal alone, a limit, a velocity limit, a mimic) by the one-row walker. The
+    with its spin row, where ``torsion`` lets spin rows appear; each count its own walker) is walked together; a unit
+    of one row (a normal alone, a limit, a velocity limit, a mimic) by the one-row walker. The
     contact rows' records are the first launch's; a joint row's records and unit source are its producer's (the limit,
     velocity-limit and mimic producers). The walker stores its footprints at their ranks in its support
     (``row_factor``, with the coordinates ``row_dof`` or the support class ``row_class``), its diagonal ``|z|^2 + cfm``,
@@ -1444,15 +1434,15 @@ def support_rows_kernel(
     """
     unit_rows = 4 if torsion else 3
 
-    def walker(rows: int, with_records: bool):
+    def walker(rows: int):
         registers = WRITERS["support"].registers(device_arch)
-        snippet = _support_snippet(parent, first, node, rows, with_records, torsion and rows == 4, half, registers)
+        snippet = _support_snippet(parent, first, node, rows, torsion and rows == 4, half, registers)
         return unit_walker(f"support_walk_{rows}", snippet)
 
-    walk_one = walker(1, False)
-    walk_unit = walker(unit_rows, records)
+    walk_one = walker(1)
+    walk_unit = walker(unit_rows)
     # Where spin rows may appear, a contact without one walks three rows, not the spin layout's four.
-    walk_three = walker(3, records) if torsion else walk_unit
+    walk_three = walker(3) if torsion else walk_unit
     read_unit = unit_reader(False, unit_rows)
 
     def kernel(
@@ -1465,6 +1455,7 @@ def support_rows_kernel(
         sink: RowSink,
         seeds: JointSeeds,
         bias: RowBias,
+        records: wp.array3d[float],
     ):
         # The list's counts are read again at each unit (L1 hits): nothing but the item lives across a walk.
         item = wp.tid()
@@ -1479,51 +1470,16 @@ def support_rows_kernel(
                 walk_three(sink, unit)
             else:
                 walk_unit(sink, unit)
-            if wp.static(records):
-                if unit.rows == 3:
-                    # The friction pair's metric of the diagonals as written, which the triplet sweeps reuse (a spin
-                    # row's couplings take its place in a unit of four).
-                    k = slot // 3
-                    coupling = sink.records[line, k, 2]
-                    largest, smallest, axis = friction_pair_metric(
-                        sink.diag[line, slot + 1], coupling, sink.diag[line, slot + 2]
-                    )
-                    sink.records[line, k, 4] = largest
-                    sink.records[line, k, 5] = smallest
-                    sink.records[line, k, 6] = axis[0]
-                    sink.records[line, k, 7] = axis[1]
-                elif wp.static(torsion) and unit.rows == 4:
-                    # The friction triple's metric of the block as written, formed once per solve: the sweeps'
-                    # visits only project (projection_laws.friction_triple_from_metric). Its eigenvalues, then its
-                    # eigenbasis as a rotation, take the triple's couplings' place.
-                    k = slot // 3
-                    t12 = sink.records[line, k, 0]
-                    t1s = sink.records[line, k, 1]
-                    t2s = sink.records[line, k, 2]
-                    block = wp.mat33(
-                        sink.diag[line, slot + 1], t12, t1s,
-                        t12, sink.diag[line, slot + 2], t2s,
-                        t1s, t2s, sink.diag[line, slot + 3],
-                    )  # fmt: skip
-                    values, vectors = friction_ball_metric(
-                        block, rows.row_mu[line, slot + 1], rows.row_mu[line, slot + 3]
-                    )
-                    basis = wp.quat_from_matrix(vectors)
-                    sink.records[line, k, 0] = values[0]
-                    sink.records[line, k, 1] = values[1]
-                    sink.records[line, k, 2] = values[2]
-                    sink.records[line, k, 3] = 0.0
-                    sink.records[line, k, 4] = basis[0]
-                    sink.records[line, k, 5] = basis[1]
-                    sink.records[line, k, 6] = basis[2]
-                    sink.records[line, k, 7] = basis[3]
+            # A contact's record where the sweep reads records (the friction metric's one layout).
+            if unit.rows >= 3 and records.shape[2] > 1:
+                contact_record(rows, sink, records, line, slot, unit.rows)
             for r in range(unit.rows):
                 incident = sink.row_incident[line, slot + r]
                 row_bias(rows, bias, line, slot + r, incident)
             item += threads
 
     name = f"support_rows_{len(node)}_{abs(hash((parent, first, node))) % (1 << 32):08x}"
-    name += ("_records" if records else "") + ("_torsion" if torsion else "")
+    name += "_torsion" if torsion else ""
     # The writer's line, at which no walker spills.
     return python_kernel(kernel, name, launch_bounds=WRITERS["support"].bounds(device_arch))
 

@@ -46,7 +46,7 @@ from ...core.memory import Buffer, Place, Staging, arch_budget, built_for
 from .device_preludes import BLOCK_THREADS, RING, SHARED_STORAGE, DevicePrelude, VirtualLanes, group_native, lane_group
 from .kernel_template import Dispatch, KernelTemplate
 from .law_source import law_preludes
-from .projection_laws import CONE_LAW, PROJECTION_LAW
+from .projection_laws import CONE_LAW, PROJECTION_LAW, RECORD_LAW
 from .response_operator import Lanes, ResponseOperator, Velocity
 from .row_inputs import RowArgument
 from .row_laws import ROW_CONTACT, ROW_FRICTION, ROW_JOINT_LIMIT, ROW_JOINT_VELOCITY_LIMIT, ROW_SPEED, ROW_TORSION
@@ -1910,10 +1910,10 @@ def level_loop(
 
 
 FRICTION_METRIC_FLOATS = 16
-"""A friction contact's record, formed once a launch (:func:`friction_record_stage`, :func:`friction_metric_stage`): a
-triple's block's three eigenvalues and an unused value, then its eigenbasis's nine entries row by row
-(:func:`.projection_laws.friction_ball_metric`), three floats of padding: four ``float4``. The basis itself, not the
-quaternion K1's records round it through, so the cached law is the visit's own arithmetic."""
+"""A friction contact's record, formed once a launch (:func:`friction_record_stage`, :func:`friction_metric_stage`,
+:func:`.walk_rows.contact_record`): a triple's block's three eigenvalues and an unused value, then its eigenbasis's
+nine entries row by row (:func:`.projection_laws.friction_ball_metric`), three floats of padding: four ``float4``.
+Every sweep that caches the metric reads this layout, so the cached law is the visit's own arithmetic."""
 
 
 def friction_metric(row: str, first: str = "", *, rows: int = 4) -> str:
@@ -1982,10 +1982,6 @@ def friction_record_stage(
     names = {name: name for name in ("normal", "tangent", "sibling", "spin")}
     diag = rows.diagonal("").value
     at = (lambda k: f"stored[({k}) * {units[2]}]") if units else (lambda k: f"stored[{k}]")
-    block = (
-        f"wp::mat33({diag('tangent')}, unit_cross, spin_cross, unit_cross, {diag('sibling')}, spin_cross_sibling,\n"
-        f"              spin_cross, spin_cross_sibling, {diag('spin')})"
-    )
     lines = [
         f"const int tangent = head, normal = head - 1, sibling = head + 1, spun = {rows.spin_of('normal', end)};",
         # A contact without a spin row reads its tangent in its place: every operand a row of the contact.
@@ -1996,14 +1992,16 @@ def friction_record_stage(
         f"const float mu = {rows.mu('tangent')}, mu_t = spun >= 0 ? {rows.mu('spin')} : 0.0f;",
         # A unit's triple law reads a ball metric whenever its contact has a spin row (the cone law takes a zero spin
         # coefficient); the visits' formed law takes the pair's metric there.
-        f"if ({'spun >= 0' if units else 'mu_t > 0.0f'}) {{",
-        f"    const auto formed = ProjectionLaw::friction_ball_metric({block}, mu, mu_t);",
-        f"    for (int f = 0; f < 3; ++f) {at('f')} = formed.v0[f];",
-        f"    for (int f = 0; f < 9; ++f) {at('4 + f')} = formed.v1.data[f / 3][f % 3];",
-        "} else {",
-        f"    const auto formed = ProjectionLaw::friction_pair_metric({diag('tangent')}, unit_cross, {diag('sibling')});",
-        f"    {at(0)} = gram_n1; {at(1)} = gram_n2; {at(2)} = unit_cross;",
-        f"    {at(4)} = formed.v0; {at(5)} = formed.v1; {at(6)} = formed.v2[0]; {at(7)} = formed.v2[1];",
+        f"const bool ball = {'spun >= 0' if units else 'mu_t > 0.0f'};",
+        "const auto formed = RecordLaw::friction_record(wp::vec3(gram_n1, gram_n2, unit_cross),",
+        f"    wp::vec3(spin_cross, spin_cross_sibling, 0.0f), wp::vec3({diag('tangent')}, {diag('sibling')}, {diag('spin')}),",
+        "    mu, mu_t, ball);",
+        # The floats the readers read: a pair's couplings and metric, a triple's values and basis.
+        f"for (int f = 0; f < 3; ++f) {at('f')} = formed.v0[f];",
+        f"for (int f = 0; f < 4; ++f) {at('4 + f')} = formed.v1[f];",
+        "if (ball) {",
+        f"    for (int f = 0; f < 4; ++f) {at('8 + f')} = formed.v2[f];",
+        f"    {at(12)} = formed.v3[0];",
         "}",
         f"{at(13)} = gram_n1; {at(14)} = gram_n2; {at(15)} = gram_n3;" if units else "",
     ]
@@ -3302,15 +3300,17 @@ class SweepConfig:
         ring: bool = True,
         rows: tuple[DevicePrelude, ...] = (),
         walks: tuple[DevicePrelude, ...] = (),
+        records: bool = False,
     ) -> str:
         """The sweep's native function: ``body`` after the frame's preludes, composed for a world of ``lanes`` lanes
         (the CPU's one thread runs them in turn, :func:`.device_preludes.group_native`).
 
         The preludes, in order: the lane group of ``group`` lanes (by default ``lanes``), the shared stage's storage,
-        the patch ring's walks (``ring``), the rows' own preludes (``rows``), the row laws (the projections, and the
-        cone's where spin rows may appear), the solve policy's, then the walks the sweep compiles (``walks``).
+        the patch ring's walks (``ring``), the rows' own preludes (``rows``), the row laws (the projections, the
+        cone's where spin rows may appear, the record's where the body forms records: ``records``), the solve policy's,
+        then the walks the sweep compiles (``walks``).
         """
-        laws = law_preludes(PROJECTION_LAW, *((CONE_LAW,) if self.torsion else ()))
+        laws = law_preludes(PROJECTION_LAW, *((CONE_LAW,) if self.torsion else ()), *((RECORD_LAW,) if records else ()))
         preludes = (
             lane_group(lanes if group is None else group),
             SHARED_STORAGE,

@@ -18,9 +18,9 @@ acts on is the factor-coordinate delta from ``v_hat``, staged per world and publ
   contact ``torsion`` the friction triples (a contact's pair and its spin row) in a phase of their own after each
   sweep's rows (:func:`.sweep.triple_phase`), so the row loop carries none of their code;
 - the **contact unit** (``contact_triplets``): a contact normal and its friction pair in one visit on their Gram
-  block (:func:`contact_units`): one load group with the triplet's block record, one reduction of the three
-  residuals, the normal step, the pair's residuals moved by the normal change through the record's couplings, the
-  pair law from the record's metric, and one apply;
+  block (:func:`contact_units`): one load group with the contact's record, one reduction of the three residuals,
+  the normal step, the pair's residuals moved by the normal change through the record's couplings, the pair law from
+  the record's metric, and one apply;
 - the **laws**: the shared row visit and law (:func:`.sweep.row_visit`) for every other row, the last-word
   velocity-limit pass under either law (``velocity_limits``), the warm-start seed (``warm_start``), and the exit under
   the solve policy.
@@ -43,10 +43,10 @@ from . import kernel_template
 from .kernel_template import Dispatch
 from .response_operator import Lanes, SparseFactor
 from .row_inputs import RowArgument
-from .row_laws import ROW_CONTACT, ROW_FRICTION, ROW_JOINT_VELOCITY_LIMIT, ROW_TORSION
-from .sparse_contact import CONTACT_RECORD_FLOATS, CONTACT_RING_FLOATS
+from .row_laws import ROW_CONTACT, ROW_JOINT_VELOCITY_LIMIT, ROW_TORSION
 from .sparse_mass_matrix import _SparseRowSupport
 from .sweep import (
+    FORMED_RECORD,
     ITERATION,
     Diagonal,
     RowContext,
@@ -62,8 +62,9 @@ from .sweep import (
     active_words,
     cached_pair_law,
     end_sweep,
+    formed_friction_laws,
+    friction_metric,
     impulse_seed,
-    indent,
     level_loop,
     row_step,
     triple_phase,
@@ -230,11 +231,15 @@ class SparseSweep(SweepConfig):
     def dispatch(self, staging: Staging) -> Dispatch:
         return kernel_template.items("world", groups=self.groups, lanes=self.lanes, guard="world_count")
 
+    @property
+    def records(self) -> bool:
+        """Contact units read their contacts' records, and where spin rows may appear every triple its metric: the
+        support writer forms them (:func:`.walk_rows.contact_record`)."""
+        return self.contact_triplets or self.torsion
+
     def operands(self) -> tuple[RowArgument, ...]:
-        # Contact units read their records; where spin rows may appear every triple reads its metric there.
-        records = self.contact_triplets or self.torsion
         return (
-            *((RowArgument("contact_records", wp.array3d[float], after="omega"),) if records else ()),
+            *((RowArgument("friction_metric", wp.array3d[float], after="omega"),) if self.records else ()),
             *self.law_operands(),
         )
 
@@ -291,92 +296,20 @@ def warm_start_seed(op: SparseFactor, pad: str) -> str:
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-@dataclasses.dataclass(frozen=True)
-class _UnitDiagonal(Diagonal):
-    """A triplet unit's diagonals: the normal steps by its record's ``1/W_nn``. Every sparse row keeps its diagonal
-    ``A_ii`` (``s_diag``), so the unit's rows vote in the velocity form, as the sparse rows' storage gives it (the
-    storage question, option 1)."""
-
-    def step(self, residual: str, row: str) -> str:
-        return f"(r == 0 ? -{residual} * unit_inverse : -{residual} / {self.diagonal(row)})"
-
-
-def _record(width: int | str, row: str) -> str:
-    """The address of the contact record of the triplet that holds row ``row``, records ``width`` floats apart."""
-    return f"contact_records.data + (static_cast<size_t>(line) * contact_records.shape[1] + {row} / 3) * {width}"
-
-
-def contact_units(sweep: SparseSweep, rows: StagedRows, op: SparseFactor, laws: RowLaws, pad: str) -> tuple[str, str]:
-    """The contact unit (:func:`.sweep.unit_visit`) on the triplet's block record (``contact_records``: the Gram
-    couplings ``W_nt1, W_nt2, W_t1t2``, ``1/W_nn``, by which the normal steps, and the pair's eigenvalues and
-    eigenbasis): its setup and its visit of row ``i``. With ``linked`` a pass at entry stores each anchor's other ring
-    members, at most three, behind its record in the order the pair update pools them (-1: a longer ring, which keeps
-    the walk). Under contact torsion a friction triple (its pair staged as spin rows) is declined: its normal takes the
+def contact_units(sweep: SparseSweep, rows: StagedRows, op: SparseFactor, laws: RowLaws, pad: str) -> str:
+    """The contact unit (:func:`.sweep.unit_visit`) of row ``i`` on its contact's record, formed by the support writer
+    (:func:`.walk_rows.contact_record`: the Gram couplings ``W_nt1, W_nt2`` and the pair's metric); the normal steps by
+    its staged reciprocal. A linked unit pools its patch ring by the ring's walk; otherwise only point contacts are
+    units. Under contact torsion a friction triple (its pair staged as spin rows) is declined: its normal takes the
     row step and the triple phase its pair and spin row (:func:`.sweep.triple_phase`).
     """
-    width = CONTACT_RECORD_FLOATS + (CONTACT_RING_FLOATS if sweep.linked_rows else 0)
-    pair_rows = f"s_type[normal + 1] != {ROW_FRICTION} || s_type[normal + 2] != {ROW_FRICTION}"
-    if laws.torsion:
-        # A triple's pair is staged as spin rows (StagedRows' triples).
-        pair_rows = f"s_type[normal + 1] != s_type[normal + 2] || (s_type[normal + 1] != {ROW_FRICTION} && s_type[normal + 1] != {ROW_TORSION})"
-    setup = ""
-    if sweep.linked_rows:
-        setup = f"""// Each anchor's other ring members, at most three, in the order the pair update pools them; -1 marks a
-// longer ring, which keeps the walk. Visits read them with the record.
-for (int normal = lane; normal + 2 < count; normal += {sweep.lanes}) {{
-    if (s_type[normal] != {ROW_CONTACT} || {pair_rows}) continue;
-    const int first = world_row_parent.data[offset + normal];
-    int second = -1, third = -1, others = 0;
-    if (first >= 0 && first != normal) {{
-        others = 1;
-        second = world_row_parent.data[offset + first];
-        if (second >= 0 && second != normal) {{
-            others = 2;
-            third = world_row_parent.data[offset + second];
-            if (third >= 0 && third != normal) {{
-                const int fourth = world_row_parent.data[offset + third];
-                others = fourth >= 0 && fourth != normal ? -1 : 3;
-            }}
-        }}
-    }}
-    *reinterpret_cast<int4*>({_record(width, "normal")} + {CONTACT_RECORD_FLOATS})
-        = make_int4(first, second, third, others);
-}}
-SYNC();"""
     normal_parent = "" if sweep.linked_rows else "\n    const int normal_parent = world_row_parent.data[offset + i];"
     point_guard = "" if sweep.linked_rows else " && normal_parent < 0"
-    ring_read = (
-        f"\n        const int4 ring = *reinterpret_cast<const int4*>(record + {CONTACT_RECORD_FLOATS});"
-        if sweep.linked_rows
-        else ""
-    )
-
-    def ring_load(parent: str, load: str) -> str:
-        # A point contact's pool is its normal's load.
-        return load
-
-    ring = ""
-    if sweep.linked_rows:
-        # The ring pools as the pair update walks it, from the normal's new load on.
-        ring = f"""
-        const auto unit_ring_load = [&](float load) -> float {{
-            if (ring.w < 0) return {rows.ring_load("head", "load")};
-            if (ring.w > 0) load += s_impulse[ring.x];
-            if (ring.w > 1) load += s_impulse[ring.y];
-            if (ring.w > 2) load += s_impulse[ring.z];
-            return load;
-        }};"""
-
-        def ring_load(parent: str, load: str) -> str:
-            return f"unit_ring_load({load})"
-
     ctx = RowContext(
         row="i",
         kind="row_type",
-        # The unit's one reduction gathers the three rows' entries; its Gram couplings and the pair's metric are the
-        # triplet's block record.
         operator=UnitZ(cached=True, fused_pair_apply=op.fused_pair_apply),
-        diagonal=_UnitDiagonal(rows.diag),
+        diagonal=Diagonal(rows.diag, rows.inverse),
         load=rows.load,
         store=rows.store,
         rhs=rows.rhs_of,
@@ -384,20 +317,17 @@ SYNC();"""
         weight=rows.weight,
         eps=rows.eps,
         parent="parent",
-        ring_load=ring_load,
+        # A point contact's pool is its normal's load.
+        ring_load=rows.ring_load if sweep.linked_rows else (lambda parent, load: load),
         lanes=rows.lanes,
         pair_law="UNIT_PAIR(0, ",
     )
-    # The record's second half holds the pair's metric: its eigenvalues and the larger's axis.
-    tail = "\n        const float4 basis = *reinterpret_cast<const float4*>(record + 4);"
-    metric = cached_pair_law("UNIT_PAIR", "basis.x", "basis.y", ("basis.z", "basis.w"), "        ")
-    loads = f"""        const float* record = {_record(width, "i")};
-        const float4 coupling = *reinterpret_cast<const float4*>(record);{tail}{ring_read}
+    loads = f"""        const float4* const record = reinterpret_cast<const float4*>({friction_metric("i", rows=3)});
+        const float4 coupling = record[0], basis = record[1];
 """
-    after = f"""
-        // W_nt moves the tangent residuals by the normal change; the record's 1/W_nn steps the normal.
-        const float gram_n1 = coupling.x, gram_n2 = coupling.y, unit_inverse = coupling.w;
-{metric}{ring}"""
+    after = "\n        const float gram_n1 = coupling.x, gram_n2 = coupling.y;\n" + cached_pair_law(
+        "UNIT_PAIR", "basis.x", "basis.y", ("basis.z", "basis.w"), "        "
+    )
     guard = (
         f"""
     // The guards load together; the rows, the record and the coordinates then load together.
@@ -409,7 +339,7 @@ SYNC();"""
         f"""tangent_parent == i && sibling_parent == i && tangent_class == sibling_class
         && row_class == tangent_class{point_guard}""",
     )
-    update = unit_visit(
+    return unit_visit(
         rows,
         op,
         laws,
@@ -421,7 +351,6 @@ SYNC();"""
         record=(loads, after),
         pad=pad,
     )
-    return indent(setup, "    ") if setup else "", update
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -455,6 +384,9 @@ def _source(sweep: SparseSweep) -> tuple[str, Staging]:
     if op.dense:
         setup.append(op.expand("count", "    "))
     setup.append("    SYNC();")
+    if sweep.torsion:
+        # A triple's law on its contact's record, which the support writer formed (walk_rows.contact_record).
+        setup.append(formed_friction_laws("FRICTION", "    "))
     if sweep.active_rows:
         setup.append(active_selection(rows, count="count", linked=sweep.linked_rows, pad="    "))
     if sweep.warm_start:
@@ -462,11 +394,7 @@ def _source(sweep: SparseSweep) -> tuple[str, Staging]:
     # The row loop's enumeration: the rows the active scan selected, or every row.
     order = SelectedRows("count") if sweep.active_rows else SlotOrder("count")
     body_pad = order.inner("        ")
-    unit = ""
-    if sweep.contact_triplets:
-        unit_setup, unit = contact_units(sweep, rows, op, laws, body_pad)
-        if unit_setup:
-            setup.append(unit_setup)
+    unit = contact_units(sweep, rows, op, laws, body_pad) if sweep.contact_triplets else ""
 
     scan = []
     if sweep.active_rows:
@@ -492,33 +420,17 @@ def _source(sweep: SparseSweep) -> tuple[str, Staging]:
     row_loop = order.wrap(f"{unit}\n{update}", "        ")
     triples = ""
     if sweep.torsion:
-        # A triple's metric is its contact's record's (eigenvalues and eigenbasis quaternion), formed once a solve by
-        # the writer (:func:`.walk_rows.support_rows_kernel`); a linked sweep's units store each normal's ring members
-        # behind it (:func:`contact_units`). Its normal is a contact whose next row is staged as a spin row, and only a
-        # world whose staging found a triple scans for them.
-        record = [
-            f"const float* const record = {_record('contact_records.shape[2]', 'head')};",
-            "const float4 triple_metric = *reinterpret_cast<const float4*>(record);",
-            "const float4 triple_basis = *reinterpret_cast<const float4*>(record + 4);",
-        ]
-        pool = ""
-        if sweep.linked_rows and sweep.contact_triplets:
-            record.append(f"const int4 ring = *reinterpret_cast<const int4*>(record + {CONTACT_RECORD_FLOATS});")
-            pool = (
-                f"if (ring.w < 0) pooled = {rows.ring_load('head', 'pooled')};\n"
-                "if (ring.w > 0) pooled += s_impulse[ring.x];\n"
-                "if (ring.w > 1) pooled += s_impulse[ring.y];\n"
-                "if (ring.w > 2) pooled += s_impulse[ring.z];"
-            )
+        # A triple reads its contact's record (the general sweep's triple phase); its normal is a contact whose next
+        # row is staged as a spin row, and only a world whose staging found a triple scans for them.
+        loaded = ", ".join(f"{name} = friction_record[{k}]" for k, name in enumerate(FORMED_RECORD))
         triples = triple_phase(
             rows,
             op,
             laws,
             count="count",
-            record="\n".join(record),
-            law="ConeLaw::friction_triple_from_metric(wp::vec3(triple_metric.x, triple_metric.y, triple_metric.z),\n"
-            "    wp::quat_to_matrix(wp::quat(triple_basis.x, triple_basis.y, triple_basis.z, triple_basis.w)), ",
-            pool=pool,
+            record=f"const float4* const friction_record = reinterpret_cast<const float4*>({friction_metric('head', rows=3)});\n"
+            f"const float4 {loaded};",
+            law=f"FRICTION({', '.join(FORMED_RECORD)}, ",
             heads=lambda row: (
                 f"{row} + 1 < count && {rows.kind(row)} == {ROW_CONTACT} && {rows.kind(f'{row} + 1')} == {ROW_TORSION}"
             ),

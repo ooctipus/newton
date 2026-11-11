@@ -42,6 +42,10 @@ CONE_LAW = LawFamily("ConeLaw", requires=(PROJECTION_LAW,))
 """The friction cone of a contact with a spin row (contact torsion), which only the sweeps of such contacts declare;
 native code calls ``ConeLaw::ball(...)``."""
 
+RECORD_LAW = LawFamily("RecordLaw", requires=(PROJECTION_LAW,))
+"""A friction contact's record (:func:`friction_record`), which only the places that form records declare; native code
+calls ``RecordLaw::friction_record(...)``."""
+
 
 @PROJECTION_LAW.law(
     native=(
@@ -366,6 +370,37 @@ def friction_ball_metric(block: wp.mat33, mu: float, mu_t: float) -> tuple[wp.ve
     # 4e-6 move a sliding triple off its cone. V (3 I - V^T V) / 2 is the nearest orthonormal basis to rounding.
     identity = wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
     return values * scale, vectors * (1.5 * identity - 0.5 * (wp.transpose(vectors) * vectors))
+
+
+@RECORD_LAW.law
+def friction_record(
+    couplings: wp.vec3, spin: wp.vec3, diagonals: wp.vec3, mu: float, mu_t: float, ball: bool
+) -> tuple[wp.vec4, wp.vec4, wp.vec4, wp.vec4]:
+    """A friction contact's record, four ``float4`` (:data:`.sweep.FRICTION_METRIC_FLOATS`), from its Gram couplings
+    ``(W_nt1, W_nt2, W_t1t2)``, its spin row's ``(W_t1s, W_t2s)`` and its tangents' and spin row's diagonals: with
+    ``ball`` the triple's ball metric (:func:`friction_ball_metric`), its eigenvalues and an unused value, then its
+    eigenbasis's nine entries row by row; otherwise the couplings and an unused value, then the pair's metric
+    (:func:`friction_pair_metric`). Every place that keeps the metric forms it here, from the Gram its rows give it."""
+    if ball:
+        block = wp.mat33(
+            diagonals[0], couplings[2], spin[0],
+            couplings[2], diagonals[1], spin[1],
+            spin[0], spin[1], diagonals[2],
+        )  # fmt: skip
+        values, vectors = friction_ball_metric(block, mu, mu_t)
+        return (
+            wp.vec4(values[0], values[1], values[2], 0.0),
+            wp.vec4(vectors[0, 0], vectors[0, 1], vectors[0, 2], vectors[1, 0]),
+            wp.vec4(vectors[1, 1], vectors[1, 2], vectors[2, 0], vectors[2, 1]),
+            wp.vec4(vectors[2, 2], 0.0, 0.0, 0.0),
+        )
+    largest, smallest, axis = friction_pair_metric(diagonals[0], couplings[2], diagonals[1])
+    return (
+        wp.vec4(couplings[0], couplings[1], couplings[2], 0.0),
+        wp.vec4(largest, smallest, axis[0], axis[1]),
+        wp.vec4(0.0),
+        wp.vec4(0.0),
+    )
 
 
 @PROJECTION_LAW.law(inline="default")

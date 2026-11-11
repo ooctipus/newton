@@ -101,7 +101,6 @@ class Packed:
     velocity_limits: bool
     active_rows_reason: str
     contact_triplets_reason: str
-    triplet_capacity: int
     index_shape: tuple[int, int, int]
     held: held_tree.HeldPlan | None = None
     """The held tree's plan with these factors, which admitted the case (:func:`.held_tree.plan`)."""
@@ -432,14 +431,13 @@ def packed_rule(inputs: ClassInputs) -> tuple[Packed | None, str]:
     # A small world packs a lane group of 8 or 16 (_small_world_lanes) without changing this owner's row
     # representation, sweep policy or velocity-limit phase.
     lanes = small_world_lanes if small_world_lanes and not active_rows else 32
-    triplet_capacity = dense_rows // 3
     contact_triplets, contact_triplets_reason = contact_triplets_rule(
         pins,
         active_rows=active_rows,
         use_support_table=use_support_table,
         lanes=lanes,
         fits=lambda: (
-            triplet_capacity > 0
+            dense_rows >= 3
             and staging(active_rows=active_rows, use_support_table=use_support_table, contact_triplets=True).fits(
                 budget
             )
@@ -471,7 +469,6 @@ def packed_rule(inputs: ClassInputs) -> tuple[Packed | None, str]:
         velocity_limits=bool(velocity_candidate),
         active_rows_reason=active_rows_reason,
         contact_triplets_reason=contact_triplets_reason,
-        triplet_capacity=triplet_capacity,
         index_shape=(1, 1, 1) if use_support_table else index_shape,
     )
     # Native sparse factors are the held tree's representation: a candidate only where it takes their group.
