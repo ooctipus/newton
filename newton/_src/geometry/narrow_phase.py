@@ -119,6 +119,8 @@ from ..geometry.support_function import (
     extract_shape_data,
     support_map,
     support_map_accelerated,
+    support_map_accelerated_inline,
+    support_map_inline,
     support_map_lean,
     support_map_lean_accelerated,
 )
@@ -2076,7 +2078,7 @@ def create_narrow_phase_process_mesh_triangle_contacts_kernel(
         # Heightfield triangles only, beside the mesh triangles' own kernels.
         suffix += "_heightfields"
     _module = f"narrow_phase_mesh_tri_{writer_func.__name__}_{convex_support_acceleration}{suffix}"
-    support_func = support_map_accelerated if convex_support_acceleration else support_map
+    support_func = support_map_accelerated_inline if convex_support_acceleration else support_map_inline
     provider_type = AcceleratedSupportMapDataProvider if convex_support_acceleration else SupportMapDataProvider
     compute_contacts = create_compute_gjk_mpr_contacts(
         writer_func,
