@@ -109,7 +109,7 @@ from .support_function import (
     create_triangle_prism_penetration_refiner,
     extract_shape_data,
     support_map,
-    support_map_accelerated,
+    support_map_accelerated_inline,
     support_map_heightfield_box,
     support_map_heightfield_capsule,
     support_map_heightfield_cylinder,
@@ -2702,7 +2702,7 @@ def _create_mesh_triangle_contacts_to_reducer_kernel(
     # Convex hulls take the cooked accelerated support (directional seeds and vertex adjacency);
     # the typed primitive queries keep their reduced support dispatch.
     accelerated = primitive_type in (0, int(GeoType.CONVEX_MESH))
-    query_support = support_map_accelerated if accelerated else HEIGHTFIELD_PRIMITIVE_SUPPORTS[primitive_type]
+    query_support = support_map_accelerated_inline if accelerated else HEIGHTFIELD_PRIMITIVE_SUPPORTS[primitive_type]
     query_filter = seam_surface_witness
     if analytic:
         pair_query = ANALYTIC_PRIMITIVE_QUERIES[primitive_type](writer_func, query_filter=query_filter)
@@ -3111,7 +3111,7 @@ def create_mesh_face_contacts_kernel(
     """
     face_contacts = create_compute_face_contacts(
         writer_func,
-        support_map_accelerated,
+        support_map_accelerated_inline,
         mesh_contact_filter,
         mesh_manifold_triangle,
         deepest_once=mesh_deepest_once,
@@ -3174,7 +3174,9 @@ def create_mesh_face_contacts_kernel(
                 provider.support_vertex_offsets = support_vertex_offsets
                 face = wp.cross(triangle.scale, triangle.auxiliary)
                 support_point = (
-                    wp.quat_rotate(quat_b, support_map_accelerated(geom_b, wp.quat_rotate_inv(quat_b, -face), provider))
+                    wp.quat_rotate(
+                        quat_b, support_map_accelerated_inline(geom_b, wp.quat_rotate_inv(quat_b, -face), provider)
+                    )
                     + pos_b
                 )
                 if triangle_plane_clears(triangle, corner_0, support_point, threshold):

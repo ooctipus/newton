@@ -461,9 +461,8 @@ def _support_map_cylinder(geom: GenericShapeData, direction: wp.vec3) -> wp.vec3
     return result
 
 
-# Out of line: GJK/MPR call it at ~150 sites, and inlining each copy dominated compile time.
-@wp.func(inline=False)
-def support_map(geom: GenericShapeData, direction: wp.vec3, data_provider: Any) -> wp.vec3:
+@wp.func
+def support_map_inline(geom: GenericShapeData, direction: wp.vec3, data_provider: Any) -> wp.vec3:
     """
     Return the support point of a primitive in its local frame.
 
@@ -593,6 +592,13 @@ def support_map(geom: GenericShapeData, direction: wp.vec3, data_provider: Any) 
     return result
 
 
+# Out of line for the convex GJK/MPR kernels, which call it at ~150 sites: inlining each copy dominated compile time
+# and slows them. The mesh contact kernels sit at their register limit, where the call spills: they inline it.
+@wp.func(inline=False)
+def support_map(geom: GenericShapeData, direction: wp.vec3, data_provider: Any) -> wp.vec3:
+    return support_map_inline(geom, direction, data_provider)
+
+
 @wp.func
 def support_map_heightfield_sphere(geom: GenericShapeData, direction: wp.vec3, data_provider: Any) -> wp.vec3:
     """Restrict support dispatch to an admitted heightfield prism/sphere pair."""
@@ -611,7 +617,7 @@ def support_map_heightfield_capsule(geom: GenericShapeData, direction: wp.vec3, 
     if geom.shape_type == GeoTypeEx.TRIANGLE_PRISM:
         result = _support_map_triangle(geom, direction)
     elif geom.shape_type == GeoType.CAPSULE:
-        result = support_map(geom, direction, data_provider)
+        result = support_map_inline(geom, direction, data_provider)
     return result
 
 
@@ -675,6 +681,14 @@ def support_map_accelerated(geom: GenericShapeData, direction: wp.vec3, data_pro
 
 
 @wp.func
+def support_map_accelerated_inline(geom: GenericShapeData, direction: wp.vec3, data_provider: Any) -> wp.vec3:
+    """:func:`support_map_accelerated` with the support map inline, for the mesh contact kernels."""
+    if geom.shape_type == GeoType.CONVEX_MESH:
+        return _support_map_convex_mesh(geom, direction, data_provider)
+    return support_map_inline(geom, direction, data_provider)
+
+
+@wp.func
 def support_map_lean_accelerated(geom: GenericShapeData, direction: wp.vec3, data_provider: Any) -> wp.vec3:
     """Lean support mapping with directional acceleration for eligible convex meshes."""
     if geom.shape_type == GeoType.CONVEX_MESH:
@@ -686,7 +700,9 @@ def create_shape_support_function(support_func: Any, center_ties: bool = False):
     """Create a support function with built-in shape policies."""
     fuse_builtin_box_support = support_func in (
         support_map,
+        support_map_inline,
         support_map_accelerated,
+        support_map_accelerated_inline,
         support_map_lean,
         support_map_lean_accelerated,
     ) or getattr(support_func, "_preserve_builtin_box_support", False)

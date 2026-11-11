@@ -52,6 +52,7 @@ from .support_function import (
     closest_point_on_triangle,
     pack_mesh_ptr,
     support_map,
+    support_map_inline,
     support_map_lean,
     support_map_lean_accelerated,
     unpack_mesh_ptr,
@@ -740,22 +741,22 @@ def compute_tight_aabb_from_support(
             max_z = wp.max(max_z, vz)
     else:
         # Generic path: 6 support evaluations for other shape types (all O(1))
-        support_point = support_map(shape_data, local_x, data_provider)
+        support_point = support_map_inline(shape_data, local_x, data_provider)
         max_x = wp.dot(local_x, support_point)
 
-        support_point = support_map(shape_data, local_y, data_provider)
+        support_point = support_map_inline(shape_data, local_y, data_provider)
         max_y = wp.dot(local_y, support_point)
 
-        support_point = support_map(shape_data, local_z, data_provider)
+        support_point = support_map_inline(shape_data, local_z, data_provider)
         max_z = wp.dot(local_z, support_point)
 
-        support_point = support_map(shape_data, -local_x, data_provider)
+        support_point = support_map_inline(shape_data, -local_x, data_provider)
         min_x = wp.dot(local_x, support_point)
 
-        support_point = support_map(shape_data, -local_y, data_provider)
+        support_point = support_map_inline(shape_data, -local_y, data_provider)
         min_y = wp.dot(local_y, support_point)
 
-        support_point = support_map(shape_data, -local_z, data_provider)
+        support_point = support_map_inline(shape_data, -local_z, data_provider)
         min_z = wp.dot(local_z, support_point)
 
     # AABB in world space (add world position to extents)
@@ -1367,7 +1368,7 @@ def _mesh_triangle_is_front_facing_local(
     # Mesh scaling transforms normals by its inverse, including reflections.
     scaled_normal = wp.cw_div(face_normal, mesh_scale)
     direction = wp.transform_vector(wp.transform_inverse(convex_in_mesh), scaled_normal)
-    support = support_map(convex, direction, SupportMapDataProvider())
+    support = support_map_inline(convex, direction, SupportMapDataProvider())
     support_in_bvh = wp.cw_div(wp.transform_point(convex_in_mesh, support), mesh_scale)
     if wp.dot(face_normal, support_in_bvh - v0) <= 0.0:
         return False
