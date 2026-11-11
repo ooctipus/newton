@@ -30,9 +30,10 @@ from unittest import mock
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs import sweep_units
+from newton._src.core.memory import Place
+from newton._src.solvers.feather_pgs import sweep_plan, sweep_routes, sweep_units
 from newton._src.solvers.feather_pgs.row_laws import ROW_CONTACT, ROW_FRICTION, ROW_TORSION
-from newton._src.solvers.feather_pgs.row_metadata import HEADER_WORDS, record_views
+from newton._src.solvers.feather_pgs.row_metadata import HEADER_WORDS, record_layout, record_views
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_scenes as scenes
 from newton.tests import test_feather_pgs_conformance as conf
@@ -368,6 +369,42 @@ class TestColoredSweep(unittest.TestCase):
         solvers = []
         self._simulate(tray(), "patch", solvers, units=4096)
         self.assertIsNone(solvers[-1].sweep.colored_units, "no world's row capacity holds 4096 contact units")
+
+    def test_every_sweep_reads_the_records_the_placement_wrote(self):
+        """Where the one-warp sweep streams its dense rows' records and the colored mapping stages them, each its own
+        stage's decision (coins at 512 worlds on the GB300), the colored mapping reads its records where the placement
+        wrote them: its worlds' speed rows, which follow their contacts and bind, step bitwise as where both stage."""
+        original = sweep_plan.Sweep._staged
+
+        def streamed(plan, config, items):
+            staged = original(plan, config, items)
+            if config.colored:
+                return staged
+            return dataclasses.replace(staged, places=dataclasses.replace(staged.places, metadata=Place.STREAMED))
+
+        def limited(device):
+            # Every box's speeds limited below its settling motion: a speed row each, reserved at every step, that binds.
+            model = tray().build(device)
+            for name, limit in (("rigid_body_max_linear_velocity", 0.02), ("rigid_body_max_angular_velocity", 0.2)):
+                setattr(model, name, wp.full(model.body_count, limit, dtype=wp.float32, device=device))
+            return model
+
+        physics = conf._physics(dataclasses.replace(tray(), build=limited), "patch", 32)
+        options = {**physics.options(32), "velocity_limit_activation_fraction": 0.0}
+        runs, solvers = [], []
+        for stage in (original, streamed):
+            with mock.patch.object(sweep_plan.Sweep, "_staged", stage), colored(1, solvers):
+                runs.append(conf.simulate(physics.scene, _ROUTE, self.device, options=options))
+        placement, sweep = solvers[-1].placement, solvers[-1].sweep
+        self.assertEqual(placement.record_first, 0, "the streamed sweep's dense records lead the line")
+        self.assertEqual(sweep.colored_sweep.places.metadata, Place.SHARED)
+        free, words = record_layout(placement.record_first, placement.body_base, placement.row_pitch)
+        source = sweep_routes.mf_gs_source(sweep.colored_sweep)[0]
+        self.assertIn(f"const int off_rec_mf = line * {words} + {free};", source)
+        counts, ends = placement.mf_constraint_count.numpy(), placement.mf_contact_rows_end.numpy()
+        self.assertTrue((counts > ends).all(), "every world's speed rows follow its contacts")
+        for name in ("body_q", "body_qd"):
+            np.testing.assert_array_equal(getattr(runs[0], name), getattr(runs[1], name), err_msg=name)
 
     def test_the_rule_leaves_thin_worlds_to_the_warp(self):
         """A world under the rule's units per color keeps the one-warp mapping beside a built colored one, bitwise."""

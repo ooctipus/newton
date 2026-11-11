@@ -494,10 +494,6 @@ class Sweep:
                     block_warps = pair.block_warps
             declared = general(lanes_per_world=lanes, block_warps=block_warps)
             self.general_sweep = self._staged(declared, worlds)
-            # The streamed rows' records, in the worlds the general sweep and the unit builder read.
-            self.placement.allocate_row_records(
-                sweep_routes.record_first(self.placement.dense_max_constraints, self.general_sweep.places)
-            )
             # The colored mapping takes the worlds the unit builder's rule picks at every pack
             # (sweep_units.COLORED_RULE), among those whose free bodies and row capacity admit it: built, with a
             # storage slot each, for those worlds only, it runs beside the one-warp mapping. More of them than the
@@ -517,6 +513,14 @@ class Sweep:
                     self.forest.free_rigid_per_world, self.placement.mf_max_constraints, rule
                 )
             colored = bool(model.device.is_cuda and capable.size > 0)
+            colored_sweep = self._staged(dataclasses.replace(declared, **_COLORED), capable.size) if colored else None
+            # The streamed rows' records, in the worlds the sweeps and the unit builder read: one layout, which every
+            # sweep reads whatever its own stage holds, with the dense rows' where any sweep streams theirs.
+            staged = [sweep for sweep in (self.general_sweep, colored_sweep) if sweep is not None]
+            self.placement.allocate_row_records(
+                min(sweep_routes.record_first(self.placement.dense_max_constraints, sweep.places) for sweep in staged)
+            )
+            self.general_sweep = dataclasses.replace(self.general_sweep, records=self.placement.record_first)
             if coordinate_levels:
                 rows = self.placement.dense_max_constraints
                 self.placement.arrays.allocate(
@@ -531,7 +535,7 @@ class Sweep:
                 )
             self.mf_gs_kernel = self.sweep("mf_gs", self.general_sweep)
             if colored:
-                self.colored_sweep = self._staged(dataclasses.replace(declared, **_COLORED), capable.size)
+                self.colored_sweep = dataclasses.replace(colored_sweep, records=self.placement.record_first)
                 self.mf_colored_kernel = self.sweep("mf_colored", self.colored_sweep)
             if parallel_rows > 0:
                 # The producer's sink, a tier's by data and the device (sweep_routes_tiers.emits): a tier that takes EMIT
