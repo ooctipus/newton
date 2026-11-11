@@ -1026,7 +1026,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         exit=sweep_vote + sweep_end,
     )
     # The streamed rows' records (row_record, row_metadata.record_layout).
-    free_records, line_records = record_layout(record_first(M_D, places), M_D, P)
+    free_records, line_records = record_layout(sweep.record_rows, M_D, P)
     records = f"    const int off_rec_mf = line * {line_records} + {free_records};"
     if dense.record:
         records = f"    const int off_rec_dense = line * {line_records};\n" + records
@@ -1106,7 +1106,7 @@ class GeneralSweep(SweepConfig):
     - the free bodies' level law (``levels``): sequential, or exact (colored: a block a world, a color's units at once,
       the worlds :class:`.sweep_units.ColoredRule` picks);
     - the row record: ``places`` (:class:`RowPlaces`, the plan's storage choice): the dense rows' metadata staged or
-      their records streamed; the free rows' records always stream;
+      their records streamed; the free rows' always stream; all at the placement's layout (``records``, its first row);
     - the enumeration: ``active_rows`` (:func:`.sweep.active_scan`), else slot order (``coordinate_levels`` first);
       the friction triples after the rows (:func:`.sweep.triple_phase`, K1's order) where each world holds ``one_tree``;
     - the support class: ``max_row_dofs`` (the placement's packed support), ``support_classes`` (the rows' sides by
@@ -1137,8 +1137,11 @@ class GeneralSweep(SweepConfig):
     free_rows: bool = True
     speed_rows: bool = False
     one_tree: bool = False
+    records: int | None = None
 
     def __post_init__(self):
+        if self.places.metadata is Place.STREAMED and self.record_rows:
+            raise ValueError("a sweep that streams its dense rows' records reads them from the line's first row")
         if self.levels.law not in (SEQUENTIAL, EXACT):
             raise ValueError("the general sweep's free bodies step in order or by exact levels (colored)")
         if self.colored and not self.free_rows:
@@ -1164,6 +1167,11 @@ class GeneralSweep(SweepConfig):
     @property
     def colored(self) -> bool:
         return self.levels.law == EXACT
+
+    @property
+    def record_rows(self) -> int:
+        # The line's first row with a record: the placement's allocation, or without one the places' own.
+        return record_first(self.max_constraints, self.places) if self.records is None else int(self.records)
 
     @property
     def lanes(self) -> int:
