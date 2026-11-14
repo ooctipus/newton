@@ -3050,6 +3050,7 @@ class CollisionPipeline:
             has_heightfields = model.heightfield_count > 0
             use_lean_gjk_mpr = False
             mesh_sdf_texture_only = False
+            mesh_sdf_any_texture = False
             mesh_sdf_identity_scale_only = False
             max_mesh_mesh_pairs = self.shape_pairs_max
             max_mesh_plane_pairs = self.shape_pairs_max
@@ -3129,6 +3130,7 @@ class CollisionPipeline:
                         mesh_sdf_texture_only = bool(
                             np.any(mesh_sdf_shapes) and np.all(has_texture_sdf[mesh_sdf_shapes])
                         )
+                        mesh_sdf_any_texture = bool(np.any(has_texture_sdf[mesh_sdf_shapes]))
                     if mesh_sdf_texture_only:
                         texture_sdf_data = model._texture_sdf_data.numpy()
                         scale_baked = texture_sdf_data["scale_baked"]
@@ -3304,6 +3306,7 @@ class CollisionPipeline:
                 candidate_pair_work_estimate=candidate_pair_work_estimate,
                 mesh_sdf_identity_scale_only=mesh_sdf_identity_scale_only,
                 mesh_sdf_texture_only=mesh_sdf_texture_only,
+                mesh_sdf_any_texture=mesh_sdf_any_texture,
                 sdf_texture_paired_samples=model._sdf_texture_paired_samples,
                 deterministic=deterministic,
                 # The pipeline sorts with its own sorter; the narrow phase's standalone sort buffers stay empty.

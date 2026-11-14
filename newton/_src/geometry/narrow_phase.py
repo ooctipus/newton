@@ -2989,6 +2989,7 @@ class NarrowPhase:
         split_gjk_mpr: bool = False,
         candidate_pair_work_estimate: int | None = None,
         mesh_sdf_texture_only: bool = False,
+        mesh_sdf_any_texture: bool = False,
         mesh_sdf_identity_scale_only: bool = False,
         sdf_texture_paired_samples: bool = True,
         deterministic: bool = False,
@@ -3051,6 +3052,9 @@ class NarrowPhase:
                 broad phase can emit. Defaults to ``max_candidate_pairs``.
             mesh_sdf_texture_only: Whether every participating mesh SDF has a texture representation,
                 allowing BVH fallback branches to be removed from mesh/SDF kernels.
+            mesh_sdf_any_texture: Whether some participating mesh SDF has a texture representation. A
+                reducing model with texture and BVH-fallback SDFs both runs the texture passes and the
+                fallback's in two kernels (``sdf_source``); a model with one kind runs one.
             mesh_sdf_identity_scale_only: Whether every participating texture SDF is queried with
                 identity scale, allowing scale conversion branches to be removed. Shapes whose SDF
                 has no baked scale must then keep unit ``shape_scale``.
@@ -3323,6 +3327,7 @@ class NarrowPhase:
         self._finite_source = None
         self.convex_support_acceleration = convex_support_acceleration
         self.mesh_sdf_texture_only = mesh_sdf_texture_only
+        self.mesh_sdf_any_texture = mesh_sdf_any_texture
         self.has_generic_convex_pairs = has_generic_convex_pairs
         self.sdf_texture_paired_samples = sdf_texture_paired_samples
         self.mesh_sdf_identity_scale_only = mesh_sdf_identity_scale_only
@@ -3566,10 +3571,11 @@ class NarrowPhase:
                     writer_func,
                 )
             if self.reduce_contacts:
-                # A model whose mesh SDFs all have textures takes one kernel; one with BVH-fallback SDFs takes the
-                # texture passes and the fallback's in two kernels, so the fallback's queries do not spill the
-                # texture passes' loop (sdf_source).
-                sources = ("any",) if self.mesh_sdf_texture_only else ("texture", "mesh")
+                # A model whose mesh SDFs are of one kind, all textures or all BVH fallbacks, takes one kernel; one
+                # with both takes the texture passes and the fallback's in two kernels, so the fallback's queries
+                # do not spill the texture passes' loop (sdf_source).
+                mixed = self.mesh_sdf_any_texture and not self.mesh_sdf_texture_only
+                sources = ("texture", "mesh") if mixed else ("any",)
                 self.mesh_mesh_contacts_kernels, self.mesh_mesh_contacts_kernels_precomputed = (
                     tuple(
                         create_narrow_phase_process_mesh_mesh_contacts_kernel(
