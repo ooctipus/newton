@@ -149,6 +149,15 @@ class TestNarrowPhaseBufferWarnings(unittest.TestCase):
                     self.assertIn("3 contact candidates", output)
 
 
+def _sort_key_bits(narrow_phase) -> int:
+    """Return the populated width of a narrow phase's deterministic sort keys.
+
+    The contact sorter merges whole 64-bit keys, so the keys' width is the narrow phase's: a sub-key and two
+    shape indices.
+    """
+    return narrow_phase._contact_sort_sub_key_bits + 2 * narrow_phase._contact_sort_shape_index_bits
+
+
 def check_normal_direction(pos_a, pos_b, normal, tolerance=1e-5):
     """Check that normal points from shape A toward shape B."""
     expected_direction = pos_b - pos_a
@@ -550,7 +559,7 @@ class TestNarrowPhase(_NarrowPhaseSetupMixin, unittest.TestCase):
 
         count, pairs, *_ = self._run_narrow_phase(geom_list, [(2, 3), (0, 1)])
 
-        self.assertEqual(self.narrow_phase._contact_sorter._key_bit_count, 7)
+        self.assertEqual(_sort_key_bits(self.narrow_phase), 7)
         self.assertEqual(count, 2)
         self.assertTrue(np.array_equal(pairs, np.array(((0, 1), (2, 3)), dtype=np.int32)))
 
@@ -569,7 +578,7 @@ class TestNarrowPhase(_NarrowPhaseSetupMixin, unittest.TestCase):
         )
 
         self.assertEqual(narrow_phase._contact_sort_sub_key_bits, 23)
-        self.assertEqual(narrow_phase._contact_sorter._key_bit_count, 27)
+        self.assertEqual(_sort_key_bits(narrow_phase), 27)
 
     def _launch_spheres_past_2_20(self):
         """Collide the sphere pairs ``(2**20, 2**20 + 1)`` and ``(2, 3)`` among ``2**20 + 2`` shapes."""
@@ -625,7 +634,7 @@ class TestNarrowPhase(_NarrowPhaseSetupMixin, unittest.TestCase):
         pairs = self._launch_spheres_past_2_20()
 
         np.testing.assert_array_equal(pairs, [(2, 3), (1 << 20, (1 << 20) + 1)])
-        self.assertEqual(self.narrow_phase._contact_sorter._key_bit_count, 3 + 2 * 21)
+        self.assertEqual(_sort_key_bits(self.narrow_phase), 3 + 2 * 21)
 
     def test_deterministic_sort_keys_reject_more_than_2_20_shapes(self):
         """Reject shape counts the deterministic sort key can't hold instead of aliasing them."""
