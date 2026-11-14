@@ -467,7 +467,7 @@ def _unhashed_functions(kernel):
             adj.resolved_static_expressions.values(), (v for _, v in adj.deferred_static_expressions)
         )
         hashed = set(functions) | {value for value in statics if isinstance(value, Function)}
-        for node in adj.reference_nodes():
+        for node in ast.walk(adj.tree):
             if not isinstance(node, ast.Call):
                 continue
             for argument in (*node.args, *(keyword.value for keyword in node.keywords)):
