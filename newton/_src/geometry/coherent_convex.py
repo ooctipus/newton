@@ -258,8 +258,10 @@ class _ConvexQueryCache:
             raise ValueError("coherent convex cache requires valid canonical shape IDs (a < b)")
         keys = (pairs[:, 0].astype(np.uint64) << np.uint64(32)) | pairs[:, 1].astype(np.uint64)
         # One sort validates duplicates and orders device lookup. Hashing packed
-        # keys can degrade badly on replicated explicit-pair patterns.
-        order = np.argsort(keys)
+        # keys can degrade badly on replicated explicit-pair patterns. The model's
+        # pairs arrive in long ascending runs, which the stable sort merges in
+        # near-linear time; unique keys have one sorted order.
+        order = np.argsort(keys, kind="stable")
         pairs, keys = pairs[order], keys[order]
         if np.any(keys[1:] == keys[:-1]):
             raise ValueError("coherent convex cache requires unique ordered pairs")
