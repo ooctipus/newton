@@ -48,6 +48,15 @@ def _store_state(cache: _CacheData, slot: int, pair: wp.vec2i, inputs: _PairInpu
         cache.entry_generation[slot] = cache.generation[0]
 
 
+COLD_QUERY_BLOCK = 128
+"""Threads a block of the cold queries: the narrow phase's CUDA block (``NarrowPhase.block_dim``)."""
+
+COLD_MPR_BLOCKS_PER_SM = 3
+"""Resident blocks a multiprocessor the cold MPR's launch bound keeps: 168 registers a thread. Unbound, CUDA 13.4's
+NVVM output takes 194 (two blocks; CUDA 12.9's 172, also two), and allegro's cold MPR ran 1.17 ms a step on the RTX
+PRO 6000; at three blocks it spills 84 B and runs 0.88 ms (12.9's: 1.07)."""
+
+
 def _create_rejection_query_kernels(accelerated=False, *, diagnostics=False):
     """Create a certificate filter and the original cold MPR/GJK queue owners.
 
@@ -160,7 +169,7 @@ def _create_rejection_query_kernels(accelerated=False, *, diagnostics=False):
                     needs_cold = cache.query_done[index] == 0
             _append_work_index_compacted(needs_cold, index, cache.unresolved_work_items, cache.unresolved_work_count)
 
-    @wp.kernel(enable_backward=False, module="unique")
+    @wp.kernel(enable_backward=False, module="unique", launch_bounds=(COLD_QUERY_BLOCK, COLD_MPR_BLOCKS_PER_SM))
     def cold_mpr(
         candidate_pair: wp.array[wp.vec2i],
         candidate_pair_count: wp.array[int],
