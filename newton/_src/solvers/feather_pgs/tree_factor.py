@@ -28,6 +28,7 @@ import numpy as np
 import warp as wp
 
 from ...core import execution, memory
+from ...core.host_unique import row_ids
 from ...sim import BodyFlags, JointType, ModelFlags
 from . import field_group, host_index
 from .factor.closure import seed_blocks_kernel
@@ -793,15 +794,21 @@ class TreeFactor:
         joint_of[joint_child[joint_child >= 0]] = np.flatnonzero(joint_child >= 0)
         path = np.zeros((max(int(model.joint_count), 1), 2), dtype=np.int32)
         dof_body = np.full(max(int(model.joint_dof_count), 1), -1, dtype=np.int32)
-        for art in arts.tolist():
-            j0, j1 = int(start[art]), int(end[art])
-            for j in range(j0, j1):
-                up = int(joint_of[joint_parent[j]]) if joint_parent[j] >= 0 else -1
-                parent = up - j0 if j0 <= up < j1 else -1
-                if parent >= j - j0:
-                    raise ValueError(f"The walk needs every parent before its children (articulation {art})")
-                path[j] = (parent, int(qd_start[j] - qd_start[j0]))
-                dof_body[qd_start[j] : qd_start[j + 1]] = j - j0
+        # Every joint of the walked trees, tree by tree: its tree's place in arts, its rank in the tree.
+        tree, rank = host_index.expand(np.maximum(end[arts] - start[arts], 0))
+        j0, j1 = start[arts][tree], end[arts][tree]
+        j = j0 + rank
+        up = np.where(joint_parent[j] >= 0, joint_of[np.maximum(joint_parent[j], 0)], -1)
+        parent = np.where((j0 <= up) & (up < j1), up - j0, -1)
+        unordered = np.flatnonzero(parent >= rank)
+        if unordered.size:
+            raise ValueError(
+                f"The walk needs every parent before its children (articulation {arts[tree[unordered[0]]]})"
+            )
+        path[j, 0] = parent
+        path[j, 1] = qd_start[j] - qd_start[j0]
+        joint, dof = host_index.expand(qd_start[j + 1] - qd_start[j])
+        dof_body[qd_start[j][joint] + dof] = rank[joint]
         joints, dofs = max(int(model.joint_count), 1), max(int(model.joint_dof_count), 1)
         self.walk_arts = wp.array(arts, dtype=wp.int32, device=device)
         # The drives' K the refresh adds where a coordinate has a drive row.
@@ -813,31 +820,23 @@ class TreeFactor:
         kinds, dims = model.joint_type.numpy(), model.joint_dof_dim.numpy()
         self.walk_half_host = np.full(dofs, WALK_BOTH, dtype=np.int32)
         walked = np.zeros(max(int(model.joint_count), 1), dtype=bool)
-        for art in arts.tolist():
-            walked[int(start[art]) : int(end[art])] = True
-        for j in range(kinds.size):
-            lin, ang = int(dims[j, 0]), int(dims[j, 1])
-            two = ang > 0 and (
-                (kinds[j] == int(JointType.D6) and lin > 0)
-                or (kinds[j] in (int(JointType.FREE), int(JointType.DISTANCE)) and path[j, 0] >= 0)
-            )
-            c = int(qd_start[j])
-            self.walk_half_host[c : c + lin] = WALK_LINEAR
-            self.walk_half_host[c + lin : c + lin + ang] = WALK_BOTH if two else WALK_ANGULAR
+        walked[j] = True
+        lin, ang = dims[:, 0].astype(np.int64), dims[:, 1].astype(np.int64)
+        two = (ang > 0) & (
+            ((kinds == int(JointType.D6)) & (lin > 0))
+            | (np.isin(kinds, (int(JointType.FREE), int(JointType.DISTANCE))) & (path[: kinds.size, 0] >= 0))
+        )
+        # Each joint's linear coordinates, then its angular ones, joint by joint (a later write wins, as in order).
+        joint, k = host_index.expand(lin + ang)
+        half = np.where(k < lin[joint], WALK_LINEAR, np.where(two[joint], WALK_BOTH, WALK_ANGULAR))
+        place = qd_start[: kinds.size][joint] + k
+        inside = place < dofs  # a slice stops at the array's end
+        self.walk_half_host[place[inside]] = half[inside]
         both = self.two_halves(np.flatnonzero(np.repeat(walked[: kinds.size], np.diff(qd_start[: kinds.size + 1]))))
         # The walking classes: each held tree's topology, which the step's one leave (walk_leave_kernel) and the
         # predictor's solve emit as its walk, and each articulation's class among them.
-        classes: dict[WalkClass, int] = {}
-        walk_class = np.full(max(int(model.articulation_count), 1), -1, dtype=np.int32)
-        for art in arts.tolist():
-            j0, j1 = int(start[art]), int(end[art])
-            table = WalkClass(
-                tuple(int(p) for p in path[j0:j1, 0]),
-                (*(int(f) for f in path[j0:j1, 1]), int(qd_start[j1] - qd_start[j0])),
-                tuple(int(h) for h in self.walk_half_host[int(qd_start[j0]) : int(qd_start[j1])]),
-            )
-            walk_class[art] = classes.setdefault(table, len(classes))
-        self.walk_classes = tuple(classes)
+        classes, walk_class = self._walk_tables(arts, start, end, qd_start, path)
+        self.walk_classes = classes
         self.walk_class = wp.array(walk_class, dtype=wp.int32, device=device)
         self.walk_class_host = walk_class
         # The refresh's join slots are its class's (WalkClass.slots): a parent waits in one for the lifted inertia of
@@ -848,7 +847,7 @@ class TreeFactor:
         # The refresh's launch (walk_work): on CUDA a lane a body of a batch and a join slot, the trees in flight
         # those with a chain to walk (a free rigid body leaves its group after the batch's first body).
         bodies = max([1, *(len(walk.parent) for walk in classes)])
-        sizes = np.array([int(end[a]) - int(start[a]) for a in arts.tolist()], dtype=np.int64)
+        sizes = (end[arts] - start[arts]).astype(np.int64)
         walked = int(np.count_nonzero(sizes > 1)) or int(arts.size)
         self.walk_shape = execution.shape(walk_work(walked, bodies, held), memory.device(device))
         self.walk_refresh = walk_step_kernel(self.walk_classes)
@@ -949,9 +948,55 @@ class TreeFactor:
         driven = self.drive_row_by_dof.numpy() >= 0
         limited = driven & ((ke > 0) | (kd > 0) | (damping > 0)) & (limit > 0) & np.isfinite(limit)
         starts, counts = forest.articulation_dof_start_host, forest.articulation_dof_count_host
-        return np.array(
-            [int(np.count_nonzero(limited[starts[a] : starts[a] + counts[a]])) for a in arts.tolist()], dtype=np.int64
-        )
+        # Each tree's count of limited coordinates, as running totals over its coordinate range (clipped as a slice).
+        total = np.concatenate(([0], np.cumsum(limited, dtype=np.int64)))
+        first = np.clip(starts[arts].astype(np.int64), 0, limited.size)
+        last = np.clip(first + counts[arts].astype(np.int64), first, limited.size)
+        return total[last] - total[first]
+
+    def _walk_tables(self, arts, start, end, qd_start, path) -> tuple[tuple[WalkClass, ...], np.ndarray]:
+        """The walking classes of the trees ``arts`` in the order they first occur, and each articulation's class (-1
+        for one not walked): a tree's class is its bodies' parents, their first coordinates with the count after the
+        last, and its coordinates' halves (:attr:`walk_half_host`), so trees of equal tables share one."""
+        model = self.model
+        walk_class = np.full(max(int(model.articulation_count), 1), -1, dtype=np.int32)
+        if arts.size == 0:
+            return (), walk_class
+        j0, j1 = start[arts].astype(np.int64), end[arts].astype(np.int64)
+        d0, d1 = qd_start[j0].astype(np.int64), qd_start[j1].astype(np.int64)
+        # Equal tables have equal joint and coordinate counts: rank the tables of each (joints, coordinates) group.
+        counts = np.stack((j1 - j0, d1 - d0), axis=1)
+        group = row_ids(counts)
+        key = np.full(arts.size, -1, dtype=np.int64)
+        found = 0
+        for g in range(int(group.max()) + 1):
+            members = np.flatnonzero(group == g)
+            joints, coordinates = (int(n) for n in counts[members[0]])
+            body = j0[members, None] + np.arange(joints)
+            rows = np.concatenate(
+                (path[body, 0], path[body, 1], self.walk_half_host[d0[members, None] + np.arange(coordinates)]), axis=1
+            )
+            ids = row_ids(rows)
+            key[members] = found + ids
+            found += int(ids.max()) + 1
+        # The classes in the order their first tree occurs in arts (a dict's insertion order).
+        first = np.full(found, arts.size, dtype=np.int64)
+        np.minimum.at(first, key, np.arange(arts.size))
+        order = np.argsort(first, kind="stable")
+        number = np.empty(found, dtype=np.int64)
+        number[order] = np.arange(found)
+        walk_class[arts] = number[key]
+        classes = []
+        for t in first[order].tolist():
+            a, b, c, d = int(j0[t]), int(j1[t]), int(d0[t]), int(d1[t])
+            classes.append(
+                WalkClass(
+                    tuple(path[a:b, 0].tolist()),
+                    (*path[a:b, 1].tolist(), d - c),
+                    tuple(self.walk_half_host[c:d].tolist()),
+                )
+            )
+        return tuple(classes), walk_class
 
     def slip_capacity(self, articulations) -> int:
         """The most drives of one of ``articulations`` that can slip (:meth:`slips_by_tree`), at most

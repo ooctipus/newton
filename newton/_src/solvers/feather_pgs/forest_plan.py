@@ -31,7 +31,7 @@ from types import SimpleNamespace
 import numpy as np
 import warp as wp
 
-from ...core.host_unique import row_ids
+from ...core.host_unique import distinct, row_ids
 from ...geometry.flags import ShapeFlags
 from ...geometry.types import GeoType
 from ...sim import Model
@@ -729,7 +729,7 @@ def _world_classes(plan, model):
     tree_world = plan.articulation_world[plan.tree_articulation]
 
     def present(law, trees):
-        np.bitwise_or.at(laws, tree_world[trees[trees >= 0]], int(law))
+        laws[distinct(tree_world[trees[trees >= 0]])] |= int(law)
 
     if model.shape_contact_pair_count:
         pairs = model.shape_contact_pairs.numpy().reshape(-1, 2)
