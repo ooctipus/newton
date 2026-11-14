@@ -361,7 +361,7 @@ def test_hydroelastic_sdf_padding_covers_margin_and_gap(test, device):
     )
     exact_builder.add_shape_box(body=-1, hx=0.5, hy=0.5, hz=0.5)
 
-    test.assertTrue(exact_builder._validate_shapes())
+    test.assertTrue(exact_builder._validate_shapes(exact_builder._shape_classes()))
 
     builder = newton.ModelBuilder()
     builder.default_shape_cfg = newton.ModelBuilder.ShapeConfig(

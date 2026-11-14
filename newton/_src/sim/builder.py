@@ -2872,6 +2872,11 @@ class ModelBuilder:
                 attributes.pop(name, None)
         object.__setattr__(self, name, value)
 
+    def _row_count(self, name: str) -> int:
+        """Length of a list attribute, read without materializing array storage."""
+        stored = self._array_backed_attributes.get(name)
+        return len(getattr(self, name)) if stored is None else len(stored[0])
+
     def _set_array_backed_attribute(self, name: str, value: np.ndarray, descriptor: _ArrayBackedListDescriptor) -> None:
         """Store an attribute as an array that materializes as a list on ordinary access."""
         self._array_backed_attributes[name] = (value, descriptor)
@@ -4097,61 +4102,61 @@ class ModelBuilder:
         """
         The number of shapes in the model.
         """
-        return len(self.shape_type)
+        return self._row_count("shape_type")
 
     @property
     def body_count(self):
         """
         The number of rigid bodies in the model.
         """
-        return len(self.body_q)
+        return self._row_count("body_q")
 
     @property
     def joint_count(self):
         """
         The number of joints in the model.
         """
-        return len(self.joint_type)
+        return self._row_count("joint_type")
 
     @property
     def particle_count(self):
         """
         The number of particles in the model.
         """
-        return len(self.particle_q)
+        return self._row_count("particle_q")
 
     @property
     def tri_count(self):
         """
         The number of triangles in the model.
         """
-        return len(self.tri_poses)
+        return self._row_count("tri_poses")
 
     @property
     def tet_count(self):
         """
         The number of tetrahedra in the model.
         """
-        return len(self.tet_poses)
+        return self._row_count("tet_poses")
 
     @property
     def edge_count(self):
         """
         The number of edges (for bending) in the model.
         """
-        return len(self.edge_rest_angle)
+        return self._row_count("edge_rest_angle")
 
     @property
     def spring_count(self):
         """
         The number of springs in the model.
         """
-        return len(self.spring_rest_length)
+        return self._row_count("spring_rest_length")
 
     @property
     def attachment_particle_body_count(self) -> int:
         """The number of particle-body attachments in the model."""
-        return len(self.attachment_particle_body_body)
+        return self._row_count("attachment_particle_body_body")
 
     @property
     def muscle_count(self):
@@ -14267,7 +14272,33 @@ class ModelBuilder:
                 "through joints. Add all connected joints to the same articulation."
             )
 
-    def _validate_shapes(self) -> bool:
+    def _shape_classes(self) -> _RowClasses:
+        """Group the shapes into classes equal in every input of the collision data derived from a shape.
+
+        The inputs are a shape's type, source (by identity), flags, scale, margin, gap and SDF settings;
+        :meth:`_validate_shapes` and :meth:`finalize` check and derive a class once, at its first shape.
+        """
+        with self._raw_array_access():
+            source = self.shape_source
+            return _RowClasses(
+                np.asarray(self.shape_world),
+                (
+                    np.asarray(self.shape_type),
+                    np.asarray(self.shape_flags),
+                    np.fromiter(map(id, source), dtype=np.int64, count=len(source)),
+                    self.shape_scale,
+                    self.shape_margin,
+                    self.shape_gap,
+                    self.shape_force_sdf,
+                    self.shape_sdf_narrow_band_range,
+                    self.shape_sdf_target_voxel_size,
+                    self.shape_sdf_max_resolution,
+                    self.shape_sdf_texture_format,
+                    self.shape_sdf_padding,
+                ),
+            )
+
+    def _validate_shapes(self, shape_classes: _RowClasses) -> bool:
         """Validate finite contact materials and shape gaps for stable collision handling.
 
         Margin is an outward offset from a shape's surface [m], while broad phase uses
@@ -14277,6 +14308,9 @@ class ModelBuilder:
 
         This check only considers shapes that participate in collisions (with the
         `COLLIDE_SHAPES` or `COLLIDE_PARTICLES` flag).
+
+        Args:
+            shape_classes: The shapes' classes (:meth:`_shape_classes`); a class is checked at its first shape.
 
         Raises:
             ValueError: If a colliding shape has a non-finite contact material value
@@ -14289,7 +14323,6 @@ class ModelBuilder:
             Whether all colliding shapes have non-negative gaps.
         """
         collision_flags_mask = ShapeFlags.COLLIDE_SHAPES | ShapeFlags.COLLIDE_PARTICLES
-        shapes_with_bad_gap = []
         with self._raw_array_access():
             colliding = (np.asarray(self.shape_flags, dtype=np.int32) & int(collision_flags_mask)) != 0
             if np.any(colliding):
@@ -14313,20 +14346,24 @@ class ModelBuilder:
                         raise ValueError(
                             f"Invalid {name} for shape {idx} ('{label}'): expected a finite value, got {values[idx]}."
                         )
-            shape_flags = _list_for_iteration(self.shape_flags)
-            shape_margin = _list_for_iteration(self.shape_margin)
-            shape_gap = _list_for_iteration(self.shape_gap)
+            shape_flags = shape_classes.values(self.shape_flags)
+            shape_margin = shape_classes.values(self.shape_margin)
+            shape_gap = shape_classes.values(self.shape_gap)
+            shape_type = shape_classes.values(self.shape_type)
+            shape_source = shape_classes.values(self.shape_source)
+            shape_sdf_padding = shape_classes.values(self.shape_sdf_padding)
 
-        for i in range(self.shape_count):
+        bad_gap_classes = np.zeros(len(shape_classes.rows), dtype=bool)
+        for c, i in enumerate(shape_classes.rows):
             # Skip shapes that don't participate in any collisions (e.g., sites, visual-only)
-            if not (shape_flags[i] & collision_flags_mask):
+            if not (shape_flags[c] & collision_flags_mask):
                 continue
-            margin = shape_margin[i]
-            gap = shape_gap[i]
-            sdf_padding = self.shape_sdf_padding[i]
+            margin = shape_margin[c]
+            gap = shape_gap[c]
+            sdf_padding = shape_sdf_padding[c]
             if (
-                shape_flags[i] & ShapeFlags.HYDROELASTIC
-                and shape_flags[i] & ShapeFlags.COLLIDE_SHAPES
+                shape_flags[c] & ShapeFlags.HYDROELASTIC
+                and shape_flags[c] & ShapeFlags.COLLIDE_SHAPES
                 and sdf_padding is not None
                 and sdf_padding < margin + gap
                 and not math.isclose(sdf_padding, margin + gap, rel_tol=1.0e-9, abs_tol=1.0e-12)
@@ -14336,11 +14373,11 @@ class ModelBuilder:
                     f"({margin + gap:.6g}), got {sdf_padding:.6g}."
                 )
             if (
-                shape_flags[i] & ShapeFlags.HYDROELASTIC
-                and shape_flags[i] & ShapeFlags.COLLIDE_SHAPES
-                and self.shape_type[i] in (GeoType.MESH, GeoType.CONVEX_MESH)
+                shape_flags[c] & ShapeFlags.HYDROELASTIC
+                and shape_flags[c] & ShapeFlags.COLLIDE_SHAPES
+                and shape_type[c] in (GeoType.MESH, GeoType.CONVEX_MESH)
             ):
-                shape_src = self.shape_source[i]
+                shape_src = shape_source[c]
                 mesh_sdf = getattr(shape_src, "sdf", None) if shape_src is not None else None
                 if mesh_sdf is not None:
                     required_sdf_padding = margin + gap
@@ -14368,12 +14405,15 @@ class ModelBuilder:
                             f"{construction_padding:.6g}. Rebuild it with "
                             f"Mesh.build_sdf(margin={required_sdf_padding:.6g})."
                         )
-            if gap < 0.0:
-                shapes_with_bad_gap.append(
-                    f"{self.shape_label[i] or f'shape_{i}'} (margin={margin:.6g}, gap={gap:.6g})"
+            bad_gap_classes[c] = gap < 0.0
+        shapes_with_bad_gap = np.flatnonzero(bad_gap_classes[shape_classes.row_class])
+        if len(shapes_with_bad_gap):
+            example_shapes = []
+            for i in shapes_with_bad_gap[:5].tolist():
+                c = int(shape_classes.row_class[i])
+                example_shapes.append(
+                    f"{self.shape_label[i] or f'shape_{i}'} (margin={shape_margin[c]:.6g}, gap={shape_gap[c]:.6g})"
                 )
-        if shapes_with_bad_gap:
-            example_shapes = shapes_with_bad_gap[:5]
             warnings.warn(
                 f"Found {len(shapes_with_bad_gap)} shape(s) with gap < 0. "
                 f"This can cause missed collisions in broad phase because effective expansion uses margin + gap. "
@@ -14670,10 +14710,11 @@ class ModelBuilder:
             _validate_particle_topology("edge_indices", edge_indices[:, 2:])
 
         if joint_count > 0:
-            joint_arrays = [
-                ("joint_mimic_joint", self.joint_mimic_joint),
-                ("joint_mimic_coeffs", self.joint_mimic_coeffs),
-            ]
+            with self._raw_array_access():
+                joint_arrays = [
+                    ("joint_mimic_joint", self.joint_mimic_joint),
+                    ("joint_mimic_coeffs", self.joint_mimic_coeffs),
+                ]
             for name, arr in joint_arrays:
                 if len(arr) != joint_count:
                     raise ValueError(
@@ -15635,6 +15676,8 @@ class ModelBuilder:
             # are validated and get their collision data like shapes.
             self._variant_shape_rows = _VariantShapeRows(self)
             try:
+                shape_classes = self._shape_classes()
+
                 # validate world ordering and contiguity
                 if not skip_all_validations and not skip_validation_worlds:
                     self._validate_world_ordering()
@@ -15645,7 +15688,7 @@ class ModelBuilder:
 
                 # validate contact materials, gaps, and hydroelastic SDF padding
                 if not skip_all_validations and not skip_validation_shapes:
-                    self._validate_shapes()
+                    self._validate_shapes(shape_classes)
 
                 # validate structural invariants (body/joint references, array lengths)
                 if not skip_all_validations and not skip_validation_structure:
@@ -15657,7 +15700,7 @@ class ModelBuilder:
 
                 with self._raw_array_access():
                     return self._finalize_impl(
-                        device=device, requires_grad=requires_grad, validate_inertia=validate_inertia
+                        shape_classes, device=device, requires_grad=requires_grad, validate_inertia=validate_inertia
                     )
             finally:
                 self._variant_shape_rows.remove(self)
@@ -15668,6 +15711,7 @@ class ModelBuilder:
 
     def _finalize_impl(
         self,
+        shape_classes: _RowClasses,
         device: Devicelike | None = None,
         *,
         requires_grad: bool = False,
@@ -15683,13 +15727,23 @@ class ModelBuilder:
         # static particles (with zero mass) have zero inverse mass
         particle_inv_mass = np.divide(1.0, ms, out=np.zeros_like(ms), where=ms != 0.0)
 
-        # Keep the compact arrays for device transfer, while using Python lists in the
-        # large per-shape loops below. Iterating NumPy rows and scalars from Python is
-        # substantially more expensive than iterating their built-in equivalents.
-        shape_flags_list = _list_for_iteration(self.shape_flags)
-        shape_scale_list = _list_for_iteration(self.shape_scale)
-        shape_margin_list = _list_for_iteration(self.shape_margin)
-        shape_gap_list = _list_for_iteration(self.shape_gap)
+        # The per-shape collision data below is derived once per shape class (rows equal in every input of
+        # the derivation, as replicated worlds repeat their prototype's rows) and gathered to the shapes.
+        shape_class = shape_classes.row_class
+        class_type = shape_classes.values(self.shape_type)
+        class_source = shape_classes.values(self.shape_source)
+        class_flags = shape_classes.values(self.shape_flags)
+        class_scale = shape_classes.values(self.shape_scale)
+        class_margin = shape_classes.values(self.shape_margin)
+        class_gap = shape_classes.values(self.shape_gap)
+        class_sdf_narrow_band_range = shape_classes.values(self.shape_sdf_narrow_band_range)
+        class_sdf_target_voxel_size = shape_classes.values(self.shape_sdf_target_voxel_size)
+        class_sdf_max_resolution = shape_classes.values(self.shape_sdf_max_resolution)
+        class_sdf_texture_format = shape_classes.values(self.shape_sdf_texture_format)
+        class_sdf_padding = shape_classes.values(self.shape_sdf_padding)
+        class_force_sdf = shape_classes.values(self.shape_force_sdf)
+        class_rows = shape_classes.rows
+        class_count = len(class_rows)
 
         shape_collision_filter_packed = self._build_shape_collision_filter_packed()
         with wp.ScopedDevice(device):
@@ -15754,26 +15808,26 @@ class ModelBuilder:
             m.body_shapes = self.body_shapes
 
             def _shape_requests_planar_sdf(shape_idx: int) -> bool:
-                """Whether a shape needs texture SDF data for planar-faced contact."""
-                if not (shape_flags_list[shape_idx] & ShapeFlags.COLLIDE_SHAPES):
+                """Whether a shape class needs texture SDF data for planar-faced contact."""
+                if not (class_flags[shape_idx] & ShapeFlags.COLLIDE_SHAPES):
                     return False
-                stype = self.shape_type[shape_idx]
+                stype = class_type[shape_idx]
                 if stype in (GeoType.MESH, GeoType.CONVEX_MESH):
-                    src = self.shape_source[shape_idx]
+                    src = class_source[shape_idx]
                     return src is not None and (
                         getattr(src, "sdf", None) is not None
-                        or self.shape_sdf_max_resolution[shape_idx] is not None
-                        or self.shape_sdf_target_voxel_size[shape_idx] is not None
+                        or class_sdf_max_resolution[shape_idx] is not None
+                        or class_sdf_target_voxel_size[shape_idx] is not None
                     )
                 return stype == GeoType.BOX and (
-                    self.shape_sdf_max_resolution[shape_idx] is not None
-                    or self.shape_sdf_target_voxel_size[shape_idx] is not None
-                    or bool(shape_flags_list[shape_idx] & ShapeFlags.HYDROELASTIC)
+                    class_sdf_max_resolution[shape_idx] is not None
+                    or class_sdf_target_voxel_size[shape_idx] is not None
+                    or bool(class_flags[shape_idx] & ShapeFlags.HYDROELASTIC)
                 )
 
-            generated_shape_sources = list(self.shape_source)
+            generated_shape_sources = list(class_source)
             deduplicated_convex_sources = {}
-            for shape_idx, shape_type in enumerate(self.shape_type):
+            for shape_idx, shape_type in enumerate(class_type):
                 source = generated_shape_sources[shape_idx]
                 if shape_type != GeoType.CONVEX_MESH or not isinstance(source, Mesh):
                     continue
@@ -15786,7 +15840,7 @@ class ModelBuilder:
                 generated_shape_sources[shape_idx] = deduplicated_source
             generated_sdf_edge_meshes = []
             unit_box_edge_mesh = None
-            for shape_idx, shape_type in enumerate(self.shape_type):
+            for shape_idx, shape_type in enumerate(class_type):
                 if shape_type == GeoType.BOX and _shape_requests_planar_sdf(shape_idx):
                     if unit_box_edge_mesh is None:
                         # The edge mesh is intentionally unscaled; per-shape box
@@ -15892,9 +15946,7 @@ class ModelBuilder:
             # finalized_geos above); visual-only shapes are skipped.
             shape_mesh_properties = []
             mesh_properties_by_geo_hash: dict[int, int] = {}
-            for shape_type, geo, shape_flags in zip(
-                self.shape_type, generated_shape_sources, shape_flags_list, strict=True
-            ):
+            for shape_type, geo, shape_flags in zip(class_type, generated_shape_sources, class_flags, strict=True):
                 mesh_properties = 0
                 is_collidable = bool(shape_flags & (ShapeFlags.COLLIDE_SHAPES | ShapeFlags.COLLIDE_PARTICLES))
                 if is_collidable and shape_type in (GeoType.MESH, GeoType.CONVEX_MESH) and isinstance(geo, Mesh):
@@ -15913,8 +15965,10 @@ class ModelBuilder:
                 shape_mesh_properties.append(mesh_properties)
 
             m.shape_type = wp.array(self.shape_type, dtype=wp.int32)
-            m.shape_source_ptr = wp.array(geo_sources, dtype=wp.uint64)
-            m._shape_mesh_properties = wp.array(shape_mesh_properties, dtype=wp.int32, device=device)
+            m.shape_source_ptr = wp.array(shape_classes.gather(geo_sources, np.uint64), dtype=wp.uint64)
+            m._shape_mesh_properties = wp.array(
+                shape_classes.gather(shape_mesh_properties, np.int32), dtype=wp.int32, device=device
+            )
             m.heightfield_meshes = heightfield_meshes
             m._mesh_keep_alive = mesh_keep_alive
 
@@ -15927,7 +15981,7 @@ class ModelBuilder:
             boundary_starts = {}
             shape_mesh_boundary_start = []
             for shape_type, source, shape_flags, mesh_properties in zip(
-                self.shape_type, geo_sources, shape_flags_list, shape_mesh_properties, strict=True
+                class_type, geo_sources, class_flags, shape_mesh_properties, strict=True
             ):
                 start = -1
                 if (
@@ -15955,7 +16009,9 @@ class ModelBuilder:
                 device=device,
             )
             m._shape_mesh_boundary_start = wp.array(
-                shape_mesh_boundary_start if shape_mesh_boundary_start else [-1], dtype=wp.int32, device=device
+                shape_classes.gather(shape_mesh_boundary_start, np.int32) if len(shape_class) else [-1],
+                dtype=wp.int32,
+                device=device,
             )
 
             # Compact convex support data (one copy per shared geometry).
@@ -15967,9 +16023,7 @@ class ModelBuilder:
             lut_offset = 0
             vertex_offset = 0
             neighbor_offset = 0
-            for shape_type, source, shape_flags in zip(
-                self.shape_type, generated_shape_sources, shape_flags_list, strict=True
-            ):
+            for shape_type, source, shape_flags in zip(class_type, generated_shape_sources, class_flags, strict=True):
                 metadata = (-1, -1, -1, 0)
                 if (
                     shape_type == GeoType.CONVEX_MESH
@@ -16018,7 +16072,9 @@ class ModelBuilder:
                     metadata = support_cache[source_key]
                 shape_support_data.append(metadata)
 
-            m._shape_support_data = wp.array(shape_support_data, dtype=wp.vec4i, device=device)
+            m._shape_support_data = wp.array(
+                shape_classes.gather(shape_support_data, np.int32, (4,)), dtype=wp.vec4i, device=device
+            )
             m._convex_support_lut = wp.array(
                 np.concatenate(support_lut_chunks) if support_lut_chunks else np.zeros(1, dtype=np.int32),
                 dtype=wp.int32,
@@ -16113,9 +16169,7 @@ class ModelBuilder:
 
                 return nx, ny, nz
 
-            for shape_type, shape_src, shape_scale in zip(
-                self.shape_type, self.shape_source, shape_scale_list, strict=True
-            ):
+            for shape_type, shape_src, shape_scale in zip(class_type, class_source, class_scale, strict=True):
                 # Create cache key based on shape type and parameters
                 if (shape_type == GeoType.MESH or shape_type == GeoType.CONVEX_MESH) and shape_src is not None:
                     cache_key = (shape_type, id(shape_src), tuple(shape_scale))
@@ -16223,10 +16277,18 @@ class ModelBuilder:
                 local_interior_point.append(interior_point)
                 voxel_resolution.append([nx, ny, nz])
 
-            m.shape_collision_aabb_lower = wp.array(local_aabb_lower, dtype=wp.vec3, device=device)
-            m.shape_collision_aabb_upper = wp.array(local_aabb_upper, dtype=wp.vec3, device=device)
-            m._shape_interior_point = wp.array(local_interior_point, dtype=wp.vec3, device=device)
-            m._shape_voxel_resolution = wp.array(voxel_resolution, dtype=wp.vec3i, device=device)
+            m.shape_collision_aabb_lower = wp.array(
+                shape_classes.gather(local_aabb_lower, np.float64, (3,)), dtype=wp.vec3, device=device
+            )
+            m.shape_collision_aabb_upper = wp.array(
+                shape_classes.gather(local_aabb_upper, np.float64, (3,)), dtype=wp.vec3, device=device
+            )
+            m._shape_interior_point = wp.array(
+                shape_classes.gather(local_interior_point, np.float64, (3,)), dtype=wp.vec3, device=device
+            )
+            m._shape_voxel_resolution = wp.array(
+                shape_classes.gather(voxel_resolution, np.int64, (3,)), dtype=wp.vec3i, device=device
+            )
 
             # The cell index of each distinct collision mesh, read by the mesh-vs-convex midphase. Its cells are no
             # finer than the shapes that query it: the median extent of the collidable non-mesh shapes' local boxes.
@@ -16234,9 +16296,9 @@ class ModelBuilder:
 
             # Replicated shapes share their box arrays (shape_aabb_cache): each distinct pair's extent is taken once.
             extent_of = {}
-            query_extents = []
-            for shape_type, flags, lower, upper in zip(
-                self.shape_type, shape_flags_list, local_aabb_lower, local_aabb_upper, strict=True
+            class_extents = np.full(class_count, np.nan)
+            for shape_idx, (shape_type, flags, lower, upper) in enumerate(
+                zip(class_type, class_flags, local_aabb_lower, local_aabb_upper, strict=True)
             ):
                 if flags & ShapeFlags.COLLIDE_SHAPES and shape_type not in (
                     GeoType.MESH,
@@ -16249,19 +16311,22 @@ class ModelBuilder:
                         extent = extent_of[(id(lower), id(upper))] = float(
                             np.max(np.asarray(upper) - np.asarray(lower))
                         )
-                    query_extents.append(extent)
+                    class_extents[shape_idx] = extent
+            query_extents = class_extents[shape_class]
+            query_extents = query_extents[~np.isnan(query_extents)]
             # The host buffers each mesh was built from, so the build reads no device memory.
             mesh_buffers = {
                 int(source): (geo.vertices, geo.indices)
-                for shape_type, geo, source in zip(self.shape_type, generated_shape_sources, geo_sources, strict=True)
+                for shape_type, geo, source in zip(class_type, generated_shape_sources, geo_sources, strict=True)
                 if shape_type == GeoType.MESH and isinstance(geo, Mesh) and source
             }
             m._mesh_cells = build_mesh_cells(
-                self.shape_type,
+                class_type,
                 geo_sources,
                 device,
                 meshes=mesh_buffers,
-                query_size=float(np.median(query_extents)) if query_extents else None,
+                query_size=float(np.median(query_extents)) if len(query_extents) else None,
+                shape_class=shape_class,
             )
             # The welded topology of the same meshes, read by the triangle contact law: one block per finalized mesh
             # (shapes whose meshes finalized to one Warp mesh share its block).
@@ -16272,9 +16337,11 @@ class ModelBuilder:
                 first_mesh_of_source.setdefault(int(source), geo)
                 if shape_type == GeoType.MESH and isinstance(geo, Mesh) and source
                 else None
-                for shape_type, geo, source in zip(self.shape_type, generated_shape_sources, geo_sources, strict=True)
+                for shape_type, geo, source in zip(class_type, generated_shape_sources, geo_sources, strict=True)
             ]
-            m._mesh_topology = MeshTopology(self.shape_type, topology_sources, device, m.shape_collision_radius)
+            m._mesh_topology = MeshTopology(
+                class_type, topology_sources, device, m.shape_collision_radius, shape_class=shape_class
+            )
 
             # ---------------------
             # Compute and compact texture SDF resources (shared table + per-shape index indirection)
@@ -16285,7 +16352,7 @@ class ModelBuilder:
                 and ssrc is not None
                 and sflags & (ShapeFlags.COLLIDE_SHAPES | ShapeFlags.COLLIDE_PARTICLES)
                 and getattr(ssrc, "sdf", None) is not None
-                for stype, ssrc, sflags in zip(self.shape_type, self.shape_source, shape_flags_list, strict=True)
+                for stype, ssrc, sflags in zip(class_type, class_source, class_flags, strict=True)
             )
             # Catch meshes whose SDF is still deferred (built during finalize) so
             # the CPU-runs-into-build_sdf path also raises here, not deeper down.
@@ -16296,17 +16363,16 @@ class ModelBuilder:
                 and (stype == GeoType.BOX or getattr(ssrc, "sdf", None) is None)
                 and (smax is not None or svox is not None)
                 for stype, ssrc, sflags, smax, svox in zip(
-                    self.shape_type,
+                    class_type,
                     generated_shape_sources,
-                    shape_flags_list,
-                    self.shape_sdf_max_resolution,
-                    self.shape_sdf_target_voxel_size,
+                    class_flags,
+                    class_sdf_max_resolution,
+                    class_sdf_target_voxel_size,
                     strict=True,
                 )
             )
             has_hydroelastic_shapes = any(
-                (sflags & ShapeFlags.HYDROELASTIC) and (sflags & ShapeFlags.COLLIDE_SHAPES)
-                for sflags in shape_flags_list
+                (sflags & ShapeFlags.HYDROELASTIC) and (sflags & ShapeFlags.COLLIDE_SHAPES) for sflags in class_flags
             )
             if (has_mesh_sdf or has_deferred_mesh_sdf or has_hydroelastic_shapes) and not is_gpu:
                 raise ValueError(
@@ -16333,7 +16399,7 @@ class ModelBuilder:
             compact_texture_sdf_coarse_textures = []
             compact_texture_sdf_subgrid_textures = []
             compact_texture_sdf_subgrid_start_slots = []
-            shape_sdf_index = [-1] * len(self.shape_type)
+            shape_sdf_index = [-1] * class_count
             sdf_cache = {}
             # Deferred-mesh SDFs are built into a temporary Mesh clone keyed by
             # the parameter tuple. This avoids mutating the user's shared Mesh
@@ -16344,21 +16410,21 @@ class ModelBuilder:
             deferred_collision_edges_cache: dict[tuple, Any] = {}
             deferred_collision_edges: dict[int, Any] = {}
 
-            for i in range(len(self.shape_type)):
-                shape_type = self.shape_type[i]
-                shape_src = self.shape_source[i]
-                shape_flags = shape_flags_list[i]
-                shape_scale = shape_scale_list[i]
-                shape_gap = shape_gap_list[i]
-                sdf_narrow_band_range = self.shape_sdf_narrow_band_range[i]
-                sdf_target_voxel_size = self.shape_sdf_target_voxel_size[i]
-                sdf_max_resolution = self.shape_sdf_max_resolution[i]
-                sdf_tex_fmt = self.shape_sdf_texture_format[i]
-                sdf_padding = self.shape_sdf_padding[i]
+            for c, i in enumerate(class_rows):
+                shape_type = class_type[c]
+                shape_src = class_source[c]
+                shape_flags = class_flags[c]
+                shape_scale = class_scale[c]
+                shape_gap = class_gap[c]
+                sdf_narrow_band_range = class_sdf_narrow_band_range[c]
+                sdf_target_voxel_size = class_sdf_target_voxel_size[c]
+                sdf_max_resolution = class_sdf_max_resolution[c]
+                sdf_tex_fmt = class_sdf_texture_format[c]
+                sdf_padding = class_sdf_padding[c]
                 is_hydroelastic = bool(
                     shape_flags & ShapeFlags.HYDROELASTIC and shape_flags & ShapeFlags.COLLIDE_SHAPES
                 )
-                required_sdf_padding = shape_gap + shape_margin_list[i] if is_hydroelastic else shape_gap
+                required_sdf_padding = shape_gap + class_margin[c] if is_hydroelastic else shape_gap
                 sdf_gen_margin = sdf_padding if sdf_padding is not None else required_sdf_padding
                 has_sdf_collision = bool(shape_flags & (ShapeFlags.COLLIDE_SHAPES | ShapeFlags.COLLIDE_PARTICLES))
 
@@ -16381,7 +16447,7 @@ class ModelBuilder:
                         sdf_kwargs["paired_samples"] = sdf_texture_paired_samples
                         # Convex collision geometry is deduplicated before finalization,
                         # so build and cache its deferred SDF against that same topology.
-                        sdf_source = generated_shape_sources[i] if shape_type == GeoType.CONVEX_MESH else shape_src
+                        sdf_source = generated_shape_sources[c] if shape_type == GeoType.CONVEX_MESH else shape_src
                         deferred_key = (
                             id(sdf_source),
                             tuple(shape_scale),
@@ -16400,10 +16466,10 @@ class ModelBuilder:
                             if getattr(mesh_copy, "_collision_edges", None) is not None:
                                 deferred_collision_edges_cache[deferred_key] = mesh_copy._collision_edges
                         if deferred_key in deferred_collision_edges_cache:
-                            deferred_collision_edges[i] = deferred_collision_edges_cache[deferred_key]
+                            deferred_collision_edges[c] = deferred_collision_edges_cache[deferred_key]
                     if mesh_sdf is not None:
                         if (
-                            self.shape_force_sdf[i]
+                            class_force_sdf[c]
                             and shape_flags & ShapeFlags.COLLIDE_PARTICLES
                             and mesh_sdf.to_texture_kernel_data() is None
                         ):
@@ -16443,11 +16509,11 @@ class ModelBuilder:
 
                 if cache_key is not None:
                     if cache_key in sdf_cache:
-                        shape_sdf_index[i] = sdf_cache[cache_key]
+                        shape_sdf_index[c] = sdf_cache[cache_key]
                     else:
                         sdf_idx = len(compact_texture_sdf_data)
                         sdf_cache[cache_key] = sdf_idx
-                        shape_sdf_index[i] = sdf_idx
+                        shape_sdf_index[c] = sdf_idx
 
                         if mesh_sdf is not None:
                             tex_data = mesh_sdf.to_texture_kernel_data()
@@ -16502,20 +16568,20 @@ class ModelBuilder:
             # Build in unscaled mesh space (scale_baked=False); eval_shape_sdf applies shape scale
             # at query time. Construction failures leave the SDF unprovisioned, which a full-surface
             # CollisionPipeline rejects rather than silently degrading.
-            if any(self.shape_force_sdf):
+            if any(class_force_sdf):
                 wt_sdf_cache = {}
-                for i in range(len(self.shape_type)):
+                for c, i in enumerate(class_rows):
                     if (
-                        shape_sdf_index[i] >= 0
-                        or self.shape_type[i] not in (GeoType.MESH, GeoType.CONVEX_MESH)
-                        or not (shape_flags_list[i] & ShapeFlags.COLLIDE_PARTICLES)
-                        or self.shape_source[i] is None
-                        or not self.shape_force_sdf[i]
+                        shape_sdf_index[c] >= 0
+                        or class_type[c] not in (GeoType.MESH, GeoType.CONVEX_MESH)
+                        or not (class_flags[c] & ShapeFlags.COLLIDE_PARTICLES)
+                        or class_source[c] is None
+                        or not class_force_sdf[c]
                     ):
                         continue
-                    src = self.shape_source[i]
-                    sdf_padding_i = self.shape_sdf_padding[i]
-                    wt_margin = sdf_padding_i if sdf_padding_i is not None else shape_gap_list[i]
+                    src = class_source[c]
+                    sdf_padding_i = class_sdf_padding[c]
+                    wt_margin = sdf_padding_i if sdf_padding_i is not None else class_gap[c]
                     # Mirror the rigid SDF cache key: shapes sharing one Mesh get distinct SDFs when any
                     # baked generation parameter differs (margin/narrow-band/resolution/voxel/format).
                     # scale stays out (scale_baked=False applies it at query time; the rigid path bakes it).
@@ -16528,7 +16594,7 @@ class ModelBuilder:
                         self.shape_sdf_texture_format[i],
                     )
                     if src_key in wt_sdf_cache:
-                        shape_sdf_index[i] = wt_sdf_cache[src_key]
+                        shape_sdf_index[c] = wt_sdf_cache[src_key]
                         continue
                     try:
                         wt_wp_mesh = wp.Mesh(
@@ -16561,7 +16627,7 @@ class ModelBuilder:
                         continue
                     wt_idx = len(compact_texture_sdf_data)
                     wt_sdf_cache[src_key] = wt_idx
-                    shape_sdf_index[i] = wt_idx
+                    shape_sdf_index[c] = wt_idx
                     compact_texture_sdf_data.append(wt_tex_data)
                     compact_texture_sdf_coarse_textures.append(wt_c_tex)
                     compact_texture_sdf_subgrid_textures.append(wt_s_tex)
@@ -16569,7 +16635,9 @@ class ModelBuilder:
                         wt_tex_data.subgrid_start_slots if wt_c_tex is not None else None
                     )
 
-            m._shape_sdf_index = wp.array(shape_sdf_index, dtype=wp.int32, device=device)
+            m._shape_sdf_index = wp.array(
+                shape_classes.gather(shape_sdf_index, np.int32), dtype=wp.int32, device=device
+            )
             m._texture_sdf_data = (
                 wp.array(compact_texture_sdf_data, dtype=TextureSDFData, device=device)
                 if compact_texture_sdf_data
@@ -16581,7 +16649,8 @@ class ModelBuilder:
 
             # ---------------------
             # heightfield collision data
-            hfield_count = sum(1 for t in self.shape_type if t == GeoType.HFIELD)
+            hfield_shapes = np.flatnonzero(np.asarray(self.shape_type) == GeoType.HFIELD).tolist()
+            hfield_count = len(hfield_shapes)
             m.heightfield_count = hfield_count
             if hfield_count > 1:
                 warnings.warn(
@@ -16594,11 +16663,11 @@ class ModelBuilder:
 
             compact_heightfield_data = []
             elevation_chunks = []
-            shape_heightfield_index = [-1] * len(self.shape_type)
+            shape_heightfield_index = np.full(len(shape_class), -1, dtype=np.int32)
             offset = 0
             if hfield_count > 0:
-                for i in range(len(self.shape_type)):
-                    if self.shape_type[i] == GeoType.HFIELD and self.shape_source[i] is not None:
+                for i in hfield_shapes:
+                    if self.shape_source[i] is not None:
                         hf = self.shape_source[i]
                         hd = HeightfieldData()
                         hd.data_offset = offset
@@ -16610,7 +16679,7 @@ class ModelBuilder:
                         # parallel-slab checks assume non-negative planar extents;
                         # z uses raw multiplication so ``sz < 0`` inverts the surface
                         # (``min_z > max_z`` already encodes an inverted heightfield).
-                        sx, sy, sz = shape_scale_list[i]
+                        sx, sy, sz = _list_for_iteration(self.shape_scale[i])
                         hd.hx = abs(hf.hx * sx)
                         hd.hy = abs(hf.hy * sy)
                         hd.min_z = hf.min_z * sz
@@ -16621,7 +16690,7 @@ class ModelBuilder:
                         offset += hf.nrow * hf.ncol
 
             m.shape_heightfield_index = wp.array(
-                shape_heightfield_index if shape_heightfield_index else [-1],
+                shape_heightfield_index if len(shape_heightfield_index) else [-1],
                 dtype=wp.int32,
                 device=device,
             )
@@ -16651,14 +16720,14 @@ class ModelBuilder:
             edge_offset = 0
             edge_cache = {}  # mesh python id → (start, count)
 
-            for i in range(len(self.shape_type)):
+            for c in range(class_count):
                 if (
-                    self.shape_type[i] in (GeoType.MESH, GeoType.CONVEX_MESH, GeoType.BOX)
-                    and generated_shape_sources[i] is not None
-                    and (shape_flags_list[i] & ShapeFlags.COLLIDE_SHAPES)
+                    class_type[c] in (GeoType.MESH, GeoType.CONVEX_MESH, GeoType.BOX)
+                    and generated_shape_sources[c] is not None
+                    and (class_flags[c] & ShapeFlags.COLLIDE_SHAPES)
                 ):
-                    mesh = generated_shape_sources[i]
-                    deferred_edges = deferred_collision_edges.get(i)
+                    mesh = generated_shape_sources[c]
+                    deferred_edges = deferred_collision_edges.get(c)
                     if deferred_edges is not None:
                         mesh_key = ("deferred", id(deferred_edges), id(mesh))
                     else:
@@ -16733,7 +16802,7 @@ class ModelBuilder:
                     shape_edge_ranges.append((-1, 0))
 
             m._shape_edge_range = wp.array(
-                shape_edge_ranges if shape_edge_ranges else [(-1, 0)],
+                shape_classes.gather(shape_edge_ranges, np.int32, (2,)) if len(shape_class) else [(-1, 0)],
                 dtype=wp.vec2i,
                 device=device,
             )
@@ -17497,6 +17566,8 @@ _ARRAY_BACKED_ATTRIBUTE_DTYPES: dict[str, Any] = {
     "particle_world": wp.int32,
     "shape_transform": wp.transform,
     "shape_body": wp.int32,
+    "shape_type": wp.int32,
+    "shape_flags": wp.int32,
     "shape_material_ke": wp.float32,
     "shape_material_kd": wp.float32,
     "shape_material_kf": wp.float32,
@@ -17557,6 +17628,10 @@ _ARRAY_BACKED_ATTRIBUTE_DTYPES: dict[str, Any] = {
     "joint_target_qd": wp.float32,
     "joint_act": wp.float32,
     "joint_articulation": wp.int32,
+    "joint_type": wp.int32,
+    "joint_dof_dim": wp.int32,
+    "joint_mimic_joint": wp.int32,
+    "joint_mimic_coeffs": wp.vec2,
     "joint_parent": wp.int32,
     "joint_child": wp.int32,
     "joint_X_p": wp.transform,
@@ -17593,6 +17668,73 @@ _ARRAY_BACKED_ATTRIBUTE_DTYPES: dict[str, Any] = {
 def _list_for_iteration(values: list[Any] | np.ndarray) -> list[Any]:
     """Return built-in list values for efficient Python iteration."""
     return values.tolist() if isinstance(values, np.ndarray) else values
+
+
+class _RowClasses:
+    """Rows grouped into classes of rows equal in a set of columns.
+
+    Rows are compared block against block, where a block is a run of rows of one world: a block joins an
+    earlier block of the same length in its run of equal-length blocks when all its rows are equal to that
+    block's in every column. Replicated worlds repeat their prototype's rows, so their blocks join the first
+    copy's. A class is represented by its first row, so derivations that run over the classes in order meet
+    each distinct input where a pass over all rows first meets it.
+    """
+
+    def __init__(self, world: np.ndarray, columns: Sequence[np.ndarray | list]):
+        """Group the rows.
+
+        Args:
+            world: The world of each row, shape [row_count].
+            columns: Per-row columns. An array is compared bitwise, row by row; a list by element
+                (equality, with identity first).
+        """
+        count = len(world)
+        rows = np.arange(count)
+        first = rows.copy()
+        if count:
+            bounds = np.concatenate(([0], np.flatnonzero(world[1:] != world[:-1]) + 1, [count]))
+            lengths = np.diff(bounds)
+            runs = np.concatenate(([0], np.flatnonzero(lengths[1:] != lengths[:-1]) + 1, [len(lengths)]))
+            arrays = [
+                np.ascontiguousarray(c).view(np.uint8).reshape(count, -1) for c in columns if isinstance(c, np.ndarray)
+            ]
+            lists = [c for c in columns if not isinstance(c, np.ndarray)]
+            for run_start, run_end in zip(runs[:-1].tolist(), runs[1:].tolist(), strict=True):
+                blocks = run_end - run_start
+                if blocks < 2:
+                    continue
+                n, a = int(lengths[run_start]), int(bounds[run_start])
+                b = a + blocks * n
+                equal = np.ones(blocks, dtype=bool)
+                for column in arrays:
+                    values = column[a:b].reshape(blocks, n, -1)
+                    equal &= (values == values[0]).all(axis=(1, 2))
+                for column in lists:
+                    head = column[a : a + n]
+                    if column[a:b] != head * blocks:
+                        equal &= np.fromiter(
+                            (column[a + k * n : a + (k + 1) * n] == head for k in range(blocks)),
+                            dtype=bool,
+                            count=blocks,
+                        )
+                first[a:b].reshape(blocks, n)[equal] = first[a : a + n]
+        self.first = np.flatnonzero(first == rows)
+        """First row of each class, ascending, shape [class_count]."""
+        self.rows = self.first.tolist()
+        """:attr:`first` as built-in integers."""
+        self.row_class = np.searchsorted(self.first, first)
+        """Class of each row, shape [row_count]."""
+
+    def values(self, values: list[Any] | np.ndarray) -> list[Any]:
+        """Each class's value of a per-row attribute, as built-in values."""
+        if isinstance(values, np.ndarray):
+            return values[self.first].tolist()
+        return [values[row] for row in self.rows]
+
+    def gather(self, class_values: Sequence[Any], dtype: Any, shape: tuple[int, ...] = ()) -> np.ndarray:
+        """Each row's value of a per-class result, as an array of ``dtype`` and element ``shape``."""
+        values = np.asarray(class_values, dtype=dtype).reshape((len(class_values), *shape))
+        return values[self.row_class]
 
 
 def _describe_array_backed_list(element: Any) -> _ArrayBackedListDescriptor:

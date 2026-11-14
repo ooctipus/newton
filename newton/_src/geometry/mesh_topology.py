@@ -213,7 +213,7 @@ def build_mesh_topology(vertices: np.ndarray, indices: np.ndarray) -> dict[str, 
 class MeshTopology:
     """Welded topology of a model's meshed shapes on one device (see :class:`MeshTopologyData`)."""
 
-    def __init__(self, shape_types, shape_sources, device, shape_radius=None):
+    def __init__(self, shape_types, shape_sources, device, shape_radius=None, *, shape_class=None):
         """Build the topology of every distinct mesh among the shapes.
 
         Args:
@@ -221,6 +221,8 @@ class MeshTopology:
             shape_sources: Host sequence of shape sources (a :class:`~newton.Mesh` for mesh shapes).
             device: Device for the arrays.
             shape_radius: The model's device array of per-shape bounding radii, read in place.
+            shape_class: Optional class of each shape, shape [shape_count]; ``shape_types`` and
+                ``shape_sources`` then hold one entry per class, which all shapes of the class share.
         """
         shape_count = len(shape_types)
         shape_base = np.full((max(shape_count, 1), 2), -1, dtype=np.int64)
@@ -264,6 +266,8 @@ class MeshTopology:
         for shape in range(shape_count):
             if shape_base[shape, 1] >= 0:
                 shape_base[shape, 1] = starts[shape_base[shape, 1]]
+        if shape_class is not None:
+            shape_base = shape_base[:shape_count][shape_class] if len(shape_class) else shape_base[:1]
         topology = np.concatenate(flat).astype(np.int32) if parts else np.zeros(1, dtype=np.int32)
         normals = np.concatenate([p["normal"] for p in parts]) if parts else np.zeros((1, 3), np.float32)
         self.mesh_count = len(parts)

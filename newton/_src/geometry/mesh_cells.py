@@ -958,6 +958,7 @@ def build_mesh_cells(
     meshes: dict | None = None,
     query_size: float | None = None,
     cell: float | None = None,
+    shape_class: np.ndarray | None = None,
 ) -> MeshCells:
     """Build the cell index of every triangle mesh shape (``GeoType.MESH``), one per distinct mesh.
 
@@ -972,6 +973,8 @@ def build_mesh_cells(
         query_size: Typical extent of the shapes that query the meshes [m]; a mesh's level-0 cells are no finer.
         cell: Level-0 cell edge for every mesh [m]; when ``None``, :func:`default_cell_size` of the mesh, raised to
             ``query_size``.
+        shape_class: Optional class of each shape, shape [shape_count]; ``shape_type`` and ``shape_source_ptr``
+            then hold one entry per class, which all shapes of the class share.
 
     Returns:
         The packed :class:`MeshCells`.
@@ -1072,6 +1075,8 @@ def build_mesh_cells(
 
     result = MeshCells()
     result.grids = wp.array(grids if grids else [MeshGrid()], dtype=MeshGrid, device=device)
+    if shape_class is not None:
+        shape_grid = shape_grid[: types.size][shape_class] if len(shape_class) else np.full(1, -1, dtype=np.int32)
     result.shape_grid = wp.array(shape_grid, dtype=wp.int32, device=device)
     result.block_keys = packed("block_keys", wp.uint64)
     result.blocks = packed("blocks", MeshCellBlock)
