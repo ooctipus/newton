@@ -2945,7 +2945,8 @@ class CollisionPipeline:
                 self.shape_pairs_max = len(shape_pairs_filtered)
                 self.shape_pairs_excluded = None
                 self.shape_pairs_excluded_count = 0
-                self.broad_phase._warn_large_pair_count(_shape_pair_list_sample(model, shape_pairs_filtered))
+                pair_sample = _shape_pair_list_sample(model, shape_pairs_filtered)
+                self.broad_phase._warn_large_pair_count(pair_sample)
             else:
                 self.shape_pairs_filtered = None
                 self.shape_pairs_max = _compute_per_world_shape_pairs_max(model)

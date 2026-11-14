@@ -23,6 +23,7 @@ from .....geometry.narrow_phase import NarrowPhase
 from .....geometry.sdf_texture import TextureSDFData
 from .....geometry.support_function import GenericShapeData, SupportMapDataProvider, pack_mesh_ptr
 from .....geometry.types import GeoType
+from .....sim.shape_contact_pairs import _PairSample
 
 # Kamino imports
 from ..core.data import DataKamino
@@ -555,9 +556,7 @@ class CollisionPipelineUnifiedKamino:
             case "explicit":
                 self.explicit_broadphase = BroadPhaseExplicit()
                 self.explicit_broadphase._warn_large_pair_count(
-                    self.shape_pairs_filtered,
-                    wid_np,
-                    self._model.size.num_worlds,
+                    _PairSample.of_list(self.shape_pairs_filtered.numpy(), wid_np, self._model.size.num_worlds)
                 )
             case _:
                 raise ValueError(f"Unsupported broad phase mode: {self._broadphase}")
