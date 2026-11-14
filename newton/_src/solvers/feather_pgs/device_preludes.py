@@ -198,9 +198,9 @@ def dual_native(body: str, *, preludes: tuple[DevicePrelude, ...]) -> str:
 _LANE_GROUP = """    const int LANES = $lanes, WIDTH = LANES < 32 ? LANES : 32;
     const unsigned MASK = (0xffffffffu >> (32 - WIDTH)) << (threadIdx.x & (31 & ~(WIDTH - 1)));
     const int LANE = LANES <= 32 ? (int)(threadIdx.x & (LANES - 1)) : (int)threadIdx.x;
-    const int STRIDE = LANES <= 32 ? LANES : (int)blockDim.x;
+    const int STRIDE = LANES;
     const int SUB = LANES <= 32 ? (int)threadIdx.x / LANES : 0, GROUPS = LANES <= 32 ? (int)blockDim.x / LANES : 1;
-    const int WARP = LANES <= 32 ? 0 : (int)(threadIdx.x >> 5), WARPS = LANES <= 32 ? 1 : (int)(blockDim.x >> 5);
+    const int WARP = LANES <= 32 ? 0 : (int)(threadIdx.x >> 5), WARPS = LANES <= 32 ? 1 : LANES >> 5;
     const auto SYNC = [&]() { if (LANES <= 32) __syncwarp(MASK); else __syncthreads(); };
     const auto WARP_SYNC = [&]() { __syncwarp(MASK); };
     const auto ALL = [&](bool p) -> bool { return LANES <= 32 ? __all_sync(MASK, p) : __syncthreads_and(p); };
