@@ -15946,9 +15946,10 @@ class ModelBuilder:
                     start = boundary_starts.get(source)
                     if start is None:
                         geo = mesh_geos[source]
+                        # Keyed by the architecture that runs the edge sweep: its float64 tests run on that device.
                         flags = _collision_cache.cached(
                             "boundary_flags",
-                            (np.asarray(geo.vertices), np.asarray(geo.indices)),
+                            (np.asarray(geo.vertices), np.asarray(geo.indices), geo.mesh.device.arch),
                             lambda geo=geo: compute_mesh_boundary_flags(geo.mesh, geo.vertices, geo.indices),
                         )
                         start = boundary_starts[source] = boundary_offset
