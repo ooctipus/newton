@@ -27,7 +27,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import class_plan, field_group, sweep_routes_tiers
+from newton._src.solvers.feather_pgs import class_plan, field_group, forest_plan, sweep_routes_tiers
 from newton._src.solvers.feather_pgs import sweep as emitter
 from newton._src.solvers.feather_pgs.device_preludes import RING
 from newton._src.solvers.feather_pgs.factor.kernels import prescale_joint_velocity_limits
@@ -1001,37 +1001,44 @@ class TestTierRule(unittest.TestCase):
             model=None,
             pins=SolverFeatherPGS.Pins(),
             dense_rows=192,
-            forest=SimpleNamespace(world_count=4, max_world_dofs=22, shape=None),
+            forest=SimpleNamespace(world_count=4, max_world_dofs=22, shape=None, contact_hub=hub),
         )
         for name, value in changes.items():
             setattr(inputs, name, value)
         sizes, reason = response
         meta = None if sizes is None else np.zeros((4, 4), np.int32)
-        with (
-            patch.object(class_plan, "tier_response", lambda shape: (sizes, meta, reason)),
-            patch.object(class_plan, "_hub", lambda model, forest: hub),
-        ):
+        with patch.object(class_plan, "tier_response", lambda shape: (sizes, meta, reason)):
             return class_plan.tier_rule(inputs)
 
     def test_a_hub_is_a_contact_that_joins_a_free_body_to_a_tree(self):
-        """A world's rows all couple where a contact joins a free body to a tree that is not one (``_hub``): not
+        """A world's rows all couple where a contact joins a free body to a tree that is not one (``contact_hub``): not
         through a contact with the static world or within one tree, nor between two trees of which neither or both are
         free bodies (the colored units' exact levels)."""
 
         def hub(pairs, free=(0, 1, 0)):
             # Bodies 0-2 on trees 0-2 (tree 1 a free body, articulation 1), body 3 on tree 0; shapes a body each, the
             # last static.
+            def host(values):
+                return SimpleNamespace(numpy=lambda: np.asarray(values, np.int32))
+
             model = SimpleNamespace(
+                world_count=1,
                 shape_contact_pair_count=len(pairs),
-                shape_contact_pairs=SimpleNamespace(numpy=lambda: np.asarray(pairs, np.int32)),
-                shape_body=SimpleNamespace(numpy=lambda: np.asarray((0, 1, 2, 3, -1), np.int32)),
+                _shape_contact_pair_data=None,
+                shape_contact_pairs=host(np.reshape(pairs, (-1, 2))),
+                shape_body=host((0, 1, 2, 3, -1)),
+                shape_world=host((0, 0, 0, 0, 0)),
+                shape_type=host((int(newton.GeoType.BOX),) * 5),
+                shape_flags=host((0,) * 5),
             )
             forest = SimpleNamespace(
+                world_count=1,
+                articulation_world=np.zeros(3, np.int32),
                 body_tree=np.asarray((0, 1, 2, 0), np.int32),
                 tree_articulation=np.asarray((0, 1, 2), np.int32),
                 is_free_rigid_host=np.asarray(free, np.int32),
             )
-            return class_plan._hub(model, forest)
+            return forest_plan._contact_laws(forest, model, np.zeros(1, np.int32))
 
         self.assertTrue(hub(((0, 1),)))
         self.assertTrue(hub(((4, 1), (1, 2))))
@@ -1052,7 +1059,10 @@ class TestTierRule(unittest.TestCase):
         """Leave every other class to its own placement and say why."""
         for changes, reason in (
             # A class with no coordinate a world leaves no matrix-free sweep.
-            ({"forest": SimpleNamespace(world_count=4, max_world_dofs=0, shape=None)}, "No matrix-free sweep"),
+            (
+                {"forest": SimpleNamespace(world_count=4, max_world_dofs=0, shape=None, contact_hub=True)},
+                "No matrix-free sweep",
+            ),
             # No contact can join a free body to another tree: no hub.
             ({"hub": False}, "no contact joins a free body to a tree"),
             ({"pins": SolverFeatherPGS.Pins(tiers=0)}, "tiers=0"),
