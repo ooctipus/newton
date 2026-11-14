@@ -4,6 +4,11 @@
 """Calibrated query costs and sampled work for experimental method choice: the step's production kernels timed on
 synthetic hulls, the work of each query counted as the step's sampler counts it."""
 
+import dataclasses
+import hashlib
+import json
+import os
+import sys
 import time
 from dataclasses import dataclass
 from statistics import median
@@ -259,15 +264,84 @@ def _measure(action, device):
     return median(values)
 
 
+_CALIBRATED_SOURCES = (
+    __name__,
+    "newton._src.geometry.coherent_convex",
+    "newton._src.geometry.coherent_convex_rejection",
+    "newton._src.geometry.collision_convex",
+    "newton._src.geometry.mpr",
+    "newton._src.geometry.narrow_phase",
+    "newton._src.geometry.simplex_solver",
+    "newton._src.geometry.support_function",
+)
+"""The modules whose code the calibrated kernels compile (the queries, their preparation and the classifier)."""
+
+
+def _stored_model_path(device) -> str:
+    """The file of ``device``'s calibrated costs next to Warp's kernel cache: one a device, Warp build and source of
+    the calibrated kernels (:data:`_CALIBRATED_SOURCES`), so a new compiler, GPU or kernel measures anew."""
+    identity = hashlib.sha256()
+    for part in (
+        device.name,
+        device.arch,
+        device.sm_count,
+        str(device.uuid),
+        wp.__version__,
+        getattr(wp.config, "_git_commit_hash", None),
+        wp.get_cuda_toolkit_version(),
+        device.get_cuda_output_format(),
+    ):
+        identity.update(repr(part).encode())
+    for name in _CALIBRATED_SOURCES:
+        with open(sys.modules[name].__file__, "rb") as source:
+            identity.update(source.read())
+    return os.path.join(wp.config.kernel_cache_dir, "newton_convex_query_cost", f"{identity.hexdigest()[:32]}.json")
+
+
+def _load_model(path) -> _QueryCostModel | None:
+    try:
+        with open(path) as stored:
+            fields = json.load(stored)
+        fields["measurements"] = tuple(fields["measurements"])
+        return _QueryCostModel(**fields)
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+
+
+def _store_model(path, model: _QueryCostModel) -> None:
+    """Write the model whole (a temporary file renamed), so a concurrent reader finds it complete or absent."""
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        temporary = f"{path}.{os.getpid()}.tmp"
+        with open(temporary, "w") as stored:
+            json.dump(dataclasses.asdict(model), stored)
+        os.replace(temporary, path)
+    except OSError:
+        pass
+
+
 def _calibrate_query_cost(device):
-    """Calibrate the convex queries' costs on synthetic hulls without a task, robot or task timing: the production
-    route's classifier and cold queries timed (:func:`_query_primitive`), their work counted (:func:`_counted_query`)."""
+    """The convex queries' costs on ``device``: measured once a device, Warp build and kernel source and kept next to
+    the kernel cache (:func:`_stored_model_path`), read back by every later process. The costs only choose which
+    route answers a pair, and both routes answer it with the same bits, so a stored model moves no result."""
     device = wp.get_device(device)
     key = (device.alias, device.uuid)
     if key in _DEVICE_MODELS:
         return _DEVICE_MODELS[key]
-    if device.is_capturing:
-        raise RuntimeError("Collision cost calibration must precede graph capture")
+    path = _stored_model_path(device)
+    model = _load_model(path)
+    if model is None:
+        if device.is_capturing:
+            raise RuntimeError("Collision cost calibration must precede graph capture")
+        model = _measure_query_cost(device)
+        _store_model(path, model)
+    _DEVICE_MODELS[key] = model
+    return model
+
+
+def _measure_query_cost(device) -> _QueryCostModel:
+    """Calibrate the convex queries' costs on synthetic hulls without a task, robot or task timing: the production
+    route's classifier and cold queries timed (:func:`_query_primitive`), their work counted (:func:`_counted_query`)."""
     start = time.monotonic()
     count = 8192
     records = []
@@ -328,7 +402,6 @@ def _calibrate_query_cost(device):
     )
     if not np.isfinite(model.coefficients(count)).all() or model.support_ns + model.vertex_ns <= 0:
         raise RuntimeError("The calibrated collision queries produced an invalid cost model")
-    _DEVICE_MODELS[key] = model
     return model
 
 
