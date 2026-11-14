@@ -4499,8 +4499,20 @@ class ModelBuilder:
                 source = np.asarray(source, dtype=numpy_dtype)
                 prefix = prefix.reshape((-1, *element_shape))
                 source = source.reshape((-1, *element_shape))
-                values = np.empty((len(prefix) + copy_count * len(source), *element_shape), dtype=numpy_dtype)
-                values[: len(prefix)] = prefix
+                total = len(prefix) + copy_count * len(source)
+                # Stored rows are a leading view of a buffer that grows geometrically, so that replicating
+                # several prototypes one after another appends in place instead of copying the rows so far.
+                buffer = prefix_values.base if existing is not None and prefix_values is existing[0] else None
+                if not (
+                    isinstance(buffer, np.ndarray)
+                    and buffer.dtype == numpy_dtype
+                    and buffer.shape[1:] == element_shape
+                    and len(buffer) >= total
+                    and buffer.ctypes.data == prefix.ctypes.data
+                ):
+                    buffer = np.empty((max(total, 2 * len(prefix)), *element_shape), dtype=numpy_dtype)
+                    buffer[: len(prefix)] = prefix
+                values = buffer[:total]
                 values[len(prefix) :].reshape((copy_count, len(source), *element_shape))[:] = source
                 self._set_array_backed_attribute(attr, values, descriptor)
                 array_starts[attr] = len(prefix)
