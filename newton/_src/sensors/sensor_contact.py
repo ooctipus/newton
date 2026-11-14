@@ -260,26 +260,19 @@ def _assign_counterpart_columns(
         counterparts_by_world: Per-world list of counterpart indices (globals + locals).
     """
     col_map = np.full(n_entities, -1, dtype=np.int32)
-
-    for col, index in enumerate(c_globals):
-        col_map[index] = col
     n_global_cols = len(c_globals)
+    col_map[np.asarray(c_globals, dtype=np.int64)] = np.arange(n_global_cols, dtype=np.int32)
 
-    counterparts_by_world: list[list[int]] = []
-    max_cols = n_global_cols
-    n_locals = len(c_locals)
-    i = 0  # cursor into c_locals
-    for w in range(world_count):
-        local_col = n_global_cols
-        cur_world_locals: list[int] = []
-        world_end = counterpart_world_start[w + 1]
-        while i < n_locals and c_locals[i] < world_end:
-            col_map[c_locals[i]] = local_col
-            cur_world_locals.append(c_locals[i])
-            local_col += 1
-            i += 1
-        max_cols = max(max_cols, local_col)
-        counterparts_by_world.append(c_globals + cur_world_locals)
+    # Each sorted local counterpart belongs to the first world whose end lies past it (none past the last world's),
+    # and takes the next column of that world after the globals.
+    locals_ = np.asarray(c_locals, dtype=np.int64)
+    ends = np.asarray(counterpart_world_start[1 : world_count + 1], dtype=np.int64)
+    world = np.searchsorted(ends, locals_, side="right")
+    bounds = np.searchsorted(world, np.arange(world_count + 1), side="left")
+    placed = np.arange(bounds[-1])
+    col_map[locals_[placed]] = n_global_cols + placed - bounds[world[placed]]
+    max_cols = n_global_cols + int(np.diff(bounds).max(initial=0))
+    counterparts_by_world = [c_globals + c_locals[bounds[w] : bounds[w + 1]] for w in range(world_count)]
     return col_map, max_cols, counterparts_by_world
 
 
