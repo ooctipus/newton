@@ -3566,45 +3566,51 @@ class NarrowPhase:
                     writer_func,
                 )
             if self.reduce_contacts:
-                self.mesh_mesh_contacts_kernel = create_narrow_phase_process_mesh_mesh_contacts_kernel(
-                    write_contact_to_reducer,
-                    enable_heightfields=has_heightfields,
-                    reduce_contacts=True,
-                    speculative=speculative,
-                    use_texture_sdf_only=self.mesh_sdf_texture_only,
-                    use_identity_sdf_scale=self.mesh_sdf_identity_scale_only,
-                    deterministic_reduction=deterministic,
-                )
-                self.mesh_mesh_contacts_kernel_precomputed = create_narrow_phase_process_mesh_mesh_contacts_kernel(
-                    write_contact_to_reducer,
-                    enable_heightfields=has_heightfields,
-                    reduce_contacts=True,
-                    use_precomputed_edge_data=True,
-                    use_texture_sdf_only=self.mesh_sdf_texture_only,
-                    use_identity_sdf_scale=self.mesh_sdf_identity_scale_only,
-                    speculative=speculative,
-                    deterministic_reduction=deterministic,
+                # A model whose mesh SDFs all have textures takes one kernel; one with BVH-fallback SDFs takes the
+                # texture passes and the fallback's in two kernels, so the fallback's queries do not spill the
+                # texture passes' loop (sdf_source).
+                sources = ("any",) if self.mesh_sdf_texture_only else ("texture", "mesh")
+                self.mesh_mesh_contacts_kernels, self.mesh_mesh_contacts_kernels_precomputed = (
+                    tuple(
+                        create_narrow_phase_process_mesh_mesh_contacts_kernel(
+                            write_contact_to_reducer,
+                            enable_heightfields=has_heightfields,
+                            reduce_contacts=True,
+                            speculative=speculative,
+                            use_precomputed_edge_data=precomputed,
+                            use_texture_sdf_only=self.mesh_sdf_texture_only,
+                            use_identity_sdf_scale=self.mesh_sdf_identity_scale_only,
+                            deterministic_reduction=deterministic,
+                            sdf_source=source,
+                        )
+                        for source in sources
+                    )
+                    for precomputed in (False, True)
                 )
             else:
-                self.mesh_mesh_contacts_kernel = create_narrow_phase_process_mesh_mesh_contacts_kernel(
-                    writer_func,
-                    enable_heightfields=has_heightfields,
-                    speculative=speculative,
-                    use_texture_sdf_only=self.mesh_sdf_texture_only,
-                    use_identity_sdf_scale=self.mesh_sdf_identity_scale_only,
+                self.mesh_mesh_contacts_kernels = (
+                    create_narrow_phase_process_mesh_mesh_contacts_kernel(
+                        writer_func,
+                        enable_heightfields=has_heightfields,
+                        speculative=speculative,
+                        use_texture_sdf_only=self.mesh_sdf_texture_only,
+                        use_identity_sdf_scale=self.mesh_sdf_identity_scale_only,
+                    ),
                 )
-                self.mesh_mesh_contacts_kernel_precomputed = create_narrow_phase_process_mesh_mesh_contacts_kernel(
-                    writer_func,
-                    enable_heightfields=has_heightfields,
-                    use_precomputed_edge_data=True,
-                    use_texture_sdf_only=self.mesh_sdf_texture_only,
-                    use_identity_sdf_scale=self.mesh_sdf_identity_scale_only,
-                    speculative=speculative,
+                self.mesh_mesh_contacts_kernels_precomputed = (
+                    create_narrow_phase_process_mesh_mesh_contacts_kernel(
+                        writer_func,
+                        enable_heightfields=has_heightfields,
+                        use_precomputed_edge_data=True,
+                        use_texture_sdf_only=self.mesh_sdf_texture_only,
+                        use_identity_sdf_scale=self.mesh_sdf_identity_scale_only,
+                        speculative=speculative,
+                    ),
                 )
         else:
             self.mesh_plane_contacts_kernel = None
-            self.mesh_mesh_contacts_kernel = None
-            self.mesh_mesh_contacts_kernel_precomputed = None
+            self.mesh_mesh_contacts_kernels = ()
+            self.mesh_mesh_contacts_kernels_precomputed = ()
 
         # Create global contact reduction kernels for mesh/heightfield-triangle
         # contacts (mirror the predicate used to gate ``self.reduce_contacts``
@@ -5053,11 +5059,11 @@ class NarrowPhase:
             if shape_edge_range is None:
                 shape_edge_range = self._empty_edge_range
 
-            if self.mesh_mesh_contacts_kernel is not None and self.max_mesh_mesh_pairs > 0:
-                mesh_mesh_contacts_kernel = (
-                    self.mesh_mesh_contacts_kernel_precomputed
+            if self.mesh_mesh_contacts_kernels and self.max_mesh_mesh_pairs > 0:
+                mesh_mesh_contacts_kernels = (
+                    self.mesh_mesh_contacts_kernels_precomputed
                     if has_precomputed_edge_data
-                    else self.mesh_mesh_contacts_kernel
+                    else self.mesh_mesh_contacts_kernels
                 )
                 if self.reduce_contacts and self.mesh_mesh_block_offsets is not None:
                     # Mesh-mesh contacts → buffer + inline hashtable registration
@@ -5076,89 +5082,91 @@ class NarrowPhase:
                         record_tape=False,
                     )
 
-                    wp.launch_tiled(
-                        kernel=mesh_mesh_contacts_kernel,
-                        dim=(self.num_mesh_mesh_blocks,),
-                        inputs=[
-                            shape_data,
-                            shape_transform,
-                            shape_source,
-                            texture_sdf_data,
-                            shape_sdf_index,
-                            shape_mesh_properties,
-                            mesh_boundary_flags,
-                            shape_mesh_boundary_start,
-                            shape_gap,
-                            shape_base_gap,
-                            shape_linear_velocity,
-                            shape_angular_velocity,
-                            collision_update_dt,
-                            max_speculative_extension,
-                            shape_collision_aabb_lower,
-                            shape_collision_aabb_upper,
-                            shape_voxel_resolution,
-                            self.shape_pairs_mesh_mesh,
-                            self.shape_pairs_mesh_mesh_count,
-                            shape_heightfield_index,
-                            heightfield_data,
-                            heightfield_elevations,
-                            mesh_edge_indices,
-                            mesh_edge_centers,
-                            mesh_edge_halves,
-                            mesh_edge_order,
-                            mesh_edge_clusters,
-                            mesh_edge_cluster_reach,
-                            shape_edge_range,
-                            self.mesh_mesh_block_offsets,
-                            reducer_data,
-                            self.num_mesh_mesh_blocks,
-                        ],
-                        device=device,
-                        block_dim=self.tile_size_mesh_mesh,
-                        record_tape=False,
-                    )
+                    for mesh_mesh_contacts_kernel in mesh_mesh_contacts_kernels:
+                        wp.launch_tiled(
+                            kernel=mesh_mesh_contacts_kernel,
+                            dim=(self.num_mesh_mesh_blocks,),
+                            inputs=[
+                                shape_data,
+                                shape_transform,
+                                shape_source,
+                                texture_sdf_data,
+                                shape_sdf_index,
+                                shape_mesh_properties,
+                                mesh_boundary_flags,
+                                shape_mesh_boundary_start,
+                                shape_gap,
+                                shape_base_gap,
+                                shape_linear_velocity,
+                                shape_angular_velocity,
+                                collision_update_dt,
+                                max_speculative_extension,
+                                shape_collision_aabb_lower,
+                                shape_collision_aabb_upper,
+                                shape_voxel_resolution,
+                                self.shape_pairs_mesh_mesh,
+                                self.shape_pairs_mesh_mesh_count,
+                                shape_heightfield_index,
+                                heightfield_data,
+                                heightfield_elevations,
+                                mesh_edge_indices,
+                                mesh_edge_centers,
+                                mesh_edge_halves,
+                                mesh_edge_order,
+                                mesh_edge_clusters,
+                                mesh_edge_cluster_reach,
+                                shape_edge_range,
+                                self.mesh_mesh_block_offsets,
+                                reducer_data,
+                                self.num_mesh_mesh_blocks,
+                            ],
+                            device=device,
+                            block_dim=self.tile_size_mesh_mesh,
+                            record_tape=False,
+                        )
                 else:
                     # Non-reduce fallback: direct contact write, no dynamic allocation
-                    wp.launch_tiled(
-                        kernel=mesh_mesh_contacts_kernel,
-                        dim=(self.num_tile_blocks,),
-                        inputs=[
-                            shape_data,
-                            shape_transform,
-                            shape_source,
-                            texture_sdf_data,
-                            shape_sdf_index,
-                            shape_mesh_properties,
-                            mesh_boundary_flags,
-                            shape_mesh_boundary_start,
-                            shape_gap,
-                            shape_base_gap,
-                            shape_linear_velocity,
-                            shape_angular_velocity,
-                            collision_update_dt,
-                            max_speculative_extension,
-                            shape_collision_aabb_lower,
-                            shape_collision_aabb_upper,
-                            shape_voxel_resolution,
-                            self.shape_pairs_mesh_mesh,
-                            self.shape_pairs_mesh_mesh_count,
-                            shape_heightfield_index,
-                            heightfield_data,
-                            heightfield_elevations,
-                            mesh_edge_indices,
-                            mesh_edge_centers,
-                            mesh_edge_halves,
-                            mesh_edge_order,
-                            mesh_edge_clusters,
-                            mesh_edge_cluster_reach,
-                            shape_edge_range,
-                            writer_data,
-                            self.num_tile_blocks,
-                        ],
-                        device=device,
-                        block_dim=self.tile_size_mesh_mesh,
-                        record_tape=False,
-                    )
+                    for mesh_mesh_contacts_kernel in mesh_mesh_contacts_kernels:
+                        wp.launch_tiled(
+                            kernel=mesh_mesh_contacts_kernel,
+                            dim=(self.num_tile_blocks,),
+                            inputs=[
+                                shape_data,
+                                shape_transform,
+                                shape_source,
+                                texture_sdf_data,
+                                shape_sdf_index,
+                                shape_mesh_properties,
+                                mesh_boundary_flags,
+                                shape_mesh_boundary_start,
+                                shape_gap,
+                                shape_base_gap,
+                                shape_linear_velocity,
+                                shape_angular_velocity,
+                                collision_update_dt,
+                                max_speculative_extension,
+                                shape_collision_aabb_lower,
+                                shape_collision_aabb_upper,
+                                shape_voxel_resolution,
+                                self.shape_pairs_mesh_mesh,
+                                self.shape_pairs_mesh_mesh_count,
+                                shape_heightfield_index,
+                                heightfield_data,
+                                heightfield_elevations,
+                                mesh_edge_indices,
+                                mesh_edge_centers,
+                                mesh_edge_halves,
+                                mesh_edge_order,
+                                mesh_edge_clusters,
+                                mesh_edge_cluster_reach,
+                                shape_edge_range,
+                                writer_data,
+                                self.num_tile_blocks,
+                            ],
+                            device=device,
+                            block_dim=self.tile_size_mesh_mesh,
+                            record_tape=False,
+                        )
 
             # Export reduced contacts from hashtable
             if self.reduce_contacts:

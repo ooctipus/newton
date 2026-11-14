@@ -1828,7 +1828,7 @@ class TestNarrowPhase(_NarrowPhaseSetupMixin, unittest.TestCase):
         the new mesh-mesh SDF backend keeps direct coverage there - the serial
         inner loop is bounded for this size.
         """
-        if narrow_phase.mesh_mesh_contacts_kernel is None:
+        if not narrow_phase.mesh_mesh_contacts_kernels:
             self.skipTest("Mesh-mesh NarrowPhase SDF contacts not available")
 
         device = narrow_phase.device if narrow_phase.device is not None else wp.get_device()

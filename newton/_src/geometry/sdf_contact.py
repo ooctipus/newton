@@ -1427,6 +1427,7 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
     use_texture_sdf_only: bool = False,
     use_identity_sdf_scale: bool = False,
     deterministic_reduction: bool = False,
+    sdf_source: str = "any",
 ):
     """Create a mesh-mesh (or heightfield-mesh) SDF contact kernel.
 
@@ -1447,6 +1448,12 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
             ``use_texture_sdf_only``.
         deterministic_reduction: Use deterministic contact reduction. Only
             applies when ``reduce_contacts`` is True.
+        sdf_source: Which of a pair's two passes the global-reduction variant
+            takes: ``"any"`` both, ``"texture"`` those whose SDF has a texture
+            (the BVH fallback compiled out) or ``"mesh"`` those that fall back
+            to the mesh BVH. The fallback's queries take registers and spill
+            the texture passes' hot loop, so a model with both kinds launches
+            the two kernels in turn.
 
     Returns:
         The mesh-SDF contact kernel, or its global-reduction variant when
@@ -1458,6 +1465,10 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
     """
     if use_identity_sdf_scale and not use_texture_sdf_only:
         raise ValueError("identity SDF scale specialization requires texture-only SDFs")
+    if sdf_source not in ("any", "texture", "mesh") or (sdf_source != "any" and not reduce_contacts):
+        raise ValueError(f"sdf_source {sdf_source!r} is 'any', or 'texture' or 'mesh' for the reducing kernel")
+    # The BVH fallback is compiled in where some pass may take it.
+    bvh_fallback = not use_texture_sdf_only and sdf_source != "texture"
     # The reducer mode is tested inside fully unrolled directional loops. Keep
     # one bounded specialization for reduced mesh-SDF kernels so those checks
     # and their inactive packing path fold away; non-reduced kernels share the
@@ -1465,7 +1476,7 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
     deterministic_reduction = bool(reduce_contacts and deterministic_reduction)
     reducer_deterministic = 1 if deterministic_reduction else 0
     do_edge_sdf_collision = _create_sdf_contact_funcs(
-        enable_heightfields, use_texture_sdf_only, texture_sample_sdf_hw, _texture_sample_sdf_hw_pair
+        enable_heightfields, not bvh_fallback, texture_sample_sdf_hw, _texture_sample_sdf_hw_pair
     )
     sample_clamped = _texture_sample_sdf_hw_clamped
     sample_grad = texture_sample_sdf_grad_only_hw
@@ -1482,7 +1493,7 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
     _module = (
         f"sdf_contact_{writer_func.__name__}_{enable_heightfields}_{reduce_contacts}_"
         f"{speculative}_{use_precomputed_edge_data}_{use_texture_sdf_only}_{use_identity_sdf_scale}_"
-        f"{deterministic_reduction}"
+        f"{deterministic_reduction}" + ("" if sdf_source == "any" else f"_{sdf_source}")
     )
 
     @wp.kernel(enable_backward=False, module=_module)
@@ -2137,6 +2148,13 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
                             use_bvh_for_sdf = texture_sdf_table[sdf_idx].coarse_texture.width == 0
                         if use_bvh_for_sdf and mesh_id_sdf == wp.uint64(0):
                             continue
+                # The pass belongs to the other kernel of the split (sdf_source).
+                if wp.static(sdf_source == "texture"):
+                    if use_bvh_for_sdf:
+                        continue
+                if wp.static(sdf_source == "mesh"):
+                    if not use_bvh_for_sdf:
+                        continue
 
                 scale_data_tri = shape_data[tri_shape]
                 scale_data_sdf = shape_data[sdf_shape]
@@ -2312,7 +2330,7 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
                                         hfd_sdf, heightfield_elevations, bsphere_center
                                     )
                                     add_edge = midpoint_sdf <= threshold
-                                elif wp.static(not use_texture_sdf_only) and use_bvh_for_sdf:
+                                elif wp.static(bvh_fallback) and use_bvh_for_sdf:
                                     midpoint_sdf = sample_mesh_sdf_for_culling(
                                         mesh_id_sdf,
                                         bsphere_center,
@@ -2436,7 +2454,7 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
                                             dist_unscaled, direction_unscaled = sample_sdf_grad_heightfield(
                                                 hfd_sdf, heightfield_elevations, point_unscaled
                                             )
-                                        elif wp.static(not use_texture_sdf_only) and use_bvh_for_sdf:
+                                        elif wp.static(bvh_fallback) and use_bvh_for_sdf:
                                             dist_unscaled, direction_unscaled = sample_sdf_grad_using_mesh(
                                                 mesh_id_sdf,
                                                 point_unscaled,
@@ -2452,7 +2470,7 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
                                             # ``dist_unscaled`` from Brent.
                                             direction_unscaled = wp.static(sample_grad)(texture_sdf, point_unscaled)
                                     else:
-                                        if wp.static(not use_texture_sdf_only) and use_bvh_for_sdf:
+                                        if wp.static(bvh_fallback) and use_bvh_for_sdf:
                                             dist_unscaled, direction_unscaled = sample_sdf_grad_using_mesh(
                                                 mesh_id_sdf,
                                                 point_unscaled,
