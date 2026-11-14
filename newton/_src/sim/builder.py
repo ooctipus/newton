@@ -16238,14 +16238,24 @@ class ModelBuilder:
             # finer than the shapes that query it: the median extent of the collidable non-mesh shapes' local boxes.
             from ..geometry.mesh_cells import build_mesh_cells  # noqa: PLC0415
 
-            query_extents = [
-                float(np.max(np.asarray(upper) - np.asarray(lower)))
-                for shape_type, flags, lower, upper in zip(
-                    self.shape_type, shape_flags_list, local_aabb_lower, local_aabb_upper, strict=True
-                )
-                if flags & ShapeFlags.COLLIDE_SHAPES
-                and shape_type not in (GeoType.MESH, GeoType.HFIELD, GeoType.PLANE, GeoType.NONE)
-            ]
+            # Replicated shapes share their box arrays (shape_aabb_cache): each distinct pair's extent is taken once.
+            extent_of = {}
+            query_extents = []
+            for shape_type, flags, lower, upper in zip(
+                self.shape_type, shape_flags_list, local_aabb_lower, local_aabb_upper, strict=True
+            ):
+                if flags & ShapeFlags.COLLIDE_SHAPES and shape_type not in (
+                    GeoType.MESH,
+                    GeoType.HFIELD,
+                    GeoType.PLANE,
+                    GeoType.NONE,
+                ):
+                    extent = extent_of.get((id(lower), id(upper)))
+                    if extent is None:
+                        extent = extent_of[(id(lower), id(upper))] = float(
+                            np.max(np.asarray(upper) - np.asarray(lower))
+                        )
+                    query_extents.append(extent)
             # The host buffers each mesh was built from, so the build reads no device memory.
             mesh_buffers = {
                 int(source): (geo.vertices, geo.indices)
