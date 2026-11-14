@@ -6,6 +6,7 @@ import gc
 import itertools
 import math
 import os
+import tempfile
 import unittest
 import warnings
 from collections import Counter
@@ -1629,7 +1630,14 @@ def test_model_mesh_properties_track_watertight(test, device):
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     open_shape = builder.add_shape_mesh(body=-1, mesh=open_mesh)
     closed_shape = builder.add_shape_mesh(body=-1, mesh=closed_mesh)
-    model = builder.finalize(device=device)
+    # An empty collision cache: a stored watertightness from an earlier build would answer without a query.
+    saved_cache = newton.config.cache_dir_collision
+    with tempfile.TemporaryDirectory() as cache_dir:
+        newton.config.cache_dir_collision = cache_dir
+        try:
+            model = builder.finalize(device=device)
+        finally:
+            newton.config.cache_dir_collision = saved_cache
 
     mesh_properties = model._shape_mesh_properties.numpy()
     test.assertFalse(int(mesh_properties[open_shape]) & MeshProperties.WATERTIGHT)
