@@ -115,21 +115,21 @@ class TreeKineticState:
         starts = model.articulation_start.numpy()
         q_starts = model.joint_q_start.numpy()
         free_roots = solver.forest.free_root_joint_indices
-        free_roots = free_roots.numpy() if free_roots is not None else []
-        root_lookup = {int(joint): slot for slot, joint in enumerate(free_roots)}
-        root_slot = np.empty(self.group_count, np.int32)
-        q_index = np.full((self.group_count, dofs), -1, np.int32)
+        # Transport slot of each free-root joint (its place in the free-root list), -1 for every other joint.
+        joint_slot = np.full(model.joint_count, -1, np.int32)
+        if free_roots is not None:
+            joint_slot[free_roots.numpy()] = np.arange(free_roots.shape[0], dtype=np.int32)
+        group_start = starts[group_to_art]
+        root_slot = joint_slot[group_start]
+        if self.layout.free_root and np.any(root_slot < 0):
+            raise ValueError("Tree kinetic state is missing a free-root transport slot")
         # Coordinate of each DOF: the joint's first coordinate plus the DOF's
         # offset within its joint (one coordinate per DOF; a ball joint's
         # quaternion is never a spring coordinate, its stiffness is zero).
         dof_offset = np.arange(dofs) - tree.dof_start[dof_joint]
-        for group, art in enumerate(group_to_art):
-            start = int(starts[art])
-            if self.layout.free_root and start not in root_lookup:
-                raise ValueError("Tree kinetic state is missing a free-root transport slot")
-            root_slot[group] = root_lookup.get(start, -1)
-            for dof in range(self.layout.root_dofs if self.layout.free_root else 0, dofs):
-                q_index[group, dof] = q_starts[start + dof_joint[dof]] + dof_offset[dof]
+        q_index = np.full((self.group_count, dofs), -1, np.int32)
+        first = self.layout.root_dofs if self.layout.free_root else 0
+        q_index[:, first:] = q_starts[group_start[:, None] + dof_joint[first:]] + dof_offset[first:]
         # Each group's coordinates are one contiguous range, from its first joint's.
         first_joint = starts[group_to_art]
         coordinates = q_starts[first_joint + bodies] - q_starts[first_joint]
@@ -173,11 +173,10 @@ class TreeKineticState:
             dof_passive[self.layout.root_offsets[r] : self.layout.root_offsets[r] + 6] = 0
         if self.layout.forest:
             root_slot = np.full((self.group_count, max(1, len(free))), -1, np.int32)
-            for group in range(self.group_count):
-                for k, r in enumerate(free):
-                    root_slot[group, k] = root_lookup.get(int(starts[arts[group, r]]), -1)
-                    if root_slot[group, k] < 0:
-                        raise ValueError("Tree kinetic state is missing a free-root transport slot")
+            if free:
+                root_slot[:, : len(free)] = joint_slot[starts[arts[:, free]]]
+                if np.any(root_slot[:, : len(free)] < 0):
+                    raise ValueError("Tree kinetic state is missing a free-root transport slot")
             root_slot = root_slot.reshape(-1)
         self.plan = field_group.upload(
             native.HeldPlan,
