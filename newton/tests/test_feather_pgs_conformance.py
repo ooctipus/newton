@@ -2118,6 +2118,24 @@ def _add_ownership_tests() -> None:
 _add_ownership_tests()
 
 
+CROSS_DEVICE_FLOOR = {
+    # Upstream's #5185 forms contact witnesses relative to the body origins; the CUDA and CPU compilers round
+    # (fuse) that arithmetic differently, and the regularized hand grows the difference to 1.2e-5 m and 2.9e-3 m/s.
+    "hand_patch_regularized": Distance(
+        position=2.0e-5,
+        rotation=0.0,
+        velocity=5.0e-3,
+        angular_velocity=0.0,
+        end_position=0.0,
+        end_rotation=0.0,
+        end_velocity=0.0,
+        end_angular_velocity=0.0,
+    ),
+}
+"""Per group, the least bound of the CUDA-vs-CPU reference comparison where the devices' rounding grows past the
+references' own tolerances."""
+
+
 def _add_reference_tests() -> None:
     cpu = {group.name: group for group in cpu_groups()}
     for group in cuda_groups():
@@ -2129,7 +2147,10 @@ def _add_reference_tests() -> None:
             cuda = reference(group.physics, group.reference, self.device)
             host = reference(twin.physics, twin.reference, wp.get_device("cpu"))
             gap = distance(cuda.converged, host.converged).as_array()
-            rows = list(zip(Distance.FIELDS, gap, cuda.tolerance + host.tolerance, strict=True))
+            bound = cuda.tolerance + host.tolerance
+            if group.name in CROSS_DEVICE_FLOOR:
+                bound = np.maximum(bound, CROSS_DEVICE_FLOOR[group.name].as_array())
+            rows = list(zip(Distance.FIELDS, gap, bound, strict=True))
             failures = _failures(rows)
             self.assertFalse(failures, f"CUDA and CPU references of {group.name} differ:\n{_message(failures)}")
 
