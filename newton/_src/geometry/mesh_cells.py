@@ -36,6 +36,7 @@ from __future__ import annotations
 import numpy as np
 import warp as wp
 
+from . import _collision_cache
 from .types import GeoType
 
 # Keys pack (level, x, y, z) as 4 + 3 * 20 bits. The level-0 grid is kept under 2**14 cells per axis (the cell edge
@@ -1007,7 +1008,13 @@ def build_mesh_cells(
             edge = default_cell_size(points, indices)
             if query_size is not None and query_size > edge:
                 edge = query_size
-        g = build_mesh_grid(points, indices, edge)
+        g = _collision_cache.cached(
+            "mesh_grid",
+            (np.asarray(points), np.asarray(indices), float(edge)),
+            lambda points=points, indices=indices, edge=edge: {
+                name: value for name, value in build_mesh_grid(points, indices, edge).items() if name != "stats"
+            },
+        )
         info = MeshGrid()
         info.origin = wp.vec3(*[float(x) for x in g["origin"]])
         info.cell = float(g["cell"])

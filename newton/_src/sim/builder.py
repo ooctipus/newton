@@ -15926,6 +15926,7 @@ class ModelBuilder:
 
             # Open-boundary bits for collision meshes queried with pseudo-normal
             # signs, packed once per unique finalized mesh.
+            from ..geometry import _collision_cache  # noqa: PLC0415
             from ..geometry.sdf_contact import compute_mesh_boundary_flags  # noqa: PLC0415
 
             boundary_chunks = []
@@ -15945,7 +15946,11 @@ class ModelBuilder:
                     start = boundary_starts.get(source)
                     if start is None:
                         geo = mesh_geos[source]
-                        flags = compute_mesh_boundary_flags(geo.mesh, geo.vertices, geo.indices)
+                        flags = _collision_cache.cached(
+                            "boundary_flags",
+                            (np.asarray(geo.vertices), np.asarray(geo.indices)),
+                            lambda geo=geo: compute_mesh_boundary_flags(geo.mesh, geo.vertices, geo.indices),
+                        )
                         start = boundary_starts[source] = boundary_offset
                         boundary_chunks.append(flags)
                         boundary_offset += len(flags)
@@ -16695,8 +16700,12 @@ class ModelBuilder:
                                 np.ascontiguousarray(np.concatenate((edge_halves, corner_ownership), axis=1))
                             )
                             # Clusters live at the shape's edge offset, ahead of unused slots.
-                            order, cluster_bounds, cluster_reach = build_mesh_edge_clusters(
-                                edge_centers, edge_radii[:, 0]
+                            order, cluster_bounds, cluster_reach = _collision_cache.cached(
+                                "edge_clusters",
+                                (edge_centers, edge_radii[:, 0]),
+                                lambda centers=edge_centers, radii=edge_radii[:, 0]: build_mesh_edge_clusters(
+                                    centers, radii
+                                ),
                             )
                             clusters = np.zeros((count, 4), dtype=np.float32)
                             clusters[: len(cluster_bounds)] = cluster_bounds

@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Global cache settings, read when downloading assets or approximating meshes.
+"""Global cache settings, read when downloading assets, approximating meshes or finalizing a model.
 
-Asset caching is enabled by default; mesh decomposition caching is opt-in.
+Asset and collision-table caching are enabled by default; mesh decomposition caching is opt-in.
 The initial asset cache location comes from ``NEWTON_CACHE_PATH`` or the
 platform's user cache directory for Newton. An empty ``NEWTON_CACHE_PATH``
 uses the current working directory for assets. Set the environment variable
@@ -19,7 +19,7 @@ import os
 
 from warp._src.thirdparty.appdirs import user_cache_dir
 
-__all__ = ["cache_dir_assets", "cache_dir_meshes"]
+__all__ = ["cache_dir_assets", "cache_dir_collision", "cache_dir_meshes"]
 
 _cache_dir = os.environ.get("NEWTON_CACHE_PATH")
 if _cache_dir is None:
@@ -39,4 +39,13 @@ cache_dir_meshes: str | os.PathLike[str] | None = None
 Defaults to ``None`` (no disk caching). Set a directory to enable caching,
 including automatic USD mesh approximation; set ``None`` to disable it again.
 This setting does not affect :meth:`newton.Mesh.build_sdf` caching.
+"""
+
+cache_dir_collision: str | os.PathLike[str] | None = os.path.join(_cache_dir, "collision")
+"""Directory for the collision tables :meth:`newton.ModelBuilder.finalize` derives from each collision mesh: its cell
+index, welded topology, open-boundary bits and edge clusters.
+
+Defaults to ``collision`` in the Newton cache directory. A later finalize of the same mesh loads its tables instead of
+deriving them again (about 13 s for a 1.2 million triangle terrain); entries are keyed by the mesh's buffers, the
+parameters and the code that derives them. Set to ``None`` to derive the tables in every finalize.
 """

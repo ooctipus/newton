@@ -38,6 +38,7 @@ import numpy as np
 import warp as wp
 
 from ..core.host_unique import distinct, row_ids
+from . import _collision_cache
 from .contact_data import ContactData
 from .heightfield_features import (
     HeightfieldFeatureContext,
@@ -235,7 +236,11 @@ class MeshTopology:
             key = id(mesh)
             if key not in blocks:
                 blocks[key] = len(parts)
-                part = build_mesh_topology(mesh.vertices, mesh.indices)
+                part = _collision_cache.cached(
+                    "mesh_topology",
+                    (np.asarray(mesh.vertices), np.asarray(mesh.indices)),
+                    lambda mesh=mesh: build_mesh_topology(mesh.vertices, mesh.indices),
+                )
                 part["row_base"] = triangle_rows
                 triangle_rows += part["neighbor"].shape[0]
                 parts.append(part)
