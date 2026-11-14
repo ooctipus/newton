@@ -5374,6 +5374,44 @@ class NarrowPhase:
                 self._pair_csr.status.zero_()
         return result
 
+    def launch_variants(self):
+        """The primitive kernel, the GJK/MPR stage and the mesh triangle queries :meth:`launch` makes, each with its
+        threads per block (:func:`~newton._src.core.execution.compile_ahead`): the largest modules of a convex or mesh
+        scene. A measured convex method choice, the heightfield primitive, pair-CSR and finite routes keep compiling at
+        their first launch."""
+        yield self.primitive_kernel, self.block_dim
+        if self.has_generic_convex_pairs:
+            if not self.split_gjk_mpr:
+                yield self.narrow_phase_kernel, self.block_dim
+            else:
+                if self._convex_method_choice is None and self._coherent_cache is not None:
+                    yield from ((kernel, self.block_dim) for kernel in self._coherent_query_kernels)
+                elif self._convex_method_choice is None:
+                    yield self.narrow_phase_mpr_kernel, self.split_convex_block_dim
+                    yield self.narrow_phase_gjk_kernel, self.split_convex_block_dim
+                yield self.narrow_phase_manifold_kernel, self.split_convex_block_dim
+        if not (self.has_meshes or self.has_heightfields):
+            return
+        block = self.mesh_triangle_block_dim
+        if self._heightfield_pair_csr or self._heightfield_finite_query or self._heightfield_primitive_query:
+            return
+        if self._mesh_triangles_direct():
+            yield self._mesh_round_direct, block
+            yield self._mesh_face_direct, block
+            yield self._mesh_queued_direct, block
+            yield self._heightfield_triangle_kernel, block
+        elif self.reduce_contacts:
+            yield self._mesh_round_kernel, block
+            if self._mesh_face_kernel is not None:
+                yield self._mesh_face_kernel, block
+                yield self._mesh_queued_kernel, block
+            else:
+                yield self._mesh_generic_kernel, block
+            export_block = self.block_dim if self._reducer_compact_export else EXPORT_REDUCED_CONTACTS_BLOCK_DIM
+            yield self.export_reduced_contacts_kernel, export_block
+        else:
+            yield self.mesh_triangle_contacts_kernel, block
+
     def _mesh_triangles_direct(self) -> bool:
         """Whether mesh triangle pairs publish their contacts directly, without the global reducer.
 

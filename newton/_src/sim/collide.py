@@ -18,6 +18,7 @@ import warp as wp
 
 from ..core.contact_pool import ContactDrops, ContactField, ContactPool, _capture_owner, capturing, model_contact_pool
 from ..core.environment_flags import record_newton_environment, retired_notice
+from ..core.execution import compile_ahead
 from ..core.reset import normalize_reset_world_mask
 from ..exceptions import NewtonDeprecationWarning, NewtonWarning
 from ..geometry.broad_phase_common import (
@@ -3735,6 +3736,8 @@ class CollisionPipeline:
         pool.publish_reach(float(np.linalg.norm(model.gravity.numpy().reshape(-1, 3), axis=1).max()))
         # Captured contact launches that a replay skipped surface with the narrow phase's capacity flags.
         self.narrow_phase.contact_pool = pool
+        # The narrow phase's largest kernels compile now, side by side, instead of one at a time at the first collide.
+        compile_ahead(self.narrow_phase.launch_variants(), device)
 
         # Publish only after all construction succeeds.
         if publish_capacity:
