@@ -37,6 +37,7 @@ from typing import Any
 import numpy as np
 import warp as wp
 
+from ..core.host_unique import distinct, row_ids
 from .contact_data import ContactData
 from .heightfield_features import (
     HeightfieldFeatureContext,
@@ -89,12 +90,10 @@ def weld_mesh(vertices: np.ndarray, indices: np.ndarray) -> tuple[np.ndarray, in
     """
     corners = np.asarray(indices, dtype=np.int64).reshape(-1, 3)
     points = np.ascontiguousarray(np.asarray(vertices, dtype=np.float32).reshape(-1, 3) + np.float32(0.0))
-    keys = points.view(np.dtype((np.void, 12))).ravel()
-    used = np.unique(corners)
-    _, inverse = np.unique(keys[used], return_inverse=True)
-    inverse = inverse.reshape(-1).astype(np.int64)
+    used = distinct(corners)
+    inverse = row_ids(points[used], by_bytes=True)
     count = int(inverse.max()) + 1 if inverse.size else 0
-    lookup = np.full(keys.shape[0], -1, dtype=np.int64)
+    lookup = np.full(points.shape[0], -1, dtype=np.int64)
     lookup[used] = inverse
     return lookup[corners], count
 

@@ -25,6 +25,7 @@ from types import SimpleNamespace
 import numpy as np
 import warp as wp
 
+from ...core.host_unique import distinct
 from . import coordinate_trees, field_group, host_index
 from .device_proof import DeviceProof
 from .tree_kinetic_owner import TreeKineticState, proof_runs
@@ -124,7 +125,7 @@ def _coverage(model, forest, compact):
     starts = model.articulation_start.numpy()
     if starts[0] != 0 or starts[-1] != model.joint_count or np.any(np.diff(starts) <= 0):
         raise ValueError("Mixed tree cache requires contiguous nonempty articulations")
-    if np.unique(model.joint_child.numpy()[owned]).size != np.count_nonzero(owned):
+    if distinct(model.joint_child.numpy()[owned]).size != np.count_nonzero(owned):
         raise ValueError("Mixed tree cache must publish a body at most once")
     return (
         tuple(forest.size_groups),

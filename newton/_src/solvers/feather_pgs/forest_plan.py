@@ -31,6 +31,7 @@ from types import SimpleNamespace
 import numpy as np
 import warp as wp
 
+from ...core.host_unique import row_ids
 from ...geometry.flags import ShapeFlags
 from ...geometry.types import GeoType
 from ...sim import Model
@@ -512,8 +513,8 @@ def _equal_ids(lengths: np.ndarray, rows) -> np.ndarray:
     found = 0
     for length in np.unique(lengths):
         members = np.flatnonzero(lengths == length)
-        _, inverse = np.unique(rows(members, int(length)), axis=0, return_inverse=True)
-        ids[members] = found + inverse.reshape(-1)
+        inverse = row_ids(rows(members, int(length)))
+        ids[members] = found + inverse
         found += int(inverse.max()) + 1
     return ids
 
@@ -741,8 +742,9 @@ def _world_classes(plan, model):
         soft = (model.shape_flags.numpy()[pairs] & int(ShapeFlags.HYDROELASTIC)) != 0
         round_ = np.isin(kinds, _ONE_POINT_SHAPES).any(axis=1)
         convex = ~np.isin(kinds, _MANIFOLD_SHAPES).any(axis=1) & ~soft.any(axis=1)
-        _, pair_body, shared = np.unique(bodies, axis=0, return_inverse=True, return_counts=True)
-        present(RowLaw.SPIN, trees[(shared[pair_body.reshape(-1)] > 1) | ~(round_ & convex)])
+        pair_body = row_ids(bodies)
+        shared = np.bincount(pair_body)[pair_body]
+        present(RowLaw.SPIN, trees[(shared > 1) | ~(round_ & convex)])
     if model.joint_count:
         joint_tree = _joint_tree(plan)
         limited = np.flatnonzero(np.isin(model.joint_type.numpy(), _LIMITED_JOINTS) & (joint_tree >= 0))

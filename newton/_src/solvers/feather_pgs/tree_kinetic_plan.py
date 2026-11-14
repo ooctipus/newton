@@ -5,6 +5,7 @@
 
 import numpy as np
 
+from ...core.host_unique import distinct
 from ...sim import BodyFlags, JointType
 from .tree_kinetic_layout import TreeLayout
 from .tree_plan import TreePlan
@@ -53,7 +54,7 @@ def make_plan(model, operator, *, complete=True):
     counts = np.diff(model.joint_qd_start.numpy())[joints]
     dofs = int(counts[0].sum())
     child = model.joint_child.numpy()
-    if np.unique(child[owned]).size != np.count_nonzero(owned):
+    if distinct(child[owned]).size != np.count_nonzero(owned):
         raise ValueError("Cached tree publication requires each body at most once")
     ancestors = model.joint_ancestor.numpy()[joints]
     local = np.where(ancestors >= 0, ancestors - starts[group, None], -1)

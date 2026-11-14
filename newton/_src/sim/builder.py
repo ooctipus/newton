@@ -15831,6 +15831,7 @@ class ModelBuilder:
             gaussians = []
             heightfield_meshes = []
             mesh_keep_alive = []
+            mesh_geos = {}  # finalized mesh id -> the geometry (host buffers) it was built from
             for geo in generated_shape_sources:
                 if not geo:
                     geo_sources.append(0)
@@ -15885,6 +15886,7 @@ class ModelBuilder:
                         # add_builder()), so the model must not rely on the geometry
                         # object keeping the finalized wp.Mesh alive
                         mesh_keep_alive.append(geo.mesh)
+                        mesh_geos[geo.mesh.id] = geo
                     elif isinstance(geo, Gaussian):
                         finalized_geos[geo_cache_key] = len(gaussians)
                         gaussians.append(
@@ -15926,7 +15928,6 @@ class ModelBuilder:
             # signs, packed once per unique finalized mesh.
             from ..geometry.sdf_contact import compute_mesh_boundary_flags  # noqa: PLC0415
 
-            finalized_meshes = {mesh.id: mesh for mesh in mesh_keep_alive}
             boundary_chunks = []
             boundary_offset = 0
             boundary_starts = {}
@@ -15937,13 +15938,14 @@ class ModelBuilder:
                 start = -1
                 if (
                     shape_type == GeoType.MESH
-                    and source in finalized_meshes
+                    and source in mesh_geos
                     and shape_flags & ShapeFlags.COLLIDE_SHAPES
                     and not mesh_properties & MeshProperties.WATERTIGHT
                 ):
                     start = boundary_starts.get(source)
                     if start is None:
-                        flags = compute_mesh_boundary_flags(finalized_meshes[source])
+                        geo = mesh_geos[source]
+                        flags = compute_mesh_boundary_flags(geo.mesh, geo.vertices, geo.indices)
                         start = boundary_starts[source] = boundary_offset
                         boundary_chunks.append(flags)
                         boundary_offset += len(flags)

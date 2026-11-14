@@ -1451,7 +1451,7 @@ def test_bounded_mesh_sdf_sign(test, device):
                     mesh.id,
                     wp.array(rotated_points, dtype=wp.vec3, device=device),
                     int(sign_method),
-                    wp.array(compute_mesh_boundary_flags(mesh), dtype=wp.uint8, device=device),
+                    wp.array(compute_mesh_boundary_flags(mesh, vertices, faces), dtype=wp.uint8, device=device),
                     values,
                     gradients,
                 ],

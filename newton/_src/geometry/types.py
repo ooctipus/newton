@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import warp as wp
 
+from ..core.host_unique import row_ids
 from ..core.types import Axis, Devicelike, Vec2, Vec3, override
 from ..exceptions import NewtonDeprecationWarning, NewtonWarning
 from ..utils.color import ColorSpace
@@ -1235,10 +1236,7 @@ class Mesh:
         before hashing, so vertices closer than 100 nm collapse to one id."""
         if self._canonical_ids is None:
             q = np.round(self._vertices * 1e7).astype(np.int64)
-            q_contig = np.ascontiguousarray(q)
-            void_verts = q_contig.view(np.dtype((np.void, q_contig.dtype.itemsize * q_contig.shape[1])))
-            _, canonical = np.unique(void_verts, return_inverse=True)
-            self._canonical_ids = canonical.ravel()
+            self._canonical_ids = row_ids(q, by_bytes=True)
         return self._canonical_ids
 
     @staticmethod

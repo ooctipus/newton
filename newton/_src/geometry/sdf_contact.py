@@ -6,6 +6,7 @@ from typing import Any
 import numpy as np
 import warp as wp
 
+from ..core.host_unique import distinct, row_ids
 from ..geometry.contact_data import (
     SHAPE_PAIR_HFIELD_BIT,
     SHAPE_PAIR_INDEX_MASK,
@@ -378,7 +379,7 @@ def _mesh_edge_boundary_kernel(mesh_id: wp.uint64, edges: wp.array[wp.vec2i], bo
     boundary[i] = wp.where(_mesh_edge_is_boundary(mesh_id, mesh.points[edge[0]], mesh.points[edge[1]]), 1, 0)
 
 
-def compute_mesh_boundary_flags(mesh: wp.Mesh) -> np.ndarray:
+def compute_mesh_boundary_flags(mesh: wp.Mesh, vertices: np.ndarray, indices: np.ndarray) -> np.ndarray:
     """Mark the open-boundary edges and vertices of each mesh face.
 
     Bit ``i`` marks the edge opposite face vertex ``i``, and bit ``3 + i``
@@ -389,16 +390,18 @@ def compute_mesh_boundary_flags(mesh: wp.Mesh) -> np.ndarray:
 
     Args:
         mesh: Finalized Warp mesh whose BVH resolves split seams.
+        vertices: The host vertex positions ``mesh`` was built from, shape ``[n, 3]`` [m].
+        indices: The host triangle indices ``mesh`` was built from, flat or shape ``[face_count, 3]``.
 
     Returns:
         Per-face boundary bits, shape [face_count], uint8.
     """
-    faces = mesh.indices.numpy().reshape(-1, 3)
+    faces = np.asarray(indices, dtype=np.int32).reshape(-1, 3)
     if len(faces) == 0:
         return np.zeros(0, dtype=np.uint8)
     # Adding zero folds -0 into +0, matching the kernels' exact position test.
-    points = np.ascontiguousarray(mesh.points.numpy() + np.float32(0.0))
-    _, position_id = np.unique(points.view(np.dtype((np.void, points.strides[0]))).ravel(), return_inverse=True)
+    points = np.ascontiguousarray(np.asarray(vertices, dtype=np.float32).reshape(-1, 3) + np.float32(0.0))
+    position_id = row_ids(points, by_bytes=True)
     position_count = int(position_id.max()) + 1
     corners = position_id.reshape(-1)[faces].astype(np.int64)
     opposite = np.array([[1, 2], [0, 2], [0, 1]])
@@ -410,7 +413,7 @@ def compute_mesh_boundary_flags(mesh: wp.Mesh) -> np.ndarray:
     # Edges shared by two faces are closed. The rest, including degenerate
     # edges, take the coverage sweep that also resolves split seams.
     slot_face = np.repeat(np.arange(len(faces), dtype=np.int64), 3)
-    edge_faces = np.unique(slot_edge * len(faces) + slot_face) // len(faces)
+    edge_faces = distinct(slot_edge * len(faces) + slot_face) // len(faces)
     face_count = np.bincount(edge_faces, minlength=len(edges))
     candidates = np.flatnonzero((face_count < 2) | (edges[:, 0] == edges[:, 1]))
     open_edge = np.zeros(len(edges), dtype=bool)
