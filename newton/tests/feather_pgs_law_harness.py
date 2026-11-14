@@ -270,6 +270,7 @@ TWIN_TOLERANCES = {
     "friction_pair": ("radius", 1.0e-5),
     "friction_pair_from_metric": ("radius", 1.0e-5),
     "friction_ball": ("load", 1.0e-5),
+    "friction_ball_metric": (None, 1.0e-6),
     "friction_ball_from_metric": ("load", 1.0e-5),
     "friction_triple": ("load", 1.0e-5),
     "friction_triple_from_metric": ("load", 1.0e-5),
@@ -279,7 +280,9 @@ results, or None for the largest result, bound)``. They test convergence and sti
 CUDA compiler fuses their multiply-adds differently in Warp's lowering (branches merged with ``wp::where``) and in
 the plain C++ rendering, so a rare sample takes the other branch of a test: :data:`TWIN_AGREEING` of the samples
 agree within the bound, every sample within a thousand times it. Today's Warp code and hand-written CUDA text of the
-pair law differ the same way."""
+pair law differ the same way. The ball metric's eigen-solve has no such test, so its bound is the rounding floor: since
+Warp 1.20's lowering of branches, the compiler fuses its products differently in the two renderings, and its results
+move by float32 roundings (2e-6 of the largest at most)."""
 
 TWIN_AGREEING = 0.995
 """Fraction of an iterative law's samples whose renderings agree within its :data:`TWIN_TOLERANCES` bound."""
