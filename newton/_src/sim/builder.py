@@ -4200,7 +4200,7 @@ class ModelBuilder:
         """
         The number of articulations in the model.
         """
-        return len(self.articulation_start)
+        return self._row_count("articulation_start")
 
     # Tombstones so that assigning the 1.3-era names fails loudly instead of
     # creating an unused instance attribute whose targets are never applied.
@@ -4470,7 +4470,7 @@ class ModelBuilder:
         if array_backed:
             for attr, warp_dtype in _ARRAY_BACKED_ATTRIBUTE_DTYPES.items():
                 spec = attribute_specs.get(attr)
-                if spec is None or spec.compaction_policy != "generic":
+                if spec is None or spec.compaction_policy not in ("generic", "start", "end"):
                     continue
                 prefix_values = getattr(self, attr)
                 source_values = getattr(builder, attr)
@@ -4610,16 +4610,33 @@ class ModelBuilder:
                 for target, vector in zip(targets, transformed.tolist(), strict=True):
                     values[target] = tuple(vector)
 
-        for body_start, shape_start in zip(body_starts, shape_starts, strict=True):
-            for body, shapes in builder.body_shapes.items():
-                translated_shapes = [shape + int(shape_start) for shape in shapes]
-                if body == -1:
-                    self.body_shapes[-1].extend(translated_shapes)
-                else:
-                    self.body_shapes[body + int(body_start)] = translated_shapes
-            # Copies share the variant sets by identity.
+        if builder.body_shapes:
+            # Every copy's body shape lists, copy by copy: static shapes extend the shared list of
+            # body -1, and each other body of a copy is new.
+            bodies = np.fromiter(builder.body_shapes.keys(), dtype=np.int64, count=len(builder.body_shapes))
+            lengths = np.fromiter(map(len, builder.body_shapes.values()), dtype=np.int64, count=len(bodies))
+            source_shapes = np.fromiter(
+                itertools.chain.from_iterable(builder.body_shapes.values()), dtype=np.int64, count=int(lengths.sum())
+            )
+            copy_shapes = (source_shapes[None, :] + shape_starts[:, None]).reshape(-1).tolist()
+            firsts = ((np.cumsum(lengths) - lengths)[None, :] + (copy_range * len(source_shapes))[:, None]).reshape(-1)
+            shape_lists = list(
+                map(
+                    copy_shapes.__getitem__,
+                    map(slice, firsts.tolist(), (firsts + np.tile(lengths, copy_count)).tolist()),
+                )
+            )
+            static = np.tile(bodies == -1, copy_count)
+            if static.any():
+                self.body_shapes[-1].extend(itertools.chain.from_iterable(itertools.compress(shape_lists, static)))
+            copy_bodies = (bodies[None, :] + body_starts[:, None]).reshape(-1)
+            self.body_shapes.update(
+                zip(copy_bodies[~static].tolist(), itertools.compress(shape_lists, ~static), strict=True)
+            )
+        # Copies share the variant sets by identity.
+        for body_start, shape_start in zip(body_starts.tolist(), shape_starts.tolist(), strict=True):
             for body, body_variants in builder._body_variants.items():
-                self._body_variants[body + int(body_start)] = body_variants.shifted(int(shape_start))
+                self._body_variants[body + body_start] = body_variants.shifted(shape_start)
 
         joint_coord_starts = starts("joint_coord")
         joint_dof_starts = starts("joint_dof")
@@ -14193,7 +14210,7 @@ class ModelBuilder:
                 ("constraint_mimic_world", self.constraint_mimic_world),
             ]
 
-        all_world_indices = set()
+        world_indices = []
 
         for array_name, world_array in world_arrays:
             if len(world_array) == 0:
@@ -14259,15 +14276,17 @@ class ModelBuilder:
                                 f"(non-decreasing). Found world {non_neg_values[i]} after world {non_neg_values[i - 1]}."
                             )
 
-                # Collect all non-negative world indices for contiguity check
-                all_world_indices.update(non_neg_values)
+                # Collect all non-negative world indices for contiguity check (the values are sorted)
+                distinct = np.ones(len(non_neg_values), dtype=bool)
+                distinct[1:] = non_neg_values[1:] != non_neg_values[:-1]
+                world_indices.append(non_neg_values[distinct])
 
         # Check contiguity: all world indices should form a sequence 0, 1, 2, ..., n-1
-        if all_world_indices:
-            world_list = sorted(all_world_indices)
-            expected = list(range(world_list[-1] + 1))
-
-            if world_list != expected:
+        if world_indices:
+            all_world_indices = np.unique(np.concatenate(world_indices))
+            if not np.array_equal(all_world_indices, np.arange(all_world_indices[-1] + 1)):
+                world_list = all_world_indices.tolist()
+                expected = list(range(world_list[-1] + 1))
                 missing = set(expected) - set(world_list)
                 raise ValueError(
                     f"World indices are not contiguous. Missing world(s): {sorted(missing)}. "
@@ -14706,8 +14725,13 @@ class ModelBuilder:
                 )
 
         # Validate start array monotonicity
+        with self._raw_array_access():
+            joint_q_start_values = self.joint_q_start
+            joint_qd_start_values = self.joint_qd_start
+            articulation_start_values = self.articulation_start
+            articulation_end_values = self.articulation_end
         if joint_count > 0:
-            joint_q_start = np.array(self.joint_q_start, dtype=np.int32)
+            joint_q_start = np.array(joint_q_start_values, dtype=np.int32)
             if len(joint_q_start) > 1:
                 diffs = np.diff(joint_q_start)
                 if np.any(diffs < 0):
@@ -14717,7 +14741,7 @@ class ModelBuilder:
                         f"joint_q_start[{idx}]={joint_q_start[idx]} > joint_q_start[{idx + 1}]={joint_q_start[idx + 1]}."
                     )
 
-            joint_qd_start = np.array(self.joint_qd_start, dtype=np.int32)
+            joint_qd_start = np.array(joint_qd_start_values, dtype=np.int32)
             if len(joint_qd_start) > 1:
                 diffs = np.diff(joint_qd_start)
                 if np.any(diffs < 0):
@@ -14729,13 +14753,13 @@ class ModelBuilder:
 
         articulation_count = self.articulation_count
         if articulation_count > 0:
-            if len(self.articulation_end) != articulation_count:
+            if len(articulation_end_values) != articulation_count:
                 raise ValueError(
                     f"Invalid articulation_end length: expected {articulation_count} entries, "
-                    f"got {len(self.articulation_end)}."
+                    f"got {len(articulation_end_values)}."
                 )
-            articulation_start = np.array(self.articulation_start, dtype=np.int32)
-            articulation_end = np.array(self.articulation_end, dtype=np.int32)
+            articulation_start = np.array(articulation_start_values, dtype=np.int32)
+            articulation_end = np.array(articulation_end_values, dtype=np.int32)
             if len(articulation_start) > 1:
                 diffs = np.diff(articulation_start)
                 if np.any(diffs < 0):
@@ -14893,8 +14917,8 @@ class ModelBuilder:
 
             # Start arrays should have length == joint_count
             start_arrays = [
-                ("joint_q_start", self.joint_q_start),
-                ("joint_qd_start", self.joint_qd_start),
+                ("joint_q_start", joint_q_start_values),
+                ("joint_qd_start", joint_qd_start_values),
             ]
             for name, arr in start_arrays:
                 if len(arr) != joint_count:
@@ -15034,27 +15058,19 @@ class ModelBuilder:
                     f"World array for {name}s has incorrect length: expected {entity_count}, found {len(entity_world)}."
                 )
 
-            # Initialize world_entity_start with zeros
-            world_entity_start.clear()
-            world_entity_start.extend([0] * (self.world_count + 2))
-
             # Count global entities at the front of the entity_world array
-            front_global_entity_count = 0
-            for w in entity_world:
-                if w == -1:
-                    front_global_entity_count += 1
-                else:
-                    break
-            world_entity_start[0] = front_global_entity_count
-
-            # Compute per-world cumulative counts
             entity_world_np = np.asarray(entity_world, dtype=np.int32)
-            world_counts = np.bincount(entity_world_np[entity_world_np >= 0], minlength=self.world_count)
-            for w in range(self.world_count):
-                world_entity_start[w + 1] = world_entity_start[w] + int(world_counts[w])
+            local = np.flatnonzero(entity_world_np != -1)
+            front_global_entity_count = int(local[0]) if len(local) else len(entity_world_np)
 
-            # Set the last element to the total entity counts over all worlds in the model
-            world_entity_start[-1] = entity_count
+            # Compute per-world cumulative counts; the last element is the total entity count over all worlds
+            world_counts = np.bincount(entity_world_np[entity_world_np >= 0], minlength=self.world_count)
+            starts = np.empty(self.world_count + 2, dtype=np.int64)
+            starts[0] = front_global_entity_count
+            starts[1 : self.world_count + 1] = front_global_entity_count + np.cumsum(world_counts[: self.world_count])
+            starts[-1] = entity_count
+            world_entity_start.clear()
+            world_entity_start.extend(starts.tolist())
 
         # Check that all world offset indices are cumulative and match counts
         for world_start_array, total_count, entity_world_array, name in world_entity_start_arrays:
@@ -15070,17 +15086,16 @@ class ModelBuilder:
                 )
 
             # Ensure that per-world start indices are non-decreasing and compute sum of per-world counts
-            sum_of_counts = world_start_array[0]
-            for w in range(self.world_count + 1):
-                start_idx = world_start_array[w]
-                end_idx = world_start_array[w + 1]
-                count = end_idx - start_idx
-                if count < 0:
-                    raise ValueError(
-                        f"Invalid world start indices for {name}s: world {w} has negative count ({count}). "
-                        f"Start index: {start_idx}, end index: {end_idx}."
-                    )
-                sum_of_counts += count
+            starts = np.asarray(world_start_array, dtype=np.int64)
+            counts = np.diff(starts)
+            negative = np.flatnonzero(counts < 0)
+            if len(negative):
+                w = int(negative[0])
+                raise ValueError(
+                    f"Invalid world start indices for {name}s: world {w} has negative count ({counts[w]}). "
+                    f"Start index: {starts[w]}, end index: {starts[w + 1]}."
+                )
+            sum_of_counts = int(starts[0] + counts.sum())
 
             # Ensure the sum of per-world counts equals the total count
             if sum_of_counts != total_count:
@@ -15141,17 +15156,16 @@ class ModelBuilder:
                 )
 
             # Ensure that per-world start indices are non-decreasing and compute sum of per-world counts
-            sum_of_counts = world_start_array[0]
-            for w in range(self.world_count + 1):
-                start_idx = world_start_array[w]
-                end_idx = world_start_array[w + 1]
-                count = end_idx - start_idx
-                if count < 0:
-                    raise ValueError(
-                        f"Invalid world start indices for {name}s: world {w} has negative count ({count}). "
-                        f"Start index: {start_idx}, end index: {end_idx}."
-                    )
-                sum_of_counts += count
+            starts = np.asarray(world_start_array, dtype=np.int64)
+            counts = np.diff(starts)
+            negative = np.flatnonzero(counts < 0)
+            if len(negative):
+                w = int(negative[0])
+                raise ValueError(
+                    f"Invalid world start indices for {name}s: world {w} has negative count ({counts[w]}). "
+                    f"Start index: {starts[w]}, end index: {starts[w + 1]}."
+                )
+            sum_of_counts = int(starts[0] + counts.sum())
 
             # Ensure the sum of per-world counts equals the total count
             if sum_of_counts != total_count:
@@ -17249,27 +17263,17 @@ class ModelBuilder:
             m.joint_enabled = wp.array(self.joint_enabled, dtype=wp.bool)
 
             # 'close' the start index arrays with a sentinel value
-            joint_q_start = copy.copy(self.joint_q_start)
-            joint_q_start.append(self.joint_coord_count)
-            joint_qd_start = copy.copy(self.joint_qd_start)
-            joint_qd_start.append(self.joint_dof_count)
-            articulation_start = copy.copy(self.articulation_start)
-            articulation_start.append(self.joint_count)
-            articulation_end = copy.copy(self.articulation_end)
+            joint_q_start = np.append(np.asarray(self.joint_q_start, dtype=np.int64), self.joint_coord_count)
+            joint_qd_start = np.append(np.asarray(self.joint_qd_start, dtype=np.int64), self.joint_dof_count)
+            articulation_start = np.append(np.asarray(self.articulation_start, dtype=np.int64), self.joint_count)
+            articulation_end = np.asarray(self.articulation_end, dtype=np.int64)
 
             # Compute max joints and dofs per articulation for IK/Jacobian kernel launches
-            max_joints_per_articulation = 0
-            max_dofs_per_articulation = 0
-            for art_idx in range(len(self.articulation_start)):
-                joint_start = articulation_start[art_idx]
-                joint_end = articulation_end[art_idx]
-                num_joints = joint_end - joint_start
-                max_joints_per_articulation = max(max_joints_per_articulation, num_joints)
-                # Compute dofs for this articulation
-                dof_start = joint_qd_start[joint_start]
-                dof_end = joint_qd_start[joint_end]
-                num_dofs = dof_end - dof_start
-                max_dofs_per_articulation = max(max_dofs_per_articulation, num_dofs)
+            articulation_joint_start = articulation_start[:-1]
+            max_joints_per_articulation = int(np.max(articulation_end - articulation_joint_start, initial=0))
+            max_dofs_per_articulation = int(
+                np.max(joint_qd_start[articulation_end] - joint_qd_start[articulation_joint_start], initial=0)
+            )
 
             m.joint_q_start = wp.array(joint_q_start, dtype=wp.int32)
             m.joint_qd_start = wp.array(joint_qd_start, dtype=wp.int32)
@@ -17757,6 +17761,10 @@ _ARRAY_BACKED_ATTRIBUTE_DTYPES: dict[str, Any] = {
     "joint_target_qd": wp.float32,
     "joint_act": wp.float32,
     "joint_articulation": wp.int32,
+    "joint_q_start": wp.int32,
+    "joint_qd_start": wp.int32,
+    "articulation_start": wp.int32,
+    "articulation_end": wp.int32,
     "joint_type": wp.int32,
     "joint_dof_dim": wp.int32,
     "joint_mimic_joint": wp.int32,

@@ -1024,8 +1024,8 @@ class TestModelBuilderReplicate(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "body_lock_inertia"):
                 ModelBuilder._build_builder_merge_attribute_specs()
 
-    def test_array_backed_attributes_have_generic_merge_metadata(self):
-        """Require generic merge metadata and NumPy-compatible dtypes for array-backed attributes."""
+    def test_array_backed_attributes_have_row_merge_metadata(self):
+        """Require row-wise merge metadata and NumPy-compatible dtypes for array-backed attributes."""
         _, builder_list_attributes = ModelBuilder._base_builder_attributes()
         specs = ModelBuilder._builder_merge_attribute_specs()
 
@@ -1034,7 +1034,7 @@ class TestModelBuilderReplicate(unittest.TestCase):
             with self.subTest(attribute=name):
                 self.assertIn(name, builder_list_attributes)
                 self.assertIn(name, specs)
-                self.assertEqual(specs[name].compaction_policy, "generic")
+                self.assertIn(specs[name].compaction_policy, ("generic", "start", "end"))
                 scalar_dtype = getattr(warp_dtype, "_wp_scalar_type_", warp_dtype)
                 self.assertIsNotNone(wp.dtype_to_numpy(scalar_dtype))
 
