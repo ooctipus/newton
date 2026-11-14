@@ -276,14 +276,14 @@ class TestModelBuilderBvhConstructor(unittest.TestCase):
         builder.add_shape_gaussian(body=-1, gaussian=gaussian)
 
         with (
-            mock.patch("newton._src.geometry.types.wp.Mesh") as wp_mesh,
+            # The real mesh: finalize sweeps its open boundary edges through its BVH.
+            mock.patch("newton._src.geometry.types.wp.Mesh", wraps=wp.Mesh) as wp_mesh,
             mock.patch.object(
                 newton.Gaussian, "finalize", autospec=True, return_value=newton.Gaussian.Data()
             ) as finalize,
             mock.patch.object(newton.Model, "bvh_build_shapes", autospec=True) as build_shapes,
             mock.patch.object(newton.Model, "bvh_build_particles", autospec=True),
         ):
-            wp_mesh.return_value.id = 123
             model = builder.finalize(device="cpu")
 
         wp_mesh.assert_called_once()
