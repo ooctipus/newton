@@ -1056,7 +1056,7 @@ def test_family_twins_agree(test, device):
 
     Every other law's results are bitwise equal up to the sign of a zero: Warp negates by subtracting from zero.
     An iterative law's samples agree within its tolerance but for rare ones whose solve takes the other branch of
-    a convergence or sticking test (``TWIN_TOLERANCES``).
+    a convergence or sticking test, and the ball metric's to the rounding floor (``TWIN_TOLERANCES``).
     """
     rng = np.random.default_rng(1234)
     for name, law in LAWS.items():
