@@ -639,6 +639,13 @@ class CoordinateTrees:
         )
         self._plan_dimensions = self._dimensions()
 
+    def launch_variants(self):
+        """Each kernel the class launches with its threads per block (:func:`~newton._src.core.execution.compile_ahead`):
+        its repair a warp per articulation, its predict and finish at Warp's default launch block (256)."""
+        yield self.repair_kernel, REPAIR_BLOCK_DIM
+        yield self.predictor_kernel, 256
+        yield self.finish_kernel, 256
+
     def record(self, drive_dofs) -> dict:
         """The class's record in the tree groups' schema (``routes.held_tree.groups``).
 

@@ -34,7 +34,10 @@ from __future__ import annotations
 import dataclasses
 import enum
 import math
+import os
 import string
+from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 
 import warp as wp
 
@@ -58,6 +61,7 @@ __all__ = [
     "Use",
     "Work",
     "append",
+    "compile_ahead",
     "device_lanes",
     "fill_lanes",
     "launch",
@@ -485,3 +489,31 @@ class Beside:
         """Make the current stream wait for the work :meth:`start` ran."""
         if self.stream is not None:
             wp.get_stream(self.device).wait_event(self.done)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Code ahead of the first launch
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+def compile_ahead(variants: Iterable[tuple[wp.Kernel | None, int]], device=None) -> None:
+    """Compile and load the code of every launch variant ``(kernel, block)`` on ``device`` now, the modules in parallel.
+
+    Warp compiles a module at its first launch, so a step's first run compiles its modules one after another. An owner
+    that knows its launches when it is built (each kernel and the block it launches with) declares them here instead:
+    their modules compile in worker threads (NVRTC releases the interpreter), and the first launches find their code
+    loaded. Variants already loaded or cached on disk only load. The CPU compiles at its first launch, as before.
+
+    Args:
+        variants: Each launch's kernel (``None`` for a launch the owner does not make) and its threads per block.
+        device: The device the kernels launch on.
+    """
+    device = wp.get_device(device)
+    if not device.is_cuda:
+        return
+    jobs = list(dict.fromkeys((kernel.module, int(block)) for kernel, block in variants if kernel is not None))
+    if not jobs:
+        return
+    with ThreadPoolExecutor(max_workers=min(len(jobs), os.cpu_count() or 1, 32)) as pool:
+        for done in [pool.submit(module.load, device, block) for module, block in jobs]:
+            done.result()

@@ -889,6 +889,11 @@ class Sweep:
             "fused_limit_upper_lambda": placement.fused_diagonal_limit_upper_lambda,
         }
 
+    def launch_variants(self):
+        """Each sweep kernel with its threads per block (:func:`~newton._src.core.execution.compile_ahead`)."""
+        for launch in self.launches:
+            yield launch.kernel, launch.block
+
     def _launch(self, launch: SweepLaunch, operands: dict, stream=None) -> None:
         """Launch a sweep with each of its parameters read by name: its own operands first, then the step's."""
         kernel, named = launch.kernel, launch.named()

@@ -20,6 +20,7 @@ import sys
 import numpy as np
 import warp as wp
 
+from ...core import execution
 from ...core.types import override
 from ...sim import Contacts, Control, Model, ModelBuilder, ModelFlags, State, StateFlags
 from ..semi_implicit.kernels_contact import (
@@ -568,6 +569,8 @@ class SolverFeatherPGS(SolverBase):
         # The step: its stages bound to the owners above from the spec and the route, the sweep's kernels and streams,
         # and its per-stage dispatch tables, which the route record reads.
         self._plan = StepPlan.build(self.spec, route, self)
+        # The step's largest kernels compile now, side by side, instead of one at a time at their first launch.
+        execution.compile_ahead((*self.factor.launch_variants(), *self.sweep.launch_variants()), model.device)
         # The options as construction applied them: the row laws' friction beta, the closure's pre-elimination, and a
         # readout only where a sweep kernel carries its counters. Recorded once; get_path_selection() returns copies.
         readout = options.diagnostics.solve_readout if self.sweep.readout.kernels else "off"

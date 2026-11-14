@@ -331,6 +331,12 @@ class TreeKineticState:
             self.trial.force = wp.zeros(dofs, dtype=float, device=self.solver.model.device)
             self.trial.response = wp.zeros(dofs, dtype=float, device=self.solver.model.device)
 
+    def launch_variants(self):
+        """Each kernel the group launches with its threads per block (:func:`~newton._src.core.execution.compile_ahead`)."""
+        for kernel in (self.repair_kernel, self.finish_kernel, self.force_kernel, self.predictor_kernel):
+            yield kernel, self.block_dim
+        yield self.walk_solve_kernel, self._walk_solve.block
+
     def _walk_classes(self):
         """Each root's walking class (:class:`.tree_scan.WalkClass`, its path table in the walk the predictor solves
         by), or ``None`` for a prescribed root (no coordinates to solve) and a diagonal root (a negative family: its walk

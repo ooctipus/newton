@@ -936,6 +936,16 @@ class TreeFactor:
             device=self.model.device,
         )
 
+    def launch_variants(self):
+        """Each kernel the walk and the held tree launch, with its threads per block
+        (:func:`~newton._src.core.execution.compile_ahead`)."""
+        if self.walk_arts is not None:
+            yield self.walk_refresh, self.walk_shape.block
+            if self.walk_leave is not None:
+                yield self.walk_leave, self.leave_shape.block
+        for group in self.held.groups if self.held is not None else ():
+            yield from group.launch_variants()
+
     def slips_by_tree(self, articulations) -> np.ndarray:
         """Each of ``articulations``' drives that can slip: its driven coordinates with a gain and a finite effort
         limit (the model's data at construction)."""
