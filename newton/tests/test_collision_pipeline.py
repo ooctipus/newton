@@ -2799,7 +2799,10 @@ class TestContactCountEstimator(unittest.TestCase):
                 self.assertGreaterEqual(_estimate_rigid_contact_max(source), count)
 
     def test_supplied_pairs_budget_noncolliding_mesh_variants(self):
-        """Budget a supplied pair at the mesh cap when its row can later hold a non-colliding mesh variant."""
+        """Budget a supplied pair at the mesh cap when its row can later hold a non-colliding mesh variant.
+
+        The mesh law writes one contact per local minimum, so each plate must be supported, not densely covered.
+        """
         ground = _flat_mesh(8)
         variants = []
         for use_mesh in (False, True):
@@ -2830,9 +2833,7 @@ class TestContactCountEstimator(unittest.TestCase):
             bodies=wp.array(ground_bodies, dtype=wp.int32, device="cpu"),
         )
         pipeline.collide(model.state(), contacts)
-        count = int(contacts.rigid_contact_count.numpy()[0])
-        self.assertGreater(count, 2 * 32 * 40)
-        self.assertLessEqual(count, contacts.rigid_contact_max)
+        _assert_plates_supported(self, pipeline, contacts, pairs)
 
     @staticmethod
     def _make_single_box_model():
@@ -3042,6 +3043,31 @@ class TestContactCountEstimator(unittest.TestCase):
         model.rigid_contact_max = 777777
         pipeline = newton.CollisionPipeline(model, broad_phase="explicit")
         self.assertEqual(pipeline.rigid_contact_max, 777777)
+
+
+def _assert_plates_supported(test, pipeline, contacts, pairs):
+    """Check that every (ground, plate) pair has contacts supporting its plate, centered at the origin in xy, and
+    that no contact was dropped.
+
+    A ground shape is static or on a body at the origin, so its witnesses are world points.
+    """
+    count = int(contacts.rigid_contact_count.numpy()[0])
+    test.assertLessEqual(count, contacts.rigid_contact_max)
+    test.assertEqual(contacts._rigid_contact_pool.drops().contacts, 0)
+    pipeline.narrow_phase.check_buffer_capacity()
+    shape0 = contacts.rigid_contact_shape0.numpy()[:count]
+    shape1 = contacts.rigid_contact_shape1.numpy()[:count]
+    point0 = contacts.rigid_contact_point0.numpy()[:count]
+    point1 = contacts.rigid_contact_point1.numpy()[:count]
+    for ground, plate in pairs:
+        points = np.concatenate(
+            (point0[(shape0 == ground) & (shape1 == plate)], point1[(shape0 == plate) & (shape1 == ground)])
+        )
+        test.assertGreaterEqual(len(points), 3, f"pair {(ground, plate)}")
+        # The plate's center lies inside the hull of its contacts when no angular gap around it reaches pi.
+        angles = np.sort(np.arctan2(points[:, 1], points[:, 0]))
+        gaps = np.diff(np.concatenate((angles, angles[:1] + 2.0 * np.pi)))
+        test.assertLess(float(gaps.max()), 0.99 * np.pi, f"pair {(ground, plate)}")
 
 
 def _flat_mesh(cells: int = 2) -> newton.Mesh:
@@ -4507,6 +4533,7 @@ def test_mesh_face_contacts_fit_automatic_capacity(test, device):
     """Hold every contact of mesh pairs that keep many reduced contacts in the automatic capacity.
 
     Also for a supplied pair array whose ground meshes have collision off, since the narrow phase routes them too.
+    The mesh law writes one contact per local minimum, so each plate must be supported, not densely covered.
     """
     ground = _flat_mesh(8)
     plate = newton.Mesh.create_box(0.9, 0.9, 0.02, duplicate_vertices=False, compute_inertia=False)
@@ -4531,10 +4558,7 @@ def test_mesh_face_contacts_fit_automatic_capacity(test, device):
             pipeline = newton.CollisionPipeline(model, broad_phase="explicit" if supplied else None)
             contacts = pipeline.contacts()
             pipeline.collide(model.state(), contacts)
-            count = int(contacts.rigid_contact_count.numpy()[0])
-            # Each resting plate keeps far more contacts than a typical mesh pair.
-            test.assertGreater(count, 2 * 32 * 40)
-            test.assertLessEqual(count, contacts.rigid_contact_max)
+            _assert_plates_supported(test, pipeline, contacts, pairs)
 
 
 def test_sdf_edge_pairs_get_mesh_pair_budget(test, device):
