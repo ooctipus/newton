@@ -65,6 +65,15 @@ class _ShapeContactPairs:
             array.setflags(write=False)
         return first, second, slot
 
+    def _filters_within(self, shape_mask: np.ndarray | None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """:attr:`_filters` with both shapes in ``shape_mask`` (all of them for ``None``): a mask only narrows the
+        collidable shapes, so its exclusions are the full set's with both shapes selected, in the same order."""
+        first, second, slot = self._filters
+        if shape_mask is None:
+            return first, second, slot
+        keep = shape_mask[first] & shape_mask[second]
+        return first[keep], second[keep], slot[keep]
+
     def _active_filters(self, active: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         first = (self.filter_pairs >> 32).astype(np.int32)
         second = (self.filter_pairs & 0xFFFFFFFF).astype(np.int32)
@@ -156,11 +165,7 @@ class _ShapeContactPairs:
                 cross = np.sum(weighted[valid] * hist[globals_][clipped[valid]], axis=1)
                 np.add.at(values, rows[valid], coefficients[valid] * cross)
         np.add.at(counts, context_slots, np.where(context_owners == 0, values, -values))
-        if shape_mask is None:
-            first, second, slot = self._filters
-        else:
-            first, second = self._active_filters(active)
-            slot = np.maximum(self.shape_world[first], self.shape_world[second]) + 1
+        first, second, slot = self._filters_within(shape_mask)
         # Each slot's excluded pairs by their category pair, weighed once per category pair (exact in int64).
         kinds = len(weights)
         excluded = np.bincount(
@@ -362,12 +367,8 @@ class _ShapeContactPairs:
         world_slot = self.shape_world + 1
         starts = np.full(self.world_count + 1, len(self.shape_body), dtype=np.int64)
         np.minimum.at(starts, world_slot[indices], indices)
-        if shape_mask is None:
-            first, second, slot = self._filters
-            filter_worlds = slot - 1
-        else:
-            first, second = self._active_filters(active)
-            filter_worlds = np.maximum(self.shape_world[first], self.shape_world[second])
+        first, second, slot = self._filters_within(shape_mask)
+        filter_worlds = slot - 1
         order = np.argsort(filter_worlds, kind="stable")
         sorted_filters = np.column_stack((first[order], second[order]))
         # Negative global IDs stay distinct from world-relative local offsets
