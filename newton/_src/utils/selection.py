@@ -3,12 +3,15 @@
 
 from __future__ import annotations
 
+import fnmatch
+import itertools
 import logging
 import operator
+import os
+import posixpath
 import re
 import warnings
 import weakref
-from fnmatch import fnmatch
 from types import NoneType
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -645,6 +648,19 @@ def find_matching_ids(
     return grouped_ids, global_ids
 
 
+def _glob_matcher(pattern: str):
+    """``fnmatch.fnmatch(label, pattern)`` as one compiled matcher, applying ``os.path.normcase`` as it does."""
+    match = re.compile(fnmatch.translate(os.path.normcase(pattern))).match
+    if os.path is posixpath:  # normcase is the identity
+        return match
+    return lambda label: match(os.path.normcase(label))
+
+
+def _matching_indices(labels: list[str], match) -> list[int]:
+    """Indices of the labels ``match`` accepts, in order, without a Python step per label."""
+    return list(itertools.compress(itertools.count(), map(match, labels)))
+
+
 def match_labels(labels: list[str], pattern: str | list[str] | re.Pattern[str] | list[int]) -> list[int]:
     """Find indices of elements in ``labels`` that match ``pattern``.
 
@@ -664,10 +680,10 @@ def match_labels(labels: list[str], pattern: str | list[str] | re.Pattern[str] |
             strings or all integers.
     """
     if isinstance(pattern, str):
-        return [idx for idx, label in enumerate(labels) if fnmatch(label, pattern)]
+        return _matching_indices(labels, _glob_matcher(pattern))
 
     if isinstance(pattern, re.Pattern):
-        return [idx for idx, label in enumerate(labels) if pattern.fullmatch(label) is not None]
+        return _matching_indices(labels, pattern.fullmatch)
 
     if not isinstance(pattern, list):
         raise TypeError(
@@ -689,7 +705,8 @@ def match_labels(labels: list[str], pattern: str | list[str] | re.Pattern[str] |
         if not validation_failure:
             return pattern
     elif all(isinstance(item, str) for item in pattern):
-        return [idx for idx, label in enumerate(labels) if any(fnmatch(label, item) for item in pattern)]
+        matchers = [_glob_matcher(item) for item in pattern]
+        return _matching_indices(labels, lambda label: any(match(label) for match in matchers))
 
     types = {type(item).__name__ for item in pattern}
     raise TypeError(f"Expected a list of str patterns or a list of int indices, got: {', '.join(sorted(types))}")
