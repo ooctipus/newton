@@ -4,10 +4,11 @@
 """Best-effort disk cache of the collision tables a model derives from each mesh.
 
 Finalizing a model derives from every collision mesh its cell index (:mod:`.mesh_cells`), its welded topology
-(:mod:`.mesh_topology`), its open-boundary bits and its edge clusters (:mod:`.sdf_contact`): about 13 s for a 1.2
-million triangle rough terrain, in every process that builds the scene. Each table is a pure function of the mesh's
-host buffers and a few parameters, so it is stored under a content hash of those inputs, and a later build of the
-same mesh loads it instead.
+(:mod:`.mesh_topology`), its open-boundary bits and its edge clusters (:mod:`.sdf_contact`) and whether it is watertight
+(:mod:`.types`), and from every small hull its support direction cells (:mod:`.convex_cells_build`): about 13 s for a
+1.2 million triangle rough terrain, in every process that builds the scene. Each table is a pure function of the
+mesh's host buffers and a few parameters, so it is stored under a content hash of those inputs, and a later build of
+the same mesh loads it instead.
 
 Entries are uncompressed ``*.npz`` files of arrays (no pickles) in a directory named by the code that computes the
 tables (the source of the modules above, NumPy's and Warp's versions), so a change to any of them starts a fresh
@@ -35,7 +36,14 @@ import numpy as np
 KEEP_DAYS = 7
 """Days a code version's directory survives without use."""
 
-_SOURCES = ("geometry/mesh_cells.py", "geometry/mesh_topology.py", "geometry/sdf_contact.py", "core/host_unique.py")
+_SOURCES = (
+    "geometry/mesh_cells.py",
+    "geometry/mesh_topology.py",
+    "geometry/sdf_contact.py",
+    "geometry/convex_cells_build.py",
+    "geometry/types.py",
+    "core/host_unique.py",
+)
 
 
 @functools.cache

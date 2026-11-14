@@ -469,7 +469,8 @@ def _build_convex_support_cells(source: Mesh) -> np.ndarray | None:
     rounding), so a support query scans only those candidates and returns the
     full scan's vertex. Hulls the exact validation rejects keep the full scan.
     """
-    from ..geometry.convex_cells_build import build_masks  # noqa: PLC0415
+    from ..geometry import _collision_cache  # noqa: PLC0415
+    from ..geometry.convex_cells_build import support_cell_words  # noqa: PLC0415
 
     vertices = np.asarray(source.vertices, dtype=np.float32).reshape(-1, 3)
     if (
@@ -478,12 +479,12 @@ def _build_convex_support_cells(source: Mesh) -> np.ndarray | None:
         or np.any((vertices != 0) & (np.abs(vertices) < np.finfo(np.float32).tiny))
     ):
         return None
-    try:
-        masks, _details = build_masks(vertices, np.asarray(source.indices, dtype=np.int64).reshape(-1, 3))
-    except (ValueError, OverflowError):
-        return None
-    # face * 256 + x * 16 + y, each mask as its low then high 32-bit word.
-    return np.ascontiguousarray(masks.reshape(-1).astype("<u8")).view("<i4")
+    indices = np.asarray(source.indices, dtype=np.int64).reshape(-1, 3)
+    # Exact rational clipping per cell, about 1 s for a humanoid's hulls: kept on disk by the hull's buffers.
+    words = _collision_cache.cached(
+        "convex_support_cells", (vertices, indices), lambda: support_cell_words(vertices, indices)
+    )
+    return words if len(words) else None
 
 
 def _build_joint_ancestor(
@@ -15884,6 +15885,8 @@ class ModelBuilder:
                 finalized_geos_by_identity[geo_identity] = finalized_geo
                 geo_sources.append(finalized_geo)
 
+            from ..geometry import _collision_cache  # noqa: PLC0415
+
             # Mesh properties consumed by the collision kernels: watertightness
             # is checked once per unique collidable mesh (content-keyed like
             # finalized_geos above); visual-only shapes are skipped.
@@ -15897,7 +15900,13 @@ class ModelBuilder:
                 if is_collidable and shape_type in (GeoType.MESH, GeoType.CONVEX_MESH) and isinstance(geo, Mesh):
                     mesh_properties = mesh_properties_by_geo_hash.get(hash(geo))
                     if mesh_properties is None:
-                        mesh_properties = MeshProperties.WATERTIGHT if geo.is_watertight else 0
+                        # Welding a terrain's vertices to test it takes about 0.7 s: kept on disk by its buffers.
+                        watertight = _collision_cache.cached(
+                            "watertight",
+                            (np.asarray(geo.vertices), np.asarray(geo.indices)),
+                            lambda geo=geo: np.asarray(geo.is_watertight),
+                        )
+                        mesh_properties = MeshProperties.WATERTIGHT if bool(watertight) else 0
                         mesh_properties_by_geo_hash[hash(geo)] = mesh_properties
                     if shape_type == GeoType.MESH and geo.enable_surface_velocity:
                         mesh_properties |= MeshProperties.SURFACE_VELOCITY
@@ -15911,7 +15920,6 @@ class ModelBuilder:
 
             # Open-boundary bits for collision meshes queried with pseudo-normal
             # signs, packed once per unique finalized mesh.
-            from ..geometry import _collision_cache  # noqa: PLC0415
             from ..geometry.sdf_contact import compute_mesh_boundary_flags  # noqa: PLC0415
 
             boundary_chunks = []

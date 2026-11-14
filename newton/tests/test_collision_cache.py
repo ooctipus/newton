@@ -29,7 +29,18 @@ def _terrain(cells: int = 12) -> newton.Mesh:
 def _collision_arrays(model) -> dict[str, np.ndarray]:
     """The model's mesh-derived collision tables (structured arrays field by field)."""
     owners = (
-        (model, "", ("_mesh_boundary_flags", "_mesh_edge_order", "_mesh_edge_clusters", "_mesh_edge_cluster_reach")),
+        (
+            model,
+            "",
+            (
+                "_mesh_boundary_flags",
+                "_mesh_edge_order",
+                "_mesh_edge_clusters",
+                "_mesh_edge_cluster_reach",
+                "_shape_mesh_properties",
+                "_convex_support_lut",
+            ),
+        ),
         (model._mesh_cells, "cells.", None),
         (model._mesh_topology.data, "topology.", None),
     )
@@ -49,6 +60,8 @@ def _finalize(cache_dir):
     builder.add_shape_mesh(body=-1, mesh=_terrain())
     body = builder.add_body(xform=wp.transform((3.0, 3.0, 1.0), wp.quat_identity()))
     builder.add_shape_box(body, hx=0.2, hy=0.2, hz=0.2)
+    hull = newton.Mesh.create_box(0.2, 0.2, 0.2, duplicate_vertices=False, compute_normals=False, compute_uvs=False)
+    builder.add_shape_convex_hull(builder.add_body(xform=wp.transform((5.0, 5.0, 1.0), wp.quat_identity())), mesh=hull)
     saved = newton.config.cache_dir_collision
     newton.config.cache_dir_collision = cache_dir
     try:
@@ -95,7 +108,10 @@ class TestCollisionCache(unittest.TestCase):
             filled = _collision_arrays(_finalize(directory))
             entries = sorted(path.name.split(".")[1] for path in Path(directory).rglob("*.npz"))
             loaded = _collision_arrays(_finalize(directory))
-        self.assertEqual(entries, ["boundary_flags", "edge_clusters", "mesh_grid", "mesh_topology"])
+        self.assertEqual(
+            sorted(set(entries)),
+            ["boundary_flags", "convex_support_cells", "edge_clusters", "mesh_grid", "mesh_topology", "watertight"],
+        )
         self.assertTrue(any(name.startswith("cells.") for name in reference))
         for tables in (filled, loaded):
             self.assertEqual(tables.keys(), reference.keys())

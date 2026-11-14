@@ -184,3 +184,13 @@ def build_masks(v, faces):
     if not np.all(masks != 0):
         raise ValueError("Direction-cell mask coverage must be nonempty")
     return masks, {"nonempty_vertex_face_cones": polygons, "sigma": float(sigma), "coordinate_l1_bound": float(bound)}
+
+
+def support_cell_words(v, faces):
+    """:func:`build_masks` of a hull as int32 word pairs (face * 256 + x * 16 + y, each mask its low then high 32-bit
+    word), or an empty array for a hull the exact validation rejects."""
+    try:
+        masks, _details = build_masks(v, faces)
+    except (ValueError, OverflowError):
+        return np.zeros(0, dtype="<i4")
+    return np.ascontiguousarray(masks.reshape(-1).astype("<u8")).view("<i4")
