@@ -120,7 +120,6 @@ from . import (  # noqa: E402
     solvers,
     usd,
     utils,
-    viewer,
 )
 
 __all__ += [
@@ -137,6 +136,18 @@ __all__ += [
     "utils",
     "viewer",
 ]
+
+
+
+def __getattr__(name: str):
+    # The viewers (OpenGL, USD, Rerun, Viser and their kernels) load on first use: about 0.3 s that a headless
+    # simulation never needs.
+    if name == "viewer":
+        import importlib  # noqa: PLC0415
+
+        return importlib.import_module(".viewer", __name__)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 from ._src.diagnostics import install_console_fallback as _install_console_fallback  # noqa: E402
 

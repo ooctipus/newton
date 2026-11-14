@@ -77,6 +77,17 @@ class TestLazySolverImports(unittest.TestCase):
         result = _run_in_fresh_interpreter(code)
         self.assertEqual(result.stdout.strip(), "", f"solver modules imported eagerly: {result.stdout.strip()}")
 
+    def test_import_newton_loads_the_viewers_on_first_use(self):
+        """Importing newton leaves the viewers unloaded; ``newton.viewer`` loads them."""
+        code = (
+            "import sys; import newton; "
+            "before = any(m.startswith('newton._src.viewer') for m in sys.modules); "
+            "viewer = newton.viewer; "
+            "print(before, viewer is sys.modules['newton.viewer'], hasattr(viewer, 'ViewerGL'))"
+        )
+        result = _run_in_fresh_interpreter(code)
+        self.assertEqual(result.stdout.strip().splitlines()[-1], "False True True")
+
     def test_public_exports_match_internal_exports(self):
         """Expose the internal solver surface through the public module."""
         self.assertEqual(set(newton.solvers.__all__), set(internal_solvers.__all__) | {"experimental"})
