@@ -84,12 +84,6 @@ def _synthetic(
         templates.append((np.empty((0, 2), dtype=np.int32), np.empty((0, 2), dtype=np.int32)))
     starts = (0 if globals_last else global_shapes) + np.arange(worlds, dtype=np.int64) * stride
     assignment = rng.integers(len(templates), size=worlds)
-    runs = []
-    for world, template in enumerate(assignment.tolist()):
-        if runs and runs[-1][0] == template:
-            runs[-1][1].append(int(starts[world]))
-        else:
-            runs.append((template, [int(starts[world])]))
     global_list = set()
     while len(global_list) < global_pairs:
         a, b = sorted(rng.choice(global_shapes, size=2, replace=False).tolist())
@@ -97,7 +91,8 @@ def _synthetic(
     record = ShapePairTemplates(
         global_pairs=np.asarray(sorted(global_list), dtype=np.int32).reshape((-1, 2)),
         templates=tuple(templates),
-        runs=tuple((template, np.asarray(run, dtype=np.int32)) for template, run in runs),
+        slot_template=assignment.astype(np.int32),
+        slot_start=starts.astype(np.int32),
     )
     return record, global_shapes + worlds * stride
 
@@ -105,10 +100,9 @@ def _synthetic(
 def _global_second_count(record):
     """Count list pairs whose global shape follows the local one: the kernel must swap them to (min, max)."""
     count = 0
-    for template, starts in record.runs:
+    for template, start in zip(record.slot_template.tolist(), record.slot_start.tolist(), strict=True):
         global_local = record.templates[template][0]
-        local = global_local[None, :, 1] + np.asarray(starts, dtype=np.int64)[:, None]
-        count += int((global_local[None, :, 0] > local).sum())
+        count += int((global_local[:, 0] > global_local[:, 1] + start).sum())
     return count
 
 
@@ -255,7 +249,8 @@ def _exact_template(pair_count, staged):
     return ShapePairTemplates(
         global_pairs=np.empty((0, 2), dtype=np.int32),
         templates=((np.empty((0, 2), dtype=np.int32), np.asarray(pairs[:pair_count], dtype=np.int32)),),
-        runs=((0, np.array([0, staged], dtype=np.int32)),),
+        slot_template=np.zeros(2, dtype=np.int32),
+        slot_start=np.array([0, staged], dtype=np.int32),
     )
 
 
@@ -462,18 +457,18 @@ class TestShapePairTemplateRecord(unittest.TestCase):
         record = model._shape_contact_pair_templates
         # Robot, variant and filtered worlds use three templates; pair-free worlds replay nothing.
         self.assertEqual(len(record.templates), 3)
-        self.assertGreater(len(record.runs), len(record.templates))
+        self.assertGreater(len(record.slot_template), len(record.templates))
 
     def test_replicate_uses_one_template(self):
-        """Record one template and one run for replicated worlds without world-specific filters."""
+        """Record one template for replicated worlds without world-specific filters."""
         builder = newton.ModelBuilder()
         builder.add_ground_plane()
         builder.replicate(_robot(), 6)
         model = _finalize(builder, "cpu")
         record = model._shape_contact_pair_templates
         self.assertEqual(len(record.templates), 1)
-        self.assertEqual(len(record.runs), 1)
-        np.testing.assert_array_equal(record.runs[0][1], model.shape_world_start.numpy()[:6])
+        np.testing.assert_array_equal(record.slot_template, np.zeros(6, dtype=np.int32))
+        np.testing.assert_array_equal(record.slot_start, model.shape_world_start.numpy()[:6])
         np.testing.assert_array_equal(record.replay(), model.shape_contact_pairs.numpy())
 
     def test_general_pair_lists_drop_the_record(self):
@@ -494,14 +489,21 @@ class TestShapePairTemplateRecord(unittest.TestCase):
         self.assertTrue(record.describes(model.shape_contact_pairs))
         self.assertFalse(record.describes(wp.clone(model.shape_contact_pairs)))
         self.assertFalse(record.describes(model.shape_contact_pairs.numpy()))
-        self.assertFalse(ShapePairTemplates(record.global_pairs, record.templates, record.runs).describes(None))
+        self.assertFalse(
+            ShapePairTemplates(
+                record.global_pairs, record.templates, record.slot_template, record.slot_start
+            ).describes(None)
+        )
 
     def test_replay_matches_builder_order(self):
         """Lead with global pairs, then each world's global-local pairs as (min, max) and its local pairs."""
         global_local = np.array([[0, 2], [7, 0]], dtype=np.int32)
         local = np.array([[0, 1], [1, 2]], dtype=np.int32)
         replay = replay_shape_pair_templates(
-            np.array([[0, 7]], dtype=np.int32), ((global_local, local),), ((0, np.array([1, 4], dtype=np.int32)),)
+            np.array([[0, 7]], dtype=np.int32),
+            ((global_local, local),),
+            np.zeros(2, dtype=np.int32),
+            np.array([1, 4], dtype=np.int32),
         )
         expected = [[0, 7], [0, 3], [1, 7], [1, 2], [2, 3], [0, 6], [4, 7], [4, 5], [5, 6]]
         self.assertEqual(replay.tolist(), expected)
@@ -515,7 +517,8 @@ class TestBroadPhaseTemplateRule(unittest.TestCase):
         record = ShapePairTemplates(
             global_pairs=np.zeros((global_pairs, 2), dtype=np.int32),
             templates=((np.empty((0, 2), dtype=np.int32), local.astype(np.int32)),),
-            runs=((0, (np.arange(worlds) * staged).astype(np.int32)),),
+            slot_template=np.zeros(worlds, dtype=np.int32),
+            slot_start=(np.arange(worlds) * staged).astype(np.int32),
         )
         return BroadPhaseExplicitTemplates(record, device="cpu")
 
@@ -553,7 +556,7 @@ class TestBroadPhaseTemplateRule(unittest.TestCase):
         """Report the largest template's pairs, which set the lanes, next to the mean the rule uses."""
         record, _ = _synthetic(3, worlds=12, world_shapes=20, template_specs=((2, 70), (1, 9)))
         described = BroadPhaseExplicitTemplates(record, device="cpu").describe()
-        per_world = [sum(map(len, record.templates[template])) for template, starts in record.runs for _ in starts]
+        per_world = [sum(map(len, record.templates[template])) for template in record.slot_template.tolist()]
         self.assertEqual(len(set(per_world)), 2)
         self.assertEqual(described["max_pairs_per_world"], 72)
         self.assertAlmostEqual(described["mean_pairs_per_world"], float(np.mean(per_world)))
@@ -576,7 +579,10 @@ class TestBroadPhaseTemplateRule(unittest.TestCase):
             "template pairs": _synthetic(4, worlds=5, world_shapes=10, template_specs=((2, 12),))[0],
             # Worlds without template pairs: verify() returned before uploading.
             "global pairs only": ShapePairTemplates(
-                np.array([[0, 1]], dtype=np.int32), (empty,), ((0, np.array([2, 3], dtype=np.int32)),)
+                np.array([[0, 1]], dtype=np.int32),
+                (empty,),
+                np.zeros(2, dtype=np.int32),
+                np.array([2, 3], dtype=np.int32),
             ),
         }
         for name, record in records.items():

@@ -70,6 +70,14 @@ def _sorted_pairs(pairs):
     return pairs[np.lexsort((pairs[:, 1], pairs[:, 0]))]
 
 
+def _world_layout(bodies, worlds, groups, flags, filters):
+    """Reorder random shapes as a model lays them out (global shapes first, then each world's in world order)."""
+    order = np.argsort(worlds, kind="stable")
+    position = np.empty_like(order)
+    position[order] = np.arange(order.size)
+    return bodies[order], worlds[order], groups[order], flags[order], position[filters]
+
+
 def _reference_builder_pairs(builder):
     return _reference_pairs(
         builder.shape_body,
@@ -148,6 +156,8 @@ class TestShapeContactPairs(unittest.TestCase):
 
     def test_randomized_topology(self):
         """Match an exhaustive oracle across groups, bodies, worlds, masks and filters."""
+        with self.assertRaises(ValueError):
+            _ = _ShapeContactPairs([0, 1, 2], [0, -1, 0], [1, 1, 1], [1, 1, 1], [], 1).counts
         rng = np.random.default_rng(4394)
         for case in range(250):
             with self.subTest(case=case):
@@ -157,6 +167,7 @@ class TestShapeContactPairs(unittest.TestCase):
                 groups = rng.choice([-2147483648, -4, -3, -2, -1, 0, 1, 2, 3, 4, 2147483647], size=size)
                 flags = rng.choice([0, int(newton.ShapeFlags.COLLIDE_SHAPES)], size=size, p=[0.1, 0.9])
                 filters = rng.integers(0, size, size=(size * 2, 2)) if size else np.empty((0, 2), dtype=int)
+                bodies, worlds, groups, flags, filters = _world_layout(bodies, worlds, groups, flags, filters)
                 packed = np.unique(_pack_shape_pair_codes(filters[:, 0], filters[:, 1]))
                 data = _ShapeContactPairs(bodies, worlds, groups, flags, packed, 6)
                 expected = _reference_pairs(bodies, worlds, groups, flags, filters)
@@ -204,6 +215,7 @@ class TestShapeContactPairs(unittest.TestCase):
                 groups = np.full(size, 2147483647)
                 flags = np.full(size, newton.ShapeFlags.COLLIDE_SHAPES)
                 filters = rng.integers(0, size, size=(400, 2))
+                bodies, worlds, groups, flags, filters = _world_layout(bodies, worlds, groups, flags, filters)
                 packed = np.unique(_pack_shape_pair_codes(filters[:, 0], filters[:, 1]))
                 data = _ShapeContactPairs(bodies, worlds, groups, flags, packed, 4)
                 expected = _reference_pairs(bodies, worlds, groups, flags, filters)
@@ -623,7 +635,10 @@ class TestShapeContactPairs(unittest.TestCase):
         """Skip dense same-body blocks for correlated collision groups."""
         size = 4000
         original_nonzero, original_repeat = np.nonzero, np.repeat
-        for world_layout, worlds in (("global", np.full(size, -1)), ("global_and_local", np.arange(size) % 2 - 1)):
+        for world_layout, worlds in (
+            ("global", np.full(size, -1)),
+            ("global_and_local", np.repeat([-1, 0], size // 2)),
+        ):
             for group_layout, groups in (
                 ("uniform", np.ones(size, dtype=int)),
                 ("body_partitioned", np.arange(size) // (size // 2) + 1),

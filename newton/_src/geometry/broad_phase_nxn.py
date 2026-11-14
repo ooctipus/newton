@@ -1162,47 +1162,51 @@ class BroadPhaseExplicit:
 def replay_shape_pair_templates(
     global_pairs: np.ndarray,
     templates: Sequence[tuple[np.ndarray, np.ndarray]],
-    runs: Sequence[tuple[int, np.ndarray]],
+    slot_template: np.ndarray,
+    slot_start: np.ndarray,
 ) -> np.ndarray:
     """Expand per-world pair templates into the explicit pair list they describe.
 
-    The list holds ``global_pairs`` first. Then, run by run and world by world, it
-    holds the template's global-local pairs, ordered ``(min, max)`` after the
-    world-local id is shifted by the world's first shape, followed by the
-    template's local pairs shifted the same way.
+    The list holds ``global_pairs`` first. Then, slot by slot, it holds the slot's template's
+    global-local pairs, ordered ``(min, max)`` after the world-local id is shifted by the
+    slot's first shape, followed by the template's local pairs shifted the same way.
 
     Args:
         global_pairs: Pairs between global shapes, shape [global_pair_count, 2], int32.
         templates: Per template, its global-local pairs (absolute global id, world-local
             id), shape [n, 2], and its local pairs, shape [m, 2], both int32.
-        runs: Consecutive worlds that share a template: the template index and the first
-            shape of each world, shape [world_count], int32.
+        slot_template: The template each world in the list replays, in list order, int32.
+        slot_start: That world's first shape, int32.
 
     Returns:
         The explicit pair list, shape [pair_count, 2], int32.
     """
-    chunks = []
-    if global_pairs.shape[0]:
-        chunks.append(global_pairs)
-    for template, starts in runs:
-        global_local_pairs, local_pairs = templates[template]
-        offsets = np.asarray(starts, dtype=np.int32)
-        global_count = global_local_pairs.shape[0]
-        pairs_per_world = global_count + local_pairs.shape[0]
-        if pairs_per_world == 0:
-            continue
-        replay = np.empty((offsets.shape[0], pairs_per_world, 2), dtype=np.int32)
-        if global_count:
-            global_replay = replay[:, :global_count, :]
-            global_replay[:, :, 0] = global_local_pairs[:, 0]
-            global_replay[:, :, 1] = global_local_pairs[:, 1] + offsets[:, None]
-            global_replay.sort(axis=2)
-        if pairs_per_world > global_count:
-            replay[:, global_count:, :] = local_pairs[None, :, :] + offsets[:, None, None]
-        chunks.append(replay.reshape((-1, 2)))
-    if chunks:
-        return np.concatenate(chunks, axis=0)
-    return np.empty((0, 2), dtype=np.int32)
+    slot_template = np.asarray(slot_template, dtype=np.int64)
+    sizes = np.asarray([g.shape[0] + l.shape[0] for g, l in templates], dtype=np.int64)
+    slot_size = sizes[slot_template] if slot_template.size else np.zeros(0, dtype=np.int64)
+    slot_offset = global_pairs.shape[0] + np.cumsum(slot_size) - slot_size
+    pairs = np.empty((global_pairs.shape[0] + int(slot_size.sum()), 2), dtype=np.int32)
+    pairs[: global_pairs.shape[0]] = global_pairs
+    starts = np.asarray(slot_start, dtype=np.int32)
+    for template, (global_local, local) in enumerate(templates):
+        size = int(sizes[template])
+        slots = np.flatnonzero(slot_template == template)
+        global_count = global_local.shape[0]
+        # Bound the replay scratch independently of the world count.
+        for begin in range(0, slots.size, max(1, (1 << 18) // max(size, 1))):
+            chunk = slots[begin : begin + max(1, (1 << 18) // max(size, 1))]
+            offsets = starts[chunk]
+            replay = np.empty((chunk.size, size, 2), dtype=np.int32)
+            if global_count:
+                global_replay = replay[:, :global_count, :]
+                global_replay[:, :, 0] = global_local[:, 0]
+                global_replay[:, :, 1] = global_local[:, 1] + offsets[:, None]
+                global_replay.sort(axis=2)
+            if size > global_count:
+                replay[:, global_count:, :] = local[None, :, :] + offsets[:, None, None]
+            rows = slot_offset[chunk, None] + np.arange(size)
+            pairs[rows.reshape(-1)] = replay.reshape((-1, 2))
+    return pairs
 
 
 @dataclass(frozen=True, eq=False)
@@ -1220,9 +1224,11 @@ class ShapePairTemplates:
     templates: tuple[tuple[np.ndarray, np.ndarray], ...]
     """Per template, its global-local pairs (absolute global id, world-local id), shape [n, 2],
     and its local pairs, shape [m, 2], both int32."""
-    runs: tuple[tuple[int, np.ndarray], ...]
-    """Consecutive worlds that share a template: the template index and each world's first
-    shape, shape [world_count], int32."""
+    slot_template: np.ndarray
+    """The template each world of the list replays, in list order (worlds without pairs have none),
+    shape [slot_count], int32."""
+    slot_start: np.ndarray
+    """That world's first shape, the origin of its template's world-local ids, shape [slot_count], int32."""
     pairs_ptr: int = 0
     """Address of the array the replay was uploaded to; 0 while unbound."""
     pair_count: int = 0
@@ -1232,7 +1238,7 @@ class ShapePairTemplates:
 
     def replay(self) -> np.ndarray:
         """Return the explicit pair list these templates describe, shape [pair_count, 2], int32."""
-        return replay_shape_pair_templates(self.global_pairs, self.templates, self.runs)
+        return replay_shape_pair_templates(self.global_pairs, self.templates, self.slot_template, self.slot_start)
 
     def bind(self, pairs: wp.array[wp.vec2i]) -> ShapePairTemplates:
         """Return a copy that describes ``pairs``, the array :meth:`replay` was uploaded to."""
@@ -1315,32 +1321,26 @@ class BroadPhaseExplicitTemplates:
         """
         self.device = wp.get_device(device)
         self.global_count = int(templates.global_pairs.shape[0])
+        sizes = np.asarray([g.shape[0] + l.shape[0] for g, l in templates.templates], dtype=np.int64)
+        slot_template = np.asarray(templates.slot_template, dtype=np.int64)
+        # Worlds of empty templates test nothing; the others' templates are compacted in order of first use.
+        replays = sizes[slot_template] > 0
+        slot_template = slot_template[replays]
+        used, first_use, compact = np.unique(slot_template, return_index=True, return_inverse=True)
+        order = np.argsort(first_use, kind="stable")
+        rank = np.empty(order.size, dtype=np.int64)
+        rank[order] = np.arange(order.size)
         stages: list[np.ndarray] = []
         entries: list[np.ndarray] = []
-        compact: dict[int, int] = {}
-        slot_starts: list[np.ndarray] = []
-        slot_templates: list[np.ndarray] = []
-        slot_counts: list[np.ndarray] = []
-        for template, starts in templates.runs:
-            global_local, local = templates.templates[template]
-            entry_count = int(global_local.shape[0] + local.shape[0])
-            if entry_count == 0:
-                continue
-            index = compact.get(template)
-            if index is None:
-                index = compact[template] = len(stages)
-                stage, packed = _template_layout(global_local, local)
-                stages.append(stage)
-                entries.append(packed)
-            world_starts = np.asarray(starts, dtype=np.int32)
-            slot_starts.append(world_starts)
-            slot_templates.append(np.full(world_starts.shape[0], index, dtype=np.int32))
-            slot_counts.append(np.full(world_starts.shape[0], entry_count, dtype=np.int64))
+        for template in used[order].tolist():
+            stage, packed = _template_layout(*templates.templates[template])
+            stages.append(stage)
+            entries.append(packed)
 
         def joined(parts: list[np.ndarray], dtype) -> np.ndarray:
             return np.concatenate(parts).astype(dtype) if parts else np.empty(0, dtype=dtype)
 
-        counts = joined(slot_counts, np.int64)
+        counts = sizes[slot_template]
         self.template_count = len(stages)
         self.slot_count = int(counts.shape[0])
         self.template_pair_count = int(counts.sum())
@@ -1378,8 +1378,8 @@ class BroadPhaseExplicitTemplates:
         # Host layout, uploaded by verify() (or the first launch), so a pipeline that keeps the
         # flat kernel without verifying allocates nothing.
         self._host = {
-            "slot_shape_start": joined(slot_starts, np.int32),
-            "slot_template": joined(slot_templates, np.int32),
+            "slot_shape_start": np.asarray(templates.slot_start, dtype=np.int32)[replays],
+            "slot_template": rank[compact.reshape(-1)].astype(np.int32),
             "template_stage_start": stage_start.astype(np.int32),
             "template_entry_start": entry_start.astype(np.int32),
             "stage": joined(stages, np.int32),
