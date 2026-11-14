@@ -187,8 +187,6 @@ class _WorldGroups:
     """Each local world's group, numbered by first world."""
     first: np.ndarray
     """Each group's first (representative) world."""
-    template: np.ndarray
-    """Each group's template (:attr:`_WorldTemplates.templates`)."""
 
     @cached_property
     def sizes(self) -> np.ndarray:
@@ -209,8 +207,6 @@ class _WorldTemplates:
 
     world_start: np.ndarray
     """Each world's first shape."""
-    body_start: np.ndarray
-    """Each world's first body among its collidable shapes' bodies that no global shape is on (0 for none)."""
     global_bodies: np.ndarray
     """The bodies of collidable global shapes, ascending."""
     globals_: np.ndarray
@@ -280,10 +276,9 @@ class _WorldTemplates:
             np.concatenate((codes[lo[w] : hi[w]], leading[crossing[cross.offsets[w] : cross.offsets[w + 1]]]))
             for w in first_world.tolist()
         )
-        templates = _WorldGroups(group, first_world, np.arange(first_world.size))
+        templates = _WorldGroups(group, first_world)
         return cls(
             world_start,
-            body_start,
             global_bodies,
             globals_,
             shapes,
@@ -305,7 +300,7 @@ class _WorldTemplates:
             shapes.rank,
         )
         group, first = _group_worlds(self.world_start.size, [self.templates.group], [part])
-        return _WorldGroups(group, first, self.templates.group[first])
+        return _WorldGroups(group, first)
 
     def world_shapes(self, world: int) -> np.ndarray:
         """The collidable shapes of ``world``, ascending."""
@@ -326,13 +321,9 @@ class _WorldTemplates:
             found.append(((first << 32) | second).reshape(-1))
         return np.concatenate(found)
 
-    def shift(self, groups: _WorldGroups) -> tuple[np.ndarray, np.ndarray]:
-        """Each world's shape and body offset from its group's representative world."""
-        representative = groups.first[groups.group]
-        return (
-            self.world_start - self.world_start[representative],
-            self.body_start - self.body_start[representative],
-        )
+    def shift(self, groups: _WorldGroups) -> np.ndarray:
+        """Each world's shape offset from its group's representative world."""
+        return self.world_start - self.world_start[groups.first[groups.group]]
 
 
 class _ShapeContactPairs:
@@ -668,7 +659,7 @@ class _ShapeContactPairs:
         pair_group = np.concatenate(
             (np.full(record.global_pairs.shape[0], -1, dtype=np.int64), np.repeat(replayed, sizes[template[replayed]]))
         )
-        shift, _ = self.worlds.shift(groups)
+        shift = self.worlds.shift(groups)
         return _PairSample(
             pairs,
             pair_group,
@@ -722,7 +713,7 @@ class _ShapeContactPairs:
             template_of_group[group] = len(stored)
             origins[group] = origin
             stored.append((global_local, (target[global_count:] - origin).astype(np.int32)))
-        shift, _ = worlds.shift(groups)
+        shift = worlds.shift(groups)
         world_template = template_of_group[groups.group]
         world_origin = origins[groups.group] + shift
         slot = world_template >= 0
