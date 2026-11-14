@@ -3872,7 +3872,8 @@ class NarrowPhase:
 
         # Dynamic block allocation for mesh-mesh and mesh-plane contacts.
         # On CUDA we partition toward ~4 blocks per SM. The 128-thread mesh-mesh
-        # kernel keeps four blocks resident per SM, and launching four times
+        # kernel kept four blocks resident per SM at its 128-register line (three
+        # at today's, MESH_SDF_GLOBAL_REDUCE_BLOCKS_PER_SM), and launching four times
         # that many blocks (several waves of small chunks) balances the uneven
         # per-chunk edge work: with only two waves, scenes around 100 pairs
         # measured 25% slower because busy chunks dominated the tail. On CPU

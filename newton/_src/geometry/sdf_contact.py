@@ -61,6 +61,14 @@ _SDF_QUERY_RADIUS_SLACK = 1.01
 # barriers wait on four warps instead of eight at the same occupancy.
 MESH_SDF_BLOCK_DIM = 128
 
+# Resident blocks per SM the global-reduce mesh-SDF kernel's launch bound
+# keeps: its register line, 65,536 / (128 * 3) = 168 registers a thread. At
+# four blocks (128 registers) CUDA 13.4's NVVM output spills 974 B of stores
+# and 1,712 B of loads a thread against CUDA 12.9's 618 and 936; on hardware
+# at 128 worlds (RTX PRO 6000, CUDA 13.4) the kernel took 272 ms a frame at
+# four blocks, 219 ms at three (168 registers) and 240 ms at two (255).
+MESH_SDF_GLOBAL_REDUCE_BLOCKS_PER_SM = 3
+
 # Capacity of the cooperative edge-selection tile stack. Sized to
 # ``2 * MESH_SDF_BLOCK_DIM`` so that the inner push loop can never
 # overflow: the loop gate ``count < MESH_SDF_BLOCK_DIM`` caps pre-push
@@ -1997,7 +2005,12 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
 
     # The tiled launch provides exactly ``total_num_blocks`` blocks and the
     # kernel strides those blocks over all active combinations itself.
-    @wp.kernel(enable_backward=False, launch_bounds=(MESH_SDF_BLOCK_DIM, 4), grid_stride=False, module=_module)
+    @wp.kernel(
+        enable_backward=False,
+        launch_bounds=(MESH_SDF_BLOCK_DIM, MESH_SDF_GLOBAL_REDUCE_BLOCKS_PER_SM),
+        grid_stride=False,
+        module=_module,
+    )
     def mesh_sdf_collision_global_reduce_kernel(
         shape_data: wp.array[wp.vec4],
         shape_transform: wp.array[wp.transform],
