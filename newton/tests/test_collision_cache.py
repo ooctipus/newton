@@ -129,6 +129,25 @@ class TestCollisionCache(unittest.TestCase):
             for name, data in reference.items():
                 np.testing.assert_array_equal(tables[name], data, err_msg=name)
 
+    def test_convex_hull_loads_equal_hull(self):
+        """An imported mesh's convex hull is stored once and loaded equal, its Qhull run skipped."""
+        from newton._src.geometry import utils  # noqa: PLC0415
+
+        points = np.random.default_rng(5).normal(size=(300, 3))
+        with tempfile.TemporaryDirectory() as directory:
+            saved = newton.config.cache_dir_collision
+            newton.config.cache_dir_collision = directory
+            try:
+                computed = utils.remesh_convex_hull(points, maxhullvert=32)
+                entries = sorted(Path(directory).rglob("*.convex_hull.npz"))
+                self.assertEqual(len(entries), 1)
+                loaded = utils.remesh_convex_hull(points, maxhullvert=32)
+            finally:
+                newton.config.cache_dir_collision = saved
+        for first, second in zip(computed, loaded, strict=True):
+            self.assertEqual(first.dtype, second.dtype)
+            np.testing.assert_array_equal(first, second)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

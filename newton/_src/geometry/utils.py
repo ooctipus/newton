@@ -14,6 +14,7 @@ import warp as wp
 
 from ..core.types import Vec3
 from ..exceptions import NewtonWarning
+from .convex_hull import convex_hull_3d
 from .inertia import compute_inertia_mesh
 from .types import (
     GeoType,
@@ -788,8 +789,6 @@ def remesh_convex_hull(vertices: np.ndarray, maxhullvert: int = 0, eps: float = 
         if the caller has already validated the input.
     """
 
-    from scipy.spatial import ConvexHull, QhullError
-
     vertices = np.asarray(vertices, dtype=np.float64)
 
     # Empty input has no geometric interpretation: fabricating a point at the
@@ -871,39 +870,8 @@ def remesh_convex_hull(vertices: np.ndarray, maxhullvert: int = 0, eps: float = 
         faces = np.concatenate([faces_ccw, faces_cw], axis=0)
         return verts, faces
 
-    # General (full 3D) case.
-    qhull_options = "Qt"
-    if maxhullvert > 0:
-        # qhull "TA" actually means "number of vertices added after the initial simplex"
-        # from mujoco's user_mesh.cc
-        qhull_options += f" TA{maxhullvert - 4}"
-    try:
-        hull = ConvexHull(vertices, qhull_options=qhull_options)
-    except QhullError:
-        # Retry with joggled input as a last resort before giving up on 3D.
-        # QJ perturbs coordinates in-place (~1e-11); it does not reorder or
-        # drop points, so hull.simplices indices still refer to the same rows
-        # of the original input array. We intentionally pull coordinates from
-        # `vertices` rather than `hull.points` below so the returned verts
-        # remain a strict subset of the caller's input (preserving the
-        # docstring invariant).
-        hull = ConvexHull(vertices, qhull_options=qhull_options + " QJ")
-    # Index into the original (un-joggled) input so that verts is always a
-    # subset of the caller's vertices, even through the QJ retry path.
-    verts = vertices.astype(np.float32)
-    faces = hull.simplices.astype(np.int32)
-
-    # Qhull leaves simplex winding arbitrary; flip faces whose normal opposes their facet's outward normal.
-    a, b, c = vertices[faces[:, 0]], vertices[faces[:, 1]], vertices[faces[:, 2]]
-    inward = np.einsum("ij,ij->i", np.cross(b - a, c - a), hull.equations[:, :3]) < 0
-    faces[inward] = faces[inward][:, [0, 2, 1]]
-
-    # trim vertices to only those that are used in the faces
-    unique_verts, faces_flat = np.unique(faces, return_inverse=True)
-    verts = verts[unique_verts]
-    faces = faces_flat.reshape(faces.shape).astype(np.int32)
-
-    return verts, faces
+    # General (full 3D) case: Qhull, stored with the meshes' other collision tables.
+    return convex_hull_3d(vertices, maxhullvert)
 
 
 RemeshingMethod = Literal["ftetwild", "alphashape", "quadratic", "convex_hull", "poisson"]
