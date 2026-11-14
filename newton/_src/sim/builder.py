@@ -2558,10 +2558,11 @@ class ModelBuilder:
         # rigid joints
         self.joint_parent: list[int] = []
         """Parent body indices accumulated for :attr:`Model.joint_parent`."""
-        self.joint_parents: dict[int, list[tuple[int, int]]] = {}
-        """Mapping from child body index to ``(parent_body, joint_idx)`` pairs (one per joint, no dedup)."""
-        self.joint_children: dict[int, list[tuple[int, int]]] = {}
-        """Mapping from parent body index to ``(child_body, joint_idx)`` pairs (one per joint, no dedup)."""
+        self._joint_adjacency: tuple[dict[int, list[tuple[int, int]]], dict[int, list[tuple[int, int]]]] | None = (
+            {},
+            {},
+        )
+        """:attr:`joint_parents` and :attr:`joint_children`, or ``None`` until derived again from the joints."""
         self.joint_child: list[int] = []
         """Child body indices accumulated for :attr:`Model.joint_child`."""
         self.joint_axis: list[Vec3] = []
@@ -2871,6 +2872,33 @@ class ModelBuilder:
             if attributes is not None:
                 attributes.pop(name, None)
         object.__setattr__(self, name, value)
+
+    @property
+    def joint_parents(self) -> dict[int, list[tuple[int, int]]]:
+        """Mapping from child body index to ``(parent_body, joint_idx)`` pairs (one per joint, no dedup)."""
+        return self._joint_lookups()[0]
+
+    @property
+    def joint_children(self) -> dict[int, list[tuple[int, int]]]:
+        """Mapping from parent body index to ``(child_body, joint_idx)`` pairs (one per joint, no dedup)."""
+        return self._joint_lookups()[1]
+
+    def _joint_lookups(self) -> tuple[dict[int, list[tuple[int, int]]], dict[int, list[tuple[int, int]]]]:
+        """Return the joint lookups, derived from :attr:`joint_parent` and :attr:`joint_child` when dropped.
+
+        Joint edits keep built lookups current; replication and joint collapse drop them instead.
+        """
+        if self._joint_adjacency is None:
+            with self._raw_array_access():
+                parents = _list_for_iteration(self.joint_parent)
+                children = _list_for_iteration(self.joint_child)
+            joint_parents: dict[int, list[tuple[int, int]]] = {}
+            joint_children: dict[int, list[tuple[int, int]]] = {}
+            for joint, (parent, child) in enumerate(zip(parents, children, strict=True)):
+                joint_parents.setdefault(child, []).append((parent, joint))
+                joint_children.setdefault(parent, []).append((child, joint))
+            self._joint_adjacency = (joint_parents, joint_children)
+        return self._joint_adjacency
 
     def _row_count(self, name: str) -> int:
         """Length of a list attribute, read without materializing array storage."""
@@ -4354,11 +4382,9 @@ class ModelBuilder:
                     "Call end_world() first, or pass separate_worlds=False to add the copies to the current world."
                 )
             if xforms is None:
-                if tuple(spacing) == (0, 0, 0):
-                    xforms = [None] * copy_count
-                else:
-                    offsets = compute_world_offsets(copy_count, spacing, self.up_axis)
-                    xforms = [wp.transform(offset, wp.quat_identity()) for offset in offsets]
+                xforms = np.tile(_IDENTITY_TRANSFORM, (copy_count, 1))
+                if tuple(spacing) != (0, 0, 0):
+                    xforms[:, :3] = compute_world_offsets(copy_count, spacing, self.up_axis)
             if label_prefixes is None:
                 label_prefixes = [None] * copy_count
 
@@ -4395,24 +4421,23 @@ class ModelBuilder:
 
         worlds = np.asarray(worlds, dtype=np.int64)
 
-        def normalize_xform(xform: Transform | None) -> wp.transform | None:
-            if xform is None:
-                return None
-            xform = wp.transform(*xform)
-            # Identity behaves as None: it is excluded from moved_copies, which keeps copies
-            # bit-exact (identity transform_mul round-trips are not exact for free-root joint_q).
-            return None if np.array_equal(np.asarray(xform), _IDENTITY_TRANSFORM) else xform
-
-        xforms = [normalize_xform(xform) for xform in xforms]
+        # Each copy's transform as a float32 row; None is the identity.
+        if isinstance(xforms, np.ndarray):
+            xform_rows = np.asarray(xforms, dtype=np.float32).reshape(copy_count, 7)
+        else:
+            xform_rows = pack_transforms([_IDENTITY_TRANSFORM if xform is None else xform for xform in xforms]).reshape(
+                copy_count, 7
+            )
+        # Identity rows are not moved, which keeps copies bit-exact (identity transform_mul round-trips
+        # are not exact for free-root joint_q).
+        moved = ~np.all(xform_rows == _IDENTITY_TRANSFORM, axis=1)
         # Copies with a non-identity transform, as copy indices and (N, 7) float32 rows.
-        moved_copies = np.asarray([i for i, xform in enumerate(xforms) if xform is not None], dtype=np.int64)
-        moved_xforms = pack_transforms([xform for xform in xforms if xform is not None])
+        moved_copies = np.flatnonzero(moved)
+        moved_xforms = xform_rows[moved]
         # Moved copies whose rotation is not the identity; only these rotate velocities.
         rotated = ~np.all(moved_xforms[:, 3:] == _IDENTITY_ROTATION, axis=1)
         translations_only = not np.any(rotated)
-        offsets = np.asarray(
-            [np.zeros(3, dtype=np.float32) if xform is None else xform.p for xform in xforms], dtype=np.float32
-        )
+        offsets = np.where(moved[:, None], xform_rows[:, :3], np.float32(0.0))
 
         def source_list(attr: str) -> list:
             values = getattr(builder, attr)
@@ -4508,8 +4533,8 @@ class ModelBuilder:
                     if spec["kind"] == DeformableVisualMesh.Kind.BODY and np.any(parents < 0):
                         # World-fixed vertices need the same placement as static shapes.
                         local = np.array(spec["local_offsets"], dtype=np.float32, copy=True)
-                        if xforms[copy_index] is not None:
-                            xform = np.asarray(xforms[copy_index], dtype=np.float32)
+                        if moved[copy_index]:
+                            xform = xform_rows[copy_index]
                             fixed = parents < 0
                             local[fixed] = quat_rotate_rows(xform[3:], local[fixed]) + xform[:3]
                         merged["local_offsets"] = local
@@ -4574,14 +4599,13 @@ class ModelBuilder:
             if world_guides.size == 0 or (not is_offset and translations_only):
                 continue
             source_vectors = np.asarray(getattr(builder, name), dtype=np.float32)[world_guides]
-            for world_index, xform in enumerate(xforms):
-                if xform is None:
-                    continue
+            for world_index in moved_copies.tolist():
+                xform = xform_rows[world_index]
                 transformed = source_vectors.copy()
                 if not translations_only:
-                    rotate_vectors(xform.q, transformed)
+                    rotate_vectors(xform[3:], transformed)
                 if is_offset:
-                    transformed += np.asarray(xform.p, dtype=np.float32)
+                    transformed += xform[:3]
                 targets = start + world_index * counts["tendon_guide"] + world_guides
                 for target, vector in zip(targets, transformed.tolist(), strict=True):
                     values[target] = tuple(vector)
@@ -4597,7 +4621,6 @@ class ModelBuilder:
             for body, body_variants in builder._body_variants.items():
                 self._body_variants[body + int(body_start)] = body_variants.shifted(int(shape_start))
 
-        joint_starts = starts("joint")
         joint_coord_starts = starts("joint_coord")
         joint_dof_starts = starts("joint_dof")
 
@@ -4651,15 +4674,9 @@ class ModelBuilder:
         elif len(joint_qd):
             self.joint_qd.extend(joint_qd.tolist())
 
-        for copy_index, joint_start in enumerate(joint_starts.tolist()):
-            body_start = int(body_starts[copy_index])
-            for joint, (parent, child) in enumerate(
-                zip(builder.joint_parent, builder.joint_child, strict=True), start=int(joint_start)
-            ):
-                new_parent = parent + body_start if parent != -1 else -1
-                new_child = child + body_start
-                self.joint_parents.setdefault(new_child, []).append((new_parent, joint))
-                self.joint_children.setdefault(new_parent, []).append((new_child, joint))
+        if counts["joint"]:
+            # Derived again from the merged joints when next read.
+            self._joint_adjacency = None
 
         attribute_specs.pop("body_q")
         if counts["body"]:
@@ -4768,18 +4785,10 @@ class ModelBuilder:
         self.joint_constraint_count += copy_count * counts["joint_constraint"]
 
         custom_attributes = self._prepare_builder_custom_attributes(builder)
-        for copy_index, world in enumerate(worlds.tolist()):
-            entity_offsets = {kind: int(starts(kind)[copy_index]) for kind in counts}
-            self._merge_builder_custom_attributes(
-                builder, entity_offsets, world, label_prefixes[copy_index], custom_attributes
-            )
-            self._merge_builder_actuators(
-                builder,
-                int(joint_dof_starts[copy_index]),
-                int(joint_coord_starts[copy_index]),
-                entity_offsets["actuator"],
-            )
-            self._merge_builder_batteries(builder, entity_offsets["actuator"], world)
+        entity_starts = {kind: starts(kind) for kind in counts}
+        self._merge_builder_custom_attributes(builder, entity_starts, worlds, label_prefixes, custom_attributes)
+        self._merge_builder_actuators(builder, joint_dof_starts, joint_coord_starts, entity_starts["actuator"])
+        self._merge_builder_batteries(builder, entity_starts["actuator"], worlds)
         self.actuator_count += copy_count * counts["actuator"]
 
     def _model_value_key(self, attribute: CustomAttribute) -> int:
@@ -6073,21 +6082,41 @@ class ModelBuilder:
     def _merge_builder_custom_attributes(
         self,
         builder: ModelBuilder,
-        entity_offsets: dict[str, int],
-        world: int,
-        label_prefix: str | None,
+        entity_starts: dict[str, np.ndarray],
+        worlds: np.ndarray,
+        label_prefixes: Sequence[str | None],
         attributes: dict[str, ModelBuilder.CustomAttribute],
     ) -> None:
+        """Merge the custom attributes of ``len(worlds)`` copies of ``builder``.
+
+        Copy ``c`` places its entities at ``entity_starts[kind][c]`` and joins world ``worlds[c]``. The rows of
+        all copies are built at once, equal to merging the copies one after another.
+        """
+        copy_count = len(worlds)
+        copies = np.arange(copy_count, dtype=np.int64)
+        zeros = np.zeros(copy_count, dtype=np.int64)
         # Resolve existing destination rows, since its topology may have
         # changed since the rows were first added.
         self._resolve_custom_frequency_articulation_owners()
-        custom_frequency_offsets = dict(self._custom_frequency_counts)
+        # Copies append their custom-frequency rows one after another. A frequency new to this builder
+        # is registered by the first copy.
+        destination_frequencies = tuple(self._custom_frequency_counts)
+        custom_starts = {
+            key: start + copies * builder._custom_frequency_counts.get(key, 0)
+            for key, start in self._custom_frequency_counts.items()
+        }
+        for key, count in builder._custom_frequency_counts.items():
+            custom_starts.setdefault(key, copies * count)
+
+        def custom_frequency_offsets(copy: int) -> dict[str, int]:
+            keys = destination_frequencies if copy == 0 else custom_starts
+            return {key: int(custom_starts[key][copy]) for key in keys}
 
         # Builders allocate MJCF mask-domain IDs independently. Remap every
         # incoming domain as one unit so its IDs cannot collide with domains
         # already present in the destination builder.
         collision_mask_domain_key = "mujoco:collision_mask_domain"
-        collision_mask_domain_remap: dict[int, int] = {}
+        domain_first_shape: dict[int, int] = {}
         source_domain_attr = builder.custom_attributes.get(collision_mask_domain_key)
         if source_domain_attr is not None and source_domain_attr.values:
             source_items = (
@@ -6096,30 +6125,66 @@ class ModelBuilder:
                 else enumerate(source_domain_attr.values)
             )
             # Copied shape ranges never overlap, so the first destination shape
-            # in each source domain is already a unique, deterministic ID. This
-            # avoids rescanning the growing destination during replication.
-            shape_offset = entity_offsets["shape"]
+            # in each source domain is already a unique, deterministic ID.
             for shape, value in source_items:
                 if value is None:
                     continue
                 source_domain = int(value)
                 if source_domain >= 0:
-                    collision_mask_domain_remap.setdefault(source_domain, shape_offset + shape)
+                    domain_first_shape.setdefault(source_domain, shape)
 
-        def get_offset(entity_or_key: Model.AttributeFrequency | str | None) -> int:
+        def starts_of(entity_or_key: Model.AttributeFrequency | str | None) -> np.ndarray:
             if entity_or_key is None:
-                return 0
+                return zeros
             if isinstance(entity_or_key, Model.AttributeFrequency):
-                return entity_offsets[entity_or_key.name.lower()]
-            if entity_or_key in custom_frequency_offsets:
-                return custom_frequency_offsets[entity_or_key]
-            if entity_or_key in builder._custom_frequency_counts:
-                return 0
+                return entity_starts[entity_or_key.name.lower()]
+            if entity_or_key in custom_starts:
+                return custom_starts[entity_or_key]
             raise ValueError(
                 f"Unknown references value '{entity_or_key}'. "
-                f"Valid values are: {list(entity_offsets.keys())} or custom frequencies."
+                f"Valid values are: {list(entity_starts.keys())} or custom frequencies."
             )
 
+        def copy_rows(
+            copy_start: int,
+            copy_end: int,
+            source_values: Any,
+            index_starts: np.ndarray,
+            value_starts: np.ndarray,
+            remap: Callable[[int, int, Any], Any] | None,
+            remap_kind: str,
+        ) -> tuple[list, list]:
+            """Rows of copies ``[copy_start, copy_end)`` as (keys, values), copy-major.
+
+            ``remap(copy, row, value)`` remaps a value. A ``"world"`` remap replaces values with the copy's
+            world, and a ``"shift"`` remap shifts non-negative indices by the copy's ``value_starts``; both
+            are applied here at once to integer values.
+            """
+            copy_span = copy_end - copy_start
+            if isinstance(source_values, dict):
+                indices, values = list(source_values.keys()), list(source_values.values())
+            else:
+                indices, values = range(len(source_values)), list(source_values)
+            keys = (
+                (np.asarray(indices, dtype=np.int64)[None, :] + index_starts[copy_start:copy_end, None])
+                .reshape(-1)
+                .tolist()
+            )
+            if remap is None:
+                return keys, values * copy_span
+            if remap_kind == "world":
+                return keys, np.repeat(worlds[copy_start:copy_end], len(values)).tolist()
+            if remap_kind == "shift" and all(type(value) is int for value in values):
+                source = np.asarray(values, dtype=np.int64)
+                shifted = np.where(source >= 0, source[None, :] + value_starts[copy_start:copy_end, None], source)
+                return keys, shifted.reshape(-1).tolist()
+            return keys, [
+                remap(copy, idx, value)
+                for copy in range(copy_start, copy_end)
+                for idx, value in zip(indices, values, strict=True)
+            ]
+
+        target_kind_attr = builder.custom_attributes.get("mujoco:equality_constraint_target_kind")
         source_counts = None
         for full_key, attr in attributes.items():
             reference = attr.references
@@ -6127,68 +6192,69 @@ class ModelBuilder:
                 reference = Model._normalize_attribute_reference(reference)
 
             freq_key = attr.frequency
-            if isinstance(freq_key, str):
-                index_offset = custom_frequency_offsets.get(freq_key, 0)
-            elif attr.frequency == Model.AttributeFrequency.ONCE:
-                index_offset = 0
-            elif attr.frequency == Model.AttributeFrequency.WORLD:
+            is_custom_frequency = isinstance(freq_key, str)
+            if is_custom_frequency:
+                index_starts = custom_starts.get(freq_key, zeros)
+            elif freq_key == Model.AttributeFrequency.ONCE:
+                index_starts = zeros
+            elif freq_key == Model.AttributeFrequency.WORLD:
                 # The destination entry: the destination world, or global world -1.
-                index_offset = world
+                index_starts = worlds
             else:
-                index_offset = get_offset(attr.frequency)
+                index_starts = starts_of(freq_key)
 
             use_current_world = reference == Model.AttributeFrequency.WORLD
-            value_offset = 0 if use_current_world else get_offset(reference)
+            value_starts = zeros if use_current_world else starts_of(reference)
             is_equality_target_attr = full_key == "mujoco:equality_constraint_target"
-            is_collision_mask_domain_attr = full_key == collision_mask_domain_key and bool(collision_mask_domain_remap)
-            source_values = attr.values
-            if attr.reference_value_transformer is not None:
-                # Remap all rows of this attribute in one call so the transformer
-                # can vectorize; builder replication invokes this once per copy.
-                if isinstance(source_values, dict):
-                    row_indices = list(source_values.keys())
-                    row_values = list(source_values.values())
-                else:
-                    row_indices = range(len(source_values))
-                    row_values = list(source_values)
-                transformed = attr.reference_value_transformer(
-                    row_values,
-                    {
-                        "builder": builder,
-                        "destination_builder": self,
-                        "entity_offsets": entity_offsets,
-                        "custom_frequency_offsets": custom_frequency_offsets,
-                        "row_indices": row_indices,
-                        "world": world,
-                        "label_prefix": label_prefix,
-                    },
-                )
-                if len(transformed) != len(row_values):
-                    raise ValueError(
-                        f"reference_value_transformer for custom attribute '{full_key}' returned "
-                        f"{len(transformed)} values, expected {len(row_values)}."
-                    )
-                if isinstance(source_values, dict):
-                    source_values = dict(zip(row_indices, transformed, strict=True))
-                else:
-                    source_values = list(transformed)
-                needs_remap = False
-            else:
-                needs_remap = (
-                    value_offset != 0 or use_current_world or is_equality_target_attr or is_collision_mask_domain_attr
-                )
+            is_collision_mask_domain_attr = full_key == collision_mask_domain_key and bool(domain_first_shape)
+            transformer = attr.reference_value_transformer
+            needs_remap = transformer is None and (
+                bool(np.any(value_starts))
+                or use_current_world
+                or is_equality_target_attr
+                or is_collision_mask_domain_attr
+            )
 
-            if needs_remap:
+            def transform_value(value: Any, offset: int, world: int, replace_with_world: bool = use_current_world):
+                if replace_with_world:
+                    return world
+                if offset == 0:
+                    return value
+                if self._is_integer_scalar(value):
+                    index = int(value)
+                    return index + offset if index >= 0 else value
+                if isinstance(value, (list, tuple)):
+                    transformed = [
+                        item + offset if self._is_integer_scalar(item) and item >= 0 else item for item in value
+                    ]
+                    return type(value)(transformed)
+                value_type = type(value)
+                if wp.types.type_is_vector(value_type) and wp.types.type_is_int(value_type._wp_scalar_type_):
+                    return value_type(*(item + offset if item >= 0 else item for item in value))
+                if isinstance(value, np.ndarray) and np.issubdtype(value.dtype, np.integer):
+                    transformed = value.copy()
+                    transformed[value >= 0] += offset
+                    return transformed
+                try:
+                    return value + offset
+                except TypeError:
+                    return value
 
-                def transform_equality_target_value(entity_idx: int, value: Any) -> Any:
+            def transform_row(
+                copy: int,
+                entity_idx: int,
+                value: Any,
+                is_equality_target: bool = is_equality_target_attr,
+                is_collision_mask_domain: bool = is_collision_mask_domain_attr,
+                value_starts: np.ndarray = value_starts,
+            ) -> Any:
+                if is_equality_target:
                     try:
                         target = int(value)
                     except (TypeError, ValueError):
                         return value
                     if target < 0:
                         return value
-
-                    target_kind_attr = builder.custom_attributes.get("mujoco:equality_constraint_target_kind")
                     target_kind = 0
                     if (
                         target_kind_attr is not None
@@ -6200,128 +6266,180 @@ class ModelBuilder:
                             target_kind = int(target_kind_attr.values[entity_idx])
                         except (TypeError, ValueError):
                             target_kind = 0
-
                     if target_kind == 1:
-                        return target + entity_offsets["joint"]
+                        return target + int(entity_starts["joint"][copy])
                     if target_kind == 2:
-                        return target + entity_offsets["constraint_mimic"]
+                        return target + int(entity_starts["constraint_mimic"][copy])
                     return value
+                if is_collision_mask_domain:
+                    first = domain_first_shape.get(int(value))
+                    return value if first is None else int(entity_starts["shape"][copy]) + first
+                return transform_value(value, int(value_starts[copy]), int(worlds[copy]))
 
-                def transform_value(
-                    value: Any,
-                    offset: int = value_offset,
-                    replace_with_world: bool = use_current_world,
-                ) -> Any:
-                    if replace_with_world:
-                        return world
-                    if offset == 0:
-                        return value
-                    if self._is_integer_scalar(value):
-                        index = int(value)
-                        return index + offset if index >= 0 else value
-                    if isinstance(value, (list, tuple)):
-                        transformed = [
-                            item + offset if self._is_integer_scalar(item) and item >= 0 else item for item in value
-                        ]
-                        return type(value)(transformed)
-                    value_type = type(value)
-                    if wp.types.type_is_vector(value_type) and wp.types.type_is_int(value_type._wp_scalar_type_):
-                        return value_type(*(item + offset if item >= 0 else item for item in value))
-                    if isinstance(value, np.ndarray) and np.issubdtype(value.dtype, np.integer):
-                        transformed = value.copy()
-                        transformed[value >= 0] += offset
-                        return transformed
-                    try:
-                        return value + offset
-                    except TypeError:
-                        return value
-
-                def transform_enum_value(
-                    entity_idx: int,
-                    value: Any,
-                    is_equality_target: bool = is_equality_target_attr,
-                    is_collision_mask_domain: bool = is_collision_mask_domain_attr,
-                ) -> Any:
-                    if is_equality_target:
-                        return transform_equality_target_value(entity_idx, value)
-                    if is_collision_mask_domain:
-                        return collision_mask_domain_remap.get(int(value), value)
-                    return transform_value(value)
-
-                if value_offset and not self._custom_attribute_defaults_match(
-                    transform_value(attr.default), attr.default
-                ):
-                    # Different copies need different reference values, not a shared shifted default.
-                    if freq_key == Model.AttributeFrequency.ONCE:
-                        # Implicit source defaults must not replace an existing global value.
-                        count = int(full_key not in self.custom_attributes)
-                    elif freq_key == Model.AttributeFrequency.WORLD:
+            # Each copy's source rows: the declared values, values completed with defaults when a copy's
+            # references shift the default, or a transformer's remapped rows.
+            variants: list[Any] = [attr.values]
+            copy_variant = np.zeros(copy_count, dtype=np.int64)
+            if transformer is not None:
+                if isinstance(attr.values, dict):
+                    row_indices = list(attr.values.keys())
+                    row_values = list(attr.values.values())
+                else:
+                    row_indices = range(len(attr.values))
+                    row_values = list(attr.values)
+                for copy in range(copy_count):
+                    # Remap all rows of this attribute in one call so the transformer can vectorize.
+                    entity_offsets = {kind: int(starts[copy]) for kind, starts in entity_starts.items()}
+                    transformed = transformer(
+                        row_values,
+                        {
+                            "builder": builder,
+                            "destination_builder": self,
+                            "entity_offsets": entity_offsets,
+                            "custom_frequency_offsets": custom_frequency_offsets(copy),
+                            "row_indices": row_indices,
+                            "world": int(worlds[copy]),
+                            "label_prefix": label_prefixes[copy],
+                        },
+                    )
+                    if len(transformed) != len(row_values):
+                        raise ValueError(
+                            f"reference_value_transformer for custom attribute '{full_key}' returned "
+                            f"{len(transformed)} values, expected {len(row_values)}."
+                        )
+                    copy_variant[copy] = len(variants)
+                    variants.append(
+                        dict(zip(row_indices, transformed, strict=True))
+                        if isinstance(attr.values, dict)
+                        else list(transformed)
+                    )
+            if freq_key == Model.AttributeFrequency.WORLD:
+                # One row per copy: all source entities join the copy's world entry.
+                for copy in range(copy_count):
+                    source_values = variants[copy_variant[copy]]
+                    world, offset = int(worlds[copy]), int(value_starts[copy])
+                    if (
+                        needs_remap
+                        and offset
+                        and not self._custom_attribute_defaults_match(
+                            transform_value(attr.default, offset, world), attr.default
+                        )
+                    ):
                         # Each copy fills its destination world. Like ONCE, an implicit source
                         # default must not replace an existing global value.
                         existing = self.custom_attributes.get(full_key)
                         count = int(world >= 0 or existing is None or -1 not in (existing.values or {}))
+                        source_values = attr._values_with_defaults(count)
+                    # Explicit source values agree, so take the global value, or else that of an
+                    # explicit world, or else the default.
+                    enum_values = {}
+                    if source_values:
+                        source_key = -1 if -1 in source_values else min(attr.values or source_values)
+                        value = source_values[source_key]
+                        enum_values[world] = transform_row(copy, source_key, value) if needs_remap else value
+                    merged = self.custom_attributes.get(full_key)
+                    if merged is None:
+                        merged = replace(attr, values=enum_values)
+                        self.custom_attributes[full_key] = merged
+                        self._custom_schema_epoch += 1
+                        self._index_custom_world_reference_attribute(merged)
+                        continue
+                    if not self._custom_attribute_defaults_match(merged.default, attr.default):
+                        raise ValueError(
+                            f"Custom attribute '{full_key}' default mismatch when merging builders: "
+                            f"existing={merged.default}, incoming={attr.default}"
+                        )
+                    if merged.values is None:
+                        merged.values = {}
+                    merged.values.update(enum_values)
+                continue
+
+            if needs_remap and value_starts.any():
+                # Different copies need different reference values, not a shared shifted default.
+                fills = np.fromiter(
+                    (
+                        offset != 0
+                        and not self._custom_attribute_defaults_match(
+                            transform_value(attr.default, offset, world), attr.default
+                        )
+                        for offset, world in zip(value_starts.tolist(), worlds.tolist(), strict=True)
+                    ),
+                    dtype=bool,
+                    count=copy_count,
+                )
+                if fills.any():
+                    if freq_key == Model.AttributeFrequency.ONCE:
+                        # Implicit source defaults must not replace an existing global value.
+                        filled = [
+                            attr._values_with_defaults(int(full_key not in self.custom_attributes) if copy == 0 else 0)
+                            for copy in range(2)
+                        ]
+                        variants.extend(filled)
+                        copy_variant[fills] = 2
+                        if fills[0]:
+                            copy_variant[0] = 1
                     else:
                         if source_counts is None:
                             source_counts = self._builder_merge_counts(builder)
                         count = (
                             builder._custom_frequency_counts.get(freq_key, 0)
-                            if isinstance(freq_key, str)
+                            if is_custom_frequency
                             else source_counts.get(self._builder_frequency_key(freq_key), 0)
                         )
-                    source_values = attr._values_with_defaults(count)
-
-            if freq_key == Model.AttributeFrequency.WORLD:
-                # All source entities join one destination entry. Explicit source values agree,
-                # so take the global value, or else that of an explicit world, or else the default.
-                enum_values = {}
-                if source_values:
-                    source_key = -1 if -1 in source_values else min(attr.values or source_values)
-                    value = source_values[source_key]
-                    enum_values[index_offset] = transform_enum_value(source_key, value) if needs_remap else value
-            elif not isinstance(freq_key, str):
-                enum_values = {
-                    index_offset + idx: transform_enum_value(idx, value) if needs_remap else value
-                    for idx, value in source_values.items()
-                }
+                        variants.append(attr._values_with_defaults(count))
+                        copy_variant[fills] = 1
 
             merged = self.custom_attributes.get(full_key)
-            if merged is None:
-                if isinstance(freq_key, str):
-                    mapped_values = [None] * index_offset
-                    if needs_remap:
-                        mapped_values.extend(
-                            transform_enum_value(idx, value) for idx, value in enumerate(source_values)
-                        )
-                    else:
-                        mapped_values.extend(source_values)
-                else:
-                    mapped_values = enum_values
-                merged = replace(attr, values=mapped_values)
-                self.custom_attributes[full_key] = merged
-                self._custom_schema_epoch += 1
-                self._index_custom_world_reference_attribute(merged)
-                continue
-
-            if not self._custom_attribute_defaults_match(merged.default, attr.default):
+            if merged is not None and not self._custom_attribute_defaults_match(merged.default, attr.default):
                 raise ValueError(
                     f"Custom attribute '{full_key}' default mismatch when merging builders: "
                     f"existing={merged.default}, incoming={attr.default}"
                 )
-
-            if merged.values is None:
-                merged.values = [] if isinstance(freq_key, str) else {}
-
-            if isinstance(freq_key, str):
-                if len(merged.values) < index_offset:
-                    merged.values.extend([None] * (index_offset - len(merged.values)))
-                if needs_remap:
-                    merged.values.extend(transform_enum_value(idx, value) for idx, value in enumerate(source_values))
-                else:
-                    merged.values.extend(source_values)
+            remap = transform_row if needs_remap else None
+            if use_current_world:
+                remap_kind = "world"
+            elif is_equality_target_attr or is_collision_mask_domain_attr:
+                remap_kind = "row"
             else:
-                merged.values.update(enum_values)
+                remap_kind = "shift"
+            runs = np.concatenate(([0], np.flatnonzero(np.diff(copy_variant)) + 1, [copy_count])).tolist()
+            for run_start, run_end in itertools.pairwise(runs):
+                keys, values = copy_rows(
+                    run_start,
+                    run_end,
+                    variants[copy_variant[run_start]],
+                    index_starts,
+                    value_starts,
+                    remap,
+                    remap_kind,
+                )
+                if merged is None:
+                    if is_custom_frequency:
+                        mapped_values = [None] * int(index_starts[0])
+                    else:
+                        mapped_values = {}
+                    merged = replace(attr, values=mapped_values)
+                    self.custom_attributes[full_key] = merged
+                    self._custom_schema_epoch += 1
+                    created = True
+                else:
+                    created = False
+                if merged.values is None:
+                    merged.values = [] if is_custom_frequency else {}
+                if is_custom_frequency:
+                    row_count = len(values) // max(run_end - run_start, 1)
+                    for copy in range(run_start, run_end):
+                        index_start = int(index_starts[copy])
+                        if len(merged.values) < index_start:
+                            merged.values.extend([None] * (index_start - len(merged.values)))
+                        first = (copy - run_start) * row_count
+                        merged.values.extend(values[first : first + row_count])
+                else:
+                    merged.values.update(zip(keys, values, strict=True))
+                if created:
+                    self._index_custom_world_reference_attribute(merged)
 
-        if label_prefix:
+        if any(prefix for prefix in label_prefixes):
             for frequency_key, frequency in builder.custom_frequencies.items():
                 label_key = frequency.label_attribute
                 if label_key is None:
@@ -6336,22 +6454,28 @@ class ModelBuilder:
                     or not label_attribute.values
                 ):
                     continue
-                start = custom_frequency_offsets.get(frequency_key, 0)
+                starts = custom_starts.get(frequency_key, zeros).tolist()
                 count = builder._custom_frequency_counts.get(frequency_key, 0)
-                for row in range(start, min(start + count, len(label_attribute.values))):
-                    label = label_attribute.values[row]
-                    if label:
-                        label_attribute.values[row] = f"{label_prefix}/{label}"
+                for start, label_prefix in zip(starts, label_prefixes, strict=True):
+                    if not label_prefix:
+                        continue
+                    for row in range(start, min(start + count, len(label_attribute.values))):
+                        label = label_attribute.values[row]
+                        if label:
+                            label_attribute.values[row] = f"{label_prefix}/{label}"
 
             if builder._equality_constraint_count > 0:
                 label_attr = self.custom_attributes.get("mujoco:equality_constraint_label")
                 if label_attr is not None and label_attr.values:
-                    start = self._equality_constraint_count
-                    for i in range(start, start + builder._equality_constraint_count):
-                        if i < len(label_attr.values):
-                            label = label_attr.values[i]
-                            if label:
-                                label_attr.values[i] = f"{label_prefix}/{label}"
+                    starts = custom_starts["mujoco:equality_constraint"].tolist()
+                    for start, label_prefix in zip(starts, label_prefixes, strict=True):
+                        if not label_prefix:
+                            continue
+                        for i in range(start, start + builder._equality_constraint_count):
+                            if i < len(label_attr.values):
+                                label = label_attr.values[i]
+                                if label:
+                                    label_attr.values[i] = f"{label_prefix}/{label}"
 
         for freq_key, freq_obj in builder.custom_frequencies.items():
             if freq_key not in self.custom_frequencies:
@@ -6360,33 +6484,44 @@ class ModelBuilder:
             self._custom_world_reference_attribute_keys.setdefault(freq_key, [])
 
         for freq_key, builder_count in builder._custom_frequency_counts.items():
-            offset = custom_frequency_offsets.get(freq_key, 0)
-            self._custom_frequency_counts[freq_key] = offset + builder_count
+            count = int(custom_starts[freq_key][-1]) + builder_count
+            self._custom_frequency_counts[freq_key] = count
             frequency = builder.custom_frequencies.get(freq_key)
             if frequency is not None and frequency.articulation_owner_resolver is not None:
                 # Source owner values were resolved above and remapped as regular
                 # articulation references, so the merged rows are already current.
-                self._custom_frequency_owner_resolved_counts[freq_key] = offset + builder_count
+                self._custom_frequency_owner_resolved_counts[freq_key] = count
 
         for key, finalizer in builder._custom_attribute_model_finalizers.items():
             self._add_custom_attribute_model_finalizer(key, finalizer)
 
-    def _merge_builder_batteries(self, builder: ModelBuilder, actuator_offset: int, world: int) -> None:
+    def _merge_builder_batteries(self, builder: ModelBuilder, actuator_starts: np.ndarray, worlds: np.ndarray) -> None:
+        """Merge the batteries of copies of ``builder`` whose actuators start at ``actuator_starts`` in ``worlds``."""
         for battery_class, sub_entry in builder.battery_entries.items():
             entry = self.battery_entries.setdefault(
                 battery_class, ModelBuilder.BatteryEntry(battery_class=battery_class)
             )
-            entry.args.extend(sub_entry.args)
-            entry.actuators.extend([idx + actuator_offset for idx in actuators] for actuators in sub_entry.actuators)
-            entry.world.extend([world] * len(sub_entry.world))
+            for actuator_offset, world in zip(actuator_starts.tolist(), worlds.tolist(), strict=True):
+                entry.args.extend(sub_entry.args)
+                entry.actuators.extend(
+                    [idx + actuator_offset for idx in actuators] for actuators in sub_entry.actuators
+                )
+                entry.world.extend([world] * len(sub_entry.world))
 
     def _merge_builder_actuators(
         self,
         builder: ModelBuilder,
-        joint_dof_offset: int,
-        joint_coord_offset: int,
-        actuator_offset: int,
+        joint_dof_starts: np.ndarray,
+        joint_coord_starts: np.ndarray,
+        actuator_starts: np.ndarray,
     ) -> None:
+        """Merge the actuators of copies of ``builder`` whose DOFs, coordinates and actuators start at the given rows."""
+        copy_count = len(actuator_starts)
+
+        def shifted(indices: list[int], starts: np.ndarray) -> list[int]:
+            # Copy-major: every copy's indices, offset by its start.
+            return (np.asarray(indices, dtype=np.int64)[None, :] + starts[:, None]).reshape(-1).tolist()
+
         for entry_key, sub_entry in builder.actuator_entries.items():
             entry = self.actuator_entries.setdefault(
                 entry_key,
@@ -6406,21 +6541,26 @@ class ModelBuilder:
                     motor_shared_kwargs=sub_entry.motor_shared_kwargs,
                 ),
             )
-            entry.indices.extend(idx + joint_dof_offset for idx in sub_entry.indices)
-            entry.actuator_indices.extend(idx + actuator_offset for idx in sub_entry.actuator_indices)
-            entry.pos_indices.extend(idx + joint_coord_offset for idx in sub_entry.pos_indices)
-            entry.drive_args.extend(sub_entry.drive_args)
-            entry.clamping_args.extend(sub_entry.clamping_args)
-            entry.motor_args.extend(sub_entry.motor_args)
-            for per_actuator in sub_entry.input_processor_args:
-                offset_args = []
-                for proc_class, sub_args in zip(sub_entry.input_processor_classes, per_actuator, strict=True):
-                    proc_args = dict(sub_args)
-                    for name in proc_class.JOINT_PARAMS:
-                        proc_args[f"{name}_indices"] += joint_dof_offset
-                        proc_args[f"{name}_pos_indices"] += joint_coord_offset
-                    offset_args.append(proc_args)
-                entry.input_processor_args.append(offset_args)
+            entry.indices.extend(shifted(sub_entry.indices, joint_dof_starts))
+            entry.actuator_indices.extend(shifted(sub_entry.actuator_indices, actuator_starts))
+            entry.pos_indices.extend(shifted(sub_entry.pos_indices, joint_coord_starts))
+            entry.drive_args.extend(sub_entry.drive_args * copy_count)
+            entry.clamping_args.extend(sub_entry.clamping_args * copy_count)
+            entry.motor_args.extend(sub_entry.motor_args * copy_count)
+            if not sub_entry.input_processor_args:
+                continue
+            for joint_dof_offset, joint_coord_offset in zip(
+                joint_dof_starts.tolist(), joint_coord_starts.tolist(), strict=True
+            ):
+                for per_actuator in sub_entry.input_processor_args:
+                    offset_args = []
+                    for proc_class, sub_args in zip(sub_entry.input_processor_classes, per_actuator, strict=True):
+                        proc_args = dict(sub_args)
+                        for name in proc_class.JOINT_PARAMS:
+                            proc_args[f"{name}_indices"] += joint_dof_offset
+                            proc_args[f"{name}_pos_indices"] += joint_coord_offset
+                        offset_args.append(proc_args)
+                    entry.input_processor_args.append(offset_args)
 
     def add_builder(
         self,
@@ -9420,19 +9560,8 @@ class ModelBuilder:
             else:
                 custom_attr.values = [remap_reference(value) for value in custom_attr.values]
 
-        # Rebuild parent/child lookups
-        self.joint_parents.clear()
-        self.joint_children.clear()
-        for i, (p, c) in enumerate(zip(self.joint_parent, self.joint_child, strict=True)):
-            if c not in self.joint_parents:
-                self.joint_parents[c] = [(p, i)]
-            else:
-                self.joint_parents[c].append((p, i))
-
-            if p not in self.joint_children:
-                self.joint_children[p] = [(c, i)]
-            else:
-                self.joint_children[p].append((c, i))
+        # Parent/child lookups are derived again from the remaining joints when next read.
+        self._joint_adjacency = None
 
         # Warning filters may raise, so finish rebuilding all references before emitting these.
         for label in removed_curve_labels:
