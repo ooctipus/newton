@@ -1008,7 +1008,14 @@ def build_mesh_cells(
         points, indices = meshes[mid] if mid in meshes else read[mid]
         edge = cell
         if edge is None:
-            edge = default_cell_size(points, indices)
+            # The median triangle span of a large terrain takes about 0.25 s: kept on disk by the mesh's buffers.
+            edge = float(
+                _collision_cache.cached(
+                    "mesh_cell_size",
+                    (np.asarray(points), np.asarray(indices)),
+                    lambda points=points, indices=indices: np.asarray(default_cell_size(points, indices)),
+                )
+            )
             if query_size is not None and query_size > edge:
                 edge = query_size
         g = _collision_cache.cached(

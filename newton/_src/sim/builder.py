@@ -687,6 +687,9 @@ def _array_data(values: Any, dtype: Any) -> Any:
         if value_types != {plain_type} and all(
             issubclass(value_type, plain_type) or is_scalar_type(value_type) for value_type in value_types
         ):
+            if plain_type is float and not any(issubclass(value_type, float) for value_type in value_types):
+                # Warp scalars convert through float(value), called here in C rather than per element in Python.
+                values = map(float, map(operator.attrgetter("value"), values))
             return np.fromiter(values, dtype=np_dtype, count=count)
     except (TypeError, ValueError, OverflowError):
         pass
@@ -15720,25 +15723,32 @@ class ModelBuilder:
         batches.meshes = tuple(meshes)
         return batches.meshes, batches
 
-    def _resolve_shape_material_mu_static(self) -> list[float]:
+    def _resolve_shape_material_mu_static(self) -> np.ndarray:
         """Static friction coefficients for :attr:`Model.shape_material_mu_static`.
 
         An unset :attr:`ShapeConfig.mu_static` follows the shape's final ``mu``, including direct edits of
         :attr:`shape_material_mu` made after :meth:`add_shape`. An explicit value below that ``mu`` is rejected
         rather than corrected quietly.
         """
-        shape_material_mu = _list_for_iteration(self.shape_material_mu)
-        shape_material_mu_static = _list_for_iteration(self.shape_material_mu_static)
-        resolved = [
-            mu if mu_static is None else mu_static
-            for mu, mu_static in zip(shape_material_mu, shape_material_mu_static, strict=True)
-        ]
-        for shape, (mu, mu_static) in enumerate(zip(shape_material_mu, resolved, strict=True)):
-            if mu_static < mu:
-                raise ValueError(
-                    f"shape_material_mu_static[{shape}] = {mu_static} is below shape_material_mu[{shape}] = {mu}. "
-                    "Update both when editing mu after add_shape, or leave mu_static None for a single coefficient."
-                )
+        shape_material_mu = np.asarray(self.shape_material_mu, dtype=np.float64)
+        shape_material_mu_static = np.asarray(self.shape_material_mu_static, dtype=object)
+        if len(shape_material_mu_static) != len(shape_material_mu):
+            raise ValueError("shape_material_mu_static must have one entry per shape")
+        unset = np.fromiter(
+            map(operator.is_, shape_material_mu_static, itertools.repeat(None)),
+            dtype=bool,
+            count=len(shape_material_mu_static),
+        )
+        resolved = shape_material_mu.copy()
+        resolved[~unset] = shape_material_mu_static[~unset].astype(np.float64)
+        below = np.flatnonzero(resolved < shape_material_mu)
+        if len(below):
+            shape = int(below[0])
+            raise ValueError(
+                f"shape_material_mu_static[{shape}] = {resolved[shape]} is below shape_material_mu[{shape}] = "
+                f"{shape_material_mu[shape]}. "
+                "Update both when editing mu after add_shape, or leave mu_static None for a single coefficient."
+            )
         return resolved
 
     def finalize(
