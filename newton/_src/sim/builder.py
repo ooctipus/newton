@@ -14942,34 +14942,19 @@ class ModelBuilder:
                     f"expected {self.joint_count}, found {len(joint_space_start)}."
                 )
 
-            # Initialize world_space_start with zeros
+            # Per-world joint space counts, the global joints at the front of the joint list added to the first
+            # world's start, made cumulative; the last entry is the total.
+            widths = np.diff(np.asarray(joint_space_start, dtype=np.int64), append=np.int64(space_count))
+            joint_world = np.asarray(self.joint_world, dtype=np.int64)
+            front = np.flatnonzero(joint_world != -1)
+            starts = np.zeros(self.world_count + 2, dtype=np.int64)
+            in_world = joint_world >= 0
+            np.add.at(starts, joint_world[in_world] + 1, widths[in_world])
+            starts[0] += widths[: front[0] if front.size else len(joint_world)].sum()
+            starts[: self.world_count + 1] = np.cumsum(starts[: self.world_count + 1])
+            starts[-1] = space_count
             world_space_start.clear()
-            world_space_start.extend([0] * (self.world_count + 2))
-
-            # Extend joint_space_start with total count to enable computing per-world counts
-            joint_space_start_ext = copy.copy(joint_space_start)
-            joint_space_start_ext.append(space_count)
-
-            # Count global entities at the front of the entity_world array
-            front_global_space_count = 0
-            for j, w in enumerate(self.joint_world):
-                if w == -1:
-                    front_global_space_count += joint_space_start_ext[j + 1] - joint_space_start_ext[j]
-                else:
-                    break
-
-            # Compute per-world cumulative joint space counts to initialize world_space_start
-            for j, w in enumerate(self.joint_world):
-                if w >= 0:
-                    world_space_start[w + 1] += joint_space_start_ext[j + 1] - joint_space_start_ext[j]
-
-            # Convert per-world counts to cumulative start indices
-            world_space_start[0] += front_global_space_count
-            for w in range(self.world_count):
-                world_space_start[w + 1] += world_space_start[w]
-
-            # Add total (i.e. final) entity counts to the per-world start indices
-            world_space_start[-1] = space_count
+            world_space_start.extend(starts.tolist())
 
         # Check that all world offset indices are cumulative and match counts
         for world_start_array, space_start_array, total_count, name in world_joint_space_start_arrays:
