@@ -515,12 +515,20 @@ def _choose_method(
         ordinary_ns = total / denominator * float(count) + 2.0 * coefficients[6]
         # Extra rejection/empty-queue launches and amortized probes.
         overhead_ns = 6.0 * coefficients[6] + (total + 3.0 * coefficients[6]) / float(period)
-        saving_ns = (mean - uncertainty) * float(count) - overhead_ns
+        saving_ns = mean * float(count) - overhead_ns
+        band_ns = uncertainty * float(count)
         estimates[0] = ordinary_ns * 1.0e-6
         estimates[1] = (ordinary_ns - saving_ns) * 1.0e-6
-        estimates[2] = uncertainty * float(count) * 1.0e-6
+        estimates[2] = band_ns * 1.0e-6
         estimates[3] = float(count)
-        choice[0] = int(samples >= 32 and wp.isfinite(saving_ns) and saving_ns > 0.15 * ordinary_ns)
+        # The two routes' estimated costs compared directly, the sampling band as hysteresis: the chosen route stays
+        # until the other is cheaper beyond the band (the saving's two-sigma bound past zero), so an estimate near the
+        # crossing keeps one route rather than flipping epoch to epoch. Too few samples keep the route as well.
+        if samples >= 32 and wp.isfinite(saving_ns):
+            if choice[0] == 0 and saving_ns - band_ns > 0.0:
+                choice[0] = 1
+            elif choice[0] == 1 and saving_ns + band_ns < 0.0:
+                choice[0] = 0
     epoch[0] += 1
     ordinary_count[0] = wp.where(choice[0] == 0, count, 0)
     rejection_count[0] = wp.where(choice[0] == 1, count, 0)
