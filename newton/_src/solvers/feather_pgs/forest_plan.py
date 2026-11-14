@@ -36,6 +36,7 @@ from ...geometry.flags import ShapeFlags
 from ...geometry.types import GeoType
 from ...sim import Model
 from ...sim.enums import JointType
+from ...sim.shape_contact_pairs import _shape_contact_pair_sample
 from . import host_index
 from .body_cut import BodyCut
 from .body_mapping import build_body_maps
@@ -303,6 +304,11 @@ class ForestPlan:
     """Each world's class among :attr:`world_classes`."""
     world_classes: tuple[WorldClass, ...]
     """The world classes, by their first world."""
+    contact_hub: bool
+    """Whether a contact can join a free body to a tree of its world that is not one: every contact on a free body
+    touches all six of its coordinates and every row of a tree shares its tree, so such a contact joins two cliques of
+    conflicting rows into one, a level whose rows all couple: the split law's. Free bodies that touch each other
+    color into exact levels (the colored units)."""
     shape: ClassShape
 
     # Size groups.
@@ -731,20 +737,7 @@ def _world_classes(plan, model):
     def present(law, trees):
         laws[distinct(tree_world[trees[trees >= 0]])] |= int(law)
 
-    if model.shape_contact_pair_count:
-        pairs = model.shape_contact_pairs.numpy().reshape(-1, 2)
-        bodies = np.sort(model.shape_body.numpy()[pairs], axis=1)
-        trees = np.where(bodies >= 0, plan.body_tree[bodies], -1).max(axis=1)
-        present(RowLaw.CONTACT, trees)
-        # A sphere or an ellipsoid touches a convex shape at one point (the narrow phase skips its multi-contact
-        # manifold); a body pair of one such shape pair has no footprint, every other one can.
-        kinds = model.shape_type.numpy()[pairs]
-        soft = (model.shape_flags.numpy()[pairs] & int(ShapeFlags.HYDROELASTIC)) != 0
-        round_ = np.isin(kinds, _ONE_POINT_SHAPES).any(axis=1)
-        convex = ~np.isin(kinds, _MANIFOLD_SHAPES).any(axis=1) & ~soft.any(axis=1)
-        pair_body = row_ids(bodies)
-        shared = np.bincount(pair_body)[pair_body]
-        present(RowLaw.SPIN, trees[(shared > 1) | ~(round_ & convex)])
+    plan.contact_hub = _contact_laws(plan, model, laws) if model.shape_contact_pair_count else False
     if model.joint_count:
         joint_tree = _joint_tree(plan)
         limited = np.flatnonzero(np.isin(model.joint_type.numpy(), _LIMITED_JOINTS) & (joint_tree >= 0))
@@ -783,6 +776,60 @@ def _world_classes(plan, model):
     laws.setflags(write=False)
     world_class.setflags(write=False)
     plan.world_laws, plan.world_class, plan.world_classes = laws, world_class, tuple(classes)
+
+
+def _contact_laws(plan, model, laws: np.ndarray) -> bool:
+    """Add the contact row laws to each world's ``laws`` from the model's pairs, and return whether a contact can join
+    a free body to a tree of its world that is not one (:attr:`ForestPlan.contact_hub`).
+
+    The pairs are sampled one world per group of worlds equal in their shapes' kinds and their bodies' trees
+    (:func:`~newton._src.sim.shape_contact_pairs._shape_contact_pair_sample`): a tree of the shape's own world counts
+    relative to the world's first tree, any other tree keeps its world apart. A group's representative's laws are
+    its worlds'.
+    """
+    tree_world = plan.articulation_world[plan.tree_articulation]
+    free_tree = plan.is_free_rigid_host[plan.tree_articulation] != 0
+    shape_body, shape_world = model.shape_body.numpy(), model.shape_world.numpy()
+    kinds = model.shape_type.numpy()
+    soft = (model.shape_flags.numpy() & int(ShapeFlags.HYDROELASTIC)) != 0
+    shape_tree = np.where(shape_body >= 0, plan.body_tree[np.maximum(shape_body, 0)], -1)
+    has_tree = shape_tree >= 0
+    own_tree, free = np.zeros_like(has_tree), np.zeros_like(has_tree)
+    own_tree[has_tree] = tree_world[shape_tree[has_tree]] == shape_world[has_tree]
+    free[has_tree] = free_tree[shape_tree[has_tree]]
+    first_tree = np.full(max(model.world_count, 1), np.iinfo(np.int64).max, dtype=np.int64)
+    np.minimum.at(first_tree, shape_world[own_tree], shape_tree[own_tree])
+    tree_code = np.where(
+        own_tree, shape_tree - first_tree[np.maximum(shape_world, 0)], np.where(has_tree, -2 - shape_world, -1)
+    )
+    sample = _shape_contact_pair_sample(model, kinds, soft, tree_code, free)
+    pairs = sample.pairs
+    bodies = np.sort(shape_body[pairs], axis=1)
+    pair_trees = np.where(bodies >= 0, plan.body_tree[np.maximum(bodies, 0)], -1)
+    trees = pair_trees.max(axis=1)
+    # A sphere or an ellipsoid touches a convex shape at one point (the narrow phase skips its multi-contact
+    # manifold); a body pair of one such shape pair has no footprint, every other one can.
+    round_ = np.isin(kinds[pairs], _ONE_POINT_SHAPES).any(axis=1)
+    convex = ~np.isin(kinds[pairs], _MANIFOLD_SHAPES).any(axis=1) & ~soft[pairs].any(axis=1)
+    # A body pair's shape pairs: those of its world, or of every world when no body is the world's own.
+    pair_body = row_ids(bodies)
+    shared = np.bincount(pair_body, weights=np.where(sample.shared_bodies(bodies), sample.weights(), 1))[pair_body]
+    bits = np.where(
+        trees >= 0, int(RowLaw.CONTACT) | np.where((shared > 1) | ~(round_ & convex), int(RowLaw.SPIN), 0), 0
+    )
+    target = np.full(trees.size, -1, dtype=np.int64)
+    target[trees >= 0] = tree_world[trees[trees >= 0]]
+    # Laws on the representative's own trees are every world's of its group; others are their tree's world's.
+    representative = np.full(trees.size, -2, dtype=np.int64)
+    representative[sample.group >= 0] = sample.first[sample.group[sample.group >= 0]]
+    replicated = (target == representative) & (bits != 0)
+    group_bits = np.zeros(sample.first.size, dtype=laws.dtype)
+    np.bitwise_or.at(group_bits, sample.group[replicated], bits[replicated].astype(laws.dtype))
+    laws |= group_bits[sample.world_group[: laws.size]]
+    direct = ~replicated & (bits != 0)
+    np.bitwise_or.at(laws, target[direct], bits[direct].astype(laws.dtype))
+    joined = pair_trees[(pair_trees >= 0).all(axis=1) & (pair_trees[:, 0] != pair_trees[:, 1])]
+    return bool(np.any(free_tree[joined[:, 0]] != free_tree[joined[:, 1]]))
 
 
 def _mass_schedules(plan, model):

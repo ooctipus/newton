@@ -18,12 +18,12 @@ from functools import cached_property
 from typing import TYPE_CHECKING
 
 import numpy as np
+import warp as wp
 
 from ..core.host_unique import row_ids
 from ..geometry.flags import ShapeFlags
 
 if TYPE_CHECKING:
-    import warp as wp
     from numpy.typing import ArrayLike
 
     from ..geometry.broad_phase_nxn import ShapePairTemplates
@@ -668,7 +668,18 @@ class _ShapeContactPairs:
         pair_group = np.concatenate(
             (np.full(record.global_pairs.shape[0], -1, dtype=np.int64), np.repeat(replayed, sizes[template[replayed]]))
         )
-        return _PairSample(pairs, pair_group, groups.sizes, groups.first, groups.group, self.worlds.global_bodies)
+        shift, _ = self.worlds.shift(groups)
+        return _PairSample(
+            pairs,
+            pair_group,
+            groups.sizes,
+            groups.first,
+            groups.group,
+            shift,
+            self.shape_world,
+            self.worlds.global_bodies,
+            self,
+        )
 
     def _templates(self, shape_mask: np.ndarray | None) -> _Templates:
         """The pairs (within ``shape_mask``) as the global pairs and per-world templates: each group's first world's
@@ -737,9 +748,10 @@ class _Templates:
 class _PairSample:
     """A pair list as the global pairs and one representative world's pairs per group of worlds.
 
-    Every quantity that a world's pairs decide through the values the groups were split by (:meth:`_ShapeContactPairs.
-    sample`) is the same for the worlds of a group, so it is computed on the representative's pairs and expanded with
-    :attr:`world_group`. A supplied pair list samples every world (each world its own group).
+    Every quantity that a world's pairs decide through the per-shape values the groups were split by
+    (:meth:`refine`) is the same for the worlds of a group, so it is computed on the representative's pairs and
+    expanded: a sum by :meth:`weights`, a per-world value by :meth:`per_world`, a per-shape one by :meth:`spread`.
+    A supplied pair list samples every world (each world its own group).
     """
 
     pairs: np.ndarray
@@ -752,17 +764,162 @@ class _PairSample:
     """Each group's representative world."""
     world_group: np.ndarray
     """Each world's group."""
+    world_shift: np.ndarray
+    """Each world's shape offset from its group's representative."""
+    shape_world: np.ndarray
+    """Each shape's world."""
     global_bodies: np.ndarray
     """The bodies that global shapes are on: the same in every world, unlike a world's own bodies."""
+    topology: _ShapeContactPairs | None = None
+    """The topology the sample's templates come from; ``None`` for a supplied list."""
+
+    @classmethod
+    def of_list(cls, pairs: np.ndarray, shape_world: np.ndarray, world_count: int) -> _PairSample:
+        """Sample a supplied pair list whole: each world is its own group, an invalid or global pair its own."""
+        pairs = np.asarray(pairs, dtype=np.int32).reshape((-1, 2))
+        valid = np.all((pairs >= 0) & (pairs < shape_world.size), axis=1)
+        world = np.full(len(pairs), -1, dtype=np.int64)
+        world[valid] = np.max(shape_world[pairs[valid]], axis=1)
+        world_count = max(world_count, int(world.max(initial=-1)) + 1)
+        worlds = np.arange(world_count, dtype=np.int64)
+        return cls(
+            pairs,
+            world,
+            np.ones(world_count, dtype=np.int64),
+            worlds,
+            worlds,
+            np.zeros(world_count, dtype=np.int64),
+            shape_world,
+            np.zeros(0, dtype=np.int64),
+        )
+
+    def refine(self, *values: np.ndarray) -> _PairSample:
+        """The same list sampled with its groups split by the per-shape ``values``."""
+        return self if self.topology is None else self.topology.sample(*values)
 
     def weights(self) -> np.ndarray:
         """The number of the list's pairs each sampled pair stands for."""
-        return np.where(self.group >= 0, self.sizes[np.maximum(self.group, 0)], 1)
+        weights = np.ones(self.group.size, dtype=np.int64)
+        grouped = self.group >= 0
+        weights[grouped] = self.sizes[self.group[grouped]]
+        return weights
+
+    def pair_list(self) -> np.ndarray:
+        """The whole pair list on the host, shape [n, 2], int32."""
+        return self.pairs if self.topology is None else self.topology.build_pairs()
+
+    def count(self, selected: np.ndarray) -> int:
+        """The number of the list's pairs whose sampled pair is ``selected``."""
+        return int(self.weights()[selected].sum())
+
+    def per_world(self, slots: np.ndarray) -> np.ndarray:
+        """Per-slot values (globals in slot zero, world w in slot w + 1) given for the global slot and the
+        representatives, for every world: each world takes its representative's."""
+        out = np.empty(self.world_group.size + 1, dtype=slots.dtype)
+        out[0] = slots[0]
+        out[1:] = slots[1 + self.first[self.world_group]]
+        return out
+
+    def spread(self, values: np.ndarray) -> np.ndarray:
+        """Per-shape ``values`` given on the global shapes and the representatives' shapes, for every shape: each
+        world's shapes take their representative's."""
+        source = np.arange(values.size)
+        local = self.shape_world >= 0
+        source[local] -= self.world_shift[self.shape_world[local]]
+        return values[source]
+
+    def shapes(self) -> np.ndarray:
+        """Whether each shape is in a pair of the list."""
+        listed = np.zeros(self.shape_world.size, dtype=bool)
+        ids = self.pairs.reshape(-1)
+        listed[ids[(ids >= 0) & (ids < listed.size)]] = True
+        return self.spread(listed)
 
     def shared_bodies(self, bodies: np.ndarray) -> np.ndarray:
         """Whether a sampled pair's ``bodies`` (shape [n, 2]) are the same in every world: no body of its world's own."""
         own = (bodies >= 0) & ~np.isin(bodies, self.global_bodies)
         return ~own.any(axis=1)
+
+    def sorted_codes(self, selected: np.ndarray, device) -> tuple[wp.array, wp.array]:
+        """The list's pairs whose sampled pair is ``selected``, as ascending packed codes ``(a << 32) | b`` and each
+        one's world (``world_count`` for a pair of global shapes), on ``device``.
+
+        A representative's pairs are sorted once and its other worlds' are written shifted by a kernel. The codes
+        ascend by first shape: those of the leading global shapes (with global shapes, then every world's shapes in
+        world order, then trailing global shapes), then each world's own, then those of the trailing global shapes.
+        """
+        pairs = self.pairs[selected].astype(np.int64)
+        group = self.group[selected]
+        world_count = self.world_group.size
+        local = self.shape_world >= 0
+        front = int(np.argmax(local)) if local.any() else self.shape_world.size
+        codes = (pairs[:, 0] << 32) | pairs[:, 1]
+        leading = pairs[:, 0] < front
+        # Leading global shapes' codes: by first shape, the global pairs before and after every world's.
+        lead_global = leading & (group < 0)
+        before = lead_global & (pairs[:, 1] < front)
+        lead_codes = np.concatenate(
+            (
+                np.sort(codes[before]),
+                self._expand(codes, group, leading & (group >= 0)),
+                np.sort(codes[lead_global & ~before]),
+            )
+        )
+        lead_codes = lead_codes[np.argsort(lead_codes >> 32, kind="stable")]
+        own = ~leading & (group >= 0)
+        trailing = np.sort(codes[~leading & (group < 0)])
+        own_order = np.lexsort((codes[own], group[own]))
+        rep_codes = codes[own][own_order]
+        rep_group = group[own][own_order]
+        counts = np.bincount(rep_group, minlength=self.first.size)
+        starts = np.cumsum(counts) - counts
+        world_counts = counts[self.world_group]
+        world_offset = lead_codes.size + np.cumsum(world_counts) - world_counts
+        total = lead_codes.size + int(world_counts.sum()) + trailing.size
+        out = wp.empty(total, dtype=wp.uint64, device=device)
+        worlds = wp.empty(total, dtype=wp.int32, device=device)
+        if lead_codes.size:
+            # A leading global shape's code belongs to its second shape's world (``world_count`` for a global one).
+            head_world = self.shape_world[lead_codes & 0xFFFFFFFF]
+            head_world = np.where(head_world < 0, world_count, head_world).astype(np.int32)
+            wp.copy(out, wp.array(lead_codes.view(np.uint64), dtype=wp.uint64, device=device), count=lead_codes.size)
+            wp.copy(worlds, wp.array(head_world, dtype=wp.int32, device=device), count=lead_codes.size)
+        if trailing.size:
+            offset = total - trailing.size
+            wp.copy(out, wp.array(trailing.view(np.uint64), dtype=wp.uint64, device=device), dest_offset=offset)
+            wp.copy(worlds, wp.full(trailing.size, world_count, dtype=wp.int32, device=device), dest_offset=offset)
+        if world_counts.size and world_counts.max(initial=0) > 0:
+            # A shift moves the first shape and a local second shape.
+            step = (1 << 32) + (self.shape_world[rep_codes & 0xFFFFFFFF] >= 0)
+            wp.launch(
+                _expand_world_codes,
+                dim=(world_count, int(world_counts.max())),
+                inputs=[
+                    wp.array(rep_codes.view(np.uint64), dtype=wp.uint64, device=device),
+                    wp.array(step.astype(np.uint64), dtype=wp.uint64, device=device),
+                    wp.array(starts[self.world_group], dtype=wp.int64, device=device),
+                    wp.array(world_counts, dtype=wp.int64, device=device),
+                    wp.array(world_offset, dtype=wp.int64, device=device),
+                    wp.array(self.world_shift, dtype=wp.int64, device=device),
+                    out,
+                    worlds,
+                ],
+                device=device,
+            )
+        return out, worlds
+
+    def _expand(self, codes: np.ndarray, group: np.ndarray, selected: np.ndarray) -> np.ndarray:
+        """The codes of a leading global shape with a world's shape, ``selected`` among the sampled ones, for every
+        world in world order, each world's in its representative's order (shifted in their second shape)."""
+        rep_codes, rep_group = codes[selected], group[selected]
+        if not rep_codes.size:
+            return rep_codes
+        counts = np.bincount(rep_group, minlength=self.first.size)
+        rep_codes = rep_codes[np.lexsort((rep_codes, rep_group))]
+        starts = np.cumsum(counts) - counts
+        world_counts = counts[self.world_group]
+        world, rank = _segments(world_counts)
+        return rep_codes[starts[self.world_group[world]] + rank] + self.world_shift[world]
 
 
 def _shape_contact_pair_counts(model: Model | ModelView, *, shape_mask: np.ndarray | None = None) -> np.ndarray:
@@ -857,6 +1014,33 @@ def _shape_contact_pair_sample(model: Model | ModelView, *values: np.ndarray) ->
     if not supplied:
         return _shape_contact_pair_topology(model).sample(*values)
     pairs = np.empty((0, 2), dtype=np.int32) if pairs is None else pairs.numpy().reshape((-1, 2))
-    world = np.max(model.shape_world.numpy()[pairs], axis=1).astype(np.int64) if len(pairs) else np.zeros(0, np.int64)
-    worlds = np.arange(model.world_count, dtype=np.int64)
-    return _PairSample(pairs, world, np.ones(model.world_count, dtype=np.int64), worlds, worlds, np.zeros(0, np.int64))
+    return _PairSample.of_list(pairs, model.shape_world.numpy(), model.world_count)
+
+
+def _shape_pair_list_sample(model: Model | ModelView, pairs: wp.array[wp.vec2i] | np.ndarray) -> _PairSample:
+    """The pair list ``pairs`` sampled: by the model's templates when it is the model's own built list, else whole."""
+    supplied, _ = _shape_contact_pair_override(model)
+    if not supplied and pairs is model._shape_contact_pairs:
+        return _shape_contact_pair_topology(model).sample()
+    pairs = pairs.numpy() if isinstance(pairs, wp.array) else np.asarray(pairs)
+    return _PairSample.of_list(pairs, model.shape_world.numpy(), model.world_count)
+
+
+@wp.kernel(enable_backward=False)
+def _expand_world_codes(
+    codes: wp.array[wp.uint64],
+    step: wp.array[wp.uint64],
+    world_start: wp.array[wp.int64],
+    world_count: wp.array[wp.int64],
+    world_offset: wp.array[wp.int64],
+    world_shift: wp.array[wp.int64],
+    out: wp.array[wp.uint64],
+    out_world: wp.array[wp.int32],
+):
+    world, rank = wp.tid()
+    if wp.int64(rank) >= world_count[world]:
+        return
+    source = world_start[world] + wp.int64(rank)
+    target = world_offset[world] + wp.int64(rank)
+    out[target] = codes[source] + wp.uint64(world_shift[world]) * step[source]
+    out_world[target] = wp.int32(world)
