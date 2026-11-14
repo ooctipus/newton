@@ -81,6 +81,9 @@ from .tree_scan import (
     WalkClass,
 )
 
+# FeatherPGS takes no gradients: its kernels compile no adjoints.
+wp.set_module_options({"enable_backward": False})
+
 __all__ = [
     "TreeFactor",
     "prepare_augmented_drives",

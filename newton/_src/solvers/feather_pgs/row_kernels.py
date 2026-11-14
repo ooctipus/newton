@@ -30,6 +30,9 @@ from .row_laws import (
 )
 from .row_records import UNIT_LINK, UNIT_SPEED, DenseRows, RowSupport, row_sides, unit_source
 
+# FeatherPGS takes no gradients: its kernels compile no adjoints.
+wp.set_module_options({"enable_backward": False})
+
 LINK_PLAN = FieldGroup(
     Field("_link_primary", wp.int32, ("link",), owner="laws"),
     Field("_link_shadow", wp.int32, ("link",), owner="laws"),

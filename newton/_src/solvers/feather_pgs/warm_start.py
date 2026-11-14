@@ -21,6 +21,9 @@ from .factor.kernels import Clock, clock_dt_ratio
 from .field_group import Field
 from .row_laws import ROW_CONTACT
 
+# FeatherPGS takes no gradients: its kernels compile no adjoints.
+wp.set_module_options({"enable_backward": False})
+
 
 @wp.kernel
 def prepare_world_impulses(

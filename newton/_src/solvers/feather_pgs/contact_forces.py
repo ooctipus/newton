@@ -10,6 +10,9 @@ from .contact_input import ContactRoutes
 from .contact_laws import contact_tangent_basis
 from .row_laws import ROW_FRICTION
 
+# FeatherPGS takes no gradients: its kernels compile no adjoints.
+wp.set_module_options({"enable_backward": False})
+
 
 @wp.func
 def _contact_linear_force(

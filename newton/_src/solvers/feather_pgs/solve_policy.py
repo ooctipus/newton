@@ -49,6 +49,9 @@ from .device_preludes import DevicePrelude
 from .field_group import Field, FieldGroup, SolverArrays
 from .row_inputs import RowArgument
 
+# FeatherPGS takes no gradients: its kernels compile no adjoints.
+wp.set_module_options({"enable_backward": False})
+
 SOLVE_READOUTS = ("off", "sweeps", "trace")
 """Accepted readouts: no counter, executed sweeps, or executed sweeps with the exit-law trace."""
 

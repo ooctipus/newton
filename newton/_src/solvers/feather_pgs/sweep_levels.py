@@ -35,6 +35,9 @@ from .kernel_template import KernelTemplate, items, python_kernel
 from .packed_rows import CLASS_SIDES
 from .row_laws import ROW_CONTACT, ROW_FRICTION, ROW_JOINT_LIMIT, ROW_JOINT_VELOCITY_LIMIT, ROW_TORSION
 
+# FeatherPGS takes no gradients: its kernels compile no adjoints.
+wp.set_module_options({"enable_backward": False})
+
 
 def level_pass(*, units: str, resources: str, counts: str, store: str, lanes: int = 32) -> str:
     """Return CUDA source that levels a world's ``units`` units in row order (Cartier-Foata), by one warp, a batch of

@@ -15,6 +15,9 @@ from ..device_preludes import lane_minimum
 from ..joint_table import JointTable
 from ..spatial_laws import free_root_transport
 
+# FeatherPGS takes no gradients: its kernels compile no adjoints.
+wp.set_module_options({"enable_backward": False})
+
 
 @wp.kernel
 def compute_com_transforms(

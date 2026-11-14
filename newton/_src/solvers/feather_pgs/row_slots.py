@@ -15,6 +15,9 @@ from .friction_patches import FrictionPatches, patch_spin_rows
 from .row_laws import contact_capped_beta, contact_depenetration_cap, contact_restitution_rhs, contact_rhs, separates
 from .row_records import UNIT_CONTACT, unit_source
 
+# FeatherPGS takes no gradients: its kernels compile no adjoints.
+wp.set_module_options({"enable_backward": False})
+
 # =============================================================================
 # Multi-Articulation Contact Building Kernels
 # =============================================================================

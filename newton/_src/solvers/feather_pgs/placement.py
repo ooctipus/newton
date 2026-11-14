@@ -41,6 +41,9 @@ from .row_records import DENSE_ROWS, ROW_RECORDS, RowSupport
 from .row_slots import place_world_contact_runs, record_world_contact_runs
 from .warm_start import ContactCarry, prepare_world_impulses
 
+# FeatherPGS takes no gradients: its kernels compile no adjoints.
+wp.set_module_options({"enable_backward": False})
+
 ROW_SLOT_UNBOUNDED = 2**31 - 1
 """First rejected slot of a row family that rejected none this step."""
 
