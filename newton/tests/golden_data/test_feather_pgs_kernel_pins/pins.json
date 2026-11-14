@@ -424,5 +424,5 @@
   "warm_start.prepare_world_impulses": "ef95f5e2e4ffaa5e28b1cf712eecd97c6294c59ed9fa8a7bb66e77561996a381",
   "warm_start.reset_world_impulses": "eaff9d7e371f52a8e01e264aac4b43427fb7b35d5681420bc0ae82cb50466b3e"
  },
- "warp": "1.20.0.dev0"
+ "warp": "1.20.0.dev20261113"
 }
