@@ -32,6 +32,7 @@ from typing import Any
 
 import warp as wp
 
+from ...core.memory import STAGE_PARAMETER
 from . import field_group
 from .device_preludes import DevicePrelude, cuda_native, dual_native, substitute
 
@@ -196,6 +197,10 @@ class KernelTemplate:
             ``"unique"`` for a variant in a module of its own.
         function: A Warp function (``wp.func``) body in place of a native one (``source`` empty): the dispatch calls
             it as it calls a native function, so a Python kernel is the same dispatch over a ``wp.func``.
+        stage: Bytes of the block's stage in dynamic shared memory (:meth:`.memory.Staging.dynamic_bytes`), or 0: the
+            wrapper allocates them first as a shared tile, which sizes the launch's dynamic shared memory and opts the
+            kernel into it, and passes the tile to the native function ahead of the dispatch's arguments as
+            :data:`.memory.STAGE_PARAMETER`, whose data the stage's declarations take.
     """
 
     name: str
@@ -210,6 +215,7 @@ class KernelTemplate:
     composed: bool = False
     module: str = "unique"
     function: Any = None
+    stage: int = 0
 
     @classmethod
     def from_abi(cls, name: str, abi, source: str, dispatch: Dispatch, extra=(), **options) -> KernelTemplate:
@@ -243,9 +249,20 @@ class KernelTemplate:
         return cuda_native(self.source, preludes=self.preludes)
 
     @property
+    def stage_words(self) -> int:
+        """32-bit words of the dynamic stage's tile: its bytes in whole 16-byte granules (a tile's alignment)."""
+        return -(-int(self.stage) // 16) * 4
+
+    @property
     def native_params(self) -> tuple[tuple[str, Any], ...]:
-        """The native function's ABI: the dispatch's leading parameters, then the kernel's (except private ones)."""
-        return (*self.dispatch.leading, *(item for item in self.params if item[0] not in self.dispatch.private))
+        """The native function's ABI: the dynamic stage's tile where there is one, the dispatch's leading parameters,
+        then the kernel's (except private ones)."""
+        stage = ((STAGE_PARAMETER, wp.tile(dtype=wp.int32, shape=(self.stage_words,), storage="shared")),)
+        return (
+            *(stage if self.stage else ()),
+            *self.dispatch.leading,
+            *(item for item in self.params if item[0] not in self.dispatch.private),
+        )
 
     @property
     def signature(self) -> tuple[tuple[str, Any], ...]:
@@ -255,8 +272,15 @@ class KernelTemplate:
     def declaration(self) -> str:
         """The Python source of the native function and its Warp wrapper (annotations by ``type_<name>`` alias)."""
         operands = (name for name, _ in self.params if name not in self.dispatch.private)
-        call = f"{self.native_name}({', '.join((*self.dispatch.arguments, *operands))})"
+        stage = (STAGE_PARAMETER,) if self.stage else ()
+        call = f"{self.native_name}({', '.join((*stage, *self.dispatch.arguments, *operands))})"
         body = substitute(self.dispatch.body, CALL=call)
+        if self.stage:
+            if self.function is not None:
+                raise ValueError(f"{self.name}: a dynamic stage is a native body's")
+            # The kernel's first allocation of Warp's dynamic shared memory, uninitialized (tile_empty stores nothing).
+            alloc = f'{STAGE_PARAMETER} = wp.tile_empty(shape={self.stage_words}, dtype=wp.int32, storage="shared")'
+            body = f"{alloc}\n{body}"
         native = f"@wp.func_native(snippet)\ndef {self.native_name}({_annotated(self.native_params)}): ...\n\n"
         return (
             ("" if self.function is not None else native)

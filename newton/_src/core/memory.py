@@ -10,8 +10,10 @@ the place is data, chosen by a rule, and the body's text does not change with it
 the one place every such concept lives:
 
 - the device: :class:`Device`, its memory hierarchy and occupancy, read once (:func:`device`);
-- the shared stage: :class:`Staging` (a block's working set, declared buffer by buffer) under the device's static
-  budget (:func:`static_budget`), the rule that stages what pays (:func:`stage`) and the carveout (:func:`carveout`);
+- the shared stage: :class:`Staging` (a block's working set, declared buffer by buffer) under the device's stage
+  budget (:func:`stage_budget`), static shared memory up to the limit a build admits and Warp's dynamic shared memory
+  past it (:attr:`Staging.dynamic`), the rule that stages what pays (:func:`stage`) and the carveout
+  (:func:`carveout`);
 - the access words, one text each with its CPU twin: ``LDG`` (L1's non-coherent path), ``LD``/``ST``/``ADD``
   (coherent global loads, stores and adds), ``TOUCH`` and ``FETCH`` (loads ahead: one L1 hint a line, and a lane
   group's fetch of a byte range), ``LDCG``/``STCG`` (L2 past L1), ``HELD`` (a distributed array over a lane group's
@@ -45,7 +47,8 @@ __all__ = [
     "RESERVED_SHARED_BYTES",
     "SHARED_ALLOCATION_BYTES",
     "SHARED_STORAGE",
-    "STATIC_SHARED_BUDGETS",
+    "STAGE_BUDGETS",
+    "STAGE_PARAMETER",
     "STATIC_SHARED_BYTES",
     "TILE_BYTES_PER_THREAD",
     "Buffer",
@@ -60,7 +63,7 @@ __all__ = [
     "granules",
     "read",
     "stage",
-    "static_budget",
+    "stage_budget",
     "table",
     "words",
 ]
@@ -71,7 +74,8 @@ __all__ = [
 
 STATIC_SHARED_BYTES = 48 * 1024
 """Static shared memory a block may declare in a build ptxas assembles [B] (offline, or a CUBIN of Warp's NVRTC):
-ptxas rejects more on every architecture (0xc000)."""
+ptxas rejects more on every architecture (0xc000). A stage past it lives in dynamic shared memory
+(:attr:`Staging.dynamic`), which a launch opts into up to the device's maximum."""
 
 CPU_STAGING_BYTES = 4 * 1024 * 1024
 """The working set a CPU block may declare [B]: the CPU's one thread runs the block and keeps it on its stack (an
@@ -80,11 +84,11 @@ automatic array), so no shared-memory budget applies; this bound keeps a block w
 RESERVED_SHARED_BYTES = 1024
 """Shared memory the driver reserves in every block [B] (sm_80 and later), out of the opt-in maximum per block."""
 
-STATIC_SHARED_BUDGETS: dict[int, int] = {}
-"""Static shared memory budgets [B] by architecture (``Device.arch``) that a probe measured below the opt-in
-maximum less the driver's reservation; :func:`static_budget` reads them first. None is recorded: from PTX, the RTX
-PRO 6000 (sm_120, opt-in 101,376 B) loads a kernel declaring 100,352 B and refuses 101,376 B, the GB300 (sm_103)
-loads 231,424 B and refuses 232,448 B (measured 2026-10-27)."""
+STAGE_BUDGETS: dict[int, int] = {}
+"""Stage budgets [B] by architecture (``Device.arch``) that a probe measured below the opt-in maximum less the
+driver's reservation; :func:`stage_budget` reads them first. None is recorded: from PTX, the RTX PRO 6000 (sm_120,
+opt-in 101,376 B) loads a kernel declaring 100,352 B and refuses 101,376 B, the GB300 (sm_103) loads 231,424 B and
+refuses 232,448 B (measured 2026-10-27)."""
 
 REFERENCE_ARCH = 120
 """The architecture an offline build that names none is sized for (:func:`built_for`): the RTX PRO 6000's (sm_120),
@@ -121,7 +125,14 @@ _ARCHITECTURES: dict[int, tuple[int, int, tuple[int, ...], int]] = {
 }
 """A multiprocessor's occupancy limits by architecture (CUDA's occupancy tables): resident threads, resident blocks,
 the driver's shared-memory carveout steps [KiB] and the unified L1/shared memory they divide [KiB]. Warp reports
-neither; every architecture keeps 65,536 registers a multiprocessor."""
+neither; every architecture keeps 65,536 registers a multiprocessor. A block's opt-in maximum of shared memory is the
+largest carveout less the driver's reservation (:func:`_opt_in`)."""
+
+
+def _opt_in(arch: int) -> int:
+    """The opt-in maximum of shared memory a block of the architecture ``arch`` [B]: its multiprocessor's shared
+    memory less the driver's reservation (sm_120's 101,376 B, sm_103's 232,448 B, as the devices report)."""
+    return _ARCHITECTURES[arch][2][-1] * 1024 - RESERVED_SHARED_BYTES
 
 
 @dataclasses.dataclass(frozen=True)
@@ -133,7 +144,7 @@ class Device:
         sms: Multiprocessors.
         threads_per_sm: Threads a multiprocessor keeps resident.
         blocks_per_sm: Blocks a multiprocessor keeps resident.
-        shared_per_block: Static shared memory a block may declare [B] (:func:`static_budget`).
+        shared_per_block: Shared memory a block's stage may take [B] (:func:`stage_budget`).
         carveouts_kb: The driver's shared-memory carveout steps [KiB], ascending; the last is a multiprocessor's
             shared memory.
         unified_kb: The unified L1 and shared memory a multiprocessor divides between them [KiB].
@@ -167,7 +178,7 @@ class Device:
         if arch not in _ARCHITECTURES:
             raise ValueError(f"no occupancy table for sm_{arch}: add the architecture to execution._ARCHITECTURES")
         threads, blocks, carveouts, unified = _ARCHITECTURES[arch]
-        budget = STATIC_SHARED_BUDGETS.get(arch, int(opt_in_shared) - RESERVED_SHARED_BYTES)
+        budget = STAGE_BUDGETS.get(arch, int(opt_in_shared) - RESERVED_SHARED_BYTES)
         return cls(arch, int(sms), threads, blocks, budget, carveouts, unified)
 
 
@@ -180,11 +191,9 @@ def _read(alias: str) -> Device:
     found = wp.get_device(alias)
     if not found.is_cuda:
         return CPU
-    opt_in = int(found.max_shared_memory_per_block)
-    if found.get_cuda_output_format() != "ptx":
-        # Warp's NVRTC assembles a CUBIN (its toolkit is newer than the driver): ptxas admits an offline build's budget.
-        opt_in = min(opt_in, STATIC_SHARED_BYTES + RESERVED_SHARED_BYTES)
-    return Device.of(int(found.arch), int(found.sm_count), opt_in)
+    # A stage past the static limit a CUBIN of Warp's NVRTC admits takes dynamic shared memory (Staging.dynamic), up to
+    # the opt-in maximum under PTX and CUBIN alike.
+    return Device.of(int(found.arch), int(found.sm_count), int(found.max_shared_memory_per_block))
 
 
 def device(identifier=None) -> Device:
@@ -211,37 +220,39 @@ def _of_architecture(arch: int) -> Device | None:
 
 def built_for(device_arch) -> Device:
     """The device a kernel factory's ``device_arch`` (a number or an offline ``"sm_XX"``) builds for: a CUDA device of
-    the architecture at hand, else the architecture's occupancy table (an offline build; one that names no
-    architecture is sized for :data:`REFERENCE_ARCH`); :data:`CPU` for architecture 0."""
+    the architecture at hand, else the architecture's occupancy table and opt-in maximum (an offline build; one that
+    names no architecture is sized for :data:`REFERENCE_ARCH`); :data:`CPU` for architecture 0."""
     arch = _architecture(device_arch)
     if arch == 0:
         return CPU
     arch = arch if arch > 0 else REFERENCE_ARCH
-    return _of_architecture(arch) or Device.of(arch, 1, STATIC_SHARED_BYTES + RESERVED_SHARED_BYTES)
+    return _of_architecture(arch) or Device.of(arch, 1, _opt_in(arch))
 
 
-def static_budget(arch: int) -> int:
-    """Static shared memory a block of a kernel built for the CUDA architecture ``arch`` may declare [B].
+def stage_budget(arch: int) -> int:
+    """Shared memory a block's stage may take in a kernel built for the CUDA architecture ``arch`` [B].
 
-    The one place a device's static budget is read: a probe's measured budget of the architecture
-    (:data:`STATIC_SHARED_BUDGETS`), else a CUDA device's (:attr:`Device.shared_per_block`): the opt-in maximum per
-    block less the driver's reservation where the driver assembles Warp's PTX, else :data:`STATIC_SHARED_BYTES`, as
-    with no such device (an offline build, the CPU).
+    The one place a device's stage budget is read: a probe's measured budget of the architecture
+    (:data:`STAGE_BUDGETS`), else the device's (:attr:`Device.shared_per_block`, a CUDA device of the architecture
+    or, offline, its occupancy table's): the opt-in maximum per block less the driver's reservation, static shared
+    memory up to :data:`STATIC_SHARED_BYTES` and dynamic past it (:attr:`Staging.dynamic`);
+    :data:`STATIC_SHARED_BYTES` for an architecture without a table.
     """
-    if arch in STATIC_SHARED_BUDGETS:
-        return int(STATIC_SHARED_BUDGETS[arch])
-    found = _of_architecture(arch)
-    return found.shared_per_block if found is not None else STATIC_SHARED_BYTES
+    if arch in STAGE_BUDGETS:
+        return int(STAGE_BUDGETS[arch])
+    if arch not in _ARCHITECTURES:
+        return STATIC_SHARED_BYTES
+    return built_for(arch).shared_per_block
 
 
 def arch_budget(device_arch) -> int:
-    """The working set a block of a kernel factory's ``device_arch`` may declare [B]: :func:`static_budget` of a CUDA
+    """The working set a block of a kernel factory's ``device_arch`` may declare [B]: :func:`stage_budget` of a CUDA
     architecture number, :data:`CPU_STAGING_BYTES` for the CPU (architecture 0) and :data:`STATIC_SHARED_BYTES` for an
     offline build that names none."""
     arch = _architecture(device_arch)
     if arch < 0:
         return STATIC_SHARED_BYTES
-    return static_budget(arch) if arch > 0 else CPU_STAGING_BYTES
+    return stage_budget(arch) if arch > 0 else CPU_STAGING_BYTES
 
 
 def granules(block_bytes: int) -> int:
@@ -507,14 +518,28 @@ class Buffer:
         return f"{align}{self.ctype} {self.name}[{self.count}];"
 
 
-def _layout(buffers) -> int:
-    """Bytes of ``buffers`` laid out in order, each at its alignment (the C rules of a struct's members)."""
-    offset, widest = 0, 1
+def _placed(buffers) -> tuple[list[tuple[Buffer, int]], int]:
+    """Each of ``buffers`` with its byte offset, laid out in order at its alignment (the C rules of a struct's
+    members), and the bytes of the whole, padded to the widest alignment."""
+    offset, widest, placed = 0, 1, []
     for buffer in buffers:
         alignment = buffer.alignment
         widest = max(widest, alignment)
-        offset = (offset + alignment - 1) // alignment * alignment + buffer.bytes
-    return (offset + widest - 1) // widest * widest
+        offset = (offset + alignment - 1) // alignment * alignment
+        placed.append((buffer, offset))
+        offset += buffer.bytes
+    return placed, (offset + widest - 1) // widest * widest
+
+
+def _layout(buffers) -> int:
+    """Bytes of ``buffers`` laid out in order, each at its alignment (the C rules of a struct's members)."""
+    return _placed(buffers)[1]
+
+
+STAGE_PARAMETER = "stage"
+"""The native parameter that carries a dynamic stage (:attr:`Staging.dynamic`): a shared tile of the stage's bytes,
+which the kernel's Warp wrapper allocates first (:class:`.feather_pgs.kernel_template.KernelTemplate`'s ``stage``), so
+Warp sizes the launch's dynamic shared memory by it and opts the kernel into it; its data holds the buffers."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -591,15 +616,30 @@ class Staging:
         return self.groups * self.group_bytes + self.tile_bytes
 
     def fits(self, limit: int = STATIC_SHARED_BYTES) -> bool:
-        """Whether the block's static shared memory fits the budget ``limit`` [B] (by default an offline build's;
-        a device's is :func:`static_budget`)."""
+        """Whether the block's shared memory fits the budget ``limit`` [B] (by default the static limit; a device's
+        is :func:`stage_budget`)."""
         return self.bytes <= int(limit)
+
+    @property
+    def dynamic(self) -> bool:
+        """Whether the stage takes dynamic shared memory: a stage past the static limit a build admits
+        (:data:`STATIC_SHARED_BYTES`), which a CUDA launch opts into up to the device's maximum (the CPU's one thread
+        keeps either on its stack). Its buffers lie in one block of bytes, ``STAGE``, at their layout's offsets."""
+        return bool(self.buffers) and not self.fits(STATIC_SHARED_BYTES)
+
+    def dynamic_bytes(self, device_arch) -> int:
+        """Dynamic shared memory a launch on ``device_arch`` (an architecture number or an offline ``"sm_XX"``) gives
+        the stage [B]: every group's buffers where the stage is :attr:`dynamic` on a CUDA architecture, else 0 (a
+        static stage, or the CPU's stack)."""
+        if not self.dynamic or _architecture(device_arch) == 0:
+            return 0
+        return self.bytes - self.tile_bytes
 
     def check(self, what: str, limit: int = STATIC_SHARED_BYTES) -> None:
         """Raise ``ValueError`` naming ``what`` when the block does not fit the budget ``limit``."""
         if not self.fits(limit):
             raise ValueError(
-                f"{what} declares {self.bytes} bytes of static shared memory per block "
+                f"{what} declares {self.bytes} bytes of shared memory per block "
                 f"({self.groups} x {self.group_bytes} + {self.tile_bytes} tile storage), over the "
                 f"{int(limit)}-byte limit"
             )
@@ -612,10 +652,14 @@ class Staging:
         the buffers per group, indexed by ``group``, and an alias per buffer
         (:meth:`undefine` removes the aliases at the end of the body), or in the
         ``arrays`` layout one array of every group's copies per buffer
-        (``name_storage``) and a pointer ``name`` to the group's copy.
+        (``name_storage``) and a pointer ``name`` to the group's copy. A
+        :attr:`dynamic` stage declares the same names over its block of bytes
+        (:meth:`_dynamic`).
         """
         if not self.buffers:
             return ""
+        if self.dynamic:
+            return self._dynamic(indent, group)
         if self.groups == 1:
             return "\n".join(f"{indent}SHARED {buffer.declaration()}" for buffer in self.buffers)
         if self.layout == "arrays":
@@ -636,6 +680,43 @@ class Staging:
             f"{indent}struct {self.name} {{\n{members}\n{indent}}};\n"
             f"{indent}SHARED {self.name} {self.name.lower()}[{self.groups}];\n{aliases}"
         )
+
+    def _dynamic(self, indent: str, group: str) -> str:
+        """The declarations of a :attr:`dynamic` stage: its block of bytes ``STAGE`` (on CUDA the data of the kernel's
+        :data:`STAGE_PARAMETER`, on the CPU the stack), then each name of :meth:`declarations`' layout at its offset
+        in it, so the body reads every buffer as it reads a static one."""
+        lines = [
+            "#if defined(__CUDA_ARCH__)",
+            f"{indent}char* const STAGE = reinterpret_cast<char*>({STAGE_PARAMETER}.data.ptr);",
+            "#else",
+            f"{indent}alignas(16) char STAGE[{self.bytes - self.tile_bytes}];",
+            "#endif",
+        ]
+        if self.groups == 1:
+            # Each name an array reference (a typedef: Warp's source defines float(x) and int(x) as casts).
+            for buffer, offset in _placed(self.buffers)[0]:
+                array = f"{buffer.name}_array"
+                lines.append(f"{indent}typedef {buffer.ctype} {array}[{buffer.count}];")
+                lines.append(f"{indent}{array}& {buffer.name} = *reinterpret_cast<{array}*>(STAGE + {offset});")
+            return "\n".join(lines)
+        if self.layout == "arrays":
+            arrays = (dataclasses.replace(buffer, count=buffer.count * self.groups) for buffer in self.buffers)
+            for array, offset in _placed(arrays)[0]:
+                lines.append(
+                    f"{indent}{array.ctype}* const {array.name}_storage = reinterpret_cast<{array.ctype}*>(STAGE + {offset});"
+                )
+            lines.extend(
+                f"{indent}{buffer.ctype}* {buffer.name} = {buffer.name}_storage + {group} * {buffer.count};"
+                for buffer in self.buffers
+            )
+            return "\n".join(lines)
+        members = "\n".join(f"{indent}    {buffer.declaration()}" for buffer in self.buffers)
+        aliases = "\n".join(
+            f"#define {buffer.name} {self.name.lower()}[{group}].{buffer.name}" for buffer in self.buffers
+        )
+        lines.append(f"{indent}struct {self.name} {{\n{members}\n{indent}}};")
+        lines.append(f"{indent}{self.name}* const {self.name.lower()} = reinterpret_cast<{self.name}*>(STAGE);")
+        return "\n".join(lines) + "\n" + aliases
 
     def undefine(self) -> str:
         """Remove the aliases :meth:`declarations` defines for several lane groups in a struct."""

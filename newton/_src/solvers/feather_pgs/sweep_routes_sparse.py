@@ -27,7 +27,7 @@ acts on is the factor-coordinate delta from ``v_hat``, staged per world and publ
 
 :class:`SparseSweep` is the configuration the one factory builds (:func:`.sweep.sweep_kernel`: :data:`SPARSE_ABI`,
 tiles of 64 threads); its working set (:attr:`SparseSweep.staging`) is what the solver's admission and the factory
-check against the device's static budget.
+check against the device's stage budget.
 """
 
 from __future__ import annotations

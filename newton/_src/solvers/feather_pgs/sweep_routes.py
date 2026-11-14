@@ -4,7 +4,7 @@
 """FeatherPGS's general (matrix-free) sweep as a configuration of the sweep emitter (:mod:`.sweep`).
 
 :class:`GeneralSweep` is its configuration, which the one factory builds (:func:`.sweep.sweep_kernel`); its working
-set fits the static budget of the device it is built for (:func:`.memory.arch_budget`). The module also holds what
+set fits the stage budget of the device it is built for (:func:`.memory.arch_budget`). The module also holds what
 every claim's sweep shares: the world queue's dispatch (:func:`worlds`), the free bodies' rows and walk.
 """
 

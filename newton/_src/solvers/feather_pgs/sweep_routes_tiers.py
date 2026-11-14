@@ -66,7 +66,7 @@ TIER_SWEEPS_PER_ITERATION = Fraction(7, 2)
 TIER_SWEEPS_CAP = 128
 """The largest tier budget."""
 TIER_MAX_ROWS = 128
-"""The most rows a tier holds: a lane per row in four warps, its staged block within the static budget."""
+"""The most rows a tier holds: a lane per row in four warps, its staged block within the stage budget."""
 TIER_ROWS = 32
 """The rows a tier holds past the tier below it, a warp's: tier ``t`` serves ``(32 t, 32 (t + 1)]`` rows
 (:func:`.sweep_levels.claim_worlds` buckets its worlds)."""
@@ -277,7 +277,7 @@ class TierSweep(SweepConfig):
     A tier owns no world with free-body rows (its kernel's name carries the solver's free-body capacity
     ``mf_max_constraints``) and admits its velocity-limit rows as unilateral rows. Its worlds' stored rows
     (:mod:`.walk_rows`) lie at their coordinates, ``max_world_dofs`` entries a row. A block a world, a thread a row
-    (the CPU's one thread runs them as virtual lanes); its working set fits the static budget of ``device_arch``. It
+    (the CPU's one thread runs them as virtual lanes); its working set fits the stage budget of ``device_arch``. It
     walks its bucket of the claims' worlds (:func:`.sweep_routes.worlds`, :func:`.sweep_levels.claim_worlds`).
     """
 

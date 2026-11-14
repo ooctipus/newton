@@ -384,7 +384,7 @@ def packed_rule(inputs: ClassInputs) -> tuple[Packed | None, str]:
     body_masks, max_support = row_support(forest, model, plan, articulated, shape.arts is None, mimic_dofs)
     if not max_support:
         return None, "Topology has no responsive row support."
-    # The sweep's shared working set (sweep_routes_sparse.SparseSweep.staging) against the device's static budget:
+    # The sweep's shared working set (sweep_routes_sparse.SparseSweep.staging) against the device's stage budget:
     # each shared-memory choice below reads its own sweep's working set, and the route is admitted by the working
     # set of the sweep it launches, which the one factory checks the same way.
     budget = arch_budget(model.device.arch)

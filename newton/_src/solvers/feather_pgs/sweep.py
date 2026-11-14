@@ -3354,8 +3354,9 @@ class SweepConfig:
 def sweep_kernel(config: SweepConfig) -> wp.Kernel:
     """The one sweep factory: the kernel of ``config`` (:class:`SweepConfig`).
 
-    The configuration's body and working set, the working set checked against the static budget of the device it is
-    built for (:func:`.memory.arch_budget`), the launch bound the layer's shape of its work there
+    The configuration's body and working set, the working set checked against the stage budget of the device it is
+    built for (:func:`.memory.arch_budget`) and held in dynamic shared memory past the static limit
+    (:meth:`.memory.Staging.dynamic_bytes`), the launch bound the layer's shape of its work there
     (:func:`~newton._src.core.execution.shape`), the kernel its native ABI under its dispatch.
     """
     snippet, staging = config.source()
@@ -3370,4 +3371,5 @@ def sweep_kernel(config: SweepConfig) -> wp.Kernel:
         composed=True,
         native_name=config.NATIVE,
         launch_bounds=bounds,
+        stage=staging.dynamic_bytes(config.device_arch),
     ).kernel()

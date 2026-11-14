@@ -307,7 +307,7 @@ multiprocessor at its block limit (24 warps on sm_120, half its 48)."""
 def levels_staging(max_world_dofs: int, device_arch) -> Staging:
     """The contact schedule's shared working set: a world's lane group's coordinates' owner and level
     (:func:`level_pass`) and the offsets' warp sum; on CUDA as many worlds a block, a warp each and up to
-    :data:`LEVELS_WORLDS`, as the device's static budget holds (:func:`.memory.arch_budget`; the CPU's one thread runs
+    :data:`LEVELS_WORLDS`, as the device's stage budget holds (:func:`.memory.arch_budget`; the CPU's one thread runs
     one). Each contact position's packed level and rank are its lane's (:func:`_sparse_contact_levels_kernel`)."""
     buffers = (
         Buffer("node_owner", "int", max_world_dofs),
@@ -390,6 +390,7 @@ def _levels_kernel(
         dispatch=items("world", lanes=L, flat=True),
         composed=True,
         native_name="sparse_contact_levels_native",
+        stage=staging.dynamic_bytes(device_arch),
     ).kernel()
 
 

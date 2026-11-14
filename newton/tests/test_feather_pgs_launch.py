@@ -18,8 +18,9 @@ import warp as wp
 
 from newton._src.core import execution, memory
 from newton._src.core.execution import Queue, Use, Work, shape
-from newton._src.core.memory import CPU, Device, Place, carveout
-from newton._src.solvers.feather_pgs import sweep_routes, tree_kinetic_state, walk_rows
+from newton._src.core.memory import CPU, Buffer, Device, Place, Staging, carveout
+from newton._src.solvers.feather_pgs import kernel_template, sweep_routes, tree_kinetic_state, walk_rows
+from newton._src.solvers.feather_pgs.device_preludes import SHARED_STORAGE, DevicePrelude, dual_native, lane_group
 from newton._src.solvers.feather_pgs.factor import walk as factor_walk
 from newton._src.solvers.feather_pgs.tree_kinetic_layout import TreeLayout
 
@@ -67,6 +68,9 @@ class TestDevice(unittest.TestCase):
             self.assertEqual(memory.built_for("sm_103").shared_per_sm, 228 * 1024)
         if not wp.get_cuda_devices():
             self.assertEqual(memory.built_for(None).arch, memory.REFERENCE_ARCH)
+        # A stage takes the opt-in maximum a block of its architecture, offline as on the device.
+        self.assertEqual(memory.stage_budget(120), PRO.shared_per_block)
+        self.assertEqual(memory.stage_budget(103), GB300.shared_per_block)
 
 
 class TestShapeAgainstTodaysRules(unittest.TestCase):
@@ -277,11 +281,64 @@ def _mark(out: wp.array[int]):
     out[wp.tid()] = 1
 
 
+_STAGE_WORDS = 16 * 1024
+"""A 64 KiB stage: past the static limit, so it takes dynamic shared memory on CUDA."""
+
+
+def _stage_kernel(device):
+    """A block group's kernel whose stage of :data:`_STAGE_WORDS` floats each lane fills and the block reads back
+    reversed, its sum a block in ``out``; and its staging."""
+    arch = wp.get_device(device).arch if wp.get_device(device).is_cuda else 0
+    staging = Staging((Buffer("s_words", "float", _STAGE_WORDS), Buffer("s_sum", "float", 1)), threads=128)
+    body = f"""{staging.declarations()}
+    for (int i = LANE; i < {_STAGE_WORDS}; i += STRIDE) s_words[i] = (float)(i % 7 + block);
+    if (LANE == 0) s_sum[0] = 0.0f;
+    SYNC();
+    float sum = 0.0f;
+    for (int i = LANE; i < {_STAGE_WORDS}; i += STRIDE) sum += s_words[{_STAGE_WORDS} - 1 - i];
+    SUM(sum);
+    if (LANE % WIDTH == 0) ADD(s_sum[0], sum);
+    SYNC();
+    if (LANE == 0) out.data[block] = s_sum[0];
+"""
+    preludes = (lane_group(128), SHARED_STORAGE, DevicePrelude("add", *memory.words("ADD")))
+    kernel = kernel_template.KernelTemplate(
+        f"stage_kernel_{arch}",
+        (("out", wp.array[float]),),
+        dual_native(body, preludes=preludes),
+        kernel_template.items("block"),
+        composed=True,
+        stage=staging.dynamic_bytes(arch),
+    ).kernel()
+    return kernel, staging
+
+
 class TestLaunch(unittest.TestCase):
     def test_plain_launch_runs_the_grid(self):
         out = wp.zeros(8, dtype=int, device="cpu")
         execution.launch(_mark, shape(Work(8), CPU), outputs=(out,), device="cpu", tiled=False)
         np.testing.assert_array_equal(out.numpy(), np.ones(8, dtype=int))
+
+    def test_a_stage_past_the_static_limit_is_dynamic(self):
+        small = Staging((Buffer("a", "float", 1024),), threads=32)
+        big = Staging((Buffer("a", "float", _STAGE_WORDS), Buffer("b", "int", 16)), threads=32)
+        self.assertFalse(small.dynamic)
+        self.assertTrue(big.dynamic)
+        self.assertEqual(big.dynamic_bytes("sm_120"), 4 * _STAGE_WORDS + 64)
+        self.assertEqual((big.dynamic_bytes(0), small.dynamic_bytes(120)), (0, 0))
+        self.assertIn("STAGE + 65536", big.declarations())
+
+    def test_a_dynamic_stage_launches(self):
+        # A block's 64 KiB stage: dynamic shared memory on CUDA (the launch opts in past 48 KiB), the stack on the CPU.
+        expected = [sum(float(i % 7 + block) for i in range(_STAGE_WORDS)) for block in range(3)]
+        for device in ("cpu", *wp.get_cuda_devices()):
+            with self.subTest(device=str(device)):
+                kernel, staging = _stage_kernel(device)
+                cuda = wp.get_device(device).is_cuda
+                self.assertEqual(staging.dynamic_bytes(wp.get_device(device).arch if cuda else 0) > 0, cuda)
+                out = wp.zeros(3, dtype=float, device=device)
+                wp.launch_tiled(kernel, dim=[3], inputs=[out], block_dim=128 if cuda else 1, device=device)
+                np.testing.assert_allclose(out.numpy(), expected)
 
 
 if __name__ == "__main__":

@@ -41,7 +41,7 @@ import numpy as np
 import warp as wp
 
 from ...core.execution import Queue, appended
-from ...core.memory import STATIC_SHARED_BYTES, Buffer, Staging, static_budget
+from ...core.memory import REFERENCE_ARCH, Buffer, Staging, arch_budget
 from . import kernel_template, sweep_levels
 from .device_preludes import SHARED_STORAGE, cuda_native, lane_group
 from .field_group import Field, FieldGroup
@@ -516,7 +516,7 @@ def build_units_kernel(
     units: int,
     *,
     rule: ColoredRule = COLORED_RULE,
-    static_bytes: int = STATIC_SHARED_BYTES,
+    device_arch=REFERENCE_ARCH,
     torsion: bool = False,
 ) -> wp.Kernel:
     """The unit builder of worlds with ``mf_rows`` free-body rows and ``dofs`` coordinates, in slots of ``units``
@@ -530,10 +530,10 @@ def build_units_kernel(
     claims' colored bucket or their general one by ``rule`` (:func:`~newton._src.core.execution.append`'s
     statements). A world with fewer contact rows than the rule's units takes no units, and a world of more units than
     its slot holds sets ``unit_status``: the one-warp sweep keeps both. Its shared working set (:func:`build_staging`)
-    must fit ``static_bytes`` (a device's :func:`.memory.static_budget`).
+    must fit the stage budget of the architecture ``device_arch`` it is built for (:func:`.memory.arch_budget`).
     """
     staging = build_staging(dofs)
-    staging.check("the unit builder", static_bytes)
+    staging.check("the unit builder", arch_budget(device_arch))
     parent = record_parent("PACKED_WORD", mf_rows)
     words = (dofs + 31) // 32
     body = _BUILD_SOURCE
@@ -582,6 +582,7 @@ def build_units_kernel(
         composed=True,
         native_name="sweep_units_native",
         launch_bounds=(32 * BUILD_WARPS, 1),
+        stage=staging.dynamic_bytes(device_arch),
     ).kernel()
 
 
@@ -653,7 +654,7 @@ class ColoredUnits:
             int(dofs),
             self.unit_capacity,
             rule=rule,
-            static_bytes=static_budget(device.arch),
+            device_arch=device.arch,
             torsion=torsion,
         )
         self.device = device
