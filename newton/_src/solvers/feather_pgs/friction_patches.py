@@ -78,10 +78,12 @@ _LIGHT_BLOCKS_PER_SM = 6
 # grid leaves no thread a second run below 8 * SMs * 256 live slots.
 _BUILD_BLOCK_DIM = 32
 _BUILD_BLOCKS_PER_SM = 8
-# The launch bound that keeps those 21 one-warp blocks resident: CUDA 13.4's NVVM output takes 104 registers unbound
-# (19 warps); at the bound ptxas allocates 80 (the RTX PRO 6000's 24-block limit), spilling 112 B a thread, and on
-# hardware at 128 worlds the build runs 28.6 ms a frame against 30.8 unbound (CUDA 12.9's: 96 registers, 29.7 ms).
-_BUILD_RESIDENT_BLOCKS = 21
+# The register line that keeps those one-warp blocks resident: CUDA 13.4's NVVM output takes 104 registers unbound
+# (19 warps); at 80 (the RTX PRO 6000's 24-block limit) it spills 112 B a thread, and on hardware at 128 worlds the
+# build runs 28.6 ms a frame against 30.8 unbound (CUDA 12.9's: 96 registers, 29.7 ms). A register cap, not a launch
+# bound: it binds no block size, so _build launches in any block the module is compiled for, and ptxas emits the
+# same code on sm_120 and sm_103 as under a (32, 21) launch bound.
+_BUILD_REGISTERS = 80
 # The patch extent: the slots to visit, the live slots, then the live sort's extent (live_sort.publish_sort_extent).
 _SORT_EXTENT = wp.constant(2)
 # Contact paths 0 and 1 hold dense and matrix-free rows, and -1 holds none.
@@ -887,7 +889,7 @@ def _build_pair(
         patches.spin_phi[c] = twist
 
 
-@wp.kernel(enable_backward=False, launch_bounds=(_BUILD_BLOCK_DIM, _BUILD_RESIDENT_BLOCKS))
+@wp.kernel(enable_backward=False, cuda_max_registers=_BUILD_REGISTERS)
 def _build(
     extent: wp.array[int],
     stored: wp.array[int],
