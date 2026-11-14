@@ -17820,11 +17820,11 @@ def _list_for_iteration(values: list[Any] | np.ndarray) -> list[Any]:
 class _RowClasses:
     """Rows grouped into classes of rows equal in a set of columns.
 
-    Rows are compared block against block, where a block is a run of rows of one world: a block joins an
-    earlier block of the same length in its run of equal-length blocks when all its rows are equal to that
-    block's in every column. Replicated worlds repeat their prototype's rows, so their blocks join the first
-    copy's. A class is represented by its first row, so derivations that run over the classes in order meet
-    each distinct input where a pass over all rows first meets it.
+    Rows are compared block against block, where a block is a run of rows of one world: blocks of one length
+    whose rows are equal in every column form a group, and each row joins the row at its position in the
+    group's first block. Replicated worlds repeat their prototypes' rows, so all copies of a prototype join
+    its first copy. A class is represented by its first row, so derivations that run over the classes in order
+    meet each distinct input where a pass over all rows first meets it.
     """
 
     def __init__(self, world: np.ndarray, columns: Sequence[np.ndarray | list]):
@@ -17836,36 +17836,34 @@ class _RowClasses:
                 (equality, with identity first).
         """
         count = len(world)
-        rows = np.arange(count)
-        first = rows.copy()
+        first = np.arange(count)
         if count:
             bounds = np.concatenate(([0], np.flatnonzero(world[1:] != world[:-1]) + 1, [count]))
-            lengths = np.diff(bounds)
-            runs = np.concatenate(([0], np.flatnonzero(lengths[1:] != lengths[:-1]) + 1, [len(lengths)]))
+            starts, lengths = bounds[:-1], np.diff(bounds)
             arrays = [
                 np.ascontiguousarray(c).view(np.uint8).reshape(count, -1) for c in columns if isinstance(c, np.ndarray)
             ]
-            lists = [c for c in columns if not isinstance(c, np.ndarray)]
-            for run_start, run_end in zip(runs[:-1].tolist(), runs[1:].tolist(), strict=True):
-                blocks = run_end - run_start
-                if blocks < 2:
+            # A list column equal in every row cannot tell blocks apart.
+            lists = [c for c in columns if not isinstance(c, np.ndarray) and c.count(c[0]) != count]
+            for length in np.unique(lengths).tolist():
+                blocks = np.flatnonzero(lengths == length)
+                if len(blocks) < 2:
                     continue
-                n, a = int(lengths[run_start]), int(bounds[run_start])
-                b = a + blocks * n
-                equal = np.ones(blocks, dtype=bool)
-                for column in arrays:
-                    values = column[a:b].reshape(blocks, n, -1)
-                    equal &= (values == values[0]).all(axis=(1, 2))
+                rows = starts[blocks][:, None] + np.arange(length)
+                keys = np.ascontiguousarray(
+                    np.concatenate([column[rows.reshape(-1)].reshape(len(blocks), -1) for column in arrays], axis=1)
+                )
+                keys = keys.view(np.dtype((np.void, keys.shape[1]))).reshape(-1)
+                _, first_block, block_group = np.unique(keys, return_index=True, return_inverse=True)
+                leaders = first_block[block_group.reshape(-1)]
                 for column in lists:
-                    head = column[a : a + n]
-                    if column[a:b] != head * blocks:
-                        equal &= np.fromiter(
-                            (column[a + k * n : a + (k + 1) * n] == head for k in range(blocks)),
-                            dtype=bool,
-                            count=blocks,
-                        )
-                first[a:b].reshape(blocks, n)[equal] = first[a : a + n]
-        self.first = np.flatnonzero(first == rows)
+                    block_starts = starts[blocks].tolist()
+                    for block, leader in enumerate(leaders.tolist()):
+                        a, b = block_starts[block], block_starts[leader]
+                        if leader != block and column[a : a + length] != column[b : b + length]:
+                            leaders[block] = block
+                first[rows] = rows[leaders]
+        self.first = np.flatnonzero(first == np.arange(count))
         """First row of each class, ascending, shape [class_count]."""
         self.rows = self.first.tolist()
         """:attr:`first` as built-in integers."""
