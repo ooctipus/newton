@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Independent query primitives and sampled work for experimental method choice."""
+"""Calibrated query costs and sampled work for experimental method choice: the step's production kernels timed on
+synthetic hulls, the work of each query counted as the step's sampler counts it."""
 
 import time
 from dataclasses import dataclass
@@ -11,7 +12,7 @@ import numpy as np
 import warp as wp
 
 from .coherent_convex import _plane_lower_bound
-from .coherent_convex_rejection import _PairInputs
+from .coherent_convex_rejection import _create_rejection_query_kernels, _PairInputs
 from .mpr import create_solve_mpr, create_support_map_function
 from .simplex_solver import create_solve_closest_distance
 from .support_function import GenericShapeData, SupportMapDataProvider, support_map_lean, unpack_mesh_ptr
@@ -49,22 +50,21 @@ def _query_functions(*, count_work):
     ).core
 
 
-def _primitive_query(*, count_work=False):
-    mpr, gjk = _query_functions(count_work=count_work)
+def _counted_query():
+    """The work of a calibration query: the support calls and visited vertices of the step sampler's MPR, then GJK
+    where MPR finds no collision, a row at the pose ``distance`` (:class:`_ProductionPairs`' second hull)."""
+    mpr, gjk = _query_functions(count_work=True)
 
     @wp.kernel(module="unique", enable_backward=False)
     def query(geom: GenericShapeData, distance: float, metrics: wp.array2d[float], output: wp.array[wp.vec4]):
         row = wp.tid()
         orientation = wp.quat_rpy(0.2, -0.3, 0.4)
         position = wp.vec3(distance, 0.07 * float(row % 4), 0.03)
-        if wp.static(count_work):
-            metrics[row, 0] = 0.0
-            metrics[row, 1] = 0.0
-            provider = _WorkCounter()
-            provider.values = metrics
-            provider.row = row
-        else:
-            provider = SupportMapDataProvider()
+        metrics[row, 0] = 0.0
+        metrics[row, 1] = 0.0
+        provider = _WorkCounter()
+        provider.values = metrics
+        provider.row = row
         collision, _a, _b, normal, depth = mpr(geom, geom, orientation, position, 0.0, provider)
         gap = -depth
         if not collision:
@@ -104,60 +104,88 @@ def _primitive_empty(output: wp.array[wp.vec4]):
     output[row] = wp.vec4(float(row), 0.0, 0.0, 0.0)
 
 
-def _classification_primitive(device, count, launch_ns):
-    from .coherent_convex import _ConvexQueryCache  # noqa: PLC0415
-    from .coherent_convex_rejection import _create_rejection_query_kernels  # noqa: PLC0415
-    from .collision_convex import ConvexQueryResult  # noqa: PLC0415
+class _ProductionPairs:
+    """``count`` convex pairs in the production rejection route's inputs (:func:`._create_rejection_query_kernels`): each
+    pair's first hull at the origin, its second at the calibration's pose ``distance`` along x (the work sampler's
+    relative pose, :func:`_counted_query`), both of ``mesh`` (``None``: an unread source, for the classifier alone)
+    scaled by (0.5, 0.4, 0.3), with world bounds that keep every pair a query."""
 
-    poses = np.zeros((2 * count, 7), dtype=np.float32)
-    poses[:, 6] = 1
-    poses[1::2, 0] = 1.2
-    inputs = _PairInputs()
-    inputs.shape_types = wp.full(2 * count, int(GeoType.CONVEX_MESH), dtype=int, device=device)
-    inputs.shape_data = wp.full(2 * count, wp.vec4(0.5, 0.4, 0.3, 0.0), dtype=wp.vec4, device=device)
-    inputs.shape_transform = wp.array(poses, dtype=wp.transform, device=device)
-    # Preparation packs the source pointer without dereferencing it.
-    inputs.shape_source = wp.zeros(2 * count, dtype=wp.uint64, device=device)
-    inputs.shape_support_data = wp.zeros(0, dtype=wp.vec4i, device=device)
-    inputs.support_lut = wp.zeros(0, dtype=int, device=device)
-    inputs.support_vertex_offsets = wp.zeros(0, dtype=int, device=device)
-    inputs.support_neighbors = wp.zeros(0, dtype=int, device=device)
-    inputs.shape_gap = wp.full(2 * count, 0.01, dtype=float, device=device)
-    inputs.shape_collision_radius = wp.full(2 * count, 2.0, dtype=float, device=device)
-    inputs.shape_aabb_lower = wp.full(2 * count, wp.vec3(-3.0), dtype=wp.vec3, device=device)
-    inputs.shape_aabb_upper = wp.full(2 * count, wp.vec3(3.0), dtype=wp.vec3, device=device)
-    inputs.shape_collision_aabb_lower = wp.full(2 * count, wp.vec3(-0.5), dtype=wp.vec3, device=device)
-    inputs.shape_collision_aabb_upper = wp.full(2 * count, wp.vec3(0.5), dtype=wp.vec3, device=device)
-    pairs = np.arange(2 * count, dtype=np.int32).reshape(count, 2)
-    pair_array = wp.array(pairs, dtype=wp.vec2i, device=device)
-    pair_count = wp.array([count], dtype=int, device=device)
-    cache = _ConvexQueryCache(
-        pairs=pairs,
-        shape_types=inputs.shape_types.numpy(),
-        shape_world=np.zeros(2 * count, dtype=np.int32),
-        world_count=1,
-        query_capacity=count,
-        device=device,
-    )
-    buffers = [
-        wp.empty(count, dtype=ConvexQueryResult, device=device),
-        wp.empty(count, dtype=int, device=device),
-        wp.zeros(1, dtype=int, device=device),
-        wp.empty(count, dtype=int, device=device),
-        wp.zeros(1, dtype=int, device=device),
-    ]
-    classify = _create_rejection_query_kernels()[0]
+    def __init__(self, device, count, mesh=None, distance=1.2):
+        from .coherent_convex import _ConvexQueryCache  # noqa: PLC0415
+        from .collision_convex import ConvexQueryResult  # noqa: PLC0415
 
-    def action():
-        cache.begin()
-        wp.launch(
-            classify, count, [pair_array, pair_count, inputs, cache.data, count, *buffers], device=device, block_dim=128
+        row = np.arange(count)
+        orientation = np.array(wp.quat_rpy(0.2, -0.3, 0.4), dtype=np.float32)
+        poses = np.zeros((2 * count, 7), dtype=np.float32)
+        poses[:, 6] = 1
+        poses[1::2, 0] = distance
+        poses[1::2, 1] = 0.07 * (row % 4)
+        poses[1::2, 2] = 0.03
+        poses[1::2, 3:] = orientation
+        inputs = _PairInputs()
+        inputs.shape_types = wp.full(2 * count, int(GeoType.CONVEX_MESH), dtype=int, device=device)
+        inputs.shape_data = wp.full(2 * count, wp.vec4(0.5, 0.4, 0.3, 0.0), dtype=wp.vec4, device=device)
+        inputs.shape_transform = wp.array(poses, dtype=wp.transform, device=device)
+        # Preparation packs the source pointer; only the queries dereference it.
+        source = 0 if mesh is None else mesh.id
+        inputs.shape_source = wp.full(2 * count, source, dtype=wp.uint64, device=device)
+        inputs.shape_support_data = wp.zeros(0, dtype=wp.vec4i, device=device)
+        inputs.support_lut = wp.zeros(0, dtype=int, device=device)
+        inputs.support_vertex_offsets = wp.zeros(0, dtype=int, device=device)
+        inputs.support_neighbors = wp.zeros(0, dtype=int, device=device)
+        inputs.shape_gap = wp.full(2 * count, 0.01, dtype=float, device=device)
+        inputs.shape_collision_radius = wp.full(2 * count, 2.0, dtype=float, device=device)
+        inputs.shape_aabb_lower = wp.full(2 * count, wp.vec3(-3.0), dtype=wp.vec3, device=device)
+        inputs.shape_aabb_upper = wp.full(2 * count, wp.vec3(3.0), dtype=wp.vec3, device=device)
+        inputs.shape_collision_aabb_lower = wp.full(2 * count, wp.vec3(-0.5), dtype=wp.vec3, device=device)
+        inputs.shape_collision_aabb_upper = wp.full(2 * count, wp.vec3(0.5), dtype=wp.vec3, device=device)
+        pairs = np.arange(2 * count, dtype=np.int32).reshape(count, 2)
+        self.device, self.count, self.inputs = device, count, inputs
+        self.pairs = wp.array(pairs, dtype=wp.vec2i, device=device)
+        self.pair_count = wp.array([count], dtype=int, device=device)
+        self.cache = _ConvexQueryCache(
+            pairs=pairs,
+            shape_types=inputs.shape_types.numpy(),
+            shape_world=np.zeros(2 * count, dtype=np.int32),
+            world_count=1,
+            query_capacity=count,
+            device=device,
+        )
+        self.queues = (
+            wp.empty(count, dtype=ConvexQueryResult, device=device),
+            wp.empty(count, dtype=int, device=device),
+            wp.zeros(1, dtype=int, device=device),
+            wp.empty(count, dtype=int, device=device),
+            wp.zeros(1, dtype=int, device=device),
         )
 
-    # No cached axes: measure actual preparation, lookup and queue traffic.
+    def launch(self, kernels):
+        """A fresh step of the rejection route's ``kernels`` over the pairs: no cached axis, empty queues."""
+        self.cache.begin()
+        self.queues[2].zero_()
+        self.queues[4].zero_()
+        arguments = [self.pairs, self.pair_count, self.inputs, self.cache.data, self.count, *self.queues]
+        for kernel in kernels:
+            wp.launch(kernel, self.count, arguments, device=self.device, block_dim=128)
+
+
+def _classification_primitive(device, count, launch_ns, kernels):
+    """The production classifier's time a pair [ns] (``kernels``: the rejection route's,
+    :func:`._create_rejection_query_kernels`): preparation, base lookup and queue traffic, no cached axis."""
+    pairs = _ProductionPairs(device, count)
     # Retain preparation in registers exactly as the production classifier does.
-    elapsed = _measure(action, device)
+    elapsed = _measure(lambda: pairs.launch(kernels[:1]), device)
     return max(0.0, elapsed - 2 * launch_ns) / count
+
+
+def _query_primitive(device, count, mesh, distance, kernels):
+    """The production cold queries' time a pair [ns] at a calibration pose (:class:`_ProductionPairs`): the rejection
+    route's MPR and GJK (``kernels``), which answer a pair as the ordinary split queue does, measured with its
+    classifier and less the classifier alone, so the cost model follows the kernels a step runs under any compiler."""
+    pairs = _ProductionPairs(device, count, mesh, distance)
+    queried = _measure(lambda: pairs.launch(kernels), device)
+    classified = _measure(lambda: pairs.launch(kernels[:1]), device)
+    return max(0.0, queried - classified) / count
 
 
 def _nonnegative_fit(features, durations):
@@ -232,7 +260,8 @@ def _measure(action, device):
 
 
 def _calibrate_query_cost(device):
-    """Calibrate synthetic convex queries without a task, robot or task timing."""
+    """Calibrate the convex queries' costs on synthetic hulls without a task, robot or task timing: the production
+    route's classifier and cold queries timed (:func:`_query_primitive`), their work counted (:func:`_counted_query`)."""
     device = wp.get_device(device)
     key = (device.alias, device.uuid)
     if key in _DEVICE_MODELS:
@@ -245,7 +274,8 @@ def _calibrate_query_cost(device):
     with wp.ScopedDevice(device):
         output = wp.zeros(count, dtype=wp.vec4, device=device)
         metrics = wp.zeros((count, 2), dtype=float, device=device)
-        plain, counted = _primitive_query(), _primitive_query(count_work=True)
+        counted = _counted_query()
+        kernels = _create_rejection_query_kernels()
         launch_ns = _measure(lambda: wp.launch(_primitive_empty, 1, [output], device=device), device)
         keys = wp.array(np.arange(count, dtype=np.uint64), dtype=wp.uint64, device=device)
         lookup_ns = (
@@ -276,19 +306,13 @@ def _calibrate_query_cost(device):
             geom.auxiliary = wp.vec3(mesh.id & 0x3FFFFF, (mesh.id >> 22) & 0x3FFFFF, (mesh.id >> 44) & 0xFFFFF)
             geom.center = wp.vec3()
             for distance in (0.2, 0.85, 1.2):
-                elapsed = _measure(
-                    lambda geom=geom, distance=distance: wp.launch(
-                        plain, count, [geom, distance, metrics, output], device=device
-                    ),
-                    device,
-                )
+                # The work a query takes, counted as the step's sampler counts it; its time, the production queries'.
                 wp.launch(counted, count, [geom, distance, metrics, output], device=device)
                 calls, visits = metrics.numpy().mean(axis=0).tolist()
+                ns = _query_primitive(device, count, mesh, distance, kernels)
                 features.append([1, calls, visits])
-                durations.append(max(0.0, elapsed - launch_ns) / count)
-                records.append(
-                    {"vertices": vertices, "distance": distance, "ns": elapsed, "calls": calls, "visits": visits}
-                )
+                durations.append(ns)
+                records.append({"vertices": vertices, "distance": distance, "ns": ns, "calls": calls, "visits": visits})
             elapsed = _measure(
                 lambda geom=geom: wp.launch(_primitive_screen, count, [geom, output], device=device), device
             )
@@ -297,13 +321,13 @@ def _calibrate_query_cost(device):
             records.append({"vertices": vertices, "screen_ns": elapsed})
         query = _nonnegative_fit(features, durations)
         screen = _nonnegative_fit(screen_features, screen_durations)
-        classify_ns = _classification_primitive(device, count, launch_ns)
+        classify_ns = _classification_primitive(device, count, launch_ns, kernels)
         records.append({"classify_ns_per_pair": classify_ns})
     model = _QueryCostModel(
         *query, *screen, lookup_ns, launch_ns, time.monotonic() - start, tuple(records), classify_ns=classify_ns
     )
     if not np.isfinite(model.coefficients(count)).all() or model.support_ns + model.vertex_ns <= 0:
-        raise RuntimeError("Independent collision primitives produced an invalid cost model")
+        raise RuntimeError("The calibrated collision queries produced an invalid cost model")
     _DEVICE_MODELS[key] = model
     return model
 
@@ -487,5 +511,5 @@ class _ConvexMethodChoice:
             "candidates": int(values[3]),
             "period": self.period,
             "calibration_seconds": self.model.calibration_seconds,
-            "source": "independent synthetic primitives and sampled support work",
+            "source": "production queries on synthetic hulls and sampled support work",
         }
