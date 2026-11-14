@@ -54,6 +54,17 @@ class _ShapeContactPairs:
             active &= shape_mask
         return active
 
+    @cached_property
+    def _filters(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """The authored exclusions among every collidable shape (:meth:`_active_filters` of the full set), with the
+        count slot of each (its world's, globals in slot zero): computed once, since the counts and the pair list
+        both subtract them."""
+        first, second = self._active_filters(self._active())
+        slot = np.maximum(self.shape_world[first], self.shape_world[second]) + 1
+        for array in (first, second, slot):
+            array.setflags(write=False)
+        return first, second, slot
+
     def _active_filters(self, active: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         first = (self.filter_pairs >> 32).astype(np.int32)
         second = (self.filter_pairs & 0xFFFFFFFF).astype(np.int32)
@@ -145,12 +156,18 @@ class _ShapeContactPairs:
                 cross = np.sum(weighted[valid] * hist[globals_][clipped[valid]], axis=1)
                 np.add.at(values, rows[valid], coefficients[valid] * cross)
         np.add.at(counts, context_slots, np.where(context_owners == 0, values, -values))
-        first, second = self._active_filters(active)
-        np.subtract.at(
-            counts,
-            np.maximum(self.shape_world[first], self.shape_world[second]) + 1,
-            weights[categories[first], categories[second]],
-        )
+        if shape_mask is None:
+            first, second, slot = self._filters
+        else:
+            first, second = self._active_filters(active)
+            slot = np.maximum(self.shape_world[first], self.shape_world[second]) + 1
+        # Each slot's excluded pairs by their category pair, weighed once per category pair (exact in int64).
+        kinds = len(weights)
+        excluded = np.bincount(
+            (slot.astype(np.int64) * kinds + categories[first]) * kinds + categories[second],
+            minlength=len(counts) * kinds * kinds,
+        ).reshape(len(counts), kinds * kinds)
+        counts -= excluded @ np.asarray(weights, dtype=np.int64).reshape(-1)
         return counts
 
     def _store_pairs(self, output: np.ndarray, a: np.ndarray, b: np.ndarray) -> int:
@@ -345,8 +362,12 @@ class _ShapeContactPairs:
         world_slot = self.shape_world + 1
         starts = np.full(self.world_count + 1, len(self.shape_body), dtype=np.int64)
         np.minimum.at(starts, world_slot[indices], indices)
-        first, second = self._active_filters(active)
-        filter_worlds = np.maximum(self.shape_world[first], self.shape_world[second])
+        if shape_mask is None:
+            first, second, slot = self._filters
+            filter_worlds = slot - 1
+        else:
+            first, second = self._active_filters(active)
+            filter_worlds = np.maximum(self.shape_world[first], self.shape_world[second])
         order = np.argsort(filter_worlds, kind="stable")
         sorted_filters = np.column_stack((first[order], second[order]))
         # Negative global IDs stay distinct from world-relative local offsets
