@@ -38,7 +38,7 @@ def _two_sphere_pair(sdf: TextureSDFData, p: wp.vec3, q: wp.vec3) -> wp.vec2:
 
 
 def _make_nonconvex_edge_kernel(paired):
-    search = _create_sdf_contact_funcs(False, paired, _two_sphere_distance, _two_sphere_pair)
+    search = _create_sdf_contact_funcs(False, paired, not paired, _two_sphere_distance, _two_sphere_pair)
 
     @wp.kernel(enable_backward=False)
     def kernel(

@@ -1004,6 +1004,7 @@ def get_edge_count(shape_type: int, edge_range: wp.vec2i, hfd: HeightfieldData) 
 def _create_sdf_contact_funcs(
     enable_heightfields: bool,
     use_texture_sdf_only: bool,
+    bvh_fallback: bool,
     sample_sdf: Any,
     sample_pair: Any,
 ):
@@ -1016,6 +1017,10 @@ def _create_sdf_contact_funcs(
 
     Args:
         enable_heightfields: When False, all heightfield code paths are compiled out.
+        use_texture_sdf_only: Whether every mesh SDF of the model has a texture; only then do heightfield-free
+            searches take the paired texture samples.
+        bvh_fallback: Whether the mesh-BVH fallback is compiled in. A model with BVH-fallback SDFs compiles it
+            out of its texture passes' kernel (``sdf_source``), whose searches stay the mixed model's.
 
     Returns:
         The ``do_edge_sdf_collision`` function.
@@ -1041,7 +1046,7 @@ def _create_sdf_contact_funcs(
         if wp.static(enable_heightfields):
             if sdf_is_heightfield:
                 return sample_sdf_heightfield(hfd_sdf, elevation_data, pp)
-            elif wp.static(use_texture_sdf_only):
+            elif wp.static(not bvh_fallback):
                 return wp.static(sample_sdf)(texture_sdf, pp)
             elif use_bvh_for_sdf:
                 return sample_sdf_using_mesh(
@@ -1050,7 +1055,7 @@ def _create_sdf_contact_funcs(
             else:
                 return wp.static(sample_sdf)(texture_sdf, pp)
         else:
-            if wp.static(use_texture_sdf_only):
+            if wp.static(not bvh_fallback):
                 return wp.static(sample_sdf)(texture_sdf, pp)
             elif use_bvh_for_sdf:
                 return sample_sdf_using_mesh(
@@ -1489,7 +1494,7 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
     deterministic_reduction = bool(reduce_contacts and deterministic_reduction)
     reducer_deterministic = 1 if deterministic_reduction else 0
     do_edge_sdf_collision = _create_sdf_contact_funcs(
-        enable_heightfields, not bvh_fallback, texture_sample_sdf_hw, _texture_sample_sdf_hw_pair
+        enable_heightfields, use_texture_sdf_only, bvh_fallback, texture_sample_sdf_hw, _texture_sample_sdf_hw_pair
     )
     sample_clamped = _texture_sample_sdf_hw_clamped
     sample_grad = texture_sample_sdf_grad_only_hw
