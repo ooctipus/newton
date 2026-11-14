@@ -13,6 +13,7 @@ from newton import NewtonWarning
 from newton._src.geometry import broad_phase_nxn
 from newton._src.geometry.broad_phase_sap import _advance_sap_chunk_base
 from newton._src.geometry.flags import ShapeFlags
+from newton._src.sim.shape_contact_pairs import _PairSample
 from newton.geometry import BroadPhaseAllPairs, BroadPhaseExplicit, BroadPhaseSAP
 from newton.tests.unittest_utils import get_test_devices
 
@@ -231,26 +232,16 @@ class TestBroadPhase(unittest.TestCase):
         with (
             mock.patch.object(broad_phase_nxn, "_EXPLICIT_LARGE_PAIR_COUNT_TOTAL", 3),
             mock.patch.object(broad_phase_nxn, "_EXPLICIT_LARGE_PAIR_COUNT_PER_WORLD", 3),
-            mock.patch.object(wp, "launch", side_effect=AssertionError("Launched warning kernel")),
         ):
-            for device in get_test_devices():
-                for label, counts, count, expected_warning, expected_reads in cases:
-                    worlds = wp.array(np.repeat(np.arange(len(counts)) - 1, 2), dtype=wp.int32, device=device)
-                    pairs = np.repeat(np.arange(0, 2 * len(counts), 2)[:, None] + [0, 1], counts, axis=0)
-                    pairs = wp.array(pairs, dtype=wp.vec2i, device=device)[:count]
-                    with (
-                        self.subTest(device=device, case=label),
-                        mock.patch.object(pairs, "numpy", wraps=pairs.numpy) as read_pairs,
-                        mock.patch.object(worlds, "numpy", wraps=worlds.numpy) as read_worlds,
-                        warnings.catch_warnings(record=True) as caught,
-                    ):
-                        warnings.filterwarnings("always", message="Explicit broad phase tests", category=NewtonWarning)
-                        BroadPhaseExplicit()._warn_large_pair_count(pairs, worlds, len(counts) - 1)
-                    self.assertEqual(len(caught), int(expected_warning))
-                    self.assertEqual(read_pairs.call_count, expected_reads)
-                    self.assertEqual(read_worlds.call_count, expected_reads)
-                    if caught:
-                        self.assertIn("broad_phase='sap'", str(caught[0].message))
+            for label, counts, count, expected_warning, _ in cases:
+                worlds = np.repeat(np.arange(len(counts)) - 1, 2).astype(np.int32)
+                pairs = np.repeat(np.arange(0, 2 * len(counts), 2)[:, None] + [0, 1], counts, axis=0)[:count]
+                with self.subTest(case=label), warnings.catch_warnings(record=True) as caught:
+                    warnings.filterwarnings("always", message="Explicit broad phase tests", category=NewtonWarning)
+                    BroadPhaseExplicit()._warn_large_pair_count(_PairSample.of_list(pairs, worlds, len(counts) - 1))
+                self.assertEqual(len(caught), int(expected_warning))
+                if caught:
+                    self.assertIn("broad_phase='sap'", str(caught[0].message))
 
     def test_sap_auto_sort_selection(self):
         """Select bounded tile sizes for small and medium-sized SAP worlds."""

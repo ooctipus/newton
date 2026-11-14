@@ -236,7 +236,10 @@ class _ConvexQueryCache:
             self.release()
 
     def __init__(self, *, pairs, shape_types, shape_world, world_count, query_capacity, device):
-        pairs = np.asarray(pairs)
+        """Lay out a slot per box and convex-hull pair of ``pairs``: an ``(n, 2)`` integer array, or a pair list's
+        :class:`~newton._src.sim.shape_contact_pairs._PairSample` (the model's pairs one world per template)."""
+        from ..sim.shape_contact_pairs import _PairSample  # noqa: PLC0415
+
         shape_types = np.asarray(shape_types)
         shape_world = np.asarray(shape_world)
         if (
@@ -252,36 +255,33 @@ class _ConvexQueryCache:
             or np.any(shape_world >= world_count)
         ):
             raise ValueError("coherent convex cache requires consistent integer shape/world metadata and capacities")
-        if pairs.ndim != 2 or pairs.shape[1] != 2 or not np.issubdtype(pairs.dtype, np.integer):
-            raise ValueError("coherent convex cache requires an integer pair array of shape (n, 2)")
-        if np.any(pairs < 0) or np.any(pairs >= len(shape_types)) or np.any(pairs[:, 0] >= pairs[:, 1]):
-            raise ValueError("coherent convex cache requires valid canonical shape IDs (a < b)")
-        keys = (pairs[:, 0].astype(np.uint64) << np.uint64(32)) | pairs[:, 1].astype(np.uint64)
-        # One sort validates duplicates and orders device lookup. Hashing packed
-        # keys can degrade badly on replicated explicit-pair patterns. The model's
-        # pairs arrive in long ascending runs, which the stable sort merges in
-        # near-linear time; unique keys have one sorted order.
-        order = np.argsort(keys, kind="stable")
-        pairs, keys = pairs[order], keys[order]
-        if np.any(keys[1:] == keys[:-1]):
-            raise ValueError("coherent convex cache requires unique ordered pairs")
+        if not isinstance(pairs, _PairSample):
+            pairs = np.asarray(pairs)
+            if pairs.ndim != 2 or pairs.shape[1] != 2 or not np.issubdtype(pairs.dtype, np.integer):
+                raise ValueError("coherent convex cache requires an integer pair array of shape (n, 2)")
+            pairs = _PairSample.of_list(pairs, shape_world, int(world_count))
         supported = np.isin(shape_types, [int(GeoType.BOX), int(GeoType.CONVEX_MESH)])
-        selected = supported[pairs[:, 0]] & supported[pairs[:, 1]]
-        pairs, keys = pairs[selected], keys[selected]
-        worlds_a, worlds_b = shape_world[pairs[:, 0]], shape_world[pairs[:, 1]]
+        sample = pairs.refine(supported)
+        listed = sample.pairs.astype(np.int64)
+        if np.any(listed < 0) or np.any(listed >= len(shape_types)) or np.any(listed[:, 0] >= listed[:, 1]):
+            raise ValueError("coherent convex cache requires valid canonical shape IDs (a < b)")
+        codes = (listed[:, 0] << 32) | listed[:, 1]
+        # A pair repeats only within its world's sampled pairs.
+        order = np.lexsort((codes, sample.group))
+        if np.any((codes[order][1:] == codes[order][:-1]) & (sample.group[order][1:] == sample.group[order][:-1])):
+            raise ValueError("coherent convex cache requires unique ordered pairs")
+        selected = supported[listed[:, 0]] & supported[listed[:, 1]]
+        worlds_a, worlds_b = shape_world[listed[selected, 0]], shape_world[listed[selected, 1]]
         if np.any((worlds_a >= 0) & (worlds_b >= 0) & (worlds_a != worlds_b)):
             raise ValueError("coherent convex cache refuses cross-world pairs")
-        worlds = np.maximum(worlds_a, worlds_b)
-        worlds = np.where(worlds < 0, world_count, worlds).astype(np.int32)
-        if np.any(worlds > world_count):
-            raise ValueError("coherent convex cache received an invalid shape world")
+        keys, worlds = sample.sorted_codes(selected, device)
         self.device = wp.get_device(device)
         self.data = _CacheData()
-        self.data.keys = wp.array(keys, dtype=wp.uint64, device=device)
-        self.data.world = wp.array(worlds, dtype=int, device=device)
+        self.data.keys = keys
+        self.data.world = worlds
         self.data.world_epoch = wp.zeros(world_count + 1, dtype=wp.uint64, device=device)
         self.data.generation = wp.zeros(1, dtype=wp.uint64, device=device)
-        n = len(keys)
+        n = keys.shape[0]
         for name in ("entry_epoch", "entry_generation", "source_a", "source_b"):
             setattr(self.data, name, wp.zeros(n, dtype=wp.uint64, device=device))
         self.data.types = wp.zeros(n, dtype=wp.vec2i, device=device)

@@ -9,7 +9,6 @@ import logging
 import os
 import warnings
 import weakref
-from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
@@ -83,9 +82,11 @@ from ..sim.contacts import GENERATION_SENTINEL, Contacts
 from ..sim.enums import BodyFlags, JointType, ModelFlags
 from ..sim.model import Model
 from ..sim.shape_contact_pairs import (
+    _PairSample,
     _shape_contact_pair_count_for_mask,
     _shape_contact_pair_counts,
     _shape_contact_pair_override,
+    _shape_pair_list_sample,
 )
 from ..sim.state import State
 
@@ -266,24 +267,6 @@ _GENERIC_CONVEX_PAIR_LOOKUP = np.array(
     ],
     dtype=bool,
 )
-
-
-_PAIR_SCAN_BLOCK = 65536
-
-
-def _iter_pair_blocks(pairs: wp.array[wp.vec2i] | np.ndarray) -> Iterator[np.ndarray]:
-    """Yield a pair list as host blocks of shape ``(n, 2)``.
-
-    A device list is copied one block at a time, so a scan's host memory stays bounded
-    however many worlds replicate the list.
-    """
-    if not isinstance(pairs, wp.array):
-        pairs = (pairs.numpy() if hasattr(pairs, "numpy") else np.asarray(pairs)).reshape(-1, 2)
-    count = len(pairs)
-    for begin in range(0, count, _PAIR_SCAN_BLOCK):
-        # Warp slices do not clamp their end.
-        block = pairs[begin : min(begin + _PAIR_SCAN_BLOCK, count)]
-        yield (block.numpy() if isinstance(block, wp.array) else block).reshape(-1, 2)
 
 
 @wp.struct
@@ -1573,7 +1556,7 @@ class _TrianglePairCountEstimate:
 
 def _estimate_triangle_pair_details(
     model: Model,
-    shape_pairs: np.ndarray | None,
+    pair_sample: _PairSample | None,
     collide_mask: np.ndarray,
     mesh_like_mask: np.ndarray,
     planar_sdf_mask: np.ndarray,
@@ -1591,7 +1574,7 @@ def _estimate_triangle_pair_details(
     Global shapes count once in every world they can touch, and global-global
     pairs count once.
 
-    With ``shape_pairs`` the routed pairs are counted exactly. Without them
+    With ``pair_sample`` the routed pairs are counted exactly. Without it
     (NXN/SAP) they are counted per world from
     shape-type counts, skipping static-static pairs; this ignores group,
     filter-pair, kinematic, and hydroelastic culling and so can only overcount.
@@ -1604,8 +1587,9 @@ def _estimate_triangle_pair_details(
 
     Args:
         model: The simulation model.
-        shape_pairs: ``(N, 2)`` candidate shape pairs from the configured explicit
-            list, or ``None`` to count from masks.
+        pair_sample: The configured explicit pair list, sampled one world per template
+            (:class:`~newton._src.sim.shape_contact_pairs._PairSample`), or ``None`` to count
+            from masks.
         collide_mask: Shapes the broad phase pairs; used only without ``shape_pairs``.
         mesh_like_mask: Routed mesh and heightfield shapes.
         planar_sdf_mask: Routed shapes with SDF edge data.
@@ -1617,7 +1601,7 @@ def _estimate_triangle_pair_details(
     """
     world_count = int(getattr(model, "world_count", 0) or 0)
     shape_world_array = getattr(model, "shape_world", None)
-    if shape_pairs is None and shape_world_array is None:
+    if pair_sample is None and shape_world_array is None:
         return _TrianglePairCountEstimate(_TRIANGLE_PAIRS_MIN_CAPACITY, world_count, 0, 0, 0, "none")
     shape_world = (
         shape_world_array.numpy().astype(np.int64)
@@ -1625,9 +1609,9 @@ def _estimate_triangle_pair_details(
         else np.zeros(len(mesh_like_mask), dtype=np.int64)
     )
 
-    if shape_pairs is not None:
+    if pair_sample is not None:
         pairs_per_bucket, participants_per_bucket = _count_routed_pairs(
-            model, shape_pairs, shape_world, mesh_like_mask, planar_sdf_mask, hydroelastic, variant_row_mask
+            model, pair_sample, mesh_like_mask, planar_sdf_mask, hydroelastic, variant_row_mask
         )
         source = "shape pairs"
     else:
@@ -1656,8 +1640,7 @@ def _estimate_triangle_pair_details(
 
 def _count_routed_pairs(
     model: Model,
-    shape_pairs: np.ndarray,
-    shape_world: np.ndarray,
+    pair_sample: _PairSample,
     mesh_like_mask: np.ndarray,
     planar_sdf_mask: np.ndarray,
     hydroelastic: bool,
@@ -1667,35 +1650,43 @@ def _count_routed_pairs(
 
     Bucket 0 holds global-global pairs and bucket ``w + 1`` holds pairs of world ``w``;
     an explicit cross-world pair is counted once, in the bucket of its larger world.
+    Each world's buckets are its group representative's in ``pair_sample``, split by
+    the routing masks.
     """
     shape_types = model.shape_type.numpy()
-    shape_a = shape_pairs[:, 0]
-    shape_b = shape_pairs[:, 1]
+    heightfield = shape_types == int(GeoType.HFIELD)
+    box = shape_types == int(GeoType.BOX)
+    if variant_row_mask is not None:
+        box &= ~variant_row_mask
+    hydro = (
+        (model.shape_flags.numpy() & int(ShapeFlags.HYDROELASTIC)) != 0
+        if hydroelastic
+        else np.zeros(len(shape_types), dtype=bool)
+    )
+    sample = pair_sample.refine(mesh_like_mask, planar_sdf_mask, heightfield, box, hydro)
+    shape_a = sample.pairs[:, 0]
+    shape_b = sample.pairs[:, 1]
     # Explicit pair lists may carry entries the narrow phase skips.
     valid = (shape_a >= 0) & (shape_b >= 0) & (shape_a < len(shape_types)) & (shape_b < len(shape_types))
     valid &= shape_a != shape_b
     shape_a = shape_a[valid]
     shape_b = shape_b[valid]
-    heightfield = shape_types == int(GeoType.HFIELD)
-    box = shape_types == int(GeoType.BOX)
-    if variant_row_mask is not None:
-        box &= ~variant_row_mask
     routed = (mesh_like_mask[shape_a] | mesh_like_mask[shape_b]) & ~(heightfield[shape_a] & heightfield[shape_b])
     routed |= planar_sdf_mask[shape_a] & planar_sdf_mask[shape_b] & ~(box[shape_a] & box[shape_b])
     if hydroelastic:
-        hydro = (model.shape_flags.numpy() & int(ShapeFlags.HYDROELASTIC)) != 0
         routed &= ~(hydro[shape_a] & hydro[shape_b])
     shape_a = shape_a[routed].astype(np.int64)
     shape_b = shape_b[routed].astype(np.int64)
     if len(shape_a) == 0:
         return np.zeros(1, dtype=np.int64), np.zeros(1, dtype=np.int64)
 
-    bucket = np.maximum(shape_world[shape_a], shape_world[shape_b]) + 1
-    bucket_count = int(bucket.max()) + 1
+    shape_world = sample.shape_world
+    bucket_count = len(sample.world_group) + 1
+    bucket = np.maximum(shape_world[shape_a], shape_world[shape_b]).astype(np.int64) + 1
     pairs_per_bucket = np.bincount(bucket, minlength=bucket_count)
     participant_keys = np.unique(np.concatenate((shape_a, shape_b)) * bucket_count + np.concatenate((bucket, bucket)))
     participants_per_bucket = np.bincount(participant_keys % bucket_count, minlength=bucket_count)
-    return pairs_per_bucket, participants_per_bucket
+    return sample.per_world(pairs_per_bucket), sample.per_world(participants_per_bucket)
 
 
 def _count_routed_pairs_from_masks(
@@ -1909,13 +1900,13 @@ def _compute_generic_convex_pair_stats(
     broad_phase_mode: str,
     shape_pairs_filtered: wp.array[wp.vec2i] | np.ndarray | None,
     candidate_pair_work_estimate: int,
-    shape_pairs_host: np.ndarray | None = None,
+    pair_sample: _PairSample | None = None,
     variant_options: _VariantOptions | None = None,
 ) -> tuple[bool, int]:
     """Determine whether generic convex pairs exist and estimate their work.
 
-    ``shape_pairs_host`` is an optional ``(N, 2)`` host copy of
-    ``shape_pairs_filtered`` that spares another device-to-host read. With
+    An explicit list is counted one world per template: ``pair_sample``, the setup's sample of
+    ``shape_pairs_filtered``, or a new one (:func:`_shape_pair_list_sample`). With
     ``variant_options``, a variant row counts as every colliding variant shape it can hold.
     """
     shape_types_array = getattr(model, "shape_type", None)
@@ -1931,20 +1922,20 @@ def _compute_generic_convex_pair_stats(
     if broad_phase_mode == "explicit":
         if shape_pairs_filtered is None:
             return True, candidate_pair_work_estimate
-        pairs = shape_pairs_host if shape_pairs_host is not None else shape_pairs_filtered
-        generic_pair_count = 0
-        # Bound temporary gathers independently of the replicated world count.
-        for block in _iter_pair_blocks(pairs):
-            if variant_options is None:
-                pair_types = shape_types[block]
-                generic = _GENERIC_CONVEX_PAIR_LOOKUP[pair_types[:, 0], pair_types[:, 1]]
-            else:
-                bits_a = type_bits[block[:, 0]]
-                bits_b = type_bits[block[:, 1]]
-                generic = np.zeros(len(block), dtype=bool)
-                for type_a, type_b in zip(*np.nonzero(_GENERIC_CONVEX_PAIR_LOOKUP), strict=True):
-                    generic |= ((bits_a >> type_a) & 1).astype(bool) & ((bits_b >> type_b) & 1).astype(bool)
-            generic_pair_count += int(np.count_nonzero(generic))
+        if pair_sample is None:
+            pair_sample = _shape_pair_list_sample(model, shape_pairs_filtered)
+        sample = pair_sample.refine(type_bits)
+        block = sample.pairs
+        if variant_options is None:
+            pair_types = shape_types[block]
+            generic = _GENERIC_CONVEX_PAIR_LOOKUP[pair_types[:, 0], pair_types[:, 1]]
+        else:
+            bits_a = type_bits[block[:, 0]]
+            bits_b = type_bits[block[:, 1]]
+            generic = np.zeros(len(block), dtype=bool)
+            for type_a, type_b in zip(*np.nonzero(_GENERIC_CONVEX_PAIR_LOOKUP), strict=True):
+                generic |= ((bits_a >> type_a) & 1).astype(bool) & ((bits_b >> type_b) & 1).astype(bool)
+        generic_pair_count = sample.count(generic)
         return generic_pair_count > 0, min(candidate_pair_work_estimate, generic_pair_count)
 
     colliding_mask = _shape_collide_mask(model, len(shape_types))
@@ -2919,8 +2910,8 @@ class CollisionPipeline:
         contact_writer = write_contact_speculative if self._speculative_enabled else write_contact
 
         unit_scale_sdf_shapes = None
-        # Host copy of the explicit pair list, read at most once during setup.
-        explicit_pairs_host = None
+        # The explicit pair list sampled one world per template: the setup's analyses of its pairs.
+        pair_sample = None
         if using_expert_components:
             if broad_phase_instance is None or narrow_phase is None:
                 raise ValueError("Provide both broad_phase and narrow_phase for expert component construction")
@@ -2954,7 +2945,7 @@ class CollisionPipeline:
                 self.shape_pairs_max = len(shape_pairs_filtered)
                 self.shape_pairs_excluded = None
                 self.shape_pairs_excluded_count = 0
-                self.broad_phase._warn_large_pair_count(shape_pairs_filtered, shape_world, model.world_count)
+                self.broad_phase._warn_large_pair_count(_shape_pair_list_sample(model, shape_pairs_filtered))
             else:
                 self.shape_pairs_filtered = None
                 self.shape_pairs_max = _compute_per_world_shape_pairs_max(model)
@@ -2999,8 +2990,8 @@ class CollisionPipeline:
                     self.shape_pairs_max = min(self.shape_pairs_max, self.broad_phase_output_max)
                 self.shape_pairs_excluded = None
                 self.shape_pairs_excluded_count = 0
-                explicit_pairs_host = shape_pairs_filtered.numpy().reshape(-1, 2)
-                self.broad_phase._warn_large_pair_count(explicit_pairs_host, shape_world, model.world_count)
+                pair_sample = _shape_pair_list_sample(model, shape_pairs_filtered)
+                self.broad_phase._warn_large_pair_count(pair_sample)
             elif self.broad_phase_mode == "nxn":
                 if shape_world is None:
                     raise ValueError("model.shape_world is required for broad_phase=NXN")
@@ -3064,9 +3055,7 @@ class CollisionPipeline:
                 # authoritative: every listed shape reaches the narrow phase, including
                 # one with shape collision disabled, and an unlisted shape never does.
                 if self.broad_phase_mode == "explicit" and self.shape_pairs_filtered is not None:
-                    route_mask = np.zeros(len(shape_types), dtype=bool)
-                    pair_shapes = explicit_pairs_host.ravel()
-                    route_mask[pair_shapes[(pair_shapes >= 0) & (pair_shapes < len(shape_types))]] = True
+                    route_mask = pair_sample.shapes()
                 # A variant row can take the geometry of any variant shape it can hold at runtime, so
                 # the stages cover every variant shape a routed row can hold, appended as extra
                 # rows, and capacities count each row as any of them.
@@ -3168,11 +3157,15 @@ class CollisionPipeline:
                         max_mesh_mesh_pairs = 0
                         max_mesh_plane_pairs = 0
                     else:
-                        shape_a = explicit_pairs_host[:, 0]
-                        shape_b = explicit_pairs_host[:, 1]
                         box_mask = route_mask & (shape_types == int(GeoType.BOX))
                         if variant_options is not None:
                             box_mask &= ~variant_options.row_mask
+                        shape_scale = model.shape_scale.numpy()
+                        infinite_plane_mask = plane_capacity & (shape_scale[:, 0] == 0.0) & (shape_scale[:, 1] == 0.0)
+                        routes = pair_sample.refine(
+                            mesh_capacity, heightfield_capacity, planar_sdf_capacity, box_mask, infinite_plane_mask
+                        )
+                        shape_a, shape_b = routes.pairs[:, 0], routes.pairs[:, 1]
                         mesh_mesh_routes = (
                             (mesh_capacity[shape_a] & mesh_capacity[shape_b])
                             | (heightfield_capacity[shape_a] & mesh_capacity[shape_b])
@@ -3183,13 +3176,11 @@ class CollisionPipeline:
                                 & ~(box_mask[shape_a] & box_mask[shape_b])
                             )
                         )
-                        shape_scale = model.shape_scale.numpy()
-                        infinite_plane_mask = plane_capacity & (shape_scale[:, 0] == 0.0) & (shape_scale[:, 1] == 0.0)
                         mesh_plane_routes = (mesh_capacity[shape_a] & infinite_plane_mask[shape_b]) | (
                             infinite_plane_mask[shape_a] & mesh_capacity[shape_b]
                         )
-                        max_mesh_mesh_pairs = int(np.count_nonzero(mesh_mesh_routes))
-                        max_mesh_plane_pairs = int(np.count_nonzero(mesh_plane_routes))
+                        max_mesh_mesh_pairs = routes.count(mesh_mesh_routes)
+                        max_mesh_plane_pairs = routes.count(mesh_plane_routes)
                 else:
                     max_mesh_mesh_pairs = min(
                         self.shape_pairs_max,
@@ -3205,12 +3196,14 @@ class CollisionPipeline:
                     # pairs (not the per-pass count) sizes its per-pair storage.
                     hfield, mesh = int(GeoType.HFIELD), int(GeoType.MESH)
                     if self.broad_phase_mode == "explicit" and self.shape_pairs_filtered is not None:
-                        explicit = explicit_pairs_host.astype(np.int64)
+                        typed = pair_sample.refine(shape_types)
+                        explicit = typed.pairs.astype(np.int64)
                         valid = np.all((explicit >= 0) & (explicit < len(shape_types)), axis=1)
                         first, second = shape_types[explicit[valid, 0]], shape_types[explicit[valid, 1]]
                         partner = np.where(first == hfield, second, first)
-                        routed = ((first == hfield) != (second == hfield)) & (partner != mesh)
-                        max_heightfield_pairs = int(np.count_nonzero(routed))
+                        routed = np.zeros(len(explicit), dtype=bool)
+                        routed[valid] = ((first == hfield) != (second == hfield)) & (partner != mesh)
+                        max_heightfield_pairs = typed.count(routed)
                     else:
                         partners = route_mask & (shape_types != hfield) & (shape_types != mesh)
                         max_heightfield_pairs = _compute_per_world_mask_pair_max(model, heightfield_capacity, partners)
@@ -3230,7 +3223,7 @@ class CollisionPipeline:
                     # NXN/SAP count from shape masks without materializing the model's lazy pair array.
                     triangle_pair_estimate = _estimate_triangle_pair_details(
                         model,
-                        explicit_pairs_host,
+                        pair_sample,
                         route_mask,
                         mesh_capacity | heightfield_capacity,
                         planar_sdf_capacity,
@@ -3257,7 +3250,7 @@ class CollisionPipeline:
                 broad_phase_mode=self.broad_phase_mode,
                 shape_pairs_filtered=self.shape_pairs_filtered,
                 candidate_pair_work_estimate=candidate_pair_work_estimate,
-                shape_pairs_host=explicit_pairs_host,
+                pair_sample=pair_sample,
                 variant_options=variant_options,
             )
             split_pair_count_threshold = (
@@ -3364,7 +3357,7 @@ class CollisionPipeline:
             name: applied.pop(name) for name in sorted(superseded) if name in applied
         }
 
-        self._configure_immobile_pairs(model, not include_immobile_pairs, immobile_source)
+        self._configure_immobile_pairs(model, not include_immobile_pairs, immobile_source, pair_sample)
 
         if getattr(self.narrow_phase, "_heightfield_finite_query", False) or getattr(
             self.narrow_phase, "_heightfield_geometric_cull", False
@@ -3382,7 +3375,7 @@ class CollisionPipeline:
 
             bind_pair_csr(
                 self.narrow_phase,
-                explicit_pairs_host if self.broad_phase_mode == "explicit" else None,
+                pair_sample.pair_list() if self.broad_phase_mode == "explicit" else None,
                 shape_types,
                 unique_generated=self.broad_phase_mode == "nxn",
             )
@@ -3474,11 +3467,9 @@ class CollisionPipeline:
                 )
             # The explicit-pair constructor contract already prohibits pair mutation.
             # Do not intersect with shape flags: explicit pairs are authoritative.
-            if explicit_pairs_host is None:
-                explicit_pairs_host = self.shape_pairs_filtered.numpy().reshape(-1, 2)
-            pair_indices = np.unique(explicit_pairs_host.reshape(-1))
-            if np.any(pair_indices < 0) or np.any(pair_indices >= shape_count):
+            if np.any((pair_sample.pairs < 0) | (pair_sample.pairs >= shape_count)):
                 raise ValueError("Explicit pair shape IDs must be within model.shape_count")
+            pair_indices = np.flatnonzero(pair_sample.shapes())
             self.prepared_shape_indices = wp.array(pair_indices, dtype=wp.int32, device=device)
 
         self._convex_selection_reason = "explicit_ordinary"
@@ -3504,11 +3495,9 @@ class CollisionPipeline:
                     coherent_convex = "0"
                 else:
                     types = model.shape_type.numpy()
-                    if explicit_pairs_host is None:
-                        explicit_pairs_host = self.shape_pairs_filtered.numpy().reshape(-1, 2)
-                    pairs = explicit_pairs_host
                     supported = np.isin(types, (int(GeoType.BOX), int(GeoType.CONVEX_MESH)))
-                    eligible = int(np.count_nonzero(supported[pairs[:, 0]] & supported[pairs[:, 1]]))
+                    coherent = pair_sample.refine(supported)
+                    eligible = coherent.count(supported[coherent.pairs[:, 0]] & supported[coherent.pairs[:, 1]])
                     if eligible == 0:
                         self._convex_selection_reason = "no_eligible_pairs"
                         coherent_convex = "0"
@@ -3524,10 +3513,8 @@ class CollisionPipeline:
             from ..geometry.coherent_convex import _ConvexQueryCache  # noqa: PLC0415
             from ..geometry.coherent_convex_rejection import _create_rejection_query_kernels  # noqa: PLC0415
 
-            if explicit_pairs_host is None:
-                explicit_pairs_host = self.shape_pairs_filtered.numpy().reshape(-1, 2)
             self.narrow_phase._coherent_cache = _ConvexQueryCache(
-                pairs=explicit_pairs_host,
+                pairs=pair_sample,
                 shape_types=model.shape_type.numpy(),
                 shape_world=model.shape_world.numpy(),
                 world_count=model.world_count,
@@ -3554,7 +3541,7 @@ class CollisionPipeline:
             terrain_law_value,
             terrain_law_classes,
             terrain_shadow_classes,
-            explicit_pairs_host if self.broad_phase_mode == "explicit" else None,
+            pair_sample,
         )
 
         # Built here (not in finalize) so models/tasks that never collide don't pay for it.
@@ -3859,13 +3846,13 @@ class CollisionPipeline:
             )
         return None
 
-    def _law_pairs(self, explicit_pairs_host: np.ndarray | None) -> np.ndarray | None:
-        """The explicit pairs the terrain law takes, from the setup's one host copy; ``None`` without a list."""
+    def _law_pairs(self, pair_sample: _PairSample | None) -> np.ndarray | None:
+        """The explicit pairs the terrain law takes, on the host; ``None`` without a list."""
         if self.broad_phase_mode != "explicit":
             return None
-        if explicit_pairs_host is None:
-            return self.shape_pairs_filtered.numpy().reshape(-1, 2)
-        return explicit_pairs_host
+        if pair_sample is None:
+            pair_sample = _shape_pair_list_sample(self.model, self.shape_pairs_filtered)
+        return pair_sample.pair_list()
 
     def _build_terrain_law(
         self,
@@ -3874,7 +3861,7 @@ class CollisionPipeline:
         value: str,
         classes: tuple[int, ...],
         shadow_classes: tuple[int, ...],
-        explicit_pairs_host: np.ndarray | None,
+        pair_sample: _PairSample | None,
     ) -> None:
         """Decide whether the terrain law writes the heightfield contacts, and build it where its kernels run.
 
@@ -3888,7 +3875,7 @@ class CollisionPipeline:
             value: The ``NEWTON_TERRAIN_LAW`` value, for the record and the errors.
             classes: The partner classes ``NEWTON_TERRAIN_LAW`` lists (empty but for an explicit request).
             shadow_classes: The partner classes ``NEWTON_TERRAIN_LAW_SHADOW`` lists.
-            explicit_pairs_host: The setup's host copy of the explicit pair list, when it read one.
+            pair_sample: The setup's sample of the explicit pair list, when it made one.
 
         Raises:
             ValueError: When ``NEWTON_TERRAIN_LAW`` requests the law for a configuration it does not support yet, or a
@@ -3941,7 +3928,7 @@ class CollisionPipeline:
         law = TerrainLawShadow(
             model,
             (classes if request == "explicit" else tuple(sorted(TERRAIN_LAW_KERNELS))) if writes else shadow_classes,
-            pairs=self._law_pairs(explicit_pairs_host),
+            pairs=self._law_pairs(pair_sample),
             status=narrow._buffer_capacity_status,
             # The rows of its scene-level spill region (default: TerrainLawShadow.default_spill_rows()).
             spill_rows=parse_terrain_law_shadow_rows(os.environ.get("NEWTON_TERRAIN_LAW_SHADOW_ROWS", "")),
@@ -4925,7 +4912,9 @@ class CollisionPipeline:
             immobile[on_body] = welded[self.shape_body[on_body]]
             return immobile
 
-    def _configure_immobile_pairs(self, model: Model, requested: bool, source: str) -> None:
+    def _configure_immobile_pairs(
+        self, model: Model, requested: bool, source: str, pair_sample: _PairSample | None = None
+    ) -> None:
         """Decide once, at construction, whether the broad phase drops pairs of structurally immobile shapes.
 
         The filter is installed only when it can change a candidate pair in some state of the
@@ -4934,23 +4923,24 @@ class CollisionPipeline:
         immobile shapes; with ``False``, where a welded body also reads as static against
         kinematic ones and any body can become kinematic, a pair that touches a shape that can
         be welded. That makes the composed rule independent of unrelated pairs. Candidates
-        come from the explicit pairs or, for ``"nxn"`` and ``"sap"``, from the model's pair
-        list, which applies the same world, group and filter-pair rules as those broad phases.
+        come from the explicit pairs (``pair_sample``, the setup's sample of them, one world per
+        template) or, for ``"nxn"`` and ``"sap"``, from the model's pair list, which applies the
+        same world, group and filter-pair rules as those broad phases.
         """
         self._weld_topology = topology = self._WeldTopology(model)
         self._colliding_shapes = _shape_collide_mask(model, len(topology.shape_body))
         self._immobile_shape_body = None
         self._no_body_flags = None
         self._immobile_inputs = None
-        # An explicit list is scanned; nxn and sap pipelines count the model's pairs by shape mask instead, never
-        # enumerating them (_shape_contact_pair_count_for_mask).
+        # An explicit list is scanned one world per template; nxn and sap pipelines count the model's pairs by shape
+        # mask instead, never enumerating them (_shape_contact_pair_count_for_mask).
         pairs = self.shape_pairs_filtered if self.broad_phase_mode == "explicit" else None
         self._immobile_pair_counts = pairs is None and model.shape_contact_pair_count > 0
         # Topology alone bounds the immobile shapes over every body-flag and joint-enable state.
         reachable = topology.immobile_shapes(topology.welded_bodies(None, None))
         weldable = None if self.include_static_kinematic_pairs else reachable & (topology.shape_body >= 0)
+        self._immobile_pair_candidates = None
         if self._immobile_pair_counts:
-            self._immobile_pair_candidates = None
             if weldable is None:
                 possible = _shape_contact_pair_count_for_mask(model, reachable) > 0
             else:
@@ -4958,25 +4948,24 @@ class CollisionPipeline:
                 unweldable = _shape_contact_pair_count_for_mask(model, ~weldable)
                 possible = _shape_contact_pair_count_for_mask(model, every) > unweldable
         elif pairs is None:
-            self._immobile_pair_candidates = None
             colliding = self._colliding_shapes
             if weldable is None:
                 possible = int(np.count_nonzero(reachable & colliding)) > 1
             else:
                 possible = bool(np.any(weldable & colliding)) and int(np.count_nonzero(colliding)) > 1
         else:
-            candidates = []
-            for block in _iter_pair_blocks(pairs):
-                listed = reachable[block[:, 0]] & reachable[block[:, 1]]
-                if weldable is not None:
-                    listed |= weldable[block[:, 0]] | weldable[block[:, 1]]
-                candidates.append(block[listed])
-            candidates = np.concatenate(candidates) if candidates else np.empty((0, 2), dtype=np.int32)
-            self._immobile_pair_candidates = candidates
+            if pair_sample is None:
+                pair_sample = _shape_pair_list_sample(model, pairs)
+            # The candidates: pairs that can join two immobile shapes, or touch a weldable one.
+            self._immobile_pair_candidates = (pair_sample, reachable, weldable)
+            sample = pair_sample.refine(reachable, np.zeros_like(reachable) if weldable is None else weldable)
+            first, second = sample.pairs[:, 0], sample.pairs[:, 1]
+            candidate = reachable[first] & reachable[second]
             if weldable is None:
-                possible = len(candidates) > 0
+                possible = bool(np.any(candidate))
             else:
-                possible = bool(np.any(weldable[candidates[:, 0]] | weldable[candidates[:, 1]]))
+                candidate |= weldable[first] | weldable[second]
+                possible = bool(np.any(candidate & (weldable[first] | weldable[second])))
         if requested and possible:
             self._immobile_shape_body = wp.zeros(len(topology.shape_body), dtype=wp.int32, device=self.device)
             self._no_body_flags = wp.empty(0, dtype=wp.int32, device=self.device)
@@ -5037,14 +5026,18 @@ class CollisionPipeline:
                     self.model, immovable | immobile
                 ) - _shape_contact_pair_count_for_mask(self.model, immovable)
         elif pairs is not None:
-            first, second = pairs[:, 0], pairs[:, 1]
-            listed = excluded = int(np.count_nonzero(immobile[first] & immobile[second]))
+            pair_sample, reachable, weldable = pairs
+            immovable = (topology.shape_body < 0) | topology.kinematic_shapes(flags)
+            weldable = np.zeros_like(reachable) if weldable is None else weldable
+            sample = pair_sample.refine(reachable, weldable, immobile, immovable)
+            first, second = sample.pairs[:, 0], sample.pairs[:, 1]
+            candidate = (reachable[first] & reachable[second]) | weldable[first] | weldable[second]
+            listed = excluded = sample.count(candidate & immobile[first] & immobile[second])
             if not self.include_static_kinematic_pairs:
                 # The test drops static and kinematic pairs anyway; welded shapes join them.
-                immovable = (topology.shape_body < 0) | topology.kinematic_shapes(flags)
                 masked = immovable | immobile
                 dropped = masked[first] & masked[second] & ~(immovable[first] & immovable[second])
-                excluded = int(np.count_nonzero(dropped))
+                excluded = sample.count(candidate & dropped)
         self._immobile_pairs.update(
             welded_bodies=int(np.count_nonzero(welded)),
             immobile_shapes=int(np.count_nonzero(immobile & self._colliding_shapes)),

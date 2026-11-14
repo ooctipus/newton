@@ -1037,23 +1037,21 @@ class BroadPhaseExplicit:
     taking into account per-geometry cutoff distances.
     """
 
-    def _warn_large_pair_count(
-        self,
-        shape_pairs: wp.array[wp.vec2i] | np.ndarray,
-        shape_world: wp.array[wp.int32] | np.ndarray,
-        world_count: int,
-    ) -> None:
-        """Warn during setup when explicit pair testing is large per world."""
-        shape_pair_count = len(shape_pairs)
+    def _warn_large_pair_count(self, pair_sample) -> None:
+        """Warn during setup when explicit pair testing is large per world.
+
+        Args:
+            pair_sample: The explicit pair list, sampled one world per template
+                (:class:`~newton._src.sim.shape_contact_pairs._PairSample`).
+        """
+        shape_pair_count = int(pair_sample.weights().sum())
         if shape_pair_count <= _EXPLICIT_LARGE_PAIR_COUNT_TOTAL:
             return
-        if world_count <= 1:
-            busiest_world = shape_pair_count
-        else:
-            pairs = shape_pairs.numpy() if isinstance(shape_pairs, wp.array) else shape_pairs
-            worlds = shape_world.numpy() if isinstance(shape_world, wp.array) else shape_world
-            pair_counts = np.bincount(np.maximum(worlds[pairs[:, 0]], worlds[pairs[:, 1]]) + 1)
-            busiest_world = int(pair_counts[0] + np.max(pair_counts[1:], initial=0))
+        group = pair_sample.group
+        slot = np.zeros(group.size, dtype=np.int64)
+        slot[group >= 0] = pair_sample.first[group[group >= 0]] + 1
+        pair_counts = pair_sample.per_world(np.bincount(slot, minlength=pair_sample.world_group.size + 1))
+        busiest_world = int(pair_counts[0] + np.max(pair_counts[1:], initial=0))
         if busiest_world >= _EXPLICIT_LARGE_PAIR_COUNT_PER_WORLD:
             warnings.warn(
                 f"Explicit broad phase tests {shape_pair_count:,} shape pairs per collision call "
