@@ -607,6 +607,8 @@ def create_compute_face_contacts(
         _support_funcs=support_funcs,
         point_filter=point_filter,
         deepest_once=deepest_once,
+        # The triangle's face normal is the surface's, not the pair's: crossing lines keep one witness.
+        line_band=False,
     )
 
     @wp.func

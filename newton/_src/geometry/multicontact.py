@@ -434,110 +434,132 @@ def trim_in_place(
     return new_loop_count
 
 
-@wp.func
-def trim_all_in_place(
-    trim_poly: wp.array[wp.vec2],
-    trim_poly_count: int,
-    loop: wp.array[wp.vec2],
-    loop_count: int,
-) -> int:
-    """
-    Trim a polygon using all edges of another polygon (Sutherland-Hodgman clipping).
+def create_trim_all_in_place(line_band: bool = True):
+    """Create the polygon trim of :func:`trim_all_in_place`, with or without the nearly parallel line band.
 
-    Both polygons (trim_poly and loop) are in 2D contact plane space and they are both convex.
+    Two crossing line features have one contact, the deepest GJK/MPR witness. With ``line_band``, nearly
+    parallel lines keep the stretch within ``EPS`` of their closest separation, so normal error does not drop
+    their line contact. That needs the pair's own normal, along which both lines support their shapes: under a
+    refined normal (a mesh or heightfield triangle's surface normal) the lines need not meet, and the band would
+    turn two lines centimeters apart into a line contact. Queries with a penetration refiner build without it.
 
     Args:
-        trim_poly: Array of vertices defining the trimming polygon (2D).
-        trim_poly_count: Number of vertices in the trimming polygon.
-        loop: Array of vertices in the loop to be trimmed (2D).
-        loop_count: Number of vertices in the loop.
-
-    Returns:
-        New number of vertices in the trimmed loop.
+        line_band: Keep the band of nearly parallel line features.
     """
 
-    if trim_poly_count <= 1:
-        return wp.min(1, loop_count)  # There is no trim polygon
+    @wp.func
+    def trim_all_in_place(
+        trim_poly: wp.array[wp.vec2],
+        trim_poly_count: int,
+        loop: wp.array[wp.vec2],
+        loop_count: int,
+    ) -> int:
+        """
+        Trim a polygon using all edges of another polygon (Sutherland-Hodgman clipping).
 
-    if trim_poly_count == 2 or loop_count == 2:
-        # Clip the actual segment: widening it creates artificial contacts
-        # whose spacing grows as the crossing angle decreases.
-        start = loop[0]
-        end = loop[1]
-        if trim_poly_count == 2:
-            start = trim_poly[0]
-            end = trim_poly[1]
-        direction = end - start
-        length_sq = wp.length_sq(direction)
-        if length_sq <= EPS * EPS:
-            return 0
-        lo = float(0.0)
-        hi = float(1.0)
-        if trim_poly_count == 2 and loop_count == 2:
-            other_start = loop[0]
-            other_end = loop[1]
-            other_direction = other_end - other_start
-            # The pair already has a GJK/MPR contact. Project parallel
-            # supporting lines onto a shared tangent to tolerate normal error.
-            t0 = wp.dot(other_start - start, direction) / length_sq
-            t1 = wp.dot(other_end - start, direction) / length_sq
-            lo = wp.max(lo, wp.min(t0, t1))
-            hi = wp.min(hi, wp.max(t0, t1))
-            other_length_sq = wp.length_sq(other_direction)
-            cross = direction[0] * other_direction[1] - direction[1] * other_direction[0]
-            if other_length_sq > 0.0 and wp.abs(cross) > 1.0e-6 * wp.sqrt(length_sq * other_length_sq):
-                # Keep separation within EPS of its closest value so normal
-                # error does not drop nearly parallel contacts.
-                inv_other_length = 1.0 / wp.sqrt(other_length_sq)
-                offset = (
-                    other_direction[0] * (start[1] - other_start[1]) - other_direction[1] * (start[0] - other_start[0])
-                ) * inv_other_length
-                slope = -cross * inv_other_length
-                separation_lo = offset + slope * lo
-                separation_hi = offset + slope * hi
-                closest = float(0.0)
-                if separation_lo * separation_hi > 0.0:
-                    closest = wp.min(wp.abs(separation_lo), wp.abs(separation_hi))
-                band_lo = (-(closest + EPS) - offset) / slope
-                band_hi = (closest + EPS - offset) / slope
-                overlap = (hi - lo) * wp.sqrt(length_sq)
-                lo = wp.max(lo, wp.min(band_lo, band_hi))
-                hi = wp.min(hi, wp.max(band_lo, band_hi))
-                # A short band uses the caller's single deepest GJK/MPR witness.
-                if (hi - lo) * wp.sqrt(length_sq) < wp.min(0.5 * overlap, MAX_CLIP_VERTEX_MERGE_DISTANCE):
-                    return 0
-        else:
-            polygon = trim_poly
-            polygon_count = trim_poly_count
+        Both polygons (trim_poly and loop) are in 2D contact plane space and they are both convex.
+
+        Args:
+            trim_poly: Array of vertices defining the trimming polygon (2D).
+            trim_poly_count: Number of vertices in the trimming polygon.
+            loop: Array of vertices in the loop to be trimmed (2D).
+            loop_count: Number of vertices in the loop.
+
+        Returns:
+            New number of vertices in the trimmed loop.
+        """
+
+        if trim_poly_count <= 1:
+            return wp.min(1, loop_count)  # There is no trim polygon
+
+        if trim_poly_count == 2 or loop_count == 2:
+            # Clip the actual segment: widening it creates artificial contacts
+            # whose spacing grows as the crossing angle decreases.
+            start = loop[0]
+            end = loop[1]
             if trim_poly_count == 2:
-                polygon = loop
-                polygon_count = loop_count
-            for i in range(polygon_count):
-                edge_start = polygon[i]
-                edge_end = polygon[(i + 1) % polygon_count]
-                a = signed_area(edge_start, edge_end, start)
-                b = signed_area(edge_start, edge_end, end)
-                if a < 0.0 and b < 0.0:
-                    return 0
-                if a < 0.0:
-                    lo = wp.max(lo, a / (a - b))
-                elif b < 0.0:
-                    hi = wp.min(hi, a / (a - b))
-        if hi <= lo:
-            return 0
-        loop[0] = start + lo * direction
-        loop[1] = start + hi * direction
-        return 2
+                start = trim_poly[0]
+                end = trim_poly[1]
+            direction = end - start
+            length_sq = wp.length_sq(direction)
+            if length_sq <= EPS * EPS:
+                return 0
+            lo = float(0.0)
+            hi = float(1.0)
+            if trim_poly_count == 2 and loop_count == 2:
+                other_start = loop[0]
+                other_end = loop[1]
+                other_direction = other_end - other_start
+                # The pair already has a GJK/MPR contact. Project parallel
+                # supporting lines onto a shared tangent to tolerate normal error.
+                t0 = wp.dot(other_start - start, direction) / length_sq
+                t1 = wp.dot(other_end - start, direction) / length_sq
+                lo = wp.max(lo, wp.min(t0, t1))
+                hi = wp.min(hi, wp.max(t0, t1))
+                other_length_sq = wp.length_sq(other_direction)
+                cross = direction[0] * other_direction[1] - direction[1] * other_direction[0]
+                if other_length_sq > 0.0 and wp.abs(cross) > 1.0e-6 * wp.sqrt(length_sq * other_length_sq):
+                    if wp.static(not line_band):
+                        # Crossing lines keep the caller's single deepest witness.
+                        return 0
+                    # Keep separation within EPS of its closest value so normal
+                    # error does not drop nearly parallel contacts.
+                    inv_other_length = 1.0 / wp.sqrt(other_length_sq)
+                    offset = (
+                        other_direction[0] * (start[1] - other_start[1])
+                        - other_direction[1] * (start[0] - other_start[0])
+                    ) * inv_other_length
+                    slope = -cross * inv_other_length
+                    separation_lo = offset + slope * lo
+                    separation_hi = offset + slope * hi
+                    closest = float(0.0)
+                    if separation_lo * separation_hi > 0.0:
+                        closest = wp.min(wp.abs(separation_lo), wp.abs(separation_hi))
+                    band_lo = (-(closest + EPS) - offset) / slope
+                    band_hi = (closest + EPS - offset) / slope
+                    overlap = (hi - lo) * wp.sqrt(length_sq)
+                    lo = wp.max(lo, wp.min(band_lo, band_hi))
+                    hi = wp.min(hi, wp.max(band_lo, band_hi))
+                    # A short band uses the caller's single deepest GJK/MPR witness.
+                    if (hi - lo) * wp.sqrt(length_sq) < wp.min(0.5 * overlap, MAX_CLIP_VERTEX_MERGE_DISTANCE):
+                        return 0
+            else:
+                polygon = trim_poly
+                polygon_count = trim_poly_count
+                if trim_poly_count == 2:
+                    polygon = loop
+                    polygon_count = loop_count
+                for i in range(polygon_count):
+                    edge_start = polygon[i]
+                    edge_end = polygon[(i + 1) % polygon_count]
+                    a = signed_area(edge_start, edge_end, start)
+                    b = signed_area(edge_start, edge_end, end)
+                    if a < 0.0 and b < 0.0:
+                        return 0
+                    if a < 0.0:
+                        lo = wp.max(lo, a / (a - b))
+                    elif b < 0.0:
+                        hi = wp.min(hi, a / (a - b))
+            if hi <= lo:
+                return 0
+            loop[0] = start + lo * direction
+            loop[1] = start + hi * direction
+            return 2
 
-    current_loop_count = loop_count
+        current_loop_count = loop_count
 
-    trim_poly_0 = trim_poly[0]  # This allows to do more memory aliasing
-    for i in range(trim_poly_count):
-        trim_seg_start = trim_poly[i]
-        trim_seg_end = trim_poly_0 if i == trim_poly_count - 1 else trim_poly[i + 1]
-        current_loop_count = trim_in_place(trim_seg_start, trim_seg_end, loop, current_loop_count)
+        trim_poly_0 = trim_poly[0]  # This allows to do more memory aliasing
+        for i in range(trim_poly_count):
+            trim_seg_start = trim_poly[i]
+            trim_seg_end = trim_poly_0 if i == trim_poly_count - 1 else trim_poly[i + 1]
+            current_loop_count = trim_in_place(trim_seg_start, trim_seg_end, loop, current_loop_count)
 
-    return current_loop_count
+        return current_loop_count
+
+    return trim_all_in_place
+
+
+trim_all_in_place = create_trim_all_in_place(True)
 
 
 @wp.func
@@ -764,6 +786,7 @@ def create_build_manifold(
     _support_funcs: Any = None,
     point_filter: Any = None,
     deepest_once: Any = None,
+    line_band: bool = True,
 ):
     """
     Factory function to create manifold generation functions with a specific support mapping function.
@@ -781,6 +804,8 @@ def create_build_manifold(
             evaluated after post-processing and before the writer.
         deepest_once: Optional ``(query_context) -> bool``: when it holds, the added deepest point is not written
             where it equals (within ``EPS``) a manifold point already written, which it then duplicates.
+        line_band: Keep a line contact between nearly parallel line features
+            (:func:`create_trim_all_in_place`); ``False`` for queries whose normal a penetration refiner sets.
 
     Returns:
         build_manifold function that generates up to 5 contact points between two shapes
@@ -789,6 +814,7 @@ def create_build_manifold(
 
     has_point_filter = point_filter is not None
     has_deepest_once = deepest_once is not None
+    trim_polygon = trim_all_in_place if line_band else create_trim_all_in_place(False)
 
     @wp.func
     def write_contact(contact_data: ContactData, writer_data: Any, query_context: Any):
@@ -930,7 +956,7 @@ def create_build_manifold(
         )
 
         anchor_sq = float(1.0e30)
-        loop_count = trim_all_in_place(m_a, m_a_count, m_b, m_b_count)
+        loop_count = trim_polygon(m_a, m_a_count, m_b, m_b_count)
 
         loop_count = remove_zero_length_edges(m_b, loop_count, merge_distance)
 

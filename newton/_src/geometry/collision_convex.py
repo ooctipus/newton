@@ -181,6 +181,7 @@ def create_solve_convex_multi_contact(
     support_funcs = create_support_map_function(support_func, use_precomputed_center)
     solve_mpr = create_solve_mpr(support_func, _support_funcs=support_funcs)
     solve_gjk = create_solve_closest_distance(support_func, _support_funcs=support_funcs)
+    # A refined normal is the surface's, not the pair's: its manifold keeps one witness for crossing lines.
     has_penetration_refiner = penetration_refiner is not None
     has_query_filter = query_filter is not None
     has_point_filter = point_filter is not None
@@ -317,6 +318,7 @@ def create_solve_convex_multi_contact(
                 _support_funcs=support_funcs,
                 point_filter=point_filter,
                 deepest_once=deepest_once,
+                line_band=not has_penetration_refiner,
             )
         )(
             manifold_a,
