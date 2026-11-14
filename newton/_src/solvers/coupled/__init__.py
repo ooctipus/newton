@@ -6,11 +6,9 @@
 .. experimental::
 """
 
+import importlib
+
 from .interface import CouplingInterface
-from .model_view import ModelView
-from .solver_coupled import SolverCoupled
-from .solver_coupled_admm import SolverCoupledADMM
-from .solver_coupled_proxy import SolverCoupledProxy
 
 __all__ = [
     "CouplingInterface",
@@ -19,3 +17,24 @@ __all__ = [
     "SolverCoupledADMM",
     "SolverCoupledProxy",
 ]
+
+# Every solver implements CouplingInterface and imports this package for it; the coupled solvers load on first use.
+_MODULES = {
+    "ModelView": "model_view",
+    "SolverCoupled": "solver_coupled",
+    "SolverCoupledADMM": "solver_coupled_admm",
+    "SolverCoupledProxy": "solver_coupled_proxy",
+}
+
+
+def __getattr__(name: str):
+    module = _MODULES.get(name)
+    if module is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(importlib.import_module(f".{module}", __name__), name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))
