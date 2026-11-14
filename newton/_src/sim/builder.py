@@ -16643,7 +16643,7 @@ class ModelBuilder:
             edge_chunks = []
             edge_center_chunks = []
             edge_half_chunks = []
-            from ..geometry.sdf_contact import build_mesh_edge_clusters  # noqa: PLC0415
+            from ..geometry.sdf_contact import build_mesh_edge_clusters, mesh_edge_endpoint_ownership  # noqa: PLC0415
 
             edge_order_chunks = []
             edge_cluster_chunks = []
@@ -16669,12 +16669,22 @@ class ModelBuilder:
                         # ``Mesh.build_sdf()`` caches a simplified edge set on
                         # the mesh for SDF-mesh contact generation; fall back
                         # to the full edge list otherwise.
+                        owns_endpoint = None
                         if deferred_edges is not None:
                             edges = deferred_edges
                         elif mesh._collision_edges is not None:
                             edges = mesh._collision_edges
                         else:
-                            edges = mesh.edges  # lazily computed and cached on the Mesh
+                            # Welding a terrain's vertices for its edges takes about 0.9 s: the edges and their
+                            # endpoint ownership are kept on disk by the mesh's buffers.
+                            edges, owns_endpoint = _collision_cache.cached(
+                                "mesh_edges",
+                                (np.asarray(mesh.vertices), np.asarray(mesh.indices)),
+                                lambda mesh=mesh: (
+                                    mesh.edges,
+                                    mesh_edge_endpoint_ownership(mesh._canonical_vertex_ids(), mesh.edges),
+                                ),
+                            )
                         start = edge_offset
                         count = len(edges)
                         edge_chunks.append(edges)
@@ -16686,11 +16696,8 @@ class ModelBuilder:
                             edge_halves = np.ascontiguousarray((edge_v1 - edge_v0) * 0.5, dtype=np.float32)
                             edge_centers = np.ascontiguousarray((edge_v0 + edge_v1) * 0.5, dtype=np.float32)
                             edge_radii = np.linalg.norm(edge_halves, axis=1, keepdims=True)
-                            canonical_edges = mesh._canonical_vertex_ids()[edges].reshape(-1)
-                            endpoint_indices = np.arange(2 * count, dtype=np.int64)
-                            first_endpoint = np.full(int(canonical_edges.max()) + 1, 2 * count, dtype=np.int64)
-                            np.minimum.at(first_endpoint, canonical_edges, endpoint_indices)
-                            owns_endpoint = (first_endpoint[canonical_edges] == endpoint_indices).reshape(-1, 2)
+                            if owns_endpoint is None:
+                                owns_endpoint = mesh_edge_endpoint_ownership(mesh._canonical_vertex_ids(), edges)
                             # Zero remains the legacy "both endpoints owned" encoding.
                             corner_ownership = (
                                 4.0 + owns_endpoint[:, 0].astype(np.float32) + 2.0 * owns_endpoint[:, 1]

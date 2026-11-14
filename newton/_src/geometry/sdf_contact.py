@@ -87,6 +87,19 @@ STACK_CAPACITY = 2 * MESH_SDF_BLOCK_DIM
 EDGE_CLUSTER_SIZE = 16
 
 
+def mesh_edge_endpoint_ownership(canonical_ids: np.ndarray, edges: np.ndarray) -> np.ndarray:
+    """Whether each edge endpoint (``(count, 2)`` bool) is the first occurrence of its welded vertex
+    (``canonical_ids``, one per mesh vertex) among the edges' endpoints in order."""
+    count = len(edges)
+    if count == 0:
+        return np.zeros((0, 2), dtype=bool)
+    canonical_edges = canonical_ids[edges].reshape(-1)
+    endpoint_indices = np.arange(2 * count, dtype=np.int64)
+    first_endpoint = np.full(int(canonical_edges.max()) + 1, 2 * count, dtype=np.int64)
+    np.minimum.at(first_endpoint, canonical_edges, endpoint_indices)
+    return (first_endpoint[canonical_edges] == endpoint_indices).reshape(-1, 2)
+
+
 def build_mesh_edge_clusters(
     centers: np.ndarray, radii: np.ndarray, size: int = EDGE_CLUSTER_SIZE
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:

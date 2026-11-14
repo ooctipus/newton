@@ -37,6 +37,9 @@ def _collision_arrays(model) -> dict[str, np.ndarray]:
                 "_mesh_edge_order",
                 "_mesh_edge_clusters",
                 "_mesh_edge_cluster_reach",
+                "_mesh_edge_indices",
+                "_mesh_edge_centers",
+                "_mesh_edge_halves",
                 "_shape_mesh_properties",
                 "_convex_support_lut",
             ),
@@ -110,7 +113,15 @@ class TestCollisionCache(unittest.TestCase):
             loaded = _collision_arrays(_finalize(directory))
         self.assertEqual(
             sorted(set(entries)),
-            ["boundary_flags", "convex_support_cells", "edge_clusters", "mesh_grid", "mesh_topology", "watertight"],
+            [
+                "boundary_flags",
+                "convex_support_cells",
+                "edge_clusters",
+                "mesh_edges",
+                "mesh_grid",
+                "mesh_topology",
+                "watertight",
+            ],
         )
         self.assertTrue(any(name.startswith("cells.") for name in reference))
         for tables in (filled, loaded):
