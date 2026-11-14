@@ -296,6 +296,10 @@ class _VariantShapeRows:
                 if isinstance(value, wp.array) and value.shape[0] == total:
                     self._rows[name] = value[start:]
                     setattr(m, name, value[: max(start, 1) if spec.requires_empty_sentinel else start])
+            # The mesh cells and topology index shapes too; a variant row takes its variant's mesh entries.
+            if m._mesh_cells is not None and m._mesh_topology is not None:
+                for name in ("_shape_mesh_grid", "_shape_mesh_topology_base"):
+                    self._rows[name] = getattr(m, name)[start:total]
             self._rows["shape_source"] = list(builder.shape_source[start:])
             m.shape_label = list(builder.shape_label[:start])
             m.shape_source = list(builder.shape_source[:start])

@@ -71,6 +71,8 @@ _SHAPE_VARIANT_ATTRIBUTES = (
     "shape_collision_aabb_upper",
     "_shape_interior_point",
     "_shape_voxel_resolution",
+    "_shape_mesh_grid",
+    "_shape_mesh_topology_base",
     "shape_flags",
     "shape_color",
     "shape_opacity",
@@ -2906,6 +2908,16 @@ class Model:
                 device=self.device,
             )
         return flags
+
+    @property
+    def _shape_mesh_grid(self) -> wp.array[wp.int32]:
+        """Per shape: its mesh's index in the mesh cells' grids, or -1; the array the mesh-vs-convex midphase reads."""
+        return self._mesh_cells.shape_grid
+
+    @property
+    def _shape_mesh_topology_base(self) -> wp.array[wp.vec2i]:
+        """Per shape: its mesh's first triangle row and topology block, or -1; the array the triangle law reads."""
+        return self._mesh_topology.data.shape_base
 
     @property
     def _has_body_variants(self) -> bool:
