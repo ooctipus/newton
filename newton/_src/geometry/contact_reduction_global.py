@@ -2082,7 +2082,8 @@ def export_and_reduce_predictive_contact(
     return -1
 
 
-@wp.kernel(enable_backward=False)
+# A module of its own: it launches at the narrow phase's block, the module's other kernels at the default.
+@wp.kernel(enable_backward=False, module="unique")
 def reduce_buffered_contacts_kernel(
     reducer_data: GlobalContactReducerData,
     shape_transform: wp.array[wp.transform],
@@ -2121,7 +2122,8 @@ def reduce_buffered_contacts_kernel(
         )
 
 
-@wp.kernel(enable_backward=False)
+# A module of its own: it launches at the narrow phase's block, the module's other kernels at the default.
+@wp.kernel(enable_backward=False, module="unique")
 def reduce_buffered_contacts_speculative_kernel(
     reducer_data: GlobalContactReducerData,
     shape_types: wp.array[int],

@@ -1869,8 +1869,9 @@ def narrow_phase_find_mesh_triangle_overlaps_kernel(
             query_grid[i] = grid
 
 
-# The pass is bound by its loads' latency: 64 registers keep more warps in flight.
-@wp.kernel(enable_backward=False, cuda_max_registers=64)
+# The pass is bound by its loads' latency: 64 registers keep more warps in flight. A module of its own: it launches at
+# the midphase's block, the module's other kernels at the default, and each compiles once at its own.
+@wp.kernel(enable_backward=False, cuda_max_registers=64, module="unique")
 def narrow_phase_mesh_cell_hits_kernel(
     shape_pairs_mesh_count: wp.array[int],
     query_lower: wp.array[wp.vec3],
