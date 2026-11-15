@@ -243,7 +243,18 @@ def _native_transform_rows(builtin_name: str, *operands: np.ndarray) -> np.ndarr
 
 
 def transform_multiply_rows(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """Compose broadcastable ``(..., 7)`` float32 transforms as ``a * b``."""
+    """Compose batches of transforms on the host as ``a * b``.
+
+    The result is bitwise equal to :func:`warp.transform_multiply` on the CPU for each row. This is the arithmetic
+    :meth:`ModelBuilder.replicate() <newton.ModelBuilder.replicate>` places copied worlds with.
+
+    Args:
+        a: Left transforms ``(px, py, pz, qx, qy, qz, qw)``, float32, shape [..., 7].
+        b: Right transforms, float32, shape [..., 7], broadcastable against ``a``.
+
+    Returns:
+        The composed transforms, float32, shape of ``a`` and ``b`` broadcast.
+    """
     a, b = np.broadcast_arrays(a, b)
     if a.size <= 7 * _NATIVE_TRANSFORM_ROW_LIMIT:
         return _native_transform_rows("wp_builtin_mul_transformf_transformf", a, b)
@@ -253,7 +264,16 @@ def transform_multiply_rows(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 
 
 def transform_inverse_rows(t: np.ndarray) -> np.ndarray:
-    """Invert ``(..., 7)`` float32 transforms."""
+    """Invert a batch of transforms on the host.
+
+    The result is bitwise equal to :func:`warp.transform_inverse` on the CPU for each row.
+
+    Args:
+        t: Transforms ``(px, py, pz, qx, qy, qz, qw)``, float32, shape [..., 7].
+
+    Returns:
+        The inverse transforms, float32, shape [..., 7].
+    """
     if t.size <= 7 * _NATIVE_TRANSFORM_ROW_LIMIT:
         return _native_transform_rows("wp_builtin_transform_inverse_transformf", t)
     q_inv = t[..., 3:] * _QUAT_CONJUGATE_SIGNS

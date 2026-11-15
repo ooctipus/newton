@@ -28,6 +28,7 @@ newton.utils
    color_graph
    color_linear_to_srgb
    color_srgb_to_linear
+   combine_independent_coloring_plan
    compute_world_offsets
    download_asset
    event_scope
@@ -39,5 +40,7 @@ newton.utils
    run_benchmark
    solidify_mesh
    string_to_warp
+   transform_inverse_rows
+   transform_multiply_rows
    validate_tet_mesh
    validate_triangle_mesh

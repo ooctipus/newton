@@ -382,14 +382,22 @@ def plot_graph(
     plt.show()
 
 
-def combine_independent_coloring_plan(sized_groups_1, sized_groups_2) -> list:
-    """
-    Pair the groups of 2 independent colorings without materializing them.
+def combine_independent_coloring_plan(sized_groups_1: list, sized_groups_2: list) -> list:
+    """Pair the color groups of two independent colorings without materializing them.
 
-    Items are ``(size, chunks)`` tuples; paired groups get their sizes added and their
-    chunk lists concatenated (first coloring's chunks first). Sorting the first coloring
-    in ascending size order and the second in descending order always combines the
-    smaller group with the larger group, which balances the load of each group.
+    Two colorings are independent when no element of one is adjacent to an element of the other, as the colorings of
+    two separate worlds are. Any pairing of their groups is then a valid coloring of both; this one combines the
+    smaller groups of one with the larger groups of the other, which balances the group sizes. It is the pairing
+    :class:`~newton.ModelBuilder` applies when it merges the colorings of copied builders.
+
+    Args:
+        sized_groups_1: Groups of the first coloring as ``(size, chunks)`` tuples, where ``chunks`` is a list of
+            opaque items describing the group's elements.
+        sized_groups_2: Groups of the second coloring, in the same form.
+
+    Returns:
+        The combined groups as ``(size, chunks)`` tuples: paired groups add their sizes and concatenate their chunk
+        lists (the first coloring's chunks first).
     """
     if len(sized_groups_1) == 0:
         return sized_groups_2

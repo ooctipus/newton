@@ -1,0 +1,1 @@
+Expose `newton.utils.transform_multiply_rows`, `newton.utils.transform_inverse_rows` and `newton.utils.combine_independent_coloring_plan`, the host transform arithmetic and coloring pairing `ModelBuilder` applies to copied worlds, so callers that assemble a model from copied worlds reproduce them exactly.

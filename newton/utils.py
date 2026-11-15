@@ -4,11 +4,15 @@
 # ==================================================================================
 # sim utils
 # ==================================================================================
-from ._src.sim.graph_coloring import color_graph, plot_graph
+from ._src.core.host_transform import transform_inverse_rows, transform_multiply_rows
+from ._src.sim.graph_coloring import color_graph, combine_independent_coloring_plan, plot_graph
 
 __all__ = [
     "color_graph",
+    "combine_independent_coloring_plan",
     "plot_graph",
+    "transform_inverse_rows",
+    "transform_multiply_rows",
 ]
 
 # ==================================================================================
