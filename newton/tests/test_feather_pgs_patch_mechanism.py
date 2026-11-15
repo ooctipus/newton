@@ -521,18 +521,37 @@ def assert_empty_tail(patches, context=""):
     np.testing.assert_array_equal(patches.previous_world.numpy()[stored:], -1, f"{context} previous_world tail")
 
 
+# Scratch of the stored frame that a build writes for itself and no later kernel reads: a build that makes a frame's
+# regions leaves each pair's index of the stored history there, and a build that carries the regions only each
+# region's own.
+_BUILD_SCRATCH = ("members", "centres", "used")
+
+
 def assert_same_state(twin, patches, context="", records=True):
-    """Require bitwise-equal arrays in two patch states, scratch included.
+    """Require bitwise-equal arrays in two patch states, the frames' state and what the builds place, and the same
+    listed regions. The builds' own scratch (:data:`_BUILD_SCRATCH`) differs between a build that makes a
+    frame's regions and one that carries them, so it is not compared.
 
     ``records`` compares the frame records as well: the sorted frame, and the
     sort's extent, which a kept build leaves empty.
     """
+    regions = int(patches.regions.numpy()[0])
+    np.testing.assert_array_equal(twin.regions.numpy(), patches.regions.numpy(), f"{context} regions")
+    np.testing.assert_array_equal(
+        np.sort(twin.current.regions.numpy()[:regions]),
+        np.sort(patches.current.regions.numpy()[:regions]),
+        f"{context} current.regions",
+    )
     for frame in ("current", "previous"):
         for name in _PatchFrame.vars:
             if frame == "previous" and name in _BUILD_FIELDS:
                 continue  # the stored frame holds no field only a build reads
             if frame == "current" and name in _STORED_FIELDS:
                 continue  # and the built frame none of the stored frame's scratch
+            if name == "regions":
+                continue  # the listed regions, compared above: threads list them in any order
+            if frame == "previous" and name in _BUILD_SCRATCH:
+                continue
             np.testing.assert_array_equal(
                 getattr(getattr(twin, frame), name).numpy(),
                 getattr(getattr(patches, frame), name).numpy(),
@@ -1597,7 +1616,12 @@ class TestPatchLaunchShapes(unittest.TestCase):
         with mock.patch.object(wp, "launch", record):
             state.build(scene.model, scene.state, scene.contacts)
         self.assertEqual(
-            launched, {("_prepare", 1536, 1536, None), ("_merge_runs", 1024, 1024, None), ("_build", 2048, 2048, 32)}
+            launched,
+            {
+                ("_prepare", 1536, 1536, None),
+                ("_merge_runs", 1024, 1024, None),
+                ("_build", 2048, 2048, 32),
+            },
         )
 
     def test_launch_shapes_match_bitwise(self):
@@ -2037,6 +2061,110 @@ _DECISION_PLANS = {
     ),
     "forget": ((("build", "a"), ("forget",), ("build", "a")), ("sort", "sort")),
 }
+
+
+class TestHeldRegions(unittest.TestCase):
+    """A contact frame's regions are made at its first build and held for the builds that share it."""
+
+    @staticmethod
+    def _states(seed):
+        """A scene with every pair in contact, a state that sorts every build and one that holds its frames."""
+        scene = _Scene("cpu", seed)
+        scene.active[:] = True
+        plain, held = _recording_pair(scene, 128)
+        return scene, plain, held, _decisions(held)
+
+    def test_held_builds_keep_the_frames_regions(self):
+        """Carry a frame's regions through builds whose poses would group its contacts otherwise.
+
+        The bodies move a centimetre between the builds of a frame, far past the plane distance that joins two
+        contacts: a build that sorts groups the contacts by the poses it finds, and a held build keeps the owner
+        and the ring of the frame's first build.
+        """
+        scene, plain, held, decisions = self._states(61)
+        regrouped = 0
+        for step in range(4):
+            scene.move()
+            live = scene.frame()
+            for state in (plain, held):
+                state.build(scene.model, scene.state, scene.contacts)
+                store_frame(state, scene.state)
+            owner = held.current.owner.numpy()[:live].copy()
+            ring = held.view.next_contact.numpy()[:live].copy()
+            for substep in range(1, 4):
+                context = f"step {step} substep {substep}"
+                scene.move(scale=50.0)
+                for state in (plain, held):
+                    state.build(scene.model, scene.state, scene.contacts)
+                self.assertEqual(decisions[-1], "keep", context)
+                np.testing.assert_array_equal(held.current.owner.numpy()[:live], owner, f"{context} owner")
+                np.testing.assert_array_equal(held.view.next_contact.numpy()[:live], ring, f"{context} ring")
+                regrouped += int(np.any(plain.current.owner.numpy()[:live] != owner))
+                for state in (plain, held):
+                    store_frame(state, scene.state)
+        self.assertGreater(regrouped, 0, "the moves must regroup the contacts of a build that sorts")
+
+    def test_a_build_without_a_store_makes_the_regions_anew(self):
+        """Make a kept frame's regions anew when no store followed its last build: the stored frame is not its own."""
+        scene, plain, held, decisions = self._states(62)
+        scene.move()
+        live = scene.frame()
+        for state in (plain, held):
+            state.build(scene.model, scene.state, scene.contacts)
+        scene.move(scale=50.0)
+        for state in (plain, held):
+            state.build(scene.model, scene.state, scene.contacts)
+        self.assertEqual(decisions, ["sort", "keep"])
+        self.assertGreater(live, 0)
+        assert_same_state(held, plain, "second build without a store", records=False)
+
+    def test_rewritten_points_move_the_contacts_and_not_the_regions(self):
+        """Keep a held frame's regions when a writer moves contact points under one generation, until it forgets.
+
+        Every build prepares the contacts anew, so their centres follow the points at once; the regions stay the
+        frame's until the writer advances the generation or forgets the frame, and the next build then groups the
+        contacts as a build that sorts does.
+        """
+        scene, plain, held, decisions = self._states(63)
+        rng = np.random.default_rng(63)
+        scene.move()
+        live = scene.frame()
+        for state in (plain, held):
+            state.build(scene.model, scene.state, scene.contacts)
+            store_frame(state, scene.state)
+        owner = held.current.owner.numpy()[:live].copy()
+        center = held.current.center.numpy()[:live].copy()
+        points = scene.contacts.rigid_contact_point0.numpy()
+        points[:live] += rng.normal(scale=0.01, size=(live, 3)).astype(points.dtype)
+        scene.contacts.rigid_contact_point0.assign(points)
+        for state in (plain, held):
+            state.build(scene.model, scene.state, scene.contacts)
+        self.assertEqual(decisions[-1], "keep")
+        np.testing.assert_array_equal(held.current.owner.numpy()[:live], owner, "the held frame's regions")
+        self.assertTrue(np.any(held.current.center.numpy()[:live] != center), "the centres follow the points")
+        sorted_owner = plain.current.owner.numpy()[:live].copy()
+        self.assertTrue(np.any(sorted_owner != owner), "the rewrite must regroup the contacts of a build that sorts")
+        held.forget_frame()
+        held.build(scene.model, scene.state, scene.contacts)
+        self.assertEqual(decisions[-1], "sort")
+        np.testing.assert_array_equal(held.current.owner.numpy()[:live], sorted_owner, "the forgotten frame's regions")
+
+    def test_a_reset_drops_the_history_and_keeps_the_frames_regions(self):
+        """Carry a held frame's regions through a reset, which drops the anchors they stored."""
+        scene, plain, held, decisions = self._states(64)
+        scene.move()
+        live = scene.frame()
+        for state in (plain, held):
+            state.build(scene.model, scene.state, scene.contacts)
+            store_frame(state, scene.state)
+        self.assertTrue(np.any(held.previous.valid.numpy()), "the frame must store anchors")
+        owner = held.current.owner.numpy()[:live].copy()
+        held.reset(None)
+        held.build(scene.model, scene.state, scene.contacts)
+        self.assertEqual(decisions[-1], "keep")
+        np.testing.assert_array_equal(held.current.owner.numpy()[:live], owner, "the held frame's regions")
+        np.testing.assert_array_equal(held.current.source.numpy()[:live], -1, "no region carries a dropped anchor")
+        self.assertTrue(np.any(held.current.valid.numpy()[:live]), "the regions place their anchors anew")
 
 
 class TestPatchFrameModes(unittest.TestCase):
@@ -2550,9 +2678,14 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
                 _assert_same_twins(twin, plain, f"{context} substep {substep}")
 
     def test_caller_count_writes_make_the_next_step_sort(self):
-        """Sort a step whose contact count a caller lowered since the last build, as the always-sort chain does."""
+        """Sort a step whose contact count a caller lowered since the last build, as a chain that sorts it does.
+
+        Both twins hold their frames while the boxes land: a landing box has two regions, and a held region takes
+        its own centre of pressure where a sorted frame's takes the nearest of its pair, so a chain that sorted
+        every landing substep would part from the twin before the step under test.
+        """
         twin = _SolverTwin("cpu", boxes=True)
-        plain = _SolverTwin("cpu", boxes=True).sort_every_build()
+        plain = _SolverTwin("cpu", boxes=True)
         for _ in range(40):
             for each in (twin, plain):
                 each.pair(collide=True)
@@ -2560,6 +2693,7 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
                 break
         self.assertGreater(int(twin.streams[0].rigid_contact_count.numpy()[0]), 1)
         self.assertTrue(np.any(twin.patches.previous.valid.numpy()), "the landed boxes must store anchors")
+        plain.sort_every_build()
         decisions = _decisions(twin.patches)
         for each in (twin, plain):
             count = int(each.streams[0].rigid_contact_count.numpy()[0])
@@ -2688,14 +2822,17 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
 
     @unittest.skipUnless(wp.is_cuda_available(), "graph capture needs CUDA")
     def test_solver_graphs_replay_empty_contact_frames(self):
-        """Replay graphs bitwise as eager always-sort steps over empty, live and again empty contact frames.
+        """Replay graphs bitwise as eager steps over empty, live and again empty contact frames.
 
         Boxes fall and rest on the ground; a Contacts.clear() empties the frame of a
         replay without a collision pass while their anchors are stored; they collide
         again, are thrown up and land again. A second eager twin is an A/A control:
         the graph must match bitwise for as long as the eager twins do, which must
         cover every transition. The boxes' 128 contact slots take the live sort,
-        which skips empty frames.
+        which skips empty frames. The eager twins hold their frames as the graph
+        does: a resting box has two regions, and a held region takes its own centre
+        of pressure where a chain that sorted every build would take the nearest of
+        its pair.
         """
         graph = _graph_twin(boxes=True)
         self.assertTrue(graph.patches.live_sort)
@@ -2703,8 +2840,6 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
         twins = (graph, eager, control)
         for twin in twins:
             twin.pair(collide=True)
-        for twin in (eager, control):
-            twin.sort_every_build()
         captured = {}
         for collide in (True, False):
             with wp.ScopedCapture(device="cuda:0") as capture:
@@ -3090,14 +3225,16 @@ def run_replay_past_the_sort_rounds(test, device, replays=3):
             stale.build(scene.model, scene.state, scene.contacts)
         fresh.build(scene.model, scene.state, scene.contacts)
         context = f"replay {replay}" if replay < replays else "eager"
+        np.testing.assert_array_equal(stale.regions.numpy(), fresh.regions.numpy(), f"{context} regions")
+        regions = int(fresh.regions.numpy()[0])
         for name in _PatchFrame.vars:
             if name in _STORED_FIELDS:
                 continue  # the built frame holds none of the stored frame's scratch
-            np.testing.assert_array_equal(
-                getattr(stale.current, name).numpy()[:live],
-                getattr(fresh.current, name).numpy()[:live],
-                f"{context} {name}",
-            )
+            arrays = [getattr(state.current, name).numpy()[:live] for state in (stale, fresh)]
+            if name == "regions":
+                # The listed regions compare as a set: threads list them in any order.
+                arrays = [np.sort(array[:regions]) for array in arrays]
+            np.testing.assert_array_equal(*arrays, f"{context} {name}")
         for name in ("weight", "next_contact", "point", "phi"):
             np.testing.assert_array_equal(
                 getattr(stale.view, name).numpy()[:live], getattr(fresh.view, name).numpy()[:live], f"{context} {name}"

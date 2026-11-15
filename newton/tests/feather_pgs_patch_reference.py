@@ -199,14 +199,18 @@ def _build(
     frame: _PatchFrame,
     prev: _PatchFrame,
     patches: FrictionPatches,
+    regions: wp.array[int],
 ):
     """One thread per sorted body pair, over the whole capacity; the pair's build is the module's (the one-wrench law),
-    its previous pairs searched over the whole history."""
+    its previous pairs searched over the whole history. Every build makes its regions anew: this reference holds
+    no frame."""
     start = wp.tid()
     end = wp.min(count[0], frame.center.shape[0])
     if start >= end or not _starts_pair(frame.keys, start):
         return
-    _build_pair(start, end, prev.center.shape[0], q, previous_q, shape_transform, shape_radius, frame, prev, patches)
+    _build_pair(
+        start, end, prev.center.shape[0], q, previous_q, shape_transform, shape_radius, frame, prev, patches, regions
+    )
 
 
 @wp.kernel(enable_backward=False)
@@ -465,6 +469,9 @@ class ReferencePatches:
             "source",
             "eligible",
             "members",
+            "regions",
+            "region_stop",
+            "carrier",
             "pressured",
         ):
             setattr(frame, field, wp.zeros(n, dtype=int, device=device))
@@ -524,6 +531,7 @@ class ReferencePatches:
                 self.current,
                 self.previous,
                 self.view,
+                wp.zeros(1, dtype=int, device=model.device),
             ],
             device=model.device,
         )

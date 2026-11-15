@@ -37,6 +37,22 @@ follows the live contact count rather than the capacity. A build whose contact
 frame the slots already hold sorted, as on every solver substep that shares a
 collision pass, keeps those pairs: the device decides it from the stream's
 ``contact_generation`` word (see :class:`_FrictionPatchState`).
+
+Regions are made with their contacts. A collision pass makes a contact frame
+and the substeps that share the pass hold it; a region is a grouping of that
+frame's contacts, so it is made at the frame's first build, from the poses of
+that build, and held for the frame's other builds (:func:`_build` makes
+them, one thread a body pair, or carries them, one thread a region). What is decided with the frame: which contacts each
+region has, and the ring in which their normal impulses pool. What every
+build decides anew, from the poses of its substep: each contact's centre, gap
+and eligibility; each region's carrier (its last eligible member) and weight;
+its footprint, spin arm and location; its anchor, placed at its centre of
+pressure of the last solve and kept on the footprint; the increment of its
+tangential and twist displacement; and, at the finish, its release. A held
+region's history is its own: the anchor and the centre of pressure its
+carrier of the last build stored, taken through the same gates, where a new
+frame's region, which has no identity across collision passes, takes the
+nearest stored ones of its body pair.
 """
 
 import itertools
@@ -86,6 +102,10 @@ _BUILD_BLOCKS_PER_SM = 8
 _BUILD_REGISTERS = 80
 # The patch extent: the slots to visit, the live slots, then the live sort's extent (live_sort.publish_sort_extent).
 _SORT_EXTENT = wp.constant(2)
+# After the sort's extent: the build's work, the slots a build that makes the frame's regions visits or the regions a
+# held frame's build carries, then those regions again (none unless the frame is held), which says which it is.
+_BUILD_EXTENT = wp.constant(2 + int(EXTENT_SIZE))
+_CARRY_EXTENT = wp.constant(3 + int(EXTENT_SIZE))
 # Contact paths 0 and 1 hold dense and matrix-free rows, and -1 holds none.
 # A region's spin arm over the polar radius of gyration of its contacts' hull: the mean radius of a convex patch under
 # uniform pressure over its gyration radius is 0.937 on a square, 0.943 on a disc and 0.866 on a line, and 0.94 holds
@@ -189,6 +209,12 @@ class _PatchFrame:
     members: wp.array[int]
     # Scratch of the previous frame: a pair's stored centres of pressure, gathered in the pair's own positions.
     centres: wp.array[wp.vec3]
+    # The frame's regions, which a held frame's builds carry: the position each region's members start at in
+    # ``members``, in any order; where they stop and the member that carried the region's friction at the last
+    # build, both at that position.
+    regions: wp.array[int]
+    region_stop: wp.array[int]
+    carrier: wp.array[int]
     # Scratch: a region's footprint points, in its members' positions.
     foot: wp.array[wp.vec2]
     support_gap_limit: wp.array[float]
@@ -268,20 +294,24 @@ class _PatchContacts:
 
 
 @wp.func
-def _prepare_contact_fields(c: int, live: int, inputs: _PatchContacts, frame: _PatchFrame, patches: FrictionPatches):
+def _prepare_contact_fields(
+    c: int, live: int, held: int, inputs: _PatchContacts, frame: _PatchFrame, patches: FrictionPatches
+):
     """Prepare contact ``c``'s frame record, all but slot ``c``'s pair key and index; return the pair key.
 
     Past ``live`` the record is empty and the key the empty key. A build stores the key and the index in
-    slot ``c``; a build that reuses sorted pairs can leave the slots' keys and indices untouched.
+    slot ``c``; a build that reuses sorted pairs can leave the slots' keys and indices untouched. A ``held`` frame's
+    live contacts keep the region that owns them and their link in its ring: the frame's regions are made once.
     """
-    frame.owner[c] = -1
+    if held == 0 or c >= live:
+        frame.owner[c] = -1
+        patches.next_contact[c] = -1
     frame.valid[c] = 0
     frame.used[c] = 0
     frame.source[c] = -1
     frame.eligible[c] = 0
     frame.pressured[c] = 0
     patches.weight[c] = 0.0
-    patches.next_contact[c] = -1
     patches.phi[c] = wp.vec2(0.0)
     patches.spin_phi[c] = 0.0
     if c >= live:
@@ -367,18 +397,23 @@ def _prepare_contact_fields(c: int, live: int, inputs: _PatchContacts, frame: _P
 
 
 @wp.func
-def _publish_extent(extent: wp.array[int], end: int, live: int, sort: int):
-    """Publish the slots to visit, the live slots, then the live sort's extent of ``sort`` slots.
+def _publish_extent(extent: wp.array[int], end: int, live: int, sort: int, build: int, carry: int):
+    """Publish the slots to visit, the live slots, the live sort's extent of ``sort`` slots, then the build's.
 
     ``extent[0]`` holds the slots to visit, ``extent[1]`` the live count and
     ``extent[_SORT_EXTENT:]`` the sort extent
     (:func:`~newton._src.core.live_sort.publish_sort_extent`): the live slots of
     a frame to sort, none of a kept one. A captured live sort follows it,
-    launching no work past the slots it sorts.
+    launching no work past the slots it sorts. ``extent[_BUILD_EXTENT]`` holds
+    the build's work, which its launch follows: the ``build`` slots of a build
+    that makes the frame's regions or the ``carry`` regions of a held frame's
+    build, of which one is zero; ``extent[_CARRY_EXTENT]`` holds ``carry``.
     """
     extent[0] = end
     extent[1] = live
     publish_sort_extent(extent, _SORT_EXTENT, sort)
+    extent[_BUILD_EXTENT] = build + carry
+    extent[_CARRY_EXTENT] = carry
 
 
 @wp.kernel(enable_backward=False)
@@ -393,7 +428,9 @@ def _prepare(
     generation: wp.array[wp.int32],
     stream: wp.int64,
     sorted_frame: wp.array[wp.int64],
+    fresh: wp.array[int],
     extent: wp.array[int],
+    regions: wp.array[int],
 ):
     """Fill this frame's contact slots and clear every slot an earlier frame used; keep a recorded frame's pairs.
 
@@ -402,8 +439,12 @@ def _prepare(
     record. ``sorted_frame`` names the frame whose pairs the slots hold sorted
     (its generation, live count and contact stream; :func:`_build` records it).
     That frame keeps its live slots' keys and indices and publishes no sort;
-    any other writes them and publishes the sort of its live slots. Thread 0
-    publishes the extent, which this launch reads nowhere.
+    any other writes them and publishes the sort of its live slots. A kept
+    frame whose last build the stored frame holds (``fresh``: a store followed
+    that build) is held: its contacts keep their regions, and its build carries
+    them where any other build makes the regions anew and empties their list
+    (:func:`_build`). Thread 0 publishes the extent and the empty list, which
+    this launch reads nowhere.
     """
     thread = wp.tid()
     live = count[0]
@@ -418,10 +459,13 @@ def _prepare(
         and sorted_frame[2] == stream
     ):
         kept = 1
+    held = kept * fresh[0]
     if thread == 0:
-        _publish_extent(extent, end, live, live * (1 - kept))
+        _publish_extent(extent, end, live, live * (1 - kept), end * (1 - held), regions[0] * held)
+        if held == 0:
+            regions[0] = 0
     for c in range(thread, end, threads):
-        key = _prepare_contact_fields(c, live, inputs, frame, patches)
+        key = _prepare_contact_fields(c, live, held, inputs, frame, patches)
         # A kept slot holds the sorted pair at position c, not contact c's key.
         if kept == 0 or c >= live:
             frame.indices[c] = c
@@ -836,8 +880,10 @@ def _build_pair(
     frame: _PatchFrame,
     prev: _PatchFrame,
     patches: FrictionPatches,
+    regions: wp.array[int],
 ):
-    """Build the body pair whose sorted run starts at live position ``start`` (:func:`_starts_pair`)."""
+    """Build the body pair whose sorted run starts at live position ``start`` (:func:`_starts_pair`): make its
+    regions, list them for the frame's later builds, and place each one's anchor."""
     key = frame.keys[start]
     stop = start + 1
     while stop < end and frame.keys[stop] == key:
@@ -955,6 +1001,10 @@ def _build_pair(
             first = tail
         else:
             first = last
+        # The region, for the builds that hold this frame: where its members lie and which one carries it.
+        frame.region_stop[member_start] = member_stop
+        frame.carrier[member_start] = first
+        frame.regions[wp.atomic_add(regions, 0, 1)] = member_start
         _place_region(
             seed,
             first,
@@ -976,6 +1026,68 @@ def _build_pair(
         )
 
 
+@wp.func
+def _carry_region(
+    member_start: int,
+    q: wp.array[wp.transform],
+    previous_q: wp.array[wp.transform],
+    shape_transform: wp.array[wp.transform],
+    shape_radius: wp.array[float],
+    frame: _PatchFrame,
+    prev: _PatchFrame,
+    patches: FrictionPatches,
+):
+    """Carry the region whose members start at ``member_start`` through a build of the frame that made it.
+
+    The region keeps its members. Its carrier is again the last member that may carry friction rows, and its anchor
+    is placed as a new region's is (:func:`_place_region`) from the members' present centres, with one difference:
+    the history it may take is its own, the anchor and the centre of pressure that its carrier of the last build
+    stored, where a new frame's region looks through its pair's.
+    """
+    member_stop = frame.region_stop[member_start]
+    seed = frame.members[member_start]
+    first = int(-1)
+    for j in range(member_start, member_stop):
+        c = frame.members[j]
+        if frame.eligible[c] != 0:
+            first = c
+    carry_only = int(0)
+    if first < 0:
+        carry_only = int(1)
+        first = frame.members[member_stop - 1]
+    # The region's own history, in its own position of the stored frame's scratch.
+    p = frame.carrier[member_start]
+    frame.carrier[member_start] = first
+    prev.used[p] = 0
+    anchor_stop = member_start
+    centre_stop = member_start
+    if prev.valid[p] != 0:
+        prev.members[member_start] = p
+        anchor_stop = member_start + 1
+    if prev.pressured[p] != 0:
+        prev.centres[member_start] = prev.pressure[p]
+        centre_stop = member_start + 1
+    _place_region(
+        seed,
+        first,
+        carry_only,
+        member_start,
+        member_stop,
+        anchor_stop - member_start,
+        member_start,
+        anchor_stop,
+        member_start,
+        centre_stop,
+        q,
+        previous_q,
+        shape_transform,
+        shape_radius,
+        frame,
+        prev,
+        patches,
+    )
+
+
 # A module of its own: the build launches at its block (_BUILD_BLOCK_DIM), the module's other kernels at the default,
 # and each compiles once at its own.
 @wp.kernel(enable_backward=False, cuda_max_registers=_BUILD_REGISTERS, module="unique")
@@ -994,22 +1106,36 @@ def _build(
     stream: wp.int64,
     built: wp.array[int],
     sorted_frame: wp.array[wp.int64],
+    fresh: wp.array[int],
+    regions: wp.array[int],
 ):
-    """Stride over the live sorted positions and build the body pair whose run starts at each; body pairs write
+    """Build the frame's regions: carry those of a held frame, make any other frame's.
+
+    A held frame's build strides over the regions its first build listed, one thread a region; regions write
     disjoint current/previous records.
 
-    A thread seeks its next pair before it builds it, so the threads of a warp, which run a statement together,
-    seek together and then build together: a thread that built whatever its own position held would build while
-    the others of its warp, on positions inside a run, waited for it, about one lane of a warp at a time on runs of
-    tens of contacts. Where the frame has no more positions than the launch has threads, each thread has one
-    position and seeks no further.
+    Any other build strides over the live sorted positions and builds the body pair whose run starts at each; body
+    pairs write disjoint current/previous records. A thread seeks its next pair before it builds it, so the
+    threads of a warp, which run a statement together, seek together and then build together: a thread that built
+    whatever its own position held would build while the others of its warp, on positions inside a run, waited
+    for it, about one lane of a warp at a time on runs of tens of contacts. Where the frame has no more positions
+    than the launch has threads, each thread has one position and seeks no further.
 
-    Thread 0 records the live count, so the next _prepare clears these slots even
-    when no store follows this build, and the frame whose pairs the slots now hold
-    sorted, which the next _prepare keeps; no _prepare thread reads it while it changes.
+    Thread 0 records that no store has followed this build and, where the build makes the regions, the live count,
+    so the next _prepare clears these slots even when no store follows this build, and the frame whose pairs the
+    slots now hold sorted, which the next _prepare keeps; no _prepare thread reads them while they change.
     """
+    if extent[_BUILD_EXTENT] == 0:
+        return
     thread = wp.tid()
     live = extent[1]
+    if thread == 0:
+        fresh[0] = 0
+    carry = extent[_CARRY_EXTENT]
+    if carry > 0:
+        for region in range(thread, carry, threads):
+            _carry_region(frame.regions[region], q, previous_q, shape_transform, shape_radius, frame, prev, patches)
+        return
     if thread == 0:
         built[0] = live
         sorted_frame[0] = wp.int64(generation[0])
@@ -1024,7 +1150,19 @@ def _build(
             position += threads
         if position >= live:
             break
-        _build_pair(position, live, previous_end, q, previous_q, shape_transform, shape_radius, frame, prev, patches)
+        _build_pair(
+            position,
+            live,
+            previous_end,
+            q,
+            previous_q,
+            shape_transform,
+            shape_radius,
+            frame,
+            prev,
+            patches,
+            regions,
+        )
         position += threads
 
 
@@ -1130,7 +1268,20 @@ def _uses_live_sort(key_bits):
     return slot_keys_fit(key_bits)
 
 
-_BUILD_FIELDS = frozenset(("center", "radius", "support_gap_limit", "flipped", "source", "eligible", "foot"))
+_BUILD_FIELDS = frozenset(
+    (
+        "regions",
+        "region_stop",
+        "carrier",
+        "center",
+        "radius",
+        "support_gap_limit",
+        "flipped",
+        "source",
+        "eligible",
+        "foot",
+    )
+)
 """Patch frame fields only a build reads: the stored frame (:attr:`_FrictionPatchState.previous`) holds none."""
 _STORED_FIELDS = frozenset(("centres",))
 """Patch frame fields only the stored frame holds: a build's scratch over the stored contacts."""
@@ -1150,8 +1301,19 @@ class _FrictionPatchState:
     next build sort. A writer that keeps the generation and the count but changes
     the shapes of a contact slot, or the contacts' order, goes unseen, and the kept
     build groups its contacts by the stale pairs; its kept indices still lie
-    below the live count. Rewrites of points, normals or margins alone are
-    exact: pair keys follow the shapes, and a kept build prepares the rest anew.
+    below the live count.
+
+    A kept frame whose last build the stored frame holds (a store followed that
+    build: ``fresh``) is held: its build carries the regions the frame's first
+    build made (see the module docstring). A kept frame without that store is
+    built as a new one is, without the sort. So a writer that rewrites points,
+    normals or margins under one generation moves each contact's centre, gap
+    and eligibility at once, as every build prepares them anew, but not the
+    regions: they stay those of the frame's first build until the writer
+    advances the generation or calls :meth:`forget_frame`. A reset
+    (:meth:`reset`) drops the stored anchors and centres of pressure of its
+    worlds and leaves their regions the frame's, as it leaves their contacts:
+    the next build carries those regions and places their anchors anew.
     """
 
     def __init__(self, model, capacity, phi, *, pool=None):
@@ -1202,7 +1364,13 @@ class _FrictionPatchState:
         # reads a count it writes, so blocks never race on them.
         self.stored = wp.zeros(1, dtype=int, device=device)
         self.built = wp.zeros(1, dtype=int, device=device)
-        self.extent = wp.zeros(_SORT_EXTENT + EXTENT_SIZE, dtype=int, device=device)
+        # The regions of the frame, listed in current.regions: a build that makes them fills the list _prepare
+        # emptied, and a held frame's builds carry them (_build).
+        self.regions = wp.zeros(1, dtype=int, device=device)
+        # Whether a store followed the last build: the stored frame then holds that build, and a build of the same
+        # contact frame is held. _finish_and_store sets it and a build clears it.
+        self.fresh = wp.zeros(1, dtype=int, device=device)
+        self.extent = wp.zeros(_CARRY_EXTENT + 1, dtype=int, device=device)
 
     def _on_view_rows(self, rows):
         rows.publish(self.view)
@@ -1306,7 +1474,8 @@ class _FrictionPatchState:
         self.forget_frame()
 
     def forget_frame(self):
-        """Make the next build sort its pairs, as it does for a new contact frame: the record names no frame."""
+        """Make the next build sort its pairs and make its regions, as it does for a new contact frame: the record
+        names no frame."""
         self.sorted_frame.fill_(GENERATION_SENTINEL)
 
     def stream_token(self, generation):
@@ -1373,6 +1542,9 @@ class _FrictionPatchState:
                 "source",
                 "eligible",
                 "members",
+                "regions",
+                "region_stop",
+                "carrier",
                 "pressured",
             )
         ]
@@ -1435,11 +1607,18 @@ class _FrictionPatchState:
         bind, the launches after it follow them through a new updater.
         """
         used = self._rows_used if self._rows_used is not None else self.pool.ready_rows
-        self.pool.launch(_prepare, self.threads, inputs=inputs, outputs=[self.extent], extent=used, clamp=True)
+        self.pool.launch(
+            _prepare,
+            self.threads,
+            inputs=[*inputs, self.fresh],
+            outputs=[self.extent, self.regions],
+            extent=used,
+            clamp=True,
+        )
         self.pool.begin_updates()
 
     def _launch_build(self, model, state, generation, stream):
-        """Build the pairs of the prepared, sorted slots and record their frame: ``generation``'s, of ``stream``."""
+        """Build the regions of the prepared, sorted slots and record their frame: ``generation``'s, of ``stream``."""
         self.pool.launch(
             _build,
             self.build_threads,
@@ -1457,9 +1636,10 @@ class _FrictionPatchState:
                 generation,
                 stream,
             ],
-            outputs=[self.built, self.sorted_frame],
-            # The slots to visit, not the live ones: thread 0 publishes the live count, also when it drops to zero.
-            extent=self.extent[0:1],
+            outputs=[self.built, self.sorted_frame, self.fresh, self.regions],
+            # A held frame's regions; any other frame's slots to visit, not the live ones: thread 0 publishes the
+            # live count, also when it drops to zero.
+            extent=self.extent[_BUILD_EXTENT : _BUILD_EXTENT + 1],
             clamp=True,
             block_dim=self.build_block_dim,
         )
@@ -1590,7 +1770,7 @@ class _FrictionPatchState:
                 self.previous_world,
                 self.previous_q,
             ],
-            outputs=[self.stored],
+            outputs=[self.stored, self.fresh],
             extent=self.extent[0:1],
             clamp=True,
         )
@@ -1892,6 +2072,7 @@ def _finish_and_store(
     previous_world: wp.array[int],
     previous_q: wp.array[wp.transform],
     stored: wp.array[int],
+    fresh: wp.array[int],
 ):
     """Finish each live anchor on its route, then store every slot this frame visits.
 
@@ -1901,12 +2082,14 @@ def _finish_and_store(
     on its route in a world none of whose rows can act (the routes' ``acts`` word: the sweeps left its rows unwritten
     at zero) releases its anchor, as its zero load does on the complete path. Other
     anchors without rows (capacity rejection, or a disabled route) keep their
-    history. Thread 0 publishes the stored count, which this launch never reads.
+    history. Thread 0 publishes the stored count and that the stored frame now
+    holds the last build, which this launch never reads.
     """
     thread = wp.tid()
     live = extent[1]
     if thread == 0:
         stored[0] = live
+        fresh[0] = 1
     finishing = routes.enabled[0] + routes.enabled[1] + routes.enabled[2] > 0
     for c in range(thread, extent[0], threads):
         if finishing and c < live and frame.valid[c] != 0:
