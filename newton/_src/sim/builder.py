@@ -3273,9 +3273,7 @@ class ModelBuilder:
                     raise ValueError(f"Articulation owner attribute '{owner_key}' must use an integer dtype")
 
                 count = model.custom_frequency_counts.get(frequency_key, 0)
-                if count == 0:
-                    owners = wp.empty(0, dtype=owner_attribute.dtype, device=device)
-                else:
+                if count:
                     owners = self._get_namespaced_attribute(model, owner_key)
                     if not isinstance(owners, wp.array) or owners.ndim != 1:
                         raise ValueError(f"Articulation owner attribute '{owner_key}' must be a 1-D Warp array")
@@ -3292,7 +3290,7 @@ class ModelBuilder:
                             f"Articulation owner attribute '{owner_key}' contains invalid articulation "
                             f"index {int(owner_values[row])} at row {row}"
                         )
-                model.custom_frequency_articulation[frequency_key] = owners
+                model.custom_frequency_articulation_attributes[frequency_key] = owner_key
 
             label_key = frequency.label_attribute
             if label_key is None:

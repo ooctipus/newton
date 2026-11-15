@@ -1,0 +1,1 @@
+`Model.custom_frequency_articulation` is a read-only property derived from the new `Model.custom_frequency_articulation_attributes`, the owner attribute of each articulation-scoped custom frequency, so the owners follow the model's attributes when they are replaced.

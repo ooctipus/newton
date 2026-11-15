@@ -2092,8 +2092,8 @@ class Model:
         self.custom_frequency_counts: dict[str, int] = {}
         """Counts for custom frequencies (e.g., ``{"mujoco:pair": 5}``). Set during finalize()."""
 
-        self.custom_frequency_articulation: dict[str, wp.array[Any]] = {}
-        """Per-row articulation owners for articulation-scoped custom frequencies."""
+        self.custom_frequency_articulation_attributes: dict[str, str] = {}
+        """Attribute keys holding each row's articulation for articulation-scoped custom frequencies."""
 
         self.custom_frequency_label_attributes: dict[str, str] = {}
         """Attribute keys containing labels for custom-frequency rows."""
@@ -2825,6 +2825,19 @@ class Model:
             self, state, self.bvh_particles.lowers, self.bvh_particles.uppers, self.bvh_particles.groups
         )
         self.bvh_particles.refit()
+
+    @property
+    def custom_frequency_articulation(self) -> dict[str, wp.array[Any]]:
+        """Per-row articulation owners of articulation-scoped custom frequencies. Read-only.
+
+        Each is the frequency's owner attribute (see :attr:`custom_frequency_articulation_attributes`); a frequency
+        without rows has an empty array.
+        """
+        owners = {}
+        for frequency, key in self.custom_frequency_articulation_attributes.items():
+            value = self._attribute_value(key) if self.custom_frequency_counts.get(frequency, 0) else None
+            owners[frequency] = value if value is not None else wp.empty(0, dtype=wp.int32, device=self.device)
+        return owners
 
     @property
     def deformable_visual_meshes(self) -> tuple[DeformableVisualMesh, ...]:
