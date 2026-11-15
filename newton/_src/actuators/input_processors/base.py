@@ -82,6 +82,12 @@ class InputProcessorBase:
         Index with ``joint_qd`` indices to read another joint."""
 
     SHARED_PARAMS: ClassVar[set[str]] = set()
+    """Constructor arguments and attributes with one value for all slots, such as a lookup table.
+
+    :meth:`~newton.ModelBuilder.add_actuator` groups actuators by these values, and an actuator built from copies of
+    its slots keeps them. Every array a component holds that its ``finalize`` does not allocate is named here or in
+    :attr:`PARAMETERS`; :meth:`Actuator.finalize() <newton.actuators.Actuator.finalize>` refuses any other.
+    """
 
     JOINT_PARAMS: ClassVar[set[str]] = set()
     """Names of parameters that reference a joint.

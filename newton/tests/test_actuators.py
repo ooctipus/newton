@@ -16,7 +16,7 @@ import zipfile
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 from unittest.mock import patch
 
 import numpy as np
@@ -1146,6 +1146,16 @@ class TestDriveNeuralGRU(unittest.TestCase):
         Actuator(indices=wp.array([3, 1, 5], dtype=wp.uint32, device=self.device), drive=drive)
         with self.assertRaisesRegex(RuntimeError, "already finalized"):
             Actuator(indices=wp.array([0, 2], dtype=wp.uint32, device=self.device), drive=drive)
+
+    def test_finalize_again_keeps_slots_and_refuses_new_ones(self):
+        """Finalizing again for the same slots passes the declaration check; new slots are refused as before."""
+        drive = DriveNeuralGRU(self._save_gru("refinalize.onnx"))
+        actuator = Actuator(indices=wp.array([3, 1, 5], dtype=wp.uint32, device=self.device), drive=drive)
+        actuator.finalize()
+        actuator.indices = wp.array([3, 1, 5, 0], dtype=wp.uint32, device=self.device)
+        actuator.pos_indices = actuator.target_pos_indices = actuator.effort_indices = actuator.indices
+        with self.assertRaisesRegex(RuntimeError, "already finalized for a different actuator"):
+            actuator.finalize()
 
     def test_runtime_dt_and_state_contract(self):
         """Reject a runtime dt that disagrees with sample_dt_s, and a missing drive state."""
@@ -3085,6 +3095,8 @@ def _scale_positions_kernel(
 
 class _ScalePositions(InputProcessorBase):
     """Test processor that replaces ``positions`` with one scaled entry per slot."""
+
+    PARAMETERS = ("scale",)
 
     @classmethod
     def resolve_arguments(cls, args):
@@ -7080,6 +7092,79 @@ class TestActuatorSlotSpecs(unittest.TestCase):
             actuator.step(sim_state, sim_control, state_a, state_b, dt=0.01)
             state_a, state_b = state_b, state_a
         np.testing.assert_allclose(sim_control.joint_f.numpy(), [1.5, 3.0, 1.5, 3.0])
+
+    def test_undeclared_array_is_refused(self):
+        """An array a component keeps through finalize must be declared per slot or shared by all slots."""
+        device = wp.get_device("cpu")
+
+        class _TableClamp(ClampingMaxEffort):
+            def __init__(self, max_effort, table):
+                super().__init__(max_effort)
+                self.table = table
+
+        class _SharedTableClamp(_TableClamp):
+            SHARED_PARAMS: ClassVar[set[str]] = {"table"}
+
+        class _SlotTableClamp(_TableClamp):
+            PARAMETERS: ClassVar[tuple[str, ...]] = (*ClampingMaxEffort.PARAMETERS, "table")
+
+        def build(clamp_class):
+            def array(values):
+                return wp.array(values, dtype=wp.float32, device=device)
+
+            clamp = clamp_class(max_effort=array([1.0, 2.0]), table=array([0.5, 0.25]))
+            return Actuator(
+                indices=wp.array([0, 1], dtype=wp.uint32, device=device),
+                drive=DrivePD(kp=array([1.0, 1.0]), kd=array([0.0, 0.0])),
+                clamping=[clamp],
+            )
+
+        message = (
+            r"^_TableClamp\.table is an array that _TableClamp\.finalize\(\) does not allocate, and _TableClamp "
+            r"declares it neither per slot \(PARAMETERS\) nor shared by all slots \(SHARED_PARAMS\)\. "
+            r"Declare 'table' in one of them\.$"
+        )
+        with self.assertRaisesRegex(TypeError, message):
+            build(_TableClamp)
+        for declared in (_SharedTableClamp, _SlotTableClamp):
+            with self.subTest(declared=declared.__name__):
+                actuator = build(declared)
+                actuator.finalize()
+
+    def test_implicit_gains_follow_new_slots(self):
+        """Finalizing an implicit PD actuator for copied slots packs the copied gains, not the old pack."""
+        device = wp.get_device("cpu")
+        model = _build_pendulum(device, worlds=2)
+        response = JointSpaceResponse(model)
+        actuator = Actuator(
+            indices=wp.array([0], dtype=wp.uint32, device=device),
+            drive=DrivePD(
+                kp=wp.array([100.0], dtype=wp.float32, device=device),
+                kd=wp.array([10.0], dtype=wp.float32, device=device),
+            ),
+        )
+        actuator.set_effort_mode_implicit(response=response)
+        for part in (actuator, *actuator.components):
+            for name, spec in part.attribute_specs().items():
+                value = getattr(part, name)
+                if value is None:
+                    continue
+                copied = np.tile(value.numpy(), 2)
+                if spec.references is not None:
+                    copied[1:] += 1
+                setattr(part, name, wp.array(copied, dtype=value.dtype, device=device))
+        actuator.finalize()
+
+        pack = actuator.drive._param_pack
+        self.assertEqual(pack.shape, (2, 3))
+        np.testing.assert_array_equal(pack.numpy()[:, :2], [[100.0, 10.0], [100.0, 10.0]])
+        state, control = model.state(), model.control()
+        control.joint_target_q.assign(np.array([0.5, 0.5], dtype=np.float32))
+        response.refresh(state)
+        actuator.step(state, control, dt=0.01)
+        effort = control.joint_f.numpy()
+        self.assertNotEqual(effort[0], 0.0)
+        self.assertEqual(effort[0], effort[1])
 
 
 if __name__ == "__main__":

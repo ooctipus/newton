@@ -36,6 +36,12 @@ class ClampingBase:
     """Space accepted by this clamp. Physical effort clamps keep the default."""
 
     SHARED_PARAMS: ClassVar[set[str]] = set()
+    """Constructor arguments and attributes with one value for all slots, such as a lookup table.
+
+    :meth:`~newton.ModelBuilder.add_actuator` groups actuators by these values, and an actuator built from copies of
+    its slots keeps them. Every array a component holds that its ``finalize`` does not allocate is named here or in
+    :attr:`PARAMETERS`; :meth:`Actuator.finalize() <newton.actuators.Actuator.finalize>` refuses any other.
+    """
 
     PARAMETERS: ClassVar[tuple[str, ...]] = ()
     """Per-slot parameter arrays, each a constructor argument and attribute of the same name (``None`` when unset)."""

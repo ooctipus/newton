@@ -217,6 +217,8 @@ class DrivePID(DriveBase):
 
     def finalize(self, device: wp.Device, num_actuators: int) -> None:
         self._next_integral = wp.zeros(num_actuators, dtype=wp.float32, device=device, requires_grad=True)
+        # The implicit mode packs the gains of the current slots again.
+        self._param_pack = None
 
     def is_stateful(self) -> bool:
         return True

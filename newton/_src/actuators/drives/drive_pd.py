@@ -120,6 +120,10 @@ class DrivePD(DriveBase):
         self.const_effort = const_effort
         self._param_pack: wp.array2d[float] | None = None
 
+    def finalize(self, device: wp.Device, num_actuators: int) -> None:
+        # The implicit mode packs the gains of the current slots again.
+        self._param_pack = None
+
     evaluate_force = _pd_evaluate_force
 
     def bind_params(self) -> wp.array2d[float]:

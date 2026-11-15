@@ -155,6 +155,37 @@ def _get_attribute(source: Any, name: str, default: Any = _MISSING) -> Any:
     return value
 
 
+def _held_arrays(part: Any) -> dict[str, wp.array]:
+    """Return the Warp arrays *part* holds as attributes, keyed by attribute name."""
+    return {name: value for name, value in vars(part).items() if isinstance(value, wp.array)}
+
+
+def _require_declared_arrays(part: Any, held_before: Mapping[str, wp.array]) -> None:
+    """Refuse an array *part* kept through ``finalize`` without declaring it per slot or shared.
+
+    ``finalize`` sizes the arrays it allocates itself. Every other array a component holds is either one row per
+    slot, which :meth:`attribute_specs` declares (``PARAMETERS`` and joint index arrays), or one value for all
+    slots, which ``SHARED_PARAMS`` names. An actuator built from copies of its slots replaces exactly the declared
+    per-slot arrays, so an undeclared one would keep the rows of the slots it was copied from.
+
+    Args:
+        part: A component of the actuator, after its ``finalize``.
+        held_before: The arrays *part* held before its ``finalize``, from :func:`_held_arrays`.
+
+    Raises:
+        TypeError: *part* holds an array from before ``finalize`` that it declares neither per slot nor shared.
+    """
+    kept = {id(value) for value in held_before.values()}
+    declared = part.attribute_specs().keys() | part.SHARED_PARAMS
+    for name, value in _held_arrays(part).items():
+        if name not in declared and id(value) in kept:
+            cls = type(part).__name__
+            raise TypeError(
+                f"{cls}.{name} is an array that {cls}.finalize() does not allocate, and {cls} declares it neither "
+                f"per slot (PARAMETERS) nor shared by all slots (SHARED_PARAMS). Declare '{name}' in one of them."
+            )
+
+
 def _require_array(source: Any, name: str) -> Any:
     """Read *name* from *source* and require an array.
 
@@ -496,6 +527,8 @@ class Actuator:
         Raises:
             ValueError: An index array does not have one entry per slot, or the motor draws from a battery and
                 :attr:`actuator_indices` is ``None``.
+            TypeError: A component holds an array that its ``finalize`` does not allocate and that it declares
+                neither per slot (``PARAMETERS``) nor shared by all slots (``SHARED_PARAMS``).
         """
         self.num_actuators = len(self.indices)
         """Number of slots N, one per driven DOF."""
@@ -508,6 +541,7 @@ class Actuator:
         if self._uses_battery and self.actuator_indices is None:
             raise ValueError(f"{type(motor).__name__} draws from a battery, which requires actuator_indices")
 
+        held_before = [_held_arrays(part) for part in self.components]
         device, requires_grad, count = self.device, self.requires_grad, self.num_actuators
         self._computed_forces = wp.zeros(count, dtype=wp.float32, device=device, requires_grad=requires_grad)
         self._applied_forces = wp.zeros(count, dtype=wp.float32, device=device, requires_grad=requires_grad)
@@ -529,6 +563,8 @@ class Actuator:
             self.set_effort_mode_explicit()
         else:
             self.set_effort_mode_implicit(*self._implicit_arguments)
+        for part, held in zip(self.components, held_before, strict=True):
+            _require_declared_arrays(part, held)
 
     def sim_state(self) -> Any:
         """Return an empty container with the fields this actuator reads from ``sim_state``.
