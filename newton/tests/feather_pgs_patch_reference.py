@@ -445,6 +445,7 @@ class ReferencePatches:
             "surface_a",
             "surface_b",
             "pressure",
+            "centres",
         ):
             setattr(frame, field, wp.zeros(n, dtype=wp.vec3, device=device))
         frame.mu = wp.zeros(n, dtype=wp.vec2, device=device)

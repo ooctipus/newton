@@ -184,8 +184,11 @@ class _PatchFrame:
     used: wp.array[int]
     source: wp.array[int]
     eligible: wp.array[int]
-    # Scratch indices: patch members in the current frame, the contacts that carry history in the previous frame.
+    # Scratch indices: patch members in the current frame, the contacts that hold a valid anchor in the previous
+    # frame.
     members: wp.array[int]
+    # Scratch of the previous frame: a pair's stored centres of pressure, gathered in the pair's own positions.
+    centres: wp.array[wp.vec3]
     # Scratch: a region's footprint points, in its members' positions.
     foot: wp.array[wp.vec2]
     support_gap_limit: wp.array[float]
@@ -642,8 +645,10 @@ def _place_region(
     member_start: int,
     member_stop: int,
     carried: int,
-    history_start: int,
-    history_stop: int,
+    anchor_start: int,
+    anchor_stop: int,
+    centre_start: int,
+    centre_stop: int,
     q: wp.array[wp.transform],
     previous_q: wp.array[wp.transform],
     shape_transform: wp.array[wp.transform],
@@ -656,8 +661,9 @@ def _place_region(
 
     The region's members lie in ``frame.members[member_start:member_stop]`` in contact order; ``carry_only`` says
     none may carry friction rows this step. ``carried`` says its pair holds stored history, which moves with the
-    bodies' pose increments since the stored poses. The stored contacts whose anchor or centre of pressure it may
-    take are ``prev.members[history_start:history_stop]``, in sorted order.
+    bodies' pose increments since the stored poses. The stored anchors it may carry are
+    ``prev.members[anchor_start:anchor_stop]`` and the stored centres of pressure it may sit at
+    ``prev.centres[centre_start:centre_stop]``, both in sorted order.
     """
     normal = frame.normal[seed]
     plane_t0, plane_t1 = contact_tangent_basis(normal)
@@ -686,7 +692,7 @@ def _place_region(
     motion = wp.vec3(0.0)
     if carried != 0:
         motion = _pose_motion(q, previous_q, a, location) - _pose_motion(q, previous_q, b, location)
-    for j in range(history_start, history_stop):
+    for j in range(anchor_start, anchor_stop):
         p = prev.members[j]
         if (
             prev.valid[p] == 0
@@ -755,14 +761,12 @@ def _place_region(
     # this pair, sliding or stuck, since the anchor may have released.
     nearest_pressure = float(1.0e30)
     shift = wp.vec3(0.0)
-    for j in range(history_start, history_stop):
-        p = prev.members[j]
-        if prev.pressured[p] != 0:
-            candidate = _world_point(q, a, prev.pressure[p]) - location
-            candidate -= n * wp.dot(candidate, n)
-            if wp.length_sq(candidate) < nearest_pressure:
-                nearest_pressure = wp.length_sq(candidate)
-                shift = candidate
+    for j in range(centre_start, centre_stop):
+        candidate = _world_point(q, a, prev.centres[j]) - location
+        candidate -= n * wp.dot(candidate, n)
+        if wp.length_sq(candidate) < nearest_pressure:
+            nearest_pressure = wp.length_sq(candidate)
+            shift = candidate
     if nearest_pressure < 1.0e29:
         # A stale centre stays on the footprint: no further along its direction than the footprint's support.
         shift_length = wp.length(shift)
@@ -852,15 +856,20 @@ def _build_pair(
     prev_start = lo
     prev_stop = lo
     # Index the pair's history once rather than rescanning all its old contacts for every new friction location:
-    # the stored contacts that hold a valid anchor or a centre of pressure, a few of a pair's many. Keep sorted
-    # order for matching ties.
-    prev_history_stop = prev_start
+    # the stored contacts that hold a valid anchor, a few of a pair's many, and the stored centres of pressure
+    # themselves, gathered one after another: every region looks for the nearest. Keep sorted order for matching
+    # ties.
+    prev_anchor_stop = prev_start
+    prev_centre_stop = prev_start
     while prev_stop < previous_end and prev.keys[prev_stop] == key:
         p = prev.indices[prev_stop]
         prev.used[p] = 0
-        if prev.valid[p] != 0 or prev.pressured[p] != 0:
-            prev.members[prev_history_stop] = p
-            prev_history_stop += 1
+        if prev.valid[p] != 0:
+            prev.members[prev_anchor_stop] = p
+            prev_anchor_stop += 1
+        if prev.pressured[p] != 0:
+            prev.centres[prev_centre_stop] = prev.pressure[p]
+            prev_centre_stop += 1
         prev_stop += 1
 
     member_stop = start
@@ -954,7 +963,9 @@ def _build_pair(
             member_stop,
             int(prev_start < prev_stop),
             prev_start,
-            prev_history_stop,
+            prev_anchor_stop,
+            prev_start,
+            prev_centre_stop,
             q,
             previous_q,
             shape_transform,
@@ -1121,6 +1132,8 @@ def _uses_live_sort(key_bits):
 
 _BUILD_FIELDS = frozenset(("center", "radius", "support_gap_limit", "flipped", "source", "eligible", "foot"))
 """Patch frame fields only a build reads: the stored frame (:attr:`_FrictionPatchState.previous`) holds none."""
+_STORED_FIELDS = frozenset(("centres",))
+"""Patch frame fields only the stored frame holds: a build's scratch over the stored contacts."""
 
 
 class _FrictionPatchState:
@@ -1317,8 +1330,9 @@ class _FrictionPatchState:
         slots that still hold it. A built frame's keys and indices hold a second,
         scratch half for the radix sort. The stored frame keeps what the next
         build reads (_build_pair, _seed_contact; _store_contact writes it): one
-        key and index a slot, which no sort visits, and none of the fields only
-        a build reads (:data:`_BUILD_FIELDS`).
+        key and index a slot, which no sort visits, none of the fields only
+        a build reads (:data:`_BUILD_FIELDS`), and the build's scratch over the
+        stored contacts (:data:`_STORED_FIELDS`).
         """
         halves = 1 if stored else 2
         slack = 0 if stored else int(SORT_CHUNK)
@@ -1364,6 +1378,7 @@ class _FrictionPatchState:
         ]
         if stored:
             fields = [field for field in fields if field.name not in _BUILD_FIELDS]
+            fields.append(ContactField("centres", wp.vec3))
         return fields
 
     def build(

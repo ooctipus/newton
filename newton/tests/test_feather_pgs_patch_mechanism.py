@@ -54,6 +54,7 @@ from newton._src.core.live_sort import MAX_MERGES, SORT_CHUNK
 from newton._src.solvers.feather_pgs import friction_patches
 from newton._src.solvers.feather_pgs.friction_patches import (
     _BUILD_FIELDS,
+    _STORED_FIELDS,
     FrictionPatches,
     _FrictionPatchState,
     _PatchFrame,
@@ -530,6 +531,8 @@ def assert_same_state(twin, patches, context="", records=True):
         for name in _PatchFrame.vars:
             if frame == "previous" and name in _BUILD_FIELDS:
                 continue  # the stored frame holds no field only a build reads
+            if frame == "current" and name in _STORED_FIELDS:
+                continue  # and the built frame none of the stored frame's scratch
             np.testing.assert_array_equal(
                 getattr(getattr(twin, frame), name).numpy(),
                 getattr(getattr(patches, frame), name).numpy(),
@@ -3088,6 +3091,8 @@ def run_replay_past_the_sort_rounds(test, device, replays=3):
         fresh.build(scene.model, scene.state, scene.contacts)
         context = f"replay {replay}" if replay < replays else "eager"
         for name in _PatchFrame.vars:
+            if name in _STORED_FIELDS:
+                continue  # the built frame holds none of the stored frame's scratch
             np.testing.assert_array_equal(
                 getattr(stale.current, name).numpy()[:live],
                 getattr(fresh.current, name).numpy()[:live],
