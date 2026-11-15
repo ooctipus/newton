@@ -690,6 +690,12 @@ def _build_pair(
         cursor = seed
         expanded_a = int(-2)
         expanded_b = int(-2)
+        # The region's members, in the order the flood meets them: the seed, then each sweep's in contact order.
+        member_start = member_stop
+        frame.members[member_stop] = seed
+        member_stop += 1
+        sweeps = int(0)
+        last = int(first)
         # The seed's fields, read once: the flood stores owners and links, and a load after a store is a load again.
         seed_center = frame.center[seed]
         seed_normal = frame.normal[seed]
@@ -701,6 +707,7 @@ def _build_pair(
             sa = frame.shape_a[cursor]
             sb = frame.shape_b[cursor]
             if sa != expanded_a or sb != expanded_b:
+                sweeps += 1
                 for j in range(index + 1, stop):
                     c = frame.indices[j]
                     # An owned contact is tested no further: its fields stay unread.
@@ -713,10 +720,14 @@ def _build_pair(
                                 remaining -= 1
                                 patches.next_contact[tail] = c
                                 tail = c
+                                frame.members[member_stop] = c
+                                member_stop += 1
                                 # Sorted order within a pair is contact order, so the
                                 # lowest index is the first eligible member in it.
-                                if frame.eligible[c] != 0 and (first < 0 or c < first):
-                                    first = c
+                                if frame.eligible[c] != 0:
+                                    if first < 0 or c < first:
+                                        first = c
+                                    last = c
                 expanded_a = sa
                 expanded_b = sb
             cursor = patches.next_contact[cursor]
@@ -730,16 +741,23 @@ def _build_pair(
             first = seed
         # One anchor per region, at its footprint's hull centroid at the members' mean height, whose rows the last
         # eligible member in contact order carries: a Gauss-Seidel sweep reaches them after every normal row of the
-        # region, and contact order alone picks the member.
-        member_start = member_stop
-        for j in range(index, stop):
-            c = frame.indices[j]
-            if frame.owner[c] != seed:
-                continue
-            frame.members[member_stop] = c
-            member_stop += 1
-            if carry_only != 0 or frame.eligible[c] != 0:
-                first = c
+        # region, and contact order alone picks the member. A flood of one sweep met its members in contact order:
+        # they are collected, the last of them carries. One of several sweeps (a region across shape pairs) met
+        # them sweep by sweep: the pair's run is scanned for them in contact order.
+        if sweeps > 1:
+            member_stop = member_start
+            for j in range(index, stop):
+                c = frame.indices[j]
+                if frame.owner[c] != seed:
+                    continue
+                frame.members[member_stop] = c
+                member_stop += 1
+                if carry_only != 0 or frame.eligible[c] != 0:
+                    first = c
+        elif carry_only != 0:
+            first = tail
+        else:
+            first = last
         normal = frame.normal[seed]
         plane_t0, plane_t1 = contact_tangent_basis(normal)
         origin = frame.center[first]
