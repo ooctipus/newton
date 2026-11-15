@@ -2499,21 +2499,23 @@ class Model:
         shapes = map(members.__getitem__, map(slice, bounds[:-1], bounds[1:]))
         self.body_shapes = dict(zip(keys.tolist(), shapes, strict=True))
 
-    def set_shape_collision_filter_pairs(self, pairs: np.ndarray) -> None:
-        """Replace the explicit shape pairs that should not collide.
+    @property
+    def shape_collision_filter_pair_codes(self) -> np.ndarray:
+        """The collision-filter pairs as codes ``(first << 32) | second`` (first below second), sorted, shape
+        [pair_count], int64. Read-only."""
+        return self._shape_collision_filter_pairs._packed
+
+    def set_shape_collision_filter_pair_codes(self, codes: np.ndarray) -> None:
+        """Replace the explicit shape pairs that should not collide, given as their codes.
+
+        The codes are installed as given, without a pass over them: membership queries search them, so they must be
+        of canonical pairs, unique and sorted.
 
         Args:
-            pairs: Canonical shape index pairs (first below second), unique and sorted lexicographically, shape
-                [pair_count, 2], as :meth:`shape_collision_filter_pairs_array` returns them.
-
-        Raises:
-            ValueError: If the pairs are not canonical, unique and sorted.
+            codes: Codes ``(first << 32) | second`` of canonical shape pairs (first below second), unique and sorted,
+                as :attr:`shape_collision_filter_pair_codes` holds them, shape [pair_count], int64.
         """
-        pairs = np.asarray(pairs, dtype=np.int64).reshape(-1, 2)
-        codes = _pack_shape_pair_codes(pairs[:, 0], pairs[:, 1])
-        if np.any(pairs[:, 0] >= pairs[:, 1]) or np.any(codes[1:] <= codes[:-1]):
-            raise ValueError("Collision-filter pairs must be canonical, unique and sorted.")
-        self._set_shape_collision_filter_packed(codes)
+        self._set_shape_collision_filter_packed(np.ascontiguousarray(codes, dtype=np.int64).reshape(-1))
 
     def build_soft_mesh_adjacency(self) -> None:
         """Build :attr:`soft_mesh_adjacency` and :attr:`soft_mesh_adjacency_device` from the model's elements.
