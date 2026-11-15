@@ -803,6 +803,121 @@ def create_narrow_phase_primitive_kernel(
             contact_normal = wp.vec3()
 
             # -----------------------------------------------------------------
+            # Box-Box collision via SAT reference-face clipping (opt-in).
+            # The manifold-quality fix for GJK/MPR witness-point teleports
+            # (measured up to ~a face width per frame under micro-wobble).
+            # Ahead of the chain and only where it is on (a pair it takes skips
+            # the chain), so a kernel without it compiles none of its code.
+            # -----------------------------------------------------------------
+            if wp.static(box_box_sat):
+                if is_box_a and is_box_b:
+                    box_rot_a = wp.quat_to_matrix(quat_a)
+                    box_rot_b = wp.quat_to_matrix(quat_b)
+                    # SAT clips the raw box surfaces, while admission subtracts
+                    # the per-shape collision margins. Include those margins in
+                    # candidate generation so an inflated contact is not rejected
+                    # before the shared admission gate can see it.
+                    sat_margin = gap_sum + margin_offset_a + margin_offset_b
+                    if wp.static(speculative):
+                        # Candidates must exist beyond the static gap for
+                        # predictive admission to see approaching boxes.
+                        sat_margin += max_speculative_extension
+                    sat_dist, sat_pos, sat_normals, sat_feat = collide_box_box_features(
+                        pos_a,
+                        box_rot_a,
+                        wp.vec3(scale_a[0], scale_a[1], scale_a[2]),
+                        pos_b,
+                        box_rot_b,
+                        wp.vec3(scale_b[0], scale_b[1], scale_b[2]),
+                        sat_margin,
+                    )
+                    # Reduce to at most 4 by feature persistence: incident-face
+                    # corners are the durable support points of a resting face
+                    # (family 2), then reference corners (1), then edge clips (0),
+                    # deepest first within a family. The generation-time feature
+                    # id -- not the output slot or any center binning -- becomes
+                    # sort_sub_key, so a surviving contact keeps its per-pair
+                    # identity across frames however the raw manifold compacts.
+                    # Dedup tolerance scaled by the smaller box so millimeter
+                    # parts keep distinct manifold points; duplicates from
+                    # different clip lines are (near-)exactly coincident.
+                    min_ext_a = wp.min(scale_a[0], wp.min(scale_a[1], scale_a[2]))
+                    min_ext_b = wp.min(scale_b[0], wp.min(scale_b[1], scale_b[2]))
+                    min_ext = wp.min(min_ext_a, min_ext_b)
+                    dedup_eps_sq = (1.0e-3 * min_ext) * (1.0e-3 * min_ext)
+                    chosen = wp.vec4i(-1, -1, -1, -1)
+                    for slot4 in range(4):
+                        best = int(-1)
+                        best_key = float(-3.4e38)
+                        for ci in range(8):
+                            if sat_dist[ci] >= MAXVAL:
+                                continue
+                            skip = False
+                            for c4 in range(4):
+                                cj = chosen[c4]
+                                if cj == ci:
+                                    skip = True
+                                elif cj >= 0:
+                                    # Aligned boxes emit coincident duplicates
+                                    # from different clip lines; a duplicated
+                                    # corner plus a missing one is a degenerate
+                                    # support under load.
+                                    dx = sat_pos[ci, 0] - sat_pos[cj, 0]
+                                    dy = sat_pos[ci, 1] - sat_pos[cj, 1]
+                                    dz = sat_pos[ci, 2] - sat_pos[cj, 2]
+                                    if dx * dx + dy * dy + dz * dz < dedup_eps_sq:
+                                        skip = True
+                            if skip:
+                                continue
+                            key = float((sat_feat[ci] >> 4) & 3) * 1.0e3 - sat_dist[ci]
+                            if key > best_key:
+                                best_key = key
+                                best = ci
+                        chosen[slot4] = best
+                    bb_data = ContactData()
+                    bb_data.margin_a = margin_offset_a
+                    bb_data.margin_b = margin_offset_b
+                    bb_data.shape_a = shape_a
+                    bb_data.shape_b = shape_b
+                    bb_data.gap_sum = gap_sum
+                    num_valid = int(0)
+                    for c4 in range(4):
+                        ci = chosen[c4]
+                        if ci >= 0:
+                            n_ci = wp.vec3(sat_normals[ci, 0], sat_normals[ci, 1], sat_normals[ci, 2])
+                            bb_data.contact_normal_a_to_b = n_ci
+                            if _admit(
+                                bb_data,
+                                wp.vec3(sat_pos[ci, 0], sat_pos[ci, 1], sat_pos[ci, 2]),
+                                sat_dist[ci],
+                                shape_transform,
+                                shape_linear_velocity,
+                                shape_angular_velocity,
+                                collision_update_dt,
+                                max_speculative_extension,
+                            ):
+                                num_valid += 1
+                            else:
+                                chosen[c4] = -1
+                    if num_valid > 0:
+                        bb_base = wp.atomic_add(writer_data.contact_count, 0, num_valid)
+                        if bb_base + num_valid <= writer_data.contact_max:
+                            for c4 in range(4):
+                                ci = chosen[c4]
+                                if ci >= 0:
+                                    bb_data.contact_point_center = wp.vec3(
+                                        sat_pos[ci, 0], sat_pos[ci, 1], sat_pos[ci, 2]
+                                    )
+                                    bb_data.contact_distance = sat_dist[ci]
+                                    bb_data.contact_normal_a_to_b = wp.vec3(
+                                        sat_normals[ci, 0], sat_normals[ci, 1], sat_normals[ci, 2]
+                                    )
+                                    bb_data.sort_sub_key = sat_feat[ci]
+                                    writer_func(bb_data, writer_data, bb_base)
+                                    bb_base += 1
+                    continue
+
+            # -----------------------------------------------------------------
             # Plane-Sphere collision (type_a=PLANE=0, type_b=SPHERE=2)
             # -----------------------------------------------------------------
             if is_plane_a and is_sphere_b:
@@ -849,116 +964,6 @@ def create_narrow_phase_primitive_kernel(
                 contact_pos_1 = wp.vec3(positions4_box[1, 0], positions4_box[1, 1], positions4_box[1, 2])
                 contact_pos_2 = wp.vec3(positions4_box[2, 0], positions4_box[2, 1], positions4_box[2, 2])
                 contact_pos_3 = wp.vec3(positions4_box[3, 0], positions4_box[3, 1], positions4_box[3, 2])
-
-            # -----------------------------------------------------------------
-            # Box-Box collision via SAT reference-face clipping (opt-in).
-            # The manifold-quality fix for GJK/MPR witness-point teleports
-            # (measured up to ~a face width per frame under micro-wobble).
-            # -----------------------------------------------------------------
-            elif wp.static(box_box_sat) and is_box_a and is_box_b:
-                box_rot_a = wp.quat_to_matrix(quat_a)
-                box_rot_b = wp.quat_to_matrix(quat_b)
-                # SAT clips the raw box surfaces, while admission subtracts
-                # the per-shape collision margins. Include those margins in
-                # candidate generation so an inflated contact is not rejected
-                # before the shared admission gate can see it.
-                sat_margin = gap_sum + margin_offset_a + margin_offset_b
-                if wp.static(speculative):
-                    # Candidates must exist beyond the static gap for
-                    # predictive admission to see approaching boxes.
-                    sat_margin += max_speculative_extension
-                sat_dist, sat_pos, sat_normals, sat_feat = collide_box_box_features(
-                    pos_a,
-                    box_rot_a,
-                    wp.vec3(scale_a[0], scale_a[1], scale_a[2]),
-                    pos_b,
-                    box_rot_b,
-                    wp.vec3(scale_b[0], scale_b[1], scale_b[2]),
-                    sat_margin,
-                )
-                # Reduce to at most 4 by feature persistence: incident-face
-                # corners are the durable support points of a resting face
-                # (family 2), then reference corners (1), then edge clips (0),
-                # deepest first within a family. The generation-time feature
-                # id -- not the output slot or any center binning -- becomes
-                # sort_sub_key, so a surviving contact keeps its per-pair
-                # identity across frames however the raw manifold compacts.
-                # Dedup tolerance scaled by the smaller box so millimeter
-                # parts keep distinct manifold points; duplicates from
-                # different clip lines are (near-)exactly coincident.
-                min_ext_a = wp.min(scale_a[0], wp.min(scale_a[1], scale_a[2]))
-                min_ext_b = wp.min(scale_b[0], wp.min(scale_b[1], scale_b[2]))
-                min_ext = wp.min(min_ext_a, min_ext_b)
-                dedup_eps_sq = (1.0e-3 * min_ext) * (1.0e-3 * min_ext)
-                chosen = wp.vec4i(-1, -1, -1, -1)
-                for slot4 in range(4):
-                    best = int(-1)
-                    best_key = float(-3.4e38)
-                    for ci in range(8):
-                        if sat_dist[ci] >= MAXVAL:
-                            continue
-                        skip = False
-                        for c4 in range(4):
-                            cj = chosen[c4]
-                            if cj == ci:
-                                skip = True
-                            elif cj >= 0:
-                                # Aligned boxes emit coincident duplicates
-                                # from different clip lines; a duplicated
-                                # corner plus a missing one is a degenerate
-                                # support under load.
-                                dx = sat_pos[ci, 0] - sat_pos[cj, 0]
-                                dy = sat_pos[ci, 1] - sat_pos[cj, 1]
-                                dz = sat_pos[ci, 2] - sat_pos[cj, 2]
-                                if dx * dx + dy * dy + dz * dz < dedup_eps_sq:
-                                    skip = True
-                        if skip:
-                            continue
-                        key = float((sat_feat[ci] >> 4) & 3) * 1.0e3 - sat_dist[ci]
-                        if key > best_key:
-                            best_key = key
-                            best = ci
-                    chosen[slot4] = best
-                bb_data = ContactData()
-                bb_data.margin_a = margin_offset_a
-                bb_data.margin_b = margin_offset_b
-                bb_data.shape_a = shape_a
-                bb_data.shape_b = shape_b
-                bb_data.gap_sum = gap_sum
-                num_valid = int(0)
-                for c4 in range(4):
-                    ci = chosen[c4]
-                    if ci >= 0:
-                        n_ci = wp.vec3(sat_normals[ci, 0], sat_normals[ci, 1], sat_normals[ci, 2])
-                        bb_data.contact_normal_a_to_b = n_ci
-                        if _admit(
-                            bb_data,
-                            wp.vec3(sat_pos[ci, 0], sat_pos[ci, 1], sat_pos[ci, 2]),
-                            sat_dist[ci],
-                            shape_transform,
-                            shape_linear_velocity,
-                            shape_angular_velocity,
-                            collision_update_dt,
-                            max_speculative_extension,
-                        ):
-                            num_valid += 1
-                        else:
-                            chosen[c4] = -1
-                if num_valid > 0:
-                    bb_base = wp.atomic_add(writer_data.contact_count, 0, num_valid)
-                    if bb_base + num_valid <= writer_data.contact_max:
-                        for c4 in range(4):
-                            ci = chosen[c4]
-                            if ci >= 0:
-                                bb_data.contact_point_center = wp.vec3(sat_pos[ci, 0], sat_pos[ci, 1], sat_pos[ci, 2])
-                                bb_data.contact_distance = sat_dist[ci]
-                                bb_data.contact_normal_a_to_b = wp.vec3(
-                                    sat_normals[ci, 0], sat_normals[ci, 1], sat_normals[ci, 2]
-                                )
-                                bb_data.sort_sub_key = sat_feat[ci]
-                                writer_func(bb_data, writer_data, bb_base)
-                                bb_base += 1
-                continue
 
             # -----------------------------------------------------------------
             # Sphere-Sphere collision (type_a=SPHERE=2, type_b=SPHERE=2)
