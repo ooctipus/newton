@@ -472,6 +472,80 @@ def _box(hx, hy, hz, n=1):
     )
 
 
+def test_capsule_level_across_a_face(test, device):
+    """A capsule lying level across a face narrower than its core rests on the face where it crosses the face's edges.
+
+    Over the face the core's distance to the surface is the plane's, constant along a level core: no interior point
+    is a strict minimum, and with both ends beyond the face no end carries it. The stretch over the face does, by
+    its two ends on the face's boundary, as a capsule's ends carry it on a plane: at any depth, whatever the
+    face's width, tessellation and the core's heading, with one end over the face, and through the tilts at which
+    the strict minimum over the lower edge takes over.
+    """
+    radius, half = 0.04, 0.06
+    capsule = ("capsule", {"radius": radius, "half_height": half})
+    hx, hz = 0.03, 0.019
+    level = wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), -1.5707964)  # the core along +y
+    for hy in (0.006, 0.017, 0.05):
+        for n in (1, 3):
+            v, f = _box(hx, hy, hz, n)
+            for separation in (0.004, -0.001, -0.005, -0.02, -0.035):
+                for heading in (0.0, 0.2, 0.7):
+                    rot = wp.mul(wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), heading), level)
+                    xform = wp.transform(wp.vec3(0.004, 0.0, hz + radius + separation), rot)
+                    count, normal, p0, sep = _collide(device, v, f, capsule, xform)
+                    label = f"width {2 * hy}, {2 * n * n} triangles a face, separation {separation}, heading {heading}"
+                    on_top = normal[:, 2] > 1.0 - 1e-6
+                    test.assertEqual(int(on_top.sum()), 2, label)
+                    np.testing.assert_allclose(sep[on_top], separation, atol=2e-5, err_msg=label)
+                    # The feet are where the core's line leaves the face: the ends of its stretch over the rectangle.
+                    along = np.array([-np.sin(heading), np.cos(heading)])
+                    lo, hi = -half, half
+                    for axis, bound in ((0, hx), (1, hy)):
+                        if abs(along[axis]) > 1e-12:
+                            a, b = sorted(((s * bound - (0.004, 0.0)[axis]) / along[axis]) for s in (-1.0, 1.0))
+                            lo, hi = max(lo, a), min(hi, b)
+                    test.assertTrue(-half < lo < hi < half, label)
+                    want = np.array([(0.004 + t * along[0], t * along[1], hz) for t in (lo, hi)])
+                    feet = p0[on_top][np.argsort(p0[on_top] @ np.array([along[0], along[1], 0.0]))]
+                    np.testing.assert_allclose(feet, want, atol=2e-5, err_msg=label)
+                    # The core's ends, beyond the face, may touch its edges: never deeper than the face's contact.
+                    test.assertTrue(np.all(sep[~on_top] > separation), f"{label}: a contact deeper than the face's")
+    v, f = _box(hx, 0.017, hz)
+    # One end over the face, the other beyond it: the end and the crossing.
+    xform = wp.transform(wp.vec3(0.0, 0.05, hz + radius - 0.002), level)
+    count, normal, p0, sep = _collide(device, v, f, capsule, xform)
+    on_top = normal[:, 2] > 1.0 - 1e-6
+    test.assertEqual(int(on_top.sum()), 2)
+    np.testing.assert_allclose(np.sort(p0[on_top][:, 1]), (-0.01, 0.017), atol=1e-6)
+    np.testing.assert_allclose(sep[on_top], -0.002, atol=2e-5)
+    # Tilting the core about x lowers its +y side: the face's contact at the lower crossing gives way to the strict
+    # minimum over that edge with no tilt between them at which neither is reported.
+    for tilt in (0.0, 1e-6, 3e-6, 1e-5, 3e-5, 1e-4, 3e-4, 1e-3, 1e-2):
+        rot = wp.mul(wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), -tilt), level)
+        xform = wp.transform(wp.vec3(0.0, 0.0, hz + radius - 0.005), rot)
+        count, normal, p0, sep = _collide(device, v, f, capsule, xform)
+        test.assertGreaterEqual(count, 1, f"tilt {tilt}")
+        lowest = int(np.argmin(sep))
+        test.assertGreater(float(normal[lowest, 2]), 1.0 - 1e-3, f"tilt {tilt}")
+        test.assertAlmostEqual(float(sep[lowest]), -0.005 - 0.017 * np.tan(tilt), delta=3e-5, msg=f"tilt {tilt}")
+
+
+def test_capsule_over_vertex(test, device):
+    """A capsule whose core passes a box corner across its diagonal: one contact at the corner, along the diagonal."""
+    s = 0.2
+    v, f = _box(s, s, s, 2)
+    diagonal = np.array([1.0, 1.0, 1.0]) / np.sqrt(3.0)
+    along = wp.quat_between_vectors(wp.vec3(0.0, 0.0, 1.0), wp.normalize(wp.vec3(1.0, -1.0, 0.0)))
+    for separation in (0.004, -0.003):
+        center = np.array([s, s, s]) + (0.03 + separation) * diagonal
+        xform = wp.transform(wp.vec3(*center), along)
+        count, normal, p0, sep = _collide(device, v, f, ("capsule", {"radius": 0.03, "half_height": 0.15}), xform)
+        test.assertEqual(count, 1)
+        np.testing.assert_allclose(p0[0], (s, s, s), atol=1e-5)
+        np.testing.assert_allclose(normal[0], diagonal, atol=1e-5)
+        test.assertAlmostEqual(float(sep[0]), separation, delta=2e-5)
+
+
 def test_capsule_core_around_a_thin_part(test, device):
     """A face holds a capsule's core behind it only where the core passes through the face.
 
@@ -579,6 +653,8 @@ for _name, _fn in (
     ("test_flat_lattice_tilted_box", test_flat_lattice_tilted_box),
     ("test_flat_lattice_tilted_solids", test_flat_lattice_tilted_solids),
     ("test_capsule_over_ridge", test_capsule_over_ridge),
+    ("test_capsule_level_across_a_face", test_capsule_level_across_a_face),
+    ("test_capsule_over_vertex", test_capsule_over_vertex),
     ("test_capsule_core_around_a_thin_part", test_capsule_core_around_a_thin_part),
     ("test_capsule_core_through_a_face", test_capsule_core_through_a_face),
     ("test_box_on_stair_nose", test_box_on_stair_nose),

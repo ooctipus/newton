@@ -1104,11 +1104,23 @@ def _core_behind_face(
 def create_mesh_capsule_contacts(writer_func):
     """Create the closed-form capsule contacts of a mesh triangle, written by ``writer_func``.
 
-    The core segment's ends take the point rule (:func:`mesh_point_feature`): the ends of a capsule resting on
-    a face carry it as on a plane. An interior point of the core is a contact where it is the core's strict
-    local minimum over a convex edge (the closest points of the core and the edge, both interior, beyond the
-    edge for both its faces) or a convex vertex (the vertex's projection on the core, every one-ring vertex
-    behind), reported by the feature's owner.
+    A capsule's contacts with the surface are the local minima of the distance from its core segment to it:
+
+    * at an end of the core, the point rule (:func:`mesh_point_feature`): the ends of a capsule resting on a face
+      carry it as on a plane;
+    * at an interior point of the core, where it is the core's strict minimum over a convex edge (the closest
+      points of the core and the edge, both interior, beyond the edge for both its faces) or a convex vertex (the
+      vertex's projection on the core, every one-ring vertex behind), reported by the feature's owner;
+    * over a face, the distance is the plane's and linear along the core, so the stretch of the core over the
+      face has its minimum at an end of the stretch: an end of the core (above), or where the core leaves the face
+      across an edge. A core that descends past the edge has its minimum beyond it (the strict edge minimum); one
+      that rises past it has none there. A core level over the face is at one distance along the whole stretch,
+      which carries the capsule by its ends as a plane does: each crossing of an edge of the face beyond which
+      the surface falls away (a boundary, or a crease whose other triangle the point is strictly beyond; not a
+      seam of the face's plane, across which the face goes on) is a contact, with the face's normal and the
+      plane distance. Level is the complement of the strict edge minimum: the core's closest point to the edge
+      lies over the edge itself, within :data:`SEGMENT_STRICT_COSINE`;
+    * where the core passes through a face, that face's plane (:func:`_core_behind_face`).
     """
 
     @wp.func
@@ -1219,7 +1231,7 @@ def create_mesh_capsule_contacts(writer_func):
             low = corners[a]
             high = corners[b]
             # A convex or boundary edge: the core's closest point to it, interior to both, strictly beyond
-            # its faces.
+            # its faces, or over the edge itself (the core level over this face).
             u = high - low
             uu = wp.dot(u, u)
             if uu > 0.0:
@@ -1239,18 +1251,40 @@ def create_mesh_capsule_contacts(writer_func):
                             and _beyond_vertex(point, low, high, True)
                             and _beyond_vertex(point, high, low, False)
                         ):
-                            minimum = (
-                                _side_cosine(point, low, high, corners[k]) > SEGMENT_STRICT_COSINE
-                                and wp.dot(point - low, face) > 0.0
+                            cosine = _side_cosine(point, low, high, corners[k])
+                            plane = wp.dot(point - low, face)
+                            minimum = cosine > SEGMENT_STRICT_COSINE and plane > 0.0
+                            # The core level over this face where it crosses the edge: the face's contact there,
+                            # unless the face goes on across the edge (a seam of one plane).
+                            level = (
+                                cosine >= -SEGMENT_STRICT_COSINE
+                                and plane > 0.0
+                                and not minimum
+                                and (context.flat & (1 << k)) == 0
                             )
                             other = int(-1)
                             if has_topology:
                                 other = context.topology[row + k]
-                            if minimum and other >= 0:
+                            if (minimum or level) and other >= 0:
                                 opposite = _mesh_point(context, context.topology[row + 3 + k])
-                                minimum = (
-                                    _side_cosine(point, low, high, opposite) > SEGMENT_STRICT_COSINE
-                                    and _edge_owner(context, low, t, other) == t
+                                falls = _side_cosine(point, low, high, opposite) > SEGMENT_STRICT_COSINE
+                                minimum = minimum and falls and _edge_owner(context, low, t, other) == t
+                                level = level and falls
+                            if level:
+                                unit = face / wp.length(face)
+                                write_capsule_contact(
+                                    foot,
+                                    unit,
+                                    wp.dot(point - low, unit),
+                                    radius,
+                                    threshold,
+                                    margin_a,
+                                    margin_b,
+                                    shape_a,
+                                    shape_b,
+                                    gap_sum,
+                                    (sort_sub_key << 3) | (2 + k),
+                                    writer_data,
                                 )
                             if minimum:
                                 write_capsule_contact(
