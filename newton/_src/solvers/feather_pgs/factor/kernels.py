@@ -480,57 +480,6 @@ def _light_remove_free_root_transport_from_qdd(
 
 
 @wp.func
-def _light_integrate_generalized_joints(
-    index: int,
-    joint_type: wp.array[int],
-    joint_parent: wp.array[int],
-    joint_child: wp.array[int],
-    joint_q_start: wp.array[int],
-    joint_qd_start: wp.array[int],
-    kinematic_joint_mask: wp.array[int],
-    joint_dof_dim: wp.array2d[int],
-    body_com: wp.array[wp.vec3],
-    joint_X_c: wp.array[wp.transform],
-    joint_q: wp.array[float],
-    joint_qd: wp.array[float],
-    joint_qdd: wp.array[float],
-    dt: float,
-    joint_q_new: wp.array[float],
-    joint_qd_new: wp.array[float],
-):
-    type = joint_type[index]
-    parent = joint_parent[index]
-    child = joint_child[index]
-    coord_start = joint_q_start[index]
-    dof_start = joint_qd_start[index]
-    if kinematic_joint_mask[index] != 0:
-        for coord in range(coord_start, joint_q_start[index + 1]):
-            joint_q_new[coord] = joint_q[coord]
-        for dof in range(dof_start, joint_qd_start[index + 1]):
-            joint_qd_new[dof] = joint_qd[dof]
-        return
-    lin_axis_count = joint_dof_dim[index, 0]
-    ang_axis_count = joint_dof_dim[index, 1]
-    jcalc_integrate(
-        type,
-        child,
-        body_com,
-        joint_X_c[index],
-        joint_q,
-        joint_qd,
-        joint_qdd,
-        coord_start,
-        dof_start,
-        lin_axis_count,
-        ang_axis_count,
-        dt,
-        parent,
-        joint_q_new,
-        joint_qd_new,
-    )
-
-
-@wp.func
 def _light_update_qdd_from_velocity(
     tid: int,
     joint_qd: wp.array[float],

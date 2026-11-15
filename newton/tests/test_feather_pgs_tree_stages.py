@@ -219,6 +219,63 @@ class TestTreeKineticStages(unittest.TestCase):
         """Leave bitwise-equal state after a CUDA finish or ordinary repair whose motion input holds NaN."""
         self.check_motion_input_ignored("cuda:0")
 
+    def check_index_tables_read_from_the_template(self, device):
+        """Launch each finish and repair on the model's index tables and on tables that keep only each tree's first
+        joint: its kind, axis counts, parent, body and first coordinates (``joint_type``, ``joint_dof_dim``,
+        ``joint_parent``, ``joint_child``, ``joint_q_start``, ``joint_qd_start``), every other joint's zeroed.
+
+        A group's kernels read the tables of its template tree, which its plan proves every tree holds, and from the
+        model only each tree's first body and coordinate: equal outputs after launches that rebuilt every cache (a
+        new generation) show that no other joint's entry is read.
+        """
+        device = wp.get_device(device)
+        model = _build(device, worlds=2)
+        solver = SolverFeatherPGS(model)
+        owner = HeldTree(solver, solver.spec.classes.held)
+        state, output = model.state(), model.state()
+        rng = np.random.default_rng(43)
+        state.joint_qd.assign(rng.uniform(-0.4, 0.4, model.joint_dof_count).astype(np.float32))
+        newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+        first = model.articulation_start.numpy()[:-1]
+        tables = {}
+        for name in ("joint_type", "joint_dof_dim", "joint_parent", "joint_child", "joint_q_start", "joint_qd_start"):
+            values = getattr(model, name).numpy()
+            kept = np.zeros_like(values)
+            kept[first] = values[first]
+            self.assertFalse(np.array_equal(kept, values), name)
+            tables[name] = wp.array(kept, dtype=getattr(model, name).dtype, device=device)
+        for group in owner.groups:
+            for name, kernel, published in (
+                ("finish", group.finish_kernel, output),
+                ("repair", group.repair_kernel, state),
+            ):
+                with self.subTest(layout=group.layout.root_families, kernel=name):
+                    data = group._publication(state, solver.factor, published, DT)
+                    start = {key: array.numpy().copy() for key, array in _state_arrays(group, data).items()}
+                    plain = _launch(group, kernel, data, state.joint_qd, start)
+                    # The launch starts from the arrays it is given: the kept tables in arrays of their own.
+                    for field, table in tables.items():
+                        setattr(data, field, table)
+                        start[f"data.{field}"] = table.numpy().copy()
+                    kept = _launch(group, kernel, data, state.joint_qd, start)
+                    for launched in (plain, kept):
+                        self.assertTrue((launched["cache.generation"] != start["cache.generation"]).all())
+                    differ = [
+                        key
+                        for key in plain
+                        if key.split(".")[1] not in tables and plain[key].tobytes() != kept[key].tobytes()
+                    ]
+                    self.assertEqual(differ, [])
+
+    def test_finish_and_repair_read_index_tables_from_the_template_cpu(self):
+        """Leave bitwise-equal state after a CPU finish or repair given only each tree's first joint's index tables."""
+        self.check_index_tables_read_from_the_template("cpu")
+
+    @unittest.skipUnless(wp.is_cuda_available(), "CUDA unavailable")
+    def test_finish_and_repair_read_index_tables_from_the_template_cuda(self):
+        """Leave bitwise-equal state after a CUDA finish or repair given only each tree's first joint's index tables."""
+        self.check_index_tables_read_from_the_template("cuda:0")
+
 
 def _keys(device, *, based, worlds=4, keys=8):
     """``worlds`` worlds of ``keys`` one-coordinate trees each, a prismatic key a tree with a drive, limits and armature:

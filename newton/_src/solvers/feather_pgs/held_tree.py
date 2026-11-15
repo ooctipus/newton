@@ -29,7 +29,7 @@ from ...core.host_unique import distinct
 from . import coordinate_trees, field_group, host_index
 from .device_proof import DeviceProof
 from .tree_kinetic_owner import TreeKineticState, proof_runs
-from .tree_kinetic_plan import make_plan, tree_joints
+from .tree_kinetic_plan import index_tables, make_plan, one_table, tree_joints
 from .tree_kinetic_state import GroupTrees, HeldResponse
 from .tree_plan import TreePlan, local_parents
 
@@ -291,6 +291,13 @@ def _forest_families(inputs, worlds, member, compact):
             return None
         if places.size != worlds.size or not np.array_equal(art_world[group[places]], worlds):
             return None
+    # One group reads every world's trees by one copy of their index tables: the rows' joints, a world's trees one
+    # after another, hold equal tables, or the class takes per-size groups (whose trees' tables are equal by their
+    # topology range).
+    first = model.articulation_start.numpy()[per_world[:, 0]]
+    joints = forest.articulation_joint_end_host[per_world[:, -1]] - first
+    if np.all(joints == joints[0]) and not one_table(model, first[:, None] + np.arange(joints[0])):
+        return None
     return families, per_world
 
 
@@ -308,6 +315,7 @@ def _forest_group(inputs, families, per_world, compact) -> HeldGroupPlan:
         local_parents(model.joint_ancestor.numpy(), [joints.start], joints.stop - joints.start)[0].tobytes(),
         model.joint_type.numpy()[joints].tobytes(),
         model.joint_dof_dim.numpy()[joints].tobytes(),
+        *(table.tobytes() for table in index_tables(model, np.arange(joints.start, joints.stop)[None]).values()),
     )
     return HeldGroupPlan(
         "forest",

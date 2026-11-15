@@ -78,11 +78,20 @@ HELD_PLAN = (
     Field("free_root_local", wp.int32, ("free_root",), owner="plan"),
     Field("free_root_dof", wp.int32, ("free_root",), owner="plan"),
     Field("dof_passive", wp.int32, ("dof",), owner="plan"),
+    # The template tree's tables, equal in every tree of the group (tree_kinetic_plan.make_plan proves it): each
+    # joint's kind and axis counts, its body and first coordinate as offsets from the tree's first joint's (the
+    # coordinates with their end) and its parent's sign (-1: the world). A joint's first velocity coordinate is the
+    # scan plan's dof_start.
+    Field("joint_type", wp.int32, ("node",), owner="plan"),
+    Field("joint_axes", wp.int32, ("node", 2), owner="plan"),
+    Field("joint_body", wp.int32, ("node",), owner="plan"),
+    Field("joint_coordinate", wp.int32, ("node_bound",), owner="plan"),
+    Field("joint_world", wp.int32, ("node",), owner="plan"),
     # The trees' state blocks where the stage declines them (TreeLayout.staged): a tree's TOTAL words.
     Field("scratch", wp.float32, ("scratch",), owner="plan"),
 )
-"""A held group's template tree as its kernels read it: the scan plan (:data:`.tree_scan.SCAN_PLAN`) and the
-group's coordinate maps."""
+"""A held group's template tree as its kernels read it: the scan plan (:data:`.tree_scan.SCAN_PLAN`), the group's
+coordinate maps and the template's index tables, which stand for every tree's."""
 
 HeldPlan = field_group.struct("HeldPlan", HELD_PLAN, __name__)
 
@@ -177,7 +186,8 @@ ForceInput = field_group.struct("ForceInput", FORCE_INPUT, __name__)
 
 @wp.struct
 class TreeGroup:
-    """One tree group in a finish or repair: its threads, articulation, refresh and state block.
+    """One tree group in a finish or repair: its threads, articulation, first body and coordinate, refresh and state
+    block.
 
     Admission fills every field but the state block, which a group admitted
     for a rebuild allocates next; every later stage reads the group from here.
@@ -190,6 +200,9 @@ class TreeGroup:
     art: int
     ds: int
     js: int
+    # The tree's first joint's body and first coordinate, which the template's tables count from.
+    body: int
+    qs: int
     refresh: int
     # Alternate repair motion: whether the motion velocity differs from the state bank's.
     motion_changed: int
@@ -1171,6 +1184,8 @@ def get_state_kernel(
                         _stamp_source(cache, g.group, data.joint_q, data.joint_qd)
                 return g
         g.refresh = refresh
+        g.body = data.joint_child[g.js]
+        g.qs = data.joint_q_start[g.js]
         if g.lane == 0:
             cache.current_valid[g.art] = 0
             for root in range(1, wp.static(roots)):
@@ -1208,28 +1223,34 @@ def get_state_kernel(
         _sync()
 
     @wp.func
-    def integrate(g: TreeGroup, data: PublicationData):
-        """Integrate every joint's coordinates into the next state bank."""
+    def integrate(g: TreeGroup, plan: HeldPlan, data: PublicationData):
+        """Integrate every joint's coordinates into the next state bank; a kinematic joint keeps its own."""
         for local in range(g.lane, bodies, g.stride):
-            joint = g.js + local
-            kernels._light_integrate_generalized_joints(
-                joint,
-                data.joint_type,
-                data.joint_parent,
-                data.joint_child,
-                data.joint_q_start,
-                data.joint_qd_start,
-                data.kinematic_joint_mask,
-                data.joint_dof_dim,
-                data.body_com,
-                data.joint_X_c,
-                data.joint_q,
-                data.joint_qd,
-                data.joint_qdd,
-                data.dt,
-                data.joint_q_new,
-                data.joint_qd_new,
-            )
+            coordinate = g.qs + plan.joint_coordinate[local]
+            dof = g.ds + plan.dof_start[local]
+            if data.kinematic_joint_mask[g.js + local] != 0:
+                for kept in range(coordinate, g.qs + plan.joint_coordinate[local + 1]):
+                    data.joint_q_new[kept] = data.joint_q[kept]
+                for kept in range(dof, g.ds + plan.dof_start[local + 1]):
+                    data.joint_qd_new[kept] = data.joint_qd[kept]
+            else:
+                kernels.jcalc_integrate(
+                    plan.joint_type[local],
+                    g.body + plan.joint_body[local],
+                    data.body_com,
+                    data.joint_X_c[g.js + local],
+                    data.joint_q,
+                    data.joint_qd,
+                    data.joint_qdd,
+                    coordinate,
+                    dof,
+                    plan.joint_axes[local, 0],
+                    plan.joint_axes[local, 1],
+                    data.dt,
+                    plan.joint_world[local],
+                    data.joint_q_new,
+                    data.joint_qd_new,
+                )
         _sync()
 
     @wp.func
@@ -1238,13 +1259,13 @@ def get_state_kernel(
         for local in range(g.lane, bodies, g.stride):
             joint = g.js + local
             transform = joint_transform(
-                data.joint_type[joint],
+                plan.joint_type[local],
                 data.joint_axis,
-                data.joint_qd_start[joint],
-                data.joint_dof_dim[joint, 0],
-                data.joint_dof_dim[joint, 1],
+                g.ds + plan.dof_start[local],
+                plan.joint_axes[local, 0],
+                plan.joint_axes[local, 1],
                 q,
-                data.joint_q_start[joint],
+                g.qs + plan.joint_coordinate[local],
             )
             relative = joint_frame_pose(data.joint_X_p[joint], transform, data.joint_X_c[joint])
             if plan.parent[local] < 0:
@@ -1265,7 +1286,7 @@ def get_state_kernel(
             local = root_local(plan, root)
             origin = wp.transform_point(
                 load_words(g.address, wp.static(body_words) * local, wp.transform()),
-                data.body_com[data.joint_child[g.js + local]],
+                data.body_com[g.body + plan.joint_body[local]],
             )
             store_words(g.address, wp.static(origin_word) + 6 * root, origin)
             data.articulation_origin[root_art(g, plan, root)] = origin + load_words(
@@ -1305,22 +1326,22 @@ def get_state_kernel(
             anchor = wp.transform(point - origin, wp.transform_get_rotation(anchor))
             if wp.static(clocked):
                 clock_m1 = _clock()
+            start = g.ds + plan.dof_start[local]
+            lin, ang = plan.joint_axes[local, 0], plan.joint_axes[local, 1]
             velocity, bias = joint_motion(
-                data.joint_type[joint],
+                plan.joint_type[local],
                 data.joint_axis,
-                data.joint_dof_dim[joint, 0],
-                data.joint_dof_dim[joint, 1],
+                lin,
+                ang,
                 anchor,
                 q,
-                data.joint_q_start[joint],
+                g.qs + plan.joint_coordinate[local],
                 qd,
-                data.joint_qd_start[joint],
+                start,
                 data.joint_S_s,
             )
             if wp.static(clocked):
                 clock_m2 = _clock()
-            start = data.joint_qd_start[joint]
-            lin, ang = data.joint_dof_dim[joint, 0], data.joint_dof_dim[joint, 1]
             # The walk's step geometry (tree_factor.WalkTrees.now): each coordinate's column at its joint's frame, so
             # a walk takes it there without S's lever about the origin, and the frame's world point (a free joint's
             # child's centre of mass). A column of one half is that half of S at the frame, the same words (S carries
@@ -1337,12 +1358,12 @@ def get_state_kernel(
                         else:
                             data.walk_now[start + k] = wp.spatial_vector(wp.vec3(), wp.spatial_bottom(column))
             if data.walk_now_link.shape[0] > 0:
-                kind = data.joint_type[joint]
+                kind = plan.joint_type[local]
                 free = kind == JointType.FREE or kind == JointType.DISTANCE
                 if free:
                     point = wp.transform_point(
                         load_words(g.address, wp.static(body_words) * local, wp.transform()),
-                        data.body_com[data.joint_child[joint]],
+                        data.body_com[g.body + plan.joint_body[local]],
                     )
                 if wp.static(two_half):
                     # A group with a joint whose column has two halves at its frame (a D6 joint's turns after its
@@ -1354,7 +1375,7 @@ def get_state_kernel(
                         ang,
                         wp.transform(wp.vec3(), wp.transform_get_rotation(anchor)),
                         q,
-                        data.joint_q_start[joint],
+                        g.qs + plan.joint_coordinate[local],
                         start,
                     )
                     if free:
@@ -1386,7 +1407,7 @@ def get_state_kernel(
     def publish(g: TreeGroup, plan: HeldPlan, data: PublicationData, cache: KineticData):
         """Publish each body's pose and twist with its bias wrench and moments."""
         for local in range(g.lane, bodies, g.stride):
-            body = data.joint_child[g.js + local]
+            body = g.body + plan.joint_body[local]
             root = root_of(plan, local)
             word = wp.static(origin_word) + 6 * root
             origin = load_words(g.address, word, wp.vec3())
@@ -1483,7 +1504,7 @@ def get_state_kernel(
             if wp.static(clocked):
                 clock_i2 = _clock()
             if wp.static(not rest):
-                integrate(g, data)
+                integrate(g, plan, data)
             q = data.joint_q_new
             qd = data.joint_qd_new
         if wp.static(clocked):

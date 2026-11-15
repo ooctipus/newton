@@ -21,10 +21,34 @@ def tree_joints(model):
     return articulation >= 0, np.bincount(articulation[articulation >= 0], minlength=model.articulation_count)
 
 
+def index_tables(model, joints: np.ndarray) -> dict[str, np.ndarray]:
+    """The index tables of the trees ``joints`` (a row a tree: its joints, consecutive) as a held group's kernels read
+    them from the group's one copy: each joint's body and first coordinate as offsets from the tree's first joint's (the
+    coordinates with their end), and its parent's sign (``-1`` the world, else ``0``: the integrator reads no more). A
+    joint's first velocity coordinate is not among them: the joints' axis counts give it."""
+    first = joints[:, :1]
+    child, start = model.joint_child.numpy(), model.joint_q_start.numpy()
+    bounds = np.concatenate((joints, joints[:, -1:] + 1), axis=1)
+    return {
+        "joint_body": (child[joints] - child[first]).astype(np.int32),
+        "joint_coordinate": (start[bounds] - start[first]).astype(np.int32),
+        "joint_world": np.where(model.joint_parent.numpy()[joints] < 0, -1, 0).astype(np.int32),
+    }
+
+
+def one_table(model, joints: np.ndarray) -> bool:
+    """Whether the trees ``joints`` hold equal index tables (:func:`index_tables`)."""
+    return all(bool(np.all(table == table[0])) for table in index_tables(model, joints).values())
+
+
 def make_plan(model, operator, *, complete=True):
-    """The layout of a held group (its lanes left to the owner's launch rule) and its template tree's parents. The plan
-    groups trees of one topology on the template's pattern; what their data can still refuse is checked: coverage, one
-    owner a body, uniform parents and joint kinds (a sparse size group, a forest's rest trees), the kinematic roots."""
+    """The layout of a held group (its lanes left to the owner's launch rule), its template tree's parents and its
+    template's tables. The plan groups trees of one topology and one set of index tables on the template's pattern
+    (:func:`.forest_plan._by_topology`, the forest's row); what their data can still refuse is checked: coverage, one
+    owner a body, uniform parents, joint kinds and axis counts (a sparse size group, a forest's rest trees), the
+    kinematic roots. The tables are the proof the group's kernels read by: each joint's kind and axis counts and its
+    index tables (:func:`index_tables`), equal in every tree of the group, so one copy serves them all; the owner's
+    device proof holds the model's arrays to it at every notification."""
     owned, counts_by_art = tree_joints(model)
     starts = model.articulation_start.numpy()
     group = operator.plan.group_to_art.numpy()
@@ -71,6 +95,11 @@ def make_plan(model, operator, *, complete=True):
     types = model.joint_type.numpy()[joints]
     if not np.all(types == types[0]):
         raise ValueError("Cached trees require one uniform parent-first topology")
+    axes = model.joint_dof_dim.numpy()[joints]
+    if np.any(axes != axes[0]) or np.any(counts != counts[0]) or not one_table(model, joints):
+        raise ValueError("Cached trees require one table of joint axes, bodies and coordinates")
+    tables = {name: table[0] for name, table in index_tables(model, joints).items()}
+    tables.update(joint_type=types[0].astype(np.int32), joint_axes=axes[0].astype(np.int32))
     # Every joint may carry one or several coordinates: the motion scan stores
     # one axis per coordinate through joint_motion and the integrator handles
     # every joint type; the mass plan takes per-body coordinate counts. A root
@@ -78,7 +107,7 @@ def make_plan(model, operator, *, complete=True):
     # a joint with coordinates that the stages treat as a descendant's.
     root_coordinates = [int(counts[0, root]) for root in root_locals]
     free_roots = [int(types[0, root]) in FREE_JOINTS for root in root_locals]
-    linear, angular = model.joint_dof_dim.numpy()[joints[0]].T
+    linear, angular = axes[0].T
     own_bias = bool(np.any((types[0] == int(JointType.D6)) & (((linear > 0) & (angular > 0)) | (angular > 1))))
     # Kinematic bodies. A prescribed group owns whole free bodies whose six
     # coordinates are all kinematic, and a forest's zero family a kinematic
@@ -121,4 +150,4 @@ def make_plan(model, operator, *, complete=True):
         free_roots=tuple(free_roots),
         own_bias=own_bias,
     )
-    return layout, parent
+    return layout, parent, tables

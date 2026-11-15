@@ -30,7 +30,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs.factor.kernels import _light_integrate_generalized_joints
+from newton._src.solvers.feather_pgs.factor.kernels import jcalc_integrate
 from newton.solvers import SolverFeatherPGS
 
 DT = 1.0 / 200.0
@@ -44,7 +44,6 @@ def _integrate(
     joint_child: wp.array[int],
     joint_q_start: wp.array[int],
     joint_qd_start: wp.array[int],
-    kinematic_joint_mask: wp.array[int],
     joint_dof_dim: wp.array2d[int],
     body_com: wp.array[wp.vec3],
     joint_X_c: wp.array[wp.transform],
@@ -55,21 +54,21 @@ def _integrate(
     joint_q_new: wp.array[float],
     joint_qd_new: wp.array[float],
 ):
-    _light_integrate_generalized_joints(
-        wp.tid(),
-        joint_type,
-        joint_parent,
-        joint_child,
-        joint_q_start,
-        joint_qd_start,
-        kinematic_joint_mask,
-        joint_dof_dim,
+    joint = wp.tid()
+    jcalc_integrate(
+        joint_type[joint],
+        joint_child[joint],
         body_com,
-        joint_X_c,
+        joint_X_c[joint],
         joint_q,
         joint_qd,
         joint_qdd,
+        joint_q_start[joint],
+        joint_qd_start[joint],
+        joint_dof_dim[joint, 0],
+        joint_dof_dim[joint, 1],
         dt,
+        joint_parent[joint],
         joint_q_new,
         joint_qd_new,
     )
@@ -250,7 +249,7 @@ class TestFeatherPgsFreeRootPredictor(unittest.TestCase):
     def test_integrator_transport_identities(self):
         """Pin the integrator's root transport and descendant pass-through directly.
 
-        The integrator's law (``_light_integrate_generalized_joints``) with zero
+        The integrator's law (``jcalc_integrate``) with zero
         ``joint_qdd`` must realize the two velocity identities: the ROOT free
         joint's linear coordinate gains exactly ``omega x v * dt`` (the
         transport term the predictor and the qdd conversion mirror), and a
@@ -300,7 +299,6 @@ class TestFeatherPgsFreeRootPredictor(unittest.TestCase):
                 model.joint_child,
                 model.joint_q_start,
                 model.joint_qd_start,
-                wp.zeros(model.joint_count, dtype=wp.int32, device=device),
                 model.joint_dof_dim,
                 model.body_com,
                 model.joint_X_c,

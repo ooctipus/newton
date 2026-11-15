@@ -19,11 +19,16 @@ def _devices() -> tuple:
     return ("cpu", "cuda:0") if wp.is_cuda_available() else ("cpu",)
 
 
-def _chain(builder, links, x):
-    """A chain of revolute links hanging at ``x`` in a plane."""
+def _chain(builder, links, x, *, reverse=False):
+    """A chain of revolute links hanging at ``x`` in a plane; with ``reverse`` its bodies are numbered tip first."""
     parent, joints = -1, []
+    order = reversed(range(links)) if reverse else range(links)
+    bodies = {
+        k: builder.add_link(mass=1.0, inertia=_INERTIA, xform=wp.transform(wp.vec3(x, 0.0, 1.0 - 0.2 * k)))
+        for k in order
+    }
     for k in range(links):
-        link = builder.add_link(mass=1.0, inertia=_INERTIA, xform=wp.transform(wp.vec3(x, 0.0, 1.0 - 0.2 * k)))
+        link = bodies[k]
         anchor = wp.vec3(x, 0.0, 1.0) if parent < 0 else wp.vec3(0.0, 0.0, -0.1)
         joints.append(
             builder.add_joint_revolute(
@@ -82,6 +87,24 @@ class TestHeldModels(unittest.TestCase):
                 self.assertEqual(sorted(group.group_count for group in held.groups), [1, 2])
                 alone = newton.ModelBuilder()
                 _star(alone, 2, 2.0)
+                _, _, expected = _fall(alone, device)
+                np.testing.assert_allclose(state.joint_q.numpy()[3:6], expected.joint_q.numpy(), atol=1e-5)
+                np.testing.assert_allclose(state.body_q.numpy()[3:6], expected.body_q.numpy(), atol=1e-5)
+
+    def test_trees_of_one_shape_group_by_their_index_tables(self):
+        """Hold chains of one shape whose bodies are numbered in opposite orders in groups of their own: a group's
+        kernels read its trees' bodies by one table, and the reversed chain falls as it does alone."""
+        for device in _devices():
+            with self.subTest(device=device):
+                builder = newton.ModelBuilder()
+                _chain(builder, 3, 0.0)
+                _chain(builder, 3, 2.0, reverse=True)
+                _chain(builder, 3, 4.0)
+                solver, _, state = _fall(builder, device)
+                self.assertEqual(sorted(np.diff(solver.forest.size_topologies[3]).tolist()), [1, 2])
+                self.assertEqual(sorted(group.group_count for group in solver.factor.held.groups), [1, 2])
+                alone = newton.ModelBuilder()
+                _chain(alone, 3, 2.0, reverse=True)
                 _, _, expected = _fall(alone, device)
                 np.testing.assert_allclose(state.joint_q.numpy()[3:6], expected.joint_q.numpy(), atol=1e-5)
                 np.testing.assert_allclose(state.body_q.numpy()[3:6], expected.body_q.numpy(), atol=1e-5)

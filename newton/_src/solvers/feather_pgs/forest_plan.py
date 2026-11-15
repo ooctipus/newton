@@ -41,6 +41,7 @@ from . import host_index
 from .body_cut import BodyCut
 from .body_mapping import build_body_maps
 from .field_group import Field, FieldGroup, SolverArrays
+from .tree_kinetic_plan import index_tables
 from .tree_plan import TreePlan
 
 BODY_MAPS = FieldGroup(
@@ -324,7 +325,8 @@ class ForestPlan:
     rest_topologies: np.ndarray
     """The articulations without coordinates, equal trees side by side, and the bounds of each run."""
     size_topologies: dict
-    """Each size group's ranges of equal trees: bounds into its group indices, one range for one topology."""
+    """Each size group's ranges of equal trees (one shape and one set of index tables, :func:`_by_topology`): bounds
+    into its group indices, one range for one topology."""
     """Each articulation's index in its size group (``-1`` without response)."""
     free_body_inertia_sizes: frozenset
     """Size groups of free bodies only (the composite inertia is the body's)."""
@@ -546,10 +548,20 @@ def _shapes(model, parent: np.ndarray, first, lengths: np.ndarray, order=None) -
 
 def _by_topology(plan, model, arts: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """The articulations ``arts`` of a size group, ascending, with equal trees side by side (ascending among them),
-    and the bounds of each run of equal trees. A group of one topology keeps its order."""
+    and the bounds of each run of equal trees. Equal trees have one shape (:func:`_shapes`) and one set of index tables
+    (:func:`.tree_kinetic_plan.index_tables`: a held group's kernels read both from the group's one copy), so trees of
+    one shape whose bodies or coordinates are laid out differently take runs of their own. A group of one topology
+    keeps its order."""
     first = model.articulation_start.numpy()[arts]
-    topology = _shapes(model, model.joint_ancestor.numpy(), first, plan.articulation_joint_end_host[arts] - first)
-    return arts[np.argsort(topology, kind="stable")], host_index.offsets(np.bincount(topology), np.int64)
+    lengths = plan.articulation_joint_end_host[arts] - first
+
+    def tables(members, length):
+        return np.concatenate(list(index_tables(model, first[members, None] + np.arange(length)).values()), axis=1)
+
+    equal = row_ids(
+        np.stack((_shapes(model, model.joint_ancestor.numpy(), first, lengths), _equal_ids(lengths, tables)), axis=1)
+    )
+    return arts[np.argsort(equal, kind="stable")], host_index.offsets(np.bincount(equal), np.int64)
 
 
 def _size_groups(plan, model):

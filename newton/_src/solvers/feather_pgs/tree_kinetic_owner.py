@@ -91,7 +91,7 @@ class TreeKineticState:
         model, device = solver.model, solver.model.device
         self.complete = complete
         host = sparse_owner.host
-        self.layout, parent = make_plan(model, sparse_owner, complete=complete)
+        self.layout, parent, tables = make_plan(model, sparse_owner, complete=complete)
         # Motion-velocity layouts validate by the stamps alone: their repair reads the prescaled velocity.
         self.bank_compare = not self.motion_velocity
         self.group_count = sparse_owner.plan.group_to_art.size
@@ -192,6 +192,7 @@ class TreeKineticState:
             free_root_local=free_root_local,
             free_root_dof=free_root_dof,
             dof_passive=dof_passive,
+            **tables,
             scratch=np.zeros(1 if self.layout.staged else self.group_count * self.layout.total, np.float32),
         )
         groups = self.group_count
