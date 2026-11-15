@@ -97,6 +97,39 @@ class DeformableVisualMesh:
         self.label = label
         """Display label. Not unique; use :attr:`index` for a stable identity."""
 
+    @staticmethod
+    def attribute_specs() -> dict[str, Model.AttributeSpec]:
+        """Return the frequency, world, references and placement of a visual mesh's values.
+
+        Each is a constructor argument of the same name. A mesh is one row of ``"deformable_visual_mesh"`` and its
+        vertices are rows of ``"deformable_visual_vertex"``: a vertex's parent indexes the domain the mesh's kind
+        names, and the body-local offsets of world-fixed vertices (parent ``-1``) move with a world transform.
+        """
+        from ..sim.model import Model  # noqa: PLC0415
+
+        frequency = Model.AttributeFrequency
+        kind = DeformableVisualMesh.Kind
+        mesh, vertex = "deformable_visual_mesh", "deformable_visual_vertex"
+        return {
+            "kind": Model.AttributeSpec(mesh),
+            "world": Model.AttributeSpec(mesh, references=frequency.WORLD),
+            "label": Model.AttributeSpec(mesh, label=True),
+            "parent": Model.AttributeSpec(
+                vertex,
+                kind_references=Model.KindReferences(
+                    "kind",
+                    (
+                        (int(kind.PARTICLE), (frequency.PARTICLE,)),
+                        (int(kind.TRIANGLE), (frequency.TRIANGLE,)),
+                        (int(kind.TETRAHEDRON), (frequency.TETRAHEDRON,)),
+                        (int(kind.BODY), (frequency.BODY,)),
+                    ),
+                ),
+            ),
+            "weights": Model.AttributeSpec(vertex),
+            "local_offsets": Model.AttributeSpec(vertex, placement=Model.AttributePlacement("point", anchor="parent")),
+        }
+
     @property
     def kind(self) -> Kind:
         """Embedding kind (see :class:`DeformableVisualMesh.Kind`). Read-only."""

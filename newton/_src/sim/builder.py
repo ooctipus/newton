@@ -4402,8 +4402,6 @@ class ModelBuilder:
             xform_rows = pack_transforms([_IDENTITY_TRANSFORM if xform is None else xform for xform in xforms]).reshape(
                 copy_count, 7
             )
-        # Identity rows are not moved, which keeps copies bit-exact.
-        moved = ~np.all(xform_rows == _IDENTITY_TRANSFORM, axis=1)
 
         def source_list(attr: str) -> list:
             values = getattr(builder, attr)
@@ -4485,6 +4483,7 @@ class ModelBuilder:
             DeformableVisualMesh.Kind.BODY: "body",
         }
         if visual_specs:
+            visual_placement = {"local_offsets": DeformableVisualMesh.attribute_specs()["local_offsets"]}
             for copy_index in range(copy_count):
                 for spec in visual_specs:
                     merged = dict(spec)
@@ -4497,12 +4496,14 @@ class ModelBuilder:
                     if "_body_worlds" in spec:
                         merged["_body_worlds"] = np.full(len(parents), worlds[copy_index], dtype=np.int32)
                     if spec["kind"] == DeformableVisualMesh.Kind.BODY and np.any(parents < 0):
-                        # World-fixed vertices need the same placement as static shapes.
-                        local = np.array(spec["local_offsets"], dtype=np.float32, copy=True)
-                        if moved[copy_index]:
-                            xform = xform_rows[copy_index]
-                            fixed = parents < 0
-                            local[fixed] = quat_rotate_rows(xform[3:], local[fixed]) + xform[:3]
+                        # World-fixed vertices are placed like every world-frame row.
+                        local = np.array(spec["local_offsets"], dtype=np.float32, copy=True).reshape(-1, 3)
+                        placed = place_copies(
+                            visual_placement, {"local_offsets": local, "parent": parents}, xform_rows[copy_index]
+                        )
+                        if "local_offsets" in placed:
+                            targets, rows = placed["local_offsets"]
+                            local[targets.reshape(-1)] = rows.reshape(-1, 3)
                         merged["local_offsets"] = local
                     self._deformable_visual_meshes.append(merged)
 

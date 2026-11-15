@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 import operator
 import warnings
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field, replace
 from enum import IntEnum
@@ -2758,6 +2758,12 @@ class Model:
         .. experimental::
         """
         return self._deformable_visual_meshes
+
+    @deformable_visual_meshes.setter
+    def deformable_visual_meshes(self, meshes: Sequence[DeformableVisualMesh]) -> None:
+        """Replace the visual meshes, for example with copies for more worlds; skinning is batched again on use."""
+        self._deformable_visual_meshes = tuple(meshes)
+        self._deformable_visual_skin_batches = None
 
     @property
     def deformable_visual_mesh_count(self) -> int:

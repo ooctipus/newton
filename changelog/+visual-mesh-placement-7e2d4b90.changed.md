@@ -1,0 +1,1 @@
+Declare a deformable visual mesh's values with `DeformableVisualMesh.attribute_specs()` and let `Model.deformable_visual_meshes` be replaced, so callers that assemble a model from copied worlds copy visual meshes by the metadata; `ModelBuilder.replicate` places world-fixed body-bound vertices with `newton.utils.place_copies`.
