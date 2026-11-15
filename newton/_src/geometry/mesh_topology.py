@@ -908,6 +908,16 @@ def mesh_surface_context(
 
 
 @wp.func
+def mesh_facet_interior(context: SurfaceFeatureContext) -> bool:
+    """Whether the triangle lies inside a facet: each edge joins a coplanar triangle, each corner is a flat vertex.
+
+    The surface around every point of such a triangle is its plane (the flat bits of its topology row); a triangle
+    without topology is alone.
+    """
+    return context.row >= 0 and (context.flat & 63) == 63
+
+
+@wp.func
 def mesh_surface_planes(context: SurfaceFeatureContext) -> SurfaceFeatureContext:
     """The context with its triangle's unit normal and edge planes, which the per-point rule and the grown facet read.
 

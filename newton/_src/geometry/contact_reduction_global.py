@@ -65,10 +65,12 @@ from newton._src.geometry.hashtable import (
 )
 
 from ..utils.heightfield import HeightfieldData, get_triangle_shape_from_heightfield
+from .collision_convex import mpr_inflate
 from .collision_core import (
     create_compute_face_contacts,
     create_compute_gjk_mpr_contacts,
     triangle_face_case,
+    triangle_facet_case,
 )
 from .contact_data import ContactData, compute_contact_approach_speed
 from .contact_reduction import (
@@ -95,6 +97,7 @@ from .mesh_topology import (
     create_surface_penetration_refiner,
     mesh_contact_filter,
     mesh_deepest_once,
+    mesh_facet_interior,
     mesh_manifold_triangle,
     mesh_surface_context,
     mesh_surface_planes,
@@ -3097,10 +3100,12 @@ def create_mesh_face_contacts_kernel(
     queue_heightfields: bool = True,
     kernel_name: str = "mesh_face_contacts_kernel",
 ):
-    """Create the first pass over mesh triangle pairs: the plane cull and the closed-form face case.
+    """Create the first pass over mesh triangle pairs: the plane cull and the closed-form face cases.
 
     A box, cylinder or convex hull whose support point along minus the face normal has its foot inside the
-    triangle (:func:`triangle_face_case`) gets the face-normal manifold here, as GJK/MPR would give it. Every
+    triangle (:func:`triangle_face_case`) gets the face-normal manifold here, as GJK/MPR would give it; one on the
+    outer side of the plane of a triangle inside a facet (:func:`triangle_facet_case`) gets the facet plane's
+    manifold, of which the triangle keeps the points over it. Every
     other pair that survives the cull, and every heightfield pair, is compacted into ``queued_pairs`` for the
     GJK/MPR kernel (the generic query with ``plane_cull=False``), so the closed-form majority does not wait on
     GJK/MPR in a warp. Sphere and capsule pairs are the lean round-shape kernel's. With ``queue_heightfields`` off,
@@ -3181,22 +3186,23 @@ def create_mesh_face_contacts_kernel(
                 if face_case_partner(type_b):
                     center = pos_b + wp.quat_rotate(quat_b, geom_b.center)
                     is_face, unit, distance = triangle_face_case(triangle, corner_0, support_point, center, threshold)
-                    if is_face:
-                        surface = mesh_surface_planes(
-                            mesh_surface_context(
-                                mesh_topology,
-                                shape_a,
-                                tri_idx,
-                                shape_source[shape_a],
-                                mesh_scale_a,
-                                X_ws_a,
-                                corner_0,
-                                corner_1,
-                                corner_2,
-                                center,
-                                shape_b,
-                            )
-                        )
+                    surface = mesh_surface_context(
+                        mesh_topology,
+                        shape_a,
+                        tri_idx,
+                        shape_source[shape_a],
+                        mesh_scale_a,
+                        X_ws_a,
+                        corner_0,
+                        corner_1,
+                        corner_2,
+                        center,
+                        shape_b,
+                    )
+                    if is_face or triangle_facet_case(
+                        mesh_facet_interior(surface), unit, distance, mpr_inflate(margin_a + margin_b)
+                    ):
+                        surface = mesh_surface_planes(surface)
                         face_contacts(
                             triangle,
                             geom_b,

@@ -576,6 +576,38 @@ def triangle_face_case(
     return True, unit, distance
 
 
+@wp.func
+def triangle_facet_case(facet_interior: bool, unit: wp.vec3, distance: float, inflate: float) -> bool:
+    """Whether a convex shape's contacts with a mesh triangle inside a facet are the facet plane's, in closed form.
+
+    A triangle is inside a facet when each of its edges joins a coplanar triangle and each of its corners is a flat
+    vertex, so that a neighbourhood of every one of its points in the surface lies in its plane P. With n the
+    outward unit normal, p0 a corner and d = min over the shape B of n . (x - p0) >= 0 (B on the outer side of P):
+
+    - the distance g(y) = dist(y, B) is convex on P, with minimum d over P, attained exactly at the feet of B's
+      support set along -n (|x - y| >= n . (x - y) >= d for x in B and y in P, with equality only there);
+    - a local minimum of g over the surface at a point y of the triangle is a local minimum over P, hence the global
+      one: it has direction n and value d. No edge or vertex of the triangle carries a contact of another direction.
+
+    The triangle's contacts are therefore those of B with the plane P that lie over the triangle: the face-normal
+    manifold of :func:`create_compute_face_contacts`, each point reported by the triangle under it. This holds
+    wherever the support point's foot lies, so the pair needs no GJK/MPR; :func:`triangle_face_case` is the same
+    statement for one triangle alone, where it needs the foot inside the triangle.
+
+    Not decided here: d below the MPR pass's inflate (B crosses the plane or rests on it within MPR's reach, where
+    MPR measures each triangle's own overlap; the switch then stays clear of the resting distance, as
+    :func:`mpr_inflate` keeps it) and triangles with a crease, a boundary edge or a facet corner, whose edges and
+    vertices carry contacts of their own.
+
+    Args:
+        facet_interior: Whether the triangle is inside a facet (:func:`mesh_facet_interior`).
+        unit: The outward unit face normal (zero for a degenerate triangle).
+        distance: The support distance d of :func:`triangle_face_case` [m].
+        inflate: The pair's MPR inflate [m] (:func:`mpr_inflate`), at least 0.
+    """
+    return facet_interior and distance >= inflate and wp.length_sq(unit) > 0.0
+
+
 def create_compute_face_contacts(
     writer_func: Any,
     support_func: Any,
@@ -590,6 +622,7 @@ def create_compute_face_contacts(
     normal (up to rounding), so the manifold built here is the one the GJK/MPR query builds after it: the shape's
     support feature clipped against the triangle (grown across coplanar edges by ``manifold_shape``), each point
     admitted by ``point_filter`` (a face contact needs no cone test: the triangle containing the point owns it).
+    Where :func:`triangle_facet_case` holds it is the facet plane's manifold, of which the triangle keeps its part.
 
     Args:
         writer_func: Function that writes generated contacts.

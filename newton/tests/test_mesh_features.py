@@ -363,6 +363,83 @@ def test_flat_lattice_shapes(test, device):
             test.assertLessEqual(reduced[0], got[0])
 
 
+def test_flat_lattice_tilted_box(test, device):
+    """A box tilted over a fine flat lattice, clear of it, gets the plane's contacts whatever its tilt.
+
+    Every triangle under the box lies inside the facet, so no edge or vertex of the lattice carries a contact: the
+    contacts are corners of the box's lower face, each once, along the plane's normal at the corner's own height
+    (all four while the tilt is well inside the manifold's feature angle). Tilts between the face-normal tolerance
+    and the feature angle used to give each triangle the box face's normal instead, with seam points.
+    """
+    fine = _soup(*_lattice(16, 0.8))
+    hx, hy, hz = 0.13, 0.07, 0.05
+    for tilt in (5.0e-4, 5.0e-3, 1.75e-2):
+        for axis in (wp.vec3(1.0, 0.0, 0.0), wp.vec3(0.0, 1.0, 0.0), wp.vec3(0.6, 0.8, 0.0)):
+            for x, y in ((0.0, 0.0), (0.033, 0.017)):
+                rot = wp.quat_from_axis_angle(axis, tilt)
+                corners = np.array(
+                    [wp.quat_rotate(rot, wp.vec3(sx * hx, sy * hy, -hz)) for sx in (-1, 1) for sy in (-1, 1)]
+                )
+                z = 0.001 - float(corners[:, 2].min())
+                want = corners + np.array([x, y, z])
+                for reduce in (False, True):
+                    count, normal, p0, separation = _collide(
+                        device,
+                        *fine,
+                        ("box", {"hx": hx, "hy": hy, "hz": hz}),
+                        wp.transform(wp.vec3(x, y, z), rot),
+                        reduce=reduce,
+                    )
+                    label = f"tilt {tilt} about {tuple(axis)} at {(x, y)}, reduce {reduce}"
+                    test.assertTrue(np.all(normal[:, 2] > 1.0 - 1e-6), f"{label}: a normal off the plane's")
+                    test.assertGreaterEqual(count, 1, label)
+                    hits = np.zeros(4, dtype=int)
+                    for k in range(count):
+                        near = np.linalg.norm(want[:, :2] - p0[k, :2], axis=1) < 2e-5
+                        test.assertEqual(int(near.sum()), 1, f"{label}: a contact off the corners")
+                        test.assertAlmostEqual(float(separation[k]), float(want[near][0, 2]), delta=2e-5)
+                        hits += near
+                    test.assertTrue(np.all(hits <= 1), f"{label}: a corner twice")
+                    if tilt <= 5.0e-3 and not reduce:
+                        test.assertEqual(count, 4, label)
+
+
+def test_flat_lattice_tilted_solids(test, device):
+    """A cylinder and a convex hull tilted over a fine flat lattice, clear of it, get contacts of the plane only.
+
+    As for the box: every contact lies on the plane along its normal, the shape's lowest point is among them at its
+    height, and none is deeper.
+    """
+    fine = _soup(*_lattice(16, 0.8))
+    angles = np.linspace(0.0, 2.0 * np.pi, 64, endpoint=False)
+    rim = np.stack([0.06 * np.cos(angles), 0.06 * np.sin(angles), np.full(64, -0.05)], 1)
+    hexagon = np.linspace(0.0, 2.0 * np.pi, 6, endpoint=False)
+    prism = np.array(
+        [[0.11 * np.cos(a), 0.06 * np.sin(a), z] for z in (-0.03, 0.03) for a in hexagon], dtype=np.float32
+    )
+    hull = newton.Mesh(prism, np.array([0, 1, 2], np.int32), compute_inertia=False)
+    shapes = (
+        ("cylinder", {"radius": 0.06, "half_height": 0.05}, rim),
+        ("convex_hull", {"mesh": hull}, prism[:6].astype(np.float64)),
+    )
+    for kind, args, lower in shapes:
+        for tilt in (5.0e-3, 1.75e-2):
+            for axis in (wp.vec3(1.0, 0.0, 0.0), wp.vec3(0.6, 0.8, 0.0)):
+                rot = wp.quat_from_axis_angle(axis, tilt)
+                lowest = min(float(wp.quat_rotate(rot, wp.vec3(*p))[2]) for p in lower)
+                z = 0.001 - lowest
+                count, normal, p0, separation = _collide(
+                    device, *fine, (kind, args), wp.transform(wp.vec3(0.033, 0.017, z), rot)
+                )
+                label = f"{kind}, tilt {tilt} about {tuple(axis)}"
+                test.assertGreaterEqual(count, 1, label)
+                test.assertLessEqual(count, 5, label)
+                test.assertTrue(np.all(normal[:, 2] > 1.0 - 1e-6), f"{label}: a normal off the plane's")
+                np.testing.assert_allclose(p0[:, 2], 0.0, atol=1e-6, err_msg=label)
+                test.assertAlmostEqual(float(separation.min()), 0.001, delta=2e-5, msg=label)
+                test.assertTrue(np.all(separation < GAP + 2e-5), label)
+
+
 def test_capsule_over_ridge(test, device):
     """A capsule across a gable ridge: one contact at the ridge, from the core's interior, normal in the cone."""
     left = _quad((-0.4, -0.4, -0.2), (0.0, -0.4, 0.0), (0.0, 0.4, 0.0), (-0.4, 0.4, -0.2))
@@ -428,6 +505,8 @@ for _name, _fn in (
     ("test_heightfield_equivalence", test_heightfield_equivalence),
     ("test_mirrored_scale_spheres", test_mirrored_scale_spheres),
     ("test_flat_lattice_shapes", test_flat_lattice_shapes),
+    ("test_flat_lattice_tilted_box", test_flat_lattice_tilted_box),
+    ("test_flat_lattice_tilted_solids", test_flat_lattice_tilted_solids),
     ("test_capsule_over_ridge", test_capsule_over_ridge),
     ("test_box_on_stair_nose", test_box_on_stair_nose),
     ("test_small_facet_keeps_its_corners", test_small_facet_keeps_its_corners),
