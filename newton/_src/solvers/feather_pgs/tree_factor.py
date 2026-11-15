@@ -50,7 +50,6 @@ from .factor.kernels import (
     advance_clock,
     apply_free_root_velocity_corrections,
     build_mass_update_mask,
-    compute_com_transforms,
     damp_free_root_spin,
     invalidate_articulation_fk_id_cache,
     invalidate_fk_id_cache_for_articulations,
@@ -486,8 +485,8 @@ class TreeFactor:
         self.parallel_drives = True
 
     def allocate_common(self) -> None:
-        """Allocate the mass-update mask, the compact diagonal's inverse mass, the body inertia records (with the COM
-        frames) and the articulation origins."""
+        """Allocate the mass-update mask, the compact diagonal's inverse mass, the body inertia records and the
+        articulation origins."""
         model, forest, arrays = self.model, self.forest, self._arrays
         if model.joint_count:
             arrays.allocate(ARTICULATION_WORK, articulation=model.articulation_count)
@@ -498,13 +497,6 @@ class TreeFactor:
         )
         if model.body_count:
             arrays.allocate(BODY_INERTIA, body=model.body_count)
-            wp.launch(
-                compute_com_transforms,
-                model.body_count,
-                inputs=[model.body_com],
-                outputs=[self.body_X_com],
-                device=model.device,
-            )
         else:
             arrays.release(BODY_INERTIA)
 
@@ -578,8 +570,8 @@ class TreeFactor:
 
     def notify_model_changed(self, flags, kinematic) -> None:
         """Take a model change once every check that can refuse it passed: prove the held tree's frames, invalidate
-        the caches the changed inputs feed, publish ``kinematic`` (:meth:`kinematic_state`, or ``None``) and re-derive
-        the COM frames on an inertial change."""
+        the caches the changed inputs feed, publish ``kinematic`` (:meth:`kinematic_state`, or ``None``) and ask every
+        tree's factor again on an inertial change (the kernels read mass, inertia and centre of mass live)."""
         # The held tree's proof stores a moved joint frame as its new reference, so it runs after every check that
         # can still refuse the notification.
         held = self.held
@@ -611,15 +603,6 @@ class TreeFactor:
             self.scatter_armature()
             self.mass_update_requested.fill_(1)
         if flags & ModelFlags.BODY_INERTIAL_PROPERTIES and self.model.body_count:
-            # Re-derive the COM frames baked from body_com in allocate_common so runtime CoM randomization reaches
-            # FK; mass and inertia are read live.
-            wp.launch(
-                compute_com_transforms,
-                self.model.body_count,
-                inputs=[self.model.body_com],
-                outputs=[self.body_X_com],
-                device=self.model.device,
-            )
             self.mass_update_requested.fill_(1)
 
     def reset_cache(self, world_mask: wp.array | None) -> None:

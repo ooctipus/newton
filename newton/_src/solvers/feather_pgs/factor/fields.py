@@ -18,7 +18,6 @@ ARTICULATION_WORK = FieldGroup(
 )
 
 BODY_INERTIA = FieldGroup(
-    Field("body_X_com", wp.transform, ("body",), fill=None, owner="factor"),
     Field("body_inertia_terms", inertia_record, ("body",), fill=None),
 )
 """Body inertia about the articulation origin as inertia records (:data:`.spatial_laws.inertia_record`): each

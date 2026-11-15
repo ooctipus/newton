@@ -4,8 +4,8 @@
 """The factor's kernels outside the walk.
 
 The velocity prescale ahead of the prediction, the free roots' prediction corrections (gyroscopic velocity, spin
-damping, the transport the integrator adds), the joint integrator, the bodies' center-of-mass transforms, and the
-flags of the mass matrices' and the FK/ID cache's refresh.
+damping, the transport the integrator adds), the joint integrator, and the flags of the mass matrices' and the FK/ID
+cache's refresh.
 """
 
 import warp as wp
@@ -17,17 +17,6 @@ from ..spatial_laws import free_root_transport
 
 # FeatherPGS takes no gradients: its kernels compile no adjoints.
 wp.set_module_options({"enable_backward": False})
-
-
-@wp.kernel
-def compute_com_transforms(
-    body_com: wp.array[wp.vec3],
-    # outputs
-    body_X_com: wp.array[wp.transform],
-):
-    tid = wp.tid()
-    com = body_com[tid]
-    body_X_com[tid] = wp.transform(com, wp.quat_identity())
 
 
 @wp.func

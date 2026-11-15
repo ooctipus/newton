@@ -1398,7 +1398,8 @@ def get_state_kernel(
                     local,
                     root,
                     pose,
-                    pose * data.body_X_com[body],
+                    # The body's centre-of-mass frame: its centre of mass, the model's own, at the body's rotation.
+                    pose * wp.transform(data.body_com[body], wp.quat_identity()),
                     origin,
                     load_words(g.address, wp.static(motion_word) + 6 * local, wp.spatial_vector()),
                     load_words(g.address, wp.static(bias_word) + 6 * local, wp.spatial_vector()),

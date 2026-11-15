@@ -700,8 +700,10 @@ class TestFeatherPGSNotifyInertial(unittest.TestCase):
 
         The trajectory after the change must match a solver constructed with
         the new COM already in the model and stepped from the same state; a
-        stale solver (COM written without notify) must diverge, proving the
-        comparison is not vacuous.
+        solver whose model keeps the old COM must diverge, proving the
+        comparison is not vacuous. The kernels read mass, inertia and centre
+        of mass from the model at every step, so the solver holds no copy of
+        them that a missing notification could leave stale.
         """
         device = wp.get_device()
         pre_steps, post_steps = 30, 60
@@ -713,18 +715,18 @@ class TestFeatherPGSNotifyInertial(unittest.TestCase):
         reference = _run_trajectory(reference_model, reference_solver, post_steps)
 
         histories = {}
-        for notify in (True, False):
+        for moved in (True, False):
             model = _pendulum(device)
             solver = SolverFeatherPGS(model)
             _run_trajectory(model, solver, pre_steps)
-            _move_mass(model, NEW_COM, 2.0)
-            if notify:
+            if moved:
+                _move_mass(model, NEW_COM, 2.0)
                 solver.notify_model_changed(newton.ModelFlags.BODY_INERTIAL_PROPERTIES)
-            histories[notify] = _run_trajectory(model, solver, post_steps)
+            histories[moved] = _run_trajectory(model, solver, post_steps)
 
         np.testing.assert_allclose(histories[True], reference, rtol=0.0, atol=1.0e-5)
-        stale_drift = np.abs(histories[False] - reference).max()
-        self.assertGreater(stale_drift, 1.0e-2, "stale-solver trajectory should diverge without notify")
+        unmoved_drift = np.abs(histories[False] - reference).max()
+        self.assertGreater(unmoved_drift, 1.0e-2, "the old centre of mass's trajectory should diverge")
 
 
 if __name__ == "__main__":

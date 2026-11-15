@@ -22,7 +22,6 @@ PUBLICATION = (
     Field("kinematic_dof_mask", wp.int32, ("dof",), owner="factor"),
     Field("kinematic_joint_mask", wp.int32, ("joint",), owner="factor"),
     Field("free_root_joint_indices", wp.int32, ("free_root",), owner="forest"),
-    Field("body_X_com", wp.transform, ("body",), owner="factor"),
     Field("body_com", wp.vec3, ("body",), owner="model"),
     Field("body_mass", wp.float32, ("body",), owner="model"),
     Field("body_inertia", wp.mat33, ("body",), owner="model"),
