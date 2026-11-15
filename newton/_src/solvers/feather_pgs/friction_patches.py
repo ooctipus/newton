@@ -210,8 +210,9 @@ class _PatchFrame:
     # Scratch of the previous frame: a pair's stored centres of pressure, gathered in the pair's own positions.
     centres: wp.array[wp.vec3]
     # The frame's regions, which a held frame's builds carry: the position each region's members start at in
-    # ``members``, in any order; where they stop and the member that carried the region's friction at the last
-    # build, both at that position.
+    # ``members``, those of one contact from the list's front and the others from its back below the live count,
+    # each in any order; where they stop and the member that carried the region's friction at the last build, both
+    # at that position.
     regions: wp.array[int]
     region_stop: wp.array[int]
     carrier: wp.array[int]
@@ -461,9 +462,10 @@ def _prepare(
         kept = 1
     held = kept * fresh[0]
     if thread == 0:
-        _publish_extent(extent, end, live, live * (1 - kept), end * (1 - held), regions[0] * held)
+        _publish_extent(extent, end, live, live * (1 - kept), end * (1 - held), (regions[0] + regions[1]) * held)
         if held == 0:
             regions[0] = 0
+            regions[1] = 0
     for c in range(thread, end, threads):
         key = _prepare_contact_fields(c, live, held, inputs, frame, patches)
         # A kept slot holds the sorted pair at position c, not contact c's key.
@@ -1004,7 +1006,13 @@ def _build_pair(
         # The region, for the builds that hold this frame: where its members lie and which one carries it.
         frame.region_stop[member_start] = member_stop
         frame.carrier[member_start] = first
-        frame.regions[wp.atomic_add(regions, 0, 1)] = member_start
+        # Regions of one contact from the front of the list and the others from its back, below the live count:
+        # the threads of a warp that carries the list then hold regions of one kind, and those of one contact
+        # wait for no footprint.
+        if member_stop - member_start == 1:
+            frame.regions[wp.atomic_add(regions, 0, 1)] = member_start
+        else:
+            frame.regions[end - 1 - wp.atomic_add(regions, 1, 1)] = member_start
         _place_region(
             seed,
             first,
@@ -1111,8 +1119,8 @@ def _build(
 ):
     """Build the frame's regions: carry those of a held frame, make any other frame's.
 
-    A held frame's build strides over the regions its first build listed, one thread a region; regions write
-    disjoint current/previous records.
+    A held frame's build strides over the regions its first build listed, those of one contact first, one thread a
+    region; regions write disjoint current/previous records.
 
     Any other build strides over the live sorted positions and builds the body pair whose run starts at each; body
     pairs write disjoint current/previous records. A thread seeks its next pair before it builds it, so the
@@ -1133,8 +1141,12 @@ def _build(
         fresh[0] = 0
     carry = extent[_CARRY_EXTENT]
     if carry > 0:
+        single = regions[0]
         for region in range(thread, carry, threads):
-            _carry_region(frame.regions[region], q, previous_q, shape_transform, shape_radius, frame, prev, patches)
+            listed = region
+            if region >= single:
+                listed = live - 1 - (region - single)
+            _carry_region(frame.regions[listed], q, previous_q, shape_transform, shape_radius, frame, prev, patches)
         return
     if thread == 0:
         built[0] = live
@@ -1364,9 +1376,10 @@ class _FrictionPatchState:
         # reads a count it writes, so blocks never race on them.
         self.stored = wp.zeros(1, dtype=int, device=device)
         self.built = wp.zeros(1, dtype=int, device=device)
-        # The regions of the frame, listed in current.regions: a build that makes them fills the list _prepare
+        # The regions of the frame, listed in current.regions, those of one contact from its front and the others
+        # from its back below the live count (their two counts): a build that makes them fills the list _prepare
         # emptied, and a held frame's builds carry them (_build).
-        self.regions = wp.zeros(1, dtype=int, device=device)
+        self.regions = wp.zeros(2, dtype=int, device=device)
         # Whether a store followed the last build: the stored frame then holds that build, and a build of the same
         # contact frame is held. _finish_and_store sets it and a build clears it.
         self.fresh = wp.zeros(1, dtype=int, device=device)

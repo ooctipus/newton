@@ -535,13 +535,15 @@ def assert_same_state(twin, patches, context="", records=True):
     ``records`` compares the frame records as well: the sorted frame, and the
     sort's extent, which a kept build leaves empty.
     """
-    regions = int(patches.regions.numpy()[0])
+    single, others = (int(count) for count in patches.regions.numpy())
+    live = int(patches.extent.numpy()[1])
     np.testing.assert_array_equal(twin.regions.numpy(), patches.regions.numpy(), f"{context} regions")
-    np.testing.assert_array_equal(
-        np.sort(twin.current.regions.numpy()[:regions]),
-        np.sort(patches.current.regions.numpy()[:regions]),
-        f"{context} current.regions",
-    )
+    for part, listed in (("of one contact", slice(0, single)), ("of several", slice(live - others, live))):
+        np.testing.assert_array_equal(
+            np.sort(twin.current.regions.numpy()[listed]),
+            np.sort(patches.current.regions.numpy()[listed]),
+            f"{context} current.regions {part}",
+        )
     for frame in ("current", "previous"):
         for name in _PatchFrame.vars:
             if frame == "previous" and name in _BUILD_FIELDS:
@@ -3226,14 +3228,17 @@ def run_replay_past_the_sort_rounds(test, device, replays=3):
         fresh.build(scene.model, scene.state, scene.contacts)
         context = f"replay {replay}" if replay < replays else "eager"
         np.testing.assert_array_equal(stale.regions.numpy(), fresh.regions.numpy(), f"{context} regions")
-        regions = int(fresh.regions.numpy()[0])
+        single, others = (int(count) for count in fresh.regions.numpy())
         for name in _PatchFrame.vars:
             if name in _STORED_FIELDS:
                 continue  # the built frame holds none of the stored frame's scratch
             arrays = [getattr(state.current, name).numpy()[:live] for state in (stale, fresh)]
             if name == "regions":
-                # The listed regions compare as a set: threads list them in any order.
-                arrays = [np.sort(array[:regions]) for array in arrays]
+                # The listed regions compare as sets, those of one contact and the others: threads list them in
+                # any order.
+                arrays = [
+                    np.concatenate((np.sort(array[:single]), np.sort(array[live - others :]))) for array in arrays
+                ]
             np.testing.assert_array_equal(*arrays, f"{context} {name}")
         for name in ("weight", "next_contact", "point", "phi"):
             np.testing.assert_array_equal(

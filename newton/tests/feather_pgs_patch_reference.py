@@ -531,7 +531,7 @@ class ReferencePatches:
                 self.current,
                 self.previous,
                 self.view,
-                wp.zeros(1, dtype=int, device=model.device),
+                wp.zeros(2, dtype=int, device=model.device),
             ],
             device=model.device,
         )
