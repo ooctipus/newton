@@ -33,11 +33,8 @@ from ..core.host_transform import (
     pack_transforms,
     pack_warp_values,
     quat_rotate_rows,
-    store_transform_rows,
     transform_inverse,
-    transform_inverse_rows,
     transform_multiply,
-    transform_multiply_rows,
     warp_array_from_values,
 )
 from ..core.types import (
@@ -116,6 +113,7 @@ from .graph_coloring import (
 )
 from .joint_mimic import _SUPPORTED_JOINT_TYPES
 from .model import Model, _pack_shape_pair_codes
+from .placement import place_copies
 from .rod import Rod
 from .shape_contact_pairs import _ShapeContactPairs
 from .tendon import TendonGuide, TendonGuideFlags, TendonGuideType
@@ -235,7 +233,6 @@ _REPLICATE_WORLD_COUNT_DEPRECATION_MSG = (
 # Plain constructors, not wp.transform_identity()/wp.quat_identity(): builtins
 # dispatch through overload resolution and would initialize the Warp runtime at import.
 _IDENTITY_TRANSFORM = np.asarray(wp.transformf((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0)), dtype=np.float32)
-_IDENTITY_ROTATION = np.asarray(wp.quatf(0.0, 0.0, 0.0, 1.0), dtype=np.float32)
 
 
 _MERGE_VALIDATION_CACHE: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
@@ -4431,34 +4428,14 @@ class ModelBuilder:
             xform_rows = pack_transforms([_IDENTITY_TRANSFORM if xform is None else xform for xform in xforms]).reshape(
                 copy_count, 7
             )
-        # Identity rows are not moved, which keeps copies bit-exact (identity transform_mul round-trips
-        # are not exact for free-root joint_q).
+        # Identity rows are not moved, which keeps copies bit-exact.
         moved = ~np.all(xform_rows == _IDENTITY_TRANSFORM, axis=1)
-        # Copies with a non-identity transform, as copy indices and (N, 7) float32 rows.
-        moved_copies = np.flatnonzero(moved)
-        moved_xforms = xform_rows[moved]
-        # Moved copies whose rotation is not the identity; only these rotate velocities.
-        rotated = ~np.all(moved_xforms[:, 3:] == _IDENTITY_ROTATION, axis=1)
-        translations_only = not np.any(rotated)
-        offsets = np.where(moved[:, None], xform_rows[:, :3], np.float32(0.0))
 
         def source_list(attr: str) -> list:
             values = getattr(builder, attr)
             # Tolerate array-valued fields assigned in place of lists (list-repeat and
             # extend would silently misbehave on ndarrays).
             return values if isinstance(values, list) else list(values)
-
-        def rotate_vectors(rotation: np.ndarray, vectors: np.ndarray) -> None:
-            # In-place SO(3) on (..., 3), with rotations (..., 4) broadcast against the
-            # vectors. Translation is not applied: a pure offset must leave linear and
-            # angular velocity unchanged. This keeps the cross-product form that velocity
-            # copies have always used, so they stay bit-identical; poses go through
-            # transform_multiply_rows(), which mirrors Warp's quat_rotate instead.
-            q = np.asarray(rotation, dtype=np.float32)
-            xyz = q[..., :3]
-            w = q[..., 3:]
-            t = 2.0 * np.cross(xyz, vectors)
-            vectors += np.cross(xyz, t) + w * t
 
         counts = self._builder_merge_counts(builder)
         self._validate_builder_merge(builder, set(counts))
@@ -4578,52 +4555,12 @@ class ModelBuilder:
         self._requested_contact_attributes.update(builder._requested_contact_attributes)
         self._requested_state_attributes.update(builder._requested_state_attributes)
 
-        attribute_specs.pop("particle_q")
         if counts["particle"]:
             self.particle_max_velocity = builder.particle_max_velocity
-            particle_q = np.tile(np.asarray(builder.particle_q, dtype=np.float32), (copy_count, 1))
-            particle_q += np.repeat(offsets, counts["particle"], axis=0)
-            if "particle_q" in array_starts:
-                self.particle_q[array_starts["particle_q"] :] = particle_q
-            else:
-                self.particle_q.extend(particle_q.tolist())
+        self._place_builder_copies(builder, attribute_specs, array_starts, xform_rows)
 
         shape_starts = starts("shape")
         body_starts = starts("body")
-
-        attribute_specs.pop("shape_transform")
-        shape_transform_start = array_starts.get("shape_transform", int(bases["shape"]))
-        if "shape_transform" not in array_starts:
-            self.shape_transform.extend(source_list("shape_transform") * copy_count)
-        if counts["shape"] and len(moved_copies):
-            static_shapes = np.flatnonzero(np.asarray(builder.shape_body, dtype=np.int64) == -1)
-            if len(static_shapes):
-                source = pack_transforms([builder.shape_transform[shape] for shape in static_shapes.tolist()])
-                transformed = transform_multiply_rows(moved_xforms[:, None], source[None])
-                targets = shape_transform_start + moved_copies[:, None] * counts["shape"] + static_shapes[None]
-                store_transform_rows(self.shape_transform, targets.ravel(), transformed.reshape(-1, 7))
-
-        # World guides carry their own frame; body-local guides follow the placed body.
-        world_guides = np.flatnonzero(np.asarray(builder.tendon_guide_body, dtype=np.int64) == -1)
-        for name in ("tendon_guide_offset", "tendon_guide_axis"):
-            attribute_specs.pop(name)
-            start = int(bases["tendon_guide"])
-            values = getattr(self, name)
-            values.extend(source_list(name) * copy_count)
-            is_offset = name == "tendon_guide_offset"
-            if world_guides.size == 0 or (not is_offset and translations_only):
-                continue
-            source_vectors = np.asarray(getattr(builder, name), dtype=np.float32)[world_guides]
-            for world_index in moved_copies.tolist():
-                xform = xform_rows[world_index]
-                transformed = source_vectors.copy()
-                if not translations_only:
-                    rotate_vectors(xform[3:], transformed)
-                if is_offset:
-                    transformed += xform[:3]
-                targets = start + world_index * counts["tendon_guide"] + world_guides
-                for target, vector in zip(targets, transformed.tolist(), strict=True):
-                    values[target] = tuple(vector)
 
         if builder.body_shapes:
             # Every copy's body shape lists, copy by copy: static shapes extend the shared list of
@@ -4656,93 +4593,9 @@ class ModelBuilder:
         joint_coord_starts = starts("joint_coord")
         joint_dof_starts = starts("joint_dof")
 
-        attribute_specs.pop("joint_X_p")
-        attribute_specs.pop("joint_q")
-        attribute_specs.pop("joint_qd")
-        joint_X_p_start = array_starts.get("joint_X_p", int(bases["joint"]))
-        if "joint_X_p" not in array_starts:
-            self.joint_X_p.extend(source_list("joint_X_p") * copy_count)
-        joint_q_source = np.asarray(builder.joint_q, dtype=np.float32)
-        joint_q = np.tile(joint_q_source, copy_count)
-        # joint_qd is parent-frame. Free-root twists use the same rotation as joint_q
-        # (xform conjugated by joint_X_p). Other joint velocities are unchanged.
-        joint_qd_source = np.asarray(builder.joint_qd, dtype=np.float32)
-        joint_qd = np.tile(joint_qd_source, copy_count)
-        if counts["joint"] and len(moved_copies):
-            joint_types = np.asarray(builder.joint_type, dtype=np.int64)
-            joint_parents = np.asarray(builder.joint_parent, dtype=np.int64)
-            nonfree_roots = np.flatnonzero((joint_parents == -1) & (joint_types != int(JointType.FREE)))
-            if len(nonfree_roots):
-                source = pack_transforms([builder.joint_X_p[joint] for joint in nonfree_roots.tolist()])
-                transformed = transform_multiply_rows(moved_xforms[:, None], source[None])
-                targets = joint_X_p_start + moved_copies[:, None] * counts["joint"] + nonfree_roots[None]
-                store_transform_rows(self.joint_X_p, targets.ravel(), transformed.reshape(-1, 7))
-
-            free_roots = np.flatnonzero((joint_parents == -1) & (joint_types == int(JointType.FREE)))
-            if len(free_roots):
-                # Arrays below are shaped (moved copy, free root, ...).
-                q_index = np.asarray(builder.joint_q_start, dtype=np.int64)[free_roots, None] + np.arange(7)
-                qd_index = np.asarray(builder.joint_qd_start, dtype=np.int64)[free_roots, None] + np.arange(6)
-                xform_prev = joint_q_source[q_index]
-                X_pj = pack_transforms([builder.joint_X_p[joint] for joint in free_roots.tolist()])
-                X_pj_inv = transform_inverse_rows(X_pj)
-                xform_local = transform_multiply_rows(
-                    transform_multiply_rows(X_pj_inv[None], moved_xforms[:, None]), X_pj[None]
-                )
-                coord_base = moved_copies[:, None, None] * counts["joint_coord"]
-                joint_q[coord_base + q_index[None]] = transform_multiply_rows(xform_local, xform_prev[None])
-                if np.any(rotated):
-                    qd_targets = moved_copies[rotated, None, None] * len(joint_qd_source) + qd_index[None]
-                    twist = joint_qd[qd_targets].reshape((*qd_targets.shape[:2], 2, 3))
-                    rotate_vectors(xform_local[rotated, :, None, 3:], twist)
-                    joint_qd[qd_targets] = twist.reshape(qd_targets.shape)
-
-        if "joint_q" in array_starts:
-            self.joint_q[array_starts["joint_q"] :] = joint_q
-        else:
-            self.joint_q.extend(joint_q.tolist())
-        if "joint_qd" in array_starts:
-            self.joint_qd[array_starts["joint_qd"] :] = joint_qd
-        elif len(joint_qd):
-            self.joint_qd.extend(joint_qd.tolist())
-
         if counts["joint"]:
             # Derived again from the merged joints when next read.
             self._joint_adjacency = None
-
-        attribute_specs.pop("body_q")
-        if counts["body"]:
-            body_q_source = pack_transforms(builder.body_q)
-            body_q = np.tile(body_q_source, (copy_count, 1))
-            if translations_only:
-                if np.any(offsets):
-                    body_q[:, :3] += np.repeat(offsets, counts["body"], axis=0)
-            elif len(moved_copies):
-                body_q.reshape((copy_count, -1, 7))[moved_copies] = transform_multiply_rows(
-                    moved_xforms[:, None], body_q_source[None]
-                )
-            if "body_q" in array_starts:
-                self.body_q[array_starts["body_q"] :] = body_q
-            else:
-                # Own each transform without retaining per-row views into the tiled array.
-                self.body_q.extend(wp.transform.from_buffer_copy(row) for row in body_q)
-
-        # body_qd is a world-frame twist (linear, angular). Rotate both parts by the
-        # copy rotation. An identity rotation, including translation-only copies, is
-        # left bit-exact.
-        attribute_specs.pop("body_qd")
-        if counts["body"]:
-            body_qd = np.tile(pack_warp_values(builder.body_qd, wp.spatial_vectorf), (copy_count, 1))
-            if np.any(rotated):
-                # Shaped (copy, body, linear/angular, 3); fancy indexing copies, so write back.
-                twists = body_qd.reshape((copy_count, -1, 2, 3))
-                rotated_twists = twists[moved_copies[rotated]]
-                rotate_vectors(moved_xforms[rotated, None, None, 3:], rotated_twists)
-                twists[moved_copies[rotated]] = rotated_twists
-            if "body_qd" in array_starts:
-                self.body_qd[array_starts["body_qd"] :] = body_qd
-            else:
-                self.body_qd.extend(wp.spatial_vector.from_buffer_copy(row) for row in body_qd)
 
         source_filter_pairs = builder._shape_collision_filter_pairs
         if source_filter_pairs:
@@ -4822,6 +4675,58 @@ class ModelBuilder:
         self._merge_builder_actuators(builder, joint_dof_starts, joint_coord_starts, entity_starts["actuator"])
         self._merge_builder_batteries(builder, entity_starts["actuator"], worlds)
         self.actuator_count += copy_count * counts["actuator"]
+
+    def _place_builder_copies(
+        self,
+        builder: ModelBuilder,
+        attribute_specs: dict[str, Model.AttributeSpec],
+        array_starts: dict[str, int],
+        xform_rows: np.ndarray,
+    ) -> None:
+        """Copy ``builder``'s placed attributes once per copy and move each copy's world-frame rows by its transform.
+
+        Handles every attribute with a :attr:`Model.AttributeSpec.placement` and removes it from ``attribute_specs``.
+        """
+        copy_count = len(xform_rows)
+        placed_specs = {name: spec for name, spec in attribute_specs.items() if spec.placement is not None}
+        for name in placed_specs:
+            del attribute_specs[name]
+        frames = {spec.placement.frame for spec in placed_specs.values()}
+        source: dict[str, np.ndarray] = {}
+        for name, spec in placed_specs.items():
+            for input_name in spec.placement.inputs:
+                if input_name not in source:
+                    values = getattr(builder, input_name)
+                    source[input_name] = (
+                        pack_transforms(values) if input_name in frames else np.asarray(values, dtype=np.int64)
+                    )
+            source[name] = _placement_source_rows(getattr(builder, name), spec.placement)
+        placed = place_copies(placed_specs, source, xform_rows)
+        for name, spec in placed_specs.items():
+            if len(source[name]) == 0:
+                continue
+            targets, rows = placed.get(name, (None, None))
+            if name in array_starts:
+                if targets is not None:
+                    getattr(self, name)[array_starts[name] :][targets] = rows
+                continue
+            destination = getattr(self, name)
+            kind = spec.placement.kind if spec.placement.owner_start is None else None
+            if kind in ("point", "direction"):
+                # Vectors keep the source's rows; placed rows become tuples.
+                start = len(destination)
+                destination.extend(list(getattr(builder, name)) * copy_count)
+                if targets is not None:
+                    for target, row in zip(
+                        (targets.reshape(-1) + start).tolist(), rows.reshape(-1, 3).tolist(), strict=True
+                    ):
+                        destination[target] = tuple(row)
+                continue
+            # Transforms, twists and rest frames are mutable values: every copy receives fresh rows.
+            values = np.tile(source[name], (copy_count,) + (1,) * (source[name].ndim - 1))
+            if targets is not None:
+                values[targets] = rows
+            destination.extend(_PLACEMENT_LIST_STORE[kind](values))
 
     def _model_value_key(self, attribute: CustomAttribute) -> int:
         """Return the value key of a ``ONCE`` or ``WORLD`` attribute in the current world context.
@@ -17694,6 +17599,34 @@ class ModelBuilder:
 
 _ArrayBackedListDescriptor = tuple[Literal["ctypes", "tuple", "list", "ndarray", "scalar"], Any]
 _ArrayBackedAttribute = tuple[np.ndarray, _ArrayBackedListDescriptor]
+
+
+_PLACEMENT_WARP_TYPES: dict[str, Any] = {
+    "pose": wp.transformf,
+    "point": wp.vec3f,
+    "direction": wp.vec3f,
+    "twist": wp.spatial_vectorf,
+    "rest_frame": wp.mat33f,
+}
+"""Float32 Warp type of one row of each placement kind."""
+
+
+def _placement_source_rows(values: Sequence[Any] | np.ndarray, placement: Model.AttributePlacement) -> np.ndarray:
+    """Return a builder attribute's rows as the float32 array :func:`place_copies` reads."""
+    if placement.owner_start is not None:
+        return np.asarray(values, dtype=np.float32)
+    if placement.kind == "pose":
+        return pack_transforms(values)
+    return pack_warp_values(values, _PLACEMENT_WARP_TYPES[placement.kind])
+
+
+_PLACEMENT_LIST_STORE: dict[str | None, Callable[[np.ndarray], list]] = {
+    "pose": lambda rows: [wp.transform.from_buffer_copy(row) for row in rows],
+    "twist": lambda rows: [wp.spatial_vector.from_buffer_copy(row) for row in rows],
+    "rest_frame": np.ndarray.tolist,
+    None: np.ndarray.tolist,
+}
+"""Fresh builder list elements of placed transforms, twists, rest frames and owners' values (``None``)."""
 
 
 _ARRAY_BACKED_ATTRIBUTE_DTYPES: dict[str, Any] = {

@@ -425,6 +425,35 @@ class Model:
         """Attribute frequency follows the number of actuators (see :attr:`~newton.Model.actuator_count`)."""
 
     @dataclass(frozen=True)
+    class AttributePlacement:
+        """How a world transform moves an attribute's values, for copies of worlds placed by their transforms.
+
+        Rows in the world frame move with the transform; rows relative to an entity (a shape on a body, a joint
+        with a parent body) keep their values and move with that entity.
+        """
+
+        kind: Literal["pose", "point", "direction", "twist", "rest_frame"]
+        """What one row holds: a transform ``(px, py, pz, qx, qy, qz, qw)``, a position, a direction, a twist
+        (linear, angular) or the rows of an inverse rest frame (a matrix whose rows rotate)."""
+        anchor: str | None = None
+        """Attribute whose ``-1`` values mark the rows in the world frame (the owners' attribute when
+        :attr:`owner_start` is set); ``None`` places every row."""
+        owner_start: str | None = None
+        """Start attribute of the owning rows: each placed owner holds one row of this attribute from its start on,
+        expressed in the owner's :attr:`frame`."""
+        frame: str | None = None
+        """Owners' transform attribute that the owned values are expressed in."""
+        free_joint: bool | None = None
+        """Place only rows of free joints (``True``), only rows of other joints (``False``), or regardless of
+        ``joint_type`` (``None``)."""
+
+        @property
+        def inputs(self) -> tuple[str, ...]:
+            """Other attributes the placement reads."""
+            names = (self.anchor, self.owner_start, self.frame, None if self.free_joint is None else "joint_type")
+            return tuple(name for name in names if name is not None)
+
+    @dataclass(frozen=True)
     class AttributeSpec:
         """Semantic metadata for an indexed model attribute.
 
@@ -462,6 +491,8 @@ class Model:
         limiting. Non-generic policies may still be overridden by the coupled
         solver when constructing a compact view.
         """
+        placement: Model.AttributePlacement | None = None
+        """How a world transform moves the values, or ``None`` when they do not depend on a world's placement."""
         default: Any = field(default=None, compare=False)
         """Experimental value of one row for entities without authored data, or ``None`` for the dtype's zero.
 
@@ -511,8 +542,12 @@ class Model:
         "tendon_guide_orientation": AttributeSpec(AttributeFrequency.TENDON_GUIDE),
         "tendon_guide_mu": AttributeSpec(AttributeFrequency.TENDON_GUIDE),
         "tendon_guide_flags": AttributeSpec(AttributeFrequency.TENDON_GUIDE),
-        "tendon_guide_offset": AttributeSpec(AttributeFrequency.TENDON_GUIDE),
-        "tendon_guide_axis": AttributeSpec(AttributeFrequency.TENDON_GUIDE),
+        "tendon_guide_offset": AttributeSpec(
+            AttributeFrequency.TENDON_GUIDE, placement=AttributePlacement("point", anchor="tendon_guide_body")
+        ),
+        "tendon_guide_axis": AttributeSpec(
+            AttributeFrequency.TENDON_GUIDE, placement=AttributePlacement("direction", anchor="tendon_guide_body")
+        ),
         "tendon_segment_compliance": AttributeSpec(AttributeFrequency.TENDON_SEGMENT),
         "tendon_segment_damping": AttributeSpec(AttributeFrequency.TENDON_SEGMENT),
         "tendon_segment_rest_length": AttributeSpec(AttributeFrequency.TENDON_SEGMENT),
@@ -521,8 +556,8 @@ class Model:
         "tendon_guide_active": AttributeSpec(AttributeFrequency.TENDON_GUIDE),
         "_tendon_initialized": AttributeSpec(AttributeFrequency.TENDON),
         # particles
-        "particle_q": AttributeSpec(AttributeFrequency.PARTICLE),
-        "particle_qd": AttributeSpec(AttributeFrequency.PARTICLE),
+        "particle_q": AttributeSpec(AttributeFrequency.PARTICLE, placement=AttributePlacement("point")),
+        "particle_qd": AttributeSpec(AttributeFrequency.PARTICLE, placement=AttributePlacement("direction")),
         "particle_f": AttributeSpec(AttributeFrequency.PARTICLE),
         "particle_mass": AttributeSpec(AttributeFrequency.PARTICLE),
         "particle_inv_mass": AttributeSpec(AttributeFrequency.PARTICLE),
@@ -539,8 +574,8 @@ class Model:
             compaction_policy="color_groups",
         ),
         # bodies
-        "body_q": AttributeSpec(AttributeFrequency.BODY),
-        "body_qd": AttributeSpec(AttributeFrequency.BODY),
+        "body_q": AttributeSpec(AttributeFrequency.BODY, placement=AttributePlacement("pose")),
+        "body_qd": AttributeSpec(AttributeFrequency.BODY, placement=AttributePlacement("twist")),
         "body_com": AttributeSpec(AttributeFrequency.BODY),
         "body_inertia": AttributeSpec(AttributeFrequency.BODY),
         "body_inv_inertia": AttributeSpec(AttributeFrequency.BODY),
@@ -584,7 +619,9 @@ class Model:
         "_shape_variant_shape": AttributeSpec(AttributeFrequency.SHAPE),
         # shapes
         "shape_label": AttributeSpec(AttributeFrequency.SHAPE),
-        "shape_transform": AttributeSpec(AttributeFrequency.SHAPE),
+        "shape_transform": AttributeSpec(
+            AttributeFrequency.SHAPE, placement=AttributePlacement("pose", anchor="shape_body")
+        ),
         "shape_body": AttributeSpec(
             AttributeFrequency.SHAPE,
             references=AttributeFrequency.BODY,
@@ -703,7 +740,7 @@ class Model:
             AttributeFrequency.TETRAHEDRON,
             references=AttributeFrequency.PARTICLE,
         ),
-        "tet_poses": AttributeSpec(AttributeFrequency.TETRAHEDRON),
+        "tet_poses": AttributeSpec(AttributeFrequency.TETRAHEDRON, placement=AttributePlacement("rest_frame")),
         "tet_activations": AttributeSpec(AttributeFrequency.TETRAHEDRON),
         "tet_materials": AttributeSpec(AttributeFrequency.TETRAHEDRON),
         # joints
@@ -723,7 +760,9 @@ class Model:
             references=AttributeFrequency.JOINT,
         ),
         "joint_mimic_coeffs": AttributeSpec(AttributeFrequency.JOINT),
-        "joint_X_p": AttributeSpec(AttributeFrequency.JOINT),
+        "joint_X_p": AttributeSpec(
+            AttributeFrequency.JOINT, placement=AttributePlacement("pose", anchor="joint_parent", free_joint=False)
+        ),
         "joint_X_c": AttributeSpec(AttributeFrequency.JOINT),
         "joint_dof_dim": AttributeSpec(AttributeFrequency.JOINT),
         "joint_enabled": AttributeSpec(AttributeFrequency.JOINT),
@@ -757,8 +796,18 @@ class Model:
             AttributeFrequency.JOINT_CONSTRAINT,
             compaction_policy="world_start",
         ),
-        "joint_q": AttributeSpec(AttributeFrequency.JOINT_COORD),
-        "joint_qd": AttributeSpec(AttributeFrequency.JOINT_DOF),
+        "joint_q": AttributeSpec(
+            AttributeFrequency.JOINT_COORD,
+            placement=AttributePlacement(
+                "pose", anchor="joint_parent", owner_start="joint_q_start", frame="joint_X_p", free_joint=True
+            ),
+        ),
+        "joint_qd": AttributeSpec(
+            AttributeFrequency.JOINT_DOF,
+            placement=AttributePlacement(
+                "twist", anchor="joint_parent", owner_start="joint_qd_start", frame="joint_X_p", free_joint=True
+            ),
+        ),
         "joint_f": AttributeSpec(AttributeFrequency.JOINT_DOF),
         "joint_armature": AttributeSpec(AttributeFrequency.JOINT_DOF),
         "joint_target_q": AttributeSpec(AttributeFrequency.JOINT_COORD),

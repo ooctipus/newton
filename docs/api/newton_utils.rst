@@ -34,13 +34,12 @@ newton.utils
    event_scope
    load_texture
    normalize_texture
+   place_copies
    plot_graph
    rasterize_mesh_to_heightfield
    remesh_mesh
    run_benchmark
    solidify_mesh
    string_to_warp
-   transform_inverse_rows
-   transform_multiply_rows
    validate_tet_mesh
    validate_triangle_mesh

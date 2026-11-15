@@ -440,6 +440,31 @@ class TestModelBuilderReplicate(unittest.TestCase):
 
         self.assertEqual(destination.calls, ["begin_world", "add_builder", "end_world"])
 
+    def test_rotating_copies_rotate_particles_and_rest_frames(self):
+        """A rotating copy places particles, their velocities and tetrahedron rest frames as if built rotated."""
+        corners = np.asarray(((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)), dtype=np.float32)
+        velocity = np.asarray((0.0, 1.0, 0.0), dtype=np.float32)
+        rotation = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), 0.5 * np.pi)
+        xform = wp.transform((1.0, 2.0, 3.0), rotation)
+
+        def tetrahedron(points: np.ndarray, qd: np.ndarray) -> ModelBuilder:
+            builder = ModelBuilder()
+            particles = [builder.add_particle(wp.vec3(*p), wp.vec3(*qd), 1.0) for p in points.tolist()]
+            builder.add_tetrahedron(*particles)
+            return builder
+
+        replicated = ModelBuilder()
+        replicated.replicate(tetrahedron(corners, velocity), 2, xforms=[wp.transform_identity(), xform])
+        model = replicated.finalize(device="cpu")
+
+        rotate = np.asarray(wp.quat_to_matrix(rotation), dtype=np.float32).reshape(3, 3)
+        built = tetrahedron(corners @ rotate.T + np.asarray((1.0, 2.0, 3.0), dtype=np.float32), rotate @ velocity)
+        expected = built.finalize(device="cpu")
+        np.testing.assert_allclose(model.particle_q.numpy()[:4], corners)
+        np.testing.assert_allclose(model.particle_q.numpy()[4:], expected.particle_q.numpy(), atol=1e-6)
+        np.testing.assert_allclose(model.particle_qd.numpy()[4:], expected.particle_qd.numpy(), atol=1e-6)
+        np.testing.assert_allclose(model.tet_poses.numpy()[1], expected.tet_poses.numpy()[0], atol=1e-6)
+
     def test_identity_transforms_do_not_alias_source(self):
         source = ModelBuilder()
         source.add_body(xform=wp.transform((1.0, 2.0, 3.0), wp.quat_identity()))
