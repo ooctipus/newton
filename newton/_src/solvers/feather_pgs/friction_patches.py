@@ -184,7 +184,7 @@ class _PatchFrame:
     used: wp.array[int]
     source: wp.array[int]
     eligible: wp.array[int]
-    # Scratch indices: patch members in the current frame, valid anchors in the previous frame.
+    # Scratch indices: patch members in the current frame, the contacts that carry history in the previous frame.
     members: wp.array[int]
     # Scratch: a region's footprint points, in its members' positions.
     foot: wp.array[wp.vec2]
@@ -663,15 +663,16 @@ def _build_pair(
             hi = mid
     prev_start = lo
     prev_stop = lo
-    # Index valid history once per pair rather than rescanning all old contacts
-    # for every new friction location. Keep sorted order for matching ties.
-    prev_anchor_stop = prev_start
+    # Index the pair's history once rather than rescanning all its old contacts for every new friction location:
+    # the stored contacts that hold a valid anchor or a centre of pressure, a few of a pair's many. Keep sorted
+    # order for matching ties.
+    prev_history_stop = prev_start
     while prev_stop < previous_end and prev.keys[prev_stop] == key:
         p = prev.indices[prev_stop]
         prev.used[p] = 0
-        if prev.valid[p] != 0:
-            prev.members[prev_anchor_stop] = p
-            prev_anchor_stop += 1
+        if prev.valid[p] != 0 or prev.pressured[p] != 0:
+            prev.members[prev_history_stop] = p
+            prev_history_stop += 1
         prev_stop += 1
 
     member_stop = start
@@ -766,7 +767,7 @@ def _build_pair(
         motion = wp.vec3(0.0)
         if prev_start < prev_stop:
             motion = _pose_motion(q, previous_q, a, location) - _pose_motion(q, previous_q, b, location)
-        for j in range(prev_start, prev_anchor_stop):
+        for j in range(prev_start, prev_history_stop):
             p = prev.members[j]
             if (
                 prev.valid[p] == 0
@@ -835,8 +836,8 @@ def _build_pair(
         # this pair, sliding or stuck, since the anchor may have released.
         nearest_pressure = float(1.0e30)
         shift = wp.vec3(0.0)
-        for j in range(prev_start, prev_stop):
-            p = prev.indices[j]
+        for j in range(prev_start, prev_history_stop):
+            p = prev.members[j]
             if prev.pressured[p] != 0:
                 candidate = _world_point(q, a, prev.pressure[p]) - location
                 candidate -= n * wp.dot(candidate, n)
