@@ -108,7 +108,7 @@ from .graph_coloring import (
     ColoringAlgorithm,
     color_graph,
     color_rigid_bodies,
-    combine_independent_coloring_plan,
+    combine_world_colorings,
     construct_particle_graph,
 )
 from .joint_mimic import _SUPPORTED_JOINT_TYPES
@@ -4609,19 +4609,8 @@ class ModelBuilder:
             if spec.compaction_policy == "color_groups":
                 kind = self._builder_frequency_key(spec.frequency)
                 source_groups = [np.asarray(group, dtype=np.int64) for group in source]
-                # Combine (size, chunk) plans per world and materialize once: same
-                # composition as sequential add_world() merges in O(total) instead
-                # of O(worlds^2). Destination chunks carry no offset (None).
-                plan = [(len(group), [(group, None)]) for group in destination]
-                for start in starts(kind).tolist():
-                    plan = combine_independent_coloring_plan(
-                        plan, [(len(group), [(group, start)]) for group in source_groups]
-                    )
-                merged_groups = []
-                for _, chunks in plan:
-                    parts = [group if offset is None else group + offset for group, offset in chunks]
-                    merged_groups.append(parts[0] if len(parts) == 1 else np.concatenate(parts))
-                setattr(self, attr, merged_groups)
+                copies = ((source_groups, start) for start in starts(kind).tolist())
+                setattr(self, attr, combine_world_colorings(destination, copies))
             elif spec.label:
                 for label_prefix in label_prefixes:
                     if label_prefix:

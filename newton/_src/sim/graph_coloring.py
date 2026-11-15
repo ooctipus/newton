@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import warnings
+from collections.abc import Iterable
 from enum import Enum
 from typing import Literal
 
@@ -387,8 +388,7 @@ def combine_independent_coloring_plan(sized_groups_1: list, sized_groups_2: list
 
     Two colorings are independent when no element of one is adjacent to an element of the other, as the colorings of
     two separate worlds are. Any pairing of their groups is then a valid coloring of both; this one combines the
-    smaller groups of one with the larger groups of the other, which balances the group sizes. It is the pairing
-    :class:`~newton.ModelBuilder` applies when it merges the colorings of copied builders.
+    smaller groups of one with the larger groups of the other, which balances the group sizes.
 
     Args:
         sized_groups_1: Groups of the first coloring as ``(size, chunks)`` tuples, where ``chunks`` is a list of
@@ -418,6 +418,32 @@ def combine_independent_coloring_plan(sized_groups_1: list, sized_groups_2: list
             combined.append((size_1 + size_2, chunks_1 + chunks_2))
         else:
             combined.append((size_1, chunks_1))
+    return combined
+
+
+def combine_world_colorings(groups: list, copies: Iterable[tuple[list, int]]) -> list:
+    """Add the colorings of copied worlds to a coloring, as :meth:`~newton.ModelBuilder.replicate` merges them.
+
+    No element of a copy is adjacent to an element of another copy or of ``groups``, as the elements of separate
+    worlds are. The copies are added in order, each pairing the smaller groups of the coloring combined so far with
+    its larger groups (or the reverse), which balances the group sizes; the groups are materialized once at the end, so
+    adding many copies takes time linear in their elements.
+
+    Args:
+        groups: Color groups of the coloring to add to, one integer array of element indices per color.
+        copies: The coloring of each copy and the offset of its elements: ``(groups, offset)``, where ``groups`` are
+            the copy's color groups as integer arrays of indices relative to the copy, which move by ``offset``.
+
+    Returns:
+        The combined color groups. A group of ``groups`` that no copy's group joins is returned as is.
+    """
+    plan = [(len(group), [(group, None)]) for group in groups]
+    for copy_groups, offset in copies:
+        plan = combine_independent_coloring_plan(plan, [(len(group), [(group, offset)]) for group in copy_groups])
+    combined = []
+    for _, chunks in plan:
+        parts = [group if offset is None else group + offset for group, offset in chunks]
+        combined.append(parts[0] if len(parts) == 1 else np.concatenate(parts))
     return combined
 
 

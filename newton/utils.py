@@ -4,12 +4,12 @@
 # ==================================================================================
 # sim utils
 # ==================================================================================
-from ._src.sim.graph_coloring import color_graph, combine_independent_coloring_plan, plot_graph
+from ._src.sim.graph_coloring import color_graph, combine_world_colorings, plot_graph
 from ._src.sim.placement import place_copies
 
 __all__ = [
     "color_graph",
-    "combine_independent_coloring_plan",
+    "combine_world_colorings",
     "place_copies",
     "plot_graph",
 ]

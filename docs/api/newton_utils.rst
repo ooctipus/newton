@@ -28,7 +28,7 @@ newton.utils
    color_graph
    color_linear_to_srgb
    color_srgb_to_linear
-   combine_independent_coloring_plan
+   combine_world_colorings
    compute_world_offsets
    download_asset
    event_scope
