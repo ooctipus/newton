@@ -3387,6 +3387,8 @@ class NarrowPhase:
             writer_func = contact_writer_warp_func
         # Retain the resolved writer for optional typed support successors.
         self._convex_writer_func = writer_func
+        # The data the writer takes (its second argument): the type a launch gives the kernels generic in it.
+        self._writer_data_type = list(writer_func.input_types.values())[1]
 
         # CPU kernels currently observe ``wp.block_dim() == 1`` regardless
         # of the plain ``wp.launch(..., block_dim=N)`` parameter (Warp
@@ -5383,29 +5385,31 @@ class NarrowPhase:
     def launch_variants(self):
         """The primitive kernel, the GJK/MPR stage and the mesh triangle queries :meth:`launch` makes, each with its
         threads per block (:func:`~newton._src.core.execution.compile_ahead`): the largest modules of a convex or mesh
-        scene. A measured convex method choice, the heightfield primitive, pair-CSR and finite routes keep compiling at
-        their first launch."""
-        yield self.primitive_kernel, self.block_dim
+        scene, a kernel generic in the writer's data as the overload its launch takes (:meth:`_launched`). A measured
+        convex method choice, the heightfield primitive, pair-CSR and finite routes keep compiling at their first
+        launch."""
+        launched = self._launched
+        yield launched(self.primitive_kernel), self.block_dim
         if self.has_generic_convex_pairs:
             if not self.split_gjk_mpr:
-                yield self.narrow_phase_kernel, self.block_dim
+                yield launched(self.narrow_phase_kernel), self.block_dim
             else:
                 if self._convex_method_choice is None and self._coherent_cache is not None:
                     yield from ((kernel, self.block_dim) for kernel in self._coherent_query_kernels)
                 elif self._convex_method_choice is None:
                     yield self.narrow_phase_mpr_kernel, self.split_convex_block_dim
                     yield self.narrow_phase_gjk_kernel, self.split_convex_block_dim
-                yield self.narrow_phase_manifold_kernel, self.split_convex_block_dim
+                yield launched(self.narrow_phase_manifold_kernel), self.split_convex_block_dim
         if not (self.has_meshes or self.has_heightfields):
             return
         block = self.mesh_triangle_block_dim
         if self._heightfield_pair_csr or self._heightfield_finite_query or self._heightfield_primitive_query:
             return
         if self._mesh_triangles_direct():
-            yield self._mesh_round_direct, block
-            yield self._mesh_face_direct, block
-            yield self._mesh_queued_direct, block
-            yield self._heightfield_triangle_kernel, block
+            yield launched(self._mesh_round_direct), block
+            yield launched(self._mesh_face_direct), block
+            yield launched(self._mesh_queued_direct), block
+            yield launched(self._heightfield_triangle_kernel), block
         elif self.reduce_contacts:
             yield self._mesh_round_kernel, block
             if self._mesh_face_kernel is not None:
@@ -5414,9 +5418,17 @@ class NarrowPhase:
             else:
                 yield self._mesh_generic_kernel, block
             export_block = self.block_dim if self._reducer_compact_export else EXPORT_REDUCED_CONTACTS_BLOCK_DIM
-            yield self.export_reduced_contacts_kernel, export_block
+            yield launched(self.export_reduced_contacts_kernel), export_block
         else:
-            yield self.mesh_triangle_contacts_kernel, block
+            yield launched(self.mesh_triangle_contacts_kernel), block
+
+    def _launched(self, kernel):
+        """``kernel`` as :meth:`launch` launches it: a kernel generic in the contact writer's data (its ``Any``
+        argument, ``writer_data`` or ``reducer_data``) as the overload its launch takes, on the writer's data type
+        (:attr:`_writer_data_type`)."""
+        if kernel is None or not kernel.is_generic:
+            return kernel
+        return wp.overload(kernel, {arg.label: self._writer_data_type for arg in kernel.adj.args if arg.type is Any})
 
     def _mesh_triangles_direct(self) -> bool:
         """Whether mesh triangle pairs publish their contacts directly, without the global reducer.

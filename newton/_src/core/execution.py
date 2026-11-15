@@ -504,14 +504,21 @@ def compile_ahead(variants: Iterable[tuple[wp.Kernel | None, int]], device=None)
     their modules compile in worker threads (NVRTC releases the interpreter), and the first launches find their code
     loaded. Variants already loaded or cached on disk only load. The CPU compiles at its first launch, as before.
 
+    A kernel generic in an argument (``Any``) has no code until a launch overloads it: its owner declares the overload
+    the launch takes (:func:`warp.overload`), and a generic kernel here is an error, never an empty module.
+
     Args:
         variants: Each launch's kernel (``None`` for a launch the owner does not make) and its threads per block.
         device: The device the kernels launch on.
     """
+    variants = [(kernel, block) for kernel, block in variants if kernel is not None]
+    generic = [kernel.key for kernel, _block in variants if kernel.is_generic]
+    if generic:
+        raise TypeError(f"compile_ahead takes the overloads a launch makes, not the generic kernels {generic}")
     device = wp.get_device(device)
     if not device.is_cuda:
         return
-    jobs = list(dict.fromkeys((kernel.module, int(block)) for kernel, block in variants if kernel is not None))
+    jobs = list(dict.fromkeys((kernel.module, int(block)) for kernel, block in variants))
     if not jobs:
         return
     with ThreadPoolExecutor(max_workers=min(len(jobs), os.cpu_count() or 1, 32)) as pool:
