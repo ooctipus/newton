@@ -2439,6 +2439,30 @@ class Model:
         """
         return self.joint_q_start
 
+    def take_shape_rows(self, rows: np.ndarray) -> None:
+        """Make the per-shape rows of the model's mesh structures those of the given shapes.
+
+        The mesh-vs-convex cells and the welded mesh topology index shapes in rows of their own; their tables of
+        distinct meshes stay shared. A model whose shape arrays were assembled from copies of shapes, for example from
+        finalized worlds, takes each shape's rows from the shape it copies. The topology reads
+        :attr:`shape_collision_radius`, which must already hold every shape.
+
+        Args:
+            rows: The shape each shape of the model copies, shape [shape_count], int.
+        """
+        rows = np.asarray(rows, dtype=np.int64)
+        # Without shapes the structures keep their one sentinel row.
+        if self._mesh_cells is not None and rows.size:
+            grid = self._mesh_cells.shape_grid
+            self._mesh_cells.shape_grid = wp.array(grid.numpy()[rows], dtype=grid.dtype, device=grid.device)
+        if self._mesh_topology is not None:
+            data = self._mesh_topology.data
+            if rows.size:
+                base = data.shape_base
+                data.shape_base = wp.array(base.numpy()[rows], dtype=base.dtype, device=base.device)
+            if self.shape_collision_radius is not None:
+                data.shape_radius = self.shape_collision_radius
+
     def build_shape_contact_pairs(self) -> None:
         """Derive the candidate shape contact pairs of each world from the model's shapes.
 
