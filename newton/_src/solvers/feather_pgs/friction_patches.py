@@ -889,7 +889,9 @@ def _build_pair(
         patches.spin_phi[c] = twist
 
 
-@wp.kernel(enable_backward=False, cuda_max_registers=_BUILD_REGISTERS)
+# A module of its own: the build launches at its block (_BUILD_BLOCK_DIM), the module's other kernels at the default,
+# and each compiles once at its own.
+@wp.kernel(enable_backward=False, cuda_max_registers=_BUILD_REGISTERS, module="unique")
 def _build(
     extent: wp.array[int],
     stored: wp.array[int],
@@ -1331,9 +1333,6 @@ class _FrictionPatchState:
 
     def _launch_build(self, model, state, generation, stream):
         """Build the pairs of the prepared, sorted slots and record their frame: ``generation``'s, of ``stream``."""
-        # Warp compiles this module once more for _build's block size; the
-        # variants differ only in the tile block size, which no _build
-        # arithmetic reads.
         self.pool.launch(
             _build,
             self.build_threads,
