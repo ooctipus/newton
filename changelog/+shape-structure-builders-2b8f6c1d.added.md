@@ -1,0 +1,1 @@
+Add `Model.build_shape_contact_pairs()`, `Model.build_body_shapes()` and `Model.set_shape_collision_filter_pairs()`, so callers that assemble a model from copied worlds derive its contact pairs and body shape lists and install its collision-filter pairs through public methods; `ModelBuilder.finalize` derives the contact pairs with the first.

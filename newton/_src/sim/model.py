@@ -2439,6 +2439,58 @@ class Model:
         """
         return self.joint_q_start
 
+    def build_shape_contact_pairs(self) -> None:
+        """Derive the candidate shape contact pairs of each world from the model's shapes.
+
+        The pairs follow from :attr:`shape_body`, :attr:`shape_world`, :attr:`shape_collision_group`,
+        :attr:`shape_flags` and the collision-filter pairs; :attr:`shape_contact_pairs` builds them on first access.
+        :meth:`ModelBuilder.finalize() <newton.ModelBuilder.finalize>` calls it; call it again after replacing any of
+        these.
+        """
+        data = _ShapeContactPairs(
+            self.shape_body.numpy() if self.shape_body is not None else np.empty(0, dtype=np.int32),
+            self.shape_world.numpy() if self.shape_world is not None else np.empty(0, dtype=np.int32),
+            self.shape_collision_group.numpy() if self.shape_collision_group is not None else np.empty(0, np.int32),
+            self.shape_flags.numpy() if self.shape_flags is not None else np.empty(0, dtype=np.int32),
+            self._shape_collision_filter_pairs._packed,
+            self.world_count,
+        )
+        counts = data.counts
+        counts.setflags(write=False)
+        self._shape_contact_pairs = None
+        self._shape_contact_pair_templates = None
+        self._shape_contact_pair_data = data
+        self._shape_contact_pair_counts.clear()
+        self._shape_contact_pair_counts[None] = counts
+        self._shape_contact_pair_count = int(counts.sum())
+
+    def build_body_shapes(self) -> None:
+        """Derive :attr:`body_shapes` from :attr:`shape_body`: every body's shapes in index order, and the static shapes
+        under body ``-1``."""
+        shape_body = self.shape_body.numpy() if self.shape_body is not None else np.empty(0, dtype=np.int32)
+        order = np.argsort(shape_body, kind="stable")
+        keys = np.arange(-1, self.body_count)
+        bounds = np.searchsorted(shape_body[order], np.r_[keys, self.body_count]).tolist()
+        members = order.tolist()
+        shapes = map(members.__getitem__, map(slice, bounds[:-1], bounds[1:]))
+        self.body_shapes = dict(zip(keys.tolist(), shapes, strict=True))
+
+    def set_shape_collision_filter_pairs(self, pairs: np.ndarray) -> None:
+        """Replace the explicit shape pairs that should not collide.
+
+        Args:
+            pairs: Canonical shape index pairs (first below second), unique and sorted lexicographically, shape
+                [pair_count, 2], as :meth:`shape_collision_filter_pairs_array` returns them.
+
+        Raises:
+            ValueError: If the pairs are not canonical, unique and sorted.
+        """
+        pairs = np.asarray(pairs, dtype=np.int64).reshape(-1, 2)
+        codes = _pack_shape_pair_codes(pairs[:, 0], pairs[:, 1])
+        if np.any(pairs[:, 0] >= pairs[:, 1]) or np.any(codes[1:] <= codes[:-1]):
+            raise ValueError("Collision-filter pairs must be canonical, unique and sorted.")
+        self._set_shape_collision_filter_packed(codes)
+
     def build_soft_mesh_adjacency(self) -> None:
         """Build :attr:`soft_mesh_adjacency` and :attr:`soft_mesh_adjacency_device` from the model's elements.
 

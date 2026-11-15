@@ -115,7 +115,6 @@ from .joint_mimic import _SUPPORTED_JOINT_TYPES
 from .model import Model, _pack_shape_pair_codes
 from .placement import place_copies
 from .rod import Rod
-from .shape_contact_pairs import _ShapeContactPairs
 from .tendon import TendonGuide, TendonGuideFlags, TendonGuideType
 
 if TYPE_CHECKING:
@@ -17235,18 +17234,7 @@ class ModelBuilder:
             m.actuator_count = self.actuator_count
             m.build_soft_mesh_adjacency()
 
-            m._shape_contact_pair_data = _ShapeContactPairs(
-                self.shape_body[:shape_count],
-                self.shape_world[:shape_count],
-                self.shape_collision_group[:shape_count],
-                self.shape_flags[:shape_count],
-                shape_collision_filter_packed,
-                self.world_count,
-            )
-            pair_counts = m._shape_contact_pair_data.counts
-            pair_counts.setflags(write=False)
-            m._shape_contact_pair_counts[None] = pair_counts
-            m._shape_contact_pair_count = int(pair_counts.sum())
+            m.build_shape_contact_pairs()
 
             # enable ground plane
             m.up_axis = self.up_axis
