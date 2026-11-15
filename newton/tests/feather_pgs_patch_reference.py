@@ -32,6 +32,7 @@ from newton._src.solvers.feather_pgs.friction_patches import (
     _finish_contact,
     _local_surface,
     _PatchFrame,
+    _starts_pair,
     patch_routes,
 )
 
@@ -203,7 +204,7 @@ def _build(
     its previous pairs searched over the whole history."""
     start = wp.tid()
     end = wp.min(count[0], frame.center.shape[0])
-    if start >= end:
+    if start >= end or not _starts_pair(frame.keys, start):
         return
     _build_pair(start, end, prev.center.shape[0], q, previous_q, shape_transform, shape_radius, frame, prev, patches)
 

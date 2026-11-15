@@ -426,6 +426,12 @@ def _prepare(
 
 
 @wp.func
+def _starts_pair(keys: wp.array[wp.int64], position: int):
+    """Whether a body pair's sorted run starts at live ``position``: its key differs from the one before."""
+    return position == 0 or keys[position - 1] != keys[position]
+
+
+@wp.func
 def _compatible(frame: _PatchFrame, center: wp.vec3, normal: wp.vec3, mu: wp.vec2, r: float, c: int):
     """Whether contact ``c`` may join the region of a seed with ``center``, ``normal``, friction ``mu`` and radius
     ``r``: the seed's fields are its caller's, read once per seed, not once per contact tested."""
@@ -641,12 +647,8 @@ def _build_pair(
     prev: _PatchFrame,
     patches: FrictionPatches,
 ):
-    """Build the body pair whose sorted run starts at ``start``; other positions return."""
-    if start > 0 and frame.keys[start - 1] == frame.keys[start]:
-        return
+    """Build the body pair whose sorted run starts at live position ``start`` (:func:`_starts_pair`)."""
     key = frame.keys[start]
-    if key == wp.int64(0x7FFFFFFFFFFFFFFF):
-        return
     stop = start + 1
     while stop < end and frame.keys[stop] == key:
         stop += 1
@@ -938,7 +940,14 @@ def _build(
     built: wp.array[int],
     sorted_frame: wp.array[wp.int64],
 ):
-    """Stride over the live sorted positions; body pairs write disjoint current/previous records.
+    """Stride over the live sorted positions and build the body pair whose run starts at each; body pairs write
+    disjoint current/previous records.
+
+    A thread seeks its next pair before it builds it, so the threads of a warp, which run a statement together,
+    seek together and then build together: a thread that built whatever its own position held would build while
+    the others of its warp, on positions inside a run, waited for it, about one lane of a warp at a time on runs of
+    tens of contacts. Where the frame has no more positions than the launch has threads, each thread has one
+    position and seeks no further.
 
     Thread 0 records the live count, so the next _prepare clears these slots even
     when no store follows this build, and the frame whose pairs the slots now hold
@@ -952,8 +961,16 @@ def _build(
         sorted_frame[1] = wp.int64(live)
         sorted_frame[2] = stream
     previous_end = stored[0]
-    for start in range(thread, live, threads):
-        _build_pair(start, live, previous_end, q, previous_q, shape_transform, shape_radius, frame, prev, patches)
+    position = thread
+    while True:
+        while position < live:
+            if _starts_pair(frame.keys, position):
+                break
+            position += threads
+        if position >= live:
+            break
+        _build_pair(position, live, previous_end, q, previous_q, shape_transform, shape_radius, frame, prev, patches)
+        position += threads
 
 
 @wp.func
