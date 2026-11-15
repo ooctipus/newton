@@ -144,8 +144,9 @@ def enclosing_half_extents(geom: Any) -> wp.vec3:
     """Half-extents [m] of the shape's local box about ``geom.center``, or zero when it has none.
 
     Primitives derive theirs from ``geom.scale`` (a sphere or capsule as the core the narrow phase
-    hands GJK/MPR); a convex hull carries its AABB in ``geom.bounds_half``. Planes, triangles and
-    shapes without a stored box return zero.
+    hands GJK/MPR); a convex hull carries its AABB in ``geom.bounds_half``. A mesh triangle's box
+    holds its three corners about its first (``geom.center``): flat along an axis the triangle is
+    normal to. Planes, heightfield prisms and shapes without a stored box return zero.
     """
     scale = geom.scale
     half = wp.vec3(0.0)
@@ -162,6 +163,8 @@ def enclosing_half_extents(geom: Any) -> wp.vec3:
         half = wp.vec3(radius, radius, scale[1])
     elif geom.shape_type == GeoType.CONVEX_MESH:
         half = geom.bounds_half
+    elif geom.shape_type == int(GeoTypeEx.TRIANGLE):
+        half = wp.max(wp.abs(scale), wp.abs(geom.auxiliary))
     return half
 
 

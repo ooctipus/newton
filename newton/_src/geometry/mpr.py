@@ -36,6 +36,7 @@ from typing import Any
 import warp as wp
 
 from .support_function import (
+    GeoTypeEx,
     create_shape_center_function,
     create_shape_support_function,
     enclosing_half_extents,
@@ -500,7 +501,8 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
         if collision:
             half_a = enclosing_half_extents(geom_a)
             half_b = enclosing_half_extents(geom_b)
-            if wp.min(half_a) > 0.0 and wp.min(half_b) > 0.0:
+            # A shape without a box has none of its half-extents; a mesh triangle's box is flat along one.
+            if wp.max(half_a) > 0.0 and wp.max(half_b) > 0.0:
                 offset = position_b + wp.quat_rotate(orientation_b, geom_b.center) - geom_a.center
                 bound_normal, bound_depth = enclosing_box_depth(half_a, half_b, orientation_b, offset)
                 if penetration > bound_depth + extend + COLLIDE_EPSILON:
@@ -511,8 +513,13 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
                     if depth < penetration:
                         normal = bound_normal
                         penetration = depth
-                        # The smaller shape's deepest point, and its partner on the other's support plane.
-                        if wp.length_sq(half_b) <= wp.length_sq(half_a):
+                        # The smaller shape's deepest point, and its partner on the other's support plane. A
+                        # mesh triangle's own deepest corner is the witness whatever its box: a point of the
+                        # surface the contact is reported on (its partner's deepest point along a box axis can
+                        # lie far from the triangle, where the surface's refiner would measure the face).
+                        if geom_a.shape_type != int(GeoTypeEx.TRIANGLE) and wp.length_sq(half_b) <= wp.length_sq(
+                            half_a
+                        ):
                             point_b = support.B
                             point_a = point_b + depth * normal
                         else:

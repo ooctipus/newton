@@ -602,6 +602,43 @@ def test_capsule_core_through_a_face(test, device):
         )
 
 
+def test_part_sunk_into_a_large_box(test, device):
+    """A small mesh part sunk a few millimetres into the face of a large flat box is held by that face.
+
+    The pair's contact is its smallest separating translation: out of the face the part sank into, by the depth it
+    sank. MPR's portal lies where the ray from the box's centre through the part leaves the box, which for a part
+    away from the centre of a flat box is the box's side: a horizontal normal and the distance to that side. The
+    portal is held to the shapes' enclosing boxes, a mesh triangle's included.
+    """
+    hx, hy, hz = 0.1925, 0.1923, 0.015  # the NIST board
+    bar = _box(0.006, 0.025, 0.004)
+    k = 24
+    angle = np.linspace(0.0, 2.0 * np.pi, k, endpoint=False)
+    ring = np.stack([0.008 * np.cos(angle), 0.008 * np.sin(angle)], 1)
+    v = np.array([[x, y, z] for y in (-0.025, 0.025) for x, z in ring] + [[0, -0.025, 0], [0, 0.025, 0]], np.float32)
+    f = []
+    for i in range(k):
+        j = (i + 1) % k
+        f += [[i, k + i, k + j], [i, k + j, j], [2 * k, i, j], [2 * k + 1, k + j, k + i]]
+    peg = _soup(v, np.array(f))  # a 16 mm round peg lying along y
+    for name, (vertices, faces), half in (("bar", bar, 0.004), ("peg", peg, 0.008)):
+        for sink in (0.002, 0.004, 0.007):
+            for x, y in ((0.0, 0.0), (0.12, 0.08), (-0.15, 0.03), (0.02, -0.12), (0.17, 0.0)):
+                # The part rests at the origin; the box lies under it with its centre at (-x, -y).
+                xform = wp.transform(wp.vec3(-x, -y, -half + sink - hz), wp.quat_identity())
+                for reduce in (False, True):
+                    count, normal, _p0, sep = _collide(
+                        device, vertices, faces, ("box", {"hx": hx, "hy": hy, "hz": hz}), xform, reduce=reduce
+                    )
+                    label = f"{name} sunk {sink} at ({x}, {y}), reduce {reduce}"
+                    test.assertGreaterEqual(count, 1, label)
+                    test.assertAlmostEqual(float(sep.min()), -sink, delta=1e-4, msg=label)
+                    # From the part down to the box: no contact along the box's side.
+                    test.assertTrue(
+                        np.all(normal[sep < 0.0][:, 2] < -0.7), f"{label}: a penetrating normal off the face"
+                    )
+
+
 def test_box_on_stair_nose(test, device):
     """A box resting across a stair nose: its patch on the tread, cut at the nose, with no ghost normal.
 
@@ -657,6 +694,7 @@ for _name, _fn in (
     ("test_capsule_over_vertex", test_capsule_over_vertex),
     ("test_capsule_core_around_a_thin_part", test_capsule_core_around_a_thin_part),
     ("test_capsule_core_through_a_face", test_capsule_core_through_a_face),
+    ("test_part_sunk_into_a_large_box", test_part_sunk_into_a_large_box),
     ("test_box_on_stair_nose", test_box_on_stair_nose),
     ("test_small_facet_keeps_its_corners", test_small_facet_keeps_its_corners),
     ("test_unreferenced_vertices", test_unreferenced_vertices),
