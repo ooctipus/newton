@@ -3661,7 +3661,8 @@ class NarrowPhase:
             mesh_only_idx = n if has_meshes else None
             n += 3 if has_meshes else 0  # mesh_plane, mesh_plane_vtx, mesh_mesh
             mesh_weight_idx = n if has_meshes and self.reduce_contacts else None
-            n += 2 if mesh_weight_idx is not None else 0  # mesh-plane vertices, mesh-mesh edges
+            # mesh-plane vertices, mesh-mesh edges, mesh-mesh passes by SDF source (texture, BVH fallback)
+            n += 4 if mesh_weight_idx is not None else 0
             row_gate_idx = n if self._heightfield_row_gate else None
             n += HEIGHTFIELD_ROW_COUNT if row_gate_idx is not None else 0  # typed terrain row lengths
             lane_idx = n if self._heightfield_lane_midphase else None
@@ -3689,6 +3690,9 @@ class NarrowPhase:
             )
             self.mesh_mesh_total_weight = (
                 c[mesh_weight_idx + 1 : mesh_weight_idx + 2] if mesh_weight_idx is not None else None
+            )
+            self.mesh_mesh_source_passes = (
+                c[mesh_weight_idx + 2 : mesh_weight_idx + 4] if mesh_weight_idx is not None else None
             )
             self.shape_pairs_mesh_mesh_count = c[mesh_only_idx + 2 : mesh_only_idx + 3] if has_meshes else None
             # One triangle-stream length per typed terrain row, in row order; zero skips the row's scan.
@@ -5079,10 +5083,13 @@ class NarrowPhase:
                         shape_edge_range=shape_edge_range,
                         shape_heightfield_index=shape_heightfield_index,
                         heightfield_data=heightfield_data,
+                        shape_sdf_index=shape_sdf_index,
+                        texture_sdf_table=texture_sdf_data,
                         target_blocks=self.num_mesh_mesh_blocks,
                         block_offsets=self.mesh_mesh_block_offsets,
                         block_counts=self.mesh_mesh_block_counts,
                         total_edge_count=self.mesh_mesh_total_weight,
+                        source_passes=self.mesh_mesh_source_passes,
                         total_num_threads=self.total_num_threads,
                         device=device,
                         record_tape=False,
@@ -5123,6 +5130,7 @@ class NarrowPhase:
                                 mesh_edge_cluster_reach,
                                 shape_edge_range,
                                 self.mesh_mesh_block_offsets,
+                                self.mesh_mesh_source_passes,
                                 reducer_data,
                                 self.num_mesh_mesh_blocks,
                             ],

@@ -1318,8 +1318,11 @@ def compute_mesh_mesh_edge_counts(
     shape_edge_range: wp.array[wp.vec2i],
     shape_heightfield_index: wp.array[wp.int32],
     heightfield_data: wp.array[HeightfieldData],
+    shape_sdf_index: wp.array[wp.int32],
+    texture_sdf_table: wp.array[TextureSDFData],
     edge_counts: wp.array[wp.int32],
     total_edge_count: wp.array[wp.int32],
+    source_passes: wp.array[wp.int32],
     total_num_threads: int,
 ):
     """Compute per-pair edge counts for mesh-mesh (or heightfield-mesh) pairs.
@@ -1327,8 +1330,16 @@ def compute_mesh_mesh_edge_counts(
     Sums the edge counts of both shapes in each pair — each shape may be
     a triangle mesh or a heightfield. Threads stride over the active pair
     prefix and accumulate its total edge count.
+
+    Also counts the pairs' passes by the source of their SDF
+    (``source_passes``, two counters zeroed before the launch): a texture or
+    a heightfield first, the mesh BVH fallback second, as the contact kernel
+    tells them apart. A contact kernel that takes one source's passes
+    (``sdf_source``) walks no pair where the launch routes none of them.
     """
     pair_count = wp.min(shape_pairs_mesh_mesh_count[0], shape_pairs_mesh_mesh.shape[0])
+    texture_passes = int(0)
+    mesh_passes = int(0)
     for i in range(wp.tid(), pair_count, total_num_threads):
         pair_encoded = shape_pairs_mesh_mesh[i]
         has_hfield = (pair_encoded[0] & SHAPE_PAIR_HFIELD_BIT) != 0
@@ -1342,8 +1353,23 @@ def compute_mesh_mesh_edge_counts(
                 pair_edges += get_edge_count(GeoType.HFIELD, wp.vec2i(-1, 0), hfd)
             else:
                 pair_edges += shape_edge_range[shape_idx][1]
+            # The pass's SDF is the other shape's: a heightfield's own evaluation, a texture, or the BVH fallback.
+            use_bvh_for_sdf = False
+            if not (has_hfield and mode == 1):
+                sdf_idx = shape_sdf_index[pair[1 - mode]]
+                use_bvh_for_sdf = sdf_idx < 0 or sdf_idx >= texture_sdf_table.shape[0]
+                if not use_bvh_for_sdf:
+                    use_bvh_for_sdf = texture_sdf_table[sdf_idx].coarse_texture.width == 0
+            if use_bvh_for_sdf:
+                mesh_passes += 1
+            else:
+                texture_passes += 1
         edge_counts[i] = wp.int32(pair_edges)
         wp.atomic_add(total_edge_count, 0, pair_edges)
+    if texture_passes > 0:
+        wp.atomic_add(source_passes, 0, texture_passes)
+    if mesh_passes > 0:
+        wp.atomic_add(source_passes, 1, mesh_passes)
 
 
 @wp.kernel(enable_backward=False)
@@ -1383,10 +1409,13 @@ def compute_mesh_mesh_block_offsets_scan(
     shape_edge_range: wp.array[wp.vec2i],
     shape_heightfield_index: wp.array[wp.int32],
     heightfield_data: wp.array[HeightfieldData],
+    shape_sdf_index: wp.array[wp.int32],
+    texture_sdf_table: wp.array[TextureSDFData],
     target_blocks: int,
     block_offsets: wp.array[wp.int32],
     block_counts: wp.array[wp.int32],
     total_edge_count: wp.array[wp.int32],
+    source_passes: wp.array[wp.int32],
     total_num_threads: int,
     device: str | None = None,
     record_tape: bool = True,
@@ -1394,8 +1423,8 @@ def compute_mesh_mesh_block_offsets_scan(
     """Compute mesh-mesh block offsets using parallel kernels and array_scan.
 
     Runs a three-stage parallel pipeline: per-pair edge counts and scalar
-    accumulation, adaptive block counts, then an exclusive scan into
-    ``block_offsets``.
+    accumulation (with the passes' counts by SDF source, ``source_passes``),
+    adaptive block counts, then an exclusive scan into ``block_offsets``.
     """
     n = block_counts.shape[0]
     launch_threads = min(n, total_num_threads)
@@ -1409,8 +1438,11 @@ def compute_mesh_mesh_block_offsets_scan(
             shape_edge_range,
             shape_heightfield_index,
             heightfield_data,
+            shape_sdf_index,
+            texture_sdf_table,
             block_counts,  # reuse as temp storage for edge counts
             total_edge_count,
+            source_passes,
             launch_threads,
         ],
         device=device,
@@ -2074,6 +2106,7 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
         mesh_edge_cluster_reach: wp.array[float],
         shape_edge_range: wp.array[wp.vec2i],
         block_offsets: wp.array[wp.int32],
+        source_passes: wp.array[wp.int32],
         reducer_data: GlobalContactReducerData,
         total_num_blocks: int,
     ):
@@ -2090,6 +2123,14 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
         block_id, t = wp.tid()
         pair_count = wp.min(shape_pairs_mesh_mesh_count[0], shape_pairs_mesh_mesh.shape[0])
         total_combos = block_offsets[pair_count]
+        # A kernel of one SDF source walks no pair where the launch routes none of its passes
+        # (compute_mesh_mesh_edge_counts): every pass would be the other kernel's.
+        if wp.static(sdf_source == "texture"):
+            if source_passes[0] == 0:
+                return
+        if wp.static(sdf_source == "mesh"):
+            if source_passes[1] == 0:
+                return
 
         edge_stack = wp.tile_stack(capacity=STACK_CAPACITY, dtype=EdgeCullResult)
         # ``progress[0]`` is the next edge index the upcoming cooperative

@@ -209,6 +209,61 @@ def test_mesh_mesh_sdf_surface_witnesses(test, device, box_sdf, *, probe_sdf=Fal
                     np.testing.assert_allclose(box_points[:, 2], 0.5, atol=sdf_tolerance)
 
 
+def test_mesh_mesh_passes_counted_by_sdf_source(test, device):
+    """Count a launch's mesh-mesh passes by SDF source; a kernel of the split without passes walks no pair."""
+    with wp.ScopedDevice(device):
+        textured = wp.get_device(device).is_cuda
+        box = newton.Mesh.create_box(0.5, 0.5, 0.5)
+        if textured:
+            box.build_sdf(max_resolution=32, device=device)
+        triangle = newton.Mesh(
+            np.array([[-0.2, -0.2, 0.0], [0.2, -0.2, 0.0], [0.0, 0.2, 0.0]], dtype=np.float32),
+            np.array([0, 2, 1], dtype=np.int32),
+            compute_inertia=False,
+        )
+        builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+        cfg = newton.ModelBuilder.ShapeConfig(density=0.0, margin=0.0, gap=0.0)
+        builder.add_shape_mesh(-1, mesh=box, cfg=cfg)
+        upper = builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        builder.add_shape_mesh(upper, mesh=box, cfg=cfg)
+        probe = builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        probe_shape = builder.add_shape_mesh(probe, mesh=triangle, cfg=cfg)
+        model = builder.finalize(device=device)
+        state = model.state()
+        pipeline = newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts=True)
+        narrow = pipeline.narrow_phase
+        # Textured boxes with the triangle's BVH fallback split the passes over two kernels.
+        test.assertEqual(len(narrow.mesh_mesh_contacts_kernels), 2 if textured else 1)
+        contacts = pipeline.contacts()
+
+        def collide(probe_height):
+            # The upper box rests 0.1 m inside the lower one; the triangle lies 0.05 m under its top or far above.
+            state.body_q.assign([wp.transform(wp.vec3(0.0, 0.0, 0.9)), wp.transform(wp.vec3(0.0, 0.0, probe_height))])
+            pipeline.collide(state, contacts)
+            count = int(contacts.rigid_contact_count.numpy()[0])
+            shapes = np.stack(
+                [contacts.rigid_contact_shape0.numpy()[:count], contacts.rigid_contact_shape1.numpy()[:count]]
+            )
+            on_probe = np.any(shapes == probe_shape, axis=0)
+            return narrow.mesh_mesh_source_passes.numpy().tolist(), int(np.sum(~on_probe)), int(np.sum(on_probe))
+
+        # Box on box routes two passes of the boxes' own source and none of the triangle's.
+        passes, box_contacts, probe_contacts = collide(10.0)
+        test.assertEqual(passes, [2, 0] if textured else [0, 2])
+        test.assertGreater(box_contacts, 0)
+        test.assertEqual(probe_contacts, 0)
+        # The triangle in the upper box adds its edges against the box and the box's edges against its BVH.
+        passes, with_probe, probe_contacts = collide(1.35)
+        test.assertEqual(passes, [3, 1] if textured else [0, 4])
+        test.assertEqual(with_probe, box_contacts)
+        test.assertGreater(probe_contacts, 0)
+        # The counts are the launch's own.
+        passes, without_probe, probe_contacts = collide(10.0)
+        test.assertEqual(passes, [2, 0] if textured else [0, 2])
+        test.assertEqual(without_probe, box_contacts)
+        test.assertEqual(probe_contacts, 0)
+
+
 @wp.kernel(enable_backward=False)
 def _cluster_certificate_kernel(
     sdf_table: wp.array[TextureSDFData],
@@ -438,6 +493,13 @@ add_function_test(
     TestSDFContact,
     "test_mesh_mesh_contained_bvh_contacts",
     test_mesh_mesh_contained_bvh_contacts,
+    devices=get_test_devices(),
+)
+
+add_function_test(
+    TestSDFContact,
+    "test_mesh_mesh_passes_counted_by_sdf_source",
+    test_mesh_mesh_passes_counted_by_sdf_source,
     devices=get_test_devices(),
 )
 
