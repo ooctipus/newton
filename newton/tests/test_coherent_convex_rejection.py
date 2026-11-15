@@ -183,6 +183,46 @@ def test_rejection_queries(test, device):
                 test.assertEqual(unresolved_count, n)
 
 
+def test_rejection_of_pairs_routed_second_shape_first(test, device):
+    """Find the slot of a pair the narrow phase routes second shape first, so its kept axis rejects it."""
+    n, threads = 131, 128
+    pairs, _pair_array, values, inputs = _box_inputs(n, device)
+    routed = wp.array(pairs[:, ::-1].copy(), dtype=wp.vec2i, device=device)
+    count = wp.array([n], dtype=int, device=device)
+    original_buffers, candidate_buffers = _buffers(n, device), _buffers(n, device)
+    _run_original(_original(), routed, count, values, device, threads, original_buffers)
+    original_ids, original_results = _accepted(original_buffers)
+    test.assertEqual(len(original_ids), 88)
+    cache = _ConvexQueryCache(
+        pairs=pairs,
+        shape_types=values[0].numpy(),
+        shape_world=np.zeros(2 * n, np.int32),
+        world_count=1,
+        query_capacity=n,
+        device=device,
+    )
+    kernels = _create_rejection_query_kernels(diagnostics=True)
+    for rejected in (0, 43):
+        for buffer in candidate_buffers:
+            buffer.zero_()
+        cache.begin()
+        for kernel in kernels:
+            wp.launch(
+                kernel,
+                dim=threads,
+                inputs=[routed, count, inputs, cache.data, threads, *candidate_buffers],
+                device=device,
+                block_dim=128,
+            )
+        ids, results = _accepted(candidate_buffers)
+        with test.subTest(rejected=rejected):
+            np.testing.assert_array_equal(np.sort(ids), np.sort(original_ids))
+            test.assertEqual(results[np.sort(ids)].tobytes(), original_results[np.sort(ids)].tobytes())
+            # The first pass has no axis to test; the second rejects the 43 pairs 0.2 m apart by the axis it kept.
+            test.assertEqual(int(cache.data.stats.numpy()[2]), rejected)
+            test.assertEqual(int(cache.data.unresolved_work_count.numpy()[0]), n - rejected)
+
+
 def test_current_motion_and_query_graph(test, device):
     """Recheck moved current shapes through eager and two actual graph replays."""
     n, threads = 131, 128
@@ -422,6 +462,7 @@ class TestCoherentConvexRejection(unittest.TestCase):
 
 for _test in (
     test_rejection_queries,
+    test_rejection_of_pairs_routed_second_shape_first,
     test_current_motion_and_query_graph,
     test_pipeline_rejection_selector,
     test_pipeline_rejection_capacity_status,

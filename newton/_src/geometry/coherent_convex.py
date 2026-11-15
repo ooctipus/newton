@@ -174,7 +174,12 @@ class _CacheData:
 
 @wp.func
 def _pair_key(pair: wp.vec2i) -> wp.uint64:
-    return (wp.uint64(pair[0]) << wp.uint64(32)) | wp.uint64(pair[1])
+    """Return the key of a pair's slot: its two shapes in ascending order, as the cache lists them.
+
+    The narrow phase's routing orders a pair by shape type, so a query names a box and a hull box first, whichever
+    has the lower index.
+    """
+    return (wp.uint64(wp.min(pair[0], pair[1])) << wp.uint64(32)) | wp.uint64(wp.max(pair[0], pair[1]))
 
 
 @wp.func
