@@ -267,6 +267,35 @@ class TestKinematicLinks(unittest.TestCase):
                     )
                     self.assertGreater(count, 0)
 
+    def test_immovable_pair_filter_follows_the_body_flag(self):
+        """Make no pair of two kinematic bodies in contact, and make it again once one of them is dynamic."""
+        for broad_phase in ("explicit", "nxn", "sap"):
+            with self.subTest(broad_phase=broad_phase):
+                model = _build_contact_pair("kinematic", "kinematic")
+                pipeline = newton.CollisionPipeline(
+                    model, broad_phase=broad_phase, include_static_kinematic_pairs=False
+                )
+                contacts = pipeline.contacts()
+                state = model.state()
+
+                def collide(kinematic: bool, pipeline=pipeline, contacts=contacts, state=state, model=model):
+                    """Set the second body's flag, then return the pass's candidate pairs and contacts."""
+                    flags = np.array(model.body_flags.numpy())
+                    flags[1] = int(BodyFlags.KINEMATIC if kinematic else BodyFlags.DYNAMIC)
+                    model.body_flags.assign(flags)
+                    pipeline.notify_model_changed(newton.ModelFlags.BODY_PROPERTIES)
+                    pipeline.collide(state, contacts)
+                    return (
+                        int(pipeline.broad_phase_pair_count.numpy()[0]),
+                        int(contacts.rigid_contact_count.numpy()[0]),
+                    )
+
+                self.assertEqual(collide(kinematic=True), (0, 0))
+                pairs, count = collide(kinematic=False)
+                self.assertEqual(pairs, 1)
+                self.assertGreater(count, 0)
+                self.assertEqual(collide(kinematic=True), (0, 0))
+
 
 class TestKinematicLinksCanonical(unittest.TestCase):
     pass
