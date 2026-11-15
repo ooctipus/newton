@@ -447,6 +447,7 @@ class ReferencePatches:
         ):
             setattr(frame, field, wp.zeros(n, dtype=wp.vec3, device=device))
         frame.mu = wp.zeros(n, dtype=wp.vec2, device=device)
+        frame.foot = wp.zeros(n, dtype=wp.vec2, device=device)
         frame.radius = wp.zeros(n, dtype=float, device=device)
         frame.support_gap_limit = wp.zeros(n, dtype=float, device=device)
         frame.twist = wp.zeros(n, dtype=float, device=device)

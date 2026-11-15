@@ -186,6 +186,8 @@ class _PatchFrame:
     eligible: wp.array[int]
     # Scratch indices: patch members in the current frame, valid anchors in the previous frame.
     members: wp.array[int]
+    # Scratch: a region's footprint points, in its members' positions.
+    foot: wp.array[wp.vec2]
     support_gap_limit: wp.array[float]
     pressure: wp.array[wp.vec3]
     pressured: wp.array[int]
@@ -538,9 +540,11 @@ def _region_footprint(
     """The region's footprint in its tangent plane: the centroid of its members' convex hull relative to ``origin``,
     and its spin arm, :data:`_SPIN_ARM` times the hull's polar radius of gyration (core-docs/WRENCH/VERDICT.md U6).
 
-    The hull is gift-wrapped over the members, and its moments accumulate over a triangle fan from the first hull
-    vertex, so nothing is stored. A hull of no area is a line: its arm is a uniform segment's. Returns ``(x, y, arm)``;
-    a region of one point has arm 0.
+    The hull is gift-wrapped over the members' points, and its moments accumulate over a triangle fan from the first
+    hull vertex. Every step of the wrap scans the points, so the first pass over the members leaves them in the
+    region's own positions of ``frame.foot``, one contiguous run: a step then reads one line of points where it
+    would chase each member's index, its eligibility and its centre. A hull of no area is a line: its arm is a
+    uniform segment's. Returns ``(x, y, arm)``; a region of one point has arm 0.
     """
     count = int(0)
     sum_x = float(0.0)
@@ -552,6 +556,7 @@ def _region_footprint(
         c = frame.members[j]
         if carry_only != 0 or frame.eligible[c] != 0:
             x, y = _footprint_point(frame, c, origin, t0, t1)
+            frame.foot[member_start + count] = wp.vec2(x, y)
             count += 1
             sum_x += x
             sum_y += y
@@ -580,19 +585,17 @@ def _region_footprint(
         best_x = float(0.0)
         best_y = float(0.0)
         found = int(0)
-        for j in range(member_start, member_stop):
-            c = frame.members[j]
-            if carry_only != 0 or frame.eligible[c] != 0:
-                x, y = _footprint_point(frame, c, origin, t0, t1)
-                x -= x_now
-                y -= y_now
-                length = x * x + y * y
-                if length > tolerance:
-                    cross = best_x * y - best_y * x
-                    if found == 0 or cross < 0.0 or (cross == 0.0 and length > best_x * best_x + best_y * best_y):
-                        best_x = x
-                        best_y = y
-                        found = 1
+        for j in range(member_start, member_start + count):
+            point = frame.foot[j]
+            x = point[0] - x_now
+            y = point[1] - y_now
+            length = x * x + y * y
+            if length > tolerance:
+                cross = best_x * y - best_y * x
+                if found == 0 or cross < 0.0 or (cross == 0.0 and length > best_x * best_x + best_y * best_y):
+                    best_x = x
+                    best_y = y
+                    found = 1
         if found == 0:
             break
         next_x = x_now + best_x
@@ -1036,7 +1039,7 @@ def _uses_live_sort(key_bits):
     return slot_keys_fit(key_bits)
 
 
-_BUILD_FIELDS = frozenset(("center", "radius", "support_gap_limit", "flipped", "source", "eligible"))
+_BUILD_FIELDS = frozenset(("center", "radius", "support_gap_limit", "flipped", "source", "eligible", "foot"))
 """Patch frame fields only a build reads: the stored frame (:attr:`_FrictionPatchState.previous`) holds none."""
 
 
@@ -1244,6 +1247,7 @@ class _FrictionPatchState:
             ContactField("keys", wp.int64, 0x7FFFFFFFFFFFFFFF, per_contact=halves, extra=slack),
             ContactField("indices", wp.int32, None, per_contact=halves, extra=slack),
             ContactField("mu", wp.vec2),
+            ContactField("foot", wp.vec2),
             ContactField("radius", wp.float32),
             ContactField("support_gap_limit", wp.float32),
             ContactField("twist", wp.float32),
