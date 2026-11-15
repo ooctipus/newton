@@ -32,8 +32,8 @@ DT = 1.0 / 240.0
 GRAVITY = (0.7, -1.2, -9.1)
 # Fields the one-coordinate class never writes for its bodies; no consumer on its route reads them.
 DROPPED_FIELDS = ("body_q_com", "body_v_s", "body_a_s", "body_f_s", "body_I_s", "body_inertia_terms")
-# Fields the held owner writes only for free bodies, not for a fixed-base arm (it publishes body_v_s).
-ARM_DROPPED_FIELDS = ("body_q_com", "body_a_s", "body_f_s", "body_I_s", "body_inertia_terms")
+# The held owner writes them only for free bodies, and body_v_s only for a prescribed articulation's: not for a
+# fixed-base arm.
 # CUDA bounds against ordinary dynamics: the keys' are FMA contraction and the rounding of the
 # inverse-mass projection and gravity force, which ordinary dynamics evaluates in another order;
 # the arm leaves the serial route for the held owner's float order.
@@ -1167,8 +1167,8 @@ class TestCoordinateTreesOwner(unittest.TestCase):
         the FK/ID fields the head's serial route writes and the held owner does
         not for a fixed-base tree.
         """
-        for names, bodies in ((DROPPED_FIELDS, layout.key_bodies), (ARM_DROPPED_FIELDS, layout.arm_bodies)):
-            for name in names:
+        for bodies in (layout.key_bodies, layout.arm_bodies):
+            for name in DROPPED_FIELDS:
                 array = getattr(solver.factor, name)
                 values = array.numpy()
                 values[bodies] = np.nan

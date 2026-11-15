@@ -849,7 +849,7 @@ def _current_valid(layout):
 def get_helpers(
     layout: TreeLayout,
     schedules: HeldSchedules,
-    body_velocity: bool = False,
+    twist_roots: int = 0,
     *,
     clocked: bool = False,
     diagonal: bool = False,
@@ -899,6 +899,7 @@ def get_helpers(
         g: TreeGroup,
         body: int,
         local: int,
+        root: int,
         pose: wp.transform,
         pose_com: wp.transform,
         origin: wp.vec3,
@@ -929,8 +930,10 @@ def get_helpers(
             clock_b1 = _clock()
         public_radius = wp.transform_point(pose, data.body_com[body]) - origin
         data.body_qd[body] = wp.spatial_vector(point_velocity(velocity, public_radius), wp.spatial_bottom(velocity))
-        if wp.static(body_velocity):
-            data.body_v_s[body] = velocity
+        if wp.static(twist_roots != 0):
+            # The twist about the origin, which a row at an endpoint of a prescribed articulation reads.
+            if (wp.static(twist_roots) >> root) & 1 != 0:
+                data.body_v_s[body] = velocity
         # The body's centre of mass relative to its articulation's origin, by its joint: the predictor's external
         # wrenches shift there, and the walk's refresh forms its inertia's lever from it (walk_step_kernel's now_com).
         cache.com_offset[g.js + local] = radius
@@ -1003,7 +1006,7 @@ def get_state_kernel(
     schedules: HeldSchedules,
     *,
     layout: TreeLayout = REFERENCE_LAYOUT,
-    body_velocity: bool = False,
+    twist_roots: int = 0,
     motion_velocity: bool = False,
     bank_coordinates: int = 0,
     clocked: bool = False,
@@ -1032,6 +1035,10 @@ def get_state_kernel(
     ``bank`` argument compares the two banks (see :func:`_bank_binding`) and,
     when they are equal, is restamped and takes the early exit. ``schedules``
     are the scans' schedules;
+    ``twist_roots`` names, a bit a root, the roots whose bodies publish their
+    twists about their articulation's origin (``body_v_s``), which only a row
+    at an endpoint of a prescribed articulation reads: the owner names a
+    group's prescribed roots;
     ``clocked`` selects the stage counters (``stage_clocks`` columns 0-7 for
     the stages, 22-24 for motion; see :func:`get_helpers`); ``diagonal`` keeps
     a compact diagonal's K-free mass (:data:`_DIAGONAL`); ``two_half`` (the group
@@ -1043,7 +1050,7 @@ def get_state_kernel(
         raise ValueError("Alternate motion velocity is a repair-only contract")
     if bank_coordinates and (finish or motion_velocity):
         raise ValueError("A compared input bank is a contract of the repair of ordinary motion")
-    h = get_helpers(layout, schedules, body_velocity, clocked=clocked, diagonal=diagonal)
+    h = get_helpers(layout, schedules, twist_roots, clocked=clocked, diagonal=diagonal)
     _lanes, _sync, _sub, _different_motion = _thread_helpers(layout)
     banked = bank_coordinates != 0
     _bank_matches = _bank_binding(bank_coordinates, layout) if banked else None
@@ -1374,7 +1381,8 @@ def get_state_kernel(
         """Publish each body's pose and twist with its bias wrench and moments."""
         for local in range(g.lane, bodies, g.stride):
             body = data.joint_child[g.js + local]
-            word = wp.static(origin_word) + 6 * root_of(plan, local)
+            root = root_of(plan, local)
+            word = wp.static(origin_word) + 6 * root
             origin = load_words(g.address, word, wp.vec3())
             shift = load_words(g.address, word + 3, wp.vec3())
             pose = load_words(g.address, 7 * local, wp.transform())
@@ -1383,13 +1391,12 @@ def get_state_kernel(
             )
             if wp.static(rest):
                 data.body_qd[body] = wp.spatial_vector()
-                if wp.static(body_velocity):
-                    data.body_v_s[body] = wp.spatial_vector()
             else:
                 body_terms(
                     g,
                     body,
                     local,
+                    root,
                     pose,
                     pose * data.body_X_com[body],
                     origin,
@@ -1519,6 +1526,8 @@ def get_state_kernel(
         name += "_diagonal"
     if two_half:
         name += "_halves"
+    if twist_roots:
+        name += "_twists"
     return python_kernel(kinetic_state, name)
 
 

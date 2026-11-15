@@ -190,6 +190,40 @@ class TestHeldModels(unittest.TestCase):
                     newton.eval_fk(model, rest.joint_q, rest.joint_qd, rest)
                     np.testing.assert_allclose(state.body_q.numpy(), rest.body_q.numpy(), atol=1e-5)
 
+    def test_body_twists_are_published_where_a_row_reads_them(self):
+        """Only a prescribed articulation's bodies publish their twists about the origin (``body_v_s``), whose one
+        reader is a row's target at such an endpoint: every other body's stays as it was, also in a group that holds
+        a prescribed root."""
+        for device in _devices():
+            for prescribed in (False, True):
+                with self.subTest(device=device, prescribed=prescribed):
+                    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+                    _chain(builder, 3, 0.0)
+                    builder.add_body(mass=1.0, inertia=_INERTIA, xform=wp.transform(wp.vec3(1.0, 0.0, 1.0)))
+                    tray = -1
+                    if prescribed:
+                        tray = builder.add_body(
+                            mass=1.0, inertia=_INERTIA, xform=wp.transform(wp.vec3(2.0, 0.0, 1.0)), is_kinematic=True
+                        )
+                    model = builder.finalize(device=device)
+                    solver = SolverFeatherPGS(model, pgs_iterations=8)
+                    self.assertEqual(solver.forest.has_prescribed_response, prescribed)
+                    state, out, control = model.state(), model.state(), model.control()
+                    state.joint_qd.fill_(0.3)
+                    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+                    solver.factor.body_v_s.fill_(float("nan"))
+                    for _ in range(3):
+                        state.clear_forces()
+                        solver.step(state, out, control, None, 1.0 / 240.0)
+                        state, out = out, state
+                    self.assertTrue(np.isfinite(state.joint_q.numpy()).all())
+                    twists = solver.factor.body_v_s.numpy()
+                    others = np.arange(model.body_count) != tray
+                    self.assertTrue(np.isnan(twists[others]).all())
+                    if prescribed:
+                        self.assertTrue(np.isfinite(twists[tray]).all())
+                        self.assertGreater(float(np.abs(twists[tray]).max()), 0.1)
+
     def test_a_second_root_in_one_articulation_is_its_own_tree(self):
         """The forest splits an articulation of two free roots into two trees, so the second root's body coasts
         where the articulation's one origin would carry it away (a free body at 0.5 m/s once ended at x = 5.85 m)."""

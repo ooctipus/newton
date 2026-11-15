@@ -99,8 +99,9 @@ def decline(forest, factor, *, sparse: bool) -> str | None:
     dynamics, not rows: the row laws (mimic rows, velocity limits) are the writers' and the sweeps'.
     """
     # The owner holds no rows, impulses or patch frames: the patch build, link, seed and finish stay on the solver
-    # pipeline around it, so it serves every contact law. Torsion rows read the joint motions and body twists every
-    # group publishes (joint_S_s, body_v_s); compliance reads no dynamics.
+    # pipeline around it, so it serves every contact law. Torsion rows read the joint motions every group publishes
+    # (joint_S_s) and, at a prescribed endpoint, the body twists its group publishes (body_v_s); compliance reads no
+    # dynamics.
     if sparse:
         if forest.has_free_rigid_bodies:
             return "The sparse factor's group holds no free rigid bodies."
@@ -489,8 +490,6 @@ class HeldGroup:
     group_to_art, geometry_group)``: the articulations of one diagonal size and, per articulation, the group whose
     collection keeps its K-free mass from coordinate ``offset``.
     """
-
-    requires_body_velocity = True
 
     def __init__(self, solver, group: HeldGroupPlan):
         device = solver.model.device

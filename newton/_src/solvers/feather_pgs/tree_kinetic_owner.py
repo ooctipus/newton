@@ -225,7 +225,14 @@ class TreeKineticState:
         self.mass_diagonal = self.data.diagonal
         self.geometry_valid = self.data.geometry_valid
         self.status = self.data.status
-        self._body_velocity = getattr(sparse_owner, "requires_body_velocity", False)
+        # The bodies' twists about the origin (body_v_s) have one reader, a row's target at an endpoint of a prescribed
+        # articulation (contact_laws.prescribed_target, row_slots' predictor speed): only a prescribed root's bodies
+        # publish them, a bit a root. Prescribed membership is fixed at construction (TreeFactor.kinematic_state
+        # refuses a change), and every tree of a root shares it (held_tree's groups).
+        prescribed = solver.forest.prescribed_articulation_host[self._root_arts] != 0
+        if np.any(prescribed != prescribed[0]):
+            raise ValueError("Tree kinetic state requires each root prescribed in every group or in none")
+        self._twist_roots = sum(1 << r for r, held in enumerate(prescribed[0].tolist()) if held)
         self._response = response
         self._bind_kernels()
         self._plan_dimensions = self._dimensions()
@@ -284,7 +291,7 @@ class TreeKineticState:
             False,
             self.schedules,
             layout=layout,
-            body_velocity=self._body_velocity,
+            twist_roots=self._twist_roots,
             motion_velocity=self.motion_velocity,
             bank_coordinates=self.bank_coordinates if self.bank_compare else 0,
             clocked=self.clocked,
@@ -295,7 +302,7 @@ class TreeKineticState:
             True,
             self.schedules,
             layout=layout,
-            body_velocity=self._body_velocity,
+            twist_roots=self._twist_roots,
             clocked=self.clocked,
             diagonal=self.diagonal_mass,
             two_half=self.two_half,
