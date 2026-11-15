@@ -1040,11 +1040,17 @@ def create_mesh_sphere_contact(writer_func):
 def _core_behind_face(
     context: SurfaceFeatureContext, start: wp.vec3, end: wp.vec3
 ) -> tuple[int, wp.vec3, wp.vec3, float]:
-    """The deepest point of a core segment behind a triangle's face, over the face.
+    """The deepest point of a core segment behind a triangle's face, over the face, where the core passes through it.
 
     The segment is clipped to the triangle's prism (its in-plane edge half-spaces); the deepest clipped point
     along the face normal is an end of the clipped interval. A point behind the plane is reported with the face's
     outward normal and its (negative) plane distance; its foot is its projection on the face.
+
+    The face holds the core only where the core passes through it: the clipped stretch starts in front of the
+    plane (or on it, within :data:`SEGMENT_STRICT_COSINE` of the core's length: a stretch entered across a seam of
+    the face). A stretch that is behind the plane throughout reached that side around the triangle's edge: through
+    another face, which holds it, or past a part thinner than the capsule, outside it. Reporting it would put the
+    capsule more than its radius deep in a part its core is not in.
     """
     p0 = context.p0
     p1 = context.p1
@@ -1081,8 +1087,12 @@ def _core_behind_face(
             high = 0.0
     if low > high:
         return 0, p0, unit, 0.0
+    h_low = h0 + low * (h1 - h0)
+    h_high = h0 + high * (h1 - h0)
+    if wp.max(h_low, h_high) < -SEGMENT_STRICT_COSINE * wp.length(d):
+        return 0, p0, unit, 0.0
     sigma = low
-    if h0 + high * (h1 - h0) < h0 + low * (h1 - h0):
+    if h_high < h_low:
         sigma = high
     point = start + sigma * d
     depth = wp.dot(point - p0, unit)

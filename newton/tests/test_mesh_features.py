@@ -457,6 +457,77 @@ def test_capsule_over_ridge(test, device):
         test.assertAlmostEqual(float(separation[0]), 0.033 - 0.03, delta=2e-5)
 
 
+def _box(hx, hy, hz, n=1):
+    """A closed box of the given half extents about the origin as a soup, each face ``2 n^2`` triangles facing out."""
+    x, y, z = hx, hy, hz
+    return _soup(
+        *_merge(
+            _quad((-x, -y, z), (x, -y, z), (x, y, z), (-x, y, z), n, toward=(0, 0, 2 * z)),
+            _quad((-x, -y, -z), (x, -y, -z), (x, y, -z), (-x, y, -z), n, toward=(0, 0, -2 * z)),
+            _quad((x, -y, -z), (x, y, -z), (x, y, z), (x, -y, z), n, toward=(2 * x, 0, 0)),
+            _quad((-x, -y, -z), (-x, y, -z), (-x, y, z), (-x, -y, z), n, toward=(-2 * x, 0, 0)),
+            _quad((-x, y, -z), (x, y, -z), (x, y, z), (-x, y, z), n, toward=(0, 2 * y, 0)),
+            _quad((-x, -y, -z), (x, -y, -z), (x, -y, z), (-x, -y, z), n, toward=(0, -2 * y, 0)),
+        )
+    )
+
+
+def test_capsule_core_around_a_thin_part(test, device):
+    """A face holds a capsule's core behind it only where the core passes through the face.
+
+    The core of a capsule larger than a part can lie behind a face's plane, over the face, without being inside the
+    part: it went around the part's edge and is past the opposite face. That face's contact would be deeper than
+    the capsule's radius and push it through the part. The capsule's contact is its overlap with the part's near
+    edge.
+    """
+    radius, half = 0.04, 0.06
+    hx, hy, hz = 0.03, 0.03, 0.004
+    direction = np.array([-0.8, 0.0, -0.6])
+    rot = wp.quat_between_vectors(wp.vec3(0.0, 0.0, 1.0), wp.vec3(*direction))
+    for n in (1, 3):
+        v, f = _box(hx, hy, hz, n)
+        for y in (0.0, 0.011):
+            # The core's middle: above the top face's plane, beyond the +x rim. Its lower end: under the part.
+            center = np.array([0.06, y, 0.006])
+            start, end = center - half * direction, center + half * direction
+            test.assertTrue(end[2] < -hz and abs(end[0]) < hx and start[2] > hz)
+            # The core passes the rim's lower edge (x = hx, z = -hz, along y) at this distance, outside the part.
+            offset = np.array([hx, y, -hz]) - start
+            clearance = float(np.linalg.norm(offset - (offset @ direction) * direction))
+            xform = wp.transform(wp.vec3(*center), rot)
+            for reduce in (False, True):
+                count, _normal, _p0, sep = _collide(
+                    device, v, f, ("capsule", {"radius": radius, "half_height": half}), xform, reduce=reduce
+                )
+                label = f"{2 * n * n} triangles a face, y {y}, reduce {reduce}"
+                test.assertGreaterEqual(count, 1, label)
+                test.assertGreater(float(sep.min()), -radius, f"{label}: a contact puts the core behind a face")
+                test.assertAlmostEqual(float(sep.min()), clearance - radius, delta=1e-4, msg=label)
+
+
+def test_capsule_core_through_a_face(test, device):
+    """A capsule's core that passes through a face is held by that face: its normal, deeper than the radius."""
+    radius, half = 0.04, 0.06
+    hx, hy, hz = 0.03, 0.03, 0.004
+    tilt = 0.2
+    rot = wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), tilt)
+    for n in (1, 3):
+        v, f = _box(hx, hy, hz, n)
+        center = np.array([0.003, 0.002, hz + 0.02])
+        low = center - half * np.array([np.sin(tilt), 0.0, np.cos(tilt)])
+        test.assertTrue(low[2] < -hz)
+        _count, normal, _p0, sep = _collide(
+            device, v, f, ("capsule", {"radius": radius, "half_height": half}), wp.transform(wp.vec3(*center), rot)
+        )
+        held = normal[:, 2] > 1.0 - 1e-6
+        test.assertGreaterEqual(int(held.sum()), 1, f"{2 * n * n} triangles a face")
+        test.assertLess(float(sep[held].min()), -radius)
+        test.assertGreaterEqual(float(sep[held].min()), low[2] - hz - radius - 1e-5)
+        test.assertTrue(
+            np.all(normal[sep < -radius][:, 2] > 1.0 - 1e-6), "a face the core did not pass through holds it"
+        )
+
+
 def test_box_on_stair_nose(test, device):
     """A box resting across a stair nose: its patch on the tread, cut at the nose, with no ghost normal.
 
@@ -508,6 +579,8 @@ for _name, _fn in (
     ("test_flat_lattice_tilted_box", test_flat_lattice_tilted_box),
     ("test_flat_lattice_tilted_solids", test_flat_lattice_tilted_solids),
     ("test_capsule_over_ridge", test_capsule_over_ridge),
+    ("test_capsule_core_around_a_thin_part", test_capsule_core_around_a_thin_part),
+    ("test_capsule_core_through_a_face", test_capsule_core_through_a_face),
     ("test_box_on_stair_nose", test_box_on_stair_nose),
     ("test_small_facet_keeps_its_corners", test_small_facet_keeps_its_corners),
     ("test_unreferenced_vertices", test_unreferenced_vertices),
