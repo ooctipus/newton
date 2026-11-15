@@ -668,24 +668,28 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
                     self.assertLess(abs(float(actual[1][0] - 0.05 * actual[1][4])), 0.01)
 
     def test_faceted_rolling_across_tessellation_direction_and_timestep(self):
-        """Bound patch approximation error across coarse and fine faceted wheels."""
+        """Bound a faceted wheel's roll across tessellation, direction and timestep.
+
+        The runs take the collision pipeline's deterministic contact order. Its default order is not reproducible on
+        a GPU, and a faceted wheel's travel follows that order through its facet impacts: two runs of one mesh
+        wheel differ by 0.01 to 0.03 m of 0.9 m of travel, which is the bound below. Under one order they agree,
+        so a difference between the two runs is the solve's own.
+        """
         device = "cuda:0" if wp.is_cuda_available() else "cpu"
         for geometry in ("mesh", "convex_hull"):
             for segments in (32, 64, 128):
                 for hz in (120, 240):
                     for direction in (-1, 1):
                         case = {"segments": segments, "hz": hz, "direction": direction}
-                        reference = _run_rolling(geometry, device, **case)
-                        actual = _run_rolling(geometry, device, **case)
+                        reference = _run_rolling(geometry, device, deterministic=True, **case)
+                        actual = _run_rolling(geometry, device, deterministic=True, **case)
                         with self.subTest(geometry=geometry, **case):
                             self.assertTrue(all(np.isfinite(value).all() for value in actual))
-                            # A two-location friction wrench approximates the
-                            # per-contact reference. Bound its one-second travel
-                            # error to 3% and mean speed error to 6% of launch speed;
-                            # include lateral motion so steering errors cannot hide.
-                            # The 128-segment convex hull at 120 Hz lands within a
-                            # few percent of these bounds and differs slightly across
-                            # GPU architectures (5.1% speed error on an RTX 5080).
+                            # The reference is the same law run again: nothing but the
+                            # solve may differ between the two. Bound the one-second
+                            # travel difference to 3% and the mean speed difference to
+                            # 6% of launch speed; include lateral motion so steering
+                            # differences cannot hide.
                             self.assertLess(np.max(np.abs(actual[0][:2] - reference[0][:2])), 0.03)
                             self.assertLess(abs(float(actual[2][0] - reference[2][0])), 0.06)
                             # Facet rocking can change the phase of lateral
@@ -697,7 +701,8 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
                             # launch's one-ulp family (0, +1, -1 ulp): its median.
                             lateral = [abs(float(actual[2][1]))]
                             for ulp in (1, -1):
-                                lateral.append(abs(float(_run_rolling(geometry, device, launch_ulp=ulp, **case)[2][1])))
+                                draw = _run_rolling(geometry, device, deterministic=True, launch_ulp=ulp, **case)
+                                lateral.append(abs(float(draw[2][1])))
                             self.assertLess(float(np.median(lateral)), 0.06, lateral)
                             # Same 6% margin on the 20 rad/s launch spin.
                             self.assertLess(abs(float(actual[2][4] - reference[2][4])), 1.2)
