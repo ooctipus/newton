@@ -424,14 +424,15 @@ def _prepare(
 
 
 @wp.func
-def _compatible(frame: _PatchFrame, seed: int, c: int):
-    d = frame.center[c] - frame.center[seed]
-    r = frame.radius[seed]
+def _compatible(frame: _PatchFrame, center: wp.vec3, normal: wp.vec3, mu: wp.vec2, r: float, c: int):
+    """Whether contact ``c`` may join the region of a seed with ``center``, ``normal``, friction ``mu`` and radius
+    ``r``: the seed's fields are its caller's, read once per seed, not once per contact tested."""
+    d = frame.center[c] - center
     return (
-        wp.dot(frame.normal[seed], frame.normal[c]) >= 0.995
-        and frame.mu[seed][0] == frame.mu[c][0]
-        and frame.mu[seed][1] == frame.mu[c][1]
-        and wp.abs(wp.dot(d, frame.normal[seed])) <= 0.02 * r
+        wp.dot(normal, frame.normal[c]) >= 0.995
+        and mu[0] == frame.mu[c][0]
+        and mu[1] == frame.mu[c][1]
+        and wp.abs(wp.dot(d, normal)) <= 0.02 * r
         and wp.length_sq(d) <= 4.0 * r * r
     )
 
@@ -685,6 +686,11 @@ def _build_pair(
         cursor = seed
         expanded_a = int(-2)
         expanded_b = int(-2)
+        # The seed's fields, read once: the flood stores owners and links, and a load after a store is a load again.
+        seed_center = frame.center[seed]
+        seed_normal = frame.normal[seed]
+        seed_mu = frame.mu[seed]
+        seed_radius = frame.radius[seed]
         # Flood through adjacent convex pieces. The queue is the contact list
         # itself; no allocation, atomics, or fixed patch-count limit is needed.
         while cursor >= 0 and remaining > 0:
@@ -693,18 +699,20 @@ def _build_pair(
             if sa != expanded_a or sb != expanded_b:
                 for j in range(index + 1, stop):
                     c = frame.indices[j]
-                    if frame.owner[c] < 0 and _compatible(frame, seed, c):
-                        if _geometry_adjacent(
-                            sa, sb, frame.shape_a[c], frame.shape_b[c], shape_transform, shape_radius
-                        ):
-                            frame.owner[c] = seed
-                            remaining -= 1
-                            patches.next_contact[tail] = c
-                            tail = c
-                            # Sorted order within a pair is contact order, so the
-                            # lowest index is the first eligible member in it.
-                            if frame.eligible[c] != 0 and (first < 0 or c < first):
-                                first = c
+                    # An owned contact is tested no further: its fields stay unread.
+                    if frame.owner[c] < 0:
+                        if _compatible(frame, seed_center, seed_normal, seed_mu, seed_radius, c):
+                            if _geometry_adjacent(
+                                sa, sb, frame.shape_a[c], frame.shape_b[c], shape_transform, shape_radius
+                            ):
+                                frame.owner[c] = seed
+                                remaining -= 1
+                                patches.next_contact[tail] = c
+                                tail = c
+                                # Sorted order within a pair is contact order, so the
+                                # lowest index is the first eligible member in it.
+                                if frame.eligible[c] != 0 and (first < 0 or c < first):
+                                    first = c
                 expanded_a = sa
                 expanded_b = sb
             cursor = patches.next_contact[cursor]
