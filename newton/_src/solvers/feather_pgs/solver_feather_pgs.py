@@ -170,13 +170,18 @@ class SolverFeatherPGS(SolverBase):
 
     @classmethod
     def register_custom_attributes(cls, builder: ModelBuilder) -> None:
-        """Register PhysX rigid-body attributes consumed by FeatherPGS.
+        """Register the rigid-body attributes consumed by FeatherPGS.
 
         ``rigid_body_max_linear_velocity`` [m/s] and ``rigid_body_max_angular_velocity``
         [rad/s] bound the speeds of a free body, the magnitudes of its center of mass
         velocity and of its angular velocity (``physxRigidBody:maxLinearVelocity`` and
         ``physxRigidBody:maxAngularVelocity``, default unbounded).
         ``rigid_body_max_depenetration_velocity`` [m/s] bounds its contact correction velocity.
+        ``body_gravity_compensation`` is the fraction of a body's weight that is cancelled
+        (``mjc:gravcomp``, MJCF ``gravcomp``, default 0): the body's weight is
+        ``(1 - c) m g`` and its inertia is unchanged, so ``1`` makes it weightless. A write
+        to it is an inertial change: announce it with
+        :attr:`~newton.ModelFlags.BODY_INERTIAL_PROPERTIES` (:meth:`notify_model_changed`).
         """
 
         def _angular_velocity_deg_to_rad(value, _context):
@@ -202,6 +207,16 @@ class SolverFeatherPGS(SolverBase):
                     usd_value_transformer=transformer,
                 )
             )
+        builder.add_custom_attribute(
+            ModelBuilder.CustomAttribute(
+                name="body_gravity_compensation",
+                frequency=Model.AttributeFrequency.BODY,
+                dtype=wp.float32,
+                default=0.0,
+                usd_attribute_name="mjc:gravcomp",
+                mjcf_attribute_name="gravcomp",
+            )
+        )
 
     def __init__(
         self,

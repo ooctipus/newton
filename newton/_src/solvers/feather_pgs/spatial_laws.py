@@ -246,6 +246,16 @@ def inertia_action(rotation: wp.quat, inertia: wp.mat33, vector: wp.vec3) -> wp.
 
 
 @SPATIAL.law
+def weight_fraction(compensation: float) -> float:
+    """Return the fraction of its weight a body keeps under its gravity compensation fraction ``c``: ``1 - c``.
+
+    A compensated body keeps its inertia and weighs ``(1 - c) m g``, as if a force ``-c m g`` held it at its center
+    of mass: ``c = 0`` is the whole weight, ``c = 1`` a weightless body.
+    """
+    return 1.0 - compensation
+
+
+@SPATIAL.law
 def body_wrench(
     mass: float,
     rotation: wp.quat,

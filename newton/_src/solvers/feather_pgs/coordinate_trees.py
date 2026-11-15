@@ -67,6 +67,7 @@ from .spatial_laws import (
     point_velocity,
     spring_damper_stiffness,
     transform_compose,
+    weight_fraction,
     wrench_shift,
 )
 from .tree_kinetic_owner import proof_runs
@@ -126,6 +127,7 @@ def _turning_load(
     motion: wp.spatial_vector,
     origin: wp.vec3,
     gravity: wp.vec3,
+    body_gravity_compensation: wp.array[float],
     body_q: wp.array[wp.transform],
     body_com: wp.array[wp.vec3],
     body_mass: wp.array[float],
@@ -138,7 +140,8 @@ def _turning_load(
     pose = body_q[body]
     mass = body_mass[body]
     radius = wp.transform_point(pose, body_com[body]) - origin
-    wrench = -wrench_shift(wp.spatial_vector(mass * gravity, wp.vec3()), radius) - _external_at_origin(
+    weight = weight_fraction(body_gravity_compensation[body]) * mass
+    wrench = -wrench_shift(wp.spatial_vector(weight * gravity, wp.vec3()), radius) - _external_at_origin(
         body, radius, body_f, body_flags
     )
     total, moment, rotational = inertia_at(mass, body_inertia[body], wp.transform_get_rotation(pose), radius)
@@ -268,6 +271,7 @@ def class_kernels(turns: bool, welded: bool) -> tuple[wp.Kernel, wp.Kernel, wp.K
                 motion,
                 origin,
                 data.gravity[0],
+                data.body_gravity_compensation,
                 data.body_q,
                 data.body_com,
                 data.body_mass,
@@ -282,6 +286,7 @@ def class_kernels(turns: bool, welded: bool) -> tuple[wp.Kernel, wp.Kernel, wp.K
                         motion,
                         origin,
                         data.gravity[0],
+                        data.body_gravity_compensation,
                         data.body_q,
                         data.body_com,
                         data.body_mass,
@@ -294,10 +299,13 @@ def class_kernels(turns: bool, welded: bool) -> tuple[wp.Kernel, wp.Kernel, wp.K
             leaf_inertia = tree_inertia + data.armature[dof]
         else:
             mass = data.body_mass[child]
+            weight = weight_fraction(data.body_gravity_compensation[child]) * mass
             if wp.static(welded):
                 for k in range(weld_start[local], weld_start[local + 1]):
-                    mass += data.body_mass[p.joint_child[root_joint + weld_joint_offset[k]]]
-            force = mass * data.gravity[0]
+                    body = p.joint_child[root_joint + weld_joint_offset[k]]
+                    mass += data.body_mass[body]
+                    weight += weight_fraction(data.body_gravity_compensation[body]) * data.body_mass[body]
+            force = weight * data.gravity[0]
             body_force = -wp.spatial_vector(force, wp.vec3()) - _external_at_origin(
                 child, wp.vec3(), f.body_f, f.body_flags
             )

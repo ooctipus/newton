@@ -172,6 +172,11 @@ class TreeFactor:
         # at the first substep of each replay.
         if model.body_count:
             self._arrays.allocate(STATE_AUX, dof=model.joint_dof_count, body=model.body_count)
+        # Each body's gravity compensation fraction: the model's attribute (the kernels read its array), or none.
+        compensation = getattr(model, "body_gravity_compensation", None)
+        if compensation is None:
+            compensation = wp.zeros(max(1, int(model.body_count)), dtype=wp.float32, device=model.device)
+        self.body_gravity_compensation = compensation
         self.kinematic_joint_mask = wp.zeros(model.joint_count, dtype=wp.int32, device=model.device)
         self.kinematic_dof_mask = wp.zeros(model.joint_dof_count, dtype=wp.int32, device=model.device)
         self.kinematic_dof_mask_host = None

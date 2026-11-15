@@ -57,6 +57,7 @@ from .spatial_laws import (
     joint_transform,
     pack_inertia,
     point_velocity,
+    weight_fraction,
 )
 from .tree_kinetic_layout import REFERENCE_LAYOUT, TreeLayout
 from .tree_plan import TreePlan
@@ -922,7 +923,8 @@ def get_helpers(
         if g.refresh != 0:
             total, moment, rotational = inertia_at(mass, inertia_local, rotation, radius)
             record = pack_inertia(total, moment, rotational)
-        wrench = body_wrench(mass, rotation, inertia_local, radius, velocity, acceleration, data.gravity[0])
+        gravity = weight_fraction(data.body_gravity_compensation[body]) * data.gravity[0]
+        wrench = body_wrench(mass, rotation, inertia_local, radius, velocity, acceleration, gravity)
         if wp.static(clocked):
             clock_b1 = _clock()
         public_radius = wp.transform_point(pose, data.body_com[body]) - origin
@@ -952,7 +954,7 @@ def get_helpers(
                     data.body_mass[body],
                     data.body_inertia[body],
                     data.body_com[body],
-                    data.gravity[0],
+                    gravity,
                     1,
                     0,
                     1,

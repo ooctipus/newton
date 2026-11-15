@@ -556,5 +556,187 @@ for _device in get_test_devices():
     )
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# gravity compensation
+#
+# A body's weight is ``(1 - c) m g`` under its gravity compensation fraction ``c`` (``body_gravity_compensation``),
+# and its inertia is unchanged: the body moves as if a force ``-c m g`` held it at its center of mass. Each scene
+# below is one tree class of the solver: a free body, a serial arm, and a fixed root over one-coordinate leaves (a
+# slide and a turn, each with a welded body).
+# ---------------------------------------------------------------------------------------------------------------------
+
+GRAVITY = -9.81
+COMPENSATION_DT = 1.0 / 240.0
+
+
+def _compensated_scene(device, kind, fractions):
+    """Two worlds of one tree class under gravity, a world's body ``i`` compensated by
+    ``fractions[i % len(fractions)]``."""
+    template = newton.ModelBuilder(gravity=(0.0, 0.0, GRAVITY))
+    SolverFeatherPGS.register_custom_attributes(template)
+    count = [0]
+
+    def attributes():
+        fraction = fractions[count[0] % len(fractions)]
+        count[0] += 1
+        return {"body_gravity_compensation": fraction}
+
+    inertia = wp.mat33(np.diag([0.004, 0.006, 0.005]))
+    if kind == "free":
+        template.add_body(mass=1.5, inertia=inertia, com=wp.vec3(0.03, -0.02, 0.01), custom_attributes=attributes())
+    elif kind == "arm":
+        joints = []
+        parent = -1
+        for index in range(5):
+            body = template.add_link(
+                mass=0.4 + 0.2 * index, inertia=inertia, com=wp.vec3(0.05, 0.01, -0.02), custom_attributes=attributes()
+            )
+            joints.append(
+                template.add_joint_revolute(
+                    parent,
+                    body,
+                    parent_xform=wp.transform(wp.vec3(0.12, 0.0, 0.0), wp.quat_identity()),
+                    axis=(newton.Axis.Y, newton.Axis.X, newton.Axis.Z)[index % 3],
+                    armature=0.01,
+                )
+            )
+            parent = body
+        template.add_articulation(joints)
+    else:
+        tilt = wp.quat_from_axis_angle(wp.normalize(wp.vec3(1.0, 0.5, 0.0)), 0.3)
+        root = template.add_link(mass=2.0, inertia=inertia, custom_attributes=attributes())
+        joints = [template.add_joint_fixed(-1, root, parent_xform=wp.transform(wp.vec3(0.0, 0.0, 1.0), tilt))]
+        for index, add_joint in enumerate((template.add_joint_prismatic, template.add_joint_revolute)):
+            leaf = template.add_link(
+                mass=0.3, inertia=inertia, com=wp.vec3(0.04, 0.0, 0.02), custom_attributes=attributes()
+            )
+            joints.append(
+                add_joint(
+                    root,
+                    leaf,
+                    parent_xform=wp.transform(wp.vec3(0.1 * index, 0.05, 0.0), wp.quat_identity()),
+                    axis=(newton.Axis.Z, newton.Axis.Y)[index],
+                    armature=0.002,
+                )
+            )
+            weld = template.add_link(
+                mass=0.2, inertia=inertia, com=wp.vec3(-0.01, 0.03, 0.0), custom_attributes=attributes()
+            )
+            joints.append(
+                template.add_joint_fixed(
+                    leaf, weld, parent_xform=wp.transform(wp.vec3(0.06, 0.0, 0.0), wp.quat_identity())
+                )
+            )
+        template.add_articulation(joints)
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, GRAVITY))
+    SolverFeatherPGS.register_custom_attributes(builder)
+    builder.replicate(template, 2, spacing=(2.0, 0.0, 0.0))
+    model = builder.finalize(device=device)
+    return model
+
+
+def _run(model, steps, *, hold=None):
+    """Step a contact-free model from rest; ``hold`` is the force [N] along z held at each body's center of mass."""
+    solver = SolverFeatherPGS(model, angular_damping=0.0)
+    state, output, control = model.state(), model.state(), model.control()
+    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+    wrench = None
+    if hold is not None:
+        wrench = np.zeros((model.body_count, 6), dtype=np.float32)
+        wrench[:, 2] = hold
+    for _ in range(steps):
+        if wrench is not None:
+            state.body_f.assign(wrench)
+        solver.step(state, output, control, None, COMPENSATION_DT)
+        state, output = output, state
+    return state
+
+
+def test_gravity_compensation_weightless(test, device):
+    """A fully compensated tree at rest stays at rest, in every tree class."""
+    for kind in ("free", "arm", "leaves"):
+        with test.subTest(kind=kind):
+            model = _compensated_scene(device, kind, (1.0,))
+            start = model.state()
+            state = _run(model, 20)
+            np.testing.assert_array_equal(state.joint_qd.numpy(), 0.0)
+            np.testing.assert_array_equal(state.joint_q.numpy(), start.joint_q.numpy())
+
+
+def test_gravity_compensation_free_fall(test, device):
+    """A free body falls at ``(1 - c) g``, and a notified write to the fraction acts from the next step."""
+    model = _compensated_scene(device, "free", (0.25,))
+    np.testing.assert_array_equal(model.body_gravity_compensation.numpy(), np.float32(0.25))
+    model.body_gravity_compensation.assign(np.array([0.25, 0.0], dtype=np.float32))
+    steps = 30
+    state = _run(model, steps)
+    velocity = state.joint_qd.numpy().reshape(2, 6)[:, 2]
+    expected = np.array([0.75, 1.0]) * GRAVITY * steps * COMPENSATION_DT
+    np.testing.assert_allclose(velocity, expected, rtol=1.0e-5)
+    solver = SolverFeatherPGS(model, angular_damping=0.0)
+    output, control = model.state(), model.control()
+    solver.step(state, output, control, None, COMPENSATION_DT)
+    state, output = output, state
+    velocity = velocity + expected / steps
+    np.testing.assert_allclose(state.joint_qd.numpy().reshape(2, 6)[:, 2], velocity, rtol=1.0e-5)
+    model.body_gravity_compensation.fill_(1.0)
+    solver.notify_model_changed(newton.ModelFlags.BODY_INERTIAL_PROPERTIES)
+    solver.step(state, output, control, None, COMPENSATION_DT)
+    np.testing.assert_allclose(output.joint_qd.numpy().reshape(2, 6)[:, 2], velocity, rtol=1.0e-6)
+    model.body_gravity_compensation.fill_(0.0)
+    solver.notify_model_changed(newton.ModelFlags.BODY_INERTIAL_PROPERTIES)
+    solver.step(output, state, control, None, COMPENSATION_DT)
+    np.testing.assert_allclose(
+        state.joint_qd.numpy().reshape(2, 6)[:, 2], velocity + GRAVITY * COMPENSATION_DT, rtol=1.0e-5
+    )
+
+
+def test_gravity_compensation_is_a_held_weight(test, device):
+    """Compensation ``c`` moves a tree as the force ``-c m g`` at each body's center of mass does."""
+    fractions = (0.3, 1.0, 0.0, 0.65)
+    for kind in ("free", "arm", "leaves"):
+        with test.subTest(kind=kind):
+            compensated = _compensated_scene(device, kind, fractions)
+            plain = _compensated_scene(device, kind, (0.0,))
+            fraction = compensated.body_gravity_compensation.numpy()
+            np.testing.assert_array_equal(
+                fraction.reshape(2, -1), np.resize(np.float32(fractions), fraction.shape[0] // 2)[None].repeat(2, 0)
+            )
+            hold = -fraction * plain.body_mass.numpy() * GRAVITY
+            a = _run(compensated, 60)
+            b = _run(plain, 60, hold=hold)
+            free = _run(plain, 60)
+            for field in ("joint_q", "joint_qd"):
+                value = getattr(a, field).numpy()
+                np.testing.assert_allclose(value, getattr(b, field).numpy(), rtol=2.0e-4, atol=2.0e-5)
+            # The fractions change the motion: the comparison above is not between two trees at rest.
+            test.assertGreater(float(np.abs(a.joint_qd.numpy() - free.joint_qd.numpy()).max()), 0.05)
+
+
+class TestFeatherPGSGravityCompensation(unittest.TestCase):
+    """A body's gravity compensation fraction, on every test device."""
+
+
+for _device in get_test_devices():
+    add_function_test(
+        TestFeatherPGSGravityCompensation,
+        "test_gravity_compensation_weightless",
+        test_gravity_compensation_weightless,
+        devices=[_device],
+    )
+    add_function_test(
+        TestFeatherPGSGravityCompensation,
+        "test_gravity_compensation_free_fall",
+        test_gravity_compensation_free_fall,
+        devices=[_device],
+    )
+    add_function_test(
+        TestFeatherPGSGravityCompensation,
+        "test_gravity_compensation_is_a_held_weight",
+        test_gravity_compensation_is_a_held_weight,
+        devices=[_device],
+    )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

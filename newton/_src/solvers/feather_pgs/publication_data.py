@@ -26,6 +26,8 @@ PUBLICATION = (
     Field("body_com", wp.vec3, ("body",), owner="model"),
     Field("body_mass", wp.float32, ("body",), owner="model"),
     Field("body_inertia", wp.mat33, ("body",), owner="model"),
+    # Each body's gravity compensation fraction (spatial_laws.weight_fraction): the model's attribute, or zeros.
+    Field("body_gravity_compensation", wp.float32, ("body",), owner="factor"),
     Field("body_to_articulation", wp.int32, ("body",), owner="forest"),
     Field("is_free_rigid", wp.int32, ("articulation",), owner="forest"),
     Field("gravity", wp.vec3, ("world",), owner="model"),
