@@ -4,9 +4,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import warp as wp
+
+from ..slots import slot_attribute_specs
+
+if TYPE_CHECKING:
+    from ...sim.model import Model
 
 
 class InputProcessorBase:
@@ -88,6 +93,25 @@ class InputProcessorBase:
     ``<name>_indices`` into ``joint_qd``-shaped arrays and
     ``<name>_pos_indices`` into ``joint_q``-shaped arrays.
     """
+
+    PARAMETERS: ClassVar[tuple[str, ...]] = ()
+    """Per-slot parameter arrays, each a constructor argument and attribute of the same name (``None`` when unset)."""
+
+    @classmethod
+    def attribute_specs(cls) -> dict[str, Model.AttributeSpec]:
+        """Return the frequency and references of the processor's per-slot arrays.
+
+        Rows are the slots of the actuator (``"actuator_slot"``). An actuator built from copies of its slots assigns
+        the copied arrays and calls :meth:`Actuator.finalize() <newton.actuators.Actuator.finalize>`. The index arrays
+        of each joint parameter (:attr:`JOINT_PARAMS`) reference joint DOFs and joint coordinates.
+        """
+        from ...sim.model import Model  # noqa: PLC0415
+
+        domains = {"_indices": Model.AttributeFrequency.JOINT_DOF, "_pos_indices": Model.AttributeFrequency.JOINT_COORD}
+        references = {
+            joint + suffix: domain for joint in sorted(cls.JOINT_PARAMS) for suffix, domain in domains.items()
+        }
+        return slot_attribute_specs(cls.PARAMETERS, references)
 
     @classmethod
     def resolve_arguments(cls, args: dict[str, Any]) -> dict[str, Any]:

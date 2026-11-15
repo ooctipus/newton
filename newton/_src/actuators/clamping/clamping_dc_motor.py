@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import math
 import warnings
-from typing import Any
+from typing import Any, ClassVar
 
 import warp as wp
 
@@ -113,6 +113,8 @@ class ClampingDCMotor(ClampingBase):
     models the motor itself including its back-EMF, so the effort-speed limit
     would be applied a second time.
     """
+
+    PARAMETERS: ClassVar[tuple[str, ...]] = ("saturation_effort", "velocity_limit", "max_motor_effort")
 
     @classmethod
     def resolve_arguments(cls, args: dict[str, Any]) -> dict[str, Any]:

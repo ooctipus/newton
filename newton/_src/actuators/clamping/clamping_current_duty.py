@@ -85,6 +85,15 @@ class ClampingCurrentDuty(ClampingBase):
 
     SHARED_PARAMS: ClassVar[set[str]] = {"voltage_source"}
 
+    PARAMETERS: ClassVar[tuple[str, ...]] = (
+        "max_current",
+        "kt_estimate",
+        "resistance_estimate",
+        "max_duty",
+        "nominal_voltage",
+        "min_voltage",
+    )
+
     @classmethod
     def resolve_arguments(cls, args: dict[str, Any]) -> dict[str, Any]:
         source = cls.VoltageSource(args.get("voltage_source", cls.VoltageSource.INPUT))

@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import Any, ClassVar
 
 import warp as wp
 
@@ -41,6 +41,8 @@ class ClampingMaxEffort(ClampingBase):
 
     Clamps the actuator output to ``[-max_effort, +max_effort]``.
     """
+
+    PARAMETERS: ClassVar[tuple[str, ...]] = ("max_effort",)
 
     @classmethod
     def resolve_arguments(cls, args: dict[str, Any]) -> dict[str, Any]:

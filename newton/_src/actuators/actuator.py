@@ -23,6 +23,7 @@ from .input_processors.base import InputProcessorBase
 from .input_processors.input_processor_delay import InputProcessorDelay
 from .input_processors.input_processor_encoder import InputProcessorEncoder
 from .motor_dc import MotorDC
+from .slots import slot_attribute_specs
 from .space import _validate_spaces
 
 if TYPE_CHECKING:
@@ -427,27 +428,12 @@ class Actuator:
         self.effort_indices = effort_indices if effort_indices is not None else indices
         self.actuator_indices = actuator_indices
         """Index of each actuator into per-actuator arrays, or ``None``."""
-        if actuator_indices is not None and actuator_indices.shape != indices.shape:
-            raise ValueError(
-                f"actuator_indices shape {actuator_indices.shape} must match indices shape {indices.shape}"
-            )
-        if self.pos_indices.shape != indices.shape:
-            raise ValueError(f"pos_indices shape {self.pos_indices.shape} must match indices shape {indices.shape}")
-        if self.target_pos_indices.shape != indices.shape:
-            raise ValueError(
-                f"target_pos_indices shape {self.target_pos_indices.shape} must match indices shape {indices.shape}"
-            )
-        if self.effort_indices.shape != indices.shape:
-            raise ValueError(
-                f"effort_indices shape {self.effort_indices.shape} must match indices shape {indices.shape}"
-            )
         self.drive = drive
         self.input_processors = input_processors
         """Input processors, applied in list order before the drive."""
         self._legacy_delay_updates = _legacy_delay_updates(input_processors)
         self.clamping = clamping or []
         _validate_spaces(drive.output_space, (c.input_space for c in self.clamping), motor is not None)
-        self.num_actuators = len(indices)
 
         self.state_pos_attr = state_pos_attr
         self.state_vel_attr = state_vel_attr
@@ -466,39 +452,83 @@ class Actuator:
                 clamp._use_motor_parameters(motor)
         self.control_supply_voltage_attr = control_supply_voltage_attr
         self.control_supply_current_attr = control_supply_current_attr
-        self._uses_battery = motor is not None and motor.uses_battery
-        if self._uses_battery and actuator_indices is None:
-            raise ValueError(f"{type(motor).__name__} draws from a battery, which requires actuator_indices")
 
         self.device = indices.device
         self.requires_grad = requires_grad
-        self._computed_forces = wp.zeros(
-            self.num_actuators, dtype=wp.float32, device=self.device, requires_grad=requires_grad
+        self._implicit_arguments: tuple[JointSpaceResponse, ImplicitOptions | None] | None = None
+        self.finalize()
+
+    @classmethod
+    def attribute_specs(cls) -> dict[str, Model.AttributeSpec]:
+        """Return the frequency and references of the actuator's per-slot index arrays.
+
+        Rows are the actuator's slots (``"actuator_slot"``), one per driven DOF; each array is a constructor argument
+        and attribute of the same name (``None`` when unset). The drive, input processors, clamps and motor
+        (:attr:`components`) declare their own per-slot arrays. To build an actuator from copies of its slots, assign
+        the copied arrays of the actuator and its components and call :meth:`finalize`.
+        """
+        from ..sim.model import Model  # noqa: PLC0415
+
+        frequency = Model.AttributeFrequency
+        return slot_attribute_specs(
+            (),
+            {
+                "indices": frequency.JOINT_DOF,
+                "pos_indices": frequency.JOINT_COORD,
+                "target_pos_indices": frequency.JOINT_COORD,
+                "effort_indices": frequency.JOINT_DOF,
+                "actuator_indices": frequency.ACTUATOR,
+            },
         )
-        self._applied_forces = wp.zeros(
-            self.num_actuators, dtype=wp.float32, device=self.device, requires_grad=requires_grad
-        )
+
+    @property
+    def components(self) -> tuple[Any, ...]:
+        """The input processors, drive, clamps and motor, in the order a step applies them."""
+        return (*self.input_processors, self.drive, *self.clamping, *((self.motor,) if self.motor is not None else ()))
+
+    def finalize(self) -> None:
+        """Size the actuator and its components for its slots.
+
+        Allocates the working buffers for one slot per entry of :attr:`indices`, calls ``finalize`` on the drive,
+        input processors, clamps and motor, and installs the current effort mode again. The constructor calls it; call
+        it again after assigning new per-slot arrays (see :meth:`attribute_specs`).
+
+        Raises:
+            ValueError: An index array does not have one entry per slot, or the motor draws from a battery and
+                :attr:`actuator_indices` is ``None``.
+        """
+        self.num_actuators = len(self.indices)
+        """Number of slots N, one per driven DOF."""
+        for name in ("pos_indices", "target_pos_indices", "effort_indices", "actuator_indices"):
+            value = getattr(self, name)
+            if value is not None and value.shape != self.indices.shape:
+                raise ValueError(f"{name} shape {value.shape} must match indices shape {self.indices.shape}")
+        motor = self.motor
+        self._uses_battery = motor is not None and motor.uses_battery
+        if self._uses_battery and self.actuator_indices is None:
+            raise ValueError(f"{type(motor).__name__} draws from a battery, which requires actuator_indices")
+
+        device, requires_grad, count = self.device, self.requires_grad, self.num_actuators
+        self._computed_forces = wp.zeros(count, dtype=wp.float32, device=device, requires_grad=requires_grad)
+        self._applied_forces = wp.zeros(count, dtype=wp.float32, device=device, requires_grad=requires_grad)
         self._drive_output = self._supply_voltage = self._motor_voltage = None
         if motor is not None:
-            self._drive_output = wp.zeros(
-                self.num_actuators, dtype=wp.float32, device=self.device, requires_grad=requires_grad
-            )
-            self._supply_voltage = wp.zeros(
-                self.num_actuators, dtype=wp.float32, device=self.device, requires_grad=requires_grad
-            )
-            self._motor_voltage = wp.zeros(
-                self.num_actuators, dtype=wp.float32, device=self.device, requires_grad=requires_grad
-            )
+            self._drive_output = wp.zeros(count, dtype=wp.float32, device=device, requires_grad=requires_grad)
+            self._supply_voltage = wp.zeros(count, dtype=wp.float32, device=device, requires_grad=requires_grad)
+            self._motor_voltage = wp.zeros(count, dtype=wp.float32, device=device, requires_grad=requires_grad)
 
-        drive.finalize(self.device, self.num_actuators)
+        self.drive.finalize(device, count)
         for processor in self.input_processors:
-            processor.finalize(self.device, self.num_actuators, requires_grad=requires_grad)
+            processor.finalize(device, count, requires_grad=requires_grad)
         for clamp in self.clamping:
-            clamp.finalize(self.device, self.num_actuators)
+            clamp.finalize(device, count)
         if motor is not None:
-            motor.finalize(self.device, self.num_actuators, requires_grad=requires_grad)
+            motor.finalize(device, count, requires_grad=requires_grad)
 
-        self.set_effort_mode_explicit()
+        if self._implicit_arguments is None:
+            self.set_effort_mode_explicit()
+        else:
+            self.set_effort_mode_implicit(*self._implicit_arguments)
 
     def sim_state(self) -> Any:
         """Return an empty container with the fields this actuator reads from ``sim_state``.
@@ -648,6 +678,7 @@ class Actuator:
                 NewtonWarning,
                 stacklevel=2,
             )
+        self._implicit_arguments = (response, options)
         self._effort_mode = _EffortModeImplicit(
             self.drive,
             self.clamping,
@@ -660,6 +691,7 @@ class Actuator:
 
     def set_effort_mode_explicit(self) -> None:
         """Switch effort computation back to the default explicit mode."""
+        self._implicit_arguments = None
         self._effort_mode = _EffortModeExplicit(
             self.drive,
             self.motor,

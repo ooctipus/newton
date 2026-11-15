@@ -74,6 +74,8 @@ class DrivePD(DriveBase):
         effort = const_effort + feedforward + kp * (target_pos - current_pos) + kd * (target_vel - current_vel)
     """
 
+    PARAMETERS: ClassVar[tuple[str, ...]] = ("kp", "kd", "const_effort")
+
     SHARED_PARAMS: ClassVar[set[str]] = {"output_space"}
 
     @classmethod

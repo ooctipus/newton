@@ -122,6 +122,8 @@ class DrivePID(DriveBase):
     :meth:`prepare_implicit`); the rest solves as :class:`DrivePD`.
     """
 
+    PARAMETERS: ClassVar[tuple[str, ...]] = ("kp", "ki", "kd", "integral_max", "const_effort")
+
     @dataclass
     class State(DriveBase.State):
         """Integral state for the PID drive."""

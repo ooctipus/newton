@@ -6998,5 +6998,89 @@ class TestControlTargetAttrDefaults(unittest.TestCase):
         self.assertEqual(actuator.control_target_vel_attr, "my_vel")
 
 
+class TestActuatorSlotSpecs(unittest.TestCase):
+    """Actuators and their components declare their per-slot arrays, and an actuator resizes to new slots."""
+
+    def test_declared_arrays_cover_the_builder_arguments(self):
+        """Every per-slot argument the builder batches for a component is one of its declared arrays."""
+        components = (
+            (DrivePD, {"kp": 1.0, "kd": 0.1, "const_effort": 0.5}),
+            (DrivePID, {"kp": 1.0, "ki": 0.1, "kd": 0.1, "integral_max": 1.0, "const_effort": 0.5}),
+            (ClampingMaxEffort, {"max_effort": 1.0}),
+            (ClampingDCMotor, {"saturation_effort": 2.0, "velocity_limit": 1.0, "max_motor_effort": 1.0}),
+            (ClampingPositionBased, {"lookup_positions": (0.0, 1.0), "lookup_efforts": (1.0, 1.0)}),
+            (
+                ClampingCurrentDuty,
+                {
+                    "max_current": 1.0,
+                    "kt_estimate": 0.5,
+                    "resistance_estimate": 1.0,
+                    "voltage_source": ClampingCurrentDuty.VoltageSource.NOMINAL,
+                    "nominal_voltage": 12.0,
+                },
+            ),
+            (InputProcessorDelay, {"delay_steps": 2}),
+            (InputProcessorEncoder, {"output_joint": 0}),
+            (MotorDC, {"kt": 1.0, "resistance": 1.0, "vin": 12.0}),
+        )
+        for component, arguments in components:
+            with self.subTest(component=component.__name__):
+                specs = component.attribute_specs()
+                per_slot = set(component.resolve_arguments(arguments)) - component.SHARED_PARAMS
+                joint_parameters = getattr(component, "JOINT_PARAMS", set())
+                indices = {joint + suffix for joint in joint_parameters for suffix in ("_indices", "_pos_indices")}
+                self.assertEqual(per_slot - joint_parameters, set(component.PARAMETERS))
+                self.assertEqual(set(specs), set(component.PARAMETERS) | indices)
+                self.assertTrue(all(spec.frequency == "actuator_slot" for spec in specs.values()))
+                self.assertEqual(
+                    {name: spec.references for name, spec in specs.items() if spec.references is not None},
+                    {
+                        name: newton.Model.AttributeFrequency.JOINT_DOF
+                        if name.endswith("_indices") and not name.endswith("_pos_indices")
+                        else newton.Model.AttributeFrequency.JOINT_COORD
+                        for name in indices
+                    },
+                )
+
+    def test_finalize_sizes_an_actuator_for_new_slots(self):
+        """Assigning copies of an actuator's declared slot arrays and finalizing steps every copy."""
+        device = wp.get_device("cpu")
+
+        def array(values, dtype=wp.float32):
+            return wp.array(values, dtype=dtype, device=device)
+
+        actuator = Actuator(
+            indices=array([0, 1], wp.uint32),
+            drive=DrivePID(
+                kp=array([2.0, 3.0]), ki=array([0.0, 0.0]), kd=array([0.0, 0.0]), integral_max=array([1.0, 1.0])
+            ),
+            input_processors=[InputProcessorDelay(delay_steps=array([1, 1], wp.int32))],
+            clamping=[ClampingMaxEffort(max_effort=array([1.5, 10.0]))],
+        )
+        for part in (actuator, *actuator.components):
+            for name, spec in part.attribute_specs().items():
+                value = getattr(part, name)
+                if value is None:
+                    continue
+                copied = np.tile(value.numpy(), 2)
+                if spec.references is not None:
+                    copied[2:] += 2
+                setattr(part, name, wp.array(copied, dtype=value.dtype, device=device))
+        actuator.finalize()
+
+        self.assertEqual(actuator.num_actuators, 4)
+        np.testing.assert_array_equal(actuator.pos_indices.numpy(), [0, 1, 2, 3])
+        state_a, state_b = actuator.state(), actuator.state()
+        sim_state = types.SimpleNamespace(joint_q=array([0.0] * 4), joint_qd=array([0.0] * 4))
+        sim_control = types.SimpleNamespace(
+            joint_target_q=array([1.0] * 4), joint_target_qd=array([0.0] * 4), joint_act=None, joint_f=array([0.0] * 4)
+        )
+        for _ in range(2):
+            sim_control.joint_f.zero_()
+            actuator.step(sim_state, sim_control, state_a, state_b, dt=0.01)
+            state_a, state_b = state_b, state_a
+        np.testing.assert_allclose(sim_control.joint_f.numpy(), [1.5, 3.0, 1.5, 3.0])
+
+
 if __name__ == "__main__":
     unittest.main()

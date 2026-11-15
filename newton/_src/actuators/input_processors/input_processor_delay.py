@@ -6,7 +6,7 @@ from __future__ import annotations
 import inspect
 import warnings
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 import warp as wp
@@ -146,6 +146,8 @@ class InputProcessorDelay(InputProcessorBase):
     is clamped to the available history so the oldest available entry is
     returned.
     """
+
+    PARAMETERS: ClassVar[tuple[str, ...]] = ("delay_steps",)
 
     @dataclass
     class State(InputProcessorBase.State):

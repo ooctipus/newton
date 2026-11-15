@@ -218,12 +218,15 @@ class ClampingPositionBased(ClampingBase):
         """Called by :class:`Actuator` after construction.
 
         Reads the lookup table from file (if a path was given) and
-        allocates device arrays.
+        allocates device arrays the first time; later calls keep the table.
 
         Args:
             device: Warp device to use.
             num_actuators: Number of actuators (DOFs).
         """
+        self._num_actuators = num_actuators
+        if self.lookup_positions is not None:
+            return
         if self._lookup_table_path is not None:
             positions, efforts = self._read_lookup_table(self._lookup_table_path)
             self._lookup_table_path = None
@@ -236,7 +239,6 @@ class ClampingPositionBased(ClampingBase):
         self.lookup_size = len(positions)
         self.lookup_positions = wp.array(np.array(positions, dtype=np.float32), dtype=wp.float32, device=device)
         self.lookup_efforts = wp.array(np.array(efforts, dtype=np.float32), dtype=wp.float32, device=device)
-        self._num_actuators = num_actuators
 
     evaluate_clamp = _evaluate_position_based_clamp
 

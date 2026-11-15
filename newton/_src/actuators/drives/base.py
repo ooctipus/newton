@@ -6,12 +6,16 @@ from __future__ import annotations
 import inspect
 from dataclasses import dataclass
 from functools import wraps
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import warp as wp
 
 from ...utils.deprecation import warn_deprecation
+from ..slots import slot_attribute_specs
 from ..space import DriveOutputSpace
+
+if TYPE_CHECKING:
+    from ...sim.model import Model
 
 _COMPUTE_FORCES_DEPRECATION_MSG = (
     "The forces argument of DriveBase.compute() is deprecated in Newton 1.9; use output instead."
@@ -77,6 +81,18 @@ class DriveBase:
             """
 
     SHARED_PARAMS: ClassVar[set[str]] = set()
+
+    PARAMETERS: ClassVar[tuple[str, ...]] = ()
+    """Per-slot parameter arrays, each a constructor argument and attribute of the same name (``None`` when unset)."""
+
+    @classmethod
+    def attribute_specs(cls) -> dict[str, Model.AttributeSpec]:
+        """Return the frequency and references of the drive's per-slot arrays.
+
+        Rows are the slots of the actuator (``"actuator_slot"``). An actuator built from copies of its slots assigns
+        the copied arrays and calls :meth:`Actuator.finalize() <newton.actuators.Actuator.finalize>`.
+        """
+        return slot_attribute_specs(cls.PARAMETERS)
 
     output_space: DriveOutputSpace = DriveOutputSpace.EFFORT
     """Output units; configurable drives may select DUTY when paired with a motor.
