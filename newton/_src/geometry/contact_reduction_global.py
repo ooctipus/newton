@@ -2350,13 +2350,8 @@ def create_export_reduced_contacts_kernel(writer_func: Any, *, clear_after_expor
             winners locally. This experimental mapping requires ``wp.launch``
             and a thread count in place of the tiled mapping's block count.
     """
-    _module = f"export_reduced_contacts_{writer_func.__name__}"
-    if clear_after_export:
-        _module += "_cleanup"
-    if compact:
-        _module += "_compact"
 
-    @wp.func
+    @wp.func(module="unique")
     def export_contact_id(
         contact_id: int,
         position_depth: wp.array[wp.vec4],
@@ -2400,7 +2395,7 @@ def create_export_reduced_contacts_kernel(writer_func: Any, *, clear_after_expor
     if compact:
         winner_values = wp.types.vector(length=VALUES_PER_KEY, dtype=wp.uint64)
 
-        @wp.kernel(enable_backward=False, module=_module)
+        @wp.kernel(enable_backward=False, module="unique")
         def export_compact_contacts_kernel(
             ht_keys: wp.array[wp.uint64],
             ht_values: wp.array[wp.uint64],
@@ -2472,7 +2467,7 @@ def create_export_reduced_contacts_kernel(writer_func: Any, *, clear_after_expor
 
         return export_compact_contacts_kernel
 
-    @wp.kernel(enable_backward=False, module=_module)
+    @wp.kernel(enable_backward=False, module="unique")
     def export_reduced_contacts_kernel(
         ht_keys: wp.array[wp.uint64],
         ht_values: wp.array[wp.uint64],

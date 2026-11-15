@@ -226,7 +226,7 @@ class ConvexPairQueryData:
 def create_prepare_convex_pair(external_aabb: bool, speculative: bool = False):
     """Create pair preparation shared by the split convex-contact kernels."""
 
-    @wp.func
+    @wp.func(module="unique")
     def prepare_convex_pair(
         pair: wp.vec2i,
         shape_types: wp.array[int],
@@ -538,7 +538,7 @@ def create_narrow_phase_primitive_kernel(
             )
         return contact_passes_gap_check(contact_data)
 
-    @wp.kernel(enable_backward=False, module=_module)
+    @wp.kernel(enable_backward=False, module="unique")
     def narrow_phase_primitive_kernel(
         candidate_pair: wp.array[wp.vec2i],
         candidate_pair_count: wp.array[int],
@@ -1247,13 +1247,10 @@ def create_narrow_phase_kernel_gjk_mpr(
     The remaining pairs are complex convex-convex (plane-box, plane-cylinder,
     plane-cone, box-box, cylinder-cylinder, etc.) that need GJK/MPR.
     """
-    _sf = support_func.__name__ if support_func is not None else "default"
-    _ppc = post_process_contact.__name__ if post_process_contact is not None else "default"
-    _module = f"narrow_phase_gjk_mpr_{external_aabb}_{speculative}_{writer_func.__name__}_{_sf}_{_ppc}"
     accelerated_support = support_func in (support_map_accelerated, support_map_lean_accelerated)
     provider_type = AcceleratedSupportMapDataProvider if accelerated_support else SupportMapDataProvider
 
-    @wp.kernel(enable_backward=False, module=_module)
+    @wp.kernel(enable_backward=False, module="unique")
     def narrow_phase_kernel_gjk_mpr(
         candidate_pair: wp.array[wp.vec2i],
         candidate_pair_count: wp.array[int],
@@ -1469,13 +1466,10 @@ def create_narrow_phase_kernels_gjk_mpr_split(
     write_result = create_write_convex_query_result(
         support_func, writer_func, post_process_contact, use_precomputed_center=True
     )
-    suffix = (
-        f"{external_aabb}_{writer_func.__name__}_{support_func.__name__}_{post_process_contact.__name__}_{speculative}"
-    )
     accelerated_support = support_func in (support_map_accelerated, support_map_lean_accelerated)
     provider_type = AcceleratedSupportMapDataProvider if accelerated_support else SupportMapDataProvider
 
-    @wp.kernel(enable_backward=False, module=f"narrow_phase_mpr_{suffix}")
+    @wp.kernel(enable_backward=False, module="unique")
     def narrow_phase_mpr_kernel(
         candidate_pair: wp.array[wp.vec2i],
         candidate_pair_count: wp.array[int],
@@ -1562,7 +1556,7 @@ def create_narrow_phase_kernels_gjk_mpr_split(
             _append_work_index_compacted(needs_gjk, pair_index, gjk_work_items, gjk_work_count)
             _append_work_index_compacted(needs_manifold, pair_index, manifold_work_items, manifold_work_count)
 
-    @wp.kernel(enable_backward=False, module=f"narrow_phase_gjk_{suffix}")
+    @wp.kernel(enable_backward=False, module="unique")
     def narrow_phase_gjk_kernel(
         candidate_pair: wp.array[wp.vec2i],
         shape_types: wp.array[int],
@@ -1631,7 +1625,7 @@ def create_narrow_phase_kernels_gjk_mpr_split(
                     needs_manifold = True
             _append_work_index_compacted(needs_manifold, pair_index, manifold_work_items, manifold_work_count)
 
-    @wp.kernel(enable_backward=False, module=f"narrow_phase_manifold_{suffix}")
+    @wp.kernel(enable_backward=False, module="unique")
     def narrow_phase_manifold_kernel(
         candidate_pair: wp.array[wp.vec2i],
         shape_types: wp.array[int],
@@ -2046,7 +2040,6 @@ def create_narrow_phase_process_mesh_triangle_contacts_kernel(
     if heightfields_only:
         # Heightfield triangles only, beside the mesh triangles' own kernels.
         suffix += "_heightfields"
-    _module = f"narrow_phase_mesh_tri_{writer_func.__name__}_{convex_support_acceleration}{suffix}"
     support_func = support_map_accelerated_inline if convex_support_acceleration else support_map_inline
     provider_type = AcceleratedSupportMapDataProvider if convex_support_acceleration else SupportMapDataProvider
     compute_contacts = create_compute_gjk_mpr_contacts(
@@ -2261,7 +2254,7 @@ def create_narrow_phase_process_mesh_triangle_contacts_kernel(
     name = "narrow_phase_process_mesh_triangle_contacts_kernel" + suffix
     narrow_phase_process_mesh_triangle_contacts_kernel.__name__ = name
     narrow_phase_process_mesh_triangle_contacts_kernel.__qualname__ = name
-    return wp.kernel(narrow_phase_process_mesh_triangle_contacts_kernel, enable_backward=False, module=_module)
+    return wp.kernel(narrow_phase_process_mesh_triangle_contacts_kernel, enable_backward=False, module="unique")
 
 
 @wp.kernel(enable_backward=False)
@@ -2354,9 +2347,8 @@ def create_narrow_phase_process_mesh_plane_contacts_kernel(
     Returns:
         A warp kernel that processes mesh-plane collisions
     """
-    _module = f"narrow_phase_mesh_plane_{writer_func.__name__}_{reduce_contacts}"
 
-    @wp.kernel(enable_backward=False, module=_module)
+    @wp.kernel(enable_backward=False, module="unique")
     def narrow_phase_process_mesh_plane_contacts_kernel(
         shape_data: wp.array[wp.vec4],
         shape_transform: wp.array[wp.transform],
@@ -2462,7 +2454,7 @@ def create_narrow_phase_process_mesh_plane_contacts_kernel(
     if not reduce_contacts:
         return narrow_phase_process_mesh_plane_contacts_kernel
 
-    @wp.kernel(enable_backward=False, module=_module)
+    @wp.kernel(enable_backward=False, module="unique")
     def narrow_phase_process_mesh_plane_contacts_reduce_kernel(
         shape_data: wp.array[wp.vec4],
         shape_transform: wp.array[wp.transform],
