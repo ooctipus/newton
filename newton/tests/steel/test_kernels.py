@@ -446,7 +446,7 @@ def test_unconverted_equality_constraints_raise(test, device):
     builder = newton.ModelBuilder()
     builder.add_mjcf(mjcf, convert_mjc_equality_constraints=False)
     imported = builder.finalize(device=device)
-    test.assertEqual(imported.mujoco.equality_constraint_count, 1)
+    test.assertEqual(imported.attribute_frequency_count("mujoco:equality_constraint"), 1)
     with test.assertRaisesRegex(NotImplementedError, "equality"):
         SolverSteel(imported)
 

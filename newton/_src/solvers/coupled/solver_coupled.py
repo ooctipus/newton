@@ -1999,7 +1999,7 @@ class SolverCoupled(SolverBase, CouplingInterface):
             exclude=range_attributes,
             free_root_joints=free_root_joints,
         )
-        self._sync_custom_frequency_namespace_metadata(view)
+        self._set_custom_frequency_world_starts(view)
 
         view.joint_q_start = wp.array(
             self._rebased_joint_starts(model.joint_q_start.numpy(), joint_order, _FREE_JOINT_COORD_COUNT),
@@ -2631,31 +2631,26 @@ class SolverCoupled(SolverBase, CouplingInterface):
             return remapped.tolist()
         return value
 
-    def _sync_custom_frequency_namespace_metadata(self, view: ModelView) -> None:
-        overrides = object.__getattribute__(view, "_overrides")
-        for frequency, count in view.custom_frequency_counts.items():
-            if ":" not in frequency:
+    def _set_custom_frequency_world_starts(self, view: ModelView) -> None:
+        """Rebuild the declared world starts of custom frequencies from the view's rows and their worlds."""
+        specs = dict(self.model._iter_attribute_specs())
+        for name, spec in specs.items():
+            if spec.compaction_policy != "world_start" or not isinstance(spec.frequency, str):
                 continue
-            namespace_name, frequency_name = frequency.split(":", 1)
-            namespace = overrides.get(namespace_name)
-            if namespace is None:
-                continue
-            setattr(namespace, f"{frequency_name}_count", int(count))
-
-        for attribute in self._attribute_projections:
-            if not isinstance(attribute.frequency, str) or attribute.references != self.model.AttributeFrequency.WORLD:
-                continue
-            world = self._view_attribute_value(view, attribute.name)
+            world_name = next(
+                (
+                    other
+                    for other, other_spec in specs.items()
+                    if other_spec.frequency == spec.frequency
+                    and other_spec.reference_domain == self.model.AttributeFrequency.WORLD
+                ),
+                None,
+            )
+            world = None if world_name is None else self._view_attribute_value(view, world_name)
             if not isinstance(world, wp.array):
                 continue
-            count = int(view.custom_frequency_counts[attribute.frequency])
-            if ":" in attribute.name:
-                namespace_name, attr_name = attribute.name.split(":", 1)
-                namespace = overrides.get(namespace_name)
-                if namespace is not None:
-                    setattr(namespace, f"{attr_name}_start", self._world_start_array(world, count))
-            elif hasattr(self.model, f"{attribute.name}_start"):
-                setattr(view, f"{attribute.name}_start", self._world_start_array(world, count))
+            count = int(view.custom_frequency_counts[spec.frequency])
+            self._set_view_attribute_value(view, name, self._world_start_array(world, count))
 
     def _select_attribute_value(
         self,

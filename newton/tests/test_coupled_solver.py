@@ -4759,7 +4759,7 @@ class TestSolverCoupledVBDColoring(unittest.TestCase):
         self.assertEqual(view.vbd.joint_is_hard.shape[0], view.joint_count)
         np.testing.assert_array_equal(view.vbd.joint_is_hard.numpy(), parent_joint_is_hard[vbd_joint_order])
 
-    def test_compacted_custom_frequency_namespace_metadata_is_generic(self):
+    def test_compacted_custom_frequency_world_starts_follow_declarations(self):
         builder = newton.ModelBuilder()
         for _ in range(4):
             builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)))
@@ -4787,12 +4787,11 @@ class TestSolverCoupledVBDColoring(unittest.TestCase):
 
         view = coupled.view("dst")
         self.assertEqual(view.custom_frequency_counts["mujoco:equality_constraint"], 1)
-        self.assertEqual(view.mujoco.equality_constraint_count, 1)
+        self.assertEqual(view.attribute_frequency_count("mujoco:equality_constraint"), 1)
         self.assertEqual(view.mujoco.equality_constraint_type.shape[0], 1)
         np.testing.assert_array_equal(view.mujoco.equality_constraint_body1.numpy(), np.array([0], dtype=np.int32))
         np.testing.assert_array_equal(view.mujoco.equality_constraint_body2.numpy(), np.array([1], dtype=np.int32))
-        self.assertEqual(int(view.mujoco.equality_constraint_world_start.numpy()[-1]), 1)
-        self.assertNotIn("equality_constraint_count", view.overrides)
+        np.testing.assert_array_equal(view.mujoco.equality_constraint_world_start.numpy(), [1, 1, 1])
         self.assertNotIn("equality_constraint_body1", view.overrides)
 
     def test_metadata_projects_nonprefix_custom_references(self):
@@ -4909,9 +4908,8 @@ class TestSolverCoupledVBDColoring(unittest.TestCase):
         self.assertIn("test:linkage_history", "\n".join(logs.output))
         view = coupled.view("dst")
 
-        self.assertEqual(view.test.linkage_count, 2)
-        self.assertEqual(view.test.entity_count, 2)
-        self.assertEqual(view.test.link_count, 2)
+        for frequency in ("test:linkage", "test:entity", "test:link"):
+            self.assertEqual(view.attribute_frequency_count(frequency), 2)
         np.testing.assert_array_equal(view.test.linkage_body0.numpy(), [0, -1])
         np.testing.assert_array_equal(view.test.linkage_body1.numpy(), [1, 0])
         np.testing.assert_array_equal(view.test.linkage_bodies.numpy(), [[0, 1], [-1, 0]])
@@ -5056,11 +5054,10 @@ class TestSolverCoupledVBDColoring(unittest.TestCase):
         )
         view = coupled.view("dst")
 
-        self.assertEqual(view.test.node_count, 2)
+        self.assertEqual(view.attribute_frequency_count("test:node"), 2)
         np.testing.assert_array_equal(view.test.node_body.numpy(), [0, 1])
         np.testing.assert_array_equal(view.test.environment.numpy(), [0, 1])
         np.testing.assert_allclose(view.test.node_value.numpy(), [1.0, 1.0])
-        np.testing.assert_array_equal(view.test.environment_start.numpy(), [0, 1, 2, 2])
 
 
 add_function_test(

@@ -5005,7 +5005,7 @@ class TestImportSampleAssetsParsing(unittest.TestCase):
                 self.assertEqual(optional_runtime_imports, [])
 
                 model = builder.finalize()
-                self.assertEqual(model.mujoco.equality_constraint_count, 3)
+                self.assertEqual(model.attribute_frequency_count("mujoco:equality_constraint"), 3)
                 self.assertEqual(model.constraint_mimic_count, int(convert_equalities))
                 self.assertEqual(model.custom_frequency_counts.get("mujoco:actuator", 0), int(register_mujoco))
 
@@ -8705,7 +8705,7 @@ def Xform "Articulation" (
         result = builder.add_usd(stage, convert_mjc_equality_constraints=False)
         model = builder.finalize()
 
-        self.assertEqual(model.mujoco.equality_constraint_count, 2)
+        self.assertEqual(model.attribute_frequency_count("mujoco:equality_constraint"), 2)
         eq_by_label = {label: i for i, label in enumerate(model.mujoco.equality_constraint_label)}
         joint1_eq = eq_by_label["/World/Articulation/Joint1"]
         joint2_eq = eq_by_label["/World/Articulation/Joint2"]
@@ -8799,7 +8799,7 @@ def Xform "Articulation" (
         result = builder.add_usd(stage, convert_mjc_equality_constraints=False)
         model = builder.finalize()
 
-        self.assertEqual(model.mujoco.equality_constraint_count, 1)
+        self.assertEqual(model.attribute_frequency_count("mujoco:equality_constraint"), 1)
         joint1_idx = result["path_joint_map"]["/World/Articulation/Joint1"]
         joint2_idx = result["path_joint_map"]["/World/Articulation/Joint2"]
         self.assertEqual(model.mujoco.equality_constraint_joint1.numpy()[0], joint2_idx)
@@ -8867,7 +8867,7 @@ def Xform "Articulation" (
         builder.add_usd(build_stage(), convert_mjc_equality_constraints=False)
         model = builder.finalize()
 
-        self.assertEqual(model.mujoco.equality_constraint_count, 1)
+        self.assertEqual(model.attribute_frequency_count("mujoco:equality_constraint"), 1)
         self.assertFalse(bool(model.mujoco.equality_constraint_enabled.numpy()[0]))
 
         # The default path additionally lowers a generic mimic constraint, which would
@@ -8877,7 +8877,7 @@ def Xform "Articulation" (
         builder.add_usd(build_stage(), convert_mjc_equality_constraints=True)
         model = builder.finalize()
 
-        self.assertEqual(model.mujoco.equality_constraint_count, 1)
+        self.assertEqual(model.attribute_frequency_count("mujoco:equality_constraint"), 1)
         self.assertFalse(bool(model.mujoco.equality_constraint_enabled.numpy()[0]))
         self.assertEqual(model.constraint_mimic_count, 1)
         self.assertFalse(bool(model.constraint_mimic_enabled.numpy()[0]))
@@ -8971,7 +8971,7 @@ def Xform "Articulation" (
         self.assertEqual(model.joint_count, 2)
         self.assertEqual(model.joint_dof_count, 12)
         self.assertEqual(model.joint_coord_count, 14)
-        self.assertEqual(model.mujoco.equality_constraint_count, 2)
+        self.assertEqual(model.attribute_frequency_count("mujoco:equality_constraint"), 2)
         eq_by_label = {label: i for i, label in enumerate(model.mujoco.equality_constraint_label)}
         site_eq = eq_by_label["/World/EqualityConnect"]
         world_eq = eq_by_label["/World/EqualityConnectBodyToWorld"]
@@ -9031,14 +9031,14 @@ def Xform "Articulation" (
         builder.add_usd(stage, convert_mjc_equality_constraints=False)
         model = builder.finalize()
 
-        self.assertEqual(model.mujoco.equality_constraint_count, 0)
+        self.assertEqual(model.attribute_frequency_count("mujoco:equality_constraint"), 0)
 
         builder = newton.ModelBuilder()
         SolverMuJoCo.register_custom_attributes(builder)
         builder.add_usd(stage, only_load_enabled_joints=False, convert_mjc_equality_constraints=False)
         model = builder.finalize()
 
-        self.assertEqual(model.mujoco.equality_constraint_count, 1)
+        self.assertEqual(model.attribute_frequency_count("mujoco:equality_constraint"), 1)
         self.assertFalse(bool(model.mujoco.equality_constraint_enabled.numpy()[0]))
 
     @requires("pxr.Usd")
@@ -9114,7 +9114,7 @@ def Xform "Articulation" (
         self.assertEqual(model.joint_count, 2)
         self.assertEqual(model.joint_dof_count, 12)
         self.assertEqual(model.joint_coord_count, 14)
-        self.assertEqual(model.mujoco.equality_constraint_count, 2)
+        self.assertEqual(model.attribute_frequency_count("mujoco:equality_constraint"), 2)
         weld_eq = model.mujoco.equality_constraint_label.index("/World/EqualityWeld")
         world_eq = model.mujoco.equality_constraint_label.index("/World/EqualityWeldBodyToWorld")
         body0_idx = result["path_body_map"]["/World/Body0"]
@@ -9429,7 +9429,7 @@ def Xform "Articulation" (
         converted_model = converted_builder.finalize()
         converted_solver = SolverMuJoCo(converted_model)
 
-        self.assertEqual(converted_model.mujoco.equality_constraint_count, 3)
+        self.assertEqual(converted_model.attribute_frequency_count("mujoco:equality_constraint"), 3)
         self.assertEqual(converted_model.constraint_mimic_count, 1)
         eq_types = converted_model.mujoco.equality_constraint_type.numpy()
         target_kinds = converted_model.mujoco.equality_constraint_target_kind.numpy()

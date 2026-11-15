@@ -17164,10 +17164,10 @@ class ModelBuilder:
                 setattr(m, f"{family}_count", len(labels))
                 setattr(m, f"{family}_world", wp.array(getattr(self, f"{family}_world"), dtype=wp.int32))
                 for suffix in references:
-                    setattr(m, f"{family}_{suffix}", wp.array(getattr(self, f"_{family}_{suffix}"), dtype=wp.int32))
+                    setattr(m, f"{family}_{suffix}", wp.array(getattr(self, f"{family}_{suffix}"), dtype=wp.int32))
 
             # ---------------------
-            # Ensure the ``mujoco`` namespace exists so the equality-constraint count (set below)
+            # Ensure the ``mujoco`` namespace exists so the equality-constraint world starts (set below)
             # can live on it. The per-row ``equality_constraint_*`` arrays are materialized by the
             # standard custom-attribute pipeline below, which is exempted from the zero-count skip
             # for this frequency so the arrays stay shape-stable (empty) even with no constraints.
@@ -17215,8 +17215,11 @@ class ModelBuilder:
             m.muscle_count = len(self.muscle_start)
             m.muscle_point_count = len(self.muscle_bodies)
             m.articulation_count = len(self.articulation_start)
-            m.mujoco.equality_constraint_count = self._equality_constraint_count
             m.mujoco.equality_constraint_world_start = wp.array(self._equality_constraint_world_start, dtype=wp.int32)
+            m._set_attribute_spec(
+                "mujoco:equality_constraint_world_start",
+                Model.AttributeSpec("mujoco:equality_constraint", compaction_policy="world_start"),
+            )
             m.constraint_mimic_count = len(self.constraint_mimic_joint0)
             m.actuator_count = self.actuator_count
             m.build_soft_mesh_adjacency()

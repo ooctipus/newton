@@ -502,7 +502,7 @@ def test_imported_connect_equality_is_enforced(test, device):
         else:
             b.add_mjcf(mjcf, convert_mjc_equality_constraints=False)
         model = b.finalize(device=device)
-        test.assertEqual(model.mujoco.equality_constraint_count, 1)
+        test.assertEqual(model.attribute_frequency_count("mujoco:equality_constraint"), 1)
         if not convert:
             with test.assertRaisesRegex(NotImplementedError, "equality"):
                 SolverSteel(model)

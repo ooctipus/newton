@@ -6428,7 +6428,7 @@ class TestImportMjcfActuatorsFrames(unittest.TestCase):
         builder.add_mjcf(mjcf, convert_mjc_equality_constraints=False)
         model = builder.finalize()
 
-        self.assertEqual(model.mujoco.equality_constraint_count, 2)
+        self.assertEqual(model.attribute_frequency_count("mujoco:equality_constraint"), 2)
 
     @requires(*MUJOCO_MODULES)
     def test_tendon_equality_matches_native_mujoco(self):
@@ -6469,7 +6469,7 @@ class TestImportMjcfActuatorsFrames(unittest.TestCase):
 
         builder = newton.ModelBuilder()
         builder.add_mjcf(mjcf, skip_equality_constraints=True)
-        self.assertEqual(builder.finalize().mujoco.equality_constraint_count, 0)
+        self.assertEqual(builder.finalize().attribute_frequency_count("mujoco:equality_constraint"), 0)
 
     def test_actuatorfrcrange_parsing(self):
         """Test that actuatorfrcrange is parsed from MJCF joint attributes and applied to joint effort limits."""
@@ -6587,7 +6587,9 @@ class TestImportMjcfActuatorsFrames(unittest.TestCase):
         self.assertTrue(hasattr(model.mujoco, "eq_solref"), "Model should have eq_solref attribute")
 
         eq_solref = model.mujoco.eq_solref.numpy()
-        self.assertEqual(model.mujoco.equality_constraint_count, 3, "Should have 3 equality constraints")
+        self.assertEqual(
+            model.attribute_frequency_count("mujoco:equality_constraint"), 3, "Should have 3 equality constraints"
+        )
 
         # Note: Newton parses equality constraints in type order: connect, then weld, then joint
         # So the order is: connect (default), weld (0.03, 0.8), weld (0.05, 1.2)
@@ -6632,7 +6634,7 @@ class TestImportMjcfActuatorsFrames(unittest.TestCase):
         builder.add_mjcf(mjcf, convert_mjc_equality_constraints=False)
         model = builder.finalize()
 
-        self.assertEqual(model.mujoco.equality_constraint_count, 1)
+        self.assertEqual(model.attribute_frequency_count("mujoco:equality_constraint"), 1)
         eq_solref = model.mujoco.eq_solref.numpy()[0].tolist()
         self.assertAlmostEqual(eq_solref[0], 0.005, places=6)
         self.assertAlmostEqual(eq_solref[1], 1.0, places=6)
@@ -6679,7 +6681,7 @@ class TestImportMjcfActuatorsFrames(unittest.TestCase):
         converted_model = converted_builder.finalize()
         converted_solver = SolverMuJoCo(converted_model)
 
-        self.assertEqual(converted_model.mujoco.equality_constraint_count, 3)
+        self.assertEqual(converted_model.attribute_frequency_count("mujoco:equality_constraint"), 3)
         self.assertEqual(converted_model.constraint_mimic_count, 1)
         np.testing.assert_array_equal(
             converted_model.mujoco.equality_constraint_type.numpy(),
@@ -6949,7 +6951,7 @@ class TestImportMjcfActuatorsFrames(unittest.TestCase):
             parse_mjcf(builder, mjcf)
         model = builder.finalize()
 
-        self.assertEqual(model.mujoco.equality_constraint_count, 3)
+        self.assertEqual(model.attribute_frequency_count("mujoco:equality_constraint"), 3)
         self.assertEqual(model.constraint_mimic_count, 1)
         self.assertTrue(hasattr(model, "mujoco"))
         self.assertTrue(hasattr(model.mujoco, "equality_constraint_target_kind"))

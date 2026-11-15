@@ -4096,8 +4096,10 @@ class TestMuJoCoSolverEqualityConstraintProperties(unittest.TestCase):
         model = builder.finalize()
         self.assertTrue(hasattr(model, "mujoco"))
         self.assertTrue(hasattr(model.mujoco, "eq_solref"))
-        self.assertEqual(model.mujoco.equality_constraint_count, world_count)  # 1 constraint per world
-        total_eq = model.mujoco.equality_constraint_count
+        self.assertEqual(
+            model.attribute_frequency_count("mujoco:equality_constraint"), world_count
+        )  # 1 constraint per world
+        total_eq = model.attribute_frequency_count("mujoco:equality_constraint")
         initial_values_solref = np.zeros((total_eq, 2), dtype=np.float32)
         for i in range(total_eq):
             # Unique pattern for 2-element solref
@@ -4108,8 +4110,10 @@ class TestMuJoCoSolverEqualityConstraintProperties(unittest.TestCase):
         model.mujoco.eq_solref.assign(initial_values_solref)
         self.assertTrue(hasattr(model, "mujoco"))
         self.assertTrue(hasattr(model.mujoco, "eq_solimp"))
-        self.assertEqual(model.mujoco.equality_constraint_count, world_count)  # 1 constraint per world
-        total_eq = model.mujoco.equality_constraint_count
+        self.assertEqual(
+            model.attribute_frequency_count("mujoco:equality_constraint"), world_count
+        )  # 1 constraint per world
+        total_eq = model.attribute_frequency_count("mujoco:equality_constraint")
         initial_values_solimp = np.zeros((total_eq, 5), dtype=np.float32)
         for i in range(total_eq):
             # Unique pattern for 5-element solimp (dmin, dmax, width, midpoint, power)
@@ -4386,14 +4390,18 @@ class TestMuJoCoSolverEqualityConstraintProperties(unittest.TestCase):
             ],
             dtype=np.float32,
         )
-        model.mujoco.equality_constraint_anchor.assign(new_anchors[: model.mujoco.equality_constraint_count])
+        model.mujoco.equality_constraint_anchor.assign(
+            new_anchors[: model.attribute_frequency_count("mujoco:equality_constraint")]
+        )
 
         # Update torquescale for WELD constraints
         new_torquescale = np.array([0.0, 0.9, 0.0, 0.0, 0.8, 0.0], dtype=np.float32)
-        model.mujoco.equality_constraint_torquescale.assign(new_torquescale[: model.mujoco.equality_constraint_count])
+        model.mujoco.equality_constraint_torquescale.assign(
+            new_torquescale[: model.attribute_frequency_count("mujoco:equality_constraint")]
+        )
 
         # Update relpose for WELD constraints
-        new_relpose = np.zeros((model.mujoco.equality_constraint_count, 7), dtype=np.float32)
+        new_relpose = np.zeros((model.attribute_frequency_count("mujoco:equality_constraint"), 7), dtype=np.float32)
         # Set new relpose for WELD constraint (index 1 in template, indices 1 and 4 after replication)
         new_trans = [0.11, 0.22, 0.33]
         new_quat_xyzw = [0.0, 0.0, 0.38268343, 0.92387953]  # 45 degrees around Z
@@ -4402,7 +4410,7 @@ class TestMuJoCoSolverEqualityConstraintProperties(unittest.TestCase):
         model.mujoco.equality_constraint_relpose.assign(new_relpose)
 
         # Update polycoef for JOINT constraints
-        new_polycoef = np.zeros((model.mujoco.equality_constraint_count, 5), dtype=np.float32)
+        new_polycoef = np.zeros((model.attribute_frequency_count("mujoco:equality_constraint"), 5), dtype=np.float32)
         # Set new polycoef for JOINT constraint (index 2 in template, indices 2 and 5 after replication)
         new_polycoef[2] = [1.1, 1.2, 1.3, 1.4, 1.5]
         new_polycoef[5] = [1.1, 1.2, 1.3, 1.4, 1.5]
@@ -4509,7 +4517,9 @@ class TestMuJoCoSolverEqualityConstraintProperties(unittest.TestCase):
         SolverMuJoCo.register_custom_attributes(builder)
         builder.replicate(template_builder, world_count)
         model = builder.finalize()
-        self.assertEqual(model.mujoco.equality_constraint_count, world_count)  # 1 constraint per world
+        self.assertEqual(
+            model.attribute_frequency_count("mujoco:equality_constraint"), world_count
+        )  # 1 constraint per world
         solver = SolverMuJoCo(model, iterations=1, disable_contacts=True)
         initial_eq_data = solver.mjw_model.eq_data.numpy().copy()
 
@@ -9053,7 +9063,7 @@ class TestMuJoCoArticulationConversion(unittest.TestCase):
         model = world_builder.finalize()
         solver = SolverMuJoCo(model, separate_worlds=True, kinematic_switchable_roots=False)
         self.assertEqual(model.joint_count, 4 * world_count)
-        self.assertEqual(model.mujoco.equality_constraint_count, 2 * world_count)
+        self.assertEqual(model.attribute_frequency_count("mujoco:equality_constraint"), 2 * world_count)
         self.assertEqual(solver.mj_model.nv, 3)
         # 2 explicit connect constraints + 1 weld from fixed loop joint
         self.assertEqual(solver.mj_model.neq, 3)

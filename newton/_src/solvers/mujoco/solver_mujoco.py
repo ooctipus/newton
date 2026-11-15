@@ -7459,7 +7459,9 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             selected_shapes = np.arange(model.shape_count, dtype=np.int32)
             selected_bodies = np.arange(model.body_count, dtype=np.int32)
             selected_joints = np.arange(model.joint_count, dtype=np.int32)
-            selected_constraints = np.arange(model.mujoco.equality_constraint_count, dtype=np.int32)
+            selected_constraints = np.arange(
+                model.attribute_frequency_count("mujoco:equality_constraint"), dtype=np.int32
+            )
             selected_mimic_constraints = np.arange(model.constraint_mimic_count, dtype=np.int32)
 
         legacy_mimic_followers = {int(mimic_joint0[i]) for i in selected_mimic_constraints}
@@ -9534,7 +9536,9 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             # Create mjc_eq_to_newton_eq: MuJoCo[world, eq] -> Newton equality constraint
             # selected_constraints[idx] is the Newton template constraint index
             neq = self.mj_model.neq
-            eq_constraints_per_world = model.mujoco.equality_constraint_count // model.world_count
+            eq_constraints_per_world = (
+                model.attribute_frequency_count("mujoco:equality_constraint") // model.world_count
+            )
             world_offsets = np.arange(nworld, dtype=np.int32)
             mjc_eq_to_newton_eq_np = np.full((nworld, neq), -1, dtype=np.int32)
             mjc_eq_to_newton_jnt_np = np.full((nworld, neq), -1, dtype=np.int32)
@@ -11257,7 +11261,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             that were projected to loop joints or mimic constraints during import.
             Generic loop closures synthesized directly from loop joints are updated
             by the joint-connect path."""
-        if self.model.mujoco.equality_constraint_count == 0:
+        if self.model.attribute_frequency_count("mujoco:equality_constraint") == 0:
             return
 
         neq = self.mj_model.neq
@@ -11628,7 +11632,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         # so models assembled without the standard pipeline still work.
         eq_constraint_world = (
             model.mujoco.equality_constraint_world.numpy()
-            if model.mujoco.equality_constraint_count > 0
+            if model.attribute_frequency_count("mujoco:equality_constraint") > 0
             else np.empty(0, dtype=np.int32)
         )
 
@@ -11769,7 +11773,9 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                     f"{references[0]}, but other worlds reference {references[1:].tolist()}."
                 )
 
-        constraints_per_world = (model.mujoco.equality_constraint_count // world_count) if world_count > 0 else 0
+        constraints_per_world = (
+            (model.attribute_frequency_count("mujoco:equality_constraint") // world_count) if world_count > 0 else 0
+        )
         if constraints_per_world > 0:
             eq_constraint_type = model.mujoco.equality_constraint_type.numpy()
             constraint_types_2d = eq_constraint_type.reshape(world_count, constraints_per_world)

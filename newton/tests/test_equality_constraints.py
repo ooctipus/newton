@@ -264,7 +264,7 @@ class TestEqualityConstraints(unittest.TestCase):
 
         # Check that equality constraints count is correct in the Newton model
         # Should be 2 constraints per world * 3 worlds = 6 total
-        self.assertEqual(model.mujoco.equality_constraint_count, 2 * world_count)
+        self.assertEqual(model.attribute_frequency_count("mujoco:equality_constraint"), 2 * world_count)
 
         # Create MuJoCo solver with separate_worlds=True
         solver = newton.solvers.SolverMuJoCo(
@@ -370,7 +370,7 @@ class TestEqualityConstraints(unittest.TestCase):
         """
         model = newton.ModelBuilder().finalize()
 
-        self.assertEqual(model.mujoco.equality_constraint_count, 0)
+        self.assertEqual(model.attribute_frequency_count("mujoco:equality_constraint"), 0)
 
         # Each per-row field must be present and read back as an empty (zero-row) array rather
         # than being absent. Vector-typed fields additionally keep their per-row width.
@@ -618,7 +618,7 @@ class TestEqualityConstraints(unittest.TestCase):
         model = builder.finalize()
         self.assertEqual(model.body_count, 3)
         self.assertEqual(model.joint_count, 3)
-        self.assertEqual(model.mujoco.equality_constraint_count, 5)
+        self.assertEqual(model.attribute_frequency_count("mujoco:equality_constraint"), 5)
 
     @requires(*MUJOCO_MODULES)
     def test_collapse_fixed_joints_keeps_a_satisfied_weld_satisfied(self):
@@ -741,7 +741,7 @@ class TestEqualityConstraints(unittest.TestCase):
 
         # After collapse the constraint should still be present and finalizable
         model = builder.finalize()
-        self.assertEqual(model.mujoco.equality_constraint_count, 1)
+        self.assertEqual(model.attribute_frequency_count("mujoco:equality_constraint"), 1)
 
 
 if __name__ == "__main__":

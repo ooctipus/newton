@@ -424,7 +424,7 @@ def _unprojected_equality_constraints(model: Model) -> np.ndarray:
     from ..mujoco.equality import MjcEqualityTargetKind  # noqa: PLC0415
 
     mujoco = getattr(model, "mujoco", None)
-    count = int(getattr(mujoco, "equality_constraint_count", 0) or 0) if mujoco is not None else 0
+    count = int(model.custom_frequency_counts.get("mujoco:equality_constraint", 0)) if mujoco is not None else 0
     enabled = getattr(mujoco, "equality_constraint_enabled", None) if count else None
     if enabled is None:
         return np.zeros(0, dtype=np.int32)
