@@ -195,7 +195,9 @@ class RowClass:
 
 
 _ROWS = """    const int line = first.data[world];
-    const int count = counts.data[world] < capacity ? counts.data[world] : capacity;
+    // A world none of whose rows can act holds them unwritten (.placement.WORLD_ACTS): it has none to read.
+    const int acting_rows = acts.shape[0] > 0 && acts.data[world] == 0 ? 0 : counts.data[world];
+    const int count = acting_rows < capacity ? acting_rows : capacity;
 $prologue
     for (int i = 0; i < count; ++i) {
 $row
@@ -206,11 +208,13 @@ $row
 
 @functools.cache
 def rows_kernel(cls: RowClass) -> wp.Kernel:
-    """Support class ``cls``'s velocity terms, a world a thread: row ``i``'s ``term`` into ``velocity[world, i]``."""
+    """Support class ``cls``'s velocity terms, a world a thread: row ``i``'s ``term`` into ``velocity[world, i]``; a
+    world none of whose rows can act (``acts``, :data:`.placement.WORLD_ACTS`) reads none, as :func:`audit_world`."""
     common = (
         ("first", wp.array[int]),
         ("counts", wp.array[int]),
         ("capacity", int),
+        ("acts", wp.array[int]),
         ("velocity", wp.array2d[float]),
     )
     return KernelTemplate(
@@ -636,7 +640,7 @@ class Audit:
         rows kernel of its support class, the sparse diagonal's fused limits, then the law."""
         solver, forest, placement = self.solver, self.solver.forest, self.solver.placement
         device, worlds, v = solver.model.device, forest.world_count, solver.v_out
-        first, capacity = placement.dense_first, placement.dense_max_constraints
+        first, capacity, acts = placement.dense_first, placement.dense_max_constraints, placement.world_acts
         # The walked rows (walk_rows) are in the walk's coordinates: their trees' coordinates are the walk's too.
         route = solver._plan.solve.name
         if route != "sparse_pgs" and placement.walks:
@@ -647,12 +651,12 @@ class Audit:
         wp.launch(
             rows_kernel(self.dense_class),
             dim=worlds,
-            inputs=[first, placement.constraint_count, capacity, self.velocity, *operands],
+            inputs=[first, placement.constraint_count, capacity, acts, self.velocity, *operands],
             device=device,
         )
         if self.walked_class is not None:
             walked = self._operands_of(self.walked_class, v)
-            inputs = [first, placement.constraint_count, capacity, self.velocity, *walked]
+            inputs = [first, placement.constraint_count, capacity, acts, self.velocity, *walked]
             wp.launch(rows_kernel(self.walked_class), dim=worlds, inputs=inputs, device=device)
         if route == "sparse_diagonal":
             limits = [
@@ -666,7 +670,7 @@ class Audit:
             ]
             wp.launch(fused_limits, dim=worlds, inputs=limits, outputs=[self.fused], device=device)
         if forest.has_free_rigid_bodies:
-            mf = [first, placement.mf_constraint_count, placement.mf_max_constraints, self.mf_velocity]
+            mf = [first, placement.mf_constraint_count, placement.mf_max_constraints, acts, self.mf_velocity]
             free = self._operands_of(free_class(), v)
             wp.launch(rows_kernel(free_class()), dim=worlds, inputs=[*mf, *free], device=device)
         inputs = [self._operands(), placement.row_seeds, int(placement.body_base)]
