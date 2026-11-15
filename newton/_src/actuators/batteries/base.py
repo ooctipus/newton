@@ -3,9 +3,12 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import warp as wp
+
+if TYPE_CHECKING:
+    from ...sim.model import Model
 
 
 class BatteryBase:
@@ -37,6 +40,27 @@ class BatteryBase:
     reading back array contents would force a synchronous device-to-host
     copy on every construction.
     """
+
+    PARAMETERS: ClassVar[tuple[str, ...]] = ()
+    """Per-battery parameter arrays, each a constructor argument and attribute of the same name."""
+
+    @classmethod
+    def attribute_specs(cls) -> dict[str, Model.AttributeSpec]:
+        """Return the frequency, world and references of the batteries' arrays.
+
+        Each array is a constructor argument of the same name (with ``world_count``), so copies of batteries are
+        built from their expanded arrays. Rows are batteries (``"battery"``) and the actuators they power
+        (``"battery_actuator"``).
+        """
+        from ...sim.model import Model  # noqa: PLC0415
+
+        specs = {
+            "actuator_start": Model.AttributeSpec("battery", references="battery_actuator", compaction_policy="start"),
+            "actuators": Model.AttributeSpec("battery_actuator", references=Model.AttributeFrequency.ACTUATOR),
+            "world": Model.AttributeSpec("battery", references=Model.AttributeFrequency.WORLD),
+        }
+        specs.update({name: Model.AttributeSpec("battery") for name in cls.PARAMETERS})
+        return specs
 
     @classmethod
     def resolve_arguments(cls, args: dict[str, Any]) -> dict[str, Any]:

@@ -59,7 +59,11 @@ def _register_equality_constraint_attributes(builder: ModelBuilder) -> None:
     model_assignment = Model.AttributeAssignment.MODEL
 
     # Register the custom frequency before any custom attributes that use it.
-    builder.add_custom_frequency(type(builder).CustomFrequency(name="equality_constraint", namespace="mujoco"))
+    builder.add_custom_frequency(
+        type(builder).CustomFrequency(
+            name="equality_constraint", namespace="mujoco", label_attribute="mujoco:equality_constraint_label"
+        )
+    )
 
     builder.add_custom_attribute(
         ca(
@@ -236,6 +240,13 @@ def _register_equality_constraint_attributes(builder: ModelBuilder) -> None:
             dtype=wp.int32,
             default=-1,
             namespace="mujoco",
+            kind_references=Model.KindReferences(
+                "mujoco:equality_constraint_target_kind",
+                (
+                    (int(MjcEqualityTargetKind.JOINT), (Model.AttributeFrequency.JOINT,)),
+                    (int(MjcEqualityTargetKind.MIMIC), (Model.AttributeFrequency.CONSTRAINT_MIMIC,)),
+                ),
+            ),
         )
     )
     # MuJoCo solver reference parameters, parsed from USD/MJCF and read back by SolverMuJoCo.

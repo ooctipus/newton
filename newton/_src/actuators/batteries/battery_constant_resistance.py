@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, ClassVar
 
 import warp as wp
 
@@ -79,6 +79,8 @@ class BatteryConstantResistance(BatteryBase):
     current limit is active, the voltage may oscillate instead of
     converging.
     """
+
+    PARAMETERS: ClassVar[tuple[str, ...]] = ("nominal_voltage", "resistance", "min_voltage")
 
     @classmethod
     def resolve_arguments(cls, args: dict[str, Any]) -> dict[str, Any]:

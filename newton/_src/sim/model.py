@@ -454,6 +454,26 @@ class Model:
             return tuple(name for name in names if name is not None)
 
     @dataclass(frozen=True)
+    class KindReferences:
+        """Entity references whose domain depends on each row's kind.
+
+        Each column of a row's value indexes the domain its kind names for that column.
+        """
+
+        kind: str
+        """Attribute of the same frequency that holds each row's kind."""
+        targets: tuple[tuple[int, tuple[Model.AttributeFrequency | str | None, ...]], ...]
+        """``(kind, domains)`` pairs: the domain each column of a row of that kind references (``None`` for a column
+        that holds no index). Rows of kinds not listed hold no indices."""
+
+        def columns(self, kind: int) -> tuple[Model.AttributeFrequency | str | None, ...]:
+            """Return the domain each column references in rows of ``kind`` (empty when they hold no indices)."""
+            for code, domains in self.targets:
+                if code == kind:
+                    return domains
+            return ()
+
+    @dataclass(frozen=True)
     class AttributeSpec:
         """Semantic metadata for an indexed model attribute.
 
@@ -491,8 +511,12 @@ class Model:
         limiting. Non-generic policies may still be overridden by the coupled
         solver when constructing a compact view.
         """
+        label: bool = False
+        """Whether the values are entity labels, which copies of a world prefix with the copy's label prefix."""
         placement: Model.AttributePlacement | None = None
         """How a world transform moves the values, or ``None`` when they do not depend on a world's placement."""
+        kind_references: Model.KindReferences | None = None
+        """Entity references whose domain depends on each row's kind, in place of :attr:`references`."""
         default: Any = field(default=None, compare=False)
         """Experimental value of one row for entities without authored data, or ``None`` for the dtype's zero.
 
@@ -514,8 +538,15 @@ class Model:
                 "passthrough",
             }:
                 raise ValueError(f"Unknown attribute compaction policy {self.compaction_policy!r}")
+            if self.kind_references is not None and self.references is not None:
+                raise ValueError("Attribute references and kind_references cannot both be specified")
             if self.compaction_policy in {"end", "range_start"} and self.references is None:
                 raise ValueError(f"Attribute compaction policy {self.compaction_policy!r} requires a reference domain")
+
+        @property
+        def reference_domain(self) -> Model.AttributeFrequency | str | None:
+            """The domain :attr:`references` names, with built-in aliases such as ``"body"`` resolved."""
+            return Model._REFERENCE_ALIASES.get(self.references, self.references)
 
     _CORE_ATTRIBUTE_SPECS: ClassVar[dict[str, AttributeSpec]] = {
         "gravity": AttributeSpec(AttributeFrequency.WORLD, compaction_policy="passthrough"),
@@ -531,7 +562,7 @@ class Model:
             "_fk_level_joint", references=AttributeFrequency.JOINT, compaction_policy="passthrough"
         ),
         "_fk_level_parent_pos": AttributeSpec("_fk_level_joint", compaction_policy="passthrough"),
-        "tendon_label": AttributeSpec(AttributeFrequency.TENDON),
+        "tendon_label": AttributeSpec(AttributeFrequency.TENDON, label=True),
         "tendon_world": AttributeSpec(AttributeFrequency.TENDON, references=AttributeFrequency.WORLD),
         "tendon_start": AttributeSpec(
             AttributeFrequency.TENDON, references=AttributeFrequency.TENDON_GUIDE, compaction_policy="start"
@@ -555,6 +586,17 @@ class Model:
         "tendon_segment_attachment_r_local": AttributeSpec(AttributeFrequency.TENDON_SEGMENT),
         "tendon_guide_active": AttributeSpec(AttributeFrequency.TENDON_GUIDE),
         "_tendon_initialized": AttributeSpec(AttributeFrequency.TENDON),
+        "tendon_segment_start": AttributeSpec(
+            AttributeFrequency.TENDON, references=AttributeFrequency.TENDON_SEGMENT, compaction_policy="start"
+        ),
+        # legacy muscles, which coupled views keep whole
+        "muscle_start": AttributeSpec("muscle", references="muscle_point", compaction_policy="start"),
+        "muscle_params": AttributeSpec("muscle", compaction_policy="passthrough"),
+        "muscle_activations": AttributeSpec("muscle", compaction_policy="passthrough"),
+        "muscle_bodies": AttributeSpec(
+            "muscle_point", references=AttributeFrequency.BODY, compaction_policy="passthrough"
+        ),
+        "muscle_points": AttributeSpec("muscle_point", compaction_policy="passthrough"),
         # particles
         "particle_q": AttributeSpec(AttributeFrequency.PARTICLE, placement=AttributePlacement("point")),
         "particle_qd": AttributeSpec(AttributeFrequency.PARTICLE, placement=AttributePlacement("direction")),
@@ -583,7 +625,7 @@ class Model:
         "body_inv_mass": AttributeSpec(AttributeFrequency.BODY),
         "body_flags": AttributeSpec(AttributeFrequency.BODY),
         "body_f": AttributeSpec(AttributeFrequency.BODY),
-        "body_label": AttributeSpec(AttributeFrequency.BODY),
+        "body_label": AttributeSpec(AttributeFrequency.BODY, label=True),
         "body_world": AttributeSpec(AttributeFrequency.BODY, references=AttributeFrequency.WORLD),
         "body_colors": AttributeSpec(AttributeFrequency.BODY),
         "body_world_start": AttributeSpec(
@@ -618,7 +660,7 @@ class Model:
         "_shape_variant_row": AttributeSpec(AttributeFrequency.SHAPE),
         "_shape_variant_shape": AttributeSpec(AttributeFrequency.SHAPE),
         # shapes
-        "shape_label": AttributeSpec(AttributeFrequency.SHAPE),
+        "shape_label": AttributeSpec(AttributeFrequency.SHAPE, label=True),
         "shape_transform": AttributeSpec(
             AttributeFrequency.SHAPE, placement=AttributePlacement("pose", anchor="shape_body")
         ),
@@ -768,7 +810,7 @@ class Model:
         "joint_enabled": AttributeSpec(AttributeFrequency.JOINT),
         "joint_twist_lower": AttributeSpec(AttributeFrequency.JOINT, deprecated=True),
         "joint_twist_upper": AttributeSpec(AttributeFrequency.JOINT, deprecated=True),
-        "joint_label": AttributeSpec(AttributeFrequency.JOINT),
+        "joint_label": AttributeSpec(AttributeFrequency.JOINT, label=True),
         "joint_world": AttributeSpec(AttributeFrequency.JOINT, references=AttributeFrequency.WORLD),
         "joint_q_start": AttributeSpec(
             AttributeFrequency.JOINT,
@@ -838,7 +880,7 @@ class Model:
             references=AttributeFrequency.JOINT,
             compaction_policy="end",
         ),
-        "articulation_label": AttributeSpec(AttributeFrequency.ARTICULATION),
+        "articulation_label": AttributeSpec(AttributeFrequency.ARTICULATION, label=True),
         "articulation_world": AttributeSpec(
             AttributeFrequency.ARTICULATION,
             references=AttributeFrequency.WORLD,
@@ -848,7 +890,7 @@ class Model:
             compaction_policy="world_start",
         ),
         # experimental deformable object identities and independent ranges
-        "curve_label": AttributeSpec(AttributeFrequency.CURVE),
+        "curve_label": AttributeSpec(AttributeFrequency.CURVE, label=True),
         "curve_world": AttributeSpec(AttributeFrequency.CURVE, references=AttributeFrequency.WORLD),
         "curve_body_start": AttributeSpec(
             AttributeFrequency.CURVE, references=AttributeFrequency.BODY, compaction_policy="range_start"
@@ -862,7 +904,7 @@ class Model:
         "curve_joint_end": AttributeSpec(
             AttributeFrequency.CURVE, references=AttributeFrequency.JOINT, compaction_policy="end"
         ),
-        "surface_label": AttributeSpec(AttributeFrequency.SURFACE),
+        "surface_label": AttributeSpec(AttributeFrequency.SURFACE, label=True),
         "surface_world": AttributeSpec(AttributeFrequency.SURFACE, references=AttributeFrequency.WORLD),
         "surface_particle_start": AttributeSpec(
             AttributeFrequency.SURFACE, references=AttributeFrequency.PARTICLE, compaction_policy="range_start"
@@ -882,7 +924,7 @@ class Model:
         "surface_edge_end": AttributeSpec(
             AttributeFrequency.SURFACE, references=AttributeFrequency.EDGE, compaction_policy="end"
         ),
-        "volume_label": AttributeSpec(AttributeFrequency.VOLUME),
+        "volume_label": AttributeSpec(AttributeFrequency.VOLUME, label=True),
         "volume_world": AttributeSpec(AttributeFrequency.VOLUME, references=AttributeFrequency.WORLD),
         "volume_particle_start": AttributeSpec(
             AttributeFrequency.VOLUME, references=AttributeFrequency.PARTICLE, compaction_policy="range_start"
@@ -907,7 +949,7 @@ class Model:
         "constraint_mimic_coef0": AttributeSpec(AttributeFrequency.CONSTRAINT_MIMIC),
         "constraint_mimic_coef1": AttributeSpec(AttributeFrequency.CONSTRAINT_MIMIC),
         "constraint_mimic_enabled": AttributeSpec(AttributeFrequency.CONSTRAINT_MIMIC),
-        "constraint_mimic_label": AttributeSpec(AttributeFrequency.CONSTRAINT_MIMIC),
+        "constraint_mimic_label": AttributeSpec(AttributeFrequency.CONSTRAINT_MIMIC, label=True),
         "constraint_mimic_world": AttributeSpec(
             AttributeFrequency.CONSTRAINT_MIMIC,
             references=AttributeFrequency.WORLD,
@@ -945,8 +987,46 @@ class Model:
     _DERIVED_FREQUENCY_COUNT_ATTRS: ClassVar[dict[str, str]] = {
         "_fk_level": "_fk_level_count",
         "_fk_level_joint": "_fk_level_joint_count",
+        "muscle": "muscle_count",
+        "muscle_point": "muscle_point_count",
     }
     """Frequencies of derived structures and the model attribute holding each one's row count."""
+
+    _FREQUENCY_WORLDS: ClassVar[dict[AttributeFrequency | str, tuple[str, int]]] = {
+        AttributeFrequency.JOINT: ("joint_world", 0),
+        AttributeFrequency.JOINT_DOF: ("joint_dof_world_start", 0),
+        AttributeFrequency.JOINT_COORD: ("joint_coord_world_start", 0),
+        AttributeFrequency.JOINT_CONSTRAINT: ("joint_constraint_world_start", 0),
+        AttributeFrequency.BODY: ("body_world", 0),
+        AttributeFrequency.SHAPE: ("shape_world", 0),
+        AttributeFrequency.ARTICULATION: ("articulation_world", 0),
+        AttributeFrequency.PARTICLE: ("particle_world", 0),
+        AttributeFrequency.EDGE: ("edge_indices", 2),
+        AttributeFrequency.TRIANGLE: ("tri_indices", 0),
+        AttributeFrequency.TETRAHEDRON: ("tet_indices", 0),
+        AttributeFrequency.SPRING: ("spring_indices", 0),
+        AttributeFrequency.CONSTRAINT_MIMIC: ("constraint_mimic_world", 0),
+        AttributeFrequency.ATTACHMENT_PARTICLE_BODY: ("attachment_particle_body_world", 0),
+        AttributeFrequency.TENDON: ("tendon_world", 0),
+        AttributeFrequency.TENDON_GUIDE: ("tendon_start", 0),
+        AttributeFrequency.TENDON_SEGMENT: ("tendon_segment_start", 0),
+        AttributeFrequency.CURVE: ("curve_world", 0),
+        AttributeFrequency.SURFACE: ("surface_world", 0),
+        AttributeFrequency.VOLUME: ("volume_world", 0),
+        AttributeFrequency.ACTUATOR: ("actuators", 0),
+        "_fk_level": ("_fk_articulation_level_start", 0),
+        "_fk_level_joint": ("_fk_level_joint_start", 0),
+        "muscle": ("muscle_start", 0),
+        "muscle_point": ("muscle_bodies", 0),
+    }
+    """Attribute (and column) that gives the rows of each frequency their world.
+
+    A world attribute holds the worlds; a world-start attribute bounds each world's rows; a start attribute gives
+    owned rows their owner's world (or owners the world of their first owned row); any other reference gives rows the
+    world of the row their column references. A custom frequency's rows take their world from its world attribute,
+    from an owner's start attribute, or from the first column of a reference, in that order. Actuator rows take the
+    world of the degree of freedom they drive.
+    """
 
     class AttributeNamespace:
         """
@@ -1396,6 +1476,9 @@ class Model:
         """Local-frame offset of the cable plane center on each body [m], shape [tendon_guide_count], vec3."""
         self.tendon_guide_axis: wp.array[wp.vec3] | None = None
         """Local-frame normal of the cable plane on each body [dimensionless], shape [tendon_guide_count], vec3."""
+        self.tendon_segment_start: wp.array[wp.int32] | None = None
+        """First segment of each tendon, shape [tendon_count + 1], int; the last entry is the segment count. A tendon
+        with ``n`` guides has the ``n - 1`` segments between consecutive guides."""
         self.tendon_segment_compliance: wp.array[wp.float32] | None = None
         """Compliance [m/N] for each tendon segment, shape [tendon_segment_count], float."""
         self.tendon_segment_damping: wp.array[wp.float32] | None = None
@@ -1959,6 +2042,12 @@ class Model:
         """Total number of springs in the system."""
         self.attachment_particle_body_count: int = 0
         """Total number of rigid-body-to-particle attachments in the system."""
+        self.muscle_point_count: int = 0
+        """Total number of muscle waypoints.
+
+        .. deprecated:: 1.8
+            Legacy muscles are deprecated; see :meth:`ModelBuilder.add_muscle`.
+        """
         self.muscle_count: int = 0
         """Total number of muscles in the system.
 
@@ -2802,6 +2891,98 @@ class Model:
         if count_attr is None:
             raise ValueError(f"Unsupported attribute frequency: {frequency!r}")
         return int(getattr(self, count_attr))
+
+    def attribute_frequency_world(self, frequency: Model.AttributeFrequency | str) -> np.ndarray:
+        """Return the world of every row of an attribute frequency, as the model declares it.
+
+        Args:
+            frequency: A built-in :class:`AttributeFrequency` with rows, a custom frequency name, or the name of a
+                frequency of a derived structure declared in :attr:`attribute_specs`.
+
+        Returns:
+            The world of each row (``-1`` for rows of the global world), shape [row count], int64, on the host.
+
+        Raises:
+            ValueError: If the model declares no world for the frequency's rows.
+        """
+        return self._frequency_worlds({})(frequency)
+
+    def _frequency_worlds(self, cache: dict[Any, np.ndarray]) -> Callable[[Any], np.ndarray]:
+        """Return a resolver of frequency worlds that memoizes into ``cache``."""
+        specs = dict(self._iter_attribute_specs())
+
+        def host(name: str) -> np.ndarray | None:
+            value = self._attribute_value(name)
+            if value is None:
+                return None
+            return (value.numpy() if isinstance(value, wp.array) else np.asarray(value)).astype(np.int64)
+
+        def declared(frequency: Any) -> tuple[str, int] | None:
+            if frequency in Model._FREQUENCY_WORLDS:
+                return Model._FREQUENCY_WORLDS[frequency]
+            same = [name for name, spec in specs.items() if spec.frequency == frequency]
+            for name in same:
+                if Model._normalize_attribute_reference(specs[name].references) == Model.AttributeFrequency.WORLD:
+                    return name, 0
+            for name, spec in specs.items():
+                if (
+                    spec.compaction_policy == "start"
+                    and Model._normalize_attribute_reference(spec.references) == frequency
+                ):
+                    return name, 0
+            for name in same:
+                if specs[name].references is not None and specs[name].compaction_policy == "generic":
+                    return name, 0
+            return None
+
+        def world(frequency: Any) -> np.ndarray:
+            if frequency in cache:
+                return cache[frequency]
+            count = self.attribute_frequency_count(frequency)
+            source = declared(frequency)
+            if count == 0:
+                rows = np.empty(0, dtype=np.int64)
+            elif source is None:
+                raise ValueError(f"The model declares no world for the rows of {frequency!r}.")
+            elif source[0] == "actuators":
+                rows = np.full(count, -1, dtype=np.int64)
+                for actuator in self.actuators:
+                    if actuator.actuator_indices is not None:
+                        dofs = world(self.get_attribute_frequency(actuator.state_vel_attr))
+                        rows[actuator.actuator_indices.numpy()] = dofs[actuator.indices.numpy()]
+            else:
+                name, column = source
+                spec = specs[name]
+                values = host(name)
+                reference = Model._normalize_attribute_reference(spec.references)
+                if reference == Model.AttributeFrequency.WORLD:
+                    rows = values
+                elif spec.compaction_policy == "world_start":
+                    starts = values[: self.world_count + 1]
+                    rows = np.full(count, -1, dtype=np.int64)
+                    rows[starts[0] : starts[-1]] = np.repeat(np.arange(self.world_count), np.diff(starts))
+                elif spec.compaction_policy == "start" and spec.frequency != frequency:
+                    owners = self.attribute_frequency_count(spec.frequency)
+                    rows = np.repeat(world(spec.frequency), np.diff(values[: owners + 1]))
+                else:
+                    targets = values.reshape(count if spec.compaction_policy != "start" else count + 1, -1)
+                    targets = targets[:count, column]
+                    if spec.compaction_policy == "start":
+                        # An owner without rows belongs to the global world.
+                        targets = np.where(np.diff(values[: count + 1]) > 0, targets, -1)
+                    referenced = world(reference)
+                    rows = np.where(targets >= 0, referenced[np.maximum(targets, 0)], -1)
+            cache[frequency] = rows
+            return rows
+
+        return world
+
+    def _attribute_value(self, name: str) -> Any:
+        """Return a built-in or namespaced (``namespace:name``) attribute's value, or ``None``."""
+        if ":" in name:
+            namespace, attribute = name.split(":", 1)
+            return getattr(getattr(self, namespace, None), attribute, None)
+        return getattr(self, name, None)
 
     def set_attribute_frequency_count(self, frequency: Model.AttributeFrequency | str, count: int) -> None:
         """Set the number of rows of an attribute frequency.

@@ -929,6 +929,7 @@ class ModelBuilder:
         "shape_sdf_target_voxel_size": Model.AttributeSpec(Model.AttributeFrequency.SHAPE),
         "shape_sdf_texture_format": Model.AttributeSpec(Model.AttributeFrequency.SHAPE),
         "shape_sdf_padding": Model.AttributeSpec(Model.AttributeFrequency.SHAPE),
+        # Copies merge muscles row by row; the model's specs keep them whole in coupled views.
         "muscle_start": Model.AttributeSpec("muscle", references="muscle_point", compaction_policy="start"),
         "muscle_params": Model.AttributeSpec("muscle"),
         "muscle_activations": Model.AttributeSpec("muscle"),
@@ -1776,7 +1777,7 @@ class ModelBuilder:
         For enum frequencies (BODY, SHAPE, etc.): dict[int, Any] mapping entity indices to values.
         For ``WORLD``, keys are world indices, and key ``-1`` is global world ``-1``, whose value is
         also the default of local worlds without one unless the attribute stores
-        references through :attr:`references` or :attr:`reference_value_transformer`.
+        references through :attr:`references` or :attr:`kind_references`.
         For string frequencies ("mujoco:pair", etc.): list[Any] for sequential custom data.
 
         If None, the attribute is not initialized with any values. Values can be assigned in subsequent
@@ -1813,47 +1814,18 @@ class ModelBuilder:
         urdf_value_transformer: Callable[[str, dict[str, Any] | None], Any] | None = None
         """Transformer function that converts a URDF attribute value string to a valid Warp dtype. If undefined, the generic converter from :func:`newton.utils.parse_warp_value_from_string` is used. Receives an optional context dict with parsing-time information."""
 
-        reference_value_transformer: Callable[[list[Any], dict[str, Any]], list[Any]] | None = None
-        """Batch transformer for entity references copied by :meth:`ModelBuilder.add_builder`.
+        kind_references: Model.KindReferences | None = None
+        """Entity references whose domain depends on another attribute's value in the same row (the row's kind).
 
-        Use this instead of :attr:`references` when the referenced entity type depends on
-        other values in the same row. For each copied builder, the callback is invoked once
-        for this attribute if its value container is nonempty. It receives a list of the
-        source builder's authored values and a context dictionary with these keys:
-
-        - ``"builder"`` (:class:`ModelBuilder`): Source builder. Companion attribute values
-          can be read using ``row_indices``.
-        - ``"destination_builder"`` (:class:`ModelBuilder`): Builder receiving the copy.
-          It is partway through merging; callbacks must not depend on which other custom
-          attributes have already been copied.
-        - ``"entity_offsets"`` (``dict[str, int]``): Index offsets for this copy's built-in
-          entities. Keys are ``"body"``, ``"shape"``, ``"joint"``, ``"joint_dof"``,
-          ``"joint_coord"``, ``"joint_constraint"``, ``"articulation"``, ``"particle"``,
-          ``"edge"``, ``"triangle"``, ``"tetrahedron"``, ``"spring"``,
-          ``"tendon"``, ``"tendon_guide"``, ``"tendon_segment"``,
-          ``"constraint_mimic"``, and ``"attachment_particle_body"``.
-        - ``"custom_frequency_offsets"`` (``dict[str, int]``): Destination row counts
-          before this copy's custom attributes are merged, keyed by full frequency name
-          (for example, ``"mujoco:tendon"``). Missing keys have offset zero.
-        - ``"row_indices"`` (``Sequence[int]``): Source index corresponding to each input
-          value. Custom-frequency lists use consecutive indices; sparse enum-frequency
-          attributes use their authored dictionary keys, which need not be sorted.
-        - ``"world"`` (``int``): Destination world for this copy, or ``-1`` for global
-          entities. Use this value for world references instead of adding an offset.
-        - ``"label_prefix"`` (``str | None``): Optional label prefix for this copy.
-
-        The callback must return a list in the same order and of the same length, preserving
-        ``None`` entries for unset rows. Treat the supplied builders, mappings, and source
-        values as read-only; create replacement values instead of mutating source objects.
-        Replication invokes the callback separately for each copy with its own offsets.
-
-        Mutually exclusive with :attr:`references`; the callback owns reference remapping.
+        Use this instead of :attr:`references` when the referenced entity type depends on the row's kind, for
+        example an actuator's target that is a joint, a tendon or a site. :meth:`ModelBuilder.add_builder` and
+        :meth:`ModelBuilder.replicate` offset each column by the copy's start in the domain the row's kind names.
         """
 
         def __post_init__(self):
             """Initialize default values and validate dtype compatibility."""
-            if self.references is not None and self.reference_value_transformer is not None:
-                raise ValueError("references and reference_value_transformer cannot both be specified.")
+            if self.references is not None and self.kind_references is not None:
+                raise ValueError("references and kind_references cannot both be specified.")
             # Allow str dtype for string attributes (stored as Python lists, not warp arrays)
             if self.dtype is not str:
                 # ensure dtype is a valid Warp dtype
@@ -1980,7 +1952,7 @@ class ModelBuilder:
                     # Key -1 is global world -1, stored after the local worlds. Like builder
                     # gravity, it is also the default of local worlds without their own value.
                     global_value = self.values[-1]
-                    if self.references is None and self.reference_value_transformer is None:
+                    if self.references is None and self.kind_references is None:
                         arr = [self.values.get(i, global_value) for i in range(count - 1)]
                         arr.append(global_value)
                     else:
@@ -3018,7 +2990,7 @@ class ModelBuilder:
             and existing.namespace == incoming.namespace
             and Model._normalize_attribute_reference(existing.references)
             == Model._normalize_attribute_reference(incoming.references)
-            and existing.reference_value_transformer is incoming.reference_value_transformer
+            and existing.kind_references == incoming.kind_references
         )
 
     @staticmethod
@@ -3339,6 +3311,8 @@ class ModelBuilder:
             if label_attribute.dtype is not str:
                 raise ValueError(f"Label attribute '{label_key}' must use dtype=str")
             model.custom_frequency_label_attributes[frequency_key] = label_key
+            if label_key in model.attribute_specs:
+                model._set_attribute_spec(label_key, replace(model.attribute_specs[label_key], label=True))
 
     def add_custom_values(self, **kwargs: Any) -> dict[str, int]:
         """Append values to custom attributes with custom string frequencies.
@@ -4650,7 +4624,7 @@ class ModelBuilder:
                     parts = [group if offset is None else group + offset for group, offset in chunks]
                     merged_groups.append(parts[0] if len(parts) == 1 else np.concatenate(parts))
                 setattr(self, attr, merged_groups)
-            elif attr.endswith("_label"):
+            elif spec.label:
                 for label_prefix in label_prefixes:
                     if label_prefix:
                         rooted = label_prefix + "/"
@@ -4728,6 +4702,20 @@ class ModelBuilder:
                 values[targets] = rows
             destination.extend(_PLACEMENT_LIST_STORE[kind](values))
 
+    @staticmethod
+    def _offset_kind_references(value: Any, offsets: list[int]) -> Any:
+        """Offset each non-negative column of a kind-referenced value by its column's domain start."""
+        if not offsets or not any(offsets):
+            return value
+        if ModelBuilder._is_integer_scalar(value):
+            index = int(value)
+            return index + offsets[0] if index >= 0 else value
+        columns = [
+            int(item) + offset if offset and int(item) >= 0 else item
+            for item, offset in itertools.zip_longest(value, offsets[: len(value)], fillvalue=0)
+        ]
+        return type(value)(*columns) if wp.types.type_is_vector(type(value)) else type(value)(columns)
+
     def _model_value_key(self, attribute: CustomAttribute) -> int:
         """Return the value key of a ``ONCE`` or ``WORLD`` attribute in the current world context.
 
@@ -4804,7 +4792,7 @@ class ModelBuilder:
         declared_builder_attributes = set(cls._BUILDER_ATTRIBUTE_SPECS)
 
         for group, references in cls._BUILDER_GROUP_REFERENCES.items():
-            specs[f"{group}_label"] = Model.AttributeSpec(group)
+            specs[f"{group}_label"] = Model.AttributeSpec(group, label=True)
             specs[f"{group}_world"] = Model.AttributeSpec(group, references=Model.AttributeFrequency.WORLD)
             declared_builder_attributes.update((f"{group}_label", f"{group}_world"))
             for suffix, reference in references.items():
@@ -5997,13 +5985,13 @@ class ModelBuilder:
             # Empty declarations are shared by all copies. Reference defaults on
             # frequencies with rows still need per-copy remapping.
             if not attr.values:
-                can_skip_remapping = attr.references is None
+                can_skip_remapping = attr.references is None and attr.kind_references is None
                 if not can_skip_remapping:
                     has_empty_custom_frequency = (
                         isinstance(attr.frequency, str) and builder._custom_frequency_counts.get(attr.frequency, 0) == 0
                     )
                     can_skip_remapping = (
-                        has_empty_custom_frequency and attr.reference_value_transformer is None
+                        has_empty_custom_frequency and attr.kind_references is None
                     ) or attr.references in (Model.AttributeFrequency.WORLD, "world")
                 if can_skip_remapping:
                     if full_key not in self.custom_attributes:
@@ -6121,7 +6109,6 @@ class ModelBuilder:
                 for idx, value in zip(indices, values, strict=True)
             ]
 
-        target_kind_attr = builder.custom_attributes.get("mujoco:equality_constraint_target_kind")
         source_counts = None
         for full_key, attr in attributes.items():
             reference = attr.references
@@ -6142,15 +6129,19 @@ class ModelBuilder:
 
             use_current_world = reference == Model.AttributeFrequency.WORLD
             value_starts = zeros if use_current_world else starts_of(reference)
-            is_equality_target_attr = full_key == "mujoco:equality_constraint_target"
+            kind_references = attr.kind_references
             is_collision_mask_domain_attr = full_key == collision_mask_domain_key and bool(domain_first_shape)
-            transformer = attr.reference_value_transformer
-            needs_remap = transformer is None and (
+            needs_remap = (
                 bool(np.any(value_starts))
                 or use_current_world
-                or is_equality_target_attr
+                or kind_references is not None
                 or is_collision_mask_domain_attr
             )
+            kind_values, kind_default = None, None
+            if kind_references is not None:
+                kind_attr = builder.custom_attributes.get(kind_references.kind)
+                if kind_attr is not None:
+                    kind_values, kind_default = kind_attr.values or [], kind_attr.default
 
             def transform_value(value: Any, offset: int, world: int, replace_with_world: bool = use_current_world):
                 if replace_with_world:
@@ -6181,33 +6172,23 @@ class ModelBuilder:
                 copy: int,
                 entity_idx: int,
                 value: Any,
-                is_equality_target: bool = is_equality_target_attr,
+                kind_references: Model.KindReferences | None = kind_references,
+                kind_values: Any = kind_values,
+                kind_default: Any = kind_default,
                 is_collision_mask_domain: bool = is_collision_mask_domain_attr,
                 value_starts: np.ndarray = value_starts,
             ) -> Any:
-                if is_equality_target:
-                    try:
-                        target = int(value)
-                    except (TypeError, ValueError):
+                if kind_references is not None:
+                    if value is None or kind_values is None:
                         return value
-                    if target < 0:
-                        return value
-                    target_kind = 0
-                    if (
-                        target_kind_attr is not None
-                        and target_kind_attr.values
-                        and entity_idx < len(target_kind_attr.values)
-                        and target_kind_attr.values[entity_idx] is not None
-                    ):
-                        try:
-                            target_kind = int(target_kind_attr.values[entity_idx])
-                        except (TypeError, ValueError):
-                            target_kind = 0
-                    if target_kind == 1:
-                        return target + int(entity_starts["joint"][copy])
-                    if target_kind == 2:
-                        return target + int(entity_starts["constraint_mimic"][copy])
-                    return value
+                    if isinstance(kind_values, dict):
+                        kind = kind_values.get(entity_idx)
+                    else:
+                        kind = kind_values[entity_idx] if entity_idx < len(kind_values) else None
+                    kind = int(kind_default if kind is None else kind)
+                    return self._offset_kind_references(
+                        value, [int(starts_of(domain)[copy]) for domain in kind_references.columns(kind)]
+                    )
                 if is_collision_mask_domain:
                     first = domain_first_shape.get(int(value))
                     return value if first is None else int(entity_starts["shape"][copy]) + first
@@ -6217,39 +6198,6 @@ class ModelBuilder:
             # references shift the default, or a transformer's remapped rows.
             variants: list[Any] = [attr.values]
             copy_variant = np.zeros(copy_count, dtype=np.int64)
-            if transformer is not None:
-                if isinstance(attr.values, dict):
-                    row_indices = list(attr.values.keys())
-                    row_values = list(attr.values.values())
-                else:
-                    row_indices = range(len(attr.values))
-                    row_values = list(attr.values)
-                for copy in range(copy_count):
-                    # Remap all rows of this attribute in one call so the transformer can vectorize.
-                    entity_offsets = {kind: int(starts[copy]) for kind, starts in entity_starts.items()}
-                    transformed = transformer(
-                        row_values,
-                        {
-                            "builder": builder,
-                            "destination_builder": self,
-                            "entity_offsets": entity_offsets,
-                            "custom_frequency_offsets": custom_frequency_offsets(copy),
-                            "row_indices": row_indices,
-                            "world": int(worlds[copy]),
-                            "label_prefix": label_prefixes[copy],
-                        },
-                    )
-                    if len(transformed) != len(row_values):
-                        raise ValueError(
-                            f"reference_value_transformer for custom attribute '{full_key}' returned "
-                            f"{len(transformed)} values, expected {len(row_values)}."
-                        )
-                    copy_variant[copy] = len(variants)
-                    variants.append(
-                        dict(zip(row_indices, transformed, strict=True))
-                        if isinstance(attr.values, dict)
-                        else list(transformed)
-                    )
             if freq_key == Model.AttributeFrequency.WORLD:
                 # One row per copy: all source entities join the copy's world entry.
                 for copy in range(copy_count):
@@ -6335,7 +6283,7 @@ class ModelBuilder:
             remap = transform_row if needs_remap else None
             if use_current_world:
                 remap_kind = "world"
-            elif is_equality_target_attr or is_collision_mask_domain_attr:
+            elif kind_references is not None or is_collision_mask_domain_attr:
                 remap_kind = "row"
             else:
                 remap_kind = "shift"
@@ -6400,19 +6348,6 @@ class ModelBuilder:
                         label = label_attribute.values[row]
                         if label:
                             label_attribute.values[row] = f"{label_prefix}/{label}"
-
-            if builder._equality_constraint_count > 0:
-                label_attr = self.custom_attributes.get("mujoco:equality_constraint_label")
-                if label_attr is not None and label_attr.values:
-                    starts = custom_starts["mujoco:equality_constraint"].tolist()
-                    for start, label_prefix in zip(starts, label_prefixes, strict=True):
-                        if not label_prefix:
-                            continue
-                        for i in range(start, start + builder._equality_constraint_count):
-                            if i < len(label_attr.values):
-                                label = label_attr.values[i]
-                                if label:
-                                    label_attr.values[i] = f"{label_prefix}/{label}"
 
         for freq_key, freq_obj in builder.custom_frequencies.items():
             if freq_key not in self.custom_frequencies:
@@ -16944,6 +16879,9 @@ class ModelBuilder:
 
                 tendon_start = [*self.tendon_start, guide_count]
                 m.tendon_start = wp.array(tendon_start, dtype=wp.int32)
+                m.tendon_segment_start = wp.array(
+                    [start - tendon for tendon, start in enumerate(tendon_start)], dtype=wp.int32
+                )
                 m.tendon_guide_body = wp.array(self.tendon_guide_body, dtype=wp.int32)
                 m.tendon_guide_type = wp.array(self.tendon_guide_type, dtype=wp.int32)
                 m.tendon_guide_radius = wp.array(
@@ -17288,6 +17226,7 @@ class ModelBuilder:
             m.spring_count = len(self.spring_rest_length)
             m.attachment_particle_body_count = self.attachment_particle_body_count
             m.muscle_count = len(self.muscle_start)
+            m.muscle_point_count = len(self.muscle_bodies)
             m.articulation_count = len(self.articulation_start)
             m.mujoco.equality_constraint_count = self._equality_constraint_count
             m.mujoco.equality_constraint_world_start = wp.array(self._equality_constraint_world_start, dtype=wp.int32)
@@ -17491,7 +17430,12 @@ class ModelBuilder:
                     custom_attr.references,
                 )
                 m._set_attribute_spec(
-                    custom_attr.key, replace(m.attribute_specs[custom_attr.key], default=custom_attr.default)
+                    custom_attr.key,
+                    replace(
+                        m.attribute_specs[custom_attr.key],
+                        default=custom_attr.default,
+                        kind_references=custom_attr.kind_references,
+                    ),
                 )
 
             self._finalize_custom_frequency_metadata(m, device)

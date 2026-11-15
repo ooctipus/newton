@@ -1960,16 +1960,8 @@ class TestCustomFrequencyAttributes(unittest.TestCase):
         # World 1: refs should be offset by 2 (entity count from world 0), so 2, 3
         np.testing.assert_array_equal(refs, [0, 1, 2, 3])
 
-    def test_custom_frequency_reference_value_transformer(self):
-        """Remap row-dependent references with one batch transformer call per copied builder."""
-        calls = []
-
-        def remap(values, context):
-            calls.append((list(values), list(context["row_indices"]), context["world"]))
-            kinds = context["builder"].custom_attributes["test:target_kind"].values
-            offsets = {0: context["entity_offsets"]["body"], 1: context["entity_offsets"]["shape"]}
-            return [None if value is None else value + offsets[kinds[row]] for row, value in enumerate(values)]
-
+    def test_custom_frequency_kind_references(self):
+        """Offset each row's reference by the domain its kind names."""
         sub_builder = ModelBuilder()
         sub_builder.add_custom_frequency(ModelBuilder.CustomFrequency(name="target", namespace="test"))
         sub_builder.add_custom_attribute(
@@ -1982,7 +1974,9 @@ class TestCustomFrequencyAttributes(unittest.TestCase):
                 dtype=wp.int32,
                 default=-1,
                 namespace="test",
-                reference_value_transformer=remap,
+                kind_references=Model.KindReferences(
+                    "test:target_kind", ((0, (AttributeFrequency.BODY,)), (1, (AttributeFrequency.SHAPE,)))
+                ),
             )
         )
         body = sub_builder.add_body(mass=1.0)
@@ -1997,39 +1991,21 @@ class TestCustomFrequencyAttributes(unittest.TestCase):
         main_builder.add_world(sub_builder)
         model = main_builder.finalize(device=self.device)
 
-        self.assertEqual(len(calls), 2)
-        self.assertEqual(calls[0], ([None, body, shape1], [0, 1, 2], 0))
-        self.assertEqual(calls[1][2], 1)
         np.testing.assert_array_equal(model.test.target_index.numpy(), [-1, body, shape1, -1, body + 1, shape1 + 2])
         self.assertEqual((body, shape0, shape1), (0, 0, 1))
-
-    def test_custom_frequency_reference_value_transformer_length_mismatch(self):
-        """Reject a reference transformer that drops rows."""
-        sub_builder = ModelBuilder()
-        sub_builder.add_custom_frequency(ModelBuilder.CustomFrequency(name="target", namespace="test"))
-        sub_builder.add_custom_attribute(
-            ModelBuilder.CustomAttribute(
-                name="target_index",
-                frequency="test:target",
-                dtype=wp.int32,
-                namespace="test",
-                reference_value_transformer=lambda values, _context: values[:-1],
-            )
+        self.assertEqual(
+            model.attribute_specs["test:target_index"].kind_references.columns(1), (AttributeFrequency.SHAPE,)
         )
-        sub_builder.add_custom_values(**{"test:target_index": 0})
 
-        with self.assertRaisesRegex(ValueError, "returned 0 values, expected 1"):
-            ModelBuilder().add_builder(sub_builder)
-
-    def test_reference_transformer_rejects_builtin_references(self):
-        """A transformer must not silently override a declared reference type."""
-        with self.assertRaisesRegex(ValueError, "references.*reference_value_transformer"):
+    def test_kind_references_reject_builtin_references(self):
+        """Kind references must not silently override a declared reference type."""
+        with self.assertRaisesRegex(ValueError, "references and kind_references"):
             ModelBuilder.CustomAttribute(
                 name="target",
                 frequency=AttributeFrequency.BODY,
                 dtype=wp.int32,
                 references="body",
-                reference_value_transformer=lambda values, _context: values,
+                kind_references=Model.KindReferences("kind", ((0, (AttributeFrequency.BODY,)),)),
             )
 
     def test_custom_frequency_unknown_references_raises_error(self):
