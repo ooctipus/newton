@@ -1051,6 +1051,7 @@ class RowLaws:
             sweep.support_units_kernel,
             dim=(solver.forest.world_count, sweep.support_lanes),
             inputs=[dense_rows, placement.unit_source, placement.constraint_count, contact_input, law, units.list],
+            block_dim=walk_rows.WRITERS["support_units"].block,
             device=model.device,
         )
         wp.launch(
@@ -1094,6 +1095,7 @@ class RowLaws:
                 solver.v_hat,
                 self.bias(solver.options, dt),
             ],
+            block_dim=walk_rows.WRITERS["slots"].block,
             device=solver.model.device,
         )
         marker = solver.sweep.sparse_contact_marker
@@ -1184,6 +1186,27 @@ class RowLaws:
         }
 
     @staticmethod
+    def writer_launches(solver) -> tuple[tuple[wp.Kernel, int], ...]:
+        """The one writer's launches, each kernel with its threads per block: the support placement's two (case K1,
+        :meth:`write_support`), the sparse diagonal's (K2, :meth:`write_slot_rows`), else the general placement's two
+        parts (:meth:`write_general`: the topology's rows walked in blocks, and the rest). The route record names them;
+        the solver compiles them ahead (:func:`~newton._src.core.execution.compile_ahead`)."""
+        support, writers = solver._plan.route.support, walk_rows.WRITERS
+        if support == "factor":
+            sweep = solver.sweep
+            return (sweep.support_units_kernel, writers["support_units"].block), (
+                sweep.support_rows,
+                writers["support"].block,
+            )
+        if support == "diagonal":
+            return ((walk_rows.slot_writer(solver), writers["slots"].block),)
+        packed = writers["packed"].block
+        return (walk_rows.writer_kernel(solver, walk_rows.WRITE_TOPOLOGY), packed), (
+            walk_rows.writer_kernel(solver),
+            packed,
+        )
+
+    @staticmethod
     def _row_builder(solver, method, size) -> dict:
         """Name the kernels that build one DOF size's dense contact rows outside the sweep, in launch order (a launch
         shared by several sizes under each). Not named: the free bodies' rows (walk_rows.write_free_body_rows,
@@ -1196,14 +1219,7 @@ class RowLaws:
             # The allocator writes the contact rows' unit sources; the one writer writes every contact row's records and
             # walks every row (walk_rows): the general placement's into its packed rows, the support placement's (K1)
             # into its support sink, the sparse diagonal's (K2) into its slots sink.
-            if solver._plan.route.support == "factor":
-                writers = (solver.sweep.support_units_kernel, solver.sweep.support_rows)
-            elif solver._plan.route.support == "diagonal":
-                writers = (walk_rows.slot_writer(solver),)
-            else:
-                # The general placement's rows in two parts: the topology's walked in blocks, and the rest.
-                writers = (walk_rows.writer_kernel(solver, walk_rows.WRITE_TOPOLOGY), walk_rows.writer_kernel(solver))
-            kernels = (*writers, *marker)
+            kernels = (*(kernel for kernel, _block in RowLaws.writer_launches(solver)), *marker)
         else:
             raise ValueError(f"No contact-row builder kernels are known for the method {method!r}.")
         entry = {

@@ -16,6 +16,7 @@ from statistics import median
 import numpy as np
 import warp as wp
 
+from ..core.execution import compile_ahead
 from .coherent_convex import _plane_lower_bound
 from .coherent_convex_rejection import _create_rejection_query_kernels, _PairInputs
 from .mpr import create_solve_mpr, create_support_map_function
@@ -109,6 +110,12 @@ def _primitive_empty(output: wp.array[wp.vec4]):
     output[row] = wp.vec4(float(row), 0.0, 0.0, 0.0)
 
 
+_PAIRS_BLOCK = 128
+"""The threads per block of the calibration's production queries (:meth:`_ProductionPairs.launch`)."""
+_DEFAULT_BLOCK = 256
+"""The threads per block of the other calibration and sampling launches: Warp's default."""
+
+
 class _ProductionPairs:
     """``count`` convex pairs in the production rejection route's inputs (:func:`._create_rejection_query_kernels`): each
     pair's first hull at the origin, its second at the calibration's pose ``distance`` along x (the work sampler's
@@ -171,7 +178,7 @@ class _ProductionPairs:
         self.queues[4].zero_()
         arguments = [self.pairs, self.pair_count, self.inputs, self.cache.data, self.count, *self.queues]
         for kernel in kernels:
-            wp.launch(kernel, self.count, arguments, device=self.device, block_dim=128)
+            wp.launch(kernel, self.count, arguments, device=self.device, block_dim=_PAIRS_BLOCK)
 
 
 def _classification_primitive(device, count, launch_ns, kernels):
@@ -350,6 +357,15 @@ def _measure_query_cost(device) -> _QueryCostModel:
         metrics = wp.zeros((count, 2), dtype=float, device=device)
         counted = _counted_query()
         kernels = _create_rejection_query_kernels()
+        # The calibration's kernels compile side by side before it times any (each as _ProductionPairs launches it).
+        compile_ahead(
+            (
+                (counted, _DEFAULT_BLOCK),
+                *((kernel, _PAIRS_BLOCK) for kernel in kernels),
+                (_primitive_empty, _DEFAULT_BLOCK),
+            ),
+            device,
+        )
         launch_ns = _measure(lambda: wp.launch(_primitive_empty, 1, [output], device=device), device)
         keys = wp.array(np.arange(count, dtype=np.uint64), dtype=wp.uint64, device=device)
         lookup_ns = (
@@ -552,6 +568,12 @@ class _ConvexMethodChoice:
         self.coefficients = wp.array(self.model.coefficients(slots), dtype=float, device=device)
         self.sample = _create_work_sampler()
 
+    def launch_variants(self):
+        """The sampler and the choice :meth:`launch` makes, each with its threads per block
+        (:func:`~newton._src.core.execution.compile_ahead`)."""
+        yield self.sample, _DEFAULT_BLOCK
+        yield _choose_method, _DEFAULT_BLOCK
+
     def launch(self, pairs, count, inputs, ordinary, rejection):
         # Empty work queues keep the parent capture and its cross-stream events
         # intact. Native conditional graph capture pauses invalidate older events.
@@ -560,6 +582,7 @@ class _ConvexMethodChoice:
             self.work.shape[0],
             [pairs, count, inputs, self.epoch, self.period, self.work],
             device=self.device,
+            block_dim=_DEFAULT_BLOCK,
         )
         wp.launch(
             _choose_method,
@@ -577,6 +600,7 @@ class _ConvexMethodChoice:
                 self.rejection_gjk_count,
             ],
             device=self.device,
+            block_dim=_DEFAULT_BLOCK,
         )
         ordinary(self.ordinary_count)
         rejection(self.rejection_count, self.rejection_gjk_count)
