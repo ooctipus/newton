@@ -80,23 +80,36 @@ class TreeLayout:
         if not min(1, self.dofs) <= self.inverse_width <= self.dofs:
             raise ValueError("Invalid inverse-column support width")
 
+    # A tree's block of words (the state kernels', tree_kinetic_state.get_state_kernel): each body's pose (7 words)
+    # and bias acceleration (6) together, BODY_WORDS a body from word 0; each body's twist (6) from motion_offset; the
+    # axes (6 a coordinate) from axis_offset; each root's origin and shift (3 each) from origin_offset. The
+    # publication's outputs take the words its inputs leave, so a block holds them once: a body's inertia record (13
+    # words) lies on its own pose and bias acceleration, its bias wrench (6) on its own twist. A body's lane loads the
+    # three before it stores the two, and no other lane reads them after the motion scan. The block is the launch's
+    # on-chip memory a tree, which bounds the trees a multiprocessor keeps in flight.
+    BODY_WORDS = 13
+    ACCELERATION_WORD = 7
+
+    @property
+    def motion_offset(self):
+        return self.BODY_WORDS * self.bodies
+
     @property
     def axis_offset(self):
-        # Collection reuses the dead pose/motion scratch for I*S. A root-only
-        # free body has more coordinates than bodies and needs extra room.
+        # A root-only free body has more coordinates than bodies.
         return max(19 * self.bodies, 6 * self.dofs)
 
     @property
     def wrench_offset(self):
-        return self.axis_offset + 6 * self.dofs
+        return self.motion_offset
 
     @property
     def moment_offset(self):
-        return self.wrench_offset + 6 * self.bodies
+        return 0
 
     @property
     def origin_offset(self):
-        return self.moment_offset + 13 * self.bodies
+        return self.axis_offset + 6 * self.dofs
 
     @property
     def total(self):
@@ -144,7 +157,9 @@ class TreeLayout:
             "ROOT_DOFS": self.root_dofs,
             "ROUNDS": self.rounds,
             "LAST_PARENT": self.max_depth - 1,
-            "MOTION": 7 * self.bodies,
+            "MOTION": self.motion_offset,
+            "BODY_WORDS": self.BODY_WORDS,
+            "ACCELERATION_WORD": self.ACCELERATION_WORD,
             "SIX_BODIES": 6 * self.bodies,
             "SIX_BODIES_PLUS3": 6 * self.bodies + 3,
             "AXIS": self.axis_offset,

@@ -219,12 +219,19 @@ class TestShapeAgainstTodaysRules(unittest.TestCase):
             self.assertEqual((placed(device, None), placed(device, 0)), places)
 
     def test_the_held_tree_stages_at_its_own_level(self):
-        """kuka's held forest keeps its state staged on the PRO at 14 of 24 warps, which the general level declines."""
+        """The held tree's state block holds its outputs on its inputs' words (19 words a body, 6 a coordinate, 6 a
+        root), so kuka's held forest keeps 22 of the PRO's 24 blocks in flight a multiprocessor; a 128-body chain's
+        block leaves 14 warps, which the held tree's level stages and the general level declines."""
         roots = {"roots": (0, 30, 31), "root_coordinates": (0, 6, 6), "root_offsets": (0, 23, 29)}
         layout = TreeLayout(32, 35, 35, 1, 0, 0, tuple(range(35)), lanes=32, root_families=(35, 0, 0), **roots)
+        self.assertEqual(layout.total, 19 * 32 + 6 * 35 + 6 * 3)
         self.assertTrue(tree_kinetic_state.held_stage(layout, 16384, PRO).staged)
+        self.assertEqual(shape(Work(16384, lanes=32, block=32, shared=4 * layout.total), PRO).blocks_per_sm, 22)
+        chain = TreeLayout(128, 128, 128, 1, 127, 0, tuple(range(128)), lanes=64)
+        self.assertEqual(shape(Work(16384, lanes=64, block=64, shared=4 * chain.total), PRO).blocks_per_sm, 7)
+        self.assertTrue(tree_kinetic_state.held_stage(chain, 16384, PRO).staged)
         with mock.patch.object(tree_kinetic_state, "HELD_HIDING", memory.HIDING_WARPS):
-            self.assertFalse(tree_kinetic_state.held_stage(layout, 16384, PRO).staged)
+            self.assertFalse(tree_kinetic_state.held_stage(chain, 16384, PRO).staged)
         self.assertTrue(tree_kinetic_state.held_stage(layout, 16384, GB300).staged)
 
     def test_fill_differs_only_where_named(self):

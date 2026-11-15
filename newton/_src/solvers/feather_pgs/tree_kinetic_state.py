@@ -480,9 +480,12 @@ _SIZES = {"nodes": "$BODIES", "rounds": "$ROUNDS", "max_depth": "($LAST_PARENT+1
 """The layout's size names in place of a plan's literals: one text serves every tree of a layout."""
 _ANY_TREE = TreePlan.build([-1, 0])
 """Any parent-first plan stands for the layout's tree once the sizes are names."""
-_POSE_SLOTS = ts.Storage({"pose": "s[7*({node})+({k})]"})
+_POSE_SLOTS = ts.Storage({"pose": "s[$BODY_WORDS*({node})+({k})]"})
 _MOTION_SLOTS = ts.Storage(
-    {"velocity": "s[$MOTION+6*({node})+({k})]", "acceleration": "s[$MOTION+$SIX_BODIES+6*({node})+({k})]"}
+    {
+        "velocity": "s[$MOTION+6*({node})+({k})]",
+        "acceleration": "s[$BODY_WORDS*({node})+$ACCELERATION_WORD+({k})]",
+    }
 )
 _REDUCE_SLOTS = ts.Storage({"wrench": "s[$WRENCH+6*({node})+({k})]", "moment": "s[$MOMENT+13*({node})+({k})]"})
 _MOTION = ts.TWIST.with_zero_acceleration()
@@ -1056,9 +1059,10 @@ def get_state_kernel(
     _bank_matches = _bank_binding(bank_coordinates, layout) if banked else None
     scan_poses, scan_motion, collect, body_terms = h._scan_poses, h._scan_motion, h._collect, h._body_terms
     _storage = h._storage
-    # The words of a tree's block (TreeLayout): poses (7 a body) from 0, then each body's twist and bias acceleration
-    # (6 each), the axes (6 a coordinate) and each root's origin and shift (3 each).
-    motion_word, bias_word = 7 * layout.bodies, 13 * layout.bodies
+    # The words of a tree's block (TreeLayout): each body's pose and bias acceleration (body_words a body) from 0,
+    # then each body's twist (6), the axes (6 a coordinate) and each root's origin and shift (3 each); the bias
+    # wrenches and the inertia records take the twists' and the poses' words once the publication has read them.
+    body_words, bias_word, motion_word = layout.BODY_WORDS, layout.ACCELERATION_WORD, layout.motion_offset
     axis_word, origin_word = layout.axis_offset, layout.origin_offset
     bodies, dofs, pack = layout.bodies, layout.dofs, layout.pack
     roots, free_roots, forest, own_bias = len(layout.roots), layout.free_root_count, layout.forest, layout.own_bias
@@ -1250,7 +1254,7 @@ def get_state_kernel(
                     wp.transform_get_translation(relative),
                 )
                 relative = wp.transform(wp.vec3(), wp.transform_get_rotation(relative))
-            store_words(g.address, 7 * local, relative)
+            store_words(g.address, wp.static(body_words) * local, relative)
         _sync()
 
     @wp.func
@@ -1260,7 +1264,8 @@ def get_state_kernel(
         for root in range(g.lane, wp.static(roots), g.stride):
             local = root_local(plan, root)
             origin = wp.transform_point(
-                load_words(g.address, 7 * local, wp.transform()), data.body_com[data.joint_child[g.js + local]]
+                load_words(g.address, wp.static(body_words) * local, wp.transform()),
+                data.body_com[data.joint_child[g.js + local]],
             )
             store_words(g.address, wp.static(origin_word) + 6 * root, origin)
             data.articulation_origin[root_art(g, plan, root)] = origin + load_words(
@@ -1292,7 +1297,7 @@ def get_state_kernel(
             shift = load_words(g.address, word + 3, wp.vec3())
             anchor = data.joint_X_p[joint]
             if parent >= 0:
-                anchor = load_words(g.address, 7 * parent, wp.transform()) * anchor
+                anchor = load_words(g.address, wp.static(body_words) * parent, wp.transform()) * anchor
             else:
                 anchor = wp.transform(wp.transform_get_translation(anchor) - shift, wp.transform_get_rotation(anchor))
             # The joint's frame point (shifted with the root): its anchor, a free joint's child's centre of mass.
@@ -1336,7 +1341,8 @@ def get_state_kernel(
                 free = kind == JointType.FREE or kind == JointType.DISTANCE
                 if free:
                     point = wp.transform_point(
-                        load_words(g.address, 7 * local, wp.transform()), data.body_com[data.joint_child[joint]]
+                        load_words(g.address, wp.static(body_words) * local, wp.transform()),
+                        data.body_com[data.joint_child[joint]],
                     )
                 if wp.static(two_half):
                     # A group with a joint whose column has two halves at its frame (a D6 joint's turns after its
@@ -1366,7 +1372,7 @@ def get_state_kernel(
                     data.walk_now_link[joint, wp.static(WALK_FRAME) + k] = frame[k]
             store_words(g.address, wp.static(motion_word) + 6 * local, velocity)
             if wp.static(own_bias):
-                store_words(g.address, wp.static(bias_word) + 6 * local, bias)
+                store_words(g.address, wp.static(body_words) * local + wp.static(bias_word), bias)
             if wp.static(clocked):
                 clock_m3 = _clock()
                 if local == 0 and data.stage_clocks.shape[0] > g.group:
@@ -1385,7 +1391,7 @@ def get_state_kernel(
             word = wp.static(origin_word) + 6 * root
             origin = load_words(g.address, word, wp.vec3())
             shift = load_words(g.address, word + 3, wp.vec3())
-            pose = load_words(g.address, 7 * local, wp.transform())
+            pose = load_words(g.address, wp.static(body_words) * local, wp.transform())
             data.body_q[body] = wp.transform(
                 wp.transform_get_translation(pose) + shift, wp.transform_get_rotation(pose)
             )
@@ -1402,7 +1408,7 @@ def get_state_kernel(
                     pose * wp.transform(data.body_com[body], wp.quat_identity()),
                     origin,
                     load_words(g.address, wp.static(motion_word) + 6 * local, wp.spatial_vector()),
-                    load_words(g.address, wp.static(bias_word) + 6 * local, wp.spatial_vector()),
+                    load_words(g.address, wp.static(body_words) * local + wp.static(bias_word), wp.spatial_vector()),
                     data,
                     cache,
                 )
