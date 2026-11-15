@@ -17108,25 +17108,6 @@ class ModelBuilder:
             m.edge_bending_properties = _to_wp_array(
                 self.edge_bending_properties, wp.float32, requires_grad=requires_grad
             )
-            # Build the soft-mesh adjacency from the accumulated bending edges and triangles:
-            # keep the builder's edge numbering (it stays aligned with the bending materials) and
-            # derive the edge/triangle maps against the final triangles.
-            edge_indices = (
-                np.array(self.edge_indices, dtype=np.int32).reshape(-1, 4)
-                if len(self.edge_indices) > 0
-                else np.empty((0, 4), dtype=np.int32)
-            )
-            m.soft_mesh_adjacency = MeshAdjacency(
-                tri_indices=self.tri_indices,
-                edge_indices=edge_indices,
-                spring_indices=self.spring_indices,
-                tet_indices=self.tet_indices,
-            )
-            # Build the vertex adjacency (cheap) and upload one device copy here, so every consumer
-            # (VBD solver, collision pipeline) shares a single MeshAdjacencyData rather than each
-            # running init_vertex_adjacency + .to() itself.
-            m.soft_mesh_adjacency.init_vertex_adjacency(self.particle_count)
-            m.soft_mesh_adjacency_device = m.soft_mesh_adjacency.to(device)
 
             # ---------------------
             # tetrahedra
@@ -17405,6 +17386,7 @@ class ModelBuilder:
             m.mujoco.equality_constraint_world_start = wp.array(self._equality_constraint_world_start, dtype=wp.int32)
             m.constraint_mimic_count = len(self.constraint_mimic_joint0)
             m.actuator_count = self.actuator_count
+            m.build_soft_mesh_adjacency()
 
             m._shape_contact_pair_data = _ShapeContactPairs(
                 self.shape_body[:shape_count],

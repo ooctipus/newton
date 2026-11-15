@@ -1379,10 +1379,11 @@ class Model:
         self.edge_constraint_lambdas: wp.array[wp.float32] | None = None
         """Lagrange multipliers for edge constraints (internal use)."""
         self.soft_mesh_adjacency: MeshAdjacency | None = None
-        """Soft mesh topology and solver adjacency, or ``None`` before finalization."""
+        """Soft mesh topology and solver adjacency, or ``None`` before finalization; see
+        :meth:`build_soft_mesh_adjacency`."""
         self.soft_mesh_adjacency_device: MeshAdjacencyData | None = None
-        """Device-uploaded :attr:`soft_mesh_adjacency`, built once at finalization and shared by all
-        consumers (VBD solver, collision pipeline). ``None`` before finalization."""
+        """Device-uploaded :attr:`soft_mesh_adjacency`, built once by :meth:`build_soft_mesh_adjacency` and shared by
+        all consumers (VBD solver, collision pipeline). ``None`` before finalization."""
 
         self.tet_indices: wp.array[wp.int32] | None = None
         """Tetrahedral element indices, shape [tet_count*4], int."""
@@ -2278,6 +2279,30 @@ class Model:
         ``(joint_count + 1,)``. Aliases :attr:`joint_q_start`.
         """
         return self.joint_q_start
+
+    def build_soft_mesh_adjacency(self) -> None:
+        """Build :attr:`soft_mesh_adjacency` and :attr:`soft_mesh_adjacency_device` from the model's elements.
+
+        The adjacency is derived from :attr:`tri_indices`, :attr:`edge_indices` (whose numbering it keeps),
+        :attr:`spring_indices` and :attr:`tet_indices` over :attr:`particle_count` particles.
+        :meth:`ModelBuilder.finalize() <newton.ModelBuilder.finalize>` calls it; call it again after replacing any of
+        these arrays.
+        """
+
+        def rows(array: wp.array | None, width: int) -> np.ndarray:
+            if array is None:
+                return np.empty((0, width), dtype=np.int32)
+            return array.numpy().reshape(-1, width)
+
+        adjacency = MeshAdjacency(
+            tri_indices=rows(self.tri_indices, 3),
+            edge_indices=rows(self.edge_indices, 4),
+            spring_indices=rows(self.spring_indices, 2).reshape(-1),
+            tet_indices=rows(self.tet_indices, 4),
+        )
+        adjacency.init_vertex_adjacency(self.particle_count)
+        self.soft_mesh_adjacency = adjacency
+        self.soft_mesh_adjacency_device = adjacency.to(self.device)
 
     def bvh_build_shapes(
         self,

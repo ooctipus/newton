@@ -1,0 +1,1 @@
+Add `Model.build_soft_mesh_adjacency()`, which builds the soft-mesh adjacency from the model's triangle, bending-edge, spring and tetrahedron arrays; `ModelBuilder.finalize()` uses it, and callers that replace those arrays call it to rebuild the adjacency.
