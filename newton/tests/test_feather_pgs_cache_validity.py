@@ -173,7 +173,10 @@ class TestFeatherPGSJointNotification(unittest.TestCase):
     def test_proven_joint_notification_keeps_held_caches(self):
         """Keep held-tree validity on a joint-property notification the owner proves unchanged.
 
-        Any other cache input invalidates as before. A moved joint frame invalidates every cache
+        A model-property notification reaches the caches through gravity alone, so one that changes
+        no world's gravity keeps them too (a changed world's caches alone are invalidated:
+        ``test_feather_pgs_contract_bodies``). Any other cache input invalidates as before. A moved
+        joint frame invalidates every cache
         without raising, and the moved frame is the proof's reference from then on: a later
         notification that moves nothing keeps the caches, and restoring the frame moves it again.
         A changed joint axis raises before any change, and without an owner nothing proves the
@@ -207,14 +210,18 @@ class TestFeatherPGSJointNotification(unittest.TestCase):
         valid, invalid = [1] * len(validity_arrays), [0] * len(validity_arrays)
         self.assertTrue(owner.validate_model(JOINT))
         self.assertFalse(owner.validate_model(newton.ModelFlags.JOINT_DOF_PROPERTIES))
-        for flags in (JOINT, JOINT | newton.ModelFlags.SHAPE_PROPERTIES, JOINT | newton.ModelFlags.ACTUATOR_PROPERTIES):
+        for flags in (
+            JOINT,
+            JOINT | newton.ModelFlags.SHAPE_PROPERTIES,
+            JOINT | newton.ModelFlags.ACTUATOR_PROPERTIES,
+            JOINT | newton.ModelFlags.MODEL_PROPERTIES,
+        ):
             with self.subTest(kept=int(flags)):
                 mark_valid()
                 self.assertEqual(invalidating_launches(flags), [])
                 self.assertEqual(validity(), valid)
         for flags in (
             JOINT | newton.ModelFlags.BODY_INERTIAL_PROPERTIES,
-            JOINT | newton.ModelFlags.MODEL_PROPERTIES,
             newton.ModelFlags.JOINT_DOF_PROPERTIES,
             newton.ModelFlags.ALL,
         ):

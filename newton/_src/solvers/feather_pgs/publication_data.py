@@ -29,7 +29,10 @@ PUBLICATION = (
     Field("body_gravity_compensation", wp.float32, ("body",), owner="factor"),
     Field("body_to_articulation", wp.int32, ("body",), owner="forest"),
     Field("is_free_rigid", wp.int32, ("articulation",), owner="forest"),
+    # Each world's gravity, the global world's last, and each body's world (-1, the global world, reads the last
+    # entry): a body feels its own world's gravity, as Model.gravity states it.
     Field("gravity", wp.vec3, ("world",), owner="model"),
+    Field("body_world", wp.int32, ("body",), owner="model"),
     Field("joint_q", wp.float32, ("coord",), owner="state_in"),
     Field("joint_qd", wp.float32, ("dof",), owner="state_in"),
     Field("v_out", wp.float32, ("dof",)),

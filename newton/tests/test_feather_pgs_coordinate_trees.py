@@ -1619,6 +1619,39 @@ class TestCoordinateTreesOwner(unittest.TestCase):
         presses = [_press_key_with_tip(self, model, layout, solver) for solver in (head, mine, reference)]
         _assert_gripper_switch(self, *presses, beta=head.options.pgs_beta, dt=DT)
 
+    def test_each_world_feels_its_own_gravity(self):
+        """The class's slides and turns, one with a welded body, weigh under their own world's gravity: a world given
+        another gravity steps as where every world has it, bit for bit, and the world beside it as where none has."""
+        device = wp.get_device("cuda:0")
+        other = (1.5, -2.0, -3.0)
+        runs = []
+        for write in ("none", "every", "one"):
+            model = build_branch_model(
+                device, worlds=2, leaves=STAR_LEAVES, kinds=("prismatic", "revolute"), descendant=True
+            )
+            if write == "every":
+                model.set_gravity(other)
+            elif write == "one":
+                model.set_gravity(other, world=1)
+            solver = recipe_solver(model, coordinate=True)
+            owner = solver.factor.held
+            self.assertIsNotNone(owner.plan.coordinate, owner.plan.coordinate_reason)
+            self.assertTrue(owner.plan.coordinate.topology.turns)
+            self.assertGreater(owner.plan.coordinate.topology.weld_joint_offset.size, 0)
+            state, output, control = model.state(), model.state(), model.control()
+            newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+            for _ in range(10):
+                state.clear_forces()
+                solver.step(state, output, control, None, DT)
+                state, output = output, state
+            runs.append({name: getattr(state, name).numpy().reshape(2, -1).copy() for name in ("joint_q", "joint_qd")})
+        plain, every, one = runs
+        for name in ("joint_q", "joint_qd"):
+            np.testing.assert_array_equal(one[name][0], plain[name][0])
+            np.testing.assert_array_equal(one[name][1], every[name][1])
+        # The two gravities move the leaves apart: the equalities are not between two stars at rest.
+        self.assertGreater(float(np.abs(plain["joint_qd"][1] - every["joint_qd"][1]).max()), 1.0e-3)
+
     def test_turning_leaves_take_the_class_kernels(self):
         """A star with revolute leaves takes the class's turning kernels; pinned (``star="held"``), the held tree's
         compact diagonal group holds it, whose walk is its inverse; both step finite."""

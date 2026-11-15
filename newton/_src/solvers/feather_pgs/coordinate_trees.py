@@ -270,7 +270,7 @@ def class_kernels(turns: bool, welded: bool) -> tuple[wp.Kernel, wp.Kernel, wp.K
                 child,
                 motion,
                 origin,
-                data.gravity[0],
+                data.gravity[data.body_world[child]],
                 data.body_gravity_compensation,
                 data.body_q,
                 data.body_com,
@@ -281,11 +281,12 @@ def class_kernels(turns: bool, welded: bool) -> tuple[wp.Kernel, wp.Kernel, wp.K
             )
             if wp.static(welded):
                 for k in range(weld_start[local], weld_start[local + 1]):
+                    welded_body = p.joint_child[root_joint + weld_joint_offset[k]]
                     wrench, inertia = _turning_load(
-                        p.joint_child[root_joint + weld_joint_offset[k]],
+                        welded_body,
                         motion,
                         origin,
-                        data.gravity[0],
+                        data.gravity[data.body_world[welded_body]],
                         data.body_gravity_compensation,
                         data.body_q,
                         data.body_com,
@@ -305,7 +306,8 @@ def class_kernels(turns: bool, welded: bool) -> tuple[wp.Kernel, wp.Kernel, wp.K
                     body = p.joint_child[root_joint + weld_joint_offset[k]]
                     mass += data.body_mass[body]
                     weight += weight_fraction(data.body_gravity_compensation[body]) * data.body_mass[body]
-            force = weight * data.gravity[0]
+            # A slide's leaf and its welded bodies weigh as one: they lie in one world (coordinate_topology).
+            force = weight * data.gravity[data.body_world[child]]
             body_force = -wp.spatial_vector(force, wp.vec3()) - _external_at_origin(
                 child, wp.vec3(), f.body_f, f.body_flags
             )
@@ -532,10 +534,17 @@ def coordinate_topology(model, forest, size: int) -> tuple:
     # Each leaf's welds: its tree's depth-first positions after its own.
     welds = cut.subtree_size[roots] - 1
     leaf, rank = host_index.expand(welds)
+    weld_offsets = cut.dfs_order[cut.dfs_position[roots][leaf] + 1 + rank] - start
+    # A leaf weighs with its welded bodies under one gravity, its own world's (Model.gravity is a vector a world).
+    body_world = model.body_world.numpy()[model.joint_child.numpy()]
+    if np.any(
+        body_world[starts[arts][:, None] + weld_offsets] != body_world[starts[arts][:, None] + (roots - start)[leaf]]
+    ):
+        return None, "One-coordinate trees require a leaf's welded bodies in the leaf's world."
     topology = CoordinateTopology(
         leaves=(roots - start).astype(np.int32),
         weld_start=host_index.offsets(welds, np.int32),
-        weld_joint_offset=(cut.dfs_order[cut.dfs_position[roots][leaf] + 1 + rank] - start).astype(np.int32),
+        weld_joint_offset=weld_offsets.astype(np.int32),
         turns=bool(np.any(model.joint_dof_dim.numpy()[roots, 1] != 0)),
     )
     return topology, ""

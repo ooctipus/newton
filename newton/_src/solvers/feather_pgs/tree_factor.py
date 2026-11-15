@@ -53,7 +53,9 @@ from .factor.kernels import (
     damp_free_root_spin,
     invalidate_articulation_fk_id_cache,
     invalidate_fk_id_cache_for_articulations,
+    invalidate_fk_id_cache_for_gravity,
     prescale_joint_velocity_limits,
+    take_gravity,
 )
 from .factor.walk import (
     RELEASE_SLIPS,
@@ -176,6 +178,10 @@ class TreeFactor:
         if compensation is None:
             compensation = wp.zeros(max(1, int(model.body_count)), dtype=wp.float32, device=model.device)
         self.body_gravity_compensation = compensation
+        # Each world's gravity as the cached dynamics hold it (the bias wrench of each body is its own world's): a
+        # model notification compares the model's with it and repairs the worlds whose vector changed.
+        self.held_gravity = wp.clone(model.gravity)
+        self.gravity_changed = wp.zeros(model.gravity.shape[0], dtype=wp.int32, device=model.device)
         self.kinematic_joint_mask = wp.zeros(model.joint_count, dtype=wp.int32, device=model.device)
         self.kinematic_dof_mask = wp.zeros(model.joint_dof_count, dtype=wp.int32, device=model.device)
         self.kinematic_dof_mask_host = None
@@ -571,7 +577,10 @@ class TreeFactor:
     def notify_model_changed(self, flags, kinematic) -> None:
         """Take a model change once every check that can refuse it passed: prove the held tree's frames, invalidate
         the caches the changed inputs feed, publish ``kinematic`` (:meth:`kinematic_state`, or ``None``) and ask every
-        tree's factor again on an inertial change (the kernels read mass, inertia and centre of mass live)."""
+        tree's factor again on an inertial change (the kernels read mass, inertia and centre of mass live). A change
+        of the model's properties (``MODEL_PROPERTIES``) reaches the cached dynamics through gravity alone, a vector a
+        world: the worlds whose vector changed are found on the device and only their trees' caches are invalidated
+        (:meth:`_take_gravity`); the factors hold no gravity."""
         # The held tree's proof stores a moved joint frame as its new reference, so it runs after every check that
         # can still refuse the notification.
         held = self.held
@@ -581,7 +590,6 @@ class TreeFactor:
             | ModelFlags.JOINT_DOF_PROPERTIES
             | ModelFlags.BODY_PROPERTIES
             | ModelFlags.BODY_INERTIAL_PROPERTIES
-            | ModelFlags.MODEL_PROPERTIES
         )
         if frames_proven and cache_inputs == int(ModelFlags.JOINT_PROPERTIES):
             # The held tree's device checksums of every joint frame and axis just matched (an exact host fingerprint
@@ -598,12 +606,35 @@ class TreeFactor:
         if cache_inputs:
             held.invalidate()
             self.fk_id_cache_valid.zero_()
+        if flags & ModelFlags.MODEL_PROPERTIES:
+            self._take_gravity()
         if kinematic is not None:
             self.apply_kinematic_state(kinematic)
             self.scatter_armature()
             self.mass_update_requested.fill_(1)
         if flags & ModelFlags.BODY_INERTIAL_PROPERTIES and self.model.body_count:
             self.mass_update_requested.fill_(1)
+
+    def _take_gravity(self) -> None:
+        """Hold the model's gravity and invalidate the cached dynamics of the trees it changed: each articulation
+        with a body in a world whose vector differs from the one held. Two launches, no readback: a captured graph
+        replays them."""
+        model = self.model
+        wp.launch(
+            take_gravity,
+            dim=model.gravity.shape[0],
+            inputs=[model.gravity],
+            outputs=[self.held_gravity, self.gravity_changed],
+            device=model.device,
+        )
+        if model.body_count:
+            wp.launch(
+                invalidate_fk_id_cache_for_gravity,
+                dim=model.body_count,
+                inputs=[self.gravity_changed, model.body_world, self.forest.body_to_articulation],
+                outputs=[self.fk_id_cache_valid],
+                device=model.device,
+            )
 
     def reset_cache(self, world_mask: wp.array | None) -> None:
         """Invalidate the FK/ID cache of the worlds ``world_mask`` selects. A step from another state than the one the

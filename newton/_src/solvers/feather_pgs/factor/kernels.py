@@ -575,6 +575,40 @@ def build_mass_update_mask(
 
 
 @wp.kernel
+def take_gravity(
+    gravity: wp.array[wp.vec3],
+    # in/out
+    held_gravity: wp.array[wp.vec3],
+    # outputs
+    changed: wp.array[int],
+):
+    """Mark each world whose gravity differs from the one the cached dynamics hold (``held_gravity``), and hold the
+    model's. A NaN component never compares equal: its world is marked at every notification."""
+    world = wp.tid()
+    held = held_gravity[world]
+    now = gravity[world]
+    changed[world] = int(now[0] != held[0] or now[1] != held[1] or now[2] != held[2])
+    held_gravity[world] = now
+
+
+@wp.kernel
+def invalidate_fk_id_cache_for_gravity(
+    changed: wp.array[int],
+    body_world: wp.array[int],
+    body_to_articulation: wp.array[int],
+    # outputs
+    fk_id_cache_valid: wp.array[int],
+):
+    """Clear the FK/ID cache flag of each articulation that holds a body of a world whose gravity changed
+    (:func:`take_gravity`; a body of the global world, ``-1``, reads the last entry, as its gravity)."""
+    body = wp.tid()
+    if changed[body_world[body]] != 0:
+        articulation = body_to_articulation[body]
+        if articulation >= 0:
+            fk_id_cache_valid[articulation] = 0
+
+
+@wp.kernel
 def invalidate_fk_id_cache_for_articulations(
     articulations: wp.array[int],
     # outputs

@@ -699,6 +699,13 @@ class SolverFeatherPGS(SolverBase):
         flag covers the :class:`~newton.Model` joint arrays only: after
         writing :class:`~newton.State` joint coordinates outside :meth:`step`,
         call :meth:`reset` with a world mask or :meth:`notify_state_changed`.
+
+        A body feels the gravity of its own world (:attr:`~newton.Model.gravity`,
+        a vector a world and the global world's last, which a body outside
+        every world feels). A write to it takes effect on the next step once
+        announced with :attr:`~newton.ModelFlags.MODEL_PROPERTIES`: the worlds
+        whose vector changed are found on the device and only their cached
+        dynamics are repaired.
         """
         self.cut.refresh()
         # Derive the kinematic state first: a body-flag change the solver

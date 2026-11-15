@@ -713,11 +713,129 @@ def test_gravity_compensation_is_a_held_weight(test, device):
             test.assertGreater(float(np.abs(a.joint_qd.numpy() - free.joint_qd.numpy()).max()), 0.05)
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# gravity a world
+#
+# ``Model.gravity`` holds a vector a world and the global world's last: a body feels its own world's, a body of the
+# global world (``body_world == -1``) the last, as SolverFeatherstone reads it. The scenes are the compensation
+# tests' three trees with no compensation, each a held tree group; the one-coordinate class has its own test
+# (``test_feather_pgs_coordinate_trees``).
+# ---------------------------------------------------------------------------------------------------------------------
+
+OTHER_GRAVITY = (1.5, -2.0, -3.0)
+
+
+def _worlds(model, state, field):
+    """A state field of a two-world scene, a row a world."""
+    return getattr(state, field).numpy().reshape(2, -1)
+
+
+def test_gravity_is_each_worlds_own(test, device):
+    """A world under another gravity moves as it does where every world has that gravity, bit for bit, and the
+    world beside it as where none has: in every tree class."""
+    for kind in ("free", "arm", "leaves"):
+        with test.subTest(kind=kind):
+            plain = _compensated_scene(device, kind, (0.0,))
+            other = _compensated_scene(device, kind, (0.0,))
+            other.set_gravity(OTHER_GRAVITY)
+            mixed = _compensated_scene(device, kind, (0.0,))
+            mixed.set_gravity(OTHER_GRAVITY, world=1)
+            np.testing.assert_array_equal(mixed.gravity.numpy()[:2], np.float32([(0.0, 0.0, GRAVITY), OTHER_GRAVITY]))
+            a, b, m = _run(plain, 20), _run(other, 20), _run(mixed, 20)
+            for field in ("joint_q", "joint_qd", "body_q", "body_qd"):
+                np.testing.assert_array_equal(_worlds(mixed, m, field)[0], _worlds(plain, a, field)[0])
+                np.testing.assert_array_equal(_worlds(mixed, m, field)[1], _worlds(other, b, field)[1])
+            # The two gravities move the tree apart: the equalities above are not between two trees at rest.
+            test.assertGreater(float(np.abs(_worlds(plain, a, "joint_qd") - _worlds(other, b, "joint_qd")).max()), 0.05)
+
+
+def test_gravity_write_reaches_its_world_on_the_next_step(test, device):
+    """A notified write to one world's gravity repairs that world's cached dynamics alone and acts on its next step;
+    the world beside it steps bit for bit as without the write."""
+    flags = newton.ModelFlags.MODEL_PROPERTIES
+    for kind in ("free", "arm", "leaves"):
+        with test.subTest(kind=kind):
+            states = []
+            for write in (False, True):
+                model = _compensated_scene(device, kind, (0.0,))
+                solver = SolverFeatherPGS(model, angular_damping=0.0)
+                state, output, control = model.state(), model.state(), model.control()
+                newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+                for step in range(10):
+                    if step == 5:
+                        before = state.joint_qd.numpy().reshape(2, -1).copy()
+                        if write:
+                            model.set_gravity(OTHER_GRAVITY, world=1)
+                            solver.notify_model_changed(flags)
+                            # The cached dynamics of the written world are stale, the other world's stand.
+                            valid = solver.factor.fk_id_cache_valid.numpy().copy()
+                            world = solver.forest.articulation_world
+                            test.assertTrue(np.all(valid[world == 0] == 1))
+                            test.assertTrue(np.all(valid[world == 1] == 0))
+                            # A notification that changes no world's gravity invalidates none.
+                            solver.factor.fk_id_cache_valid.fill_(1)
+                            solver.notify_model_changed(flags)
+                            test.assertTrue(np.all(solver.factor.fk_id_cache_valid.numpy() == 1))
+                            solver.factor.fk_id_cache_valid.assign(valid)
+                    solver.step(state, output, control, None, COMPENSATION_DT)
+                    state, output = output, state
+                    if step == 5:
+                        after = state.joint_qd.numpy().reshape(2, -1).copy()
+                states.append((state, before, after))
+            (plain, _, plain_after), (written, before, after) = states
+            for field in ("joint_q", "joint_qd", "body_q", "body_qd"):
+                np.testing.assert_array_equal(_worlds(model, written, field)[0], _worlds(model, plain, field)[0])
+            # The step after the write differs in the written world.
+            test.assertGreater(float(np.abs(after[1] - plain_after[1]).max()), 1.0e-3)
+            if kind == "free":
+                # A free body's velocity gains the new gravity times the step on that step.
+                expected = np.float64(OTHER_GRAVITY) * COMPENSATION_DT
+                np.testing.assert_allclose(after[1][:3] - before[1][:3], expected, rtol=1.0e-4, atol=1.0e-7)
+
+
+def test_gravity_of_the_global_world(test, device):
+    """A body outside every world feels the global world's gravity, the last entry, as SolverFeatherstone has it."""
+    template = newton.ModelBuilder(gravity=(0.0, 0.0, GRAVITY))
+    template.add_body(mass=1.5, inertia=wp.mat33(np.diag([0.004, 0.006, 0.005])))
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, GRAVITY))
+    builder.replicate(template, 2, spacing=(2.0, 0.0, 0.0))
+    builder.add_body(
+        mass=1.0, inertia=wp.mat33(np.diag([0.004, 0.006, 0.005])), xform=wp.transform(wp.vec3(0.0, 3.0, 0.0))
+    )
+    model = builder.finalize(device=device)
+    np.testing.assert_array_equal(model.body_world.numpy(), [0, 1, -1])
+    model.set_gravity(OTHER_GRAVITY, world=-1)
+    model.set_gravity((0.0, 0.0, 0.0), world=1)
+    steps = 20
+    velocities = []
+    for solver_cls in (SolverFeatherPGS, SolverFeatherstone):
+        solver = solver_cls(model, angular_damping=0.0)
+        state, output, control = model.state(), model.state(), model.control()
+        newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+        for _ in range(steps):
+            solver.step(state, output, control, None, COMPENSATION_DT)
+            state, output = output, state
+        velocities.append(state.joint_qd.numpy().reshape(3, 6)[:, :3].astype(np.float64))
+    expected = np.float64([(0.0, 0.0, GRAVITY), (0.0, 0.0, 0.0), OTHER_GRAVITY]) * steps * COMPENSATION_DT
+    np.testing.assert_allclose(velocities[0], expected, rtol=1.0e-5, atol=1.0e-7)
+    np.testing.assert_allclose(velocities[0], velocities[1], rtol=1.0e-5, atol=1.0e-7)
+
+
+class TestFeatherPGSWorldGravity(unittest.TestCase):
+    """Each world's own gravity, on every test device."""
+
+
 class TestFeatherPGSGravityCompensation(unittest.TestCase):
     """A body's gravity compensation fraction, on every test device."""
 
 
 for _device in get_test_devices():
+    for _test in (
+        test_gravity_is_each_worlds_own,
+        test_gravity_write_reaches_its_world_on_the_next_step,
+        test_gravity_of_the_global_world,
+    ):
+        add_function_test(TestFeatherPGSWorldGravity, _test.__name__, _test, devices=[_device])
     add_function_test(
         TestFeatherPGSGravityCompensation,
         "test_gravity_compensation_weightless",

@@ -940,7 +940,7 @@ def get_helpers(
         if g.refresh != 0:
             total, moment, rotational = inertia_at(mass, inertia_local, rotation, radius)
             record = pack_inertia(total, moment, rotational)
-        gravity = weight_fraction(data.body_gravity_compensation[body]) * data.gravity[0]
+        gravity = weight_fraction(data.body_gravity_compensation[body]) * data.gravity[data.body_world[body]]
         wrench = body_wrench(mass, rotation, inertia_local, radius, velocity, acceleration, gravity)
         if wp.static(clocked):
             clock_b1 = _clock()
