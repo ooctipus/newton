@@ -487,6 +487,7 @@ class Model:
                 raise ValueError(f"Attribute compaction policy {self.compaction_policy!r} requires a reference domain")
 
     _CORE_ATTRIBUTE_SPECS: ClassVar[dict[str, AttributeSpec]] = {
+        "gravity": AttributeSpec(AttributeFrequency.WORLD, compaction_policy="passthrough"),
         "tendon_label": AttributeSpec(AttributeFrequency.TENDON),
         "tendon_world": AttributeSpec(AttributeFrequency.TENDON, references=AttributeFrequency.WORLD),
         "tendon_start": AttributeSpec(
