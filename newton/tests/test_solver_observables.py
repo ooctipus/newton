@@ -314,7 +314,7 @@ class TestSolverObservables(unittest.TestCase):
                 count_attr = self.model._ATTRIBUTE_FREQUENCY_COUNT_ATTRS[domain]
                 self.assertIsNone(getattr(self.model, count_attr))
                 with self.assertRaisesRegex(RuntimeError, "CollisionPipeline"):
-                    self.model._attribute_frequency_count(domain)
+                    self.model.attribute_frequency_count(domain)
 
         for rigid_max, soft_max in ((5, 3), (0, 3), (5, 0), (0, 0)):
             newton.CollisionPipeline(self.model, rigid_contact_max=rigid_max, soft_contact_max=soft_max)
@@ -326,7 +326,7 @@ class TestSolverObservables(unittest.TestCase):
                 with self.subTest(domain=domain, rigid_max=rigid_max, soft_max=soft_max):
                     count_attr = self.model._ATTRIBUTE_FREQUENCY_COUNT_ATTRS[domain]
                     self.assertEqual(getattr(self.model, count_attr), count)
-                    self.assertEqual(self.model._attribute_frequency_count(domain), count)
+                    self.assertEqual(self.model.attribute_frequency_count(domain), count)
 
     def test_custom_soft_contact_frequency(self):
         """Require contact binding for a soft-only diagnostic without standard forces."""

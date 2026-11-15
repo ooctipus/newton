@@ -215,14 +215,14 @@ class ModelView:
                 name,
                 value,
                 spec.frequency,
-                self._attribute_frequency_count(spec.frequency),
+                self.attribute_frequency_count(spec.frequency),
             )
 
         if not isinstance(value, (wp.array, np.ndarray)):
             return value
 
         if spec.compaction_policy == "start":
-            start_count = self._attribute_frequency_count(spec.frequency) + 1
+            start_count = self.attribute_frequency_count(spec.frequency) + 1
             if value.shape[0] == start_count:
                 return value
             if value.shape[0] < start_count:
@@ -235,7 +235,7 @@ class ModelView:
             return self._count_limited_world_start(
                 name,
                 value,
-                self._attribute_frequency_count(spec.frequency),
+                self.attribute_frequency_count(spec.frequency),
             )
 
         count = self._frequency_count_for_attribute(name)
@@ -252,7 +252,7 @@ class ModelView:
         if spec is None or spec.compaction_policy not in {"generic", "end", "range_start"}:
             return None
         try:
-            count = self._attribute_frequency_count(spec.frequency)
+            count = self.attribute_frequency_count(spec.frequency)
         except KeyError:
             return None
         return count * spec.row_width
@@ -289,7 +289,7 @@ class ModelView:
         if not isinstance(value, list):
             return value
         parent = object.__getattribute__(self, "_parent")
-        if count >= parent._attribute_frequency_count(frequency):
+        if count >= parent.attribute_frequency_count(frequency):
             return value
 
         cache_name = f"__count_limited_{name}_{count}"
@@ -360,11 +360,11 @@ class ModelView:
 
         Model._add_requested_state_attributes(self, state, requested, requires_grad=requires_grad)
 
-    def _attribute_frequency_count(self, frequency: Model.AttributeFrequency | str) -> int:
+    def attribute_frequency_count(self, frequency: Model.AttributeFrequency | str) -> int:
         """Return an attribute frequency count using this view's overrides."""
         from ...sim import Model  # noqa: PLC0415
 
-        return Model._attribute_frequency_count(self, frequency)
+        return Model.attribute_frequency_count(self, frequency)
 
     def _temporary_state_array_overrides(self):
         """Temporarily slice state source arrays to match view-local counts."""

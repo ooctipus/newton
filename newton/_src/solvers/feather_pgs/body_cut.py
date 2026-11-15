@@ -383,7 +383,7 @@ class BodyCut:
             if name.endswith("_world_start"):
                 # Per-world index ranges do not hold over shadows past every world's bodies; no primitive reads them.
                 setattr(forest, name, None)
-            elif isinstance(value, wp.array | list) and len(value) == source._attribute_frequency_count(spec.frequency):
+            elif isinstance(value, wp.array | list) and len(value) == source.attribute_frequency_count(spec.frequency):
                 setattr(forest, name, _gathered(value, self._orders[spec.frequency]))
 
         def indices(values):

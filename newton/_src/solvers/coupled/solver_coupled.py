@@ -731,7 +731,7 @@ class SolverCoupled(SolverBase, CouplingInterface):
 
         result = {}
         for item_frequency in required:
-            count = int(model._attribute_frequency_count(item_frequency))
+            count = int(model.attribute_frequency_count(item_frequency))
             row_world = direct.get(item_frequency)
             if isinstance(row_world, wp.array):
                 result[item_frequency] = row_world
@@ -1208,7 +1208,7 @@ class SolverCoupled(SolverBase, CouplingInterface):
             frequency = attribute.frequency
             if frequency in projections:
                 continue
-            count = self.model._attribute_frequency_count(frequency)
+            count = self.model.attribute_frequency_count(frequency)
             projections[frequency] = _compact_index_projection(range(count), count)
         return projections
 
@@ -1563,7 +1563,7 @@ class SolverCoupled(SolverBase, CouplingInterface):
             return None, "a selected custom-frequency domain is not grouped by world"
 
         frequency_orders = {
-            frequency: (order, model._attribute_frequency_count(frequency))
+            frequency: (order, model.attribute_frequency_count(frequency))
             for frequency, order in built_in_frequency_orders.items()
         }
         frequency_orders.update(
@@ -1593,7 +1593,7 @@ class SolverCoupled(SolverBase, CouplingInterface):
         orders = {}
         range_maps = {}
         for family_frequency in (frequency.CURVE, frequency.SURFACE, frequency.VOLUME):
-            count = model._attribute_frequency_count(family_frequency)
+            count = model.attribute_frequency_count(family_frequency)
             keep = np.ones(count, dtype=bool)
             if count:
                 for attribute in self._attribute_projections:
@@ -1603,7 +1603,7 @@ class SolverCoupled(SolverBase, CouplingInterface):
                     ends = getattr(model, attribute.name.removesuffix("_start") + "_end").numpy()
                     if attribute.references not in range_maps:
                         selected = np.asarray(frequency_orders[attribute.references], dtype=np.int32)
-                        inverse = np.full(model._attribute_frequency_count(attribute.references), -1, dtype=np.int32)
+                        inverse = np.full(model.attribute_frequency_count(attribute.references), -1, dtype=np.int32)
                         # Synthesized FREE roots do not retain the original joint.
                         original = selected >= 0
                         inverse[selected[original]] = np.flatnonzero(original)

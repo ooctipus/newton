@@ -488,6 +488,18 @@ class Model:
 
     _CORE_ATTRIBUTE_SPECS: ClassVar[dict[str, AttributeSpec]] = {
         "gravity": AttributeSpec(AttributeFrequency.WORLD, compaction_policy="passthrough"),
+        # forward-kinematics schedules: a serial joint order and per-articulation levels of joints
+        "_fk_joint_order": AttributeSpec(
+            AttributeFrequency.JOINT, references=AttributeFrequency.JOINT, compaction_policy="passthrough"
+        ),
+        "_fk_articulation_level_start": AttributeSpec(
+            AttributeFrequency.ARTICULATION, references="_fk_level", compaction_policy="start"
+        ),
+        "_fk_level_joint_start": AttributeSpec("_fk_level", references="_fk_level_joint", compaction_policy="start"),
+        "_fk_level_joints": AttributeSpec(
+            "_fk_level_joint", references=AttributeFrequency.JOINT, compaction_policy="passthrough"
+        ),
+        "_fk_level_parent_pos": AttributeSpec("_fk_level_joint", compaction_policy="passthrough"),
         "tendon_label": AttributeSpec(AttributeFrequency.TENDON),
         "tendon_world": AttributeSpec(AttributeFrequency.TENDON, references=AttributeFrequency.WORLD),
         "tendon_start": AttributeSpec(
@@ -880,6 +892,12 @@ class Model:
         AttributeFrequency.SURFACE: "surface_count",
         AttributeFrequency.VOLUME: "volume_count",
     }
+
+    _DERIVED_FREQUENCY_COUNT_ATTRS: ClassVar[dict[str, str]] = {
+        "_fk_level": "_fk_level_count",
+        "_fk_level_joint": "_fk_level_joint_count",
+    }
+    """Frequencies of derived structures and the model attribute holding each one's row count."""
 
     class AttributeNamespace:
         """
@@ -1722,6 +1740,8 @@ class Model:
         self._fk_level_joints: wp.array[wp.int32] | None = None
         self._fk_level_parent_pos: wp.array[wp.int32] | None = None
         self._fk_level_capacity: int = 0
+        self._fk_level_count: int = 0
+        self._fk_level_joint_count: int = 0
         self._fk_joint_order: wp.array[wp.int32] | None = None
         self.articulation_label: list[str] = []
         """Articulation labels, shape [articulation_count], str."""
@@ -2683,7 +2703,7 @@ class Model:
 
             frequency = getattr(Model.AttributeFrequency, template.frequency)
             value = wp.zeros(
-                self._attribute_frequency_count(frequency),
+                self.attribute_frequency_count(frequency),
                 dtype=template.dtype,
                 device=self.device,
                 requires_grad=requires_grad,
@@ -2698,8 +2718,24 @@ class Model:
             else:
                 setattr(state, full_name, value)
 
-    def _attribute_frequency_count(self, frequency: Model.AttributeFrequency | str) -> int:
+    def attribute_frequency_count(self, frequency: Model.AttributeFrequency | str) -> int:
+        """Return the number of rows of an attribute frequency.
+
+        Args:
+            frequency: A built-in :class:`AttributeFrequency`, a custom frequency name, or the name of a frequency of
+                a derived structure declared in :attr:`attribute_specs`.
+
+        Returns:
+            The row count. :attr:`AttributeFrequency.WORLD` counts the local worlds and the global world
+            (``world_count + 1``); :attr:`AttributeFrequency.ONCE` counts one row.
+
+        Raises:
+            ValueError: If the frequency is not supported.
+        """
         if isinstance(frequency, str):
+            count_attr = Model._DERIVED_FREQUENCY_COUNT_ATTRS.get(frequency)
+            if count_attr is not None:
+                return int(getattr(self, count_attr))
             return int(self.custom_frequency_counts[frequency])
 
         if frequency == Model.AttributeFrequency.ONCE:
@@ -2717,6 +2753,40 @@ class Model:
         if count_attr is None:
             raise ValueError(f"Unsupported attribute frequency: {frequency!r}")
         return int(getattr(self, count_attr))
+
+    def set_attribute_frequency_count(self, frequency: Model.AttributeFrequency | str, count: int) -> None:
+        """Set the number of rows of an attribute frequency.
+
+        Callers that assemble a model's arrays themselves, for example from copies of finalized worlds, set the
+        counts of the frequencies whose rows they changed. The attributes of the frequency must hold ``count`` rows.
+
+        Args:
+            frequency: A built-in :class:`AttributeFrequency` with a row count, a custom frequency name, or the name of
+                a frequency of a derived structure declared in :attr:`attribute_specs`.
+            count: The new row count.
+
+        Raises:
+            ValueError: If the frequency has no settable row count (:attr:`AttributeFrequency.ONCE`,
+                :attr:`AttributeFrequency.WORLD` and the contact frequencies).
+        """
+        if isinstance(frequency, str):
+            count_attr = Model._DERIVED_FREQUENCY_COUNT_ATTRS.get(frequency)
+            if count_attr is not None:
+                setattr(self, count_attr, int(count))
+            elif frequency in self.custom_frequency_counts:
+                self.custom_frequency_counts[frequency] = int(count)
+            else:
+                raise ValueError(f"Unknown custom attribute frequency: {frequency!r}")
+            return
+        count_attr = Model._ATTRIBUTE_FREQUENCY_COUNT_ATTRS.get(frequency)
+        if count_attr is None or frequency in (
+            Model.AttributeFrequency.WORLD,
+            Model.AttributeFrequency.CONTACT,
+            Model.AttributeFrequency.CONTACT_RIGID,
+            Model.AttributeFrequency.CONTACT_SOFT,
+        ):
+            raise ValueError(f"Attribute frequency {frequency!r} has no settable row count")
+        setattr(self, count_attr, int(count))
 
     def control(self, requires_grad: bool | None = None, clone_variables: bool = True) -> Control:
         """

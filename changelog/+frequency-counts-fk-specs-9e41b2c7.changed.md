@@ -1,0 +1,1 @@
+Make `Model.attribute_frequency_count()` public and add `Model.set_attribute_frequency_count()`, so callers that assemble a model from copies of finalized worlds read and set row counts from the attribute metadata; declare the forward-kinematics schedules (`_fk_joint_order` and the per-articulation joint levels) in `Model.attribute_specs`.

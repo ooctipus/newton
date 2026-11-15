@@ -125,7 +125,7 @@ class TestTendonBuilder(unittest.TestCase):
             ("tendon_segment_compliance", frequency.TENDON_SEGMENT),
         ):
             self.assertEqual(model.get_attribute_frequency(name), freq)
-        self.assertEqual(model._attribute_frequency_count(frequency.TENDON_GUIDE), 4)
+        self.assertEqual(model.attribute_frequency_count(frequency.TENDON_GUIDE), 4)
         self.assertEqual(model._attribute_spec("tendon_guide_body").references, frequency.BODY)
         np.testing.assert_array_equal(model.tendon_start.numpy(), [0, 2, 4])
         np.testing.assert_array_equal(model.tendon_world.numpy(), [0, 1])

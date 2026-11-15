@@ -904,7 +904,7 @@ class SolverBase:
             if kind in contact_fields:
                 count = _contact_row_count(spec.frequency, contacts)
             else:
-                count = self.model._attribute_frequency_count(spec.frequency)
+                count = self.model.attribute_frequency_count(spec.frequency)
             setattr(
                 observables,
                 name,

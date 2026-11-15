@@ -17320,6 +17320,8 @@ class ModelBuilder:
                     m._fk_level_joints = wp.array(fk_level_joints, dtype=wp.int32)
                     m._fk_level_parent_pos = wp.array(fk_level_parent_pos, dtype=wp.int32)
                     m._fk_level_capacity = fk_level_capacity
+                    m._fk_level_count = len(fk_level_joint_start) - 1
+                    m._fk_level_joint_count = len(fk_level_joints)
             m.articulation_label = self.articulation_label
             m.articulation_world = wp.array(self.articulation_world, dtype=wp.int32)
             m.max_joints_per_articulation = max_joints_per_articulation
@@ -17566,7 +17568,7 @@ class ModelBuilder:
                     continue
 
                 freq_key = custom_attr.frequency
-                count = m._attribute_frequency_count(freq_key)
+                count = m.attribute_frequency_count(freq_key)
 
                 # Keep canonical MuJoCo equality attributes shape-stable at zero rows. This lets
                 # callers consume ``model.mujoco.equality_constraint_*`` without branching on

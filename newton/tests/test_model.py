@@ -139,9 +139,9 @@ class TestModelAttributeSpecs(unittest.TestCase):
                 # WORLD arrays end with an entry for global world -1.
                 global_entry = int(attribute_frequency == frequency.WORLD)
                 self.assertEqual(
-                    model._attribute_frequency_count(attribute_frequency),
+                    model.attribute_frequency_count(attribute_frequency),
                     getattr(model, count_attribute) + global_entry,
-                    f"Model._attribute_frequency_count() must resolve Model.AttributeFrequency."
+                    f"Model.attribute_frequency_count() must resolve Model.AttributeFrequency."
                     f"{attribute_frequency.name} through Model.{count_attribute}.",
                 )
 
