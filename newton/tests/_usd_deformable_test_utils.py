@@ -273,6 +273,6 @@ def group_range(builder, family, label, kind, world=None):
         raise LookupError(f"{len(matches)} {family} groups labelled '{label}' (world={world})")
     (i,) = matches
     return (
-        getattr(builder, f"_{registry_family}_{kind}_start")[i],
-        getattr(builder, f"_{registry_family}_{kind}_end")[i],
+        getattr(builder, f"{registry_family}_{kind}_start")[i],
+        getattr(builder, f"{registry_family}_{kind}_end")[i],
     )

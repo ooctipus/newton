@@ -2656,13 +2656,13 @@ class ModelBuilder:
 
            Builder-time deformable object identities may change without notice.
         """
-        self._curve_body_start: list[int] = []
+        self.curve_body_start: list[int] = []
         """Inclusive body-range start of each deformable curve."""
-        self._curve_body_end: list[int] = []
+        self.curve_body_end: list[int] = []
         """Exclusive body-range end of each deformable curve."""
-        self._curve_joint_start: list[int] = []
+        self.curve_joint_start: list[int] = []
         """Inclusive joint-range start of each deformable curve."""
-        self._curve_joint_end: list[int] = []
+        self.curve_joint_end: list[int] = []
         """Exclusive joint-range end of each deformable curve."""
         self._curve_object_recording_suppressed: int = 0
         """Nesting depth for private deformable-curve recording suppression."""
@@ -2688,17 +2688,17 @@ class ModelBuilder:
 
            Builder-time deformable object identities may change without notice.
         """
-        self._surface_particle_start: list[int] = []
+        self.surface_particle_start: list[int] = []
         """Inclusive particle-range start of each deformable surface."""
-        self._surface_particle_end: list[int] = []
+        self.surface_particle_end: list[int] = []
         """Exclusive particle-range end of each deformable surface."""
-        self._surface_tri_start: list[int] = []
+        self.surface_tri_start: list[int] = []
         """Inclusive triangle-range start of each deformable surface."""
-        self._surface_tri_end: list[int] = []
+        self.surface_tri_end: list[int] = []
         """Exclusive triangle-range end of each deformable surface."""
-        self._surface_edge_start: list[int] = []
+        self.surface_edge_start: list[int] = []
         """Inclusive edge-range start of each deformable surface."""
-        self._surface_edge_end: list[int] = []
+        self.surface_edge_end: list[int] = []
         """Exclusive edge-range end of each deformable surface."""
 
         self.volume_label: list[str] = []
@@ -2722,13 +2722,13 @@ class ModelBuilder:
 
            Builder-time deformable object identities may change without notice.
         """
-        self._volume_particle_start: list[int] = []
+        self.volume_particle_start: list[int] = []
         """Inclusive particle-range start of each deformable volume."""
-        self._volume_particle_end: list[int] = []
+        self.volume_particle_end: list[int] = []
         """Exclusive particle-range end of each deformable volume."""
-        self._volume_tet_start: list[int] = []
+        self.volume_tet_start: list[int] = []
         """Inclusive tetrahedron-range start of each deformable volume."""
-        self._volume_tet_end: list[int] = []
+        self.volume_tet_end: list[int] = []
         """Exclusive tetrahedron-range end of each deformable volume."""
 
         self.joint_dof_count: int = 0
@@ -4783,7 +4783,7 @@ class ModelBuilder:
             specs[f"{group}_world"] = Model.AttributeSpec(group, references=Model.AttributeFrequency.WORLD)
             declared_builder_attributes.update((f"{group}_label", f"{group}_world"))
             for suffix, reference in references.items():
-                name = f"_{group}_{suffix}"
+                name = f"{group}_{suffix}"
                 specs[name] = Model.AttributeSpec(
                     group,
                     references=reference,
@@ -5030,10 +5030,10 @@ class ModelBuilder:
         label = label or f"curve_{len(self.curve_label)}"
         self.curve_label.append(label)
         self.curve_world.append(self.current_world)
-        self._curve_body_start.append(body_range[0])
-        self._curve_body_end.append(body_range[1])
-        self._curve_joint_start.append(joint_range[0])
-        self._curve_joint_end.append(joint_range[1])
+        self.curve_body_start.append(body_range[0])
+        self.curve_body_end.append(body_range[1])
+        self.curve_joint_start.append(joint_range[0])
+        self.curve_joint_end.append(joint_range[1])
 
     @contextmanager
     def _suppress_curve_object_recording(self) -> Iterator[None]:
@@ -5055,12 +5055,12 @@ class ModelBuilder:
         label = label or f"surface_{len(self.surface_label)}"
         self.surface_label.append(label)
         self.surface_world.append(self.current_world)
-        self._surface_particle_start.append(particle_range[0])
-        self._surface_particle_end.append(particle_range[1])
-        self._surface_tri_start.append(tri_range[0])
-        self._surface_tri_end.append(tri_range[1])
-        self._surface_edge_start.append(edge_range[0])
-        self._surface_edge_end.append(edge_range[1])
+        self.surface_particle_start.append(particle_range[0])
+        self.surface_particle_end.append(particle_range[1])
+        self.surface_tri_start.append(tri_range[0])
+        self.surface_tri_end.append(tri_range[1])
+        self.surface_edge_start.append(edge_range[0])
+        self.surface_edge_end.append(edge_range[1])
 
     def _record_volume_deformable_object(
         self,
@@ -5072,10 +5072,10 @@ class ModelBuilder:
         label = label or f"volume_{len(self.volume_label)}"
         self.volume_label.append(label)
         self.volume_world.append(self.current_world)
-        self._volume_particle_start.append(particle_range[0])
-        self._volume_particle_end.append(particle_range[1])
-        self._volume_tet_start.append(tet_range[0])
-        self._volume_tet_end.append(tet_range[1])
+        self.volume_particle_start.append(particle_range[0])
+        self.volume_particle_end.append(particle_range[1])
+        self.volume_tet_start.append(tet_range[0])
+        self.volume_tet_end.append(tet_range[1])
 
     # region importers
     def add_urdf(
@@ -9008,10 +9008,10 @@ class ModelBuilder:
             zip(
                 self.curve_label,
                 self.curve_world,
-                self._curve_body_start,
-                self._curve_body_end,
-                self._curve_joint_start,
-                self._curve_joint_end,
+                self.curve_body_start,
+                self.curve_body_end,
+                self.curve_joint_start,
+                self.curve_joint_end,
                 strict=True,
             )
         ):
@@ -9038,10 +9038,10 @@ class ModelBuilder:
 
         self.curve_label = [record[0] for record in curve_records]
         self.curve_world = [record[1] for record in curve_records]
-        self._curve_body_start = [record[2] for record in curve_records]
-        self._curve_body_end = [record[3] for record in curve_records]
-        self._curve_joint_start = [record[4] for record in curve_records]
-        self._curve_joint_end = [record[5] for record in curve_records]
+        self.curve_body_start = [record[2] for record in curve_records]
+        self.curve_body_end = [record[3] for record in curve_records]
+        self.curve_joint_start = [record[4] for record in curve_records]
+        self.curve_joint_end = [record[5] for record in curve_records]
 
         def remap_object_reference(value: Any, remap: dict[int, int]) -> Any:
             if isinstance(value, bool):
@@ -15244,11 +15244,11 @@ class ModelBuilder:
         if triangle:
             raw, obj, others = tri_range, surface, (tet_range, volume)
             raw_name, obj_name, count = "tri_range", "surface", self.tri_count
-            labels, starts, ends = self.surface_label, self._surface_tri_start, self._surface_tri_end
+            labels, starts, ends = self.surface_label, self.surface_tri_start, self.surface_tri_end
         else:
             raw, obj, others = tet_range, volume, (tri_range, surface)
             raw_name, obj_name, count = "tet_range", "volume", self.tet_count
-            labels, starts, ends = self.volume_label, self._volume_tet_start, self._volume_tet_end
+            labels, starts, ends = self.volume_label, self.volume_tet_start, self.volume_tet_end
         if any(option is not None for option in others):
             raise ValueError(f"add_deformable_visual_mesh: only {raw_name} or {obj_name} applies to this binding kind")
         if (raw is None) == (obj is None):
@@ -15311,7 +15311,7 @@ class ModelBuilder:
             raise ValueError(
                 f"add_deformable_visual_mesh: curve {index} is not one of the {len(self.curve_label)} recorded objects"
             )
-        return np.arange(self._curve_body_start[index], self._curve_body_end[index], dtype=np.int32)
+        return np.arange(self.curve_body_start[index], self.curve_body_end[index], dtype=np.int32)
 
     def _bind_visual_vertices_to_bodies(
         self, vertices: np.ndarray, bodies: np.ndarray, *, nearest: bool = False, poses: np.ndarray | None = None

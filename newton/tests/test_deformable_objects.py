@@ -15,9 +15,7 @@ from newton.tests.unittest_utils import get_test_devices
 
 def _ranges(builder, family, kind):
     """Pair the builder's start and end indices for one element kind."""
-    return list(
-        zip(getattr(builder, f"_{family}_{kind}_start"), getattr(builder, f"_{family}_{kind}_end"), strict=True)
-    )
+    return list(zip(getattr(builder, f"{family}_{kind}_start"), getattr(builder, f"{family}_{kind}_end"), strict=True))
 
 
 class TestDeformableObjects(unittest.TestCase):

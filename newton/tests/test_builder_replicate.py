@@ -1022,7 +1022,7 @@ class TestModelBuilderReplicate(unittest.TestCase):
             for suffix in references:
                 name = f"{family}_{suffix}"
                 with self.subTest(attribute=name):
-                    builder_spec = specs[f"_{name}"]
+                    builder_spec = specs[name]
                     model_spec = Model._CORE_ATTRIBUTE_SPECS[name]
                     self.assertEqual(builder_spec.references, model_spec.references)
                     self.assertEqual(builder_spec.compaction_policy, model_spec.compaction_policy)

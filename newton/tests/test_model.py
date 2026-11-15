@@ -2855,7 +2855,7 @@ class TestModelJoints(unittest.TestCase):
         cable_labels_before = [builder.body_label[b] for b in bodies]
         builder.collapse_fixed_joints()
         # The fixed pair merged into one body; the cable bodies stay contiguous and ordered.
-        start, end = builder._curve_body_start[0], builder._curve_body_end[0]
+        start, end = builder.curve_body_start[0], builder.curve_body_end[0]
         self.assertEqual(end - start, len(bodies))
         self.assertEqual([builder.body_label[b] for b in range(start, end)], cable_labels_before)
 
