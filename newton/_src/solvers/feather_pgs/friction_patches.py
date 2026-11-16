@@ -42,7 +42,8 @@ Regions are made with their contacts. A collision pass makes a contact frame
 and the substeps that share the pass hold it; a region is a grouping of that
 frame's contacts, so it is made at the frame's first build, from the poses of
 that build, and held for the frame's other builds (:func:`_build` makes
-them, one thread a body pair, or carries them, one thread a region). What is decided with the frame: which contacts each
+them, one thread a body pair or a warp a long one, or carries them, one
+thread a region). What is decided with the frame: which contacts each
 region has, and the ring in which their normal impulses pool. What every
 build decides anew, from the poses of its substep: each contact's centre, gap
 and eligibility; each region's carrier (its last eligible member) and weight;
@@ -75,6 +76,18 @@ from ...sim.contacts import GENERATION_SENTINEL
 from . import field_group
 from .contact_filters import contact_normal_gap_limit
 from .contact_laws import contact_bodies, contact_point, contact_points, contact_tangent_basis
+from .device_preludes import (
+    lane_any,
+    lane_ballot,
+    lane_below,
+    lane_count,
+    lane_first,
+    lane_index,
+    lane_last,
+    lane_read,
+    lane_stride,
+    lane_sync,
+)
 from .field_group import Field
 from .spatial_laws import point_velocity
 
@@ -94,6 +107,8 @@ _LIGHT_BLOCKS_PER_SM = 6
 # grid leaves no thread a second run below 8 * SMs * 256 live slots.
 _BUILD_BLOCK_DIM = 32
 _BUILD_BLOCKS_PER_SM = 8
+# The lanes that build a long body pair together: the build's one-warp block (_build_pair_lanes).
+_PAIR_LANES = wp.constant(_BUILD_BLOCK_DIM)
 # The register line that keeps those one-warp blocks resident: CUDA 13.4's NVVM output takes 104 registers unbound
 # (19 warps); at 80 (the RTX PRO 6000's 24-block limit) it spills 112 B a thread, and on hardware at 128 worlds the
 # build runs 28.6 ms a frame against 30.8 unbound (CUDA 12.9's: 96 registers, 29.7 ms). A register cap, not a launch
@@ -900,6 +915,7 @@ _settle_region = _region_placement(search=False, settle=True)
 @wp.func
 def _build_pair(
     start: int,
+    stop: int,
     end: int,
     previous_end: int,
     q: wp.array[wp.transform],
@@ -911,12 +927,9 @@ def _build_pair(
     patches: FrictionPatches,
     regions: wp.array[int],
 ):
-    """Build the body pair whose sorted run starts at live position ``start`` (:func:`_starts_pair`): make its
-    regions, list them for the frame's later builds, and place each one's anchor."""
+    """Build the body pair whose sorted run is live positions ``[start, stop)`` on one thread: make its regions, list
+    them for the frame's later builds, and place each one's anchor."""
     key = frame.keys[start]
-    stop = start + 1
-    while stop < end and frame.keys[stop] == key:
-        stop += 1
 
     # Binary search the previous pair, avoiding a scan over other worlds/pairs.
     # Positions from previous_end on hold no stored record.
@@ -1066,6 +1079,385 @@ def _build_pair(
 
 
 @wp.func
+def _place_regions(
+    queued: int,
+    seed: int,
+    first: int,
+    carry_only: int,
+    member_start: int,
+    member_stop: int,
+    end: int,
+    carried: int,
+    anchor_start: int,
+    anchor_stop: int,
+    centre_start: int,
+    centre_stop: int,
+    q: wp.array[wp.transform],
+    previous_q: wp.array[wp.transform],
+    shape_transform: wp.array[wp.transform],
+    shape_radius: wp.array[float],
+    frame: _PatchFrame,
+    prev: _PatchFrame,
+    patches: FrictionPatches,
+    regions: wp.array[int],
+):
+    """List and place the ``queued`` regions of a body pair the lanes hold, a region a lane from lane 0 in the order
+    the flood made them (``seed`` and the rest are this lane's region below ``queued``), with the pair's stored history
+    (:func:`_place_region`'s arguments).
+
+    The lanes find their regions' locations and the stored anchors they would take at once; then they take the anchors
+    lane by lane in order, and a region whose anchor an earlier lane has taken looks again among those left
+    (``prev.used``). So each region carries the anchor that the one-thread build, which places them in that order,
+    gives it.
+    """
+    lane = lane_index(_PAIR_LANES)
+    holds = lane < queued
+    location = wp.vec3(0.0)
+    spin_arm = float(0.0)
+    chosen = int(-1)
+    motion = wp.vec3(0.0)
+    if holds:
+        frame.region_stop[member_start] = member_stop
+        frame.carrier[member_start] = first
+        if member_stop - member_start == 1:
+            frame.regions[wp.atomic_add(regions, 0, 1)] = member_start
+        else:
+            frame.regions[end - 1 - wp.atomic_add(regions, 1, 1)] = member_start
+    # Every lane searches its region's anchor at once; then the lanes take the anchors one by one in order, from the
+    # lane after the last that took one, and a lane that finds its anchor taken by an earlier lane searches again,
+    # among those left, before any later lane takes one.
+    searching = holds
+    claimed = int(-1)
+    while lane_any(searching, _PAIR_LANES):
+        if searching:
+            location, spin_arm, chosen, motion = _search_region(
+                seed,
+                first,
+                carry_only,
+                member_start,
+                member_stop,
+                carried,
+                anchor_start,
+                anchor_stop,
+                centre_start,
+                centre_stop,
+                location,
+                spin_arm,
+                chosen,
+                motion,
+                q,
+                previous_q,
+                shape_transform,
+                shape_radius,
+                frame,
+                prev,
+                patches,
+            )
+            searching = False
+        claims = lane_ballot(holds and chosen >= 0 and lane > claimed, _PAIR_LANES)
+        claimed = _PAIR_LANES
+        while claims != wp.uint32(0):
+            claimant = lane_first(claims, _PAIR_LANES)
+            taken = False
+            if lane == claimant:
+                taken = prev.used[chosen] != 0
+                if not taken:
+                    prev.used[chosen] = 1
+            lane_sync(_PAIR_LANES)
+            if lane_any(taken, _PAIR_LANES):
+                searching = taken
+                claimed = claimant - 1
+                claims = wp.uint32(0)
+            else:
+                claims = claims & (claims - wp.uint32(1))
+    if holds:
+        _settle_region(
+            seed,
+            first,
+            carry_only,
+            member_start,
+            member_stop,
+            carried,
+            anchor_start,
+            anchor_stop,
+            centre_start,
+            centre_stop,
+            location,
+            spin_arm,
+            chosen,
+            motion,
+            q,
+            previous_q,
+            shape_transform,
+            shape_radius,
+            frame,
+            prev,
+            patches,
+        )
+
+
+@wp.func(inline=False)
+def _first_region_leaves(
+    start: int,
+    end: int,
+    shape_transform: wp.array[wp.transform],
+    shape_radius: wp.array[float],
+    frame: _PatchFrame,
+):
+    """The end of the body pair whose sorted run starts at live position ``start``, and the contacts its first region
+    leaves: the run's contacts after its first that the first seed's first sweep does not take (the flood's own tests,
+    :func:`_compatible` and :func:`_geometry_adjacent`, made by the warp's lanes a stride at a time). Nothing is
+    written."""
+    lane = lane_index(_PAIR_LANES)
+    stride = lane_stride(_PAIR_LANES)
+    key = frame.keys[start]
+    stop = start
+    inside_count = stride
+    while inside_count == stride:
+        j = stop + lane
+        inside = False
+        if j < end:
+            inside = frame.keys[j] == key
+        inside_count = lane_count(lane_ballot(inside, _PAIR_LANES), _PAIR_LANES)
+        stop += inside_count
+    seed = frame.indices[start]
+    seed_center = frame.center[seed]
+    seed_normal = frame.normal[seed]
+    seed_mu = frame.mu[seed]
+    seed_radius = frame.radius[seed]
+    sa = frame.shape_a[seed]
+    sb = frame.shape_b[seed]
+    joined = int(0)
+    for chunk in range(start + 1, stop, stride):
+        j = chunk + lane
+        joins = False
+        if j < stop:
+            c = frame.indices[j]
+            if _compatible(frame, seed_center, seed_normal, seed_mu, seed_radius, c):
+                joins = _geometry_adjacent(sa, sb, frame.shape_a[c], frame.shape_b[c], shape_transform, shape_radius)
+        joined += lane_count(lane_ballot(joins, _PAIR_LANES), _PAIR_LANES)
+    return stop, stop - start - 1 - joined
+
+
+@wp.func(inline=False)
+def _build_pair_lanes(
+    start: int,
+    end: int,
+    previous_end: int,
+    q: wp.array[wp.transform],
+    previous_q: wp.array[wp.transform],
+    shape_transform: wp.array[wp.transform],
+    shape_radius: wp.array[float],
+    frame: _PatchFrame,
+    prev: _PatchFrame,
+    patches: FrictionPatches,
+    regions: wp.array[int],
+):
+    """Build the body pair whose sorted run starts at live position ``start`` with the lanes of the warp together:
+    every region, member, link and record :func:`_build_pair` builds on one thread, the same.
+
+    The lanes read the run, the stored run and its history a stride of positions at a time. The flood keeps its
+    order: seed after seed in sorted order, and for each sweep of a seed the lanes test a stride of the later
+    contacts at once; those that join take their places among the members in sorted order (a vote, then each its
+    rank), as the one-thread sweep appends them. A region's ring links its members in flood order. The regions, a
+    lane each, are placed as soon as the lanes hold one each, and at the pair's end (:func:`_place_regions`).
+    """
+    lane = lane_index(_PAIR_LANES)
+    stride = lane_stride(_PAIR_LANES)
+    key = frame.keys[start]
+    stop = start
+    inside_count = stride
+    while inside_count == stride:
+        j = stop + lane
+        inside = False
+        if j < end:
+            inside = frame.keys[j] == key
+        inside_count = lane_count(lane_ballot(inside, _PAIR_LANES), _PAIR_LANES)
+        stop += inside_count
+
+    # The stored run and its history, as _build_pair indexes them.
+    lo = int(0)
+    hi = previous_end
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if prev.keys[mid] < key:
+            lo = mid + 1
+        else:
+            hi = mid
+    prev_start = lo
+    prev_stop = lo
+    anchor_stop = prev_start
+    centre_stop = prev_start
+    inside_count = stride
+    while inside_count == stride:
+        position = prev_stop + lane
+        inside = False
+        valid = False
+        pressured = False
+        p = int(-1)
+        if position < previous_end:
+            if prev.keys[position] == key:
+                inside = True
+                p = prev.indices[position]
+                prev.used[p] = 0
+                valid = prev.valid[p] != 0
+                pressured = prev.pressured[p] != 0
+        valid_bits = lane_ballot(valid, _PAIR_LANES)
+        pressured_bits = lane_ballot(pressured, _PAIR_LANES)
+        if valid:
+            prev.members[anchor_stop + lane_below(valid_bits, _PAIR_LANES)] = p
+        if pressured:
+            prev.centres[centre_stop + lane_below(pressured_bits, _PAIR_LANES)] = prev.pressure[p]
+        anchor_stop += lane_count(valid_bits, _PAIR_LANES)
+        centre_stop += lane_count(pressured_bits, _PAIR_LANES)
+        inside_count = lane_count(lane_ballot(inside, _PAIR_LANES), _PAIR_LANES)
+        prev_stop += inside_count
+    carried = int(prev_start < prev_stop)
+    lane_sync(_PAIR_LANES)
+
+    member_stop = start
+    remaining = stop - start
+    queued = int(0)
+    held_seed = int(-1)
+    held_first = int(-1)
+    held_carry_only = int(0)
+    held_start = int(0)
+    held_stop = int(0)
+    index = start
+    pending = bool(True)
+    while pending or queued > 0:
+        # The next seed: the first position from index whose contact no region owns.
+        seed = int(-1)
+        if pending:
+            j = index + lane
+            free = False
+            if j < stop:
+                free = frame.owner[frame.indices[j]] < 0
+            free_bits = lane_ballot(free, _PAIR_LANES)
+            if free_bits == wp.uint32(0):
+                index += stride
+            else:
+                index += lane_first(free_bits, _PAIR_LANES)
+                seed = frame.indices[index]
+        if seed >= 0:
+            member_start = member_stop
+            if lane == 0:
+                frame.owner[seed] = seed
+                frame.members[member_start] = seed
+            member_stop += 1
+            remaining -= 1
+            # The last member in flood order that may carry friction rows, -1 while none may.
+            last = int(-1)
+            if frame.eligible[seed] != 0:
+                last = seed
+            seed_center = frame.center[seed]
+            seed_normal = frame.normal[seed]
+            seed_mu = frame.mu[seed]
+            seed_radius = frame.radius[seed]
+            expanded_a = int(-2)
+            expanded_b = int(-2)
+            sweeps = int(0)
+            cursor_at = member_start
+            lane_sync(_PAIR_LANES)
+            while cursor_at < member_stop and remaining > 0:
+                cursor = frame.members[cursor_at]
+                sa = frame.shape_a[cursor]
+                sb = frame.shape_b[cursor]
+                if sa != expanded_a or sb != expanded_b:
+                    sweeps += 1
+                    for chunk in range(index + 1, stop, stride):
+                        j = chunk + lane
+                        c = int(-1)
+                        joins = False
+                        if j < stop:
+                            c = frame.indices[j]
+                            if frame.owner[c] < 0:
+                                if _compatible(frame, seed_center, seed_normal, seed_mu, seed_radius, c):
+                                    joins = _geometry_adjacent(
+                                        sa, sb, frame.shape_a[c], frame.shape_b[c], shape_transform, shape_radius
+                                    )
+                        join_bits = lane_ballot(joins, _PAIR_LANES)
+                        if join_bits != wp.uint32(0):
+                            eligible_bits = lane_ballot(joins and frame.eligible[c] != 0, _PAIR_LANES)
+                            if joins:
+                                frame.owner[c] = seed
+                                frame.members[member_stop + lane_below(join_bits, _PAIR_LANES)] = c
+                            joined = lane_count(join_bits, _PAIR_LANES)
+                            member_stop += joined
+                            remaining -= joined
+                            if eligible_bits != wp.uint32(0):
+                                last = lane_read(c, lane_last(eligible_bits, _PAIR_LANES), _PAIR_LANES)
+                    expanded_a = sa
+                    expanded_b = sb
+                    lane_sync(_PAIR_LANES)
+                cursor_at += 1
+            # The ring in flood order: each member links the next, the last the seed.
+            for at in range(member_start + lane, member_stop, stride):
+                following = seed
+                if at + 1 < member_stop:
+                    following = frame.members[at + 1]
+                patches.next_contact[frame.members[at]] = following
+            carry_only = int(0)
+            first = last
+            if last < 0:
+                carry_only = int(1)
+                first = frame.members[member_stop - 1]
+            if sweeps > 1:
+                # A region across shape pairs: its members in contact order, the last that may carry friction rows (any,
+                # under carry_only) its carrier.
+                lane_sync(_PAIR_LANES)
+                member_stop = member_start
+                for chunk in range(index, stop, stride):
+                    j = chunk + lane
+                    c = int(-1)
+                    mine = False
+                    if j < stop:
+                        c = frame.indices[j]
+                        mine = frame.owner[c] == seed
+                    mine_bits = lane_ballot(mine, _PAIR_LANES)
+                    carrier_bits = lane_ballot(mine and (carry_only != 0 or frame.eligible[c] != 0), _PAIR_LANES)
+                    if mine:
+                        frame.members[member_stop + lane_below(mine_bits, _PAIR_LANES)] = c
+                    member_stop += lane_count(mine_bits, _PAIR_LANES)
+                    if carrier_bits != wp.uint32(0):
+                        first = lane_read(c, lane_last(carrier_bits, _PAIR_LANES), _PAIR_LANES)
+            lane_sync(_PAIR_LANES)
+            if lane == queued:
+                held_seed = seed
+                held_first = first
+                held_carry_only = carry_only
+                held_start = member_start
+                held_stop = member_stop
+            queued += 1
+            index += 1
+        pending = index < stop
+        if queued == stride or (queued > 0 and not pending):
+            _place_regions(
+                queued,
+                held_seed,
+                held_first,
+                held_carry_only,
+                held_start,
+                held_stop,
+                end,
+                carried,
+                prev_start,
+                anchor_stop,
+                prev_start,
+                centre_stop,
+                q,
+                previous_q,
+                shape_transform,
+                shape_radius,
+                frame,
+                prev,
+                patches,
+                regions,
+            )
+            queued = 0
+
+
+@wp.func
 def _carry_region(
     member_start: int,
     q: wp.array[wp.transform],
@@ -1164,6 +1556,17 @@ def _build(
     for it, about one lane of a warp at a time on runs of tens of contacts. Where the frame has no more positions
     than the launch has threads, each thread has one position and seeks no further.
 
+    The warp's lanes may build a pair together (:func:`_build_pair_lanes`), after the warp's other pairs, one such
+    pair after another. What they share is the flood of each seed after the first and the placement of each region
+    after the first: on one thread a seed tests every later contact and the regions are placed one after another, on
+    the warp a seed is a pass of the lanes and 32 regions are placed at once, but a shared pair holds the round while
+    the lanes' own pairs would run side by side. Both are bounded by the contacts the pair's first region leaves: at
+    most as many further seeds, each testing at most as many contacts, and as many further regions. So a pair takes the
+    warp where those contacts outnumber the pairs the lanes found. A pair of no more contacts than that cannot, and
+    builds on its lane; for a longer one the warp first makes the first seed's first sweep, a pass of the flood's own
+    tests that writes nothing (:func:`_first_region_leaves`). NIST's tangles and seated parts take the warp; a coin's
+    pair, one region, does not; the robot tasks' pairs (1 to 3 contacts, 15 to 17 found a round) never reach the pass.
+
     Thread 0 records that no store has followed this build and, where the build makes the regions, the live count,
     so the next _prepare clears these slots even when no store follows this build, and the frame whose pairs the
     slots now hold sorted, which the next _prepare keeps; no _prepare thread reads them while they change.
@@ -1189,27 +1592,70 @@ def _build(
         sorted_frame[1] = wp.int64(live)
         sorted_frame[2] = stream
     previous_end = stored[0]
+    lane = lane_index(_PAIR_LANES)
     position = thread
     while True:
         while position < live:
             if _starts_pair(frame.keys, position):
                 break
             position += threads
-        if position >= live:
+        found = position < live
+        found_pairs = lane_count(lane_ballot(found, _PAIR_LANES), _PAIR_LANES)
+        if found_pairs == 0:
             break
-        _build_pair(
-            position,
-            live,
-            previous_end,
-            q,
-            previous_q,
-            shape_transform,
-            shape_radius,
-            frame,
-            prev,
-            patches,
-            regions,
-        )
+        # A pair the warp builds with every lane: one whose first region leaves more contacts than the pairs the lanes
+        # found (_build's docstring).
+        whole = False
+        stop = position
+        if found:
+            key = frame.keys[position]
+            stop = position + 1
+            while stop < live and frame.keys[stop] == key and stop - position <= found_pairs:
+                stop += 1
+            whole = stop - position <= found_pairs
+        longer = lane_ballot(found and not whole, _PAIR_LANES)
+        while longer != wp.uint32(0):
+            longest = lane_first(longer, _PAIR_LANES)
+            run_stop, left = _first_region_leaves(
+                lane_read(position, longest, _PAIR_LANES), live, shape_transform, shape_radius, frame
+            )
+            if lane == longest:
+                stop = run_stop
+                whole = left <= found_pairs
+            longer = longer & (longer - wp.uint32(1))
+        if found:
+            if whole:
+                _build_pair(
+                    position,
+                    stop,
+                    live,
+                    previous_end,
+                    q,
+                    previous_q,
+                    shape_transform,
+                    shape_radius,
+                    frame,
+                    prev,
+                    patches,
+                    regions,
+                )
+        # The longer pairs the lanes found, one after another, each with every lane of the warp.
+        shared = lane_ballot(found and not whole, _PAIR_LANES)
+        while shared != wp.uint32(0):
+            _build_pair_lanes(
+                lane_read(position, lane_first(shared, _PAIR_LANES), _PAIR_LANES),
+                live,
+                previous_end,
+                q,
+                previous_q,
+                shape_transform,
+                shape_radius,
+                frame,
+                prev,
+                patches,
+                regions,
+            )
+            shared = shared & (shared - wp.uint32(1))
         position += threads
 
 

@@ -208,8 +208,22 @@ def _build(
     end = wp.min(count[0], frame.center.shape[0])
     if start >= end or not _starts_pair(frame.keys, start):
         return
+    stop = start + 1
+    while stop < end and frame.keys[stop] == frame.keys[start]:
+        stop += 1
     _build_pair(
-        start, end, prev.center.shape[0], q, previous_q, shape_transform, shape_radius, frame, prev, patches, regions
+        start,
+        stop,
+        end,
+        prev.center.shape[0],
+        q,
+        previous_q,
+        shape_transform,
+        shape_radius,
+        frame,
+        prev,
+        patches,
+        regions,
     )
 
 
