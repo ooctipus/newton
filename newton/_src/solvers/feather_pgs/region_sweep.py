@@ -591,54 +591,57 @@ def place_regions(
     head_size: wp.array[int],
     body_regions: wp.array[wp.vec2i],
     body_count: wp.array2d[int],
-    reg_head: wp.array[wp.vec2i],
-    reg_cand: wp.array[wp.vec2i],
+    reg_place: wp.array[wp.vec3i],
 ):
     """Each region's head into a place of its body's (:func:`place_bodies`), in the order its thread arrives
-    (:func:`order_regions` orders them): its row in the store and its world (``reg_head``) and its size."""
+    (:func:`order_regions` orders them): its row in the store, its size and its body (``reg_place``)."""
     for c in range(wp.tid(), data.count[0], threads):
         size = head_size[c]
         if size == 0:
             continue
-        world = data.world[c]
-        line = rows.first[world]
+        line = rows.first[data.world[c]]
         slot = data.slot[c]
         f = art_free[rows.sides[line, slot][0]]
         span = body_regions[f]
         if span[1] == span[0]:
             continue
         g = span[0] + wp.atomic_add(body_count, f, 2, 1)
-        reg_head[g] = wp.vec2i(line * pitch + slot, world)
-        reg_cand[g] = wp.vec2i(size, 0)
+        reg_place[g] = wp.vec3i(line * pitch + slot, size, f)
 
 
 @wp.kernel(enable_backward=False, module="unique")
 def order_regions(
+    cursor: wp.array[int],
+    threads: int,
+    body_world: wp.array[int],
     body_regions: wp.array[wp.vec2i],
     body_cand: wp.array[int],
+    reg_place: wp.array[wp.vec3i],
     reg_head: wp.array[wp.vec2i],
     reg_cand: wp.array[wp.vec2i],
     reg_state: wp.array[int],
 ):
-    """A body's regions in their order, a thread a body: by their heads' rows (the order of the world's rows), then
-    each one's candidates' places after the last one's, and the state of a region that holds nothing."""
-    span = body_regions[wp.tid()]
-    for i in range(span[0] + 1, span[1]):
-        head = reg_head[i]
-        held = reg_cand[i]
-        j = i - 1
-        while j >= span[0] and reg_head[j][0] > head[0]:
-            reg_head[j + 1] = reg_head[j]
-            reg_cand[j + 1] = reg_cand[j]
-            j -= 1
-        reg_head[j + 1] = head
-        reg_cand[j + 1] = held
-    at = body_cand[wp.tid()]
-    for g in range(span[0], span[1]):
-        size = reg_cand[g][0]
-        reg_cand[g] = wp.vec2i(at, at + size)
-        at += size
-        reg_state[g] = REGION_IDLE
+    """A body's regions in their order (the placed regions, ``threads`` lanes striding over them): a region's place is
+    its body's first plus the count of its body's regions whose heads' rows come before its own (the order of the
+    world's rows), and its candidates' places follow those regions' candidates. It takes its head's row and world
+    (``reg_head``), its candidates' places (``reg_cand``) and the state of a region that holds nothing."""
+    if cursor[3] != 0:
+        return
+    for g in range(wp.tid(), cursor[0], threads):
+        own = reg_place[g]
+        f = own[2]
+        span = body_regions[f]
+        rank = int(0)
+        at = body_cand[f]
+        for h in range(span[0], span[1]):
+            other = reg_place[h]
+            if other[0] < own[0]:
+                rank += 1
+                at += other[1]
+        place = span[0] + rank
+        reg_head[place] = wp.vec2i(own[0], body_world[f])
+        reg_cand[place] = wp.vec2i(at, at + own[1])
+        reg_state[place] = REGION_IDLE
 
 
 @wp.func
@@ -1323,6 +1326,7 @@ def level_regions(
 
 _REGION_FIELDS = (
     ("head_size", wp.int32, 1),
+    ("reg_place", wp.vec3i, 1),
     ("reg_head", wp.vec2i, 1),
     ("reg_frame", wp.mat33, 1),
     ("reg_arm", wp.vec3, 1),
@@ -1526,15 +1530,15 @@ class Regions:
             place_regions,
             threads,
             inputs=[data, rows, pitch, threads, self.art_free, self.head_size, self.body_regions],
-            outputs=[self.body_count, self.reg_head, self.reg_cand],
+            outputs=[self.body_count, self.reg_place],
             **live,
         )
-        wp.launch(
+        pool.launch(
             order_regions,
-            dim=self.count,
-            inputs=[self.body_regions, self.body_cand],
+            threads,
+            inputs=[self.cursor, threads, self.body_world, self.body_regions, self.body_cand, self.reg_place],
             outputs=[self.reg_head, self.reg_cand, self.reg_state],
-            device=device,
+            **live,
         )
         pool.launch(
             fill_regions,
