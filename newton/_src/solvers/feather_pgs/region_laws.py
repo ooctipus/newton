@@ -96,49 +96,50 @@ def set_residual(x: wp.vec3, e0: wp.vec3, e1: wp.vec3) -> tuple[wp.vec3, float, 
 def set_basis(a0: wp.vec3, a1: wp.vec3, a2: wp.vec3, L: wp.mat33, n: int) -> tuple[wp.vec3, wp.vec3, wp.vec3, wp.mat33]:
     """The set's ``n`` rows whitened by the metric's factor ``L`` (:func:`metric_factor`) and made orthonormal:
     ``L^T a_k = sum_l R[k, l] e_l`` with ``R`` lower triangular (an unused row: ``e`` zero, ``R``'s row the
-    identity's). So ``A K A^T = R R^T`` with ``R`` formed from residuals, never from differences of the rows' Gram
-    entries: rows that lie close together keep their geometry in float32, which the normal equations lose (a part's
+    identity's), the factor holding each diagonal entry as its reciprocal (the solves multiply, the one division a
+    row is its normalization's). So ``A K A^T = R R^T`` with ``R`` formed from residuals, never from differences of
+    the rows' Gram entries: rows that lie close together keep their geometry in float32, which the normal equations lose (a part's
     tilt response is 1e4 times its linear one)."""
     zero = wp.vec3(0.0, 0.0, 0.0)
     Lt = wp.transpose(L)
     z0 = Lt * a0
-    r00 = wp.length(z0)
-    e0 = wp.where(n >= 1 and r00 > 0.0, z0 * (1.0 / wp.max(r00, 1.0e-30)), zero)
+    i00 = 1.0 / wp.max(wp.length(z0), 1.0e-30)
+    e0 = wp.where(n >= 1, z0 * i00, zero)
     v1, c10, _c1z = set_residual(Lt * a1, e0, zero)
-    r11 = wp.length(v1)
-    e1 = wp.where(n >= 2 and r11 > 0.0, v1 * (1.0 / wp.max(r11, 1.0e-30)), zero)
+    i11 = 1.0 / wp.max(wp.length(v1), 1.0e-30)
+    e1 = wp.where(n >= 2, v1 * i11, zero)
     v2, c20, c21 = set_residual(Lt * a2, e0, e1)
-    r22 = wp.length(v2)
-    e2 = wp.where(n >= 3 and r22 > 0.0, v2 * (1.0 / wp.max(r22, 1.0e-30)), zero)
+    i22 = 1.0 / wp.max(wp.length(v2), 1.0e-30)
+    e2 = wp.where(n >= 3, v2 * i22, zero)
     R = wp.mat33(
-        wp.where(n >= 1, r00, 1.0),
+        wp.where(n >= 1, i00, 1.0),
         0.0,
         0.0,
         wp.where(n >= 2, c10, 0.0),
-        wp.where(n >= 2, r11, 1.0),
+        wp.where(n >= 2, i11, 1.0),
         0.0,
         wp.where(n >= 3, c20, 0.0),
         wp.where(n >= 3, c21, 0.0),
-        wp.where(n >= 3, r22, 1.0),
+        wp.where(n >= 3, i22, 1.0),
     )
     return e0, e1, e2, R
 
 
 @REGION_LAW.law
 def set_lower(R: wp.mat33, rhs: wp.vec3) -> wp.vec3:
-    """``R^-1 rhs`` for the lower triangular ``R`` of :func:`set_basis`."""
-    y0 = rhs[0] / R[0, 0]
-    y1 = (rhs[1] - R[1, 0] * y0) / R[1, 1]
-    y2 = (rhs[2] - R[2, 0] * y0 - R[2, 1] * y1) / R[2, 2]
+    """``R^-1 rhs`` for the lower triangular ``R`` of :func:`set_basis` (its diagonal held as reciprocals)."""
+    y0 = rhs[0] * R[0, 0]
+    y1 = (rhs[1] - R[1, 0] * y0) * R[1, 1]
+    y2 = (rhs[2] - R[2, 0] * y0 - R[2, 1] * y1) * R[2, 2]
     return wp.vec3(y0, y1, y2)
 
 
 @REGION_LAW.law
 def set_upper(R: wp.mat33, y: wp.vec3) -> wp.vec3:
-    """``R^-T y`` for the lower triangular ``R`` of :func:`set_basis`."""
-    x2 = y[2] / R[2, 2]
-    x1 = (y[1] - R[2, 1] * x2) / R[1, 1]
-    x0 = (y[0] - R[1, 0] * x1 - R[2, 0] * x2) / R[0, 0]
+    """``R^-T y`` for the lower triangular ``R`` of :func:`set_basis` (its diagonal held as reciprocals)."""
+    x2 = y[2] * R[2, 2]
+    x1 = (y[1] - R[2, 1] * x2) * R[1, 1]
+    x0 = (y[0] - R[1, 0] * x1 - R[2, 0] * x2) * R[0, 0]
     return wp.vec3(x0, x1, x2)
 
 
@@ -294,21 +295,21 @@ def set_enter(
                 wp.where(n == 0, entering, mu[0]), wp.where(n == 1, entering, mu[1]), wp.where(n == 2, entering, mu[2])
             )
             # The entering row's remainder is the factor's new column: set_basis's own arithmetic for the grown set.
-            r = wp.length(rest)
-            column = rest * (1.0 / wp.max(r, 1.0e-30))
+            inv = 1.0 / wp.max(wp.sqrt(along), 1.0e-30)
+            column = rest * inv
             e0 = wp.where(n == 0, column, e0)
             e1 = wp.where(n == 1, column, e1)
             e2 = wp.where(n == 2, column, e2)
             R = wp.mat33(
-                wp.where(n == 0, r, R[0, 0]),
+                wp.where(n == 0, inv, R[0, 0]),
                 0.0,
                 0.0,
                 wp.where(n == 1, c0, R[1, 0]),
-                wp.where(n == 1, r, R[1, 1]),
+                wp.where(n == 1, inv, R[1, 1]),
                 0.0,
                 wp.where(n == 2, c0, R[2, 0]),
                 wp.where(n == 2, c1, R[2, 1]),
-                wp.where(n == 2, r, R[2, 2]),
+                wp.where(n == 2, inv, R[2, 2]),
             )
             n += 1
             ended = 1
