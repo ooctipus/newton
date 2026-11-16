@@ -830,7 +830,12 @@ class Regions:
     def __init__(self, model, forest, placement, factor, options):
         self.model, self.forest, self.placement, self.factor, self.options = model, forest, placement, factor, options
         device = model.device
-        free_art = np.flatnonzero(np.asarray(forest.is_free_rigid_host) != 0).astype(np.int32)
+        # The free bodies are the forest's: those that respond, in its order, which is the order of their speed rows'
+        # slots (Placement.rigid_velocity_limit_slot). A prescribed free body is no row's side and holds no region.
+        free_art = np.zeros(0, dtype=np.int32)
+        if forest.free_rigid_body_count:
+            bodies = forest.free_rigid_body_indices.numpy()
+            free_art = forest.body_to_articulation.numpy()[bodies].astype(np.int32)
         count = int(free_art.size)
         self.count = count
         art_free = np.full(max(int(forest.is_free_rigid_host.size), 1), -1, dtype=np.int32)
