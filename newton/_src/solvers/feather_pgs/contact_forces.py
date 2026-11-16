@@ -15,7 +15,7 @@ wp.set_module_options({"enable_backward": False})
 
 
 @wp.func
-def _contact_linear_force(
+def contact_linear_force(
     dense_first: wp.array[int],
     body_base: int,
     routes: ContactRoutes,
@@ -91,7 +91,7 @@ def compute_contact_linear_force_from_impulses(
     rigid_contact_force: wp.array[wp.vec3],
 ):
     "Convert solved FeatherPGS contact impulses into world-frame forces."
-    _contact_linear_force(
+    contact_linear_force(
         dense_first,
         body_base,
         routes,
