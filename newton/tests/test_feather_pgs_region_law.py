@@ -36,6 +36,54 @@ def tangent_basis(n):
     return t0, t1 / np.linalg.norm(t1)
 
 
+@wp.kernel(enable_backward=False)
+def _region_terms(
+    body_inertia: wp.array2d[wp.mat33],
+    region_body: wp.array[int],
+    frames: wp.array[wp.mat33],
+    arms: wp.array[wp.vec3],
+    laws: wp.array[wp.vec2],
+    kinds: wp.array[int],
+    cfm: float,
+    wnn: wp.array[wp.mat33],
+    wnf: wp.array[wp.mat33],
+    wff: wp.array[wp.mat33],
+    ball_values: wp.array[wp.vec3],
+    ball_vectors: wp.array[wp.mat33],
+    ginv: wp.array[wp.mat33],
+    stick: wp.array[wp.mat33],
+    stick_factor: wp.array[wp.mat33],
+    free_factor: wp.array[wp.mat33],
+):
+    """Each region's step terms (:func:`.region_sweep.region_terms`), as the listing's fill forms them."""
+    g = wp.tid()
+    frame = frames[g]
+    law = laws[g]
+    Wnn, C, G, values, vectors, Ginv, K, Lk, Lw = region_sweep.region_terms(
+        body_inertia,
+        region_body[g],
+        -1,
+        arms[g],
+        wp.vec3(0.0),
+        frame[0],
+        frame[1],
+        frame[2],
+        law[0],
+        law[1],
+        kinds[g] & region_sweep.FRICTION_ROWS,
+        cfm,
+    )
+    ginv[g] = Ginv
+    stick[g] = K
+    stick_factor[g] = Lk
+    free_factor[g] = Lw
+    wnn[g] = Wnn
+    wnf[g] = C
+    wff[g] = G
+    ball_values[g] = values
+    ball_vectors[g] = vectors
+
+
 class Bodies:
     """Synthetic free bodies with their regions: the kernel's stream and the reference's regions."""
 
@@ -114,6 +162,20 @@ class Bodies:
         bodies, regions, candidates = self.count, len(self.frames), len(self.cands)
         impulses = wp.zeros(candidates + 3 * regions, dtype=float, device=device)
         du = wp.zeros(6 * bodies, dtype=float, device=device)
+        inertia = wp.array(np.asarray(self.inertia, dtype=np.float32), dtype=wp.mat33, device=device)
+        frames, arms, laws = array(self.frames, wp.mat33), array(self.arms, wp.vec3), array(self.laws, wp.vec2)
+        region_body = np.concatenate([np.full(last - first, b) for b, (first, last) in enumerate(self.spans)])
+        terms = [
+            wp.zeros(regions, dtype=dtype, device=device)
+            for dtype in (wp.mat33, wp.mat33, wp.mat33, wp.vec3, wp.mat33) + (wp.mat33,) * 4
+        ]
+        wp.launch(
+            _region_terms,
+            dim=regions,
+            inputs=[inertia, array(region_body, int), frames, arms, laws, array(self.kinds, int), 0.0],
+            outputs=terms,
+            device=device,
+        )
         wp.launch(
             region_sweep.sweep_closed_bodies,
             dim=bodies,
@@ -121,16 +183,17 @@ class Bodies:
                 array([0, 0, bodies, 0], int),
                 array(np.arange(bodies), int),
                 array(self.spans, wp.vec2i),
-                wp.array(np.asarray(self.inertia, dtype=np.float32), dtype=wp.mat33, device=device),
+                inertia,
                 wp.array(np.asarray(self.bases, dtype=np.float32), dtype=wp.spatial_vector, device=device),
                 array(6 * np.arange(bodies), int),
-                array(self.frames, wp.mat33),
-                array(self.arms, wp.vec3),
+                frames,
+                arms,
                 array(self.cand_spans, wp.vec2i),
-                array(self.laws, wp.vec2),
+                laws,
                 array(self.bfs, wp.vec3),
                 array(self.kinds, int),
                 array(candidates + 3 * np.arange(regions), int),
+                *terms,
                 array(self.cands, wp.vec4),
                 array(np.arange(candidates), int),
                 sweeps,

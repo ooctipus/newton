@@ -46,7 +46,7 @@ solved in that metric.
 import warp as wp
 
 from .law_source import LawFamily
-from .projection_laws import BILATERAL_PIVOT, CONE_LAW, friction_triple
+from .projection_laws import BILATERAL_PIVOT, CONE_LAW, friction_triple, friction_triple_from_metric
 
 REGION_LAW = LawFamily("RegionLaw", requires=(CONE_LAW,))
 """The region law's family; native code calls ``RegionLaw::region_visit(...)``."""
@@ -347,6 +347,7 @@ def candidate_compliance(record: wp.vec4, a: wp.vec3, free: wp.mat33) -> float:
 def region_block(
     start: wp.vec3,
     K: wp.mat33,
+    L: wp.mat33,
     without: wp.vec3,
     free: wp.mat33,
     cand: wp.array[wp.vec4],
@@ -380,7 +381,7 @@ def region_block(
     a2 = wp.where(i2_in >= 0, candidate_row(v2), zero)
     ab = wp.vec3(wp.where(i0_in >= 0, v0[2], 0.0), wp.where(i1_in >= 0, v1[2], 0.0), wp.where(i2_in >= 0, v2[2], 0.0))
     n = wp.where(i0_in >= 0, 1, 0) + wp.where(i1_in >= 0, 1, 0) + wp.where(i2_in >= 0, 1, 0)
-    Lk = metric_factor(K)
+    Lk = L
     a0, a1, a2, ab, i0, i1, i2, mu, n, e0, e1, e2, R = set_start(start, Lk, a0, a1, a2, ab, i0_in, i1_in, i2_in, n)
     # The metric and the start with the closing springs in them: none yet.
     Ks = K
@@ -478,6 +479,37 @@ def region_block(
 
 
 @REGION_LAW.law
+def friction_unit(C: wp.mat33, G: wp.mat33, friction: int) -> tuple[wp.mat33, wp.mat33]:
+    """A friction unit's coupling and block in a region's coordinates, ``(Cu, Gu)``: a unit without a spin row holds two
+    coordinates, its third free (no coupling, a unit diagonal)."""
+    Cu = C
+    Gu = G
+    if friction < 3:
+        Cu = wp.mat33(C[0, 0], C[0, 1], 0.0, C[1, 0], C[1, 1], 0.0, C[2, 0], C[2, 1], 0.0)
+        Gu = wp.mat33(G[0, 0], G[0, 1], 0.0, G[1, 0], G[1, 1], 0.0, 0.0, 0.0, 1.0)
+    return Cu, Gu
+
+
+@REGION_LAW.law
+def stick_terms(
+    Wnn: wp.mat33, C: wp.mat33, G: wp.mat33, cfm: float, friction: int
+) -> tuple[wp.mat33, wp.mat33, wp.mat33, wp.mat33]:
+    """A region's terms that stand for a step (its response does): the regularized friction block's inverse ``Ginv``,
+    the stick metric ``K = Wnn - C Ginv C^T`` (the unit held), and the factors of ``K`` and of ``Wnn``
+    (:func:`metric_factor`), ``(Ginv, K, Lk, Lw)``; a region without friction rows holds ``Wnn``'s alone."""
+    Cu, Gu = friction_unit(C, G, friction)
+    Gs = Gu + wp.mat33(cfm, 0.0, 0.0, 0.0, cfm, 0.0, 0.0, 0.0, cfm)
+    Ginv = wp.inverse(Gs)
+    CG = Cu * Ginv
+    K = Wnn - CG * wp.transpose(Cu)
+    Lw = metric_factor(Wnn)
+    Lk = Lw
+    if friction > 0:
+        Lk = metric_factor(K)
+    return Ginv, K, Lk, Lw
+
+
+@REGION_LAW.law
 def region_visit(
     sn: wp.vec3,
     sf: wp.vec3,
@@ -489,6 +521,12 @@ def region_visit(
     mu: float,
     mu_t: float,
     friction: int,
+    ball_values: wp.vec3,
+    ball_vectors: wp.mat33,
+    Ginv: wp.mat33,
+    K: wp.mat33,
+    Lk: wp.mat33,
+    Lw: wp.mat33,
     cand: wp.array[wp.vec4],
     g0: int,
     g1: int,
@@ -513,6 +551,13 @@ def region_visit(
         mu: The friction coefficient.
         mu_t: The torsional coefficient [m], 0 for a unit without a spin row.
         friction: The friction unit's rows: 0 (none), 2 (a tangent pair) or 3 (with the spin row).
+        ball_values: The cone law's metric of the regularized friction block (:func:`.projection_laws.friction_ball_metric`
+            of ``G`` plus ``cfm``), its eigenvalues; read where ``mu_t`` is positive.
+        ball_vectors: Its eigenvectors.
+        Ginv: The regularized friction block's inverse (:func:`stick_terms`).
+        K: The stick metric.
+        Lk: Its factor.
+        Lw: ``Wnn``'s factor.
         cand: The candidates' records.
         g0: The region's first candidate.
         g1: One past its last.
@@ -532,12 +577,9 @@ def region_visit(
     """
     zero = wp.vec3(0.0, 0.0, 0.0)
     # A unit without a spin row holds two coordinates: the third is free (no coupling, no residual).
-    Cu = C
-    Gu = G
+    Cu, Gu = friction_unit(C, G, friction)
     rf0 = sf + bf
     if friction < 3:
-        Cu = wp.mat33(C[0, 0], C[0, 1], 0.0, C[1, 0], C[1, 1], 0.0, C[2, 0], C[2, 1], 0.0)
-        Gu = wp.mat33(G[0, 0], G[0, 1], 0.0, G[1, 0], G[1, 1], 0.0, 0.0, 0.0, 1.0)
         rf0 = wp.vec3(rf0[0], rf0[1], 0.0)
     # The region's own wrench leaves the velocity.
     without = sn - Wnn * wrench_in
@@ -546,18 +588,16 @@ def region_visit(
         rf0 = rf0 - wp.transpose(Cu) * wrench_in - Gu * phi_in
     if friction == 0:
         wrench, i0, i1, i2, multipliers, spring, velocity, opened, _bounded, steps = region_block(
-            without, Wnn, without, Wnn, cand, g0, g1, i0_in, i1_in, i2_in, spring_in, tol
+            without, Wnn, Lw, without, Wnn, cand, g0, g1, i0_in, i1_in, i2_in, spring_in, tol
         )
         if opened == 1:
             return zero, zero, -1, -1, -1, zero, zero, without, REGION_OPEN, steps
         return wrench, zero, i0, i1, i2, multipliers, spring, velocity, REGION_STICK, steps
     # Stick first: the friction unit held at zero residual with the candidates' block.
     Gs = Gu + wp.mat33(cfm, 0.0, 0.0, 0.0, cfm, 0.0, 0.0, 0.0, cfm)
-    Ginv = wp.inverse(Gs)
     CG = Cu * Ginv
-    K = Wnn - CG * wp.transpose(Cu)
     wrench, i0, i1, i2, multipliers, spring, velocity, opened, bounded, steps = region_block(
-        without - CG * rf0, K, without, Wnn, cand, g0, g1, i0_in, i1_in, i2_in, spring_in, tol
+        without - CG * rf0, K, Lk, without, Wnn, cand, g0, g1, i0_in, i1_in, i2_in, spring_in, tol
     )
     if opened == 1:
         return zero, zero, -1, -1, -1, zero, zero, without, REGION_OPEN, steps
@@ -571,10 +611,14 @@ def region_visit(
     # Slide: the candidates' block with the friction as it was, then the unit's cone law at the block's load, once.
     start = without + Cu * phi_in
     wrench, i0, i1, i2, multipliers, spring, velocity, _opened, _bounded, more = region_block(
-        start, Wnn, without, Wnn, cand, g0, g1, i0, i1, i2, spring, tol
+        start, Wnn, Lw, without, Wnn, cand, g0, g1, i0, i1, i2, spring, tol
     )
     residual = rf0 + wp.transpose(Cu) * wrench + Gu * phi_in
-    phi = friction_triple(Gs, residual, phi_in, mu, mu_t, wrench[0], 1.0)
+    phi = wp.vec3(0.0, 0.0, 0.0)
+    if mu_t > 0.0:
+        phi = friction_triple_from_metric(ball_values, ball_vectors, residual, phi_in, mu, mu_t, wrench[0], 1.0)
+    else:
+        phi = friction_triple(Gs, residual, phi_in, mu, mu_t, wrench[0], 1.0)
     return wrench, phi, i0, i1, i2, multipliers, spring, velocity, REGION_SLIDE, steps + more
 
 

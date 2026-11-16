@@ -31,6 +31,7 @@ from .contact_input import ContactInput, contact_frame
 from .device_preludes import dual_native
 from .factor.walk import FREE_BODY_WALK, WALK_COORDINATE, WALK_LINK, WalkTrees, walk_down_prelude
 from .friction_patches import PatchRowLaw
+from .projection_laws import friction_ball_metric
 from .region_laws import (
     REGION_SLIDE,
     candidate_compliance,
@@ -39,6 +40,7 @@ from .region_laws import (
     frame_twist,
     frame_wrench,
     region_visit,
+    stick_terms,
 )
 from .row_kernels import RIGID_SPEED_ROWS, RowBias, row_bias
 from .row_laws import ROW_FRICTION, ROW_TORSION
@@ -140,6 +142,15 @@ def sweep_closed_bodies(
     reg_bf: wp.array[wp.vec3],
     reg_kind: wp.array[int],
     reg_row: wp.array[int],
+    reg_wnn: wp.array[wp.mat33],
+    reg_wnf: wp.array[wp.mat33],
+    reg_wff: wp.array[wp.mat33],
+    reg_ball_values: wp.array[wp.vec3],
+    reg_ball_vectors: wp.array[wp.mat33],
+    reg_ginv: wp.array[wp.mat33],
+    reg_k: wp.array[wp.mat33],
+    reg_lk: wp.array[wp.mat33],
+    reg_lw: wp.array[wp.mat33],
     cand: wp.array[wp.vec4],
     cand_row: wp.array[int],
     sweeps: int,
@@ -231,7 +242,9 @@ def sweep_closed_bodies(
             if (kind & KIND_SECOND) != 0:
                 sign = -1.0
             sn, sf = frame_twist(v, w, arm, n, t0, t1)
-            Wnn, C, G = frame_response(Avv, Avw, Aww, arm, n, t0, t1)
+            Wnn = reg_wnn[found]
+            C = reg_wnf[found]
+            G = reg_wff[found]
             wrench_old = reg_wrench[found]
             phi_old = reg_phi[found]
             set_old = reg_set[found]
@@ -246,6 +259,12 @@ def sweep_closed_bodies(
                 law[0],
                 law[1],
                 kind & FRICTION_ROWS,
+                reg_ball_values[found],
+                reg_ball_vectors[found],
+                reg_ginv[found],
+                reg_k[found],
+                reg_lk[found],
+                reg_lw[found],
                 cand,
                 c0,
                 c1,
@@ -602,6 +621,43 @@ def order_regions(
 
 
 @wp.func
+def region_terms(
+    body_inertia: wp.array2d[wp.mat33],
+    f0: int,
+    f1: int,
+    arm: wp.vec3,
+    arm_b: wp.vec3,
+    n: wp.vec3,
+    t0: wp.vec3,
+    t1: wp.vec3,
+    mu: float,
+    mu_t: float,
+    friction: int,
+    cfm: float,
+):
+    """A region's terms that stand for the step, as its bodies' bases do, formed once a step for every visit of both
+    sweeps: the pair's response in the region's coordinates (:func:`.region_laws.frame_response`, summed over the
+    bodies that move), for a unit with a spin row the cone law's metric of its regularized friction block
+    (:func:`.projection_laws.friction_ball_metric`), and the stick terms (:func:`.region_laws.stick_terms`: the
+    block's inverse, the stick metric and the two metrics' factors). ``(Wnn, C, G, values, vectors, Ginv, K, Lk,
+    Lw)``; each is the arithmetic a visit made of the same inputs, so the visits' results keep their bits."""
+    Wnn, C, G = frame_response(body_inertia[f0, 0], body_inertia[f0, 1], body_inertia[f0, 2], arm, n, t0, t1)
+    if f1 >= 0:
+        Wnn_b, C_b, G_b = frame_response(
+            body_inertia[f1, 0], body_inertia[f1, 1], body_inertia[f1, 2], arm_b, n, t0, t1
+        )
+        Wnn = Wnn + Wnn_b
+        C = C + C_b
+        G = G + G_b
+    values = wp.vec3(0.0, 0.0, 0.0)
+    vectors = wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+    if mu_t > 0.0:
+        values, vectors = friction_ball_metric(G + wp.mat33(cfm, 0.0, 0.0, 0.0, cfm, 0.0, 0.0, 0.0, cfm), mu, mu_t)
+    Ginv, K, Lk, Lw = stick_terms(Wnn, C, G, cfm, friction)
+    return Wnn, C, G, values, vectors, Ginv, K, Lk, Lw
+
+
+@wp.func
 def fill_region(
     g: int,
     rows: DenseRows,
@@ -616,6 +672,8 @@ def fill_region(
     row_contact: wp.array2d[int],
     art_free: wp.array[int],
     body_twist: wp.array[wp.spatial_vector],
+    body_inertia: wp.array2d[wp.mat33],
+    cfm: float,
     reg_head: wp.array[wp.vec2i],
     reg_cand: wp.array[wp.vec2i],
     reg_frame: wp.array[wp.mat33],
@@ -626,6 +684,15 @@ def fill_region(
     reg_bf: wp.array[wp.vec3],
     reg_kind: wp.array[int],
     reg_row: wp.array[int],
+    reg_wnn: wp.array[wp.mat33],
+    reg_wnf: wp.array[wp.mat33],
+    reg_wff: wp.array[wp.mat33],
+    reg_ball_values: wp.array[wp.vec3],
+    reg_ball_vectors: wp.array[wp.mat33],
+    reg_ginv: wp.array[wp.mat33],
+    reg_k: wp.array[wp.mat33],
+    reg_lk: wp.array[wp.mat33],
+    reg_lw: wp.array[wp.mat33],
     cand: wp.array[wp.vec4],
     cand_row: wp.array[int],
     reg_wrench: wp.array[wp.vec3],
@@ -728,6 +795,18 @@ def fill_region(
     reg_bf[g] = bf
     reg_kind[g] = kind
     reg_row[g] = friction_row
+    Wnn, C, G, values, vectors, Ginv, K, Lk, Lw = region_terms(
+        body_inertia, f0, f1, arm, arm_b, n, t0, t1, mu, mu_t, kind & FRICTION_ROWS, cfm
+    )
+    reg_ginv[g] = Ginv
+    reg_k[g] = K
+    reg_lk[g] = Lk
+    reg_lw[g] = Lw
+    reg_wnn[g] = Wnn
+    reg_wnf[g] = C
+    reg_wff[g] = G
+    reg_ball_values[g] = values
+    reg_ball_vectors[g] = vectors
     reg_wrench[g] = wp.vec3(0.0, 0.0, 0.0)
     reg_phi[g] = wp.vec3(0.0, 0.0, 0.0)
     reg_set[g] = wp.vec3i(-1, -1, -1)
@@ -748,6 +827,8 @@ def fill_regions(
     row_contact: wp.array2d[int],
     art_free: wp.array[int],
     body_twist: wp.array[wp.spatial_vector],
+    body_inertia: wp.array2d[wp.mat33],
+    cfm: float,
     cursor: wp.array[int],
     threads: int,
     reg_head: wp.array[wp.vec2i],
@@ -760,6 +841,15 @@ def fill_regions(
     reg_bf: wp.array[wp.vec3],
     reg_kind: wp.array[int],
     reg_row: wp.array[int],
+    reg_wnn: wp.array[wp.mat33],
+    reg_wnf: wp.array[wp.mat33],
+    reg_wff: wp.array[wp.mat33],
+    reg_ball_values: wp.array[wp.vec3],
+    reg_ball_vectors: wp.array[wp.mat33],
+    reg_ginv: wp.array[wp.mat33],
+    reg_k: wp.array[wp.mat33],
+    reg_lk: wp.array[wp.mat33],
+    reg_lw: wp.array[wp.mat33],
     cand: wp.array[wp.vec4],
     cand_row: wp.array[int],
     reg_wrench: wp.array[wp.vec3],
@@ -780,8 +870,10 @@ def fill_regions(
     for g in range(wp.tid(), cursor[0], threads):
         fill_region(
             g, rows, bias, data, law, mf_constraint_count, mf_contact_rows_end, dense_max, mf_max, pitch, row_contact,
-            art_free, body_twist, reg_head, reg_cand, reg_frame, reg_arm, reg_arm_b, reg_body, reg_law, reg_bf, reg_kind,
-            reg_row, cand, cand_row, reg_wrench, reg_phi, reg_set, reg_spring,
+            art_free, body_twist, body_inertia, cfm, reg_head, reg_cand, reg_frame, reg_arm, reg_arm_b, reg_body, reg_law,
+            reg_bf, reg_kind, reg_row, reg_wnn, reg_wnf, reg_wff, reg_ball_values, reg_ball_vectors, reg_ginv, reg_k, reg_lk, reg_lw, cand,
+            cand_row,
+            reg_wrench, reg_phi, reg_set, reg_spring,
         )  # fmt: skip
 
 
@@ -917,6 +1009,15 @@ _REGION_FIELDS = (
     ("reg_bf", wp.vec3, 1),
     ("reg_kind", wp.int32, 1),
     ("reg_row", wp.int32, 1),
+    ("reg_wnn", wp.mat33, 1),
+    ("reg_wnf", wp.mat33, 1),
+    ("reg_wff", wp.mat33, 1),
+    ("reg_ball_values", wp.vec3, 1),
+    ("reg_ball_vectors", wp.mat33, 1),
+    ("reg_ginv", wp.mat33, 1),
+    ("reg_k", wp.mat33, 1),
+    ("reg_lk", wp.mat33, 1),
+    ("reg_lw", wp.mat33, 1),
     ("cand", wp.vec4, 1),
     ("cand_row", wp.int32, 1),
     ("reg_wrench", wp.vec3, 1),
@@ -1110,6 +1211,8 @@ class Regions:
                 self.row_contact,
                 self.art_free,
                 self.body_twist,
+                self.body_inertia,
+                float(self.options.pgs_cfm),
                 self.cursor,
                 threads,
                 self.reg_head,
@@ -1124,6 +1227,15 @@ class Regions:
                 self.reg_bf,
                 self.reg_kind,
                 self.reg_row,
+                self.reg_wnn,
+                self.reg_wnf,
+                self.reg_wff,
+                self.reg_ball_values,
+                self.reg_ball_vectors,
+                self.reg_ginv,
+                self.reg_k,
+                self.reg_lk,
+                self.reg_lw,
                 self.cand,
                 self.cand_row,
                 self.reg_wrench,
@@ -1171,6 +1283,15 @@ class Regions:
                 self.reg_bf,
                 self.reg_kind,
                 self.reg_row,
+                self.reg_wnn,
+                self.reg_wnf,
+                self.reg_wff,
+                self.reg_ball_values,
+                self.reg_ball_vectors,
+                self.reg_ginv,
+                self.reg_k,
+                self.reg_lk,
+                self.reg_lw,
                 self.cand,
                 self.cand_row,
                 int(self.options.pgs_iterations),
@@ -1224,8 +1345,9 @@ class Regions:
 
     def operands(self) -> dict:
         """The stream as the general sweep's region phase takes it (:data:`.sweep_routes.REGION_OPERANDS`)."""
-        names = "world_regions world_levels level_end level_region reg_order body_first body_basis body_inertia"
-        names += " reg_frame reg_arm reg_arm_b reg_body reg_cand reg_law"
+        names = "world_regions world_levels level_end level_region reg_order body_first body_basis"
+        names += " reg_frame reg_arm reg_arm_b reg_body reg_cand reg_law reg_wnn reg_wnf reg_wff reg_ball_values"
+        names += " reg_ball_vectors reg_ginv reg_k reg_lk reg_lw"
         names += " reg_bf reg_kind reg_row cand cand_row reg_wrench reg_phi reg_set reg_spring reg_state reg_stamp"
         names += " body_seen body_version"
         return {**{name: getattr(self, name) for name in names.split()}, "region_cfm": float(self.options.pgs_cfm)}

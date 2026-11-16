@@ -624,7 +624,6 @@ REGION_OPERANDS = (
     ("reg_order", wp.array[int]),
     ("body_first", wp.array[int]),
     ("body_basis", wp.array2d[wp.spatial_vector]),
-    ("body_inertia", wp.array2d[wp.mat33]),
     ("reg_frame", wp.array[wp.mat33]),
     ("reg_arm", wp.array[wp.vec3]),
     ("reg_arm_b", wp.array[wp.vec3]),
@@ -634,6 +633,15 @@ REGION_OPERANDS = (
     ("reg_bf", wp.array[wp.vec3]),
     ("reg_kind", wp.array[int]),
     ("reg_row", wp.array[int]),
+    ("reg_wnn", wp.array[wp.mat33]),
+    ("reg_wnf", wp.array[wp.mat33]),
+    ("reg_wff", wp.array[wp.mat33]),
+    ("reg_ball_values", wp.array[wp.vec3]),
+    ("reg_ball_vectors", wp.array[wp.mat33]),
+    ("reg_ginv", wp.array[wp.mat33]),
+    ("reg_k", wp.array[wp.mat33]),
+    ("reg_lk", wp.array[wp.mat33]),
+    ("reg_lw", wp.array[wp.mat33]),
     ("cand", wp.array[wp.vec4]),
     ("cand_row", wp.array[int]),
     ("reg_wrench", wp.array[wp.vec3]),
@@ -647,7 +655,8 @@ REGION_OPERANDS = (
     ("region_cfm", float),
 )
 """The operands of a sweep that visits regions (:mod:`.region_sweep`'s stream): each world's open regions, each free
-body's first world coordinate, basis and inverse inertia, the regions' records, candidates and state, each open
+body's first world coordinate and basis, the regions' records, step terms (:func:`.region_sweep.region_terms`),
+candidates and state, each open
 body's walk coordinates as its last visit or sweep left them with its version (``body_seen``, ``body_version``: the
 pass rule's; ``reg_stamp`` a region's second body's version at its last settled visit), the friction units'
 regularization."""
@@ -664,9 +673,9 @@ def region_phase(pad: str = "        ") -> str:
     world whose levels hold fewer regions than the colored rule's parallelism (a chain: a tangled pair's regions
     share both bodies, one a level) is walked by its first lane in the order the levels were made from
     (``reg_order``: a body's regions together within a depth), a first body's twist kept from one of its regions to
-    the next, as a sequential walk does; the result is the same either way. A region's
-    response is the sum of its bodies' (:func:`.region_laws.frame_response`), and its wrench's change returns
-    through their bases.
+    the next, as a sequential walk does; the result is the same either way. A region's response and the other terms
+    that stand for the step are the listing's (:func:`.region_sweep.region_terms`), and its wrench's change returns
+    through its bodies' bases.
 
     The pass rule is exact, by a version a body: the version is raised whenever a bit of the body's walk coordinates
     differs from those its last visit, or its last sweep, left (``body_seen``). A region that holds a wrench and
@@ -724,7 +733,6 @@ if (moved) {{
     wp::spatial_vector u;
     wp::vec3 v, w;
     const wp::spatial_vector* basis = body_basis.data;
-    const wp::mat33* inertia = body_inertia.data;
     // A chain world walks its order itself (reg_order: a body's regions together, so its twist stays kept), as one
     // span; the others take the levels.
     const int spans = alone ? 1 : levels;
@@ -739,7 +747,6 @@ if (moved) {{
             body = f;
             first = body_first.data[f];
             basis = body_basis.data + (size_t)f * 6;
-            inertia = body_inertia.data + (size_t)f * 3;
             {{
 {first_body}
             }}
@@ -784,21 +791,15 @@ if (moved) {{
             }}
             if (!closes) continue;
         }}
-        auto response = RegionLaw::frame_response(inertia[0], inertia[1], inertia[2], arm, n, t0, t1);
-        if (f_b >= 0) {{
-            const wp::mat33* const inertia_b = body_inertia.data + (size_t)f_b * 3;
-            const auto other = RegionLaw::frame_response(inertia_b[0], inertia_b[1], inertia_b[2], arm_b, n, t0, t1);
-            response.v0 = wp::add(response.v0, other.v0);
-            response.v1 = wp::add(response.v1, other.v1);
-            response.v2 = wp::add(response.v2, other.v2);
-        }}
+        struct {{ wp::mat33 v0, v1, v2; }} response{{reg_wnn.data[g], reg_wnf.data[g], reg_wff.data[g]}};
         const wp::vec2 law = reg_law.data[g];
         const wp::vec3 rhs_f = reg_bf.data[g];
         const wp::vec3 wrench_old = reg_wrench.data[g], phi_old = reg_phi.data[g];
         const wp::vec3i set_old = reg_set.data[g];
         const auto out = RegionLaw::region_visit(
             sn, sf, response.v0, response.v1, response.v2, region_cfm, rhs_f, law[0], law[1],
-            kind & {int(FRICTION_ROWS)}, cand, span[0], span[1], wrench_old, phi_old, set_old[0], set_old[1], set_old[2],
+            kind & {int(FRICTION_ROWS)}, reg_ball_values.data[g], reg_ball_vectors.data[g],
+            reg_ginv.data[g], reg_k.data[g], reg_lk.data[g], reg_lw.data[g], cand, span[0], span[1], wrench_old, phi_old, set_old[0], set_old[1], set_old[2],
             reg_spring.data[g], {REGION_TOLERANCE!r}f);
         // The change of the region's wrench through its bodies' bases.
         const wp::vec3 d_wrench = wp::sub(out.v0, wrench_old), d_phi = wp::sub(out.v1, phi_old);
