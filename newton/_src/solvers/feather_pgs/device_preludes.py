@@ -739,3 +739,36 @@ def lane_maximum(value: float, lanes: int) -> float:
 @wp.func_native(lane_word(_RETURN.format("SCAN(value)"), "lanes"))
 def lane_scan(value: int, lanes: int) -> int:
     """The sum of ``value`` over the group's lower lanes (0 on the CPU)."""
+
+
+@wp.func_native(lane_word(_RETURN.format("BALLOT(p)"), "lanes"))
+def lane_ballot(p: bool, lanes: int) -> wp.uint32:
+    """The group's votes on ``p``, a bit a lane, lane 0 lowest (one bit on the CPU)."""
+
+
+@wp.func_native(lane_word(_RETURN.format("BELOW(bits)"), "lanes"))
+def lane_below(bits: wp.uint32, lanes: int) -> int:
+    """The ``bits`` of this thread's lower lanes (0 on the CPU): its rank among the lanes that voted."""
+
+
+@wp.func_native(lane_word(_RETURN.format("COUNT(bits)"), "lanes"))
+def lane_count(bits: wp.uint32, lanes: int) -> int:
+    """The lanes ``bits`` holds."""
+
+
+@wp.func_native(lane_word(_RETURN.format("FIRST(bits)"), "lanes"))
+def lane_first(bits: wp.uint32, lanes: int) -> int:
+    """The lowest lane ``bits`` holds, -1 for none."""
+
+
+@wp.func_native(
+    lane_word(
+        device_branches(
+            "    return bits == 0u ? -1 : 31 - __clz(bits);\n",
+            "    int last = -1;\n    for (unsigned rest = bits; rest != 0u; rest >>= 1) ++last;\n    return last;\n",
+        ),
+        "lanes",
+    )
+)
+def lane_last(bits: wp.uint32, lanes: int) -> int:
+    """The highest lane ``bits`` holds, -1 for none."""
