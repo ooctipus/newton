@@ -8,9 +8,11 @@ the held lanes, the support walkers' grid, the launch bounds and H8's and ZY's c
 names it (the fill at 512-4,096 worlds, the writer's lanes at 16,384 worlds, the predictor's bound on sm_103).
 """
 
+import ctypes
 import dataclasses
 import types
 import unittest
+from typing import Any
 from unittest import mock
 
 import numpy as np
@@ -162,20 +164,18 @@ class TestShapeAgainstTodaysRules(unittest.TestCase):
             self.assertEqual(walk_rows.WRITERS["support"].registers(device.arch), 170)
 
     def test_carveout_steps(self):
-        # H8: a predictor block over 1,664 B moves the PRO from 64 KiB to 100 KiB; ZY: 1 KiB at 256 threads keeps 16.
-        for block, shared, step in (
-            (32, 1664, 64),
-            (32, 2200, 100),
-            (64, 1664, 64),
-            (256, 1024, 16),
-            (256, 28672, 100),
-        ):
-            with self.subTest(block=block, shared=shared):
-                self.assertEqual(carveout(PRO, block, shared), step)
+        # The smallest step holding the resident blocks: on the PRO 24 blocks of 1,664 B keep 64 KiB and of 2,200 B
+        # take 100 KiB (H8, the thread and block limits' 24); the general sweep's 8 register-bound blocks of 4,776 B
+        # keep 64 KiB, where the driver's own choice (24 of them) takes 100 KiB and leaves L1 28 KiB.
+        for resident, shared, step in ((24, 1664, 64), (24, 2200, 100), (8, 4776, 64), (16, 1024, 32), (3, 28672, 100)):
+            with self.subTest(resident=resident, shared=shared):
+                self.assertEqual(carveout(PRO, resident, shared), step)
         self.assertEqual(carveout(GB300, 32, 1664), 100)  # 32 blocks of 2,688 B: 84 KiB
-        self.assertEqual(carveout(GB300, 256, 28672), 228)
+        self.assertEqual(carveout(GB300, 8, 4776), 64)
+        self.assertEqual(carveout(GB300, 8, 28672), 228)
+        self.assertEqual(carveout(CPU, 8, 4776), 0)
         got = shape(Work(4096, lanes=32, block=32, shared=1664), PRO)
-        self.assertEqual((got.carveout_kb, got.l1_kb), (64, 64))
+        self.assertEqual((got.blocks_per_sm, got.carveout_kb, got.l1_kb), (24, 64, 64))
 
     def test_stage_pays_in_warps(self):
         """franka-cabinet's general sweep streams its records (6 and 14 warps staged, 32 streamed), g1's stages them at
@@ -288,6 +288,12 @@ def _mark(out: wp.array[int]):
     out[wp.tid()] = 1
 
 
+@wp.kernel
+def _copy_any(source: wp.array[Any], target: wp.array[Any]):
+    i = wp.tid()
+    target[i] = source[i]
+
+
 _STAGE_WORDS = 16 * 1024
 """A 64 KiB stage: past the static limit, so it takes dynamic shared memory on CUDA."""
 
@@ -346,6 +352,43 @@ class TestLaunch(unittest.TestCase):
                 out = wp.zeros(3, dtype=float, device=device)
                 wp.launch_tiled(kernel, dim=[3], inputs=[out], block_dim=128 if cuda else 1, device=device)
                 np.testing.assert_allclose(out.numpy(), expected)
+
+    def test_a_kernel_prefers_the_step_of_its_resident_blocks(self):
+        # The driver's occupancy of the loaded code sets the step (memory.fit_carveout); the function keeps the
+        # preference, once, and the launch runs under it.
+        expected = [sum(float(i % 7 + block) for i in range(_STAGE_WORDS)) for block in range(3)]
+        for device in wp.get_cuda_devices():
+            with self.subTest(device=str(device)):
+                kernel, staging = _stage_kernel(device)
+                spec = memory.device(device)
+                step = memory.fit_carveout(kernel, 128, device)
+                self.assertIn(step, spec.carveouts_kb)
+                self.assertGreaterEqual(step * 1024, memory.granules(staging.dynamic_bytes(spec.arch)))
+                self.assertEqual(memory.fit_carveout(kernel, 128, device), step)
+                hooks = kernel.module.load(device, 128).get_kernel_hooks(kernel)
+                share = ctypes.c_int(-2)
+                memory._call("cuFuncGetAttribute", ctypes.byref(share), ctypes.c_int(9), ctypes.c_void_p(hooks.forward))
+                self.assertEqual(share.value, step * 100 // spec.carveouts_kb[-1])
+                out = wp.zeros(3, dtype=float, device=device)
+                wp.launch_tiled(kernel, dim=[3], inputs=[out], block_dim=128, device=device)
+                np.testing.assert_allclose(out.numpy(), expected)
+        self.assertEqual(memory.fit_carveout(_mark, 32, "cpu"), 0)
+
+    def test_a_generic_kernel_fits_the_overload_it_launches(self):
+        # A generic kernel has no code of its own: the layer's launch fits the overload its arguments select.
+        for device in ("cpu", *wp.get_cuda_devices()):
+            with self.subTest(device=str(device)):
+                source = wp.array(np.arange(16, dtype=np.float32).reshape(8, 2), dtype=wp.vec2, device=device)
+                target = wp.zeros(8, dtype=wp.vec2, device=device)
+                execution.launch(
+                    _copy_any,
+                    shape(Work(8), memory.device(device)),
+                    inputs=(source,),
+                    outputs=(target,),
+                    device=device,
+                    tiled=False,
+                )
+                np.testing.assert_array_equal(target.numpy(), source.numpy())
 
 
 if __name__ == "__main__":

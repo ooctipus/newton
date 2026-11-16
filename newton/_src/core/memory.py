@@ -12,8 +12,9 @@ the one place every such concept lives:
 - the device: :class:`Device`, its memory hierarchy and occupancy, read once (:func:`device`);
 - the shared stage: :class:`Staging` (a block's working set, declared buffer by buffer) under the device's stage
   budget (:func:`stage_budget`), static shared memory up to the limit a build admits and Warp's dynamic shared memory
-  past it (:attr:`Staging.dynamic`), the rule that stages what pays (:func:`stage`) and the carveout
-  (:func:`carveout`);
+  past it (:attr:`Staging.dynamic`), the rule that stages what pays (:func:`stage`) and the carveout: the smallest step
+  that holds the blocks a kernel keeps resident, its registers included (:func:`carveout`), which each kernel prefers
+  once its code is loaded (:func:`fit_carveout`), so L1 keeps the rest;
 - the access words, one text each with its CPU twin: ``LDG`` (L1's non-coherent path), ``LD``/``ST``/``ADD``
   (coherent global loads, stores and adds), ``TOUCH`` and ``FETCH`` (loads ahead: one L1 hint a line, and a lane
   group's fetch of a byte range), ``LDCG``/``STCG`` (L2 past L1), ``HELD`` (a distributed array over a lane group's
@@ -26,9 +27,11 @@ body's preludes, as it does the ordered reservation's.
 
 from __future__ import annotations
 
+import ctypes
 import dataclasses
 import enum
 import functools
+import sys
 from collections.abc import Callable
 
 import warp as wp
@@ -60,6 +63,7 @@ __all__ = [
     "built_for",
     "carveout",
     "device",
+    "fit_carveout",
     "granules",
     "read",
     "stage",
@@ -261,17 +265,81 @@ def granules(block_bytes: int) -> int:
     return granules * SHARED_ALLOCATION_BYTES
 
 
-def carveout(device: Device, block: int, shared: int) -> int:
-    """The driver's carveout step [KiB] for blocks of ``block`` threads and ``shared`` bytes: the smallest step that
-    holds the blocks the thread and block limits allow (H8: the PRO keeps 64 KiB for 32-thread blocks of 1,664 B,
-    takes 100 KiB at 2,200 B); 0 on the CPU."""
+def carveout(device: Device, resident: int, shared: int) -> int:
+    """The carveout step [KiB] for ``resident`` blocks of ``shared`` bytes each: the smallest step that holds them; 0
+    on the CPU. The driver's own choice holds the blocks its thread and block limits allow, whatever registers keep
+    resident (H8), and so takes shared memory a register-bound kernel never uses (the PRO's general sweep: 100 KiB
+    for its 8 resident blocks of 4,776 B, 28 KiB of L1 left); a kernel prefers this step instead (:func:`fit_carveout`)."""
     if not device.cuda:
         return 0
-    need = min(device.blocks_per_sm, device.threads_per_sm // block) * granules(shared)
+    need = int(resident) * granules(shared)
     for step in device.carveouts_kb:
         if step * 1024 >= need:
             return step
     return device.carveouts_kb[-1]
+
+
+_CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES = 1
+_CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT = 9
+_fitted: dict[tuple[wp.Kernel, int, int], int] = {}
+
+
+@functools.cache
+def _driver() -> ctypes.CDLL:
+    """The CUDA driver, for the function attributes Warp does not expose (the preferred carveout)."""
+    return ctypes.CDLL("nvcuda.dll" if sys.platform == "win32" else "libcuda.so.1")
+
+
+def _call(name: str, *args) -> None:
+    status = getattr(_driver(), name)(*args)
+    if status != 0:
+        raise RuntimeError(f"{name} failed with CUresult {status}")
+
+
+def fit_carveout(kernel: wp.Kernel, block: int, device=None) -> int:
+    """Prefer for ``kernel`` (the one launched: a generic kernel's overload), launched in blocks of ``block`` threads
+    on ``device``, the carveout step that holds the blocks its loaded code keeps resident (:func:`carveout`, the
+    driver's occupancy: its registers, its static and dynamic shared memory), once a kernel and device, and return the
+    step [KiB]; 0 on the CPU. The kernel's module is loaded here if its launch has not loaded it yet. The preference is
+    the step's share of the largest, rounded down: the driver takes the next step up, which is this one."""
+    found = wp.get_device(device)
+    if not found.is_cuda:
+        return 0
+    key = (kernel, int(block), int(found.context))
+    if key in _fitted:
+        return _fitted[key]
+    loaded = kernel.module.load(found, int(block))
+    if loaded is None:
+        raise RuntimeError(
+            f"the module of kernel {kernel.key} did not load on {found}: no function to set a carveout on"
+        )
+    hooks = loaded.get_kernel_hooks(kernel)
+    if not hooks.forward:
+        raise RuntimeError(f"Warp gives no CUDA function for kernel {kernel.key} on {found}")
+    function = ctypes.c_void_p(int(hooks.forward))
+    static = ctypes.c_int(0)
+    resident = ctypes.c_int(0)
+    with wp.ScopedDevice(found):
+        _call("cuFuncGetAttribute", ctypes.byref(static), ctypes.c_int(_CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES), function)
+        dynamic = int(hooks.forward_smem_bytes)
+        _call(
+            "cuOccupancyMaxActiveBlocksPerMultiprocessor",
+            ctypes.byref(resident),
+            function,
+            ctypes.c_int(int(block)),
+            ctypes.c_size_t(dynamic),
+        )
+        spec = _read(found.alias)
+        step = carveout(spec, resident.value, static.value + dynamic)
+        share = step * 100 // spec.carveouts_kb[-1]
+        _call(
+            "cuFuncSetAttribute",
+            function,
+            ctypes.c_int(_CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT),
+            ctypes.c_int(share),
+        )
+    _fitted[key] = step
+    return step
 
 
 # ---------------------------------------------------------------------------------------------------------------------

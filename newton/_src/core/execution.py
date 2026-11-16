@@ -25,8 +25,8 @@ The one rule (``SP/core/FL/HANDOFF_ZEX.md`` §3.2):
   declared line is the launch bound ``(block, those blocks)``, or, for a line that is no cap, only where the shared
   memory keeps no more blocks than the line;
 - the grid covers the items, at most ``waves`` waves of resident blocks when the kernel strides over them;
-- the carveout is the driver's smallest step that holds the blocks the thread and block limits allow (H8,
-  :func:`~.memory.carveout`).
+- the carveout is the smallest step that holds the resident blocks (:func:`~.memory.carveout`); a launch prefers it
+  for the kernel's loaded code, its own registers included (:func:`~.memory.fit_carveout`), so L1 keeps the rest.
 """
 
 from __future__ import annotations
@@ -49,6 +49,7 @@ from .memory import (
     Device,
     Staging,
     carveout,
+    fit_carveout,
     granules,
     stage,
 )
@@ -322,7 +323,8 @@ class Shape:
         registers: The register budget a lane: the line the bound leaves, else :data:`REGISTERS_PER_THREAD`. A
             body's unroll, hold and loads ahead read it.
         grid: Blocks of the launch.
-        carveout_kb: The driver's shared-memory carveout step [KiB].
+        carveout_kb: The shared-memory carveout step that holds the resident blocks [KiB] (the launch prefers it,
+            :func:`~.memory.fit_carveout`, from the loaded code's registers, which may keep fewer).
         l1_kb: The L1 the carveout leaves [KiB].
         staging: The working set as staged, where the work declares one.
     """
@@ -412,7 +414,7 @@ def shape(work: Work, device: Device) -> Shape:
     if work.persistent:
         cap = (work.grid_per_sm or round(work.waves * per_sm)) * device.sms
         grid = min(grid, max(cap, 1))
-    step = carveout(device, block, work.shared)
+    step = carveout(device, per_sm, work.shared)
     bounds = (block, per_sm) if line else None
     return Shape(lanes, groups, block, per_sm, bounds, registers, grid, step, device.unified_kb - step, staging)
 
@@ -429,7 +431,8 @@ def launch(
     pool=None,
     stream=None,
 ) -> None:
-    """Launch ``kernel`` at ``shape``: ``shape.grid`` blocks of ``shape.block`` threads.
+    """Launch ``kernel`` at ``shape``: ``shape.grid`` blocks of ``shape.block`` threads, the kernel preferring its
+    carveout (:func:`~.memory.fit_carveout`).
 
     Args:
         kernel: The Warp kernel.
@@ -446,6 +449,9 @@ def launch(
     """
     if shape.grid == 0:
         return
+    # A generic kernel launches the overload its arguments select, as Warp's launch selects it.
+    launched = kernel.add_overload(kernel.infer_argument_types([*inputs, *outputs])) if kernel.is_generic else kernel
+    fit_carveout(launched, shape.block, device)
     if pool is not None:
         if extent is None:
             raise ValueError("a pool launch needs the device extent it follows")
@@ -519,7 +525,8 @@ def compile_ahead(variants: Iterable[tuple[wp.Kernel | None, int]], device=None)
     Warp compiles a module at its first launch, so a step's first run compiles its modules one after another. An owner
     that knows its launches when it is built (each kernel and the block it launches with) declares them here instead:
     their modules compile in worker threads (NVRTC releases the interpreter), and the first launches find their code
-    loaded. Variants already loaded or cached on disk only load. The CPU compiles at its first launch, as before.
+    loaded, each kernel preferring its carveout (:func:`~.memory.fit_carveout`). Variants already loaded or cached on
+    disk only load. The CPU compiles at its first launch, as before.
 
     A kernel generic in an argument (``Any``) has no code until a launch overloads it: its owner declares the overload
     the launch takes (:func:`warp.overload`), and a generic kernel here is an error, never an empty module.
@@ -541,3 +548,5 @@ def compile_ahead(variants: Iterable[tuple[wp.Kernel | None, int]], device=None)
     with ThreadPoolExecutor(max_workers=min(len(jobs), os.cpu_count() or 1, 32)) as pool:
         for done in [pool.submit(module.load, device, block) for module, block in jobs]:
             done.result()
+    for kernel, block in dict.fromkeys(variants):
+        fit_carveout(kernel, block, device)
