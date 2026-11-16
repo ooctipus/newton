@@ -1002,31 +1002,33 @@ def test_texture_sdf_in_model(test, device):
 
 
 def test_texture_sdf_model_owns_cell_lower(test, device):
-    """The tables the model's packed SDF structs address stay the model's: later arrays do not take their memory.
+    """A live array owns the cull table that each of the model's packed SDF structs addresses.
 
     A box's SDF record is made inside ``finalize()``. The packed struct holds only the address of its
-    ``cell_lower`` table, so unless the model owns the record the table is freed with it and the memory pool
-    hands its block to the next array of its size, while the collision kernels keep reading it.
+    ``cell_lower`` table: unless the model owns the record, the table is freed with it, the memory pool hands
+    its block to later arrays, and the collision kernels keep reading the address. The owner is looked up
+    among the live arrays, so a freed address is never read (a device copy from one can end the process).
     """
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     body = builder.add_body()
     builder.add_shape_box(body, hx=0.1, hy=0.2, hz=0.3, cfg=newton.ModelBuilder.ShapeConfig(sdf_max_resolution=16))
     model = builder.finalize(device=device)
     gc.collect()
-    wp.synchronize_device(device)
 
-    packed = model._texture_sdf_data.numpy()[0]["cell_lower"]
-    shape = tuple(int(n) for n in packed["shape"][: int(packed["ndim"])])
-    test.assertEqual(len(shape), 4)
-    table = wp.array(ptr=int(packed["data"]), shape=shape, dtype=float, device=device)
-    before = table.numpy().copy()
-    test.assertTrue(np.isfinite(before).all())
-
-    # Arrays of the table's size take every block of that size the pool has free.
-    claimed = [wp.full(shape, 3.0e38, dtype=float, device=device) for _ in range(64)]
-    wp.synchronize_device(device)
-    np.testing.assert_array_equal(table.numpy(), before)
-    del claimed
+    packed = model._texture_sdf_data.numpy()[0]
+    address = int(packed["cell_lower"]["data"])
+    shape = tuple(int(n) for n in packed["cell_lower"]["shape"][: int(packed["cell_lower"]["ndim"])])
+    test.assertNotEqual(address, 0)
+    owners = [
+        array
+        for array in gc.get_objects()
+        if isinstance(array, wp.array)
+        and getattr(array, "deleter", None) is not None
+        and array.ptr == address
+        and array.shape == shape
+    ]
+    test.assertEqual(len(owners), 1, "no live array owns the address of the packed struct's cell_lower table")
+    test.assertEqual(float(packed["cell_lower_floor"]), float(owners[0].numpy()[0].min()))
 
 
 @wp.kernel(enable_backward=False)
