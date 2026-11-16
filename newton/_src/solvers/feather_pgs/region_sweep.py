@@ -939,6 +939,10 @@ class Regions:
             **live,
         )
         speed = placement.rigid_velocity_limit_slot
+        if speed is not None and speed.shape[0] != RIGID_SPEED_ROWS * self.count:
+            raise ValueError(
+                f"the speed rows' slots are {speed.shape[0]}, not {RIGID_SPEED_ROWS} a body of the stream's {self.count}"
+            )
         wp.launch(
             place_bodies,
             dim=forest.world_count,
