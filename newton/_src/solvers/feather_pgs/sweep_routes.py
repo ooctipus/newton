@@ -655,7 +655,8 @@ def region_phase(pad: str = "        ") -> str:
     (:func:`.region_laws.frame_response`), and its wrench's change returns through the bases. The pass rule is
     exact: a region that holds a wrench and whose last visit settled it is passed while its bodies' walk coordinates
     have the bits that visit left; one that holds nothing is opened only if a candidate closes at its bodies' twist.
-    A visit that changes a bit of the velocity votes for another sweep."""
+    A visit votes for another sweep by the exit law: a coordinate of the region whose own change is past the floor
+    (:data:`.solve_policy.QUIET`) of its terms."""
     text = f"""SYNC();
 if (lane == 0) {{
     const wp::vec2i region_span = world_regions.data[world];
@@ -723,27 +724,36 @@ if (lane == 0) {{
         // The change of the region's wrench through its bodies' bases.
         const wp::vec3 d_wrench = wp::sub(out.v0, wrench_old), d_phi = wp::sub(out.v1, phi_old);
         const auto push_a = RegionLaw::frame_wrench(d_wrench, d_phi, arm_a, n, t0, t1);
-        bool moved = false;
         for (int k = 0; k < 6; ++k) {{
             const float change = sign * (basis_a[0][k] * push_a.v0[0] + basis_a[1][k] * push_a.v0[1] + basis_a[2][k] * push_a.v0[2]
                                          + basis_a[3][k] * push_a.v1[0] + basis_a[4][k] * push_a.v1[1] + basis_a[5][k] * push_a.v1[2]);
-            const float now = u_a[k] + change;
-            moved = moved || now != u_a[k];
-            u_a[k] = now;
-            s_v[first_a + k] = now;
+            u_a[k] += change;
+            s_v[first_a + k] = u_a[k];
         }}
         if (first_b >= 0) {{
             const auto push_b = RegionLaw::frame_wrench(d_wrench, d_phi, arm_b, n, t0, t1);
             for (int k = 0; k < 6; ++k) {{
                 const float change = sign * (basis_b[0][k] * push_b.v0[0] + basis_b[1][k] * push_b.v0[1] + basis_b[2][k] * push_b.v0[2]
                                              + basis_b[3][k] * push_b.v1[0] + basis_b[4][k] * push_b.v1[1] + basis_b[5][k] * push_b.v1[2]);
-                const float now = u_b[k] - change;
-                moved = moved || now != u_b[k];
-                u_b[k] = now;
-                s_v[first_b + k] = now;
+                u_b[k] -= change;
+                s_v[first_b + k] = u_b[k];
             }}
         }}
-        if (moved) iteration_changed = 1;
+        // The exit law's vote: a coordinate of the region whose own change is past the floor of its terms (its
+        // velocity, its right-hand side, what the region's wrench holds of it).
+        {{
+            const wp::mat33 coupling = wp::transpose(response.v1);
+            const wp::vec3 own_n = wp::add(wp::mul(response.v0, d_wrench), wp::mul(response.v1, d_phi));
+            const wp::vec3 own_f = wp::add(wp::mul(coupling, d_wrench), wp::mul(response.v2, d_phi));
+            const wp::vec3 held_n = wp::add(wp::mul(response.v0, out.v0), wp::mul(response.v1, out.v1));
+            const wp::vec3 held_f = wp::add(wp::mul(coupling, out.v0), wp::mul(response.v2, out.v1));
+            const wp::vec3 rhs_f = reg_bf.data[g];
+            for (int k = 0; k < 3; ++k) {{
+                if (!(fabsf(own_n[k]) <= {QUIET_LITERAL} * (fabsf(sn[k]) + fabsf(held_n[k])))) iteration_changed = 1;
+                if (!(fabsf(own_f[k]) <= {QUIET_LITERAL} * (fabsf(sf[k]) + fabsf(rhs_f[k]) + fabsf(held_f[k]))))
+                    iteration_changed = 1;
+            }}
+        }}
         // The candidates' impulses, the friction's, the region's state.
         float* const lambda = world_impulses.data;
         for (int k = 0; k < 3; ++k) if (set_old[k] >= 0) lambda[cand_row.data[set_old[k]]] = 0.0f;
@@ -771,7 +781,6 @@ if (lane == 0) {{
         reg_spring.data[g] = out.v6;
         if (out.v8 == {int(REGION_SLIDE)}) {{
             reg_state.data[g] = {int(REGION_LOOSE)};
-            iteration_changed = 1;
         }} else if (out.v0[0] > 0.0f) {{
             reg_state.data[g] = 0;
             reg_seen.data[2 * g] = u_a;
