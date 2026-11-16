@@ -17,8 +17,8 @@ awake tree that is not ready, or a moving kinematic body, wakes, before the narr
 (:mod:`newton._src.geometry.sleep_filter`, which the collision pipeline runs on :meth:`Sleep.collision_sleep_filter`'s
 arrays). An asleep tree's solved velocity is zero (:meth:`Sleep.hold`), so its coordinates stay bit for bit; no contact
 is made between two held sides, so it holds no row. A reset or a notified state write wakes the trees of its worlds,
-a model change every tree. The law's per-contact load runs only for contacts of trees that can count, and not at all
-in a substep after one where no tree was still: a scene whose free bodies are held by robots pays a per-tree test.
+a model change every tree. The law's per-contact load runs only for contacts of trees that can count: a scene whose
+free bodies are held by robots pays a per-tree test. Each world's trees count on that world's data alone.
 
 A tree never rests where a row joins it to another tree (a loop's link, a mimic), a coordinate of it is kinematic,
 carries a drive gain or has an actuator (``Model.joint_target_mode``: MuJoCo's rule, an actuated tree never sleeps); a
@@ -122,14 +122,10 @@ def _contact_load(
     load_n: wp.array[float],
     load_t: wp.array[wp.vec3],
     pressed: wp.array[wp.int32],
-    still_flags: wp.array[wp.int32],
 ):
     """Export the force of each contact a tree that can count touches (the solver's export) and lump it on such trees:
     each tree's cone capacity ``sum mu f_n`` and its friction force ``sum f_t``, and whether an agent (:func:`_agent`)
-    touches it. Nothing where no tree was still in the last substep (``still_flags[1]``): no count can start without a
-    load; and nothing for a contact between trees that cannot count (acted on, loaded, or never resting)."""
-    if still_flags[1] == 0:
-        return
+    touches it. Nothing for a contact between trees that cannot count (acted on, loaded, or never resting)."""
     c = wp.tid()
     if c >= routes.count[0]:
         return
@@ -181,14 +177,6 @@ def _contact_load(
 
 
 @wp.kernel
-def _roll(still_flags: wp.array[wp.int32]):
-    """Between the contact load and the rest test: whether this substep's load ran (``still_flags[0]``), and a fresh
-    flag for whether any tree is still now (``still_flags[1]``)."""
-    still_flags[0] = still_flags[1]
-    still_flags[1] = 0
-
-
-@wp.kernel
 def _rest_test(
     slot_never: wp.array[wp.int32],
     slot_mass: wp.array[float],
@@ -209,12 +197,11 @@ def _rest_test(
     load_t: wp.array[wp.vec3],
     pressed: wp.array[wp.int32],
     moving: wp.array[wp.int32],
-    still_flags: wp.array[wp.int32],
     tree_asleep: wp.array2d[wp.int32],
 ):
     """Count each awake tree's quiet substeps (see the module docstring); consume its contact load; say whether it
-    moved (for the next substep's :func:`_agent`) and whether any tree is still (the next substep's load). A substep
-    whose load did not run (no tree was still before it) counts for no tree: every counted substep is checked."""
+    moved (for the next substep's :func:`_agent`). A tree that can count had its contacts' load this substep, so every
+    counted substep is checked."""
     i = wp.tid()
     capacity = load_n[i]
     friction = load_t[i]
@@ -256,10 +243,8 @@ def _rest_test(
         return
     still = wp.length(friction) <= stick * capacity and twice_energy < slot_mass[i] * speed_squared
     moving[i] = wp.where(still, 0, 1)
-    if still:
-        still_flags[1] = 1
     # A tree an agent touches is loaded by it, not at rest: its count restarts until the agent lets go.
-    if still and not touched and still_flags[0] != 0:
+    if still and not touched:
         tree_asleep[w, t] = wp.min(wp.max(state, AWAKE) + 1, READY)
     else:
         tree_asleep[w, t] = AWAKE
@@ -335,8 +320,6 @@ class Sleep:
             self.load_t = wp.zeros(slots, dtype=wp.vec3)
             self.pressed = wp.zeros(slots, dtype=wp.int32)
             self.moving = wp.zeros(slots, dtype=wp.int32)
-            # Whether the last substep's contact load ran, and whether any tree is still (both on at the start).
-            self.still_flags = wp.ones(2, dtype=wp.int32)
             self._no_forces = wp.zeros(0, dtype=wp.float32)
             self._no_wrenches = wp.zeros(0, dtype=wp.spatial_vector)
 
@@ -488,11 +471,10 @@ class Sleep:
                     self.trees,
                     self.tree_asleep,
                 ],
-                outputs=[contacts.rigid_contact_force, self.load_n, self.load_t, self.pressed, self.still_flags],
+                outputs=[contacts.rigid_contact_force, self.load_n, self.load_t, self.pressed],
                 extent=contacts.rigid_contact_count,
                 max_blocks=placement.contact_capacity_blocks,
             )
-        wp.launch(_roll, dim=1, outputs=[self.still_flags], device=device)
         joint_f = getattr(control, "joint_f", None) if control is not None else None
         body_f = state_in.body_f
         wp.launch(
@@ -515,7 +497,7 @@ class Sleep:
                 SLEEP_SPEED * SLEEP_SPEED,
                 STICK,
             ],
-            outputs=[self.load_n, self.load_t, self.pressed, self.moving, self.still_flags, self.tree_asleep],
+            outputs=[self.load_n, self.load_t, self.pressed, self.moving, self.tree_asleep],
             device=device,
         )
 
