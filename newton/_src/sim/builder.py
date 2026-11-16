@@ -15861,6 +15861,7 @@ class ModelBuilder:
             finalized_geos = {}  # content hash -> finalized geometry
             finalized_geos_by_identity = {}  # object id -> finalized geometry
             gaussians = []
+            gaussian_bvhs = []
             heightfield_meshes = []
             mesh_keep_alive = []
             mesh_geos = {}  # finalized mesh id -> the geometry (host buffers) it was built from
@@ -15924,6 +15925,9 @@ class ModelBuilder:
                         gaussians.append(
                             geo.finalize(device=device, bvh_constructor=self.default_bvh_cfg.gaussian_constructor)
                         )
+                        # keep the BVH alive for the model's lifetime: the geometry
+                        # object replaces its own on its next finalize
+                        gaussian_bvhs.append(geo.bvh)
                     else:
                         finalized_geos[geo_cache_key] = geo.finalize()
 
@@ -16085,6 +16089,9 @@ class ModelBuilder:
             m._generated_sdf_edge_meshes = generated_sdf_edge_meshes
             m.gaussians_count = len(gaussians)
             m.gaussians_data = wp.array(gaussians, dtype=Gaussian.Data)
+            # The packed structs hold device addresses only: the records own the arrays they address.
+            m._gaussians_records = gaussians
+            m._gaussians_bvhs = gaussian_bvhs
             m.shape_scale = warp_array_from_values(self.shape_scale, dtype=wp.vec3, requires_grad=requires_grad)
             m.shape_is_solid = wp.array(self.shape_is_solid, dtype=wp.bool)
             m.shape_margin = wp.array(self.shape_margin, dtype=wp.float32, requires_grad=requires_grad)

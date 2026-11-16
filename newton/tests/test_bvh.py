@@ -3,7 +3,9 @@
 
 """Tests for cooperative shape BVH local-bounds reduction."""
 
+import gc
 import unittest
+import weakref
 from unittest import mock
 
 import numpy as np
@@ -115,9 +117,54 @@ def test_tiled_local_bounds_rebuild(test: TestShapeBvhBounds, device: str):
             np.testing.assert_allclose(rebuilt_bounds[shape], changed_bounds, rtol=0.0, atol=0.0)
 
 
+def test_model_owns_gaussian_data(test: TestShapeBvhBounds, device: str):
+    """A model owns the arrays and the BVH that its packed Gaussian structs address.
+
+    :attr:`newton.Model.gaussians_data` packs each Gaussian's finalized record into a device array of structs,
+    which holds only the addresses of the record's arrays and the id of its BVH, and the shape BVH's bounds read
+    them on every build and refit. A Gaussian replaces its own record and BVH on its next ``finalize()`` (a second
+    model from the same builder): unless the first model owns them, they are freed there and the allocator hands
+    their memory to later objects. The owners are watched through weak references, so a freed address is never
+    read.
+    """
+    gaussian = newton.Gaussian(positions=_make_points(np.random.default_rng(7), 16, 1.0))
+    builder = newton.ModelBuilder()
+    builder.add_shape_gaussian(builder.add_body(), gaussian=gaussian)
+    model = builder.finalize(device=device)
+
+    # The owners while the Gaussian still holds its first record: the live arrays at the packed addresses.
+    packed = model.gaussians_data.numpy()[0]
+    owners = {}
+    for name in ("transforms", "scales", "opacities", "sh_coeffs"):
+        address = int(packed[name]["data"])
+        found = [
+            array
+            for array in gc.get_objects()
+            if isinstance(array, wp.array) and getattr(array, "deleter", None) is not None and array.ptr == address
+        ]
+        test.assertEqual(len(found), 1)
+        owners[name] = weakref.ref(found[0])
+        del found
+    bvh = weakref.ref(gaussian.bvh)
+    test.assertEqual(bvh().id, int(packed["bvh_id"]))
+
+    # The same Gaussian finalized again replaces its own record and BVH.
+    other = builder.finalize(device=device)
+    gc.collect()
+
+    for name, owner in owners.items():
+        with test.subTest(array=name):
+            test.assertIsNotNone(owner(), f"nothing owns the {name} array the packed Gaussian struct addresses")
+    test.assertIsNotNone(bvh(), "nothing owns the BVH the packed Gaussian struct names")
+    test.assertNotEqual(other.gaussians_data.numpy()[0]["bvh_id"], packed["bvh_id"])
+
+
 add_function_test(TestShapeBvhBounds, "test_tiled_local_bounds", test_tiled_local_bounds, devices=get_test_devices())
 add_function_test(
     TestShapeBvhBounds, "test_tiled_local_bounds_rebuild", test_tiled_local_bounds_rebuild, devices=get_test_devices()
+)
+add_function_test(
+    TestShapeBvhBounds, "test_model_owns_gaussian_data", test_model_owns_gaussian_data, devices=get_test_devices()
 )
 
 

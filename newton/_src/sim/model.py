@@ -1307,6 +1307,12 @@ class Model:
         """Number of gaussians."""
         self.gaussians_data = None
         """Data for Gaussian Splats, shape [gaussians_count], Gaussian.Data."""
+        self._gaussians_records: list = []
+        """The :class:`~newton.Gaussian.Data` records packed into :attr:`gaussians_data`, kept alive for the
+        model's lifetime: a packed struct holds only the addresses of its record's arrays."""
+        self._gaussians_bvhs: list[wp.Bvh] = []
+        """wp.Bvh objects referenced by the ``bvh_id`` of :attr:`gaussians_data`, kept alive for the model's
+        lifetime."""
 
         # Shape and particle BVH structures and related fields
         self.bvh_shapes: wp.Bvh | None = None
