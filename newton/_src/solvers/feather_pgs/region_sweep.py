@@ -449,59 +449,131 @@ def ring_head(parent: wp.array2d[int], line: int, row: int, limit: int) -> int:
 
 
 @wp.kernel(enable_backward=False, module="unique")
-def reset_bodies(
-    cursor: wp.array[int],
-    body_open: wp.array[int],
-    body_count: wp.array2d[int],
-    body_regions: wp.array[wp.vec2i],
+def begin_listing(
+    held: wp.array[int],
+    relist: wp.array[int],
     body_seen: wp.array[wp.spatial_vector],
     body_version: wp.array[int],
+    body_touch: wp.array[int],
 ):
-    """Each free body without a region, closed and at rest in the sweeps' coordinates (its version zero), and the
-    stream empty, before a step's regions are listed."""
+    """Each free body at rest in the sweeps' coordinates (its version zero) and untouched, before a step's regions are
+    listed; and whether the step lists them anew (``relist[0]``): where the patch builder made the contact frame's
+    regions anew (``held``, the regions its build carried: zero) or the last listing did not fit (``relist[1]``).
+    The checks (:func:`check_contacts`, :func:`check_bodies`) may still ask for a new listing."""
+    f = wp.tid()
+    if f == 0:
+        relist[0] = int(held[0] == 0 or relist[1] == 0)
+    if f < body_seen.shape[0]:
+        body_seen[f] = wp.spatial_vector()
+        body_version[f] = 0
+        body_touch[f] = 0
+
+
+@wp.kernel(enable_backward=False, module="unique")
+def check_contacts(
+    data: ContactInput,
+    rows: DenseRows,
+    threads: int,
+    art_free: wp.array[int],
+    listed: wp.array[int],
+    body_touch: wp.array[int],
+    relist: wp.array[int],
+):
+    """Each contact against the listing it holds, ``threads`` lanes striding over them: a dense contact touches the
+    free bodies it has (``body_touch``); a contact the free bodies' rows hold, its first side a free body, is a
+    candidate of the frame's regions. A candidate the listing does not hold, or a listed one the step does not admit,
+    asks for a new listing (``relist[0]``)."""
+    for c in range(wp.tid(), data.count[0], threads):
+        candidate = int(0)
+        slot = data.slot[c]
+        if slot >= 0:
+            if data.path[c] == 0:
+                for side in range(2):
+                    art = data.art0[c]
+                    if side == 1:
+                        art = data.art1[c]
+                    if art >= 0:
+                        f = art_free[art]
+                        if f >= 0:
+                            body_touch[f] = 1
+            elif data.path[c] == 1:
+                if rows.sides[rows.first[data.world[c]], slot][0] >= 0:
+                    candidate = 1
+        if candidate != listed[c]:
+            relist[0] = 1
+
+
+@wp.kernel(enable_backward=False, module="unique")
+def check_bodies(
+    speed_slot: wp.array[int],
+    speed_rows: int,
+    body_pair: wp.array[int],
+    body_open: wp.array[int],
+    body_touch: wp.array[int],
+    relist: wp.array[int],
+):
+    """Each free body's marks: a dense row (:func:`check_contacts`) or a speed row (``speed_slot``, ``speed_rows`` a
+    body) touches it (``body_touch``); with a region between two movable bodies on it (``body_pair``, the listing's)
+    it is open. A body whose mark is not the listing's asks for a new listing (``relist[0]``)."""
+    f = wp.tid()
+    touch = body_touch[f]
+    for row in range(speed_rows):
+        if speed_slot[speed_rows * f + row] >= 0:
+            touch = 1
+    body_touch[f] = touch
+    if int(touch != 0 or body_pair[f] != 0) != body_open[f]:
+        relist[0] = 1
+
+
+@wp.kernel(enable_backward=False, module="unique")
+def clear_layout(
+    relist: wp.array[int],
+    cursor: wp.array[int],
+    blk_cursor: wp.array[int],
+    body_count: wp.array2d[int],
+    body_regions: wp.array[wp.vec2i],
+    body_pair: wp.array[int],
+):
+    """Where the step lists its regions anew: the stream empty and each free body without a region."""
+    if relist[0] == 0:
+        return
     f = wp.tid()
     if f < 4:
         cursor[f] = 0
-    if f < body_open.shape[0]:
-        body_open[f] = 0
+    if f < 2:
+        blk_cursor[f] = 0
+    if f < body_pair.shape[0]:
         for k in range(3):
             body_count[f, k] = 0
         body_regions[f] = wp.vec2i(0, 0)
-        body_seen[f] = wp.spatial_vector()
-        body_version[f] = 0
+        body_pair[f] = 0
 
 
 @wp.kernel(enable_backward=False, module="unique")
 def mark_regions(
+    relist: wp.array[int],
     data: ContactInput,
     rows: DenseRows,
     mf_max: int,
     threads: int,
     art_free: wp.array[int],
     head_size: wp.array[int],
-    body_open: wp.array[int],
+    listed: wp.array[int],
+    body_pair: wp.array[int],
     body_count: wp.array2d[int],
 ):
-    """Each contact with rows, ``threads`` lanes striding over them: a dense contact opens the free bodies it
-    touches, a free one between two movable bodies both of them; a contact whose normal row heads its ring (the
+    """Where the step lists its regions anew, each contact with free rows, ``threads`` lanes striding over them: a
+    contact between two movable bodies marks both (``body_pair``); a contact whose normal row heads its ring (the
     ring's lowest row, :func:`ring_head`) is a region's head: it takes the ring's size (``head_size``, 0 on every
-    other contact) and counts a region and its candidates on its first body (``body_count``)."""
+    other contact) and counts a region and its candidates on its first body (``body_count``). No contact is listed
+    yet (``listed``: :func:`order_regions` lists the candidates)."""
+    if relist[0] == 0:
+        return
     for c in range(wp.tid(), data.count[0], threads):
         head_size[c] = 0
+        listed[c] = 0
         slot = data.slot[c]
-        if slot < 0:
-            continue
-        if data.path[c] == 0:
-            for side in range(2):
-                art = data.art0[c]
-                if side == 1:
-                    art = data.art1[c]
-                if art >= 0:
-                    f = art_free[art]
-                    if f >= 0:
-                        body_open[f] = 1
-            continue
-        if data.path[c] != 1:
+        if slot < 0 or data.path[c] != 1:
             continue
         line = rows.first[data.world[c]]
         sides = rows.sides[line, slot]
@@ -509,8 +581,8 @@ def mark_regions(
             continue
         f = art_free[sides[0]]
         if sides[1] >= 0:
-            body_open[f] = 1
-            body_open[art_free[sides[1]]] = 1
+            body_pair[f] = 1
+            body_pair[art_free[sides[1]]] = 1
         size = ring_head(rows.row_parent, line, slot, mf_max)
         if size > 0:
             head_size[c] = size
@@ -520,10 +592,11 @@ def mark_regions(
 
 @wp.kernel(enable_backward=False, module="unique")
 def place_bodies(
+    relist: wp.array[int],
     world_free_start: wp.array[int],
     world_free: wp.array[int],
-    speed_slot: wp.array[int],
-    speed_rows: int,
+    body_touch: wp.array[int],
+    body_pair: wp.array[int],
     capacity: wp.array[int],
     body_count: wp.array2d[int],
     cursor: wp.array[int],
@@ -533,14 +606,17 @@ def place_bodies(
     lanes: wp.array[int],
     world_regions: wp.array[wp.vec2i],
 ):
-    """A world's bodies placed in the regions' stream, a thread a world (it reads its free bodies' counts only).
+    """Where the step lists its regions anew, a world's bodies placed in the regions' stream, a thread a world (it
+    reads its free bodies' counts only).
 
-    A free body is *open* when a dense row, a region between two movable bodies (:func:`mark_regions`) or a speed
-    row (``speed_slot``, ``speed_rows`` a body) touches it, else *closed*. The stream holds the world's closed
-    bodies' regions body by body, each such body a lane of ``lanes`` (counted in ``cursor[2]``), then its open
+    A free body is *open* when a dense row or a speed row (``body_touch``, :func:`check_bodies`) or a region between
+    two movable bodies (``body_pair``, :func:`mark_regions`) touches it, else *closed*. The stream holds the world's
+    closed bodies' regions body by body, each such body a lane of ``lanes`` (counted in ``cursor[2]``), then its open
     bodies' (``world_regions``): each body takes its regions' places (``body_regions``) and its candidates' first
     (``body_cand``). The places are taken from ``cursor`` as worlds arrive: they decide no result. A world whose
     regions do not fit the stream (``capacity``: the contact pool's ready rows) lists none and sets ``cursor[3]``."""
+    if relist[0] == 0:
+        return
     world = wp.tid()
     world_regions[world] = wp.vec2i(0, 0)
     f_begin = world_free_start[world]
@@ -549,9 +625,7 @@ def place_bodies(
     candidates = int(0)
     for k in range(f_begin, f_end):
         f = world_free[k]
-        for row in range(speed_rows):
-            if speed_slot[speed_rows * f + row] >= 0:
-                body_open[f] = 1
+        body_open[f] = int(body_touch[f] != 0 or body_pair[f] != 0)
         regions += body_count[f, 0]
         candidates += body_count[f, 1]
     if regions == 0:
@@ -584,6 +658,7 @@ def place_bodies(
 
 @wp.kernel(enable_backward=False, module="unique")
 def place_regions(
+    relist: wp.array[int],
     data: ContactInput,
     rows: DenseRows,
     pitch: int,
@@ -595,7 +670,10 @@ def place_regions(
     reg_place: wp.array[wp.vec3i],
 ):
     """Each region's head into a place of its body's (:func:`place_bodies`), in the order its thread arrives
-    (:func:`order_regions` orders them): its row in the store, its size and its body (``reg_place``)."""
+    (:func:`order_regions` orders them): its row in the store, its size and its body (``reg_place``), where the step
+    lists its regions anew."""
+    if relist[0] == 0:
+        return
     for c in range(wp.tid(), data.count[0], threads):
         size = head_size[c]
         if size == 0:
@@ -612,21 +690,30 @@ def place_regions(
 
 @wp.kernel(enable_backward=False, module="unique")
 def order_regions(
+    relist: wp.array[int],
     cursor: wp.array[int],
     threads: int,
+    rows: DenseRows,
+    pitch: int,
+    dense_max: int,
+    row_contact: wp.array2d[int],
     body_world: wp.array[int],
     body_regions: wp.array[wp.vec2i],
     body_cand: wp.array[int],
     reg_place: wp.array[wp.vec3i],
     reg_head: wp.array[wp.vec2i],
     reg_cand: wp.array[wp.vec2i],
-    reg_state: wp.array[int],
+    reg_kind: wp.array[int],
+    cand_contact: wp.array[int],
+    listed: wp.array[int],
 ):
-    """A body's regions in their order (the placed regions, ``threads`` lanes striding over them): a region's place is
-    its body's first plus the count of its body's regions whose heads' rows come before its own (the order of the
-    world's rows), and its candidates' places follow those regions' candidates. It takes its head's row and world
-    (``reg_head``), its candidates' places (``reg_cand``) and the state of a region that holds nothing."""
-    if cursor[3] != 0:
+    """Where the step lists its regions anew, a body's regions in their order (the placed regions, ``threads`` lanes
+    striding over them): a region's place is its body's first plus the count of its body's regions whose heads' rows
+    come before its own (the order of the world's rows), and its candidates' places follow those regions'
+    candidates. It takes its world (``reg_head``), its candidates' places (``reg_cand``), no kind yet, and its
+    candidates: the ring's contacts in the ring's order from its head (``cand_contact``, each ``listed``), which the
+    frame's later steps keep (:func:`fill_regions` finds their rows)."""
+    if relist[0] == 0 or cursor[3] != 0:
         return
     for g in range(wp.tid(), cursor[0], threads):
         own = reg_place[g]
@@ -642,7 +729,14 @@ def order_regions(
         place = span[0] + rank
         reg_head[place] = wp.vec2i(own[0], body_world[f])
         reg_cand[place] = wp.vec2i(at, at + own[1])
-        reg_state[place] = REGION_IDLE
+        reg_kind[place] = 0
+        line = own[0] / pitch
+        j = own[0] - line * pitch
+        for k in range(own[1]):
+            c = row_contact[line, j - dense_max]
+            cand_contact[at + k] = c
+            listed[c] = 1
+            j = rows.row_parent[line, j]
 
 
 @wp.func
@@ -711,7 +805,7 @@ def fill_region(
     dense_max: int,
     mf_max: int,
     pitch: int,
-    row_contact: wp.array2d[int],
+    cand_contact: wp.array[int],
     art_free: wp.array[int],
     body_twist: wp.array[wp.spatial_vector],
     body_inertia: wp.array2d[wp.mat33],
@@ -741,33 +835,35 @@ def fill_region(
     reg_phi: wp.array[wp.vec3],
     reg_set: wp.array[wp.vec3i],
     reg_spring: wp.array[wp.vec3],
+    reg_state: wp.array[int],
 ):
-    """Region ``g`` formed from its head and its candidates' places (:func:`fill_regions`)."""
-    head = reg_head[g]
-    world = head[1]
-    line = head[0] / pitch
-    r = head[0] - line * pitch
+    """Region ``g`` formed from its world, its candidates' contacts and their places (:func:`fill_regions`)."""
+    world = reg_head[g][1]
+    line = rows.first[world]
     span = reg_cand[g]
     c0 = span[0]
     size = span[1] - span[0]
     end = dense_max + wp.min(mf_contact_rows_end[world], wp.min(mf_constraint_count[world], mf_max))
+    head = cand_contact[c0]
+    r = data.slot[head]
     sides = rows.sides[line, r]
     f0 = art_free[sides[0]]
     f1 = int(-1)
     if sides[1] >= 0:
         f1 = art_free[sides[1]]
-    # The ring's carrier: the member its friction rows follow.
+    # The ring's carrier: the member its friction rows follow, at the rows the step gave the members.
     carrier = int(-1)
-    j = r
-    for _ in range(size):
+    c = head
+    for k in range(size):
+        cj = cand_contact[c0 + k]
+        j = data.slot[cj]
         if j + 1 < end:
             if rows.row_type[line, j + 1] == ROW_FRICTION and rows.row_parent[line, j + 1] == j:
                 carrier = j
-        j = rows.row_parent[line, j]
+                c = cj
     source = r
     if carrier >= 0:
         source = carrier
-    c = row_contact[line, source - dense_max]
     frame = contact_frame(data, law, c)
     member_laws(rows, bias, data, law, frame, c)
     n = frame.normal
@@ -808,14 +904,16 @@ def fill_region(
             friction_row = line * pitch + carrier + 1
     if sign < 0.0:
         kind = kind | KIND_SECOND
+    # A block's marks are the frame's (:func:`form_blocks`).
+    kind = kind | (reg_kind[g] & ~(FRICTION_ROWS | KIND_SPRINGS | KIND_SECOND))
     Wnn, C, G, values, vectors, Ginv, K, Lk, Lw = region_terms(
         body_inertia, f0, f1, arm, arm_b, n, t0, t1, mu, mu_t, kind & FRICTION_ROWS, cfm
     )
     # The candidates: the ring's contacts in its order, each a point on the frame, its compliance [1/kg] the row's
     # (a material's) or its relative one's share of the candidate's own response a . Wnn a.
-    j = r
     for k in range(size):
-        cj = row_contact[line, j - dense_max]
+        cj = cand_contact[c0 + k]
+        j = data.slot[cj]
         member = frame
         if j != source:
             member = contact_frame(data, law, cj)
@@ -839,7 +937,6 @@ def fill_region(
             kind = kind | KIND_SPRINGS
         cand[c0 + k] = wp.vec4(a1, a2, rows.rhs[line, j] + incident, eps)
         cand_row[c0 + k] = line * pitch + j
-        j = rows.row_parent[line, j]
     reg_frame[g] = wp.matrix_from_rows(n, t0, t1)
     reg_arm[g] = arm
     reg_arm_b[g] = arm_b
@@ -861,6 +958,7 @@ def fill_region(
     reg_phi[g] = wp.vec3(0.0, 0.0, 0.0)
     reg_set[g] = wp.vec3i(-1, -1, -1)
     reg_spring[g] = wp.vec3(0.0, 0.0, 0.0)
+    reg_state[g] = REGION_IDLE
 
 
 @wp.kernel(enable_backward=False, module="unique")
@@ -874,7 +972,7 @@ def fill_regions(
     dense_max: int,
     mf_max: int,
     pitch: int,
-    row_contact: wp.array2d[int],
+    cand_contact: wp.array[int],
     art_free: wp.array[int],
     body_twist: wp.array[wp.spatial_vector],
     body_inertia: wp.array2d[wp.mat33],
@@ -906,6 +1004,7 @@ def fill_regions(
     reg_phi: wp.array[wp.vec3],
     reg_set: wp.array[wp.vec3i],
     reg_spring: wp.array[wp.vec3],
+    reg_state: wp.array[int],
 ):
     """The placed regions formed (:func:`order_regions`; the first ``cursor[0]`` of the stream), ``threads`` lanes
     striding over them.
@@ -921,23 +1020,21 @@ def fill_regions(
         return
     for g in range(wp.tid(), cursor[0], threads):
         fill_region(
-            g, rows, bias, data, law, mf_constraint_count, mf_contact_rows_end, dense_max, mf_max, pitch, row_contact,
+            g, rows, bias, data, law, mf_constraint_count, mf_contact_rows_end, dense_max, mf_max, pitch, cand_contact,
             art_free, body_twist, body_inertia, cfm, reg_head, reg_cand, reg_frame, reg_arm, reg_arm_b, reg_body, reg_law,
             reg_bf, reg_kind, reg_row, reg_wnn, reg_wnf, reg_wff, reg_ball_values, reg_ball_vectors, reg_ginv, reg_k, reg_lk, reg_lw, cand,
             cand_row,
-            reg_wrench, reg_phi, reg_set, reg_spring,
+            reg_wrench, reg_phi, reg_set, reg_spring, reg_state,
         )  # fmt: skip
 
 
 @wp.kernel(enable_backward=False, module="unique")
 def form_blocks(
+    relist: wp.array[int],
     world_regions: wp.array[wp.vec2i],
     world_free_start: wp.array[int],
     world_free: wp.array[int],
     reg_body: wp.array[wp.vec2i],
-    reg_arm: wp.array[wp.vec3],
-    reg_arm_b: wp.array[wp.vec3],
-    body_inertia: wp.array2d[wp.mat33],
     least: int,
     reg_cand: wp.array[wp.vec2i],
     cand: wp.array[wp.vec4],
@@ -951,24 +1048,20 @@ def form_blocks(
     reg_stage: wp.array[wp.vec3i],
     reg_kind: wp.array[int],
     blk_pair: wp.array[wp.vec2i],
-    blk_L: wp.array[wp.spatial_matrix],
-    blk_d: wp.array[wp.vec3],
-    blk_wrench: wp.array[wp.spatial_vector],
 ):
     """A world's groups (a pair of movable bodies, or a body against immovable partners) with more than ``least``
     regions closing at the predictor (a candidate's gap term below ``-tol``; ``least`` the group's six relative
     coordinates: its rows then over-determine them), every candidate compliant, as blocks (the
     largest first, :data:`PAIR_BLOCKS` at most), a thread a world: the pair's first region in the stream stands for
-    the block (:data:`KIND_BLOCK`), the others are its members (:data:`KIND_MEMBER`). A block's pair ``(a, b)``, the
-    bodies' origins' offset ``d = o_a - o_b``, the factor ``L`` of the pair's relative response
-    ``W = A_a + P A_b P^T`` (``P`` moves b's twist to a's origin; ``W = L L^T``, lower) and its held wrenches (normal,
-    friction; zero). ``blk_count`` counts a world's pairs by its bodies' places (``body_level`` holds them here), a
+    the block (:data:`KIND_BLOCK`), the others are its members (:data:`KIND_MEMBER`); its pair ``(a, b)``
+    (:func:`factor_blocks` forms its response each step). The blocks are the contact frame's: they are formed where
+    the step lists its regions anew, at that step's predictor. ``blk_count`` counts a world's pairs by its bodies' places (``body_level`` holds them here), a
     side of the world's free bodies; a world of more than 16 free bodies lists no block."""
+    if relist[0] == 0:
+        return
     world = wp.tid()
     for k in range(PAIR_BLOCKS):
         blk_pair[world * PAIR_BLOCKS + k] = wp.vec2i(-1, -1)
-        blk_wrench[2 * (world * PAIR_BLOCKS + k)] = wp.spatial_vector()
-        blk_wrench[2 * (world * PAIR_BLOCKS + k) + 1] = wp.spatial_vector()
     span = world_regions[world]
     s = span[0]
     e = span[1]
@@ -1051,52 +1144,80 @@ def form_blocks(
         blk_blob[world * PAIR_BLOCKS + k] = wp.vec4i(at, members, at + STAGE_UNIT * members, first_cand)
         blk_head[world * PAIR_BLOCKS + k] = best_g
         sides = reg_body[best_g]
-        # A body against immovable partners is the pair (a, -1): W = A_a.
+        # A body against immovable partners is the pair (a, -1).
         a = sides[0]
         b = sides[1]
         if b >= 0:
             a = wp.min(sides[0], sides[1])
             b = wp.max(sides[0], sides[1])
-        d = wp.vec3(0.0, 0.0, 0.0)
-        Wvv = body_inertia[a, 0]
-        Wvw = body_inertia[a, 1]
-        Www = body_inertia[a, 2]
-        if b >= 0:
-            d = reg_arm_b[best_g] - reg_arm[best_g]
-            if sides[0] != a:
-                d = -d
-            # W = A_a + P A_b P^T, P = [[I, -[d]x], [0, I]].
-            X = wp.skew(d)
-            Bvv = body_inertia[b, 0]
-            Bvw = body_inertia[b, 1]
-            Bww = body_inertia[b, 2]
-            Pvv = Bvv - X * wp.transpose(Bvw) - Bvw * wp.transpose(X) + X * Bww * wp.transpose(X)
-            Pvw = Bvw - X * Bww
-            Wvv = Wvv + Pvv
-            Wvw = Wvw + Pvw
-            Www = Www + Bww
-        Wm = wp.spatial_matrix()
-        for i in range(3):
-            for j in range(3):
-                Wm[i, j] = Wvv[i, j]
-                Wm[i, j + 3] = Wvw[i, j]
-                Wm[i + 3, j] = Wvw[j, i]
-                Wm[i + 3, j + 3] = Www[i, j]
-        Lm = wp.spatial_matrix()
-        for j in range(6):
-            t = Wm[j, j]
-            for k2 in range(j):
-                t -= Lm[j, k2] * Lm[j, k2]
-            ljj = wp.sqrt(wp.max(t, 1.0e-30))
-            Lm[j, j] = ljj
-            for i in range(j + 1, 6):
-                t2 = Wm[i, j]
-                for k2 in range(j):
-                    t2 -= Lm[i, k2] * Lm[j, k2]
-                Lm[i, j] = t2 / ljj
         blk_pair[world * PAIR_BLOCKS + k] = wp.vec2i(a, b)
-        blk_L[world * PAIR_BLOCKS + k] = Lm
-        blk_d[world * PAIR_BLOCKS + k] = d
+
+
+@wp.kernel(enable_backward=False, module="unique")
+def factor_blocks(
+    blk_pair: wp.array[wp.vec2i],
+    blk_head: wp.array[int],
+    reg_body: wp.array[wp.vec2i],
+    reg_arm: wp.array[wp.vec3],
+    reg_arm_b: wp.array[wp.vec3],
+    body_inertia: wp.array2d[wp.mat33],
+    blk_L: wp.array[wp.spatial_matrix],
+    blk_d: wp.array[wp.vec3],
+    blk_wrench: wp.array[wp.spatial_vector],
+):
+    """Each block's response at the step's poses, a thread a block's slot (:func:`form_blocks`): the bodies' origins'
+    offset ``d = o_a - o_b``, the factor ``L`` of the pair's relative response ``W = A_a + P A_b P^T`` (``P`` moves
+    b's twist to a's origin; ``W = A_a`` against immovable partners; ``W = L L^T``, lower), and its held wrenches
+    (normal, friction) at zero."""
+    bid = wp.tid()
+    blk_wrench[2 * bid] = wp.spatial_vector()
+    blk_wrench[2 * bid + 1] = wp.spatial_vector()
+    pair = blk_pair[bid]
+    a = pair[0]
+    b = pair[1]
+    if a < 0:
+        return
+    best_g = blk_head[bid]
+    sides = reg_body[best_g]
+    d = wp.vec3(0.0, 0.0, 0.0)
+    Wvv = body_inertia[a, 0]
+    Wvw = body_inertia[a, 1]
+    Www = body_inertia[a, 2]
+    if b >= 0:
+        d = reg_arm_b[best_g] - reg_arm[best_g]
+        if sides[0] != a:
+            d = -d
+        # W = A_a + P A_b P^T, P = [[I, -[d]x], [0, I]].
+        X = wp.skew(d)
+        Bvv = body_inertia[b, 0]
+        Bvw = body_inertia[b, 1]
+        Bww = body_inertia[b, 2]
+        Pvv = Bvv - X * wp.transpose(Bvw) - Bvw * wp.transpose(X) + X * Bww * wp.transpose(X)
+        Pvw = Bvw - X * Bww
+        Wvv = Wvv + Pvv
+        Wvw = Wvw + Pvw
+        Www = Www + Bww
+    Wm = wp.spatial_matrix()
+    for i in range(3):
+        for j in range(3):
+            Wm[i, j] = Wvv[i, j]
+            Wm[i, j + 3] = Wvw[i, j]
+            Wm[i + 3, j] = Wvw[j, i]
+            Wm[i + 3, j + 3] = Www[i, j]
+    Lm = wp.spatial_matrix()
+    for j in range(6):
+        t = Wm[j, j]
+        for k2 in range(j):
+            t -= Lm[j, k2] * Lm[j, k2]
+        ljj = wp.sqrt(wp.max(t, 1.0e-30))
+        Lm[j, j] = ljj
+        for i in range(j + 1, 6):
+            t2 = Wm[i, j]
+            for k2 in range(j):
+                t2 -= Lm[i, k2] * Lm[j, k2]
+            Lm[i, j] = t2 / ljj
+    blk_L[bid] = Lm
+    blk_d[bid] = d
 
 
 @wp.kernel(enable_backward=False, module="unique")
@@ -1209,6 +1330,8 @@ def stage_blocks(
 
 @wp.kernel(enable_backward=False, module="unique")
 def level_regions(
+    relist: wp.array[int],
+    cursor: wp.array[int],
     world_regions: wp.array[wp.vec2i],
     world_free_start: wp.array[int],
     world_free: wp.array[int],
@@ -1234,8 +1357,15 @@ def level_regions(
     The levels: a region's level is one past the last level of a region before it on either of its bodies, so a
     level's regions share no body and a sweep that takes the levels in turn, a level's regions at once, is the
     sequential sweep of the order itself. The world's span ``[s, e)`` of the stream holds the regions by level
-    (``level_region``) and, at ``s + L``, the end of level ``L`` (``level_end``); ``world_levels`` the count."""
+    (``level_region``) and, at ``s + L``, the end of level ``L`` (``level_end``); ``world_levels`` the count.
+
+    The levels are the contact frame's: they are made where the step lists its regions anew, whose listing then
+    stands for the frame's later steps if it fit (``relist[1]``)."""
+    if relist[0] == 0:
+        return
     world = wp.tid()
+    if world == 0:
+        relist[1] = int(cursor[3] == 0)
     span = world_regions[world]
     s = span[0]
     e = span[1]
@@ -1352,6 +1482,7 @@ def level_regions(
 
 _REGION_FIELDS = (
     ("head_size", wp.int32, 1),
+    ("listed", wp.int32, 1),
     ("reg_place", wp.vec3i, 1),
     ("reg_head", wp.vec2i, 1),
     ("reg_frame", wp.mat33, 1),
@@ -1374,6 +1505,7 @@ _REGION_FIELDS = (
     ("reg_lw", wp.mat33, 1),
     ("cand", wp.vec4, 1),
     ("cand_row", wp.int32, 1),
+    ("cand_contact", wp.int32, 1),
     ("reg_wrench", wp.vec3, 1),
     ("reg_phi", wp.vec3, 1),
     ("reg_set", wp.vec3i, 1),
@@ -1440,8 +1572,13 @@ class Regions:
         self.body_seen = wp.zeros(count, dtype=wp.spatial_vector, device=device)
         self.body_version = wp.zeros(count, dtype=wp.int32, device=device)
         self.body_regions = wp.zeros(count, dtype=wp.vec2i, device=device)
+        self.body_touch = wp.zeros(max(count, 1), dtype=wp.int32, device=device)
+        self.body_pair = wp.zeros(count, dtype=wp.int32, device=device)
         self.lanes = wp.zeros(count, dtype=wp.int32, device=device)
         self.cursor = wp.zeros(4, dtype=wp.int32, device=device)
+        # Whether a step lists its regions anew ([0]) and whether the last listing fit the stream ([1]: none yet).
+        self.relist = wp.array([1, 0], dtype=wp.int32, device=device)
+        self.no_hold = wp.zeros(1, dtype=wp.int32, device=device)
         self.world_regions = wp.zeros(worlds, dtype=wp.vec2i, device=device)
         self.world_levels = wp.zeros(worlds, dtype=wp.int32, device=device)
         self.body_level = wp.zeros(max(count, 1), dtype=wp.int32, device=device)
@@ -1473,40 +1610,51 @@ class Regions:
         )
 
     def _on_rows(self, rows) -> None:
-        """Take the stream's arrays at the contact pool's ready rows, on creation and after each growth."""
+        """Take the stream's arrays at the contact pool's ready rows, on creation and after each growth: the next step
+        lists its regions anew."""
         rows.publish(self)
+        self.relist.zero_()
         self.capacity = int(rows.rows)
         if self.placement.contact_pool.ready_rows is None:
             self.ready.fill_(self.capacity)
 
     def list(self, solver, state_in, contacts, dt: float) -> None:
-        """The step's regions, once the rows' kinds are written and the patch link made their rings: each free
-        body's basis (:func:`free_body_basis`), then the regions marked and counted a contact
+        """The step's regions, once the rows' kinds are written and the patch link made their rings.
+
+        Every step: each free body's basis (:func:`free_body_basis`) and the checks of the listing it holds
+        (:func:`begin_listing`, :func:`check_contacts`, :func:`check_bodies`). Where the patch builder made the contact
+        frame's regions anew, or a check failed, the step lists them anew: the regions marked and counted a contact
         (:func:`mark_regions`), each world's bodies placed in the stream (:func:`place_bodies`), the regions placed
-        and ordered a body (:func:`place_regions`, :func:`order_regions`) and formed a region (:func:`fill_regions`)."""
+        and ordered a body with their candidates' contacts (:func:`place_regions`, :func:`order_regions`), then,
+        after the fill, the frame's blocks and levels (:func:`form_blocks`, :func:`level_regions`). Every step forms
+        each region at the step's rows and poses (:func:`fill_regions`) and its blocks' responses and records
+        (:func:`factor_blocks`, :func:`stage_blocks`)."""
         from .contact_input import bind as bind_contact_input  # noqa: PLC0415
         from .friction_patches import patch_row_law  # noqa: PLC0415
         from .row_records import bind as bind_dense_rows  # noqa: PLC0415
 
         placement, forest, device = self.placement, self.forest, self.model.device
         pool = placement.contact_pool
+        if contacts is None or contacts.rigid_contact_count is None or contacts._rigid_contact_rows <= 0:
+            # No region: the stream empty, and the next step with contacts lists anew.
+            for array in (self.cursor, self.body_regions, self.world_regions, self.world_levels):
+                array.zero_()
+            wp.launch(
+                begin_listing,
+                dim=max(self.count, 1),
+                inputs=[self.no_hold],
+                outputs=[self.relist, self.body_seen, self.body_version, self.body_touch],
+                device=device,
+            )
+            self.relist.zero_()
+            return
         wp.launch(
-            reset_bodies,
-            dim=max(self.count, 4),
-            outputs=[
-                self.cursor,
-                self.body_open,
-                self.body_count,
-                self.body_regions,
-                self.body_seen,
-                self.body_version,
-            ],
+            begin_listing,
+            dim=max(self.count, 1),
+            inputs=[solver.laws.friction_patches.held_regions()],
+            outputs=[self.relist, self.body_seen, self.body_version, self.body_touch],
             device=device,
         )
-        if contacts is None or contacts.rigid_contact_count is None or contacts._rigid_contact_rows <= 0:
-            self.world_regions.zero_()
-            self.world_levels.zero_()
-            return
         wp.launch(
             free_body_basis,
             dim=self.count,
@@ -1523,14 +1671,15 @@ class Regions:
         rows, bias = bind_dense_rows(placement), solver.laws.bias(self.options, dt)
         data = bind_contact_input(solver, state_in, self.factor, contacts, dt, 1.0)
         mf_max, pitch = int(placement.mf_max_constraints), int(placement.row_pitch)
+        dense_max = int(placement.dense_max_constraints)
         # Sized for the pool's launch rows: a capture's replays run them at the live count (ContactPool.launch).
         threads = min(pool.launch_rows(), _THREAD_CAP)
         live = {"extent": contacts.rigid_contact_count, "clamp": True}
         pool.launch(
-            mark_regions,
+            check_contacts,
             threads,
-            inputs=[data, rows, mf_max, threads, self.art_free],
-            outputs=[self.head_size, self.body_open, self.body_count],
+            inputs=[data, rows, threads, self.art_free, self.listed],
+            outputs=[self.body_touch, self.relist],
             **live,
         )
         speed = placement.rigid_velocity_limit_slot
@@ -1539,13 +1688,35 @@ class Regions:
                 f"the speed rows' slots are {speed.shape[0]}, not {RIGID_SPEED_ROWS} a body of the stream's {self.count}"
             )
         wp.launch(
+            check_bodies,
+            dim=self.count,
+            inputs=[self.lanes if speed is None else speed, 0 if speed is None else RIGID_SPEED_ROWS, self.body_pair],
+            outputs=[self.body_open, self.body_touch, self.relist],
+            device=device,
+        )
+        wp.launch(
+            clear_layout,
+            dim=max(self.count, 4),
+            inputs=[self.relist],
+            outputs=[self.cursor, self.blk_cursor, self.body_count, self.body_regions, self.body_pair],
+            device=device,
+        )
+        pool.launch(
+            mark_regions,
+            threads,
+            inputs=[self.relist, data, rows, mf_max, threads, self.art_free],
+            outputs=[self.head_size, self.listed, self.body_pair, self.body_count],
+            **live,
+        )
+        wp.launch(
             place_bodies,
             dim=forest.world_count,
             inputs=[
+                self.relist,
                 self.world_free_start,
                 self.world_free,
-                self.lanes if speed is None else speed,
-                0 if speed is None else RIGID_SPEED_ROWS,
+                self.body_touch,
+                self.body_pair,
                 self.ready,
                 self.body_count,
             ],
@@ -1555,15 +1726,27 @@ class Regions:
         pool.launch(
             place_regions,
             threads,
-            inputs=[data, rows, pitch, threads, self.art_free, self.head_size, self.body_regions],
+            inputs=[self.relist, data, rows, pitch, threads, self.art_free, self.head_size, self.body_regions],
             outputs=[self.body_count, self.reg_place],
             **live,
         )
         pool.launch(
             order_regions,
             threads,
-            inputs=[self.cursor, threads, self.body_world, self.body_regions, self.body_cand, self.reg_place],
-            outputs=[self.reg_head, self.reg_cand, self.reg_state],
+            inputs=[
+                self.relist,
+                self.cursor,
+                threads,
+                rows,
+                pitch,
+                dense_max,
+                self.row_contact,
+                self.body_world,
+                self.body_regions,
+                self.body_cand,
+                self.reg_place,
+            ],
+            outputs=[self.reg_head, self.reg_cand, self.reg_kind, self.cand_contact, self.listed],
             **live,
         )
         pool.launch(
@@ -1576,10 +1759,10 @@ class Regions:
                 patch_row_law(solver),
                 placement.mf_constraint_count,
                 placement.mf_contact_rows_end,
-                int(placement.dense_max_constraints),
+                dense_max,
                 mf_max,
                 pitch,
-                self.row_contact,
+                self.cand_contact,
                 self.art_free,
                 self.body_twist,
                 self.body_inertia,
@@ -1613,22 +1796,20 @@ class Regions:
                 self.reg_phi,
                 self.reg_set,
                 self.reg_spring,
+                self.reg_state,
             ],
             **live,
         )
         if self.blocks:
-            self.blk_cursor.zero_()
             wp.launch(
                 form_blocks,
                 dim=forest.world_count,
                 inputs=[
+                    self.relist,
                     self.world_regions,
                     self.world_free_start,
                     self.world_free,
                     self.reg_body,
-                    self.reg_arm,
-                    self.reg_arm_b,
-                    self.body_inertia,
                     BLOCK_CLOSING,
                     self.reg_cand,
                     self.cand,
@@ -1644,16 +1825,28 @@ class Regions:
                     self.reg_stage,
                     self.reg_kind,
                     self.blk_pair,
-                    self.blk_L,
-                    self.blk_d,
-                    self.blk_wrench,
                 ],
+                device=device,
+            )
+            wp.launch(
+                factor_blocks,
+                dim=self.blk_pair.shape[0],
+                inputs=[self.blk_pair, self.blk_head, self.reg_body, self.reg_arm, self.reg_arm_b, self.body_inertia],
+                outputs=[self.blk_L, self.blk_d, self.blk_wrench],
                 device=device,
             )
         wp.launch(
             level_regions,
             dim=forest.world_count,
-            inputs=[self.world_regions, self.world_free_start, self.world_free, self.reg_body, self.reg_kind],
+            inputs=[
+                self.relist,
+                self.cursor,
+                self.world_regions,
+                self.world_free_start,
+                self.world_free,
+                self.reg_body,
+                self.reg_kind,
+            ],
             outputs=[
                 self.body_level,
                 self.reg_level,

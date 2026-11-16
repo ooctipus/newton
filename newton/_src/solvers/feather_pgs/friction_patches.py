@@ -1486,6 +1486,11 @@ class _FrictionPatchState:
         # Pair keys follow the shapes' bodies.
         self.forget_frame()
 
+    def held_regions(self) -> wp.array:
+        """The regions the last build carried: zero where it made the frame's regions anew (one word on the device,
+        :func:`_publish_extent`)."""
+        return self.extent[_CARRY_EXTENT : _CARRY_EXTENT + 1]
+
     def forget_frame(self):
         """Make the next build sort its pairs and make its regions, as it does for a new contact frame: the record
         names no frame."""

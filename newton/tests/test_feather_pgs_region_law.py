@@ -309,6 +309,63 @@ class TestRegionStream(unittest.TestCase):
         np.testing.assert_array_equal(regions.body_open.numpy(), [0, 0, 1])
         self.assertEqual(int(regions.cursor.numpy()[2]), 2)
 
+    def test_a_held_frame_keeps_the_listing_a_new_one_would_make(self):
+        """List a contact frame's regions once and hold them through its later steps: a held step's listing (its
+        bodies' places and marks, each region's candidates by contact, the order and its levels) is the one a new
+        listing of that step's rows makes.
+
+        A stack of three boxes and a tilted pair of boxes on the ground, colliding once every four steps: the steps
+        between hold the frame (the patch builder carries its regions, every candidate is admitted again and no
+        mark changes).
+        """
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()
+        for k in range(3):
+            body = builder.add_body(xform=wp.transform((0.0, 0.0, 0.05 + 0.0999 * k), wp.quat_identity()))
+            builder.add_shape_box(body, hx=0.05, hy=0.05, hz=0.05)
+        tilt = wp.quat_from_axis_angle(wp.vec3(1.0, 0.3, 0.0), 0.2)
+        for k in range(2):
+            body = builder.add_body(xform=wp.transform((0.4, 0.1 * k, 0.04 + 0.075 * k), tilt))
+            builder.add_shape_box(body, hx=0.04, hy=0.04, hz=0.04)
+        model = builder.finalize(device="cpu")
+        solver = SolverFeatherPGS(model, pgs_iterations=8)
+        regions = solver.sweep.regions
+        self.assertIsNotNone(regions)
+        pipeline = newton.CollisionPipeline(model)
+        contacts = pipeline.contacts()
+        state, out, control = model.state(), model.state(), model.control()
+        dt = 1.0 / 480.0
+        names = (
+            "cursor", "body_open", "body_regions", "body_cand", "world_regions", "world_levels", "lanes", "reg_cand",
+            "reg_kind", "reg_order", "reg_level", "cand_contact", "level_end", "level_region",
+        )  # fmt: skip
+
+        def listing():
+            count = int(regions.cursor.numpy()[0])
+            candidates = int(regions.reg_cand.numpy()[:count, 1].max()) if count else 0
+            sizes = {"reg_cand": count, "reg_kind": count, "reg_order": count, "reg_level": count}
+            sizes.update({"cand_contact": candidates, "level_end": count, "level_region": count})
+            return {name: getattr(regions, name).numpy()[: sizes.get(name, None)].copy() for name in names}
+
+        held = 0
+        for step in range(12):
+            if step % 4 == 0:
+                pipeline.collide(state, contacts)
+            solver.step(state, out, control, contacts, dt)
+            state, out = out, state
+            if regions.relist.numpy()[0] != 0:
+                continue
+            held += 1
+            kept = listing()
+            # The same step's rows listed anew.
+            regions.relist.zero_()
+            regions.list(solver, out, contacts, dt)
+            self.assertEqual(int(regions.relist.numpy()[0]), 1)
+            made = listing()
+            for name in names:
+                np.testing.assert_array_equal(kept[name], made[name], err_msg=f"step {step}: {name}")
+        self.assertGreaterEqual(held, 6)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
