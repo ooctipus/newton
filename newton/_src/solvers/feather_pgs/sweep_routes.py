@@ -1184,8 +1184,11 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
             return friction_metric(row, rows=3)
 
         friction_laws = formed_friction_laws(metric, "    ") + "\n"
-        metric_stage = friction_record_stage(dense, dense_op, end="m_dense", record=dense_record, pad="    ") + "\n"
-        if free_rows and not colored and not sweep.regions:
+        # The dense contacts' records: formed here, or by the stage launch that runs this text without its sweeps
+        # ahead of it (``formed``), so the sweep's own code holds none of the formation.
+        if sweep.formed != "ahead":
+            metric_stage = friction_record_stage(dense, dense_op, end="m_dense", record=dense_record, pad="    ") + "\n"
+        if free_rows and not colored and not sweep.regions and sweep.formed != "stage":
 
             def free_record(row: str) -> str:
                 # The free bodies' rows follow the dense ones in the line.
@@ -1393,6 +1396,21 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     if speed_rows:
         dense_count += "\n    const int speed_start = speed_first.data[world];"
     dense_view = dense.declaration() + "\n" if dense.stream else ""
+    # The sweeps and the way back; the stage launch (``formed == "stage"``) forms the dense records and leaves.
+    rest = f"""
+{sweeps}
+
+    {barrier}
+{first_warp}    for (int d = lane; d < {D}; d += STRIDE) {{
+        int global_dof = world_dof_indices.data[dof_map_base + d];
+        if (global_dof >= 0) walk.du.data[global_dof] += s_v[d];
+    }}
+    for (int i = lane; i < m_dense; i += STRIDE) {{
+        {dense.stores("i")}
+    }}{free_stores}
+{end_first_warp}"""
+    if sweep.formed == "stage":
+        seed, rest = "", ""
     body = f"""{head}
 
     {dense_count}
@@ -1421,22 +1439,11 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     for (int d = lane; d < {D}; d += STRIDE) s_v[d] = 0.0f;
 {end_first_warp}    {barrier}
 {seed}{first_warp}{metric_stage}{end_first_warp}{metric_build}{chr(10) if level_marks else ""}{level_marks}
-
-{sweeps}
-
-    {barrier}
-{first_warp}    for (int d = lane; d < {D}; d += STRIDE) {{
-        int global_dof = world_dof_indices.data[dof_map_base + d];
-        if (global_dof >= 0) walk.du.data[global_dof] += s_v[d];
-    }}
-    for (int i = lane; i < m_dense; i += STRIDE) {{
-        {dense.stores("i")}
-    }}{free_stores}
-{end_first_warp}"""
+{rest}"""
     # The rows' layout is the configuration's: rows as wide as the world (and no classes) sit at their coordinates.
     packed = PACKED_SIDES_DENSE if not sweep.support_classes and max_row_dofs == D else PACKED_SIDES_BY_SIDE
     sides = (packed, *((CLASS_SIDES,) if sweep.support_classes else ()), *((memory_words(_SLOTS),) if colored else ()))
-    records = bool(metric_stage or colored)
+    records = bool(contact_torsion or colored)
     families = (REGION_LAW,) if sweep.regions else ()
     return sweep.native(
         body, lanes=lanes, rows=sides, walks=(FREE_BODY_WALKS,), records=records, laws=families
@@ -1488,6 +1495,7 @@ class GeneralSweep(SweepConfig):
     one_tree: bool = False
     records: int | None = None
     regions: bool = False
+    formed: str = "inline"
 
     def __post_init__(self):
         if self.regions and (self.levels.law == EXACT or not self.free_rows):
@@ -1501,6 +1509,12 @@ class GeneralSweep(SweepConfig):
         validate_record_coordinates(self.max_world_dofs)
         if self.material and not self.weighted:
             raise ValueError("material contacts step by their weights: their sweeps are weighted")
+        if self.formed not in ("inline", "ahead", "stage"):
+            raise ValueError(
+                f"a sweep's dense friction records are formed inline, ahead or as the stage, got {self.formed}"
+            )
+        if self.formed != "inline" and (self.colored or not self.torsion):
+            raise ValueError("the dense friction records form ahead of the warp mapping's sweep, where it forms them")
         if self.colored and (self.active_rows or self.contact_units or self.block_warps != 1):
             raise ValueError(
                 "the colored mapping visits every dense row in turn, a world a block: its exit votes over it"
@@ -1571,6 +1585,7 @@ class GeneralSweep(SweepConfig):
             + (f"_p{pitch}" if pitch is not None and pitch != M + MF else "")
             + ("" if self.free_rows else "_line")
             + ("_regions" if self.regions else "")
+            + {"inline": "", "ahead": "_formed", "stage": "_records"}[self.formed]
             + ("_speed" if self.speed_rows else "")
             + ("_tree" if self.one_tree else "")
             + "_walk"

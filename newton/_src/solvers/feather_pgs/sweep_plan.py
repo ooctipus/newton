@@ -409,6 +409,10 @@ class Sweep:
                 metric=FRICTION_METRIC_FLOATS,
             )
         self.mf_gs_kernel = None
+        # The general sweep's dense friction records, formed by a launch of its text without its sweeps ahead of it
+        # (sweep_routes.GeneralSweep.formed), where it forms them.
+        self.general_records = None
+        self.mf_records_kernel = None
         # The free bodies' contacts as regions (region_sweep.Regions), where the general sweep takes every world.
         self.regions = None
         # The colored mapping of the matrix-free sweep and its units, when a world can take it.
@@ -534,6 +538,12 @@ class Sweep:
                     device_arch,
                     torsion=bool(self.laws.spin_rows),
                 )
+            if self.general_sweep.torsion:
+                # The dense contacts' records form in a launch of their own, ahead of the sweep: the formation's
+                # code (its eigen solves) leaves the sweep's, whose instruction supply bounds it (SAT).
+                self.general_records = dataclasses.replace(self.general_sweep, formed="stage")
+                self.general_sweep = dataclasses.replace(self.general_sweep, formed="ahead")
+                self.mf_records_kernel = self.sweep("mf_gs_records", self.general_records)
             self.mf_gs_kernel = self.sweep("mf_gs", self.general_sweep)
             if colored:
                 self.colored_sweep = dataclasses.replace(colored_sweep, records=self.placement.record_first)
@@ -608,6 +618,12 @@ class Sweep:
                 self.general_sweep, self.mf_gs_kernel, worlds, self.claim_general, sweep_levels.COST_CLASSES
             )
             mapped = (general,)
+            if self.general_records is not None:
+                # In line with the sweep, on its stream: the records it reads, then the sweep.
+                records = self._claim_launch(
+                    self.general_records, self.mf_records_kernel, worlds, self.claim_general, sweep_levels.COST_CLASSES
+                )
+                mapped = (records, general)
             if colored:
                 slots = self.colored_units.slot_count
                 mapped += (self._claim_launch(self.colored_sweep, self.mf_colored_kernel, slots, self.claim_colored),)
