@@ -28,7 +28,7 @@ import warp as wp
 
 from ...core.contact_pool import ContactField
 from ...geometry.flags import ShapeFlags
-from .contact_input import ContactInput, contact_frame
+from .contact_input import ContactFrame, ContactInput, contact_frame
 from .device_preludes import dual_native
 from .factor.walk import FREE_BODY_WALK, WALK_COORDINATE, WALK_LINK, WalkTrees, walk_down_prelude
 from .friction_patches import PatchRowLaw
@@ -42,6 +42,7 @@ from .region_laws import (
     region_visit,
     stick_terms,
 )
+from .row_build import contact_row_law
 from .row_kernels import RIGID_SPEED_ROWS, RowBias, row_bias
 from .row_laws import ROW_FRICTION, ROW_TORSION
 from .row_records import DenseRows
@@ -682,6 +683,23 @@ def region_terms(
 
 
 @wp.func
+def member_laws(rows: DenseRows, bias: RowBias, data: ContactInput, law: PatchRowLaw, frame: ContactFrame, c: int):
+    """A region member's rows' laws, contact ``c`` at its front end ``frame``: each row's records by the contact law
+    (:func:`.row_build.contact_row_law`), its friction and spin rows' rhs by the row law (:func:`.row_kernels.row_bias`,
+    no incident velocity: the region's own slips enter where the fill reads them). Its kinds and sides are the free
+    bodies' writer's (:func:`.walk_rows.free_body_region_rows`)."""
+    slot = data.slot[c]
+    line = rows.first[data.world[c]]
+    count = int(1)
+    if data.slots_needed[c] >= 3:
+        count = data.slots_needed[c]
+    for row in range(count):
+        contact_row_law(data, law, frame, c, row, False)
+        if row > 0:
+            row_bias(rows, bias, line, slot + row, 0.0)
+
+
+@wp.func
 def fill_region(
     g: int,
     rows: DenseRows,
@@ -751,6 +769,7 @@ def fill_region(
         source = carrier
     c = row_contact[line, source - dense_max]
     frame = contact_frame(data, law, c)
+    member_laws(rows, bias, data, law, frame, c)
     n = frame.normal
     t0 = frame.tangent0
     t1 = frame.tangent1
@@ -797,7 +816,10 @@ def fill_region(
     j = r
     for k in range(size):
         cj = row_contact[line, j - dense_max]
-        member = contact_frame(data, law, cj)
+        member = frame
+        if j != source:
+            member = contact_frame(data, law, cj)
+            member_laws(rows, bias, data, law, member, cj)
         lever = wp.cross(member.point - frame.friction_point, n)
         a1 = wp.dot(lever, t0)
         a2 = wp.dot(lever, t1)
@@ -892,7 +914,9 @@ def fill_regions(
     friction row uses for it, at the region's friction location. Its candidates are the ring's contacts, each a
     point on that frame with the row law's right-hand side at the predictor (:func:`.row_kernels.row_bias`, the
     incident velocity the frame's); its friction rows' right-hand sides are the row law's with the predictor's
-    slips and spin. It starts holding nothing."""
+    slips and spin. Each member's rows take their laws where its front end is formed (:func:`member_laws`), the
+    carrier's first, so the region reads them: the free bodies' writer leaves the regions' rows their kinds alone. It
+    starts holding nothing."""
     if cursor[3] != 0:
         return
     for g in range(wp.tid(), cursor[0], threads):
@@ -1454,7 +1478,7 @@ class Regions:
             self.ready.fill_(self.capacity)
 
     def list(self, solver, state_in, contacts, dt: float) -> None:
-        """The step's regions, once the rows' records are written and the patch link made their rings: each free
+        """The step's regions, once the rows' kinds are written and the patch link made their rings: each free
         body's basis (:func:`free_body_basis`), then the regions marked and counted a contact
         (:func:`mark_regions`), each world's bodies placed in the stream (:func:`place_bodies`), the regions placed
         and ordered a body (:func:`place_regions`, :func:`order_regions`) and formed a region (:func:`fill_regions`)."""

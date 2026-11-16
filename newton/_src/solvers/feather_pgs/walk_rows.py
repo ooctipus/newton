@@ -72,6 +72,7 @@ from .row_records import (
     UNIT_VELOCITY,
     DenseRows,
     RowSupport,
+    row_sides,
     unit_source,
 )
 from .sparse_mass_matrix import _SparseRowSupport
@@ -1775,19 +1776,13 @@ def free_body_contact_rows(sink: RowSink, rows: DenseRows, data: ContactInput, l
 
 @wp.func
 def free_body_region_rows(
-    rows: DenseRows,
-    data: ContactInput,
-    law: PatchRowLaw,
-    bias: RowBias,
-    row_contact: wp.array2d[int],
-    base: int,
-    c: int,
+    rows: DenseRows, data: ContactInput, law: PatchRowLaw, row_contact: wp.array2d[int], base: int, c: int
 ):
-    """Contact ``c``'s records where the allocation routed it to the free bodies (``path`` 1) and their contacts are
-    regions (:mod:`.region_sweep`): no row is walked. Each of its rows takes its records by the contact law
-    (:func:`.row_build.write_contact_row`), its friction rows their rhs by the row law, and its normal row's slot
-    names the contact (``row_contact``, from the free bodies' first row ``base``): the regions' listing forms the
-    candidate there (:func:`.region_sweep.fill_regions`)."""
+    """Contact ``c``'s kinds where the allocation routed it to the free bodies (``path`` 1) and their contacts are
+    regions (:mod:`.region_sweep`): no row is walked, and its laws are the regions' fill's. Each of its rows takes its
+    kind (:func:`.row_build.contact_row_kind`: what the patch link and the listing read) and its sides, and its normal
+    row's slot names the contact (``row_contact``, from the free bodies' first row ``base``): the regions' listing
+    forms the candidate there and writes its rows' laws (:func:`.region_sweep.fill_regions`)."""
     slot = data.slot[c]
     if data.path[c] != 1 or slot < 0:
         return
@@ -1795,11 +1790,10 @@ def free_body_region_rows(
     count = int(1)
     if data.slots_needed[c] >= 3:
         count = data.slots_needed[c]
-    frame = contact_frame(data, law, c)
+    sides = row_sides(data.art0[c], data.art1[c], data.response_dofs)
     for row in range(count):
-        write_contact_row(data, law, frame, c, row, False)
-        if row > 0:
-            row_bias(rows, bias, line, slot + row, 0.0)
+        contact_row_kind(data, law, ContactFrame(), c, row, False)
+        rows.sides[line, slot + row] = sides
     row_contact[line, slot - base] = c
 
 
@@ -1898,7 +1892,7 @@ def write_free_body_regions(device_arch) -> wp.Kernel:
         contacts = data.count[0]
         for item in range(wp.tid(), contacts + speed_bodies, threads):
             if item < contacts:
-                free_body_region_rows(rows, data, law, bias, row_contact, sink.base, item)
+                free_body_region_rows(rows, data, law, row_contact, sink.base, item)
             else:
                 free_body_speed_rows(bodies, rows, sink, speed_slot, bias, item - contacts)
 
