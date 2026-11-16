@@ -51,7 +51,7 @@
   "placement._accumulate_row_capacity_telemetry": "d909544ecf9669c05bf97c1de0396fe39ff5195c068c12a899905c12588a4e3e",
   "placement._accumulate_row_watermark": "91493d15a468654d25833fca1813f2964674ac21cd8ba8e300163344143cc7e3",
   "placement._clear_dense_diagonals": "591b631eb09f159c46e5a41b92debdc3122ac56be48823a3cfeee7cb0da38148",
-  "placement._clear_dense_row_state": "488860c6a07741f4e5414063335475f4b5188bc18532d1923c7ecca387b9d23e",
+  "placement._clear_dense_row_state": "808bc7e613ac8d401fd9b842066ded7644b1d223563bb8fa3de048d07a7a851c",
   "placement._finalize_constraint_status": "ee00b31da9bbbd149b178915293da07ce8dd22f4f5e81491f05aa0aacdccafd7",
   "placement._reset_solver_status": "a2bfd6fce4d63742a7c71580d2eeb7074556a08745adfd37ad154fa181ae1066",
   "placement._warn_constraint_row_overflow": "cc85f6e2758d45d7336f0e78311e5930d5dde574ae23ba62ddfd712f9f7c4517",
@@ -440,7 +440,7 @@
   "warm_start.carry_contacts": "3f7495842117f2aa0ab731c5d1b75a54dc3e1d9e6721b444b3d9246c9b8a770c",
   "warm_start.forget_carried_contacts": "aca3e2aa48e35b6b5d4b1bfa00a374383fe8466ee1157669f2f7e478324cba20",
   "warm_start.gather_carried_normals": "b933dada24b619638508aa30cca8d699ea6c0f5210f44899954d8fbb33feae52",
-  "warm_start.prepare_world_impulses": "ef95f5e2e4ffaa5e28b1cf712eecd97c6294c59ed9fa8a7bb66e77561996a381",
+  "warm_start.prepare_world_impulses": "22c4c1a6a3e25a042ad887937cc758323a4b974334bd066e5e521af9dd2dc0b8",
   "warm_start.reset_world_impulses": "eaff9d7e371f52a8e01e264aac4b43427fb7b35d5681420bc0ae82cb50466b3e"
  },
  "warp": "1.20.0.dev20261114"

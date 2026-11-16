@@ -39,7 +39,7 @@ from .row_laws import LINK_ROWS
 from .row_metadata import record_layout
 from .row_records import DENSE_ROWS, ROW_RECORDS, RowSupport
 from .row_slots import place_world_contact_runs, record_world_contact_runs
-from .warm_start import ContactCarry, prepare_world_impulses
+from .warm_start import PREPARE_LANES, ContactCarry, prepare_world_impulses
 
 # FeatherPGS takes no gradients: its kernels compile no adjoints.
 wp.set_module_options({"enable_backward": False})
@@ -205,31 +205,24 @@ def _clear_dense_diagonals(diag: wp.array2d[float]):
 
 @wp.kernel
 def _clear_dense_row_state(
-    first: wp.array[int],
     slot_counter: wp.array2d[int],
     first_rejected: wp.array2d[int],
     count: wp.array2d[int],
     dropped: wp.array2d[int],
-    has_free_rigid: int,
-    body_base: int,
-    impulses: wp.array2d[float],
     acts: wp.array[int],
 ):
-    """Clear each row class's allocation state and row-loss counters (by class and world), the world's acts word, and
-    the free bodies' rows (their count, and impulses from ``body_base`` of each world's line), in one launch. The dense
-    rows' count stands until their producers' finalize: the last step's rows are cleared by it."""
-    world, column = wp.tid()
-    line = first[world]
-    if column == 0:
-        for row_class in range(2):
-            slot_counter[row_class, world] = 0
-            first_rejected[row_class, world] = ROW_SLOT_UNBOUNDED
-            dropped[row_class, world] = 0
-        count[1, world] = 0
-        if acts.shape[0] > 0:
-            acts[world] = 0
-    if has_free_rigid != 0:
-        impulses[line, body_base + column] = 0.0
+    """Clear each row class's allocation state and row-loss counters (by class and world), the free bodies' row count
+    and the world's acts word, in one launch. The dense rows' count stands until their producers' finalize: the last
+    step's rows are cleared by it. The rows' impulses start where the counts are final
+    (:func:`.warm_start.prepare_world_impulses`)."""
+    world = wp.tid()
+    for row_class in range(2):
+        slot_counter[row_class, world] = 0
+        first_rejected[row_class, world] = ROW_SLOT_UNBOUNDED
+        dropped[row_class, world] = 0
+    count[1, world] = 0
+    if acts.shape[0] > 0:
+        acts[world] = 0
 
 
 @wp.kernel
@@ -802,24 +795,11 @@ class Placement:
 
     def begin(self):
         """Clear the rows' allocation state before the row pass writes them."""
-        # One launch clears the world-level allocation state and, with free rigid bodies, the free bodies'
-        # counters and impulses (PGS reads their impulses before its first write; the warm start's gather seeds
-        # their normals after the row pass). Other row buffers are fully overwritten by their producers.
-        mf_active = self.forest.has_free_rigid_bodies
         wp.launch(
             _clear_dense_row_state,
-            dim=(self.forest.world_count, self.mf_max_constraints if mf_active else 1),
-            inputs=[
-                self.dense_first,
-                self.row_slot_counter,
-                self.row_first_rejected,
-                self.row_count,
-                self.row_dropped_all,
-                1 if mf_active else 0,
-                self.body_base,
-                self.impulses if mf_active else self.dummy_mf_impulses,
-                self.world_acts,
-            ],
+            dim=self.forest.world_count,
+            inputs=[self.row_slot_counter, self.row_first_rejected, self.row_count, self.row_dropped_all],
+            outputs=[self.world_acts],
             device=self.model.device,
         )
 
@@ -1096,15 +1076,25 @@ class Placement:
         return bool(self.packed_response)
 
     def prepare_impulses(self):
+        """Start the step's rows' impulses (:func:`.warm_start.prepare_world_impulses`): each world's dense rows, and
+        with free rigid bodies the rows of their run, cold where the sweep is cold and over capacity under the warm
+        start."""
         warmstart_flag = 1 if self.options.pgs_warmstart else 0
+        free_max = self.mf_max_constraints if self.forest.has_free_rigid_bodies else 0
+        # No more lanes a world than its rows' capacity: a world of a few rows takes as few.
+        lanes = max(min(PREPARE_LANES, max(int(self.dense_max_constraints), int(free_max))), 1)
         wp.launch(
             prepare_world_impulses,
-            dim=self.forest.world_count,
+            dim=(self.forest.world_count, lanes),
             inputs=[
                 self.dense_first,
                 self.constraint_count,
                 self.dense_max_constraints,
+                self.mf_constraint_count,
+                self.body_base,
+                free_max,
                 warmstart_flag,
+                lanes,
             ],
             outputs=[self.impulses],
             device=self.model.device,

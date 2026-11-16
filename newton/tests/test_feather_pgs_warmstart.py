@@ -174,12 +174,16 @@ class TestFeatherPGSIdentityWarmstartKernel(unittest.TestCase):
         impulses = wp.array([[1.0, 2.0, 3.0, 4.0]], dtype=wp.float32, device="cpu")
         wp.launch(
             prepare_world_impulses,
-            dim=1,
+            dim=(1, 2),
             inputs=[
                 row_lines("cpu"),
                 wp.array([4], dtype=wp.int32, device="cpu"),
                 4,
+                wp.zeros(1, dtype=wp.int32, device="cpu"),
+                4,
+                0,
                 1,
+                2,
             ],
             outputs=[impulses],
             device="cpu",

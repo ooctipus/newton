@@ -25,16 +25,26 @@ from .row_laws import ROW_CONTACT
 wp.set_module_options({"enable_backward": False})
 
 
+PREPARE_LANES = 32
+"""Lanes a world of :func:`prepare_world_impulses`: they stride over the world's rows, so its stores coalesce."""
+
+
 @wp.kernel
 def prepare_world_impulses(
     dense_first: wp.array[int],
     world_constraint_count: wp.array[int],
     max_constraints: int,
+    free_count: wp.array[int],
+    free_base: int,
+    free_max: int,
     warmstart: int,
+    lanes: int,
     # in/out
     world_impulses: wp.array2d[float],
 ):
-    """Cold-initialize dense rows before identity-gathering contact impulses.
+    """Cold-initialize each world's rows before identity-gathering contact impulses, ``lanes`` lanes a world striding
+    over its rows: the dense rows, then the free bodies' rows (``free_count`` of them from ``free_base``, at most
+    ``free_max``: zero where no free body keeps rows).
 
     No current non-contact row family has a cross-step identity contract:
     limits are activation-allocated, while mimic and link rows can be enabled
@@ -42,20 +52,23 @@ def prepare_world_impulses(
     full capacity before the contact/friction identity gather; cold solves only
     need to clear the current active prefix.
     """
-    world = wp.tid()
+    world, lane = wp.tid()
     line = dense_first[world]
-    m = world_constraint_count[world]
 
     # Cold-started solves consume only the current active prefix. Rows outside
     # that prefix are ignored, and a row that becomes active on a later step is
     # cleared then as part of that step's prefix. Warm-started solves clear full
     # capacity so no inactive cache can survive a later layout growth.
     clear_count = max_constraints
+    free_clear = free_max
     if warmstart == 0:
-        clear_count = m
+        clear_count = world_constraint_count[world]
+        free_clear = wp.min(free_count[world], free_max)
 
-    for i in range(clear_count):
+    for i in range(lane, clear_count, lanes):
         world_impulses[line, i] = 0.0
+    for i in range(lane, free_clear, lanes):
+        world_impulses[line, free_base + i] = 0.0
 
 
 ContactCarry = field_group.struct(
