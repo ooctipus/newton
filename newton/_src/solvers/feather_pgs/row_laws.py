@@ -15,7 +15,8 @@ target and its stabilization. Every row builder and sweep that forms a row's
   penetrating row and the speculative bias of a separated row, at a ``beta``
   :func:`contact_capped_beta` holds to its bodies' depenetration speed;
 * :func:`contact_material_rhs` is a material (compliant) contact normal's law:
-  its spring-dashpot bias and its compliance ``eps``;
+  its spring-dashpot bias and its compliance ``eps``; :func:`authored_contact_law`
+  gives an authored material's spring and dashpot per unit mass (MuJoCo's rule);
 * :func:`contact_restitution_rhs` replaces a closing row's bias by the
   restitution target ``-target + e u`` where :func:`contact_restitution_fires`;
 * :func:`joint_limit_side`, :func:`velocity_limit_active` and :func:`mimic_phi`
@@ -137,6 +138,61 @@ def contact_material_rhs(phi: float, target: float, stiffness: float, damping: f
     """
     denominator = dt * stiffness + wp.where(phi <= 0.0, damping, 0.0)
     return stiffness * phi / denominator - target, 1.0 / (dt * denominator)
+
+
+MATERIAL_TIMECONST = wp.constant(0.02)
+MATERIAL_DAMPRATIO = wp.constant(1.0)
+"""MuJoCo's default solref ``(timeconst [s], dampratio)``: a shape's whose stiffness or damping is not positive."""
+MATERIAL_IMP_MIN = wp.constant(0.9)
+MATERIAL_IMP_MAX = wp.constant(0.95)
+MATERIAL_IMP_WIDTH = wp.constant(0.001)
+MATERIAL_IMP_MID = wp.constant(0.5)
+"""MuJoCo's default solimp ``(dmin, dmax, width [m], midpoint, power 2)``: the impedance over a contact's depth."""
+
+
+@ROW_LAW.law(cuda=False)
+def material_solref(stiffness: float, damping: float) -> wp.vec2:
+    """Return a shape's MuJoCo ``solref`` from its material: ``(2 / kd, kd / (2 sqrt(ke)))``, Newton's conversion for
+    MJWarp (``convert_solref(ke, kd, 1, 1)``), and MuJoCo's default where either value is not positive."""
+    if stiffness > 0.0 and damping > 0.0:
+        return wp.vec2(2.0 / damping, 0.5 * damping / wp.sqrt(stiffness))
+    return wp.vec2(MATERIAL_TIMECONST, MATERIAL_DAMPRATIO)
+
+
+@ROW_LAW.law(cuda=False)
+def material_impedance(phi: float) -> float:
+    """Return MuJoCo's impedance at gap ``phi`` [m] on the default solimp curve: ``dmin`` at contact rising to
+    ``dmax`` at a depth of ``width``, a power-2 sigmoid through the midpoint (``_contact_kbimp``)."""
+    x = wp.min(wp.abs(phi) / MATERIAL_IMP_WIDTH, 1.0)
+    y = 2.0 * x * x
+    if x > MATERIAL_IMP_MID:
+        y = 1.0 - 2.0 * (1.0 - x) * (1.0 - x)
+    return MATERIAL_IMP_MIN + y * (MATERIAL_IMP_MAX - MATERIAL_IMP_MIN)
+
+
+@ROW_LAW.law(cuda=False)
+def authored_contact_law(
+    stiffness_a: float, damping_a: float, stiffness_b: float, damping_b: float, phi: float, dt: float
+) -> tuple[float, float]:
+    """Return an authored material contact's spring ``kappa`` [1/s^2] and dashpot ``beta`` [1/s] per unit effective
+    mass, MuJoCo's soft contact at rest (DECISIONS 11-16, "Authored materials only").
+
+    MuJoCo's pair rule: the mean of the two shapes' :func:`material_solref` (equal solmix, no priority), its time
+    constant at least ``2 dt`` (refsafe). Its row ``k = 1 / (dmax^2 tc^2 dr^2)``, ``b = 2 / (dmax tc)`` with the
+    impedance ``imp`` (:func:`material_impedance`) and regularization ``R = (1 - imp) / imp w`` holds a resting
+    contact at ``f = -(k imp pos + b v) / R``: the spring ``kappa = k imp^2 / (1 - imp)`` and dashpot
+    ``beta = b imp / (1 - imp)`` times the contact's effective mass. The law is the material's normal stiffness,
+    independent of the cone (no pyramid factor). :func:`contact_material_rhs` given ``kappa`` and ``beta`` returns
+    the row's rhs and its relative compliance ``rho``: ``eps = rho d`` on the row's diagonal ``d``.
+    """
+    solref = 0.5 * (material_solref(stiffness_a, damping_a) + material_solref(stiffness_b, damping_b))
+    timeconst = wp.max(solref[0], 2.0 * dt)
+    dampratio = solref[1]
+    k = 1.0 / (MATERIAL_IMP_MAX * MATERIAL_IMP_MAX * timeconst * timeconst * dampratio * dampratio)
+    b = 2.0 / (MATERIAL_IMP_MAX * timeconst)
+    imp = material_impedance(phi)
+    share = imp / (1.0 - imp)
+    return k * imp * share, b * share
 
 
 @ROW_LAW.law
