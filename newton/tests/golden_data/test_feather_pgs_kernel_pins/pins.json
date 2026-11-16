@@ -66,7 +66,7 @@
   "region_sweep.place_regions": "f6ffde2506dd1b84a61aaace39871c06b9ed2e8c4525ab29dce5b00200f7b8a3",
   "region_sweep.reset_bodies": "1625005fbe6addc747279f7a2a65609dec26ad16b25a75498a0277f315c4ee27",
   "region_sweep.stage_blocks": "d8b70002c844b3282619dbcc3e321198a366c6f8ab76a041da5530306c1de02f",
-  "region_sweep.sweep_closed_bodies": "26e5724a91718e665b4c1c19fd2e5b8a2629104d988c119775a224d6ec368fa2",
+  "region_sweep.sweep_closed_bodies": "68dd5a81a8c3bc0012cf4878a9b135c1d7d2fae7f3d5d726d211cec80c6cf5e5",
   "response_builds_rows.store_row_records": "31da8458c0eec9a11ea3280a648b34ec979b76b81c5d53c5a65b003ce499a078",
   "row_kernels.allocate_link_slots": "486e985b17405adbd3051190872d26f2d534932c4b2ecd98f50d915c769c8337",
   "row_kernels.allocate_rigid_velocity_limit_slots": "b0471e72715b84ddeebf34fe2130b57c08fc271f41bd0565cbfdecb3746dcef1",

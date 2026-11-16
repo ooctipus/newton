@@ -167,7 +167,25 @@ def set_start(
 ) -> tuple[wp.vec3, wp.vec3, wp.vec3, wp.vec3, int, int, int, wp.vec3, int, wp.vec3, wp.vec3, wp.vec3, wp.mat33]:
     """The given set's multipliers at ``start`` in the metric ``K = L L^T``; a row whose multiplier is not positive
     leaves the set. Returns the set (its rows, their right-hand sides, their candidates), its multipliers, its size
-    and its factor (:func:`set_basis`, made once and again only after a row leaves)."""
+    and its factor (:func:`set_basis`, made once and again only after a row leaves). An empty set (every candidate of a
+    compliant region) has no factor to make: its rows zero, its factor the identity's."""
+    zero = wp.vec3(0.0, 0.0, 0.0)
+    if n_in == 0:
+        return (
+            a0_in,
+            a1_in,
+            a2_in,
+            ab_in,
+            i0_in,
+            i1_in,
+            i2_in,
+            zero,
+            0,
+            zero,
+            zero,
+            zero,
+            wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0),
+        )
     a0 = a0_in
     a1 = a1_in
     a2 = a2_in
@@ -176,7 +194,6 @@ def set_start(
     i1 = i1_in
     i2 = i2_in
     n = n_in
-    zero = wp.vec3(0.0, 0.0, 0.0)
     mu = zero
     e0, e1, e2, R = set_basis(a0, a1, a2, L, n)
     turn = int(0)
@@ -376,6 +393,7 @@ def region_block(
     # The metric and the start with the closing springs in them: none yet.
     Ks = K
     Ls = Lk
+    factored = int(1)
     ss = start
     S = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
     q = zero
@@ -444,7 +462,12 @@ def region_block(
             q = qs
             shape = wp.inverse(identity + K * S)
             Ks = shape * K
-            Ls = metric_factor(Ks)
+            # The metric's factor serves the rigid set only: formed where a set holds rows, else when a rigid
+            # candidate enters.
+            factored = 0
+            if n > 0:
+                Ls = metric_factor(Ks)
+                factored = 1
             ss = shape * (start - K * q)
             a0, a1, a2, ab, i0, i1, i2, mu, n, e0, e1, e2, R = set_start(ss, Ls, a0, a1, a2, ab, i0, i1, i2, n)
             s = ss + Ks * (a0 * mu[0] + a1 * mu[1] + a2 * mu[2])
@@ -452,6 +475,9 @@ def region_block(
             continue
         if j < 0:
             break
+        if factored == 0:
+            Ls = metric_factor(Ks)
+            factored = 1
         record = cand[j]
         a0, a1, a2, ab, i0, i1, i2, mu, n, s, ended, e0, e1, e2, R = set_enter(
             s, Ls, candidate_row(record), record[2], j, a0, a1, a2, ab, i0, i1, i2, mu, n, e0, e1, e2, R
