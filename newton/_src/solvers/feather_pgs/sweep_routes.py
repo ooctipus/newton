@@ -660,9 +660,11 @@ def region_phase(pad: str = "        ") -> str:
 
     The order is taken by its exact levels (:func:`.region_sweep.level_regions`): a level's regions share no body,
     so the world's lanes visit them at once, and a barrier ends a level; that is the sequential sweep itself. A
-    region's bodies' twists are formed from their walk coordinates through their bases where it is visited. A
-    region's response is the sum of its bodies' (:func:`.region_laws.frame_response`), and its wrench's change
-    returns through their bases.
+    world whose levels hold fewer regions than the colored rule's parallelism (a chain: a tangled pair's regions
+    share both bodies, one a level) is walked by its first lane in the levels' order, a first body's twist kept from
+    one of its regions to the next, as a sequential walk does; the result is the same either way. A region's
+    response is the sum of its bodies' (:func:`.region_laws.frame_response`), and its wrench's change returns
+    through their bases.
 
     The pass rule is exact, by a version a body: the version is raised whenever a bit of the body's walk coordinates
     differs from those its last visit, or its last sweep, left (``body_seen``). A region that holds a wrench and
@@ -705,28 +707,40 @@ if (moved) {{
         push.format(u="u_b", op="-", basis="basis_b", wrench="push_b", first="first_b", version="version_b", f="f_b"),
         "            ",
     )
+    parallelism = repr(float(sweep_units.COLORED_RULE.parallelism))
     text = f"""SYNC();
 {{
     const wp::vec2i region_span = world_regions.data[world];
     const int levels = world_levels.data[world];
+    // The colored rule's measure (sweep_units.COLORED_RULE): a world whose levels hold fewer regions than its
+    // parallelism, a chain, is walked by its first lane in the levels' order, a body's twist kept from one region
+    // to the next of the same body; the others' levels take the lanes. Both are the same order, the same sweep.
+    const bool alone = (float)(region_span[1] - region_span[0]) < {parallelism}f * (float)levels;
+    const int stride = alone ? 1 : STRIDE;
     int level_first = region_span[0];
+    int body = -1, first = 0, version = 0;
+    wp::spatial_vector u;
+    wp::vec3 v, w;
+    const wp::spatial_vector* basis = body_basis.data;
+    const wp::mat33* inertia = body_inertia.data;
     for (int level = 0; level < levels; ++level) {{
     const int level_last = level_end.data[region_span[0] + level];
-    for (int place = level_first + lane; place < level_last; place += STRIDE) {{
+    for (int place = level_first + lane; lane < stride && place < level_last; place += stride) {{
         const int g = level_region.data[place];
         const wp::vec2i sides = reg_body.data[g];
         const int f = sides[0], f_b = sides[1];
-        // The first body: its walk coordinates, its version and its twist.
-        const int first = body_first.data[f];
-        const wp::spatial_vector* const basis = body_basis.data + (size_t)f * 6;
-        const wp::mat33* const inertia = body_inertia.data + (size_t)f * 3;
-        int version = 0;
-        wp::spatial_vector u;
-        {{
+        if (!alone || f != body) {{
+            // The first body: its walk coordinates, its version and its twist.
+            body = f;
+            first = body_first.data[f];
+            basis = body_basis.data + (size_t)f * 6;
+            inertia = body_inertia.data + (size_t)f * 3;
+            {{
 {first_body}
+            }}
+            v = wp::vec3(wp::dot(basis[0], u), wp::dot(basis[1], u), wp::dot(basis[2], u));
+            w = wp::vec3(wp::dot(basis[3], u), wp::dot(basis[4], u), wp::dot(basis[5], u));
         }}
-        wp::vec3 v(wp::dot(basis[0], u), wp::dot(basis[1], u), wp::dot(basis[2], u));
-        wp::vec3 w(wp::dot(basis[3], u), wp::dot(basis[4], u), wp::dot(basis[5], u));
         // A region between two movable bodies: its second body's walk coordinates and version.
         int first_b = -1, version_b = 0;
         wp::spatial_vector u_b;
@@ -838,9 +852,10 @@ if (moved) {{
         reg_stamp.data[g] = version_b;
     }}
     level_first = level_last;
-    SYNC();
+    if (!alone) SYNC();
     }}
-}}"""
+}}
+SYNC();"""
     return indent(text, pad)
 
 
