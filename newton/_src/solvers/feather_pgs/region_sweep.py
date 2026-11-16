@@ -1137,7 +1137,14 @@ class Regions:
             level_regions,
             dim=forest.world_count,
             inputs=[self.world_regions, self.world_free_start, self.world_free, self.reg_body],
-            outputs=[self.body_level, self.reg_level, self.reg_order, self.level_end, self.level_region, self.world_levels],
+            outputs=[
+                self.body_level,
+                self.reg_level,
+                self.reg_order,
+                self.level_end,
+                self.level_region,
+                self.world_levels,
+            ],
             device=device,
         )
 

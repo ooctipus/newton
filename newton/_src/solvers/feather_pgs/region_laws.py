@@ -93,9 +93,7 @@ def set_residual(x: wp.vec3, e0: wp.vec3, e1: wp.vec3) -> tuple[wp.vec3, float, 
 
 
 @REGION_LAW.law
-def set_basis(
-    a0: wp.vec3, a1: wp.vec3, a2: wp.vec3, L: wp.mat33, n: int
-) -> tuple[wp.vec3, wp.vec3, wp.vec3, wp.mat33]:
+def set_basis(a0: wp.vec3, a1: wp.vec3, a2: wp.vec3, L: wp.mat33, n: int) -> tuple[wp.vec3, wp.vec3, wp.vec3, wp.mat33]:
     """The set's ``n`` rows whitened by the metric's factor ``L`` (:func:`metric_factor`) and made orthonormal:
     ``L^T a_k = sum_l R[k, l] e_l`` with ``R`` lower triangular (an unused row: ``e`` zero, ``R``'s row the
     identity's). So ``A K A^T = R R^T`` with ``R`` formed from residuals, never from differences of the rows' Gram
@@ -106,7 +104,7 @@ def set_basis(
     z0 = Lt * a0
     r00 = wp.length(z0)
     e0 = wp.where(n >= 1 and r00 > 0.0, z0 * (1.0 / wp.max(r00, 1.0e-30)), zero)
-    v1, c10, c1z = set_residual(Lt * a1, e0, zero)
+    v1, c10, _c1z = set_residual(Lt * a1, e0, zero)
     r11 = wp.length(v1)
     e1 = wp.where(n >= 2 and r11 > 0.0, v1 * (1.0 / wp.max(r11, 1.0e-30)), zero)
     v2, c20, c21 = set_residual(Lt * a2, e0, e1)
@@ -148,7 +146,7 @@ def set_upper(R: wp.mat33, y: wp.vec3) -> wp.vec3:
 def set_multipliers(a0: wp.vec3, a1: wp.vec3, a2: wp.vec3, L: wp.mat33, n: int, rhs: wp.vec3) -> wp.vec3:
     """``(A K A^T)^-1 rhs`` over the set's ``n`` rows in the metric ``K = L L^T``, as ``R^-T R^-1 rhs``
     (:func:`set_basis`; the unused rows' multipliers zero)."""
-    e0, e1, e2, R = set_basis(a0, a1, a2, L, n)
+    _e0, _e1, _e2, R = set_basis(a0, a1, a2, L, n)
     kept = wp.vec3(wp.where(n >= 1, rhs[0], 0.0), wp.where(n >= 2, rhs[1], 0.0), wp.where(n >= 3, rhs[2], 0.0))
     return set_upper(R, set_lower(R, kept))
 
@@ -249,7 +247,7 @@ def set_enter(
         # row's remainder); its coordinates along them give the multipliers' change d = (A K A^T)^-1 A K aj = R^-T c.
         e0, e1, e2, R = set_basis(a0, a1, a2, L, n)
         part, c0, c1 = set_residual(zj, e0, e1)
-        rest, c2, cz = set_residual(part, e2, wp.vec3(0.0, 0.0, 0.0))
+        rest, c2, _cz = set_residual(part, e2, wp.vec3(0.0, 0.0, 0.0))
         d = set_upper(R, wp.vec3(wp.where(n >= 1, c0, 0.0), wp.where(n >= 2, c1, 0.0), wp.where(n >= 3, c2, 0.0)))
         direction = L * rest
         along = wp.dot(rest, rest)
