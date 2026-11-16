@@ -29,9 +29,19 @@ import warp as wp
 from ...core.contact_pool import ContactField
 from ...geometry.flags import ShapeFlags
 from .contact_input import ContactFrame, ContactInput, contact_frame
-from .device_preludes import dual_native
+from .device_preludes import (
+    dual_native,
+    lane_any,
+    lane_ballot,
+    lane_index,
+    lane_read,
+    lane_scan,
+    lane_stride,
+    lane_sum,
+    lane_sync,
+)
 from .factor.walk import FREE_BODY_WALK, WALK_COORDINATE, WALK_LINK, WalkTrees, walk_down_prelude
-from .friction_patches import PatchRowLaw
+from .friction_patches import PatchRowLaw, patch_friction_location
 from .projection_laws import friction_ball_metric
 from .region_laws import (
     REGION_SLIDE,
@@ -56,6 +66,8 @@ lane's version at the region's last settled visit."""
 FRICTION_ROWS = wp.constant(3)
 """The bits of a region's kind that hold its friction unit's rows (0, 2 or 3)."""
 KIND_SPRINGS = wp.constant(4)
+# The lanes that share a warp's regions' candidates in the fill (fill_regions).
+_FILL_LANES = wp.constant(32)
 """The bit of a region's kind that says a candidate of it is compliant."""
 KIND_SECOND = wp.constant(8)
 """The bit of a region's kind that says its listed body is the pair's second (its twist enters with a minus)."""
@@ -794,7 +806,7 @@ def member_laws(rows: DenseRows, bias: RowBias, data: ContactInput, law: PatchRo
 
 
 @wp.func
-def fill_region(
+def fill_region_head(
     g: int,
     rows: DenseRows,
     bias: RowBias,
@@ -829,15 +841,17 @@ def fill_region(
     reg_k: wp.array[wp.mat33],
     reg_lk: wp.array[wp.mat33],
     reg_lw: wp.array[wp.mat33],
-    cand: wp.array[wp.vec4],
-    cand_row: wp.array[int],
     reg_wrench: wp.array[wp.vec3],
     reg_phi: wp.array[wp.vec3],
     reg_set: wp.array[wp.vec3i],
     reg_spring: wp.array[wp.vec3],
     reg_state: wp.array[int],
 ):
-    """Region ``g`` formed from its world, its candidates' contacts and their places (:func:`fill_regions`)."""
+    """Region ``g`` formed from its world, its candidates' contacts and their places, all but its candidates
+    (:func:`fill_region_member`) and its kind, which it returns with what its candidates read: ``(kind, c0, size, line,
+    source, c, sn, point)``, the first candidate, the candidates, the world's row line, the slot that holds its frame's
+    rows, the contact its frame is, the predictor's normal and friction slips at its friction location, and its
+    frame's point."""
     world = reg_head[g][1]
     line = rows.first[world]
     span = reg_cand[g]
@@ -908,41 +922,12 @@ def fill_region(
     Wnn, C, G, values, vectors, Ginv, K, Lk, Lw = region_terms(
         body_inertia, f0, f1, arm, arm_b, n, t0, t1, mu, mu_t, kind & FRICTION_ROWS, cfm
     )
-    # The candidates: the ring's contacts in its order, each a point on the frame, its compliance [1/kg] the row's
-    # (a material's) or its relative one's share of the candidate's own response a . Wnn a.
-    for k in range(size):
-        cj = cand_contact[c0 + k]
-        j = data.slot[cj]
-        member = frame
-        if j != source:
-            member = contact_frame(data, law, cj)
-            member_laws(rows, bias, data, law, member, cj)
-        lever = wp.cross(member.point - frame.friction_point, n)
-        a1 = wp.dot(lever, t0)
-        a2 = wp.dot(lever, t1)
-        incident = sn[0] + a1 * sn[1] + a2 * sn[2]
-        row_bias(rows, bias, line, j, incident)
-        eps = float(0.0)
-        if bias.material != 0:
-            eps = rows.row_eps[line, j]
-        if eps == 0.0 and bias.weighted != 0:
-            weight = rows.row_w[line, j]
-            if weight < 1.0:
-                eps = -(1.0 / weight - 1.0)
-        if eps < 0.0:
-            row = wp.vec3(1.0, a1, a2)
-            eps = -eps * wp.dot(row, Wnn * row)
-        if eps != 0.0:
-            kind = kind | KIND_SPRINGS
-        cand[c0 + k] = wp.vec4(a1, a2, rows.rhs[line, j] + incident, eps)
-        cand_row[c0 + k] = line * pitch + j
     reg_frame[g] = wp.matrix_from_rows(n, t0, t1)
     reg_arm[g] = arm
     reg_arm_b[g] = arm_b
     reg_body[g] = wp.vec2i(f0, f1)
     reg_law[g] = wp.vec2(mu, mu_t)
     reg_bf[g] = bf
-    reg_kind[g] = kind
     reg_row[g] = friction_row
     reg_ginv[g] = Ginv
     reg_k[g] = K
@@ -958,6 +943,65 @@ def fill_region(
     reg_set[g] = wp.vec3i(-1, -1, -1)
     reg_spring[g] = wp.vec3(0.0, 0.0, 0.0)
     reg_state[g] = REGION_IDLE
+    return kind, c0, size, line, source, c, sn, frame.point
+
+
+@wp.func
+def fill_region_member(
+    g: int,
+    k: int,
+    c0: int,
+    line: int,
+    source: int,
+    c: int,
+    sn: wp.vec3,
+    point: wp.vec3,
+    rows: DenseRows,
+    bias: RowBias,
+    data: ContactInput,
+    law: PatchRowLaw,
+    pitch: int,
+    cand_contact: wp.array[int],
+    reg_frame: wp.array[wp.mat33],
+    reg_wnn: wp.array[wp.mat33],
+    cand: wp.array[wp.vec4],
+    cand_row: wp.array[int],
+) -> bool:
+    """Candidate ``k`` of region ``g`` (:func:`fill_region_head`'s returns): a point on the region's frame (its normal
+    and tangents ``reg_frame[g]``, its friction location contact ``c``'s), its rows' laws where its front end is formed
+    unless its rows are the frame's own (``source``), its rhs at the predictor, and its compliance [1/kg], the row's
+    (a material's) or its relative one's share of the candidate's own response a . Wnn a (``reg_wnn[g]``). Returns
+    whether it is compliant."""
+    basis = reg_frame[g]
+    n = wp.vec3(basis[0, 0], basis[0, 1], basis[0, 2])
+    t0 = wp.vec3(basis[1, 0], basis[1, 1], basis[1, 2])
+    t1 = wp.vec3(basis[2, 0], basis[2, 1], basis[2, 2])
+    friction_point = patch_friction_location(law.patches, c)
+    cj = cand_contact[c0 + k]
+    j = data.slot[cj]
+    member_point = point
+    if j != source:
+        member = contact_frame(data, law, cj)
+        member_laws(rows, bias, data, law, member, cj)
+        member_point = member.point
+    lever = wp.cross(member_point - friction_point, n)
+    a1 = wp.dot(lever, t0)
+    a2 = wp.dot(lever, t1)
+    incident = sn[0] + a1 * sn[1] + a2 * sn[2]
+    row_bias(rows, bias, line, j, incident)
+    eps = float(0.0)
+    if bias.material != 0:
+        eps = rows.row_eps[line, j]
+    if eps == 0.0 and bias.weighted != 0:
+        weight = rows.row_w[line, j]
+        if weight < 1.0:
+            eps = -(1.0 / weight - 1.0)
+    if eps < 0.0:
+        row = wp.vec3(1.0, a1, a2)
+        eps = -eps * wp.dot(row, reg_wnn[g] * row)
+    cand[c0 + k] = wp.vec4(a1, a2, rows.rhs[line, j] + incident, eps)
+    cand_row[c0 + k] = line * pitch + j
+    return eps != 0.0
 
 
 @wp.kernel(enable_backward=False, module="unique")
@@ -1014,17 +1058,82 @@ def fill_regions(
     incident velocity the frame's); its friction rows' right-hand sides are the row law's with the predictor's
     slips and spin. Each member's rows take their laws where its front end is formed (:func:`member_laws`), the
     carrier's first, so the region reads them: the free bodies' writer leaves the regions' rows their kinds alone. It
-    starts holding nothing."""
+    starts holding nothing.
+
+    A region's candidates are the work a region has, 1 to tens of them, and a warp's 32 regions would hold its lanes
+    to its largest: each lane forms its region's frame, terms and records (:func:`fill_region_head`), then the warp
+    deals its regions' candidates over its lanes in order, a candidate a lane (:func:`fill_region_member`), each with
+    its region's values from the region's lane, and the region's lane takes back whether one is compliant."""
     if cursor[3] != 0:
         return
-    for g in range(wp.tid(), cursor[0], threads):
-        fill_region(
-            g, rows, bias, data, law, mf_constraint_count, mf_contact_rows_end, dense_max, mf_max, pitch, cand_contact,
-            art_free, body_twist, body_inertia, cfm, reg_head, reg_cand, reg_frame, reg_arm, reg_arm_b, reg_body, reg_law,
-            reg_bf, reg_kind, reg_row, reg_wnn, reg_wnf, reg_wff, reg_ball_values, reg_ball_vectors, reg_ginv, reg_k, reg_lk, reg_lw, cand,
-            cand_row,
-            reg_wrench, reg_phi, reg_set, reg_spring, reg_state,
-        )  # fmt: skip
+    count = cursor[0]
+    lane = lane_index(_FILL_LANES)
+    stride = lane_stride(_FILL_LANES)
+    g = wp.tid()
+    while lane_any(g < count, _FILL_LANES):
+        holds = g < count
+        kind = int(0)
+        c0 = int(0)
+        size = int(0)
+        line = int(0)
+        source = int(0)
+        c = int(0)
+        sn = wp.vec3(0.0)
+        point = wp.vec3(0.0)
+        if holds:
+            kind, c0, size, line, source, c, sn, point = fill_region_head(
+                g, rows, bias, data, law, mf_constraint_count, mf_contact_rows_end, dense_max, mf_max, pitch,
+                cand_contact, art_free, body_twist, body_inertia, cfm, reg_head, reg_cand, reg_frame, reg_arm, reg_arm_b,
+                reg_body, reg_law, reg_bf, reg_kind, reg_row, reg_wnn, reg_wnf, reg_wff, reg_ball_values,
+                reg_ball_vectors, reg_ginv, reg_k, reg_lk, reg_lw, reg_wrench, reg_phi, reg_set, reg_spring, reg_state,
+            )  # fmt: skip
+        # The candidates of the warp's regions dealt over its lanes in order, a candidate a lane: a warp runs as many
+        # rounds as its regions hold candidates over its lanes, where a region's lane alone ran its largest region's.
+        first = lane_scan(size, _FILL_LANES)
+        total = lane_sum(size, _FILL_LANES)
+        lane_sync(_FILL_LANES)
+        for dealt in range(0, total, stride):
+            q = dealt + lane
+            # The lane whose region holds candidate q: the last whose first candidate is at most q.
+            owner = int(0)
+            span = stride // 2
+            while span > 0:
+                if lane_read(first, owner + span, _FILL_LANES) <= q:
+                    owner = owner + span
+                span = span // 2
+            owner_g = lane_read(g, owner, _FILL_LANES)
+            owner_first = lane_read(first, owner, _FILL_LANES)
+            owner_c0 = lane_read(c0, owner, _FILL_LANES)
+            owner_line = lane_read(line, owner, _FILL_LANES)
+            owner_source = lane_read(source, owner, _FILL_LANES)
+            owner_c = lane_read(c, owner, _FILL_LANES)
+            owner_sn = wp.vec3(
+                lane_read(sn[0], owner, _FILL_LANES),
+                lane_read(sn[1], owner, _FILL_LANES),
+                lane_read(sn[2], owner, _FILL_LANES),
+            )
+            owner_point = wp.vec3(
+                lane_read(point[0], owner, _FILL_LANES),
+                lane_read(point[1], owner, _FILL_LANES),
+                lane_read(point[2], owner, _FILL_LANES),
+            )
+            springs = False
+            if q < total:
+                springs = fill_region_member(
+                    owner_g, q - owner_first, owner_c0, owner_line, owner_source, owner_c, owner_sn, owner_point,
+                    rows, bias, data, law, pitch, cand_contact, reg_frame, reg_wnn, cand, cand_row,
+                )  # fmt: skip
+            spring_bits = wp.uint64(lane_ballot(springs, _FILL_LANES))
+            # This lane's region's candidates in this round are lanes [lo, hi).
+            lo = wp.max(first - dealt, 0)
+            hi = wp.min(first + size - dealt, stride)
+            if lo < hi:
+                mine = (wp.uint64(1) << wp.uint64(hi)) - (wp.uint64(1) << wp.uint64(lo))
+                if (spring_bits & mine) != wp.uint64(0):
+                    kind = kind | KIND_SPRINGS
+        if holds:
+            reg_kind[g] = kind
+        g += threads
 
 
 @wp.kernel(enable_backward=False, module="unique")
