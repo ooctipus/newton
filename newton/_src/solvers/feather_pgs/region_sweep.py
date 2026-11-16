@@ -793,23 +793,88 @@ def level_regions(
     reg_body: wp.array[wp.vec2i],
     body_level: wp.array[int],
     reg_level: wp.array[int],
+    reg_order: wp.array[int],
     level_end: wp.array[int],
     level_region: wp.array[int],
     world_levels: wp.array[int],
 ):
-    """A world's open regions by the exact levels of their order, a thread a world: a region's level is one past the
-    last level of a region before it on either of its bodies, so a level's regions share no body and a sweep that
-    takes the levels in turn, a level's regions at once, is the sequential sweep itself. The world's span
-    ``[s, e)`` of the stream holds the regions by level (``level_region``, in their order within a level) and, at
-    ``s + L``, the end of level ``L`` (``level_end``); ``world_levels`` the count."""
+    """A world's open regions in their order from the free end down (the contact graph's), by the exact levels of
+    that order, a thread a world.
+
+    The order: a body's depth is its distance on the contact graph from the immovable partners (one for a body
+    with a region against one, one more for each region between two movable bodies on the way), a region's the
+    larger of its bodies', and the regions are taken by decreasing depth (a part the graph does not reach comes
+    first), in their stream order within a depth: a cold sweep then carries a pile's weight down to its supports
+    within the sweep, where the order up from the supports carries it one interface a sweep.
+
+    The levels: a region's level is one past the last level of a region before it on either of its bodies, so a
+    level's regions share no body and a sweep that takes the levels in turn, a level's regions at once, is the
+    sequential sweep of the order itself. The world's span ``[s, e)`` of the stream holds the regions by level
+    (``level_region``) and, at ``s + L``, the end of level ``L`` (``level_end``); ``world_levels`` the count."""
     world = wp.tid()
     span = world_regions[world]
     s = span[0]
     e = span[1]
+    if e <= s:
+        world_levels[world] = 0
+        return
+    far = int(1 << 29)
+    # The depths: relaxed over the regions until they stand (each pass takes them in the stream's order).
+    for i in range(world_free_start[world], world_free_start[world + 1]):
+        body_level[world_free[i]] = far
+    for g in range(s, e):
+        sides = reg_body[g]
+        if sides[1] < 0:
+            body_level[sides[0]] = 1
+    changed = int(1)
+    while changed != 0:
+        changed = int(0)
+        for g in range(s, e):
+            sides = reg_body[g]
+            if sides[1] >= 0:
+                a = body_level[sides[0]]
+                b = body_level[sides[1]]
+                if b < far and b + 1 < a:
+                    body_level[sides[0]] = b + 1
+                    changed = 1
+                elif a < far and a + 1 < b:
+                    body_level[sides[1]] = a + 1
+                    changed = 1
+    deepest = int(0)
+    unreached = int(0)
+    for g in range(s, e):
+        sides = reg_body[g]
+        depth = body_level[sides[0]]
+        if sides[1] >= 0:
+            depth = wp.max(depth, body_level[sides[1]])
+        reg_level[g] = depth
+        if depth < far:
+            deepest = wp.max(deepest, depth)
+        else:
+            unreached = 1
+    # By decreasing depth (unreached first), stable: a counting sort on the span's slots. A body at depth d has d
+    # regions on its way down, so the keys (the depths, and the unreached where some are) are at most e - s.
+    top = deepest + unreached
+    for k in range(top):
+        level_end[s + k] = 0
+    for g in range(s, e):
+        reg_level[g] = top - wp.min(reg_level[g], deepest + 1)
+        level_end[s + reg_level[g]] += 1
+    at = s
+    for k in range(top):
+        count = level_end[s + k]
+        level_end[s + k] = at
+        at += count
+    for g in range(s, e):
+        place = level_end[s + reg_level[g]]
+        reg_order[place] = g
+        level_end[s + reg_level[g]] = place + 1
+    # The levels of that order.
     for i in range(world_free_start[world], world_free_start[world + 1]):
         body_level[world_free[i]] = 0
     levels = int(0)
-    for g in range(s, e):
+    for p in range(s, e):
+        g = reg_order[p]
         sides = reg_body[g]
         level = body_level[sides[0]]
         if sides[1] >= 0:
@@ -821,14 +886,15 @@ def level_regions(
         levels = wp.max(levels, level + 1)
     for level in range(levels):
         level_end[s + level] = 0
-    for g in range(s, e):
-        level_end[s + reg_level[g]] += 1
+    for p in range(s, e):
+        level_end[s + reg_level[reg_order[p]]] += 1
     at = s
     for level in range(levels):
         count = level_end[s + level]
         level_end[s + level] = at
         at += count
-    for g in range(s, e):
+    for p in range(s, e):
+        g = reg_order[p]
         place = level_end[s + reg_level[g]]
         level_region[place] = g
         level_end[s + reg_level[g]] = place + 1
@@ -860,6 +926,7 @@ _REGION_FIELDS = (
     ("reg_state", wp.int32, 1),
     ("reg_stamp", wp.int32, 1),
     ("reg_level", wp.int32, 1),
+    ("reg_order", wp.int32, 1),
     ("level_region", wp.int32, 1),
     ("level_end", wp.int32, 1),
 )
@@ -1070,7 +1137,7 @@ class Regions:
             level_regions,
             dim=forest.world_count,
             inputs=[self.world_regions, self.world_free_start, self.world_free, self.reg_body],
-            outputs=[self.body_level, self.reg_level, self.level_end, self.level_region, self.world_levels],
+            outputs=[self.body_level, self.reg_level, self.reg_order, self.level_end, self.level_region, self.world_levels],
             device=device,
         )
 
