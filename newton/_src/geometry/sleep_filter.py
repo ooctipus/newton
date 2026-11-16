@@ -143,13 +143,15 @@ def _join(
         ib = shape_sleep_index[sb]
         if ia[1] < 0 and ib[1] < 0:
             continue
+        a = ia[0] * trees + ia[1]
+        b = ib[0] * trees + ib[1]
+        if a == b and ia[1] >= 0:
+            # Two shapes of one tree join nothing.
+            continue
         if not _overlap(sa, sb, lower, upper):
             continue
         if ia[1] >= 0 and ib[1] >= 0:
-            a = ia[0] * trees + ia[1]
-            b = ib[0] * trees + ib[1]
-            if a != b:
-                _unite(parent, a, b)
+            _unite(parent, a, b)
         elif ia[1] >= 0:
             if ib[1] == UNHELD and _moving(sb, shape_body, body_qd):
                 held_back[ia[0] * trees + ia[1]] = 1
@@ -249,6 +251,10 @@ class SleepFilter:
         self.root = wp.zeros(count, dtype=wp.int32, device=device)
         self.held_back = wp.zeros(count, dtype=wp.int32, device=device)
         self.acted = wp.zeros(count, dtype=wp.int32, device=device)
+        # The pair loops wait on their reads (the boxes, a union-find hop): a thread a candidate pair, up to the
+        # device's full residency.
+        cuda = wp.get_device(device)
+        self.pair_threads = cuda.sm_count * 2048 if cuda.is_cuda else 1 << 16
 
     def apply(self, pairs: wp.array, pair_count: wp.array, lower: wp.array, upper: wp.array, body_qd: wp.array):
         """Decide the pass's sleep and wake from the broad phase's candidate ``pairs`` and the grown boxes
@@ -257,7 +263,7 @@ class SleepFilter:
         islands = int(self.tree_asleep.shape[0]) * self.trees
         if islands == 0:
             return
-        threads = max(1, min(int(pairs.shape[0]), 1 << 16))
+        threads = max(1, min(int(pairs.shape[0]), self.pair_threads))
         device = self.device
         wp.launch(
             _seed,
