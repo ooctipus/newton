@@ -910,37 +910,37 @@ class RowLaws:
     def write_free_bodies(self, solver, state_in: State, contacts: Contacts | None, dt: float) -> None:
         """The free bodies' rows, once their families' slots are reserved (staged with free bodies): one writer over
         their contacts' rows and their speed rows (:func:`.walk_rows.write_free_body_rows`), on its threads at its own
-        line (:data:`.walk_rows.WRITERS`); their counts finalized with status."""
+        line (:data:`.walk_rows.WRITERS`); where their contacts are regions (``Sweep.regions``) the regions' fill
+        writes their contacts' rows and the writer the speed rows alone (:func:`.walk_rows.write_free_body_regions`);
+        their counts finalized with status."""
         placement, model = solver.placement, solver.model
-        # The free bodies' contacts are theirs only where they keep their own run (Placement.free_contact_rows).
-        if _holds_contact_rows(contacts) and placement.free_contact_rows:
-            data = bind_contact_input(solver, state_in, solver.factor, contacts, dt, 1.0)
-            rows = placement.contact_pool.launch_rows()
-        else:
-            # No contact: the writer reads only the count, zero.
-            data, rows = ContactInput(), 0
-            data.count = placement.dummy_contact_count
         speed = placement.rigid_velocity_limit_slot is not None
         speed_bodies = solver.forest.free_rigid_body_count if speed else 0
-        threads = walk_rows.support_threads(rows + speed_bodies, model.device, walk_rows.WRITERS["free_body"])
-        # Where the free bodies' contacts are regions (Sweep.regions) their writer walks no contact row.
-        regions = solver.sweep.regions
-        writer = walk_rows.write_free_body_rows if regions is None else walk_rows.write_free_body_regions
+        tail = (
+            bind_free_bodies(solver) if speed else FreeBodies(),
+            placement.rigid_velocity_limit_slot if speed else placement.dummy_is_free_rigid,
+            speed_bodies,
+        )
+        head = (walk_rows.free_body_sink(solver), bind_dense_rows(placement))
+        if solver.sweep.regions is not None:
+            threads = walk_rows.support_threads(speed_bodies, model.device, walk_rows.WRITERS["free_body"])
+            writer, inputs = walk_rows.write_free_body_regions, [*head, *tail, threads, self.bias(solver.options, dt)]
+        else:
+            # The free bodies' contacts are theirs only where they keep their own run (Placement.free_contact_rows).
+            if _holds_contact_rows(contacts) and placement.free_contact_rows:
+                data = bind_contact_input(solver, state_in, solver.factor, contacts, dt, 1.0)
+                rows = placement.contact_pool.launch_rows()
+            else:
+                # No contact: the writer reads only the count, zero.
+                data, rows = ContactInput(), 0
+                data.count = placement.dummy_contact_count
+            threads = walk_rows.support_threads(rows + speed_bodies, model.device, walk_rows.WRITERS["free_body"])
+            writer = walk_rows.write_free_body_rows
+            inputs = [*head, data, patch_row_law(solver), *tail, threads, self.bias(solver.options, dt)]
         wp.launch(
             writer(model.device.arch),
             dim=threads,
-            inputs=[
-                walk_rows.free_body_sink(solver),
-                bind_dense_rows(placement),
-                data,
-                patch_row_law(solver),
-                bind_free_bodies(solver) if speed else FreeBodies(),
-                placement.rigid_velocity_limit_slot if speed else placement.dummy_is_free_rigid,
-                speed_bodies,
-                threads,
-                self.bias(solver.options, dt),
-                *(() if regions is None else (regions.row_contact,)),
-            ],
+            inputs=inputs,
             block_dim=walk_rows.WRITERS["free_body"].block,
             device=model.device,
         )

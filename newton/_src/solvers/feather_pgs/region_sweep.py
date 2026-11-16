@@ -42,10 +42,10 @@ from .region_laws import (
     region_visit,
     stick_terms,
 )
-from .row_build import contact_row_law
+from .row_build import contact_row_law, write_contact_row
 from .row_kernels import RIGID_SPEED_ROWS, RowBias, row_bias
-from .row_laws import ROW_FRICTION, ROW_TORSION
-from .row_records import DenseRows
+from .row_laws import ROW_CONTACT, ROW_TORSION
+from .row_records import DenseRows, row_sides
 
 REGION_IDLE = wp.constant(-2)
 """A region's state: it holds nothing."""
@@ -472,7 +472,6 @@ def begin_listing(
 @wp.kernel(enable_backward=False, module="unique")
 def check_contacts(
     data: ContactInput,
-    rows: DenseRows,
     threads: int,
     art_free: wp.array[int],
     listed: wp.array[int],
@@ -497,7 +496,7 @@ def check_contacts(
                         if f >= 0:
                             body_touch[f] = 1
             elif data.path[c] == 1:
-                if rows.sides[rows.first[data.world[c]], slot][0] >= 0:
+                if row_sides(data.art0[c], data.art1[c], data.response_dofs)[0] >= 0:
                     candidate = 1
         if candidate != listed[c]:
             relist[0] = 1
@@ -575,15 +574,14 @@ def mark_regions(
         slot = data.slot[c]
         if slot < 0 or data.path[c] != 1:
             continue
-        line = rows.first[data.world[c]]
-        sides = rows.sides[line, slot]
+        sides = row_sides(data.art0[c], data.art1[c], data.response_dofs)
         if sides[0] < 0:
             continue
         f = art_free[sides[0]]
         if sides[1] >= 0:
             body_pair[f] = 1
             body_pair[art_free[sides[1]]] = 1
-        size = ring_head(rows.row_parent, line, slot, mf_max)
+        size = ring_head(rows.row_parent, rows.first[data.world[c]], slot, mf_max)
         if size > 0:
             head_size[c] = size
             wp.atomic_add(body_count, f, 0, 1)
@@ -667,25 +665,23 @@ def place_regions(
     head_size: wp.array[int],
     body_regions: wp.array[wp.vec2i],
     body_count: wp.array2d[int],
-    reg_place: wp.array[wp.vec3i],
+    reg_place: wp.array[wp.vec4i],
 ):
     """Each region's head into a place of its body's (:func:`place_bodies`), in the order its thread arrives
-    (:func:`order_regions` orders them): its row in the store, its size and its body (``reg_place``), where the step
-    lists its regions anew."""
+    (:func:`order_regions` orders them): its row in the store, its size, its body and its contact (``reg_place``),
+    where the step lists its regions anew."""
     if relist[0] == 0:
         return
     for c in range(wp.tid(), data.count[0], threads):
         size = head_size[c]
         if size == 0:
             continue
-        line = rows.first[data.world[c]]
-        slot = data.slot[c]
-        f = art_free[rows.sides[line, slot][0]]
+        f = art_free[row_sides(data.art0[c], data.art1[c], data.response_dofs)[0]]
         span = body_regions[f]
         if span[1] == span[0]:
             continue
         g = span[0] + wp.atomic_add(body_count, f, 2, 1)
-        reg_place[g] = wp.vec3i(line * pitch + slot, size, f)
+        reg_place[g] = wp.vec4i(rows.first[data.world[c]] * pitch + data.slot[c], size, f, c)
 
 
 @wp.kernel(enable_backward=False, module="unique")
@@ -693,14 +689,12 @@ def order_regions(
     relist: wp.array[int],
     cursor: wp.array[int],
     threads: int,
-    rows: DenseRows,
-    pitch: int,
-    dense_max: int,
-    row_contact: wp.array2d[int],
+    data: ContactInput,
+    law: PatchRowLaw,
     body_world: wp.array[int],
     body_regions: wp.array[wp.vec2i],
     body_cand: wp.array[int],
-    reg_place: wp.array[wp.vec3i],
+    reg_place: wp.array[wp.vec4i],
     reg_head: wp.array[wp.vec2i],
     reg_cand: wp.array[wp.vec2i],
     reg_kind: wp.array[int],
@@ -711,8 +705,9 @@ def order_regions(
     striding over them): a region's place is its body's first plus the count of its body's regions whose heads' rows
     come before its own (the order of the world's rows), and its candidates' places follow those regions'
     candidates. It takes its world (``reg_head``), its candidates' places (``reg_cand``), no kind yet, and its
-    candidates: the ring's contacts in the ring's order from its head (``cand_contact``, each ``listed``), which the
-    frame's later steps keep (:func:`fill_regions` finds their rows)."""
+    candidates: the members of its patch the step admits on the free bodies' rows, in the patch's order from its
+    head (the ring the patch link made of their rows), each ``listed`` (``cand_contact``, which the frame's later
+    steps keep: :func:`fill_regions` finds their rows)."""
     if relist[0] == 0 or cursor[3] != 0:
         return
     for g in range(wp.tid(), cursor[0], threads):
@@ -730,13 +725,17 @@ def order_regions(
         reg_head[place] = wp.vec2i(own[0], body_world[f])
         reg_cand[place] = wp.vec2i(at, at + own[1])
         reg_kind[place] = 0
-        line = own[0] / pitch
-        j = own[0] - line * pitch
+        head = own[3]
+        c = head
         for k in range(own[1]):
-            c = row_contact[line, j - dense_max]
             cand_contact[at + k] = c
             listed[c] = 1
-            j = rows.row_parent[line, j]
+            # The patch's next member on the head's rows (the link's rule, :func:`.friction_patches._link_contact`).
+            c = law.patches.next_contact[c]
+            while c >= 0 and c != head:
+                if data.slot[c] >= 0 and data.path[c] == data.path[head] and data.world[c] == data.world[head]:
+                    break
+                c = law.patches.next_contact[c]
 
 
 @wp.func
@@ -778,19 +777,20 @@ def region_terms(
 
 @wp.func
 def member_laws(rows: DenseRows, bias: RowBias, data: ContactInput, law: PatchRowLaw, frame: ContactFrame, c: int):
-    """A region member's rows' laws, contact ``c`` at its front end ``frame``: each row's records by the contact law
-    (:func:`.row_build.contact_row_law`), its friction and spin rows' rhs by the row law (:func:`.row_kernels.row_bias`,
-    no incident velocity: the region's own slips enter where the fill reads them). Its kinds and sides are the free
-    bodies' writer's (:func:`.walk_rows.free_body_region_rows`)."""
+    """A region member's rows, contact ``c`` at its front end ``frame``, as the free bodies' rows hold them: each row's
+    kind (its normal row's parent is the patch link's ring), its records by the contact law
+    (:func:`.row_build.write_contact_row`), its friction and spin rows' rhs by the row law
+    (:func:`.row_kernels.row_bias`, no incident velocity: the region's own slips enter where the fill reads them)."""
     slot = data.slot[c]
     line = rows.first[data.world[c]]
     count = int(1)
     if data.slots_needed[c] >= 3:
         count = data.slots_needed[c]
-    for row in range(count):
-        contact_row_law(data, law, frame, c, row, False)
-        if row > 0:
-            row_bias(rows, bias, line, slot + row, 0.0)
+    rows.row_type[line, slot] = ROW_CONTACT
+    contact_row_law(data, law, frame, c, 0, False)
+    for row in range(1, count):
+        write_contact_row(data, law, frame, c, row, False)
+        row_bias(rows, bias, line, slot + row, 0.0)
 
 
 @wp.func
@@ -846,21 +846,20 @@ def fill_region(
     end = dense_max + wp.min(mf_contact_rows_end[world], wp.min(mf_constraint_count[world], mf_max))
     head = cand_contact[c0]
     r = data.slot[head]
-    sides = rows.sides[line, r]
+    sides = row_sides(data.art0[head], data.art1[head], data.response_dofs)
     f0 = art_free[sides[0]]
     f1 = int(-1)
     if sides[1] >= 0:
         f1 = art_free[sides[1]]
-    # The ring's carrier: the member its friction rows follow, at the rows the step gave the members.
+    # The ring's carrier: the last member the allocation gave friction rows, at the rows the step gave the members.
     carrier = int(-1)
     c = head
     for k in range(size):
         cj = cand_contact[c0 + k]
         j = data.slot[cj]
-        if j + 1 < end:
-            if rows.row_type[line, j + 1] == ROW_FRICTION and rows.row_parent[line, j + 1] == j:
-                carrier = j
-                c = cj
+        if j + 1 < end and data.slots_needed[cj] >= 3:
+            carrier = j
+            c = cj
     source = r
     if carrier >= 0:
         source = carrier
@@ -1483,7 +1482,7 @@ def level_regions(
 _REGION_FIELDS = (
     ("head_size", wp.int32, 1),
     ("listed", wp.int32, 1),
-    ("reg_place", wp.vec3i, 1),
+    ("reg_place", wp.vec4i, 1),
     ("reg_head", wp.vec2i, 1),
     ("reg_frame", wp.mat33, 1),
     ("reg_arm", wp.vec3, 1),
@@ -1598,8 +1597,6 @@ class Regions:
         words = STAGE_WORDS if self.blocks else 1
         self.blk_stage = wp.zeros(words, dtype=wp.float32, device=device)
         self.blk_istage = wp.zeros(words, dtype=wp.int32, device=device)
-        lines = int(placement.impulses.shape[0])
-        self.row_contact = wp.zeros((lines, int(placement.mf_max_constraints)), dtype=wp.int32, device=device)
         self.capacity = 0
         # The stream's capacity on the device: the pool's ready rows, which follow its growth between captures.
         self.ready = placement.contact_pool.ready_rows
@@ -1678,7 +1675,7 @@ class Regions:
         pool.launch(
             check_contacts,
             threads,
-            inputs=[data, rows, threads, self.art_free, self.listed],
+            inputs=[data, threads, self.art_free, self.listed],
             outputs=[self.body_touch, self.relist],
             **live,
         )
@@ -1737,10 +1734,8 @@ class Regions:
                 self.relist,
                 self.cursor,
                 threads,
-                rows,
-                pitch,
-                dense_max,
-                self.row_contact,
+                data,
+                patch_row_law(solver),
                 self.body_world,
                 self.body_regions,
                 self.body_cand,

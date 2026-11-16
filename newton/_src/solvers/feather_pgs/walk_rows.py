@@ -72,7 +72,6 @@ from .row_records import (
     UNIT_VELOCITY,
     DenseRows,
     RowSupport,
-    row_sides,
     unit_source,
 )
 from .sparse_mass_matrix import _SparseRowSupport
@@ -1775,29 +1774,6 @@ def free_body_contact_rows(sink: RowSink, rows: DenseRows, data: ContactInput, l
 
 
 @wp.func
-def free_body_region_rows(
-    rows: DenseRows, data: ContactInput, law: PatchRowLaw, row_contact: wp.array2d[int], base: int, c: int
-):
-    """Contact ``c``'s kinds where the allocation routed it to the free bodies (``path`` 1) and their contacts are
-    regions (:mod:`.region_sweep`): no row is walked, and its laws are the regions' fill's. Each of its rows takes its
-    kind (:func:`.row_build.contact_row_kind`: what the patch link and the listing read) and its sides, and its normal
-    row's slot names the contact (``row_contact``, from the free bodies' first row ``base``): the regions' listing
-    forms the candidate there and writes its rows' laws (:func:`.region_sweep.fill_regions`)."""
-    slot = data.slot[c]
-    if data.path[c] != 1 or slot < 0:
-        return
-    line = rows.first[data.world[c]]
-    count = int(1)
-    if data.slots_needed[c] >= 3:
-        count = data.slots_needed[c]
-    sides = row_sides(data.art0[c], data.art1[c], data.response_dofs)
-    for row in range(count):
-        contact_row_kind(data, law, ContactFrame(), c, row, False)
-        rows.sides[line, slot + row] = sides
-    row_contact[line, slot - base] = c
-
-
-@wp.func
 def speed_axis(sink: RowSink, line: int, slot: int, art: int, dof: int) -> float:
     """A speed row's epilogue, after its seed's walk gave its diagonal ``|L^-1 P e_k|^2 + cfm``: its ``Z`` holds the
     axis it bounds unwhitened (``e_k`` at the entry of its side's coordinate ``k``, every other entry zero), and its
@@ -1874,27 +1850,21 @@ def write_free_body_rows(device_arch) -> wp.Kernel:
 
 @cache
 def write_free_body_regions(device_arch) -> wp.Kernel:
-    """:func:`write_free_body_rows` where the free bodies' contacts are regions: the contacts' records
-    (:func:`free_body_region_rows`, no walk), then the free bodies' speed rows as rows (:func:`free_body_speed_rows`)."""
+    """:func:`write_free_body_rows` where the free bodies' contacts are regions: their rows are the regions' fill's
+    (:func:`.region_sweep.fill_regions`), so ``threads`` lanes stride over the ``speed_bodies`` free rigid bodies'
+    speed rows alone (:func:`free_body_speed_rows`)."""
 
     def kernel(
         sink: RowSink,
         rows: DenseRows,
-        data: ContactInput,
-        law: PatchRowLaw,
         bodies: FreeBodies,
         speed_slot: wp.array[int],
         speed_bodies: int,
         threads: int,
         bias: RowBias,
-        row_contact: wp.array2d[int],
     ):
-        contacts = data.count[0]
-        for item in range(wp.tid(), contacts + speed_bodies, threads):
-            if item < contacts:
-                free_body_region_rows(rows, data, law, row_contact, sink.base, item)
-            else:
-                free_body_speed_rows(bodies, rows, sink, speed_slot, bias, item - contacts)
+        for item in range(wp.tid(), speed_bodies, threads):
+            free_body_speed_rows(bodies, rows, sink, speed_slot, bias, item)
 
     return python_kernel(kernel, "write_free_body_regions", launch_bounds=WRITERS["free_body"].bounds(device_arch))
 

@@ -1934,6 +1934,8 @@ def _link_contact(
     """
     row = patches.next_contact[c]
     if row < 0:
+        # No patch: the normal row is its own ring's.
+        parents[first[world[c]], slot[c]] = -1
         return
     next_slot = slot[c]
     while row != c:
