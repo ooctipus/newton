@@ -16638,6 +16638,8 @@ class ModelBuilder:
             m._texture_sdf_coarse_textures = compact_texture_sdf_coarse_textures
             m._texture_sdf_subgrid_textures = compact_texture_sdf_subgrid_textures
             m._texture_sdf_subgrid_start_slots = compact_texture_sdf_subgrid_start_slots
+            # The packed structs hold device addresses only: the records own what they address.
+            m._texture_sdf_records = compact_texture_sdf_data
 
             # ---------------------
             # heightfield collision data

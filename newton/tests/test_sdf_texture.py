@@ -9,6 +9,7 @@ gradient quality, extrapolation, array indexing, and multi-resolution behavior.
 Note: These tests require GPU (CUDA) since wp.Texture3D only supports CUDA devices.
 """
 
+import gc
 import unittest
 
 import numpy as np
@@ -1000,6 +1001,34 @@ def test_texture_sdf_in_model(test, device):
     test.assertEqual(len(model._texture_sdf_subgrid_textures), 2)
 
 
+def test_texture_sdf_model_owns_cell_lower(test, device):
+    """The tables the model's packed SDF structs address stay the model's: later arrays do not take their memory.
+
+    A box's SDF record is made inside ``finalize()``. The packed struct holds only the address of its
+    ``cell_lower`` table, so unless the model owns the record the table is freed with it and the memory pool
+    hands its block to the next array of its size, while the collision kernels keep reading it.
+    """
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    body = builder.add_body()
+    builder.add_shape_box(body, hx=0.1, hy=0.2, hz=0.3, cfg=newton.ModelBuilder.ShapeConfig(sdf_max_resolution=16))
+    model = builder.finalize(device=device)
+    gc.collect()
+    wp.synchronize_device(device)
+
+    packed = model._texture_sdf_data.numpy()[0]["cell_lower"]
+    shape = tuple(int(n) for n in packed["shape"][: int(packed["ndim"])])
+    test.assertEqual(len(shape), 4)
+    table = wp.array(ptr=int(packed["data"]), shape=shape, dtype=float, device=device)
+    before = table.numpy().copy()
+    test.assertTrue(np.isfinite(before).all())
+
+    # Arrays of the table's size take every block of that size the pool has free.
+    claimed = [wp.full(shape, 3.0e38, dtype=float, device=device) for _ in range(64)]
+    wp.synchronize_device(device)
+    np.testing.assert_array_equal(table.numpy(), before)
+    del claimed
+
+
 @wp.kernel(enable_backward=False)
 def _cell_lower_margin_kernel(sdf: TextureSDFData, points: wp.array[wp.vec3], margin: wp.array[float]):
     tid = wp.tid()
@@ -1947,6 +1976,12 @@ def test_texture_sdf_sign_mode_normal_open_mesh(test, device):
 # Register tests for CUDA devices
 devices = get_cuda_test_devices()
 add_function_test(TestTextureSDF, "test_texture_sdf_construction", test_texture_sdf_construction, devices=devices)
+add_function_test(
+    TestTextureSDF,
+    "test_texture_sdf_model_owns_cell_lower",
+    test_texture_sdf_model_owns_cell_lower,
+    devices=devices,
+)
 add_function_test(
     TestTextureSDF,
     "test_texture_sdf_cell_lower_bounds_hardware_samples",

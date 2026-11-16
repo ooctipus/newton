@@ -1416,6 +1416,10 @@ class Model:
         """Subgrid 3D textures matching _texture_sdf_data by index. Kept for reference counting."""
         self._texture_sdf_subgrid_start_slots: list = []
         """Subgrid start slot arrays matching _texture_sdf_data by index. Kept for reference counting."""
+        self._texture_sdf_records: list = []
+        """The :class:`~newton._src.geometry.sdf_texture.TextureSDFData` records packed into _texture_sdf_data,
+        by index. The packed structs hold device addresses only; the records own every array and texture those
+        address (the cluster cull's ``cell_lower`` tables among them) for the model's lifetime."""
 
         # Local AABB and voxel grid for contact reduction
         # Note: These are stored in Model (not Contacts) because they are static geometry properties
