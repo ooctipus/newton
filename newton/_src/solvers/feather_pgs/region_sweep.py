@@ -395,22 +395,17 @@ def ring_head(parent: wp.array2d[int], line: int, row: int, limit: int) -> int:
 
 
 @wp.kernel(enable_backward=False, module="unique")
-def list_regions(
+def index_regions(
     rows: DenseRows,
-    bias: RowBias,
-    data: ContactInput,
-    law: PatchRowLaw,
     constraint_count: wp.array[int],
     mf_constraint_count: wp.array[int],
     mf_contact_rows_end: wp.array[int],
     dense_max: int,
     mf_max: int,
     pitch: int,
-    row_contact: wp.array2d[int],
     world_free_start: wp.array[int],
     world_free: wp.array[int],
     art_free: wp.array[int],
-    body_twist: wp.array[wp.spatial_vector],
     capacity: int,
     cursor: wp.array[int],
     body_open: wp.array[int],
@@ -418,38 +413,25 @@ def list_regions(
     body_regions: wp.array[wp.vec2i],
     lanes: wp.array[int],
     world_regions: wp.array[wp.vec2i],
-    reg_frame: wp.array[wp.mat33],
-    reg_arm: wp.array[wp.vec3],
-    reg_arm_b: wp.array[wp.vec3],
-    reg_body: wp.array[wp.vec2i],
+    reg_head: wp.array[wp.vec2i],
     reg_cand: wp.array[wp.vec2i],
-    reg_law: wp.array[wp.vec2],
-    reg_bf: wp.array[wp.vec3],
-    reg_kind: wp.array[int],
-    reg_row: wp.array[int],
-    cand: wp.array[wp.vec4],
-    cand_row: wp.array[int],
-    reg_wrench: wp.array[wp.vec3],
-    reg_phi: wp.array[wp.vec3],
-    reg_set: wp.array[wp.vec3i],
-    reg_spring: wp.array[wp.vec3],
     reg_state: wp.array[int],
     impulses: wp.array2d[float],
 ):
-    """A world's regions listed as the sweeps read them, one thread a world (the rows' rings are walked in order).
+    """A world's regions placed in the stream, one thread a world (the rows' rings are walked in order; only the
+    rows' kinds, parents and sides are read).
 
     A region is a ring of the free bodies' normal rows (the patch link's, :mod:`.friction_patches`) with the
     friction rows of the ring's carrier, headed by its lowest row; the regions follow each other by their heads.
     A free body is *open* when a dense row, a speed row or a region between two movable bodies touches it, else
-    *closed*. The regions' stream (``reg_*``, their candidates ``cand``) holds a world's closed bodies' regions
-    body by body (``body_regions``; each such body a lane of ``lanes``, counted in ``cursor[2]``), then its open
-    regions in their order (``world_regions``). The stream's places are taken from ``cursor`` as worlds arrive:
-    they decide no result. A world whose regions do not fit ``capacity`` lists none and sets ``cursor[3]``.
+    *closed*. The regions' stream holds a world's closed bodies' regions body by body (``body_regions``; each such
+    body a lane of ``lanes``, counted in ``cursor[2]``), then its open regions in their order (``world_regions``).
+    The stream's places are taken from ``cursor`` as worlds arrive: they decide no result. A world whose regions do
+    not fit ``capacity`` lists none and sets ``cursor[3]``.
 
-    A region's frame is its carrier's (its head's without one): the contact's normal, the tangent pair every
-    friction row uses for it, at the region's friction location. Its candidates are the ring's contacts, each a
-    point on that frame with the row law's right-hand side at the predictor (:func:`.row_kernels.row_bias`, the
-    incident velocity the frame's)."""
+    Each region takes its head (its row in the store and its world, ``reg_head``), its candidates' places
+    (``reg_cand``) and the state of a region not yet filled; :func:`fill_regions` forms the rest, a thread a
+    region."""
     world = wp.tid()
     line = rows.first[world]
     world_regions[world] = wp.vec2i(0, 0)
@@ -532,108 +514,162 @@ def list_regions(
         size = ring_head(rows.row_parent, line, r, mf_max)
         if size == 0:
             continue
-        sides = rows.sides[line, r]
-        f0 = art_free[sides[0]]
-        f1 = int(-1)
-        if sides[1] >= 0:
-            f1 = art_free[sides[1]]
+        f = art_free[rows.sides[line, r][0]]
         g = region_at
         c0 = candidate_at
-        if body_open[f0] == 0:
-            at = body_cursor[f0]
+        if body_open[f] == 0:
+            at = body_cursor[f]
             g = at[0]
             c0 = at[1]
-            body_cursor[f0] = wp.vec2i(g + 1, c0 + size)
+            body_cursor[f] = wp.vec2i(g + 1, c0 + size)
         else:
             region_at += 1
             candidate_at += size
-        # The ring's carrier: the member its friction rows follow.
-        carrier = int(-1)
-        j = r
-        for _ in range(size):
-            if j + 1 < end:
-                if rows.row_type[line, j + 1] == ROW_FRICTION and rows.row_parent[line, j + 1] == j:
-                    carrier = j
-            j = rows.row_parent[line, j]
-        source = r
-        if carrier >= 0:
-            source = carrier
-        c = row_contact[line, source - dense_max]
-        frame = contact_frame(data, law, c)
-        n = frame.normal
-        t0 = frame.tangent0
-        t1 = frame.tangent1
-        arm = frame.friction_point - data.origin[sides[0]]
-        arm_b = wp.vec3(0.0, 0.0, 0.0)
-        # The pair's first body (the rows' positive side) is the region's first side, or its second.
-        sign = float(1.0)
-        if data.art0[c] != sides[0]:
-            sign = -1.0
-        twist = body_twist[f0]
-        sn, sf = frame_twist(wp.spatial_top(twist), wp.spatial_bottom(twist), arm, n, t0, t1)
-        sn = sn * sign
-        sf = sf * sign
-        if f1 >= 0:
-            arm_b = frame.friction_point - data.origin[sides[1]]
-            twist_b = body_twist[f1]
-            sn_b, sf_b = frame_twist(wp.spatial_top(twist_b), wp.spatial_bottom(twist_b), arm_b, n, t0, t1)
-            sn = sn - sn_b * sign
-            sf = sf - sf_b * sign
-        kind = int(0)
-        mu = float(0.0)
-        mu_t = float(0.0)
-        bf = wp.vec3(0.0, 0.0, 0.0)
-        friction_row = int(-1)
-        if carrier >= 0:
-            mu = rows.row_mu[line, carrier + 1]
-            bf = wp.vec3(rows.rhs[line, carrier + 1] + sf[0], rows.rhs[line, carrier + 2] + sf[1], 0.0)
-            unit_rows = int(2)
-            if carrier + 3 < end:
-                if rows.row_type[line, carrier + 3] == ROW_TORSION and rows.row_parent[line, carrier + 3] == carrier:
-                    unit_rows = 3
-                    mu_t = rows.row_mu[line, carrier + 3]
-                    bf = wp.vec3(bf[0], bf[1], rows.rhs[line, carrier + 3] + sf[2])
-            if mu > 0.0:
-                kind = unit_rows
-                friction_row = line * pitch + carrier + 1
-        if sign < 0.0:
-            kind = kind | KIND_SECOND
-        # The candidates: the ring's contacts in its order, each a point on the frame.
-        j = r
-        for k in range(size):
-            cj = row_contact[line, j - dense_max]
-            member = contact_frame(data, law, cj)
-            lever = wp.cross(member.point - frame.friction_point, n)
-            a1 = wp.dot(lever, t0)
-            a2 = wp.dot(lever, t1)
-            incident = sn[0] + a1 * sn[1] + a2 * sn[2]
-            row_bias(rows, bias, line, j, incident)
-            eps = float(0.0)
-            if bias.material != 0:
-                eps = rows.row_eps[line, j]
-            if eps == 0.0 and bias.weighted != 0:
-                weight = rows.row_w[line, j]
-                if weight < 1.0:
-                    eps = -(1.0 / weight - 1.0)
-            if eps != 0.0:
-                kind = kind | KIND_SPRINGS
-            cand[c0 + k] = wp.vec4(a1, a2, rows.rhs[line, j] + incident, eps)
-            cand_row[c0 + k] = line * pitch + j
-            j = rows.row_parent[line, j]
-        reg_frame[g] = wp.matrix_from_rows(n, t0, t1)
-        reg_arm[g] = arm
-        reg_arm_b[g] = arm_b
-        reg_body[g] = wp.vec2i(f0, f1)
+        reg_head[g] = wp.vec2i(line * pitch + r, world)
         reg_cand[g] = wp.vec2i(c0, c0 + size)
-        reg_law[g] = wp.vec2(mu, mu_t)
-        reg_bf[g] = bf
-        reg_kind[g] = kind
-        reg_row[g] = friction_row
-        reg_wrench[g] = wp.vec3(0.0, 0.0, 0.0)
-        reg_phi[g] = wp.vec3(0.0, 0.0, 0.0)
-        reg_set[g] = wp.vec3i(-1, -1, -1)
-        reg_spring[g] = wp.vec3(0.0, 0.0, 0.0)
         reg_state[g] = REGION_IDLE
+
+
+@wp.kernel(enable_backward=False, module="unique")
+def fill_regions(
+    rows: DenseRows,
+    bias: RowBias,
+    data: ContactInput,
+    law: PatchRowLaw,
+    mf_constraint_count: wp.array[int],
+    mf_contact_rows_end: wp.array[int],
+    dense_max: int,
+    mf_max: int,
+    pitch: int,
+    row_contact: wp.array2d[int],
+    art_free: wp.array[int],
+    body_twist: wp.array[wp.spatial_vector],
+    cursor: wp.array[int],
+    reg_head: wp.array[wp.vec2i],
+    reg_cand: wp.array[wp.vec2i],
+    reg_frame: wp.array[wp.mat33],
+    reg_arm: wp.array[wp.vec3],
+    reg_arm_b: wp.array[wp.vec3],
+    reg_body: wp.array[wp.vec2i],
+    reg_law: wp.array[wp.vec2],
+    reg_bf: wp.array[wp.vec3],
+    reg_kind: wp.array[int],
+    reg_row: wp.array[int],
+    cand: wp.array[wp.vec4],
+    cand_row: wp.array[int],
+    reg_wrench: wp.array[wp.vec3],
+    reg_phi: wp.array[wp.vec3],
+    reg_set: wp.array[wp.vec3i],
+    reg_spring: wp.array[wp.vec3],
+):
+    """The regions :func:`index_regions` placed, formed a thread a region (the first ``cursor[0]`` of the stream).
+
+    A region's frame is its carrier's (its head's without one): the contact's normal, the tangent pair every
+    friction row uses for it, at the region's friction location. Its candidates are the ring's contacts, each a
+    point on that frame with the row law's right-hand side at the predictor (:func:`.row_kernels.row_bias`, the
+    incident velocity the frame's); its friction rows' right-hand sides are the row law's with the predictor's
+    slips and spin. It starts holding nothing."""
+    g = wp.tid()
+    if g >= cursor[0] or cursor[3] != 0:
+        return
+    head = reg_head[g]
+    world = head[1]
+    line = head[0] / pitch
+    r = head[0] - line * pitch
+    span = reg_cand[g]
+    c0 = span[0]
+    size = span[1] - span[0]
+    end = dense_max + wp.min(mf_contact_rows_end[world], wp.min(mf_constraint_count[world], mf_max))
+    sides = rows.sides[line, r]
+    f0 = art_free[sides[0]]
+    f1 = int(-1)
+    if sides[1] >= 0:
+        f1 = art_free[sides[1]]
+    # The ring's carrier: the member its friction rows follow.
+    carrier = int(-1)
+    j = r
+    for _ in range(size):
+        if j + 1 < end:
+            if rows.row_type[line, j + 1] == ROW_FRICTION and rows.row_parent[line, j + 1] == j:
+                carrier = j
+        j = rows.row_parent[line, j]
+    source = r
+    if carrier >= 0:
+        source = carrier
+    c = row_contact[line, source - dense_max]
+    frame = contact_frame(data, law, c)
+    n = frame.normal
+    t0 = frame.tangent0
+    t1 = frame.tangent1
+    arm = frame.friction_point - data.origin[sides[0]]
+    arm_b = wp.vec3(0.0, 0.0, 0.0)
+    # The pair's first body (the rows' positive side) is the region's first side, or its second.
+    sign = float(1.0)
+    if data.art0[c] != sides[0]:
+        sign = -1.0
+    twist = body_twist[f0]
+    sn, sf = frame_twist(wp.spatial_top(twist), wp.spatial_bottom(twist), arm, n, t0, t1)
+    sn = sn * sign
+    sf = sf * sign
+    if f1 >= 0:
+        arm_b = frame.friction_point - data.origin[sides[1]]
+        twist_b = body_twist[f1]
+        sn_b, sf_b = frame_twist(wp.spatial_top(twist_b), wp.spatial_bottom(twist_b), arm_b, n, t0, t1)
+        sn = sn - sn_b * sign
+        sf = sf - sf_b * sign
+    kind = int(0)
+    mu = float(0.0)
+    mu_t = float(0.0)
+    bf = wp.vec3(0.0, 0.0, 0.0)
+    friction_row = int(-1)
+    if carrier >= 0:
+        mu = rows.row_mu[line, carrier + 1]
+        bf = wp.vec3(rows.rhs[line, carrier + 1] + sf[0], rows.rhs[line, carrier + 2] + sf[1], 0.0)
+        unit_rows = int(2)
+        if carrier + 3 < end:
+            if rows.row_type[line, carrier + 3] == ROW_TORSION and rows.row_parent[line, carrier + 3] == carrier:
+                unit_rows = 3
+                mu_t = rows.row_mu[line, carrier + 3]
+                bf = wp.vec3(bf[0], bf[1], rows.rhs[line, carrier + 3] + sf[2])
+        if mu > 0.0:
+            kind = unit_rows
+            friction_row = line * pitch + carrier + 1
+    if sign < 0.0:
+        kind = kind | KIND_SECOND
+    # The candidates: the ring's contacts in its order, each a point on the frame.
+    j = r
+    for k in range(size):
+        cj = row_contact[line, j - dense_max]
+        member = contact_frame(data, law, cj)
+        lever = wp.cross(member.point - frame.friction_point, n)
+        a1 = wp.dot(lever, t0)
+        a2 = wp.dot(lever, t1)
+        incident = sn[0] + a1 * sn[1] + a2 * sn[2]
+        row_bias(rows, bias, line, j, incident)
+        eps = float(0.0)
+        if bias.material != 0:
+            eps = rows.row_eps[line, j]
+        if eps == 0.0 and bias.weighted != 0:
+            weight = rows.row_w[line, j]
+            if weight < 1.0:
+                eps = -(1.0 / weight - 1.0)
+        if eps != 0.0:
+            kind = kind | KIND_SPRINGS
+        cand[c0 + k] = wp.vec4(a1, a2, rows.rhs[line, j] + incident, eps)
+        cand_row[c0 + k] = line * pitch + j
+        j = rows.row_parent[line, j]
+    reg_frame[g] = wp.matrix_from_rows(n, t0, t1)
+    reg_arm[g] = arm
+    reg_arm_b[g] = arm_b
+    reg_body[g] = wp.vec2i(f0, f1)
+    reg_law[g] = wp.vec2(mu, mu_t)
+    reg_bf[g] = bf
+    reg_kind[g] = kind
+    reg_row[g] = friction_row
+    reg_wrench[g] = wp.vec3(0.0, 0.0, 0.0)
+    reg_phi[g] = wp.vec3(0.0, 0.0, 0.0)
+    reg_set[g] = wp.vec3i(-1, -1, -1)
+    reg_spring[g] = wp.vec3(0.0, 0.0, 0.0)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -641,6 +677,7 @@ def list_regions(
 # ---------------------------------------------------------------------------------------------------------------------
 
 _REGION_FIELDS = (
+    ("reg_head", wp.vec2i, 1),
     ("reg_frame", wp.mat33, 1),
     ("reg_arm", wp.vec3, 1),
     ("reg_arm_b", wp.vec3, 1),
@@ -693,6 +730,7 @@ class Regions:
         self.art_free = wp.array(art_free, dtype=wp.int32, device=device)
         self.world_free = wp.array(order if count else np.zeros(1, dtype=np.int32), dtype=wp.int32, device=device)
         self.world_free_start = wp.array(start, dtype=wp.int32, device=device)
+        self.body_world = wp.array(world if count else np.zeros(0, dtype=np.int32), dtype=wp.int32, device=device)
         self.body_first = wp.array(offsets[free_art], dtype=wp.int32, device=device)
         self.body_dof = wp.array(
             np.asarray(forest.articulation_dof_start_host)[free_art], dtype=wp.int32, device=device
@@ -721,7 +759,8 @@ class Regions:
 
     def list(self, solver, state_in, contacts, dt: float) -> None:
         """The step's regions, once the rows' records are written and the patch link made their rings: each free
-        body's basis (:func:`free_body_basis`), then each world's regions (:func:`list_regions`)."""
+        body's basis (:func:`free_body_basis`), then each world's regions placed (:func:`index_regions`) and formed
+        (:func:`fill_regions`)."""
         from .contact_input import bind as bind_contact_input  # noqa: PLC0415
         from .friction_patches import patch_row_law  # noqa: PLC0415
         from .row_records import bind as bind_dense_rows  # noqa: PLC0415
@@ -738,25 +777,20 @@ class Regions:
             outputs=[self.body_basis, self.body_inertia, self.body_twist],
             device=device,
         )
+        rows, bias = bind_dense_rows(placement), solver.laws.bias(self.options, dt)
+        counts = [placement.mf_constraint_count, placement.mf_contact_rows_end]
+        sizes = [int(placement.dense_max_constraints), int(placement.mf_max_constraints), int(placement.row_pitch)]
         wp.launch(
-            list_regions,
+            index_regions,
             dim=forest.world_count,
             inputs=[
-                bind_dense_rows(placement),
-                solver.laws.bias(self.options, dt),
-                bind_contact_input(solver, state_in, self.factor, contacts, dt, 1.0),
-                patch_row_law(solver),
+                rows,
                 placement.constraint_count,
-                placement.mf_constraint_count,
-                placement.mf_contact_rows_end,
-                int(placement.dense_max_constraints),
-                int(placement.mf_max_constraints),
-                int(placement.row_pitch),
-                self.row_contact,
+                *counts,
+                *sizes,
                 self.world_free_start,
                 self.world_free,
                 self.art_free,
-                self.body_twist,
                 self.capacity,
             ],
             outputs=[
@@ -766,11 +800,36 @@ class Regions:
                 self.body_regions,
                 self.lanes,
                 self.world_regions,
+                self.reg_head,
+                self.reg_cand,
+                self.reg_state,
+                placement.impulses,
+            ],
+            device=device,
+        )
+        # A thread a region of the stream: no step holds more regions than the pool's launch rows.
+        wp.launch(
+            fill_regions,
+            dim=min(self.capacity, placement.contact_pool.launch_rows()),
+            inputs=[
+                rows,
+                bias,
+                bind_contact_input(solver, state_in, self.factor, contacts, dt, 1.0),
+                patch_row_law(solver),
+                *counts,
+                *sizes,
+                self.row_contact,
+                self.art_free,
+                self.body_twist,
+                self.cursor,
+                self.reg_head,
+                self.reg_cand,
+            ],
+            outputs=[
                 self.reg_frame,
                 self.reg_arm,
                 self.reg_arm_b,
                 self.reg_body,
-                self.reg_cand,
                 self.reg_law,
                 self.reg_bf,
                 self.reg_kind,
@@ -781,8 +840,6 @@ class Regions:
                 self.reg_phi,
                 self.reg_set,
                 self.reg_spring,
-                self.reg_state,
-                placement.impulses,
             ],
             device=device,
         )
@@ -828,8 +885,161 @@ class Regions:
             device=self.model.device,
         )
 
+    def audit(self, coordinates: wp.array, velocity: wp.array) -> None:
+        """The regions' rows' velocity terms at the published velocity (its walk coordinates ``coordinates``) into the
+        audit's free rows' terms ``velocity`` (:func:`audit_regions`), with the candidates' diagonals."""
+        placement = self.placement
+        wp.launch(
+            audit_regions,
+            dim=self.count + int(self.forest.world_count),
+            inputs=[
+                self.count,
+                self.body_world,
+                self.body_open,
+                self.body_regions,
+                self.world_regions,
+                int(placement.row_pitch),
+                int(placement.body_base),
+                coordinates,
+                self.body_first,
+                self.body_basis,
+                self.body_inertia,
+                self.reg_frame,
+                self.reg_arm,
+                self.reg_arm_b,
+                self.reg_body,
+                self.reg_cand,
+                self.reg_kind,
+                self.reg_row,
+                self.cand,
+                self.cand_row,
+            ],
+            outputs=[placement.diag, velocity],
+            device=self.model.device,
+        )
+
     def operands(self) -> dict:
         """The stream as the general sweep's region phase takes it (:data:`.sweep_routes.REGION_OPERANDS`)."""
         names = "world_regions body_first body_basis body_inertia reg_frame reg_arm reg_arm_b reg_body reg_cand reg_law"
         names += " reg_bf reg_kind reg_row cand cand_row reg_wrench reg_phi reg_set reg_spring reg_state reg_seen"
         return {**{name: getattr(self, name) for name in names.split()}, "region_cfm": float(self.options.pgs_cfm)}
+
+
+@wp.func
+def audit_region(
+    g: int,
+    world: int,
+    pitch: int,
+    base: int,
+    coordinates: wp.array2d[float],
+    body_first: wp.array[int],
+    body_basis: wp.array2d[wp.spatial_vector],
+    body_inertia: wp.array2d[wp.mat33],
+    reg_frame: wp.array[wp.mat33],
+    reg_arm: wp.array[wp.vec3],
+    reg_arm_b: wp.array[wp.vec3],
+    reg_body: wp.array[wp.vec2i],
+    reg_cand: wp.array[wp.vec2i],
+    reg_kind: wp.array[int],
+    reg_row: wp.array[int],
+    cand: wp.array[wp.vec4],
+    cand_row: wp.array[int],
+    diag: wp.array2d[float],
+    velocity: wp.array2d[float],
+):
+    """Region ``g``'s rows' velocity terms at the published velocity (its walk coordinates, ``coordinates``), into
+    the audit's free rows' terms: each candidate's ``a . N`` and the friction rows' ``F``, with each candidate's own
+    response as its row's diagonal."""
+    frame = reg_frame[g]
+    n = frame[0]
+    t0 = frame[1]
+    t1 = frame[2]
+    sides = reg_body[g]
+    kind = reg_kind[g]
+    sign = float(1.0)
+    if (kind & KIND_SECOND) != 0:
+        sign = -1.0
+    sn = wp.vec3(0.0, 0.0, 0.0)
+    sf = wp.vec3(0.0, 0.0, 0.0)
+    Wnn = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    for side in range(2):
+        f = sides[side]
+        if f < 0:
+            continue
+        first = body_first[f]
+        u = wp.spatial_vector()
+        for k in range(6):
+            u[k] = coordinates[world, first + k]
+        v = wp.vec3(wp.dot(body_basis[f, 0], u), wp.dot(body_basis[f, 1], u), wp.dot(body_basis[f, 2], u))
+        w = wp.vec3(wp.dot(body_basis[f, 3], u), wp.dot(body_basis[f, 4], u), wp.dot(body_basis[f, 5], u))
+        arm = reg_arm[g]
+        if side == 1:
+            arm = reg_arm_b[g]
+        tn, tf = frame_twist(v, w, arm, n, t0, t1)
+        response, _c, _g = frame_response(body_inertia[f, 0], body_inertia[f, 1], body_inertia[f, 2], arm, n, t0, t1)
+        Wnn += response
+        sn += tn * sign
+        sf += tf * sign
+        sign = -sign
+    span = reg_cand[g]
+    for i in range(span[0], span[1]):
+        record = cand[i]
+        a = candidate_row(record)
+        line = cand_row[i] / pitch
+        row = cand_row[i] - line * pitch
+        velocity[world, row - base] = wp.dot(a, sn)
+        diag[line, row] = wp.dot(a, Wnn * a)
+    friction = reg_row[g]
+    if friction >= 0:
+        line = friction / pitch
+        row = friction - line * pitch - base
+        velocity[world, row] = sf[0]
+        velocity[world, row + 1] = sf[1]
+        if (kind & FRICTION_ROWS) == 3:
+            velocity[world, row + 2] = sf[2]
+
+
+@wp.kernel(enable_backward=False, module="unique")
+def audit_regions(
+    bodies: int,
+    body_world: wp.array[int],
+    body_open: wp.array[int],
+    body_regions: wp.array[wp.vec2i],
+    world_regions: wp.array[wp.vec2i],
+    pitch: int,
+    base: int,
+    coordinates: wp.array2d[float],
+    body_first: wp.array[int],
+    body_basis: wp.array2d[wp.spatial_vector],
+    body_inertia: wp.array2d[wp.mat33],
+    reg_frame: wp.array[wp.mat33],
+    reg_arm: wp.array[wp.vec3],
+    reg_arm_b: wp.array[wp.vec3],
+    reg_body: wp.array[wp.vec2i],
+    reg_cand: wp.array[wp.vec2i],
+    reg_kind: wp.array[int],
+    reg_row: wp.array[int],
+    cand: wp.array[wp.vec4],
+    cand_row: wp.array[int],
+    diag: wp.array2d[float],
+    velocity: wp.array2d[float],
+):
+    """The audit's reader of the regions (:func:`audit_region`): a thread a free body for a closed body's regions,
+    then a thread a world for its open ones."""
+    tid = wp.tid()
+    span = wp.vec2i(0, 0)
+    world = int(-1)
+    if tid < bodies:
+        if body_open[tid] == 0:
+            span = body_regions[tid]
+            world = body_world[tid]
+    else:
+        world = tid - bodies
+        span = world_regions[world]
+    if world < 0:
+        return
+    for g in range(span[0], span[1]):
+        audit_region(
+            g, world, pitch, base, coordinates, body_first, body_basis, body_inertia, reg_frame, reg_arm, reg_arm_b,
+            reg_body, reg_cand, reg_kind, reg_row, cand, cand_row, diag, velocity,
+        )  # fmt: skip

@@ -1781,7 +1781,7 @@ def free_body_region_rows(
     regions (:mod:`.region_sweep`): no row is walked. Each of its rows takes its records by the contact law
     (:func:`.row_build.write_contact_row`), its friction rows their rhs by the row law, and its normal row's slot
     names the contact (``row_contact``, from the free bodies' first row ``base``): the regions' listing forms the
-    candidate there (:func:`.region_sweep.list_regions`)."""
+    candidate there (:func:`.region_sweep.fill_regions`)."""
     slot = data.slot[c]
     if data.path[c] != 1 or slot < 0:
         return

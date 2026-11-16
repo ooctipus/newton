@@ -647,7 +647,7 @@ two a region, its bodies' walk coordinates as its last settled visit left them),
 
 def region_phase(pad: str = "        ") -> str:
     """Native statements of a sweep's region phase: the world's open regions (those a dense row, a speed row or a
-    second movable body touches; :func:`.region_sweep.list_regions`) in their order, each by the one visit
+    second movable body touches; :func:`.region_sweep.fill_regions`) in their order, each by the one visit
     (:func:`.region_laws.region_visit`), on the world's velocity change in walk coordinates (``s_v``), by the
     world's first lane.
 

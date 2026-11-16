@@ -673,6 +673,9 @@ class Audit:
             mf = [first, placement.mf_constraint_count, placement.mf_max_constraints, acts, self.mf_velocity]
             free = self._operands_of(free_class(), v)
             wp.launch(rows_kernel(free_class()), dim=worlds, inputs=[*mf, *free], device=device)
+            # Where the free bodies' contacts are regions, their rows' terms are the regions' (no row holds a Z).
+            if solver.sweep.regions is not None:
+                solver.sweep.regions.audit(self.coordinates, self.mf_velocity)
         inputs = [self._operands(), placement.row_seeds, int(placement.body_base)]
         inputs += [self.velocity, self.mf_velocity, self.fused, self.rhs, self.diag]
         wp.launch(audit_world, dim=worlds, inputs=inputs, outputs=[self.readout], device=device)
