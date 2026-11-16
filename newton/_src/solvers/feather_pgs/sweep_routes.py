@@ -840,7 +840,7 @@ if (moved) {{
                 if (record[3] != 0.0f) {{
                     const wp::vec3 a = RegionLaw::candidate_row(record);
                     const float closing = wp::min(wp::dot(a, out.v7) + record[2], 0.0f);
-                    lambda[cand_row.data[i]] = -closing / RegionLaw::candidate_compliance(record, a, response.v0);
+                    lambda[cand_row.data[i]] = -closing / record[3];
                 }}
             }}
         }}

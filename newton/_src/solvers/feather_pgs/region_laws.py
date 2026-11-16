@@ -11,7 +11,8 @@ twist at the anchor, in that frame, splits three and three:
   tilts. Every contact of the region, a *candidate*, is a row over ``N``:
   ``r_i = v_n + a_i1 w_t0 + a_i2 w_t1 + b_i (+ eps_i lambda_i)`` with
   ``(a_i1, a_i2) = ((d_i x n) . t0, (d_i x n) . t1)`` for its point ``d_i``
-  from the anchor. A candidate's record is ``(a_i1, a_i2, b_i, eps_i)``.
+  from the anchor. A candidate's record is ``(a_i1, a_i2, b_i, eps_i)``, its
+  compliance ``eps_i`` [1/kg] as the listing forms it (0: rigid).
 * ``F = (v_t0, v_t1, w_n)``: the two slips at the anchor and the spin, the
   region's friction unit, on the cone ``|(f_0 / mu, f_1 / mu, f_2 / mu_t)| <=
   load`` at the region's load, the sum of its candidates' impulses.
@@ -334,23 +335,11 @@ def candidate_row(record: wp.vec4) -> wp.vec3:
 
 
 @REGION_LAW.law
-def candidate_compliance(record: wp.vec4, a: wp.vec3, free: wp.mat33) -> float:
-    """A candidate's compliance ``eps`` [1/kg] from its record: a material's (positive), or, stored negative, a
-    relative weight's share ``-eps`` of the row's own response ``a . free a`` (:func:`.row_laws.contact_rhs`'s
-    ``contact_w``: ``eps = (1 / w - 1) d``)."""
-    eps = record[3]
-    if eps < 0.0:
-        eps = -eps * wp.dot(a, free * a)
-    return eps
-
-
-@REGION_LAW.law
 def region_block(
     start: wp.vec3,
     K: wp.mat33,
     L: wp.mat33,
     without: wp.vec3,
-    free: wp.mat33,
     cand: wp.array[wp.vec4],
     g0: int,
     g1: int,
@@ -365,8 +354,8 @@ def region_block(
     ``r = A (start + K A^T lambda) + b + eps lambda >= 0`` and ``lambda . r = 0``, solved exactly (the module's
     statement), from the set and the springs' wrench its last solve left.
 
-    ``without`` is the velocity without the region and ``free`` the response the relative weights read: the block is
-    *open* when no candidate closes at ``without`` faster than ``tol``.
+    ``without`` is the velocity without the region: the block is *open* when no candidate closes at ``without`` faster
+    than ``tol``.
 
     Returns ``(wrench, i0, i1, i2, multipliers, springs, velocity, open, bounded, steps)``: the block's wrench
     ``A^T lambda`` (its first coordinate the load), the rigid set and its multipliers, the compliant candidates'
@@ -429,7 +418,7 @@ def region_block(
                     r = wp.dot(a, s) + record[2]
                     if record[3] != 0.0:
                         if r < 0.0:
-                            ai = a * (1.0 / candidate_compliance(record, a, free))
+                            ai = a * (1.0 / record[3])
                             s00 += ai[0] * a[0]
                             s01 += ai[0] * a[1]
                             s02 += ai[0] * a[2]
@@ -589,7 +578,7 @@ def region_visit(
         rf0 = rf0 - wp.transpose(Cu) * wrench_in - Gu * phi_in
     if friction == 0:
         wrench, i0, i1, i2, multipliers, spring, velocity, opened, _bounded, steps = region_block(
-            without, Wnn, Lw, without, Wnn, cand, g0, g1, i0_in, i1_in, i2_in, spring_in, tol
+            without, Wnn, Lw, without, cand, g0, g1, i0_in, i1_in, i2_in, spring_in, tol
         )
         if opened == 1:
             return zero, zero, -1, -1, -1, zero, zero, without, REGION_OPEN, steps
@@ -598,7 +587,7 @@ def region_visit(
     Gs = Gu + wp.mat33(cfm, 0.0, 0.0, 0.0, cfm, 0.0, 0.0, 0.0, cfm)
     CG = Cu * Ginv
     wrench, i0, i1, i2, multipliers, spring, velocity, opened, bounded, steps = region_block(
-        without - CG * rf0, K, Lk, without, Wnn, cand, g0, g1, i0_in, i1_in, i2_in, spring_in, tol
+        without - CG * rf0, K, Lk, without, cand, g0, g1, i0_in, i1_in, i2_in, spring_in, tol
     )
     if opened == 1:
         return zero, zero, -1, -1, -1, zero, zero, without, REGION_OPEN, steps
@@ -612,7 +601,7 @@ def region_visit(
     # Slide: the candidates' block with the friction as it was, then the unit's cone law at the block's load, once.
     start = without + Cu * phi_in
     wrench, i0, i1, i2, multipliers, spring, velocity, _opened, _bounded, more = region_block(
-        start, Wnn, Lw, without, Wnn, cand, g0, g1, i0, i1, i2, spring, tol
+        start, Wnn, Lw, without, cand, g0, g1, i0, i1, i2, spring, tol
     )
     residual = rf0 + wp.transpose(Cu) * wrench + Gu * phi_in
     phi = wp.vec3(0.0, 0.0, 0.0)

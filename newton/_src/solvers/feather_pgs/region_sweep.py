@@ -34,7 +34,6 @@ from .friction_patches import PatchRowLaw
 from .projection_laws import friction_ball_metric
 from .region_laws import (
     REGION_SLIDE,
-    candidate_compliance,
     candidate_row,
     frame_response,
     frame_twist,
@@ -102,7 +101,6 @@ def publish_region(
     cand_row: wp.array[int],
     c0: int,
     c1: int,
-    free: wp.mat33,
     velocity: wp.vec3,
     old: wp.vec3i,
     new: wp.vec3i,
@@ -124,7 +122,7 @@ def publish_region(
             if record[3] != 0.0:
                 a = candidate_row(record)
                 closing = wp.min(wp.dot(a, velocity) + record[2], 0.0)
-                impulses[cand_row[i]] = -closing / candidate_compliance(record, a, free)
+                impulses[cand_row[i]] = -closing / record[3]
 
 
 @wp.kernel(enable_backward=False, module="unique")
@@ -287,7 +285,6 @@ def sweep_closed_bodies(
                 cand_row,
                 c0,
                 c1,
-                Wnn,
                 velocity,
                 set_old,
                 set_new,
@@ -765,7 +762,11 @@ def fill_region(
             friction_row = line * pitch + carrier + 1
     if sign < 0.0:
         kind = kind | KIND_SECOND
-    # The candidates: the ring's contacts in its order, each a point on the frame.
+    Wnn, C, G, values, vectors, Ginv, K, Lk, Lw = region_terms(
+        body_inertia, f0, f1, arm, arm_b, n, t0, t1, mu, mu_t, kind & FRICTION_ROWS, cfm
+    )
+    # The candidates: the ring's contacts in its order, each a point on the frame, its compliance [1/kg] the row's
+    # (a material's) or its relative one's share of the candidate's own response a . Wnn a.
     j = r
     for k in range(size):
         cj = row_contact[line, j - dense_max]
@@ -782,6 +783,9 @@ def fill_region(
             weight = rows.row_w[line, j]
             if weight < 1.0:
                 eps = -(1.0 / weight - 1.0)
+        if eps < 0.0:
+            row = wp.vec3(1.0, a1, a2)
+            eps = -eps * wp.dot(row, Wnn * row)
         if eps != 0.0:
             kind = kind | KIND_SPRINGS
         cand[c0 + k] = wp.vec4(a1, a2, rows.rhs[line, j] + incident, eps)
@@ -795,9 +799,6 @@ def fill_region(
     reg_bf[g] = bf
     reg_kind[g] = kind
     reg_row[g] = friction_row
-    Wnn, C, G, values, vectors, Ginv, K, Lk, Lw = region_terms(
-        body_inertia, f0, f1, arm, arm_b, n, t0, t1, mu, mu_t, kind & FRICTION_ROWS, cfm
-    )
     reg_ginv[g] = Ginv
     reg_k[g] = K
     reg_lk[g] = Lk
