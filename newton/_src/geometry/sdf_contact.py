@@ -1478,6 +1478,7 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
     use_identity_sdf_scale: bool = False,
     deterministic_reduction: bool = False,
     sdf_source: str = "any",
+    staged_passes: bool = False,
 ):
     """Create a mesh-mesh (or heightfield-mesh) SDF contact kernel.
 
@@ -1504,6 +1505,9 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
             to the mesh BVH. The fallback's queries take registers and spill
             the texture passes' hot loop, so a model with both kinds launches
             the two kernels in turn.
+        staged_passes: Leave the passes of mesh edges against a texture SDF
+            to the staged kernels (:func:`create_mesh_sdf_staged_kernels`);
+            the global-reduction variant with precomputed edges only.
 
     Returns:
         The mesh-SDF contact kernel, or its global-reduction variant when
@@ -1517,6 +1521,8 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
         raise ValueError("identity SDF scale specialization requires texture-only SDFs")
     if sdf_source not in ("any", "texture", "mesh") or (sdf_source != "any" and not reduce_contacts):
         raise ValueError(f"sdf_source {sdf_source!r} is 'any', or 'texture' or 'mesh' for the reducing kernel")
+    if staged_passes and not (reduce_contacts and use_precomputed_edge_data):
+        raise ValueError("staged_passes needs the reducing kernel with precomputed edges")
     # The BVH fallback is compiled in where some pass may take it.
     bvh_fallback = not use_texture_sdf_only and sdf_source != "texture"
     # The reducer mode is tested inside fully unrolled directional loops. Keep
@@ -1543,7 +1549,9 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
     _module = (
         f"sdf_contact_{writer_func.__name__}_{enable_heightfields}_{reduce_contacts}_"
         f"{speculative}_{use_precomputed_edge_data}_{use_texture_sdf_only}_{use_identity_sdf_scale}_"
-        f"{deterministic_reduction}" + ("" if sdf_source == "any" else f"_{sdf_source}")
+        f"{deterministic_reduction}"
+        + ("" if sdf_source == "any" else f"_{sdf_source}")
+        + ("_staged" if staged_passes else "")
     )
 
     @wp.kernel(enable_backward=False, module=_module)
@@ -2214,6 +2222,10 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
                 if wp.static(sdf_source == "mesh"):
                     if not use_bvh_for_sdf:
                         continue
+                # The staged kernels take mesh edges against a texture SDF.
+                if wp.static(staged_passes):
+                    if not tri_is_hfield and not sdf_is_hfield and not use_bvh_for_sdf:
+                        continue
 
                 scale_data_tri = shape_data[tri_shape]
                 scale_data_sdf = shape_data[sdf_shape]
@@ -2655,3 +2667,739 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
                         wp.tile_stack_clear(edge_stack)
 
     return mesh_sdf_collision_global_reduce_kernel
+
+
+# =============================================================================
+# Staged mesh-SDF passes: the reducing kernel's passes of mesh edges against a
+# texture SDF as a cull, a search and an export, each over dense work (whole
+# segments of candidates across pairs, blocks claiming work by cursor). The
+# arithmetic of every candidate, search and insert is the single kernel's;
+# only where and in which order it runs changes.
+# =============================================================================
+
+# work_state layout: a wave's segments written, an overflow flag (never set: the reservations bound the writes), the
+# cull cursor (it carries over the waves of a pass), the search cursor, a wave's hits, a wave's reserved segments,
+# whether another wave is needed, the pass's waves and the pass's candidates.
+MESH_SDF_STAGE_STATE_SIZE = 9
+_STAGE_SEGMENTS = 0
+_STAGE_OVERFLOW = 1
+_STAGE_CULL_CURSOR = 2
+_STAGE_SOLVE_CURSOR = 3
+_STAGE_HITS = 4
+_STAGE_RESERVED = 5
+_STAGE_MORE = 6
+_STAGE_WAVES = 7
+_STAGE_PASS_CANDIDATES = 8
+
+# A cluster round of a cull block tests MESH_SDF_BLOCK_DIM clusters of EDGE_CLUSTER_SIZE edges; with the ring's carry
+# (less than a segment) its candidates fill at most this many segments, the reservation a block holds before a round.
+MESH_SDF_STAGE_ROUND_SEGMENTS = EDGE_CLUSTER_SIZE + 1
+
+
+@wp.kernel(enable_backward=False)
+def mesh_sdf_stage_wave_start_kernel(state: wp.array[wp.int32]):
+    """A wave's counters start at zero; the cull cursor carries over, and ``more`` is set again by a cull that
+    stops for want of room."""
+    state[_STAGE_SEGMENTS] = 0
+    state[_STAGE_SOLVE_CURSOR] = 0
+    state[_STAGE_HITS] = 0
+    state[_STAGE_RESERVED] = 0
+    state[_STAGE_MORE] = 0
+    state[_STAGE_WAVES] = state[_STAGE_WAVES] + 1
+
+
+@wp.kernel(enable_backward=False)
+def mesh_sdf_stage_wave_end_kernel(state: wp.array[wp.int32], demand: wp.array[wp.int32], more: wp.array[wp.int32]):
+    """Close a wave; at the pass's last one record its demand, the full segments its candidates fill (the largest
+    so far), and whether it needed more than one wave; ``more`` drives the wave loop."""
+    more[0] = state[_STAGE_MORE]
+    if state[_STAGE_MORE] == 0:
+        segments = (state[_STAGE_PASS_CANDIDATES] + wp.static(MESH_SDF_BLOCK_DIM - 1)) // wp.static(MESH_SDF_BLOCK_DIM)
+        demand[0] = wp.max(demand[0], segments)
+        if state[_STAGE_WAVES] > 1:
+            demand[1] = demand[1] + 1
+
+
+@wp.struct
+class MeshSDFStageContext:
+    """One pass of a mesh-SDF pair (a pair and which shape gives the edges): the single kernel's per-pass values."""
+
+    staged: int
+    tri_shape: int
+    sdf_shape: int
+    sdf_index: int
+    edge_range: wp.vec2i
+    mesh_to_sdf: wp.transform
+    mesh_scale_tri: wp.vec3
+    sdf_scale: wp.vec3
+    inv_sdf_scale: wp.vec3
+    min_sdf_scale: float
+    edge_radius_scale: float
+    triangle_mesh_margin: float
+    sdf_mesh_margin: float
+    gap_sum: float
+    base_gap_sum: float
+    contact_threshold: float
+    contact_threshold_unscaled: float
+    search_precision: float
+    texture_voxel_radius: float
+
+
+@wp.struct
+class MeshSDFStageCandidate:
+    context_id: int
+    edge_idx: int
+    midpoint_sdf: float
+
+
+@wp.struct
+class MeshSDFStageHit:
+    context_id: int
+    edge_idx: int
+    point: wp.vec3
+    dist: float
+
+
+def create_mesh_sdf_staged_kernels(
+    speculative: bool,
+    use_texture_sdf_only: bool,
+    use_identity_sdf_scale: bool,
+    deterministic_reduction: bool,
+):
+    """Create the context, cull, search and export kernels of the staged texture passes.
+
+    The passes they take are the single reducing kernel's texture passes on precomputed mesh edges (no heightfield);
+    the search is compiled as that kernel's (``use_texture_sdf_only`` selects its sampling), so a candidate's search
+    and insert are the same arithmetic.
+    """
+    do_edge_sdf_collision = _create_sdf_contact_funcs(
+        False, use_texture_sdf_only, False, texture_sample_sdf_hw, _texture_sample_sdf_hw_pair
+    )
+    sample_clamped = _texture_sample_sdf_hw_clamped
+    sample_grad = texture_sample_sdf_grad_only_hw
+    get_mesh_edge = _create_mesh_edge_accessor_func(True)
+    get_mesh_edge_bounding_sphere = _create_get_mesh_edge_bounding_sphere_func(True)
+    reducer_deterministic = 1 if deterministic_reduction else 0
+    module = (
+        f"sdf_contact_staged_{speculative}_{use_texture_sdf_only}_{use_identity_sdf_scale}_{deterministic_reduction}"
+    )
+    block = MESH_SDF_BLOCK_DIM
+
+    @wp.kernel(enable_backward=False, module=module)
+    def mesh_sdf_stage_context_kernel(
+        shape_data: wp.array[wp.vec4],
+        shape_transform: wp.array[wp.transform],
+        shape_source: wp.array[wp.uint64],
+        texture_sdf_table: wp.array[TextureSDFData],
+        shape_sdf_index: wp.array[wp.int32],
+        shape_gap: wp.array[float],
+        shape_base_gap: wp.array[float],
+        shape_pairs_mesh_mesh: wp.array[wp.vec2i],
+        shape_pairs_mesh_mesh_count: wp.array[int],
+        shape_edge_range: wp.array[wp.vec2i],
+        contexts: wp.array[MeshSDFStageContext],
+    ):
+        pair_idx = wp.tid()
+        pair_count = wp.min(shape_pairs_mesh_mesh_count[0], shape_pairs_mesh_mesh.shape[0])
+        if pair_idx >= pair_count:
+            return
+        pair_encoded = shape_pairs_mesh_mesh[pair_idx]
+        has_hfield = (pair_encoded[0] & SHAPE_PAIR_HFIELD_BIT) != 0
+        shape_a = pair_encoded[0] & SHAPE_PAIR_INDEX_MASK
+        shape_b = pair_encoded[1]
+        gap_sum = shape_gap[shape_a] + shape_gap[shape_b]
+        base_gap_sum = shape_base_gap[shape_a] + shape_base_gap[shape_b]
+        for mode in range(2):
+            tri_shape = shape_a if mode == 0 else shape_b
+            sdf_shape = shape_b if mode == 0 else shape_a
+            ctx = MeshSDFStageContext()
+            ctx.staged = 0
+            ctx.tri_shape = tri_shape
+            ctx.sdf_shape = sdf_shape
+            sdf_idx = shape_sdf_index[sdf_shape]
+            ctx.sdf_index = sdf_idx
+            # the passes the single kernel leaves to these kernels (staged_passes): mesh edges against a texture SDF
+            texture = not has_hfield and shape_source[tri_shape] != wp.uint64(0)
+            if wp.static(not use_texture_sdf_only):
+                if texture:
+                    texture = sdf_idx >= 0 and sdf_idx < texture_sdf_table.shape[0]
+                if texture:
+                    texture = texture_sdf_table[sdf_idx].coarse_texture.width != 0
+            if texture:
+                ctx.staged = 1
+                texture_sdf = texture_sdf_table[sdf_idx]
+                scale_data_tri = shape_data[tri_shape]
+                scale_data_sdf = shape_data[sdf_shape]
+                mesh_scale_tri = wp.vec3(scale_data_tri[0], scale_data_tri[1], scale_data_tri[2])
+                mesh_scale_sdf = wp.vec3(scale_data_sdf[0], scale_data_sdf[1], scale_data_sdf[2])
+                if wp.static(use_identity_sdf_scale):
+                    sdf_scale = wp.vec3(1.0, 1.0, 1.0)
+                else:
+                    sdf_scale = mesh_scale_sdf
+                    if texture_sdf.scale_baked:
+                        sdf_scale = wp.vec3(1.0, 1.0, 1.0)
+                X_tri_ws = shape_transform[tri_shape]
+                X_sdf_ws = shape_transform[sdf_shape]
+                ctx.mesh_to_sdf = wp.transform_multiply(wp.transform_inverse(X_sdf_ws), X_tri_ws)
+                triangle_mesh_margin = scale_data_tri[3]
+                sdf_mesh_margin = scale_data_sdf[3]
+                if wp.static(use_identity_sdf_scale):
+                    inv_sdf_scale = wp.vec3(1.0, 1.0, 1.0)
+                    min_sdf_scale = float(1.0)
+                    edge_radius_scale = float(1.0)
+                else:
+                    inv_sdf_scale, min_sdf_scale = safe_sdf_scale_inverse(sdf_scale)
+                    edge_radius_scale = wp.max(
+                        wp.max(wp.abs(inv_sdf_scale[0]), wp.abs(inv_sdf_scale[1])), wp.abs(inv_sdf_scale[2])
+                    )
+                edge_radius_scale *= wp.max(
+                    wp.max(wp.abs(mesh_scale_tri[0]), wp.abs(mesh_scale_tri[1])), wp.abs(mesh_scale_tri[2])
+                )
+                contact_threshold = gap_sum + triangle_mesh_margin + sdf_mesh_margin
+                ctx.edge_range = shape_edge_range[tri_shape]
+                ctx.mesh_scale_tri = mesh_scale_tri
+                ctx.sdf_scale = sdf_scale
+                ctx.inv_sdf_scale = inv_sdf_scale
+                ctx.min_sdf_scale = min_sdf_scale
+                ctx.edge_radius_scale = edge_radius_scale
+                ctx.triangle_mesh_margin = triangle_mesh_margin
+                ctx.sdf_mesh_margin = sdf_mesh_margin
+                ctx.gap_sum = gap_sum
+                ctx.base_gap_sum = base_gap_sum
+                ctx.contact_threshold = contact_threshold
+                ctx.contact_threshold_unscaled = contact_threshold / min_sdf_scale
+                ctx.texture_voxel_radius = texture_sdf.voxel_radius
+                ctx.search_precision = mesh_sdf_contact_search_precision(
+                    triangle_mesh_margin + sdf_mesh_margin, min_sdf_scale, texture_sdf.voxel_radius, True
+                )
+            contexts[2 * pair_idx + mode] = ctx
+
+    @wp.func
+    def stage_search(
+        candidate: MeshSDFStageCandidate,
+        valid: bool,
+        texture_sdf_table: wp.array[TextureSDFData],
+        mesh_edge_indices: wp.array[wp.vec2i],
+        mesh_edge_centers: wp.array[wp.vec4],
+        mesh_edge_halves: wp.array[wp.vec4],
+        mesh_boundary_flags: wp.array[wp.uint8],
+        heightfield_elevations: wp.array[wp.float32],
+        contexts: wp.array[MeshSDFStageContext],
+    ):
+        hit = MeshSDFStageHit()
+        is_hit = False
+        if valid:
+            ctx = contexts[candidate.context_id]
+            texture_sdf = texture_sdf_table[ctx.sdf_index]
+            v0s, v1s, corner_ownership = get_mesh_edge(
+                wp.uint64(0),
+                mesh_edge_indices,
+                mesh_edge_centers,
+                mesh_edge_halves,
+                ctx.edge_range,
+                ctx.mesh_scale_tri,
+                ctx.mesh_to_sdf,
+                candidate.edge_idx,
+            )
+            v0 = wp.cw_mul(v0s, ctx.inv_sdf_scale)
+            v1 = wp.cw_mul(v1s, ctx.inv_sdf_scale)
+            cached_sdf_val = candidate.midpoint_sdf
+            dist_unscaled, point_unscaled, best_endpoint = do_edge_sdf_collision(
+                texture_sdf,
+                wp.uint64(0),
+                v0,
+                v1,
+                cached_sdf_val,
+                False,
+                0,
+                mesh_boundary_flags,
+                0,
+                False,
+                HeightfieldData(),
+                heightfield_elevations,
+                ctx.search_precision,
+            )
+            dist_approx = dist_unscaled * ctx.min_sdf_scale
+            bsphere_center_inner, bsphere_radius_inner = get_edge_bounding_sphere(v0, v1)
+            inner_cull_consistent = mesh_sdf_contact_passes_inner_cull_consistency(
+                dist_approx,
+                ctx.triangle_mesh_margin + ctx.sdf_mesh_margin,
+                cached_sdf_val,
+                bsphere_center_inner,
+                bsphere_radius_inner,
+                texture_sdf.sdf_box_lower,
+                texture_sdf.sdf_box_upper,
+                ctx.min_sdf_scale,
+                True,
+            )
+            owns_endpoint = best_endpoint == 0 or corner_ownership == 0 or (corner_ownership & best_endpoint) != 0
+            if dist_approx < ctx.contact_threshold and inner_cull_consistent and owns_endpoint:
+                is_hit = True
+                hit.context_id = candidate.context_id
+                hit.edge_idx = candidate.edge_idx
+                hit.point = point_unscaled
+                hit.dist = dist_unscaled
+        return is_hit, hit
+
+    @wp.func
+    def stage_export(
+        hit: MeshSDFStageHit,
+        shape_transform: wp.array[wp.transform],
+        texture_sdf_table: wp.array[TextureSDFData],
+        shape_linear_velocity: wp.array[wp.vec3],
+        shape_angular_velocity: wp.array[wp.vec3],
+        collision_update_dt: float,
+        max_speculative_extension: float,
+        shape_collision_aabb_lower: wp.array[wp.vec3],
+        shape_collision_aabb_upper: wp.array[wp.vec3],
+        shape_voxel_resolution: wp.array[wp.vec3i],
+        shape_pairs_mesh_mesh: wp.array[wp.vec2i],
+        contexts: wp.array[MeshSDFStageContext],
+        reducer_data: GlobalContactReducerData,
+    ):
+        ctx = contexts[hit.context_id]
+        mode = hit.context_id & 1
+        pair_encoded = shape_pairs_mesh_mesh[hit.context_id >> 1]
+        shape_a = pair_encoded[0] & SHAPE_PAIR_INDEX_MASK
+        shape_b = pair_encoded[1]
+        tri_shape = ctx.tri_shape
+        sdf_shape = ctx.sdf_shape
+        texture_sdf = texture_sdf_table[ctx.sdf_index]
+        dist_unscaled = hit.dist
+        point_unscaled = hit.point
+        direction_unscaled = wp.static(sample_grad)(texture_sdf, point_unscaled)
+        if wp.static(use_identity_sdf_scale):
+            dist = dist_unscaled
+            direction = direction_unscaled
+            point = point_unscaled
+        else:
+            dist, direction = scale_sdf_result_to_world(
+                dist_unscaled, direction_unscaled, ctx.sdf_scale, ctx.inv_sdf_scale, ctx.min_sdf_scale
+            )
+            point = wp.cw_mul(point_unscaled, ctx.sdf_scale)
+        X_tri_ws = shape_transform[tri_shape]
+        X_sdf_ws = shape_transform[sdf_shape]
+        point_world = wp.transform_point(X_sdf_ws, point)
+        direction_world = wp.transform_vector(X_sdf_ws, direction)
+        direction_len_sq = wp.length_sq(direction_world)
+        if direction_len_sq > 0.0:
+            direction_world = direction_world * _sdf_rsqrt_rn(direction_len_sq)
+        else:
+            fallback_dir = point_world - wp.transform_get_translation(X_sdf_ws)
+            fallback_len_sq = wp.length_sq(fallback_dir)
+            if fallback_len_sq > 0.0:
+                direction_world = fallback_dir * _sdf_rsqrt_rn(fallback_len_sq)
+            else:
+                direction_world = wp.vec3(0.0, 1.0, 0.0)
+        contact_normal = -direction_world if mode == 0 else direction_world
+        contact_center = point_world - 0.5 * dist * direction_world
+        position_local_tri = wp.quat_rotate_inv(
+            wp.transform_get_rotation(X_tri_ws),
+            point_world - wp.transform_get_translation(X_tri_ws),
+        )
+        margin_sum = ctx.triangle_mesh_margin + ctx.sdf_mesh_margin
+        midpoint = (wp.transform_get_translation(X_tri_ws) + wp.transform_get_translation(X_sdf_ws)) * 0.5
+        inner_spatial_depth = margin_sum
+        inner_spatial_depth += wp.min(ctx.texture_voxel_radius * ctx.min_sdf_scale, ctx.base_gap_sum)
+        outer_spatial_depth = margin_sum + ctx.gap_sum
+        step_end_depth = dist
+        if wp.static(speculative):
+            outer_spatial_depth = margin_sum + ctx.base_gap_sum
+            unit_normal = wp.normalize(contact_normal)
+            closing_speed = compute_contact_approach_speed(
+                shape_a,
+                shape_b,
+                contact_center - unit_normal * (0.5 * dist),
+                contact_center + unit_normal * (0.5 * dist),
+                unit_normal,
+                shape_transform,
+                shape_linear_velocity,
+                shape_angular_velocity,
+            )
+            step_end_depth = dist - closing_speed * collision_update_dt
+        contact_id = _export_and_reduce_contact_centered_two_spatial_depths(
+            shape_a,
+            shape_b,
+            contact_center,
+            contact_normal,
+            dist,
+            step_end_depth,
+            (hit.edge_idx << 2) | (mode << 1),
+            contact_center - midpoint,
+            inner_spatial_depth,
+            outer_spatial_depth,
+            position_local_tri,
+            shape_collision_aabb_lower[tri_shape],
+            shape_collision_aabb_upper[tri_shape],
+            shape_voxel_resolution[tri_shape],
+            reducer_data,
+            wp.static(reducer_deterministic),
+        )
+        if wp.static(speculative):
+            if dist >= inner_spatial_depth:
+                export_and_reduce_predictive_contact(
+                    shape_a,
+                    shape_b,
+                    contact_center,
+                    contact_normal,
+                    dist,
+                    margin_sum,
+                    0.0,
+                    0.0,
+                    (hit.edge_idx << 2) | (mode << 1),
+                    shape_transform,
+                    shape_linear_velocity,
+                    shape_angular_velocity,
+                    collision_update_dt,
+                    max_speculative_extension,
+                    contact_id,
+                    reducer_data,
+                )
+
+    @wp.kernel(enable_backward=False, launch_bounds=(MESH_SDF_BLOCK_DIM, 4), grid_stride=False, module=module)
+    def mesh_sdf_stage_cull_kernel(
+        texture_sdf_table: wp.array[TextureSDFData],
+        shape_pairs_mesh_mesh: wp.array[wp.vec2i],
+        shape_pairs_mesh_mesh_count: wp.array[int],
+        mesh_edge_indices: wp.array[wp.vec2i],
+        mesh_edge_centers: wp.array[wp.vec4],
+        mesh_edge_order: wp.array[wp.int32],
+        mesh_edge_clusters: wp.array[wp.vec4],
+        mesh_edge_cluster_reach: wp.array[float],
+        block_offsets: wp.array[wp.int32],
+        contexts: wp.array[MeshSDFStageContext],
+        candidate_ids: wp.array[wp.vec2i],
+        candidate_sdf: wp.array[wp.float32],
+        segment_fill: wp.array[wp.int32],
+        work_state: wp.array[wp.int32],
+        capacity: wp.array[wp.int32],
+        resume: wp.array[wp.vec3i],
+    ):
+        """Cull one wave of combos into full segments.
+
+        Before each cluster round (at most MESH_SDF_STAGE_ROUND_SEGMENTS segments with the ring's carry) a block
+        tops its reservation up to that plus one segment for its last, partial one. A block that cannot reserve
+        writes its ring out, records where it stands (combo, pass, cluster slot) in ``resume`` and stops; the next
+        wave starts it there. The written segments never pass the reservations: no overflow, no dropped candidate.
+        """
+        block_id, t = wp.tid()
+        # the work buffer's segments: a device value, so a buffer grown in place serves the graph that captured it
+        segment_capacity = capacity[0]
+        pair_count = wp.min(shape_pairs_mesh_mesh_count[0], shape_pairs_mesh_mesh.shape[0])
+        total_combos = block_offsets[pair_count]
+        ring = wp.tile_stack(capacity=STACK_CAPACITY, dtype=MeshSDFStageCandidate)
+        progress = wp.tile_zeros(shape=1, dtype=int, storage="shared")
+        cluster_stack = wp.tile_stack(capacity=MESH_SDF_BLOCK_DIM, dtype=int)
+        kept_clusters = wp.tile_zeros(shape=MESH_SDF_BLOCK_DIM, dtype=int, storage="shared")
+        cluster_progress = wp.tile_zeros(shape=1, dtype=int, storage="shared")
+        claim = wp.tile_zeros(shape=1, dtype=int, storage="shared")
+        stopped = wp.tile_zeros(shape=1, dtype=int, storage="shared")
+
+        # segments this block may still write; thread 0's count (only it reserves and flushes)
+        held = int(0)
+        need = wp.static(MESH_SDF_STAGE_ROUND_SEGMENTS + 1)
+        here = resume[block_id]
+        combo_idx = here[0]
+        first_mode = here[1]
+        first_slot = here[2]
+        if combo_idx < 0:
+            combo_idx = int(0)
+            if t == 0:
+                combo_idx = wp.atomic_add(work_state, _STAGE_CULL_CURSOR, 1)
+            wp.tile_scatter_masked(claim, 0, combo_idx, t == 0)
+            combo_idx = wp.tile_extract(claim, 0)
+            first_mode = 0
+            first_slot = -1
+        elif t == 0:
+            resume[block_id] = wp.vec3i(-1, 0, 0)
+        while combo_idx < total_combos:
+            lo = int(0)
+            hi = int(pair_count)
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if block_offsets[mid + 1] <= combo_idx:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            pair_idx = int(lo)
+            pair_block_start = block_offsets[pair_idx]
+            block_in_pair = combo_idx - pair_block_start
+            blocks_for_pair = block_offsets[pair_idx + 1] - pair_block_start
+            for mode in range(first_mode, wp.int32(2)):
+                context_id = 2 * pair_idx + mode
+                ctx = contexts[context_id]
+                if ctx.staged == 0:
+                    continue
+                texture_sdf = texture_sdf_table[ctx.sdf_index]
+                edge_range_tri = ctx.edge_range
+                num_edges = edge_range_tri[1]
+                chunk_size = (num_edges + blocks_for_pair - 1) // blocks_for_pair
+                chunk_size = (chunk_size + EDGE_CLUSTER_SIZE - 1) // EDGE_CLUSTER_SIZE * EDGE_CLUSTER_SIZE
+                edge_start = block_in_pair * chunk_size
+                if first_slot >= 0:
+                    edge_start = first_slot
+                    first_slot = -1
+                edge_end = wp.min(block_in_pair * chunk_size + chunk_size, num_edges)
+                wp.tile_stack_clear(cluster_stack)
+                wp.tile_scatter_masked(cluster_progress, 0, edge_start, t == 0)
+                while wp.tile_extract(cluster_progress, 0) < edge_end:
+                    first = wp.tile_extract(cluster_progress, 0)
+                    # the round's reservation; without it the block records where it stands and stops
+                    stop = int(0)
+                    if t == 0 and held < need:
+                        start = wp.atomic_add(work_state, _STAGE_RESERVED, need - held)
+                        if start + need - held <= segment_capacity:
+                            held = need
+                        else:
+                            wp.atomic_sub(work_state, _STAGE_RESERVED, need - held)
+                            work_state[_STAGE_MORE] = 1
+                            resume[block_id] = wp.vec3i(combo_idx, mode, first)
+                            stop = 1
+                    wp.tile_scatter_masked(stopped, 0, stop, t == 0)
+                    if wp.tile_extract(stopped, 0) != 0:
+                        break
+                    cluster_slot = first + t * EDGE_CLUSTER_SIZE
+                    keep_cluster = cluster_slot < edge_end
+                    if keep_cluster:
+                        cluster = edge_range_tri[0] + cluster_slot // EDGE_CLUSTER_SIZE
+                        cluster_bounds = mesh_edge_clusters[cluster]
+                        keep_cluster = texture_sdf_cluster_may_contact(
+                            texture_sdf,
+                            wp.cw_mul(
+                                wp.vec3(cluster_bounds[0], cluster_bounds[1], cluster_bounds[2]), ctx.mesh_scale_tri
+                            ),
+                            cluster_bounds[3],
+                            mesh_edge_cluster_reach[cluster],
+                            ctx.mesh_to_sdf,
+                            ctx.inv_sdf_scale,
+                            ctx.edge_radius_scale,
+                            ctx.contact_threshold_unscaled,
+                        )
+                    kept_slot = wp.tile_stack_push(cluster_stack, cluster_slot, keep_cluster)
+                    wp.tile_scatter_masked(kept_clusters, wp.max(kept_slot, 0), cluster_slot, kept_slot >= 0)
+                    kept_edges = wp.tile_stack_count(cluster_stack) * EDGE_CLUSTER_SIZE
+                    wp.tile_stack_clear(cluster_stack)
+                    wp.tile_scatter_masked(cluster_progress, 0, first + wp.block_dim() * EDGE_CLUSTER_SIZE, t == 0)
+                    wp.tile_scatter_masked(progress, 0, 0, t == 0)
+
+                    while wp.tile_extract(progress, 0) < kept_edges:
+                        base_kept = wp.tile_extract(progress, 0)
+                        kept = base_kept + t
+                        edge_idx = int(-1)
+                        if kept < kept_edges:
+                            edge_idx = (
+                                wp.tile_extract(kept_clusters, kept // EDGE_CLUSTER_SIZE) + kept % EDGE_CLUSTER_SIZE
+                            )
+                            if edge_idx >= edge_end:
+                                edge_idx = -1
+                            else:
+                                edge_idx = mesh_edge_order[edge_range_tri[0] + edge_idx]
+                        add_edge = False
+                        midpoint_sdf = float(0.0)
+                        if edge_idx >= 0:
+                            bsphere_center, bsphere_radius = get_mesh_edge_bounding_sphere(
+                                wp.uint64(0),
+                                mesh_edge_indices,
+                                mesh_edge_centers,
+                                edge_range_tri,
+                                ctx.mesh_scale_tri,
+                                ctx.mesh_to_sdf,
+                                ctx.inv_sdf_scale,
+                                ctx.edge_radius_scale,
+                                edge_idx,
+                            )
+                            culling_radius = bsphere_radius + ctx.contact_threshold_unscaled
+                            clamped = wp.min(
+                                wp.max(bsphere_center, texture_sdf.sdf_box_lower), texture_sdf.sdf_box_upper
+                            )
+                            aabb_dist_sq = wp.length_sq(bsphere_center - clamped)
+                            if aabb_dist_sq <= culling_radius * culling_radius:
+                                diff_mag = float(0.0)
+                                if aabb_dist_sq > 0.0:
+                                    diff_mag = wp.sqrt(aabb_dist_sq)
+                                midpoint_sdf = wp.static(sample_clamped)(texture_sdf, clamped, diff_mag)
+                                add_edge = midpoint_sdf <= culling_radius
+                        candidate = MeshSDFStageCandidate()
+                        candidate.context_id = context_id
+                        candidate.edge_idx = edge_idx
+                        candidate.midpoint_sdf = midpoint_sdf
+                        wp.tile_stack_push(ring, candidate, add_edge)
+                        wp.tile_scatter_masked(progress, 0, base_kept + wp.block_dim(), t == 0)
+                        # a full segment leaves the ring (the ring holds less than one before the push)
+                        if wp.tile_stack_count(ring) >= wp.static(block):
+                            segment = int(0)
+                            if t == 0:
+                                segment = wp.atomic_add(work_state, _STAGE_SEGMENTS, 1)
+                                held -= 1
+                            wp.tile_scatter_masked(claim, 0, segment, t == 0)
+                            segment = wp.tile_extract(claim, 0)
+                            # the ring is last in, first out: a pop hands out its top slots, numbered 0 .. fill - 1 by slot - base
+                            base = wp.tile_stack_count(ring) - wp.static(block)
+                            for _k in range((wp.static(block) + wp.block_dim() - 1) // wp.block_dim()):
+                                popped, popped_slot = wp.tile_stack_pop(ring)
+                                if popped_slot >= 0 and segment < segment_capacity:
+                                    slot = segment * wp.static(block) + popped_slot - base
+                                    candidate_ids[slot] = wp.vec2i(popped.context_id, popped.edge_idx)
+                                    candidate_sdf[slot] = popped.midpoint_sdf
+                            if t == 0:
+                                if segment < segment_capacity:
+                                    segment_fill[segment] = wp.static(block)
+                                    wp.atomic_add(work_state, _STAGE_PASS_CANDIDATES, wp.static(block))
+                                else:
+                                    wp.atomic_max(work_state, _STAGE_OVERFLOW, 1)
+                if wp.tile_extract(stopped, 0) != 0:
+                    break
+            first_mode = 0
+            if wp.tile_extract(stopped, 0) != 0:
+                break
+            if t == 0:
+                combo_idx = wp.atomic_add(work_state, _STAGE_CULL_CURSOR, 1)
+            wp.tile_scatter_masked(claim, 0, combo_idx, t == 0)
+            combo_idx = wp.tile_extract(claim, 0)
+
+        # the last, partial segment
+        fill = wp.tile_stack_count(ring)
+        if fill > 0:
+            segment = int(0)
+            if t == 0:
+                segment = wp.atomic_add(work_state, _STAGE_SEGMENTS, 1)
+            wp.tile_scatter_masked(claim, 0, segment, t == 0)
+            segment = wp.tile_extract(claim, 0)
+            # the ring is last in, first out: a pop hands out its top slots, numbered 0 .. fill - 1 by slot - base
+            base = wp.tile_stack_count(ring) - fill
+            for _k in range((fill + wp.block_dim() - 1) // wp.block_dim()):
+                popped, popped_slot = wp.tile_stack_pop(ring)
+                if popped_slot >= 0 and segment < segment_capacity:
+                    slot = segment * wp.static(block) + popped_slot - base
+                    candidate_ids[slot] = wp.vec2i(popped.context_id, popped.edge_idx)
+                    candidate_sdf[slot] = popped.midpoint_sdf
+            if t == 0:
+                if segment < segment_capacity:
+                    segment_fill[segment] = fill
+                    wp.atomic_add(work_state, _STAGE_PASS_CANDIDATES, fill)
+                else:
+                    wp.atomic_max(work_state, _STAGE_OVERFLOW, 1)
+
+    @wp.kernel(enable_backward=False, launch_bounds=(MESH_SDF_BLOCK_DIM, 4), grid_stride=False, module=module)
+    def mesh_sdf_stage_search_kernel(
+        texture_sdf_table: wp.array[TextureSDFData],
+        mesh_edge_indices: wp.array[wp.vec2i],
+        mesh_edge_centers: wp.array[wp.vec4],
+        mesh_edge_halves: wp.array[wp.vec4],
+        mesh_boundary_flags: wp.array[wp.uint8],
+        heightfield_elevations: wp.array[wp.float32],
+        contexts: wp.array[MeshSDFStageContext],
+        candidate_ids: wp.array[wp.vec2i],
+        candidate_sdf: wp.array[wp.float32],
+        segment_fill: wp.array[wp.int32],
+        work_state: wp.array[wp.int32],
+        capacity: wp.array[wp.int32],
+        hit_ids: wp.array[wp.vec2i],
+        hit_points: wp.array[wp.vec4],
+    ):
+        _block_id, t = wp.tid()
+        segment_capacity = capacity[0]
+        hit_capacity = segment_capacity * wp.static(block)
+        segment_count = wp.min(work_state[_STAGE_SEGMENTS], segment_capacity)
+        hit_stack = wp.tile_stack(capacity=MESH_SDF_BLOCK_DIM, dtype=MeshSDFStageHit)
+        claim = wp.tile_zeros(shape=1, dtype=int, storage="shared")
+        segment = int(0)
+        if t == 0:
+            segment = wp.atomic_add(work_state, _STAGE_SOLVE_CURSOR, 1)
+        wp.tile_scatter_masked(claim, 0, segment, t == 0)
+        segment = wp.tile_extract(claim, 0)
+        while segment < segment_count:
+            fill = segment_fill[segment]
+            # a lane a candidate; the lane loop covers a segment when the block is narrower (CPU)
+            for lane in range(t, wp.static(block), wp.block_dim()):
+                candidate = MeshSDFStageCandidate()
+                if lane < fill:
+                    slot = segment * wp.static(block) + lane
+                    ids = candidate_ids[slot]
+                    candidate.context_id = ids[0]
+                    candidate.edge_idx = ids[1]
+                    candidate.midpoint_sdf = candidate_sdf[slot]
+                is_hit, hit = stage_search(
+                    candidate,
+                    lane < fill,
+                    texture_sdf_table,
+                    mesh_edge_indices,
+                    mesh_edge_centers,
+                    mesh_edge_halves,
+                    mesh_boundary_flags,
+                    heightfield_elevations,
+                    contexts,
+                )
+                wp.tile_stack_push(hit_stack, hit, is_hit)
+                hit_fill = wp.tile_stack_count(hit_stack)
+                if hit_fill > 0:
+                    hit_base = int(0)
+                    if t == 0:
+                        hit_base = wp.atomic_add(work_state, _STAGE_HITS, hit_fill)
+                        if hit_base + hit_fill > hit_capacity:
+                            wp.atomic_max(work_state, _STAGE_OVERFLOW, 2)
+                    wp.tile_scatter_masked(claim, 0, hit_base, t == 0)
+                    hit_base = wp.tile_extract(claim, 0)
+                    popped, hit_slot = wp.tile_stack_pop(hit_stack)
+                    if hit_slot >= 0 and hit_base + hit_slot < hit_capacity:
+                        hit_ids[hit_base + hit_slot] = wp.vec2i(popped.context_id, popped.edge_idx)
+                        hit_points[hit_base + hit_slot] = wp.vec4(
+                            popped.point[0], popped.point[1], popped.point[2], popped.dist
+                        )
+                    wp.tile_stack_clear(hit_stack)
+            if t == 0:
+                segment = wp.atomic_add(work_state, _STAGE_SOLVE_CURSOR, 1)
+            wp.tile_scatter_masked(claim, 0, segment, t == 0)
+            segment = wp.tile_extract(claim, 0)
+
+    @wp.kernel(enable_backward=False, module=module)
+    def mesh_sdf_stage_export_kernel(
+        shape_transform: wp.array[wp.transform],
+        texture_sdf_table: wp.array[TextureSDFData],
+        shape_linear_velocity: wp.array[wp.vec3],
+        shape_angular_velocity: wp.array[wp.vec3],
+        collision_update_dt: float,
+        max_speculative_extension: float,
+        shape_collision_aabb_lower: wp.array[wp.vec3],
+        shape_collision_aabb_upper: wp.array[wp.vec3],
+        shape_voxel_resolution: wp.array[wp.vec3i],
+        shape_pairs_mesh_mesh: wp.array[wp.vec2i],
+        contexts: wp.array[MeshSDFStageContext],
+        hit_ids: wp.array[wp.vec2i],
+        hit_points: wp.array[wp.vec4],
+        capacity: wp.array[wp.int32],
+        work_state: wp.array[wp.int32],
+        reducer_data: GlobalContactReducerData,
+        total_num_threads: int,
+    ):
+        hit_count = wp.min(work_state[_STAGE_HITS], capacity[0] * wp.static(block))
+        for hit_index in range(wp.tid(), hit_count, total_num_threads):
+            ids = hit_ids[hit_index]
+            packed = hit_points[hit_index]
+            hit = MeshSDFStageHit()
+            hit.context_id = ids[0]
+            hit.edge_idx = ids[1]
+            hit.point = wp.vec3(packed[0], packed[1], packed[2])
+            hit.dist = packed[3]
+            stage_export(
+                hit,
+                shape_transform,
+                texture_sdf_table,
+                shape_linear_velocity,
+                shape_angular_velocity,
+                collision_update_dt,
+                max_speculative_extension,
+                shape_collision_aabb_lower,
+                shape_collision_aabb_upper,
+                shape_voxel_resolution,
+                shape_pairs_mesh_mesh,
+                contexts,
+                reducer_data,
+            )
+
+    return (
+        mesh_sdf_stage_context_kernel,
+        mesh_sdf_stage_cull_kernel,
+        mesh_sdf_stage_search_kernel,
+        mesh_sdf_stage_export_kernel,
+    )

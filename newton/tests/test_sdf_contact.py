@@ -264,6 +264,67 @@ def test_mesh_mesh_passes_counted_by_sdf_source(test, device):
         test.assertEqual(probe_contacts, 0)
 
 
+def test_mesh_sdf_staged_waves_keep_the_contacts(test, device):
+    """The staged texture passes give the same contacts in one wave and in many (a buffer short of the demand)."""
+    with wp.ScopedDevice(device):
+        sphere = newton.Mesh.create_sphere(0.3, num_latitudes=48, num_longitudes=48)
+        sphere.build_sdf(max_resolution=64, device=device)
+        builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
+        cfg = newton.ModelBuilder.ShapeConfig(density=0.0, margin=0.0, gap=0.01)
+        worlds = 8
+        for _world in range(worlds):
+            builder.begin_world()
+            lower = builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)))
+            builder.add_shape_mesh(lower, mesh=sphere, cfg=cfg)
+            upper = builder.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)))
+            builder.add_shape_mesh(upper, mesh=sphere, cfg=cfg)
+            builder.end_world()
+        model = builder.finalize(device=device)
+        state = model.state()
+        # Each upper sphere sinks 2 cm into its lower one, a little off axis.
+        poses = []
+        for world in range(worlds):
+            poses += [wp.transform(wp.vec3(0.0, 0.0, 0.0)), wp.transform(wp.vec3(0.01 * world, 0.0, 0.58))]
+        state.body_q.assign(poses)
+        pipeline = newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts=True, deterministic=True)
+        narrow = pipeline.narrow_phase
+        test.assertIsNotNone(narrow._mesh_sdf_staged)
+        contacts = pipeline.contacts()
+
+        def collide():
+            pipeline.collide(state, contacts)
+            count = int(contacts.rigid_contact_count.numpy()[0])
+            waves = int(narrow._mesh_sdf_staged_state.numpy()[7])
+            columns = [
+                getattr(contacts, "rigid_contact_" + name).numpy()[:count].reshape(count, -1).astype(np.float64)
+                for name in ("shape0", "shape1", "point0", "point1", "normal")
+            ]
+            rows = np.concatenate(columns, axis=1)
+            return count, waves, rows[np.lexsort(rows.T[::-1])]
+
+        count, waves, one_wave = collide()
+        test.assertGreater(count, 0)
+        test.assertEqual(waves, 1)
+        # Two cull blocks and a buffer of their floor: the pass takes several waves, each block stopping and resuming.
+        narrow._mesh_sdf_staged_blocks = 2
+        narrow._mesh_sdf_staged_resume = wp.zeros(2, dtype=wp.vec3i, device=device)
+        narrow._mesh_sdf_staged_rows = None
+        narrow._size_mesh_sdf_staged(0)
+        count_waves, waves, many_waves = collide()
+        test.assertGreater(waves, 2)
+        test.assertEqual(count_waves, count)
+        # the same contacts, bit for bit (as a set: the deterministic reducer's winners do not depend on order)
+        np.testing.assert_array_equal(many_waves, one_wave)
+        # The service grows the buffer to the recorded demand (in place where the segments are virtual memory): one
+        # wave again, the same contacts.
+        narrow.service_mesh_sdf_staged(measured=True)
+        test.assertGreaterEqual(narrow.mesh_sdf_staged_status()["segments"], narrow.mesh_sdf_staged_status()["demand"])
+        count_grown, waves, grown = collide()
+        test.assertEqual(waves, 1)
+        test.assertEqual(count_grown, count)
+        np.testing.assert_array_equal(grown, one_wave)
+
+
 @wp.kernel(enable_backward=False)
 def _cluster_certificate_kernel(
     sdf_table: wp.array[TextureSDFData],
@@ -501,6 +562,13 @@ add_function_test(
     "test_mesh_mesh_passes_counted_by_sdf_source",
     test_mesh_mesh_passes_counted_by_sdf_source,
     devices=get_test_devices(),
+)
+
+add_function_test(
+    TestSDFContact,
+    "test_mesh_sdf_staged_waves_keep_the_contacts",
+    test_mesh_sdf_staged_waves_keep_the_contacts,
+    devices=get_cuda_test_devices(),
 )
 
 add_function_test(

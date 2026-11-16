@@ -10,6 +10,7 @@ from typing import Any, Literal
 
 import warp as wp
 
+from ..core.contact_pool import ContactField, ContactRows, _grow_rows, device_row_limit
 from ..core.types import MAXVAL, Devicelike
 from ..geometry.collision_convex import ConvexQueryResult, create_write_convex_query_result, gjk_separation_cutoff
 from ..geometry.collision_core import (
@@ -106,9 +107,15 @@ from ..geometry.mesh_topology import (
 from ..geometry.mpr import create_solve_mpr, create_support_map_function
 from ..geometry.sdf_contact import (
     MESH_SDF_BLOCK_DIM,
+    MESH_SDF_STAGE_ROUND_SEGMENTS,
+    MESH_SDF_STAGE_STATE_SIZE,
+    MeshSDFStageContext,
     compute_block_counts_from_weights,
     compute_mesh_mesh_block_offsets_scan,
+    create_mesh_sdf_staged_kernels,
     create_narrow_phase_process_mesh_mesh_contacts_kernel,
+    mesh_sdf_stage_wave_end_kernel,
+    mesh_sdf_stage_wave_start_kernel,
 )
 from ..geometry.sdf_hydroelastic import HydroelasticSDF
 from ..geometry.sdf_texture import TextureSDFData
@@ -3577,6 +3584,10 @@ class NarrowPhase:
                 # do not spill the texture passes' loop (sdf_source).
                 mixed = self.mesh_sdf_any_texture and not self.mesh_sdf_texture_only
                 sources = ("texture", "mesh") if mixed else ("any",)
+                # With precomputed edges the staged kernels take every pass of mesh edges against a texture SDF
+                # (create_mesh_sdf_staged_kernels); this kernel keeps the heightfield and BVH-fallback passes, so a
+                # source with none of those left is not launched.
+                staged = self.mesh_sdf_any_texture
                 self.mesh_mesh_contacts_kernels, self.mesh_mesh_contacts_kernels_precomputed = (
                     tuple(
                         create_narrow_phase_process_mesh_mesh_contacts_kernel(
@@ -3589,8 +3600,10 @@ class NarrowPhase:
                             use_identity_sdf_scale=self.mesh_sdf_identity_scale_only,
                             deterministic_reduction=deterministic,
                             sdf_source=source,
+                            staged_passes=staged and precomputed,
                         )
                         for source in sources
+                        if not (staged and precomputed) or has_heightfields or source == "mesh"
                     )
                     for precomputed in (False, True)
                 )
@@ -3618,6 +3631,27 @@ class NarrowPhase:
             self.mesh_plane_contacts_kernel = None
             self.mesh_mesh_contacts_kernels = ()
             self.mesh_mesh_contacts_kernels_precomputed = ()
+        # The staged texture passes of the reducing mesh-SDF path (create_mesh_sdf_staged_kernels), with precomputed
+        # edges: the work buffer holds whole segments of candidates; a pass that needs more runs in waves.
+        self._mesh_sdf_staged = None
+        if has_meshes and self.reduce_contacts and self.mesh_sdf_any_texture:
+            self._mesh_sdf_staged = create_mesh_sdf_staged_kernels(
+                speculative, self.mesh_sdf_texture_only, self.mesh_sdf_identity_scale_only, deterministic
+            )
+            self._mesh_sdf_staged_blocks = device_obj.sm_count * 4 if device_obj.is_cuda else 1
+            self._mesh_sdf_staged_contexts = wp.zeros(
+                max(2 * self.max_mesh_mesh_pairs, 1), dtype=MeshSDFStageContext, device=device
+            )
+            # where each cull block stopped in the last wave (combo, pass, cluster slot; combo -1: nowhere)
+            self._mesh_sdf_staged_resume = wp.zeros(self._mesh_sdf_staged_blocks, dtype=wp.vec3i, device=device)
+            self._mesh_sdf_staged_state = wp.zeros(MESH_SDF_STAGE_STATE_SIZE, dtype=wp.int32, device=device)
+            self._mesh_sdf_staged_more = wp.zeros(1, dtype=wp.int32, device=device)
+            # The largest number of segments a pass has asked for, and the passes that needed more than one wave.
+            self._mesh_sdf_staged_demand = wp.zeros(2, dtype=wp.int32, device=device)
+            # its copy the host reads without synchronizing (it lags the passes in flight)
+            self._mesh_sdf_staged_demand_host = wp.zeros(2, dtype=wp.int32, device="cpu", pinned=device_obj.is_cuda)
+            self._mesh_sdf_staged_rows = None
+            self._size_mesh_sdf_staged(0)
 
         # Create global contact reduction kernels for mesh/heightfield-triangle
         # contacts (mirror the predicate used to gate ``self.reduce_contacts``
@@ -3920,6 +3954,211 @@ class NarrowPhase:
             self.mesh_plane_target_blocks = self.num_tile_blocks
             self.mesh_plane_block_offsets = None
             self.mesh_plane_block_counts = None
+
+    def _size_mesh_sdf_staged(self, demand: int) -> bool:
+        """Hold the staged work buffer for a pass of ``demand`` segments; return whether graphs must be recaptured.
+
+        The buffer holds the demand plus every resident cull block's reservation (a cluster round's segments and its
+        last one), so a pass of that demand runs in one wave and every wave makes progress. A pass that asks for more
+        runs further waves (exact, slower) and is counted in the status until the service grows the buffer. The
+        segments are CUDA virtual memory (:class:`~newton._src.core.contact_pool.ContactRows`) where it is available:
+        growth maps pages behind fixed addresses, the kernels read the capacity from the device, and the graphs that
+        captured the buffer keep serving it; ordinary arrays are reallocated and need their graphs recaptured.
+        """
+        floor = self._mesh_sdf_staged_blocks * (MESH_SDF_STAGE_ROUND_SEGMENTS + 1)
+        segments = floor + max(int(demand), 0)
+        rows = self._mesh_sdf_staged_rows
+        if rows is None:
+            fields = (
+                ContactField("candidate_ids", wp.vec2i, per_contact=MESH_SDF_BLOCK_DIM),
+                ContactField("candidate_sdf", wp.float32, per_contact=MESH_SDF_BLOCK_DIM),
+                ContactField("fill", wp.int32),
+                ContactField("hit_ids", wp.vec2i, per_contact=MESH_SDF_BLOCK_DIM),
+                ContactField("hit_points", wp.vec4, per_contact=MESH_SDF_BLOCK_DIM),
+            )
+            reserve = min(
+                device_row_limit(self.device, sum(field.row_bytes for field in fields)),
+                *(field.row_limit() for field in fields),
+            )
+            rows = self._mesh_sdf_staged_rows = ContactRows(fields, rows=segments, reserve=reserve, device=self.device)
+            self._mesh_sdf_staged_capacity = wp.array([rows.rows], dtype=wp.int32, device=self.device)
+            return False
+        if rows.rows >= segments:
+            return False
+        held = _grow_rows([rows], min(segments, rows.reserve))
+        self._mesh_sdf_staged_capacity.fill_(held)
+        return not rows.virtual
+
+    def service_mesh_sdf_staged(self, *, measured: bool = False) -> bool:
+        """Grow the staged work buffer to the largest demand a pass recorded; return whether graphs that captured
+        the old buffer must be recaptured (never with CUDA virtual memory). Call outside graph capture.
+
+        Args:
+            measured: A pass was just run outside capture (a measured state): read its demand from the device.
+                Otherwise the host copy is read without synchronizing; it lags the passes in flight.
+        """
+        if self._mesh_sdf_staged is None:
+            return False
+        demand = self._mesh_sdf_staged_demand.numpy() if measured else self._mesh_sdf_staged_demand_host.numpy()
+        return self._size_mesh_sdf_staged(int(demand[0]))
+
+    def mesh_sdf_staged_status(self) -> dict[str, int]:
+        """The staged texture passes' status: the work buffer's segments, the largest demand of a pass, and the
+        passes that needed more than one wave (exact, slower: the buffer was short). Synchronizes."""
+        if self._mesh_sdf_staged is None:
+            return {}
+        demand = self._mesh_sdf_staged_demand.numpy()
+        return {
+            "segments": int(self._mesh_sdf_staged_rows.rows),
+            "demand": int(demand[0]),
+            "multi_wave_passes": int(demand[1]),
+        }
+
+    def _launch_mesh_sdf_staged(
+        self,
+        shape_data,
+        shape_transform,
+        shape_source,
+        texture_sdf_data,
+        shape_sdf_index,
+        shape_gap,
+        shape_base_gap,
+        shape_linear_velocity,
+        shape_angular_velocity,
+        collision_update_dt,
+        max_speculative_extension,
+        shape_collision_aabb_lower,
+        shape_collision_aabb_upper,
+        shape_voxel_resolution,
+        mesh_boundary_flags,
+        heightfield_elevations,
+        mesh_edge_indices,
+        mesh_edge_centers,
+        mesh_edge_halves,
+        mesh_edge_order,
+        mesh_edge_clusters,
+        mesh_edge_cluster_reach,
+        shape_edge_range,
+        reducer_data,
+        device,
+    ):
+        """The staged texture passes: contexts and chunks, then waves of cull, search and export."""
+        context_kernel, cull_kernel, search_kernel, export_kernel = self._mesh_sdf_staged
+        state = self._mesh_sdf_staged_state
+        state.zero_()
+        wp.launch(
+            context_kernel,
+            dim=max(self.max_mesh_mesh_pairs, 1),
+            inputs=[
+                shape_data,
+                shape_transform,
+                shape_source,
+                texture_sdf_data,
+                shape_sdf_index,
+                shape_gap,
+                shape_base_gap,
+                self.shape_pairs_mesh_mesh,
+                self.shape_pairs_mesh_mesh_count,
+                shape_edge_range,
+                self._mesh_sdf_staged_contexts,
+            ],
+            device=device,
+            record_tape=False,
+        )
+        offsets = self.mesh_mesh_block_offsets
+        self._mesh_sdf_staged_resume.fill_(wp.vec3i(-1, 0, 0))
+        more = self._mesh_sdf_staged_more
+        more.fill_(1)
+        blocks = self._mesh_sdf_staged_blocks
+        # the whole reservation: the kernels bound their writes by the device capacity, the mapped segments
+        buffer = self._mesh_sdf_staged_rows.reserved
+        capacity = self._mesh_sdf_staged_capacity
+
+        def wave():
+            wp.launch(mesh_sdf_stage_wave_start_kernel, dim=1, inputs=[state], device=device, record_tape=False)
+            wp.launch_tiled(
+                cull_kernel,
+                dim=(blocks,),
+                inputs=[
+                    texture_sdf_data,
+                    self.shape_pairs_mesh_mesh,
+                    self.shape_pairs_mesh_mesh_count,
+                    mesh_edge_indices,
+                    mesh_edge_centers,
+                    mesh_edge_order,
+                    mesh_edge_clusters,
+                    mesh_edge_cluster_reach,
+                    offsets,
+                    self._mesh_sdf_staged_contexts,
+                    buffer["candidate_ids"],
+                    buffer["candidate_sdf"],
+                    buffer["fill"],
+                    state,
+                    capacity,
+                    self._mesh_sdf_staged_resume,
+                ],
+                device=device,
+                block_dim=MESH_SDF_BLOCK_DIM,
+                record_tape=False,
+            )
+            wp.launch_tiled(
+                search_kernel,
+                dim=(blocks,),
+                inputs=[
+                    texture_sdf_data,
+                    mesh_edge_indices,
+                    mesh_edge_centers,
+                    mesh_edge_halves,
+                    mesh_boundary_flags,
+                    heightfield_elevations,
+                    self._mesh_sdf_staged_contexts,
+                    buffer["candidate_ids"],
+                    buffer["candidate_sdf"],
+                    buffer["fill"],
+                    state,
+                    capacity,
+                    buffer["hit_ids"],
+                    buffer["hit_points"],
+                ],
+                device=device,
+                block_dim=MESH_SDF_BLOCK_DIM,
+                record_tape=False,
+            )
+            wp.launch(
+                export_kernel,
+                dim=self.total_num_threads,
+                inputs=[
+                    shape_transform,
+                    texture_sdf_data,
+                    shape_linear_velocity,
+                    shape_angular_velocity,
+                    collision_update_dt,
+                    max_speculative_extension,
+                    shape_collision_aabb_lower,
+                    shape_collision_aabb_upper,
+                    shape_voxel_resolution,
+                    self.shape_pairs_mesh_mesh,
+                    self._mesh_sdf_staged_contexts,
+                    buffer["hit_ids"],
+                    buffer["hit_points"],
+                    capacity,
+                    state,
+                    reducer_data,
+                    self.total_num_threads,
+                ],
+                device=device,
+                record_tape=False,
+            )
+            wp.launch(
+                mesh_sdf_stage_wave_end_kernel,
+                dim=1,
+                inputs=[state, self._mesh_sdf_staged_demand, more],
+                device=device,
+                record_tape=False,
+            )
+
+        wp.capture_while(more, wave)
+        wp.copy(self._mesh_sdf_staged_demand_host, self._mesh_sdf_staged_demand)
 
     def _launch_generic_convex(
         self,
@@ -5099,6 +5338,39 @@ class NarrowPhase:
                         record_tape=False,
                     )
 
+                    if self._mesh_sdf_staged is not None and has_precomputed_edge_data:
+                        # The waves are a conditional graph loop, which captures on one stream: the convex pairs'
+                        # stream joins here instead of after the mesh stages.
+                        if main_stream is not None:
+                            main_stream.wait_event(self._convex_stream.record_event(self._convex_events[1]))
+                            main_stream = None
+                        self._launch_mesh_sdf_staged(
+                            shape_data,
+                            shape_transform,
+                            shape_source,
+                            texture_sdf_data,
+                            shape_sdf_index,
+                            shape_gap,
+                            shape_base_gap,
+                            shape_linear_velocity,
+                            shape_angular_velocity,
+                            collision_update_dt,
+                            max_speculative_extension,
+                            shape_collision_aabb_lower,
+                            shape_collision_aabb_upper,
+                            shape_voxel_resolution,
+                            mesh_boundary_flags,
+                            heightfield_elevations,
+                            mesh_edge_indices,
+                            mesh_edge_centers,
+                            mesh_edge_halves,
+                            mesh_edge_order,
+                            mesh_edge_clusters,
+                            mesh_edge_cluster_reach,
+                            shape_edge_range,
+                            reducer_data,
+                            device,
+                        )
                     for mesh_mesh_contacts_kernel in mesh_mesh_contacts_kernels:
                         wp.launch_tiled(
                             kernel=mesh_mesh_contacts_kernel,
