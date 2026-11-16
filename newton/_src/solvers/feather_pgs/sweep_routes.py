@@ -683,27 +683,13 @@ _PAIR_BLOCK = """if ((kind & 16) != 0) {
             bits &= bits - 1u;
             float* const U = stage + blob[0] + 44 * m;
             const int friction = (int)U[23];
-            const float load = U[38];
-            const wp::vec3 phi_old(U[39], U[40], U[41]);
-            float s0 = U[18], s1 = U[19], s2 = 0.0f;
-            for (int k = 0; k < 6; ++k) { s0 += U[k] * yh[k]; s1 += U[6 + k] * yh[k]; }
-            if (friction == 3) {
-                s2 = U[20];
-                for (int k = 0; k < 6; ++k) s2 += U[12 + k] * yh[k];
-            }
-            const float mu = U[21], mu_t = U[22];
-            const wp::mat33 M(U[25], U[26], U[27], U[28], U[29], U[30], U[31], U[32], U[33]);
-            wp::vec3 phi;
-            if (mu_t > 0.0f)
-                phi = ConeLaw::friction_triple_from_metric(wp::vec3(U[34], U[35], U[36]), M, wp::vec3(s0, s1, s2),
-                                                           phi_old, mu, mu_t, load, 1.0f);
-            else
-                phi = ConeLaw::friction_triple(M, wp::vec3(s0, s1, s2), phi_old, mu, mu_t, load, 1.0f);
-            const float e0 = phi[0] - phi_old[0], e1 = phi[1] - phi_old[1], e2 = phi[2] - phi_old[2];
+            wp::spatial_vector yv;
+            for (int k = 0; k < 6; ++k) yv[k] = yh[k];
+            const auto unit = RegionLaw::block_unit(blk_stage, blob[0] + 44 * m, yv, U[38]);
+            const wp::vec3 phi = unit.v0;
             for (int k = 0; k < 6; ++k) {
-                const float push = U[k] * e0 + U[6 + k] * e1 + U[12 + k] * e2;
-                yh[k] += push;
-                Jf[k] += push;
+                yh[k] += unit.v1[k];
+                Jf[k] += unit.v1[k];
             }
             if (mine == 0) {
                 U[39] = phi[0];
@@ -716,8 +702,7 @@ _PAIR_BLOCK = """if ((kind & 16) != 0) {
                     if (friction == 3) lambda[row + 2] = phi[2];
                 }
             }
-            const float sx = phi[0] / mu, sy = phi[1] / mu, sz = mu_t > 0.0f ? phi[2] / mu_t : 0.0f;
-            if (load > 0.0f && sx * sx + sy * sy + sz * sz >= load * load * (1.0f - 1.0e-5f)) slid = true;
+            if (unit.v2) slid = true;
         }
     }
     // The normals as one compliant block: their own impulses leave, Newton on the six coordinates; the candidates

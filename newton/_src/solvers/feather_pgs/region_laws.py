@@ -639,6 +639,64 @@ def region_visit(
 
 
 @REGION_LAW.law
+def block_unit(
+    stage: wp.array[float], at: int, yh: wp.spatial_vector, load: float
+) -> tuple[wp.vec3, wp.spatial_vector, bool]:
+    """A group block's member's friction unit (:func:`.region_sweep.stage_blocks`' record at ``at`` of ``stage``: its
+    whitened rows, right-hand sides, ``mu``, ``mu_t``, rows, the cone law's block or metric, its friction) at the
+    ``load`` its candidates hold, on the group's whitened twist ``yh``: the region law's own cone law. Returns the
+    unit's new friction, its push on ``yh`` and whether it slides (on its cone at a positive load)."""
+    friction = int(stage[at + 23])
+    phi_old = wp.vec3(stage[at + 39], stage[at + 40], stage[at + 41])
+    s0 = stage[at + 18]
+    s1 = stage[at + 19]
+    s2 = float(0.0)
+    for k in range(6):
+        s0 += stage[at + k] * yh[k]
+        s1 += stage[at + 6 + k] * yh[k]
+    if friction == 3:
+        s2 = stage[at + 20]
+        for k in range(6):
+            s2 += stage[at + 12 + k] * yh[k]
+    mu = stage[at + 21]
+    mu_t = stage[at + 22]
+    M = wp.mat33(
+        stage[at + 25], stage[at + 26], stage[at + 27],
+        stage[at + 28], stage[at + 29], stage[at + 30],
+        stage[at + 31], stage[at + 32], stage[at + 33],
+    )  # fmt: skip
+    phi = wp.vec3(0.0)
+    if mu_t > 0.0:
+        phi = friction_triple_from_metric(
+            wp.vec3(stage[at + 34], stage[at + 35], stage[at + 36]), M, wp.vec3(s0, s1, s2), phi_old, mu, mu_t, load, 1.0
+        )
+    else:
+        phi = friction_triple(M, wp.vec3(s0, s1, s2), phi_old, mu, mu_t, load, 1.0)
+    e0 = phi[0] - phi_old[0]
+    e1 = phi[1] - phi_old[1]
+    e2 = phi[2] - phi_old[2]
+    push = wp.spatial_vector(
+        wp.vec3(
+            stage[at + 0] * e0 + stage[at + 6] * e1 + stage[at + 12] * e2,
+            stage[at + 1] * e0 + stage[at + 7] * e1 + stage[at + 13] * e2,
+            stage[at + 2] * e0 + stage[at + 8] * e1 + stage[at + 14] * e2,
+        ),
+        wp.vec3(
+            stage[at + 3] * e0 + stage[at + 9] * e1 + stage[at + 15] * e2,
+            stage[at + 4] * e0 + stage[at + 10] * e1 + stage[at + 16] * e2,
+            stage[at + 5] * e0 + stage[at + 11] * e1 + stage[at + 17] * e2,
+        ),
+    )
+    sx = phi[0] / mu
+    sy = phi[1] / mu
+    sz = float(0.0)
+    if mu_t > 0.0:
+        sz = phi[2] / mu_t
+    slid = load > 0.0 and sx * sx + sy * sy + sz * sz >= load * load * (1.0 - 1.0e-5)
+    return phi, push, slid
+
+
+@REGION_LAW.law
 def frame_twist(v: wp.vec3, w: wp.vec3, r: wp.vec3, n: wp.vec3, t0: wp.vec3, t1: wp.vec3) -> tuple[wp.vec3, wp.vec3]:
     """A body's twist ``(v, w)`` about its origin in a region's coordinates ``(N, F)``: the frame ``n``, ``t0``,
     ``t1`` at the anchor ``r`` from the origin."""
