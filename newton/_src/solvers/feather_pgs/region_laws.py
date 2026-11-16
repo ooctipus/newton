@@ -470,9 +470,7 @@ def region_visit(
 
 
 @REGION_LAW.law
-def frame_twist(
-    v: wp.vec3, w: wp.vec3, r: wp.vec3, n: wp.vec3, t0: wp.vec3, t1: wp.vec3
-) -> tuple[wp.vec3, wp.vec3]:
+def frame_twist(v: wp.vec3, w: wp.vec3, r: wp.vec3, n: wp.vec3, t0: wp.vec3, t1: wp.vec3) -> tuple[wp.vec3, wp.vec3]:
     """A body's twist ``(v, w)`` about its origin in a region's coordinates ``(N, F)``: the frame ``n``, ``t0``,
     ``t1`` at the anchor ``r`` from the origin."""
     at = v + wp.cross(w, r)

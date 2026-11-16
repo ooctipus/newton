@@ -693,7 +693,10 @@ if (moved) {{
 }}"""
     first_body = indent(gather.format(f="f", u="u", first="first", version="version"), "            ")
     second_body = indent(gather.format(f="f_b", u="u_b", first="first_b", version="version_b"), "            ")
-    push_a = indent(push.format(u="u", op="+", basis="basis", wrench="push", first="first", version="version", f="f"), "            ")
+    push_a = indent(
+        push.format(u="u", op="+", basis="basis", wrench="push", first="first", version="version", f="f"),
+        "            ",
+    )
     push_b = indent(
         push.format(u="u_b", op="-", basis="basis_b", wrench="push_b", first="first_b", version="version_b", f="f_b"),
         "            ",
@@ -1212,7 +1215,9 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     sides = (packed, *((CLASS_SIDES,) if sweep.support_classes else ()), *((memory_words(_SLOTS),) if colored else ()))
     records = bool(metric_stage or colored)
     families = (REGION_LAW,) if sweep.regions else ()
-    return sweep.native(body, lanes=lanes, rows=sides, walks=(FREE_BODY_WALKS,), records=records, laws=families), staging
+    return sweep.native(
+        body, lanes=lanes, rows=sides, walks=(FREE_BODY_WALKS,), records=records, laws=families
+    ), staging
 
 
 @dataclasses.dataclass(frozen=True)

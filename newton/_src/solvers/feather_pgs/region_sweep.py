@@ -41,7 +41,7 @@ from .region_laws import (
     region_visit,
 )
 from .row_kernels import RIGID_SPEED_ROWS, RowBias, row_bias
-from .row_laws import ROW_CONTACT, ROW_FRICTION, ROW_TORSION
+from .row_laws import ROW_FRICTION, ROW_TORSION
 from .row_records import DenseRows
 
 REGION_IDLE = wp.constant(-2)
@@ -264,7 +264,17 @@ def sweep_closed_bodies(
             w_new = wp.transpose(Avw) * force + Aww * torque
             set_new = wp.vec3i(i0, i1, i2)
             publish_region(
-                cand, cand_row, c0, c1, Wnn, velocity, set_old, set_new, multipliers, (kind & KIND_SPRINGS) != 0, impulses
+                cand,
+                cand_row,
+                c0,
+                c1,
+                Wnn,
+                velocity,
+                set_old,
+                set_new,
+                multipliers,
+                (kind & KIND_SPRINGS) != 0,
+                impulses,
             )
             row = reg_row[found]
             if row >= 0:
@@ -724,7 +734,6 @@ def fill_region(
     reg_spring[g] = wp.vec3(0.0, 0.0, 0.0)
 
 
-
 @wp.kernel(enable_backward=False, module="unique")
 def fill_regions(
     rows: DenseRows,
@@ -885,7 +894,14 @@ class Regions:
         wp.launch(
             reset_bodies,
             dim=max(self.count, 4),
-            outputs=[self.cursor, self.body_open, self.body_count, self.body_regions, self.body_seen, self.body_version],
+            outputs=[
+                self.cursor,
+                self.body_open,
+                self.body_count,
+                self.body_regions,
+                self.body_seen,
+                self.body_version,
+            ],
             device=device,
         )
         if contacts is None or contacts.rigid_contact_count is None or contacts._rigid_contact_rows <= 0:
@@ -894,7 +910,13 @@ class Regions:
         wp.launch(
             free_body_basis,
             dim=self.count,
-            inputs=[self.free_art, self.factor.walk_view(), self.factor.joint_S_s, forest.articulation_dof_start, solver.v_hat],
+            inputs=[
+                self.free_art,
+                self.factor.walk_view(),
+                self.factor.joint_S_s,
+                forest.articulation_dof_start,
+                solver.v_hat,
+            ],
             outputs=[self.body_basis, self.body_inertia, self.body_twist],
             device=device,
         )

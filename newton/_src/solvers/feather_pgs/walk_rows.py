@@ -1775,7 +1775,13 @@ def free_body_contact_rows(sink: RowSink, rows: DenseRows, data: ContactInput, l
 
 @wp.func
 def free_body_region_rows(
-    rows: DenseRows, data: ContactInput, law: PatchRowLaw, bias: RowBias, row_contact: wp.array2d[int], base: int, c: int
+    rows: DenseRows,
+    data: ContactInput,
+    law: PatchRowLaw,
+    bias: RowBias,
+    row_contact: wp.array2d[int],
+    base: int,
+    c: int,
 ):
     """Contact ``c``'s records where the allocation routed it to the free bodies (``path`` 1) and their contacts are
     regions (:mod:`.region_sweep`): no row is walked. Each of its rows takes its records by the contact law
