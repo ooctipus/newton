@@ -962,8 +962,8 @@ def form_blocks(
     the block (:data:`KIND_BLOCK`), the others are its members (:data:`KIND_MEMBER`). A block's pair ``(a, b)``, the
     bodies' origins' offset ``d = o_a - o_b``, the factor ``L`` of the pair's relative response
     ``W = A_a + P A_b P^T`` (``P`` moves b's twist to a's origin; ``W = L L^T``, lower) and its held wrenches (normal,
-    friction; zero). ``blk_count`` counts a world's pairs by its bodies' places (``body_level`` holds them here); a
-    world of more free bodies than its table's side lists no block."""
+    friction; zero). ``blk_count`` counts a world's pairs by its bodies' places (``body_level`` holds them here), a
+    side of the world's free bodies; a world of more than 16 free bodies lists no block."""
     world = wp.tid()
     for k in range(PAIR_BLOCKS):
         blk_pair[world * PAIR_BLOCKS + k] = wp.vec2i(-1, -1)
@@ -973,8 +973,10 @@ def form_blocks(
     s = span[0]
     e = span[1]
     f0 = world_free_start[world]
-    side = int(16)
-    if e - s <= least or world_free_start[world + 1] - f0 > side:
+    # The table's side is the world's free bodies (at most 16, the table's row of 256 cells): its cells in order are
+    # the pairs of places in order, whatever the side.
+    side = world_free_start[world + 1] - f0
+    if e - s <= least or side > 16:
         return
     for i in range(f0, world_free_start[world + 1]):
         body_level[world_free[i]] = i - f0
