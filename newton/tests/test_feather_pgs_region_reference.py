@@ -178,6 +178,60 @@ class TestRegionBlock(unittest.TestCase):
         self.assertLessEqual(most_steps, 6)
         self.assertGreater(most_closing, 6)
 
+    def test_compliant_block_is_three_unknowns(self):
+        """A region of one normal has three normal coordinates (closing speed, two tilts) however many compliant
+        candidates close: the block solved in them, with the region's 3 x 3 response, is the block over the body's
+        six coordinates."""
+        rng = np.random.default_rng(9)
+        points = np.column_stack([rng.uniform(-HALF, HALF, size=(11, 2)), np.full(11, -HALF)])
+        normals = np.tile(UP, (11, 1))
+        rows = ref.body_rows(MASS, INERTIA, points, normals)
+        frame = np.linalg.svd(rows, full_matrices=False)[2][:3]
+        self.assertLess(np.abs(rows - (rows @ frame.T) @ frame).max(), 1e-13)
+        unit = box_on_ground(FALL, STILL).unit
+        for trial in range(20):
+            rhs = point_speed(points, normals, FALL * rng.uniform(0.2, 3.0), rng.normal(size=3) * 0.3) + rng.uniform(
+                -0.01, 0.02, size=11
+            )
+            eps = rng.uniform(0.05, 2.0, size=11)
+            start = rng.normal(size=6) * 0.02
+            metric = ref.held_metric(unit, 6) if trial % 2 else np.eye(6)
+            lam, velocity, _, _ = ref.candidates_block(ref.Region(rows, rhs, eps, unit), start, metric)
+            # The same block in the region's coordinates: s = E v, the candidates' three coefficients, K3 = E K E^T.
+            # Only the part of the start the candidates see enters; the rest of the velocity is the start's.
+            small = ref.Region(rows @ frame.T, rhs, eps)
+            small_lam, s, _ = ref.compliant_block(small, frame @ start, frame @ metric @ frame.T)
+            np.testing.assert_allclose(small_lam, lam, atol=1e-13)
+            np.testing.assert_allclose(start + metric @ (frame.T @ (small.rows.T @ small_lam)), velocity, atol=1e-13)
+            np.testing.assert_allclose(s, frame @ velocity, atol=1e-13)
+
+    def test_compliant_region_with_friction(self):
+        """Compliance is a case of the same visit: stick first with the springs, the cone at the block's load (the sum
+        of the springs' impulses), the two steps for a region that slides, and the pass rule."""
+        eps, mu = 0.6, 0.5
+        for degrees, sticks in ((20.0, True), (35.0, False)):
+            theta = np.radians(degrees)
+            free = GRAVITY * DT * np.array([np.sin(theta), 0.0, -np.cos(theta)])
+            region = box_on_ground(free, STILL, mu=mu, eps=eps)
+            velocity, states, log = ref.solve([region], 6, 80)
+            lam, phi = states[0].lam, states[0].phi
+            self.assertTrue((lam > 0.0).all())
+            np.testing.assert_allclose(region.rows @ velocity + region.rhs + eps * lam, 0.0, atol=1e-12)
+            linear, angular = end_velocity(free, STILL, velocity)
+            if sticks:
+                self.assertEqual(log[0], ["stick"])
+                self.assertEqual(log[1:], [["passed"]] * 79)
+                # Stick holds the unit's rows (the base's centre does not slip or spin) inside the cone of the springs'
+                # load; the springs give way, so the box tips on them and its mass centre moves.
+                np.testing.assert_allclose(region.unit.rows @ velocity + region.unit.rhs, 0.0, atol=1e-13)
+                self.assertLess(np.hypot(phi[0], phi[1]), mu * lam.sum())
+                self.assertGreater(abs(angular[1]), 1e-4)
+                continue
+            self.assertEqual({outcomes[0] for outcomes in log}, {"slide"})
+            self.assertAlmostEqual(np.hypot(phi[0], phi[1]), mu * lam.sum(), delta=1e-9 * lam.sum())
+            # Momentum along the slope: the sliding speed is the free one less the friction's share.
+            self.assertAlmostEqual(linear[0], free[0] - mu * lam.sum() / MASS, delta=1e-10)
+
     def test_rigid_and_compliant_candidates_in_one_region(self):
         region = box_on_ground(FALL, np.array([0.1, 0.25, 0.0]), mu=5.0)
         region.eps[:2] = 0.5

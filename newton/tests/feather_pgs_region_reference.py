@@ -174,14 +174,19 @@ def compliant_block(region: Region, start: np.ndarray, metric: np.ndarray, max_s
     ``(I + K S) v = start - K q``, ``S = sum_C z z^T / eps``, ``q = sum_C z b / eps``: one pass over the candidates
     and one solve in the velocity's coordinates, however many candidates close. The step is exact once the closing
     set stands at its own solution; before that it is shortened to lower the block's energy
-    ``1/2 |v - start|^2 + 1/2 sum max(0, -(z . v + b))^2 / eps``, which the solution minimizes.
+    ``1/2 (v - start)^T K^+ (v - start) + 1/2 sum max(0, -(z . v + b))^2 / eps``, which the solution minimizes.
+    ``metric`` is any symmetric positive semidefinite response: the identity, :func:`held_metric`, or a region's
+    3 x 3 response ``E K E^T`` with the candidates' three coefficients as ``region.rows``.
     Returns ``(lam, velocity, steps)``."""
     Z, rhs, eps = region.rows, region.rhs, region.eps
     identity = np.eye(len(start))
+    inverse = np.linalg.pinv(metric)
 
     def energy(v):
         closing_speed = np.minimum(Z @ v + rhs, 0.0)
-        return 0.5 * float((v - start) @ (v - start)) + 0.5 * float((closing_speed * closing_speed / eps).sum())
+        return 0.5 * float((v - start) @ inverse @ (v - start)) + 0.5 * float(
+            (closing_speed * closing_speed / eps).sum()
+        )
 
     velocity = start.copy()
     steps = 0
