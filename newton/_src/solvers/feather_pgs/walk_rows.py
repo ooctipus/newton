@@ -104,6 +104,7 @@ __all__ = [
     "unit_list",
     "unit_reader",
     "walked_rows_kernel",
+    "write_free_body_regions",
     "write_free_body_rows",
     "writer_kernel",
     "writer_lanes",
@@ -1773,6 +1774,30 @@ def free_body_contact_rows(sink: RowSink, rows: DenseRows, data: ContactInput, l
 
 
 @wp.func
+def free_body_region_rows(
+    rows: DenseRows, data: ContactInput, law: PatchRowLaw, bias: RowBias, row_contact: wp.array2d[int], base: int, c: int
+):
+    """Contact ``c``'s records where the allocation routed it to the free bodies (``path`` 1) and their contacts are
+    regions (:mod:`.region_sweep`): no row is walked. Each of its rows takes its records by the contact law
+    (:func:`.row_build.write_contact_row`), its friction rows their rhs by the row law, and its normal row's slot
+    names the contact (``row_contact``, from the free bodies' first row ``base``): the regions' listing forms the
+    candidate there (:func:`.region_sweep.list_regions`)."""
+    slot = data.slot[c]
+    if data.path[c] != 1 or slot < 0:
+        return
+    line = rows.first[data.world[c]]
+    count = int(1)
+    if data.slots_needed[c] >= 3:
+        count = data.slots_needed[c]
+    frame = contact_frame(data, law, c)
+    for row in range(count):
+        write_contact_row(data, law, frame, c, row, False)
+        if row > 0:
+            row_bias(rows, bias, line, slot + row, 0.0)
+    row_contact[line, slot - base] = c
+
+
+@wp.func
 def speed_axis(sink: RowSink, line: int, slot: int, art: int, dof: int) -> float:
     """A speed row's epilogue, after its seed's walk gave its diagonal ``|L^-1 P e_k|^2 + cfm``: its ``Z`` holds the
     axis it bounds unwhitened (``e_k`` at the entry of its side's coordinate ``k``, every other entry zero), and its
@@ -1845,6 +1870,33 @@ def write_free_body_rows(device_arch) -> wp.Kernel:
                 free_body_speed_rows(bodies, rows, sink, speed_slot, bias, item - contacts)
 
     return python_kernel(kernel, "write_free_body_rows", launch_bounds=WRITERS["free_body"].bounds(device_arch))
+
+
+@cache
+def write_free_body_regions(device_arch) -> wp.Kernel:
+    """:func:`write_free_body_rows` where the free bodies' contacts are regions: the contacts' records
+    (:func:`free_body_region_rows`, no walk), then the free bodies' speed rows as rows (:func:`free_body_speed_rows`)."""
+
+    def kernel(
+        sink: RowSink,
+        rows: DenseRows,
+        data: ContactInput,
+        law: PatchRowLaw,
+        bodies: FreeBodies,
+        speed_slot: wp.array[int],
+        speed_bodies: int,
+        threads: int,
+        bias: RowBias,
+        row_contact: wp.array2d[int],
+    ):
+        contacts = data.count[0]
+        for item in range(wp.tid(), contacts + speed_bodies, threads):
+            if item < contacts:
+                free_body_region_rows(rows, data, law, bias, row_contact, sink.base, item)
+            else:
+                free_body_speed_rows(bodies, rows, sink, speed_slot, bias, item - contacts)
+
+    return python_kernel(kernel, "write_free_body_regions", launch_bounds=WRITERS["free_body"].bounds(device_arch))
 
 
 def free_body_sink(solver) -> RowSink:

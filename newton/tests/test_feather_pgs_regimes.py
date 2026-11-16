@@ -648,19 +648,16 @@ class TestQ10MassRatio(unittest.TestCase):
         self.assertLess(self._overlap(12.0, 24), 1.0e-3)
 
     def test_overlap_scale(self):
-        """Inside the limit the overlap follows ``5e-5 (ratio / N)^1.4`` [m], about 0.05 mm at ``ratio = N``, and stays
-        under the rigid bound ``3e-4 (ratio / N)^2``.
+        """Inside the limit the overlap stays under the rigid bound ``3e-4 (ratio / N)^2`` [m].
 
-        The scale is the friction law's, measured over mass ratios 3 to 100 at 12 to 96 sweeps (each point within a
-        factor 2.2 of it inside the budget): the stick holds the light box, so the overlap grows more slowly with
-        ``ratio / N`` than the bound.
+        The bound is one-sided: the rigid answer is no overlap, and a floor on it would describe a law's residue,
+        not physics. Scalar rows left ``5e-5 (ratio / N)^1.4`` [m], about 0.05 mm at ``ratio = N`` (the friction
+        law's stick holding the light box, measured over mass ratios 3 to 100 at 12 to 96 sweeps); the region law's
+        block leaves about 2e-8 m at the same ratios and sweeps.
         """
         for ratio, sweeps in ((10.0, 24), (30.0, 24), (100.0, 24), (30.0, 96), (100.0, 96)):
             with self.subTest(ratio=ratio, sweeps=sweeps):
-                scale = 5.0e-5 * (ratio / sweeps) ** 1.4
-                overlap = self._overlap(ratio, sweeps)
-                self.assertGreater(overlap, 0.3 * scale)
-                self.assertLess(overlap, 3.0e-4 * (ratio / sweeps) ** 2)
+                self.assertLess(self._overlap(ratio, sweeps), 3.0e-4 * (ratio / sweeps) ** 2)
 
     @known_failure(
         "H: heavy on light, the load-path rows",

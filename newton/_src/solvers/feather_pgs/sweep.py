@@ -3301,16 +3301,20 @@ class SweepConfig:
         rows: tuple[DevicePrelude, ...] = (),
         walks: tuple[DevicePrelude, ...] = (),
         records: bool = False,
+        laws: tuple = (),
     ) -> str:
         """The sweep's native function: ``body`` after the frame's preludes, composed for a world of ``lanes`` lanes
         (the CPU's one thread runs them in turn, :func:`.device_preludes.group_native`).
 
         The preludes, in order: the lane group of ``group`` lanes (by default ``lanes``), the shared stage's storage,
         the patch ring's walks (``ring``), the rows' own preludes (``rows``), the row laws (the projections, the
-        cone's where spin rows may appear, the record's where the body forms records: ``records``), the solve policy's,
+        cone's where spin rows may appear, the record's where the body forms records: ``records``, and the families
+        ``laws`` the body calls beside them), the solve policy's,
         then the walks the sweep compiles (``walks``).
         """
-        laws = law_preludes(PROJECTION_LAW, *((CONE_LAW,) if self.torsion else ()), *((RECORD_LAW,) if records else ()))
+        laws = law_preludes(
+            PROJECTION_LAW, *((CONE_LAW,) if self.torsion else ()), *((RECORD_LAW,) if records else ()), *laws
+        )
         preludes = (
             lane_group(lanes if group is None else group),
             SHARED_STORAGE,

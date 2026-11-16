@@ -538,6 +538,8 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
         (s4r, "diagonals", placement.clears_diagonals and topology is None, (placement, "diagonals")),
         (s4r, "write_walked", holds, *join, (*walk, WRITE_ROWS if topology is None else WRITE_REST)),
         (s4r, "link_patches", True, (laws, "link_patches", solver, CONTACTS)),
+        # The free bodies' regions follow the rings the link made.
+        (s4r, "list_regions", sweep.regions is not None, (sweep, "list_regions", solver, STATE_IN, CONTACTS, DT)),
         (s4r, "store_records", placement.writes_records, (sweep, "store_records")),
         (s4r, "schedule_diagonal", sweep.sparse_contact_schedule is not None, (sweep, "schedule_diagonal")),
         # Stages 5 and 6: the impulses' start (the warm start's normals, the closures' seeds: the one writer closed the

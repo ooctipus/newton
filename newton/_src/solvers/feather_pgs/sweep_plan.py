@@ -47,6 +47,7 @@ from .field_group import Field, FieldGroup
 from .friction_patches import patch_routes
 from .path_selection import json_value, kernel_key
 from .placement import SPARSE_CONTACT_LEVELS
+from .region_sweep import Regions
 from .response_builds_rows import bind_row_records, store_row_records
 from .row_records import bind as bind_dense_rows
 from .solve_policy import QUIET_UNITS, UNIT_ROUNDOFF, SolvePolicy, SolveReadoutRecord
@@ -408,6 +409,8 @@ class Sweep:
                 metric=FRICTION_METRIC_FLOATS,
             )
         self.mf_gs_kernel = None
+        # The free bodies' contacts as regions (region_sweep.Regions), where the general sweep takes every world.
+        self.regions = None
         # The colored mapping of the matrix-free sweep and its units, when a world can take it.
         self.mf_colored_kernel = None
         self.colored_units = None
@@ -505,6 +508,18 @@ class Sweep:
                 min(sweep_routes.record_first(self.placement.dense_max_constraints, sweep.places) for sweep in staged)
             )
             self.general_sweep = dataclasses.replace(self.general_sweep, records=self.placement.record_first)
+            # The free bodies' contacts are regions where no world can take the colored mapping, whose units are
+            # rows until that route's unit is the region too; the sweeps then start from rest (the warm start by
+            # contact identity seeds rows).
+            if (
+                self.placement.free_contact_rows
+                and not colored
+                and not self.options.pgs_warmstart
+                and self.factor.walk_arts is not None
+                and self.forest.free_rigid_body_count > 0
+            ):
+                self.regions = Regions(model, self.forest, self.placement, self.factor, self.options)
+                self.general_sweep = dataclasses.replace(self.general_sweep, regions=True)
             if coordinate_levels:
                 rows = self.placement.dense_max_constraints
                 self.placement.arrays.allocate(
@@ -754,11 +769,16 @@ class Sweep:
             max_blocks=placement.contact_capacity_blocks,
         )
 
+    def list_regions(self, solver, state_in, contacts, dt: float) -> None:
+        """The step's regions (:meth:`.region_sweep.Regions.list`), after the patch link."""
+        self.regions.list(solver, state_in, contacts, dt)
+
     def _operands(self, v_hat: wp.array, v_out: wp.array) -> dict:
         """The step's sweep operands by parameter name, which every sweep kernel takes from (:meth:`_launch`). A row
         array is read here, each step: the contact pool's growth rebinds what a build would hold."""
         placement, forest = self.placement, self.forest
         return {
+            **({} if self.regions is None else self.regions.operands()),
             "world_constraint_count": placement.constraint_count,
             "dense_first": placement.dense_first,
             "dense_phase_bounds": placement.dense_phase_bounds,
@@ -923,6 +943,9 @@ class Sweep:
         self.readout.count_skipped(
             self.placement.constraint_count, self.placement.mf_constraint_count, self.placement.world_acts
         )
+        # The closed free bodies' regions: their own launch, a lane a body (no other row touches them).
+        if self.regions is not None:
+            self.regions.sweep_closed(self.factor.walk_view().du)
         streams = self.claim_streams
         if not streams:
             for launch in self.launches:

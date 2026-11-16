@@ -22,6 +22,8 @@ from .device_preludes import memory_words
 from .factor.walk import FREE_BODY_WALK, WALK_COORDINATE, WALK_LINK, WalkTrees, walk_down_prelude
 from .kernel_template import Dispatch
 from .packed_rows import CLASS_SIDES, PACKED_SIDES_BY_SIDE, PACKED_SIDES_DENSE
+from .region_laws import REGION_LAW, REGION_SLIDE
+from .region_sweep import FRICTION_ROWS, KIND_SECOND, KIND_SPRINGS, REGION_IDLE, REGION_LOOSE, REGION_TOLERANCE
 from .response_operator import Lanes, SparseFactor, Velocity
 from .row_inputs import RowArgument
 from .row_laws import ROW_CONTACT, ROW_FRICTION, ROW_JOINT_LIMIT, ROW_JOINT_VELOCITY_LIMIT, ROW_SPEED, ROW_TORSION
@@ -614,6 +616,175 @@ def coordinate_levels(
     return marks, phase, skip
 
 
+REGION_OPERANDS = (
+    ("world_regions", wp.array[wp.vec2i]),
+    ("body_first", wp.array[int]),
+    ("body_basis", wp.array2d[wp.spatial_vector]),
+    ("body_inertia", wp.array2d[wp.mat33]),
+    ("reg_frame", wp.array[wp.mat33]),
+    ("reg_arm", wp.array[wp.vec3]),
+    ("reg_arm_b", wp.array[wp.vec3]),
+    ("reg_body", wp.array[wp.vec2i]),
+    ("reg_cand", wp.array[wp.vec2i]),
+    ("reg_law", wp.array[wp.vec2]),
+    ("reg_bf", wp.array[wp.vec3]),
+    ("reg_kind", wp.array[int]),
+    ("reg_row", wp.array[int]),
+    ("cand", wp.array[wp.vec4]),
+    ("cand_row", wp.array[int]),
+    ("reg_wrench", wp.array[wp.vec3]),
+    ("reg_phi", wp.array[wp.vec3]),
+    ("reg_set", wp.array[wp.vec3i]),
+    ("reg_spring", wp.array[wp.vec3]),
+    ("reg_state", wp.array[int]),
+    ("reg_seen", wp.array[wp.spatial_vector]),
+    ("region_cfm", float),
+)
+"""The operands of a sweep that visits regions (:mod:`.region_sweep`'s stream): each world's open regions, each free
+body's first world coordinate, basis and inverse inertia, the regions' records, candidates and state (``reg_seen``:
+two a region, its bodies' walk coordinates as its last settled visit left them), the friction units' regularization."""
+
+
+def region_phase(pad: str = "        ") -> str:
+    """Native statements of a sweep's region phase: the world's open regions (those a dense row, a speed row or a
+    second movable body touches; :func:`.region_sweep.list_regions`) in their order, each by the one visit
+    (:func:`.region_laws.region_visit`), on the world's velocity change in walk coordinates (``s_v``), by the
+    world's first lane.
+
+    A region's bodies' twists are their bases' of their walk coordinates, its response the sum of its bodies'
+    (:func:`.region_laws.frame_response`), and its wrench's change returns through the bases. The pass rule is
+    exact: a region that holds a wrench and whose last visit settled it is passed while its bodies' walk coordinates
+    have the bits that visit left; one that holds nothing is opened only if a candidate closes at its bodies' twist.
+    A visit that changes a bit of the velocity votes for another sweep."""
+    text = f"""SYNC();
+if (lane == 0) {{
+    const wp::vec2i region_span = world_regions.data[world];
+    for (int g = region_span[0]; g < region_span[1]; ++g) {{
+        const wp::vec2i sides = reg_body.data[g];
+        const int kind = reg_kind.data[g];
+        const float sign = (kind & {int(KIND_SECOND)}) != 0 ? -1.0f : 1.0f;
+        const int first_a = body_first.data[sides[0]];
+        const int first_b = sides[1] >= 0 ? body_first.data[sides[1]] : -1;
+        wp::spatial_vector u_a, u_b;
+        for (int k = 0; k < 6; ++k) {{
+            u_a[k] = s_v[first_a + k];
+            u_b[k] = first_b >= 0 ? s_v[first_b + k] : 0.0f;
+        }}
+        const int state = reg_state.data[g];
+        if (state >= 0) {{
+            const wp::spatial_vector seen_a = reg_seen.data[2 * g], seen_b = reg_seen.data[2 * g + 1];
+            bool same = true;
+            for (int k = 0; k < 6; ++k) same = same && u_a[k] == seen_a[k] && u_b[k] == seen_b[k];
+            if (same) continue;
+        }}
+        const wp::spatial_vector* const basis_a = body_basis.data + (size_t)sides[0] * 6;
+        const wp::spatial_vector* const basis_b = body_basis.data + (size_t)(sides[1] >= 0 ? sides[1] : sides[0]) * 6;
+        const wp::vec3 v_a(wp::dot(basis_a[0], u_a), wp::dot(basis_a[1], u_a), wp::dot(basis_a[2], u_a));
+        const wp::vec3 w_a(wp::dot(basis_a[3], u_a), wp::dot(basis_a[4], u_a), wp::dot(basis_a[5], u_a));
+        const wp::mat33 frame = reg_frame.data[g];
+        const wp::vec3 n(frame.data[0][0], frame.data[0][1], frame.data[0][2]);
+        const wp::vec3 t0(frame.data[1][0], frame.data[1][1], frame.data[1][2]);
+        const wp::vec3 t1(frame.data[2][0], frame.data[2][1], frame.data[2][2]);
+        const wp::vec3 arm_a = reg_arm.data[g], arm_b = reg_arm_b.data[g];
+        const auto twist_a = RegionLaw::frame_twist(v_a, w_a, arm_a, n, t0, t1);
+        wp::vec3 sn = wp::mul(twist_a.v0, sign), sf = wp::mul(twist_a.v1, sign);
+        if (first_b >= 0) {{
+            const wp::vec3 v_b(wp::dot(basis_b[0], u_b), wp::dot(basis_b[1], u_b), wp::dot(basis_b[2], u_b));
+            const wp::vec3 w_b(wp::dot(basis_b[3], u_b), wp::dot(basis_b[4], u_b), wp::dot(basis_b[5], u_b));
+            const auto twist_b = RegionLaw::frame_twist(v_b, w_b, arm_b, n, t0, t1);
+            sn = wp::sub(sn, wp::mul(twist_b.v0, sign));
+            sf = wp::sub(sf, wp::mul(twist_b.v1, sign));
+        }}
+        const wp::vec2i span = reg_cand.data[g];
+        if (state == {int(REGION_IDLE)}) {{
+            bool closes = false;
+            for (int i = span[0]; i < span[1]; ++i) {{
+                const wp::vec4 record = cand.data[i];
+                closes = closes || sn[0] + record[0] * sn[1] + record[1] * sn[2] + record[2] < -{REGION_TOLERANCE!r}f;
+            }}
+            if (!closes) continue;
+        }}
+        const wp::mat33* const inertia_a = body_inertia.data + (size_t)sides[0] * 3;
+        auto response = RegionLaw::frame_response(inertia_a[0], inertia_a[1], inertia_a[2], arm_a, n, t0, t1);
+        if (first_b >= 0) {{
+            const wp::mat33* const inertia_b = body_inertia.data + (size_t)sides[1] * 3;
+            const auto other = RegionLaw::frame_response(inertia_b[0], inertia_b[1], inertia_b[2], arm_b, n, t0, t1);
+            response.v0 = wp::add(response.v0, other.v0);
+            response.v1 = wp::add(response.v1, other.v1);
+            response.v2 = wp::add(response.v2, other.v2);
+        }}
+        const wp::vec2 law = reg_law.data[g];
+        const wp::vec3 wrench_old = reg_wrench.data[g], phi_old = reg_phi.data[g];
+        const wp::vec3i set_old = reg_set.data[g];
+        const auto out = RegionLaw::region_visit(
+            sn, sf, response.v0, response.v1, response.v2, region_cfm, reg_bf.data[g], law[0], law[1],
+            kind & {int(FRICTION_ROWS)}, cand, span[0], span[1], wrench_old, phi_old, set_old[0], set_old[1], set_old[2],
+            reg_spring.data[g], {REGION_TOLERANCE!r}f);
+        // The change of the region's wrench through its bodies' bases.
+        const wp::vec3 d_wrench = wp::sub(out.v0, wrench_old), d_phi = wp::sub(out.v1, phi_old);
+        const auto push_a = RegionLaw::frame_wrench(d_wrench, d_phi, arm_a, n, t0, t1);
+        bool moved = false;
+        for (int k = 0; k < 6; ++k) {{
+            const float change = sign * (basis_a[0][k] * push_a.v0[0] + basis_a[1][k] * push_a.v0[1] + basis_a[2][k] * push_a.v0[2]
+                                         + basis_a[3][k] * push_a.v1[0] + basis_a[4][k] * push_a.v1[1] + basis_a[5][k] * push_a.v1[2]);
+            const float now = u_a[k] + change;
+            moved = moved || now != u_a[k];
+            u_a[k] = now;
+            s_v[first_a + k] = now;
+        }}
+        if (first_b >= 0) {{
+            const auto push_b = RegionLaw::frame_wrench(d_wrench, d_phi, arm_b, n, t0, t1);
+            for (int k = 0; k < 6; ++k) {{
+                const float change = sign * (basis_b[0][k] * push_b.v0[0] + basis_b[1][k] * push_b.v0[1] + basis_b[2][k] * push_b.v0[2]
+                                             + basis_b[3][k] * push_b.v1[0] + basis_b[4][k] * push_b.v1[1] + basis_b[5][k] * push_b.v1[2]);
+                const float now = u_b[k] - change;
+                moved = moved || now != u_b[k];
+                u_b[k] = now;
+                s_v[first_b + k] = now;
+            }}
+        }}
+        if (moved) iteration_changed = 1;
+        // The candidates' impulses, the friction's, the region's state.
+        float* const lambda = world_impulses.data;
+        for (int k = 0; k < 3; ++k) if (set_old[k] >= 0) lambda[cand_row.data[set_old[k]]] = 0.0f;
+        const int set_new[3] = {{out.v2, out.v3, out.v4}};
+        for (int k = 0; k < 3; ++k) if (set_new[k] >= 0) lambda[cand_row.data[set_new[k]]] = out.v5[k];
+        if ((kind & {int(KIND_SPRINGS)}) != 0) {{
+            for (int i = span[0]; i < span[1]; ++i) {{
+                const wp::vec4 record = cand.data[i];
+                if (record[3] != 0.0f) {{
+                    const wp::vec3 a = RegionLaw::candidate_row(record);
+                    const float closing = wp::min(wp::dot(a, out.v7) + record[2], 0.0f);
+                    lambda[cand_row.data[i]] = -closing / RegionLaw::candidate_compliance(record, a, response.v0);
+                }}
+            }}
+        }}
+        const int friction_row = reg_row.data[g];
+        if (friction_row >= 0) {{
+            lambda[friction_row] = out.v1[0];
+            lambda[friction_row + 1] = out.v1[1];
+            if ((kind & {int(FRICTION_ROWS)}) == 3) lambda[friction_row + 2] = out.v1[2];
+        }}
+        reg_wrench.data[g] = out.v0;
+        reg_phi.data[g] = out.v1;
+        reg_set.data[g] = wp::vec3i(out.v2, out.v3, out.v4);
+        reg_spring.data[g] = out.v6;
+        if (out.v8 == {int(REGION_SLIDE)}) {{
+            reg_state.data[g] = {int(REGION_LOOSE)};
+            iteration_changed = 1;
+        }} else if (out.v0[0] > 0.0f) {{
+            reg_state.data[g] = 0;
+            reg_seen.data[2 * g] = u_a;
+            reg_seen.data[2 * g + 1] = u_b;
+        }} else {{
+            reg_state.data[g] = {int(REGION_IDLE)};
+        }}
+    }}
+}}
+SYNC();"""
+    return indent(text, pad)
+
+
 def world_lanes(support: int, *, free_rows: bool) -> int:
     """A world's lanes (switch 2): the power of two over its rows' widest ``support``, 8 at least, 16 with the free
     bodies' run (6 + 6 entries a row), up to a warp's 32: a lane holds at most one entry of a row."""
@@ -742,7 +913,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
 
         friction_laws = formed_friction_laws(metric, "    ") + "\n"
         metric_stage = friction_record_stage(dense, dense_op, end="m_dense", record=dense_record, pad="    ") + "\n"
-        if free_rows and not colored:
+        if free_rows and not colored and not sweep.regions:
 
             def free_record(row: str) -> str:
                 # The free bodies' rows follow the dense ones in the line.
@@ -796,7 +967,10 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         first_warp = end_first_warp = ""
         barrier = "SYNC();"
         free_phase = ""
-        if free_rows:
+        if sweep.regions:
+            # The free bodies' contacts are regions: the world's open ones, by the one visit.
+            free_phase = region_phase("    ")
+        elif free_rows:
             free_phase = rows_block(
                 free, free_op, laws, admission=_MF_ADMISSION, metric=metric, formed=free_record, pad="    "
             )
@@ -831,7 +1005,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
                     ),
                 ),
             )
-            if free_rows
+            if free_rows and not sweep.regions
             else ()
         )
         seed = f"{first_warp}{chr(10).join(seeds)}\n{end_first_warp}    {barrier}\n"
@@ -928,12 +1102,15 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     if free_rows:
         mf_count = "int m_mf = mf_constraint_count.data[world];"
         free_view = free.declaration()
+        # Under regions the run's contact rows are the regions' candidates, whose impulses their visits publish: the
+        # run's staged impulses are its speed rows'.
+        staged_first = "mf_contact_end + lane" if sweep.regions else "lane"
         free_loads = f"""
-    for (int i = lane; i < m_mf; i += STRIDE) {{
+    for (int i = {staged_first}; i < m_mf; i += STRIDE) {{
         {mf_load}
     }}"""
         free_stores = f"""
-    for (int i = lane; i < m_mf; i += STRIDE) {{
+    for (int i = {staged_first}; i < m_mf; i += STRIDE) {{
         {mf_store}
     }}"""
     if speed_rows:
@@ -983,7 +1160,8 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     packed = PACKED_SIDES_DENSE if not sweep.support_classes and max_row_dofs == D else PACKED_SIDES_BY_SIDE
     sides = (packed, *((CLASS_SIDES,) if sweep.support_classes else ()), *((memory_words(_SLOTS),) if colored else ()))
     records = bool(metric_stage or colored)
-    return sweep.native(body, lanes=lanes, rows=sides, walks=(FREE_BODY_WALKS,), records=records), staging
+    families = (REGION_LAW,) if sweep.regions else ()
+    return sweep.native(body, lanes=lanes, rows=sides, walks=(FREE_BODY_WALKS,), records=records, laws=families), staging
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1030,8 +1208,11 @@ class GeneralSweep(SweepConfig):
     speed_rows: bool = False
     one_tree: bool = False
     records: int | None = None
+    regions: bool = False
 
     def __post_init__(self):
+        if self.regions and (self.levels.law == EXACT or not self.free_rows):
+            raise ValueError("regions are the free bodies' run's units in the one-warp mapping")
         if self.places.metadata is Place.STREAMED and self.record_rows:
             raise ValueError("a sweep that streams its dense rows' records reads them from the line's first row")
         if self.levels.law not in (SEQUENTIAL, EXACT):
@@ -1110,6 +1291,7 @@ class GeneralSweep(SweepConfig):
             + (f"_w{self.block_warps}" if self.block_warps > 1 else "")
             + (f"_p{pitch}" if pitch is not None and pitch != M + MF else "")
             + ("" if self.free_rows else "_line")
+            + ("_regions" if self.regions else "")
             + ("_speed" if self.speed_rows else "")
             + ("_tree" if self.one_tree else "")
             + "_walk"
@@ -1166,6 +1348,8 @@ class GeneralSweep(SweepConfig):
                 if self.coordinate_levels
                 else ()
             ),
+            # Where the free bodies' contacts are regions, their stream.
+            *((RowArgument(name, dtype, after="omega") for name, dtype in REGION_OPERANDS) if self.regions else ()),
             *self.law_operands(),
         )
 

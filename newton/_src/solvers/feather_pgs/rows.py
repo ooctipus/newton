@@ -904,8 +904,11 @@ class RowLaws:
         speed = placement.rigid_velocity_limit_slot is not None
         speed_bodies = solver.forest.free_rigid_body_count if speed else 0
         threads = walk_rows.support_threads(rows + speed_bodies, model.device, walk_rows.WRITERS["free_body"])
+        # Where the free bodies' contacts are regions (Sweep.regions) their writer walks no contact row.
+        regions = solver.sweep.regions
+        writer = walk_rows.write_free_body_rows if regions is None else walk_rows.write_free_body_regions
         wp.launch(
-            walk_rows.write_free_body_rows(model.device.arch),
+            writer(model.device.arch),
             dim=threads,
             inputs=[
                 walk_rows.free_body_sink(solver),
@@ -917,6 +920,7 @@ class RowLaws:
                 speed_bodies,
                 threads,
                 self.bias(solver.options, dt),
+                *(() if regions is None else (regions.row_contact,)),
             ],
             block_dim=walk_rows.WRITERS["free_body"].block,
             device=model.device,
