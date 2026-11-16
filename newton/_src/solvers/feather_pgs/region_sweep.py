@@ -785,6 +785,56 @@ def fill_regions(
         )  # fmt: skip
 
 
+@wp.kernel(enable_backward=False, module="unique")
+def level_regions(
+    world_regions: wp.array[wp.vec2i],
+    world_free_start: wp.array[int],
+    world_free: wp.array[int],
+    reg_body: wp.array[wp.vec2i],
+    body_level: wp.array[int],
+    reg_level: wp.array[int],
+    level_end: wp.array[int],
+    level_region: wp.array[int],
+    world_levels: wp.array[int],
+):
+    """A world's open regions by the exact levels of their order, a thread a world: a region's level is one past the
+    last level of a region before it on either of its bodies, so a level's regions share no body and a sweep that
+    takes the levels in turn, a level's regions at once, is the sequential sweep itself. The world's span
+    ``[s, e)`` of the stream holds the regions by level (``level_region``, in their order within a level) and, at
+    ``s + L``, the end of level ``L`` (``level_end``); ``world_levels`` the count."""
+    world = wp.tid()
+    span = world_regions[world]
+    s = span[0]
+    e = span[1]
+    for i in range(world_free_start[world], world_free_start[world + 1]):
+        body_level[world_free[i]] = 0
+    levels = int(0)
+    for g in range(s, e):
+        sides = reg_body[g]
+        level = body_level[sides[0]]
+        if sides[1] >= 0:
+            level = wp.max(level, body_level[sides[1]])
+        reg_level[g] = level
+        body_level[sides[0]] = level + 1
+        if sides[1] >= 0:
+            body_level[sides[1]] = level + 1
+        levels = wp.max(levels, level + 1)
+    for level in range(levels):
+        level_end[s + level] = 0
+    for g in range(s, e):
+        level_end[s + reg_level[g]] += 1
+    at = s
+    for level in range(levels):
+        count = level_end[s + level]
+        level_end[s + level] = at
+        at += count
+    for g in range(s, e):
+        place = level_end[s + reg_level[g]]
+        level_region[place] = g
+        level_end[s + reg_level[g]] = place + 1
+    world_levels[world] = levels
+
+
 # ---------------------------------------------------------------------------------------------------------------------
 # The step's regions: their storage and launches
 # ---------------------------------------------------------------------------------------------------------------------
@@ -809,6 +859,9 @@ _REGION_FIELDS = (
     ("reg_spring", wp.vec3, 1),
     ("reg_state", wp.int32, 1),
     ("reg_stamp", wp.int32, 1),
+    ("reg_level", wp.int32, 1),
+    ("level_region", wp.int32, 1),
+    ("level_end", wp.int32, 1),
 )
 """The regions' stream, by contact row of the pool: a region's record and state at its place, a candidate's at its
 own (no step holds more regions or candidates than contacts)."""
@@ -867,6 +920,8 @@ class Regions:
         self.lanes = wp.zeros(count, dtype=wp.int32, device=device)
         self.cursor = wp.zeros(4, dtype=wp.int32, device=device)
         self.world_regions = wp.zeros(worlds, dtype=wp.vec2i, device=device)
+        self.world_levels = wp.zeros(worlds, dtype=wp.int32, device=device)
+        self.body_level = wp.zeros(max(count, 1), dtype=wp.int32, device=device)
         lines = int(placement.impulses.shape[0])
         self.row_contact = wp.zeros((lines, int(placement.mf_max_constraints)), dtype=wp.int32, device=device)
         self.capacity = 0
@@ -911,6 +966,7 @@ class Regions:
         )
         if contacts is None or contacts.rigid_contact_count is None or contacts._rigid_contact_rows <= 0:
             self.world_regions.zero_()
+            self.world_levels.zero_()
             return
         wp.launch(
             free_body_basis,
@@ -1010,6 +1066,13 @@ class Regions:
             ],
             **live,
         )
+        wp.launch(
+            level_regions,
+            dim=forest.world_count,
+            inputs=[self.world_regions, self.world_free_start, self.world_free, self.reg_body],
+            outputs=[self.body_level, self.reg_level, self.level_end, self.level_region, self.world_levels],
+            device=device,
+        )
 
     def sweep_closed(self, du: wp.array) -> None:
         """The closed bodies' sweeps (:func:`sweep_closed_bodies`), a lane a free body: each adds its body's change to
@@ -1087,7 +1150,8 @@ class Regions:
 
     def operands(self) -> dict:
         """The stream as the general sweep's region phase takes it (:data:`.sweep_routes.REGION_OPERANDS`)."""
-        names = "world_regions body_first body_basis body_inertia reg_frame reg_arm reg_arm_b reg_body reg_cand reg_law"
+        names = "world_regions world_levels level_end level_region body_first body_basis body_inertia reg_frame reg_arm"
+        names += " reg_arm_b reg_body reg_cand reg_law"
         names += " reg_bf reg_kind reg_row cand cand_row reg_wrench reg_phi reg_set reg_spring reg_state reg_stamp"
         names += " body_seen body_version"
         return {**{name: getattr(self, name) for name in names.split()}, "region_cfm": float(self.options.pgs_cfm)}
