@@ -134,11 +134,14 @@ def store_row_records(
     incident: wp.array2d[float],
     count: wp.array[int],
     mf_count: wp.array[int],
+    mf_contact_end: wp.array[int],
+    regions: int,
 ):
     """Store the records of the rows of ``worlds`` (the claims' worlds the general sweep and the unit builder read,
     :func:`.sweep_levels.claim_worlds`), once their writers and the patch link have left them final: a world's dense
     rows (``count``) from ``first``, then its free rows (``mf_count``) from ``base``, ``lanes`` lanes a world
-    and ``grid`` worlds at once."""
+    and ``grid`` worlds at once. Where the free bodies' contacts are regions (``regions``) no sweep reads their
+    rows' records: the free rows' start after their contacts' (``mf_contact_end``), at the speed rows."""
     item, lane = wp.tid()
     pitch = rows.rhs.shape[1]
     world = bucket_item(worlds, item)
@@ -146,7 +149,10 @@ def store_row_records(
         line = rows.first[world]
         for slot in range(records.first + lane, wp.min(count[world], records.base), lanes):
             write_row_record(records, rows, incident[line, slot], line, slot)
-        for slot in range(records.base + lane, wp.min(records.base + mf_count[world], pitch), lanes):
+        free_first = records.base + lane
+        if regions != 0:
+            free_first += mf_contact_end[world]
+        for slot in range(free_first, wp.min(records.base + mf_count[world], pitch), lanes):
             write_row_record(records, rows, incident[line, slot], line, slot)
         item += grid
         world = bucket_item(worlds, item)

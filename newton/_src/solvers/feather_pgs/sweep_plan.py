@@ -714,6 +714,8 @@ class Sweep:
                 placement.row_incident,
                 placement.constraint_count,
                 placement.mf_constraint_count,
+                placement.mf_contact_rows_end,
+                int(self.regions is not None),
             ],
             device=self.model.device,
         )
