@@ -17,9 +17,11 @@ These validations ensure the NarrowPhase follows the same contact conventions as
 primitive collision functions.
 """
 
+import gc
 import sys
 import typing
 import unittest
+import weakref
 from unittest import mock
 
 import numpy as np
@@ -500,6 +502,37 @@ class TestNarrowPhase(_NarrowPhaseSetupMixin, unittest.TestCase):
                     signs = np.where(pairs[:, 0] == 0, 1.0, -1.0)
                     np.testing.assert_allclose(normals, signs[:, None] * np.array([0.0, 0.0, 1.0]), atol=1.0e-3)
                     np.testing.assert_allclose(depths, -0.25, atol=1.0e-3)
+
+    def test_own_mesh_data_keeps_the_arrays_of_its_key(self):
+        """A narrow phase's own mesh cells stay bound to the arrays they were built for.
+
+        The cells and topology a narrow phase builds when a launch brings none are cached under the addresses of
+        the launch's ``shape_source`` and ``shape_types`` arrays. Unless the cache holds the arrays, the caller
+        frees them, the allocator hands their addresses to the next arrays, and the cache answers for other
+        meshes. The arrays are watched through weak references, so a freed address is never read.
+        """
+        devices = ["cpu"]
+        if _cuda_available:
+            devices.append("cuda:0")
+        for device in devices:
+            with self.subTest(device=device), wp.ScopedDevice(device):
+                mesh = wp.Mesh(
+                    points=wp.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=wp.vec3),
+                    indices=wp.array([0, 1, 2], dtype=wp.int32),
+                )
+                narrow_phase = NarrowPhase(max_candidate_pairs=1, device=device)
+                shape_types = wp.array([int(GeoType.MESH)], dtype=wp.int32)
+                shape_source = wp.array([mesh.id], dtype=wp.uint64)
+                radius = wp.zeros(1, dtype=wp.float32)
+                cells, _topology = narrow_phase._own_mesh_data(shape_types, shape_source, radius, device)
+                again, _topology = narrow_phase._own_mesh_data(shape_types, shape_source, radius, device)
+                self.assertIs(again, cells)
+
+                owners = weakref.ref(shape_source), weakref.ref(shape_types)
+                del shape_source, shape_types
+                gc.collect()
+                for name, owner in zip(("shape_source", "shape_types"), owners, strict=True):
+                    self.assertIsNotNone(owner(), f"nothing owns the {name} array the cache's key addresses")
 
     def test_launch_forwards_convex_support_metadata(self):
         """Forward cooked convex support metadata through the standard launch path."""

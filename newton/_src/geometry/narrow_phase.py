@@ -3129,6 +3129,7 @@ class NarrowPhase:
         self.has_meshes = has_meshes
         self._empty_mesh_cells = None
         self._own_mesh_key = None
+        self._own_mesh_key_arrays = None
         self._own_mesh_data_value = None
         self.has_heightfields = has_heightfields
         # Mixed mesh/heightfield scenes retain the original full midphase;
@@ -4232,6 +4233,9 @@ class NarrowPhase:
             topology = MeshTopology(types, shape_meshes, device, shape_collision_radius).data
             self._own_mesh_data_value = (cells, topology)
             self._own_mesh_key = key
+            # The key holds addresses only: its arrays live as long as it does, so the allocator cannot hand
+            # their addresses to other arrays, which would match it.
+            self._own_mesh_key_arrays = (shape_source, shape_types)
         cells, topology = self._own_mesh_data_value
         topology.shape_radius = shape_collision_radius
         return cells, topology
