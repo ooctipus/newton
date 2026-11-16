@@ -30,8 +30,9 @@ iterative ones (the friction pair, the Coulomb bisection) agree to their
 solve's tolerance.
 
 The subset: scalar (``float``, ``int``, ``bool``, ``wp.float64``), vector,
-matrix, quaternion and transform arguments and locals, read-only Warp arrays,
-arithmetic, comparisons, ``and``/``or``/``not``, conditional expressions,
+matrix (up to ``wp.spatial_matrix``), quaternion and transform arguments and
+locals, writes of one component of a local vector or matrix, read-only Warp
+arrays, arithmetic, comparisons, ``and``/``or``/``not``, conditional expressions,
 ``if``/``elif``/``else``, ``for`` over ``range`` (``wp.static`` bounds allowed),
 ``while``, ``break``, ``continue`` and ``return`` of one value or a tuple, calls
 of Warp builtins and of registered laws, and module constants. A local is
@@ -129,6 +130,7 @@ _NAMED_TYPES = {
     wp.spatial_vector: "wp::spatial_vector",
     wp.mat22: "wp::mat22",
     wp.mat33: "wp::mat33",
+    wp.spatial_matrix: "wp::spatial_matrix",
     wp.quat: "wp::quat",
     wp.transform: "wp::transform",
 }
@@ -188,6 +190,7 @@ class _Law:
     result_annotations: tuple  # one result type, or one per tuple member
     results: tuple[str, ...]  # their C++ types
     native: tuple[str, ...] = ()  # the CUDA function's statements, where the subset cannot write them
+    dense: tuple[str, ...] = ()  # array arguments the CUDA function reads as dense memory
 
     @property
     def name(self) -> str:
@@ -227,6 +230,7 @@ class LawFamily:
         inline: str = "force",
         cuda: bool = True,
         native: tuple[str, ...] = (),
+        dense: tuple[str, ...] = (),
     ):
         """Register ``definition`` as a law of this family and return its Warp function.
 
@@ -239,9 +243,12 @@ class LawFamily:
             native: The CUDA function's statements, for a law whose CUDA form is a device instruction sequence the
                 subset cannot write. The definition stays the law: Warp kernels, the CPU twin and Python callers run
                 it, and the statements must compute its value (the law's docstring says where they do).
+            dense: Array arguments the CUDA function reads as dense memory (``data[i]``, constant offsets from one
+                address), where a law reads a record at an offset; its native callers pass contiguous arrays. The
+                Warp function reads them as Warp reads any array.
         """
         if definition is None:
-            return lambda fn: self.law(fn, inline=inline, cuda=cuda, native=native)
+            return lambda fn: self.law(fn, inline=inline, cuda=cuda, native=native, dense=dense)
         if inline not in _INLINE:
             raise ValueError(f"inline must be one of {tuple(_INLINE)}, got {inline!r}")
         if self._prelude is not None:
@@ -256,7 +263,13 @@ class LawFamily:
             if parameter.annotation is inspect.Parameter.empty:
                 raise TypeError(f"law {definition.__name__} must annotate argument {parameter.name}")
         function = wp.func(definition)
-        entry = _Law(definition, function, self, inline, cuda, signature, annotations, results, tuple(native))
+        for name in dense:
+            annotation = signature.parameters[name].annotation if name in signature.parameters else None
+            if annotation is None or not wp.types.is_array(annotation) or annotation.ndim != 1:
+                raise TypeError(f"law {definition.__name__}: dense argument {name} is not a one-dimensional array")
+        entry = _Law(
+            definition, function, self, inline, cuda, signature, annotations, results, tuple(native), tuple(dense)
+        )
         self._laws.append(entry)
         _LAWS[id(function)] = entry
         _LAWS[id(definition)] = entry
@@ -404,6 +417,7 @@ _BUILTIN_KINDS = {
     "mat22": _MATRIX,
     "mat33": _MATRIX,
     "mat44": _MATRIX,
+    "spatial_matrix": _MATRIX,
     "transpose": _MATRIX,
     "skew": _MATRIX,
     "quat_to_matrix": _MATRIX,
@@ -642,11 +656,18 @@ class _Renderer:
         self.emit(indent, f"wp::{name}({', '.join(arguments)});")
 
     def target(self, node) -> tuple[str, str]:
-        """The C++ variable and kind an assignment updates: laws assign whole local values."""
+        """The C++ variable and kind an assignment updates: a whole local value, or one component of a local vector
+        or matrix."""
         if isinstance(node, ast.Subscript):
-            if isinstance(node.value, ast.Name) and self.kind_of(node.value.id) == _ARRAY:
+            base = node.value
+            if isinstance(base, ast.Name) and self.kind_of(base.id) == _ARRAY:
                 self.fail(node, "laws do not write arrays; return the value instead")
-            self.fail(node, "laws assign whole values; build the vector instead of writing one component")
+            if not (isinstance(base, ast.Name) and self.kind_of(base.id) in (_VECTOR, _MATRIX)):
+                self.fail(node, "a component write updates a local vector or matrix")
+            text, _, kind = self.subscript(node)
+            if kind != _SCALAR:
+                self.fail(node, "a component write sets one component")
+            return text, _SCALAR
         if not isinstance(node, ast.Name):
             self.fail(node, f"assignment target {type(node).__name__}")
         if not self.declared(node.id):
@@ -828,6 +849,9 @@ class _Renderer:
         if isinstance(base, ast.Name) and self.kind_of(base.id) == _ARRAY:
             # A value load, as Warp reads an array element: a reference into memory compiles differently.
             dtype = self.params[base.id].dtype
+            if base.id in self.entry.dense:
+                # A dense array's element at its index: a record read at constant offsets from one address.
+                return f"{self.cname(base.id)}.data[{rendered[0]}]", _PREC_POSTFIX, _kind(dtype)
             address = f"wp::address({self.cname(base.id)}, {', '.join(rendered)})"
             return f"wp::load({address})", _PREC_POSTFIX, _kind(dtype)
         for element in indices:

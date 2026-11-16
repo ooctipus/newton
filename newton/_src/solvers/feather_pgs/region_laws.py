@@ -638,7 +638,7 @@ def region_visit(
     return wrench, phi, i0, i1, i2, multipliers, spring, velocity, REGION_SLIDE, steps + more
 
 
-@REGION_LAW.law
+@REGION_LAW.law(dense=("stage",))
 def block_unit(
     stage: wp.array[float], at: int, yh: wp.spatial_vector, load: float
 ) -> tuple[wp.vec3, wp.spatial_vector, bool]:
@@ -668,7 +668,14 @@ def block_unit(
     phi = wp.vec3(0.0)
     if mu_t > 0.0:
         phi = friction_triple_from_metric(
-            wp.vec3(stage[at + 34], stage[at + 35], stage[at + 36]), M, wp.vec3(s0, s1, s2), phi_old, mu, mu_t, load, 1.0
+            wp.vec3(stage[at + 34], stage[at + 35], stage[at + 36]),
+            M,
+            wp.vec3(s0, s1, s2),
+            phi_old,
+            mu,
+            mu_t,
+            load,
+            1.0,
         )
     else:
         phi = friction_triple(M, wp.vec3(s0, s1, s2), phi_old, mu, mu_t, load, 1.0)
@@ -694,6 +701,109 @@ def block_unit(
         sz = phi[2] / mu_t
     slid = load > 0.0 and sx * sx + sy * sy + sz * sz >= load * load * (1.0 - 1.0e-5)
     return phi, push, slid
+
+
+@REGION_LAW.law
+def block_enter(L: wp.spatial_matrix, y: wp.spatial_vector) -> wp.spatial_vector:
+    """A group's relative twist ``y`` whitened by the factor ``L`` (lower) of its response ``W = L L^T``: ``L^-1 y``,
+    the coordinates its block solves in."""
+    yh = wp.spatial_vector()
+    for i in range(6):
+        t = y[i]
+        for j in range(i):
+            t -= L[i, j] * yh[j]
+        yh[i] = t * (1.0 / L[i, i])
+    return yh
+
+
+@REGION_LAW.law(dense=("stage",))
+def block_load(stage: wp.array[float], at: int, cands: int) -> tuple[float, bool]:
+    """A group block's member's load (its record at ``at`` of ``stage``, its block's candidates' records from
+    ``cands``): the sum of its candidates' impulses in their order, and whether its friction unit is live (it holds a
+    load or a friction). A member without friction rows has no load and is never live."""
+    load = float(0.0)
+    live = False
+    if int(stage[at + 23]) != 0:
+        nc = int(stage[at + 37])
+        c0 = int(stage[at + 42])
+        for i in range(nc):
+            load += stage[cands + 12 * (c0 + i) + 8]
+        live = load > 0.0 or stage[at + 39] != 0.0 or stage[at + 40] != 0.0 or stage[at + 41] != 0.0
+    return load, live
+
+
+@REGION_LAW.law(dense=("stage",))
+def block_candidate(
+    stage: wp.array[float], at: int, yh: wp.spatial_vector, S: wp.spatial_matrix, q: wp.spatial_vector
+) -> tuple[wp.spatial_matrix, wp.spatial_vector, float, bool]:
+    """A group block's candidate (its record at ``at`` of ``stage``: its whitened row ``z``, right-hand side ``b``,
+    compliance ``eps``) at the whitened twist ``yh``: where it closes (``r = z . yh + b < 0``) its spring's impulse
+    ``-r / eps`` and its term of the Newton step's system, ``S += z z^T / eps`` (the lower triangle) and
+    ``q += z b / eps``. Returns ``S``, ``q``, the impulse (zero where it does not close) and whether it closes."""
+    r = stage[at + 6]
+    for k in range(6):
+        r += stage[at + k] * yh[k]
+    lam = float(0.0)
+    closes = r < 0.0
+    if closes:
+        ie = 1.0 / stage[at + 7]
+        lam = -r * ie
+        for a in range(6):
+            za = stage[at + a] * ie
+            for b in range(a + 1):
+                S[a, b] += za * stage[at + b]
+            q[a] += za * stage[at + 6]
+    return S, q, lam, closes
+
+
+@REGION_LAW.law
+def block_newton(S: wp.spatial_matrix, q: wp.spatial_vector, ys: wp.spatial_vector) -> wp.spatial_vector:
+    """A group block's Newton step on its six whitened coordinates: the twist ``yh`` with ``(I + S) yh = ys - q`` for
+    its closing candidates' sums ``S`` (lower triangle) and ``q`` (:func:`block_candidate`), by Cholesky; ``ys`` is
+    the twist without the block's normal impulses."""
+    Lc = wp.spatial_matrix()
+    for a in range(6):
+        for b in range(a + 1):
+            t = S[a, b] + (1.0 if a == b else 0.0)
+            for k in range(b):
+                t -= Lc[a, k] * Lc[b, k]
+            Lc[a, b] = wp.sqrt(wp.max(t, 1.0e-30)) if a == b else t / Lc[b, b]
+    x = wp.spatial_vector()
+    for a in range(6):
+        t = ys[a] - q[a]
+        for k in range(a):
+            t -= Lc[a, k] * x[k]
+        x[a] = t / Lc[a, a]
+    for a in range(5, -1, -1):
+        t = x[a]
+        for k in range(a + 1, 6):
+            t -= Lc[k, a] * x[k]
+        x[a] = t / Lc[a, a]
+    return x
+
+
+@REGION_LAW.law
+def block_leave(
+    L: wp.spatial_matrix,
+    yh: wp.spatial_vector,
+    ys: wp.spatial_vector,
+    Jf: wp.spatial_vector,
+    Jn0: wp.spatial_vector,
+    Jf0: wp.spatial_vector,
+) -> tuple[wp.spatial_vector, wp.spatial_vector, wp.spatial_vector, wp.spatial_vector]:
+    """A group block's visit's end, in its whitened coordinates: the normals' held wrench ``Jn = yh - ys``, the held
+    wrench ``Jn + Jf`` (``Jf`` its units'), its change ``own`` from the visit's start (``Jn0 + Jf0``) and that change
+    about the group's first body's origin, ``dJ = L^-T own``."""
+    Jn = yh - ys
+    held = Jn + Jf
+    own = held - (Jn0 + Jf0)
+    dJ = wp.spatial_vector()
+    for i in range(5, -1, -1):
+        t = own[i]
+        for j in range(i + 1, 6):
+            t -= L[j, i] * dJ[j]
+        dJ[i] = t * (1.0 / L[i, i])
+    return Jn, held, own, dJ
 
 
 @REGION_LAW.law

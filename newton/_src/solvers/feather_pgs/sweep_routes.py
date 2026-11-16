@@ -618,10 +618,11 @@ def coordinate_levels(
 
 _PAIR_BLOCK = """if ((kind & 16) != 0) {
     // The group's block over its six relative coordinates y = t_a - P t_b, whitened by W = L L^T
-    // (yh = L^-1 y), from its staged records (region_sweep.stage_blocks): each member's friction unit by the region
-    // law's cone law at the load its region holds, then every member candidate's normal as one compliant block (the
-    // region law's closing springs, Newton on the six). The held wrenches are kept whitened (L^T J). A chain world's
-    // lanes all walk its order (alone), so its block's candidate passes take the group's lanes (team).
+    // (yh = L^-1 y), from its staged records (region_sweep.stage_blocks), by the region law's block laws
+    // (region_laws.block_*): each member's friction unit by the region law's cone law at the load its region holds,
+    // then every member candidate's normal as one compliant block (the region law's closing springs, Newton on the
+    // six). The held wrenches are kept whitened (L^T J). A chain world's lanes all walk its order (alone), so its
+    // block's candidate passes take the group's lanes (team).
     const int team = alone ? STRIDE : 1, mine = alone ? lane : 0;
     const int bid = world * 2 + (kind >> 8);
     const wp::vec2i pair = blk_pair.data[bid];
@@ -636,22 +637,17 @@ _PAIR_BLOCK = """if ((kind & 16) != 0) {
     const wp::spatial_vector* bb = body_basis.data + (size_t)(fb >= 0 ? fb : fa) * 6;
     const wp::vec3 dd = blk_d.data[bid];
     const wp::spatial_matrix Lm = blk_L.data[bid];
-    float Li[6];
-    for (int i = 0; i < 6; ++i) Li[i] = 1.0f / Lm.data[i][i];
     float ta[6], tb[6];
     for (int k = 0; k < 6; ++k) { ta[k] = wp::dot(ba[k], ua); tb[k] = fb >= 0 ? wp::dot(bb[k], ub) : 0.0f; }
     const wp::vec3 wbd = wp::cross(wp::vec3(tb[3], tb[4], tb[5]), dd);
-    const float y[6] = {ta[0] - tb[0] - wbd[0], ta[1] - tb[1] - wbd[1], ta[2] - tb[2] - wbd[2],
-                        ta[3] - tb[3], ta[4] - tb[4], ta[5] - tb[5]};
-    float yh[6];
-    for (int i = 0; i < 6; ++i) {
-        float t = y[i];
-        for (int j = 0; j < i; ++j) t -= Lm.data[i][j] * yh[j];
-        yh[i] = t * Li[i];
+    wp::spatial_vector y;
+    for (int k = 0; k < 3; ++k) {
+        y[k] = ta[k] - tb[k] - wbd[k];
+        y[k + 3] = ta[k + 3] - tb[k + 3];
     }
+    wp::spatial_vector yh = RegionLaw::block_enter(Lm, y);
     const wp::spatial_vector Jn0 = blk_wrench.data[2 * bid], Jf0 = blk_wrench.data[2 * bid + 1];
-    float Jf[6];
-    for (int k = 0; k < 6; ++k) Jf[k] = Jf0[k];
+    wp::spatial_vector Jf = Jf0;
     const wp::vec4i blob = blk_blob.data[bid];
     float* const stage = blk_stage.data;
     const int* const istage = blk_istage.data;
@@ -664,14 +660,10 @@ _PAIR_BLOCK = """if ((kind & 16) != 0) {
     for (int base = 0; base < blob[1]; base += team) {
         bool live = false;
         if (base + mine < blob[1]) {
-            float* const Uj = stage + blob[0] + 44 * (base + mine);
-            if ((int)Uj[23] != 0) {
-                const int nc = (int)Uj[37], c0 = (int)Uj[42];
-                float load = 0.0f;
-                for (int i = 0; i < nc; ++i) load += stage[blob[2] + 12 * (c0 + i) + 8];
-                Uj[38] = load;
-                live = load > 0.0f || Uj[39] != 0.0f || Uj[40] != 0.0f || Uj[41] != 0.0f;
-            }
+            const int at = blob[0] + 44 * (base + mine);
+            const auto member = RegionLaw::block_load(blk_stage, at, blob[2]);
+            stage[at + 38] = member.v0;
+            live = member.v1;
         }
         unsigned bits = live ? 1u : 0u;
         if (team > 1) {
@@ -681,25 +673,20 @@ _PAIR_BLOCK = """if ((kind & 16) != 0) {
         while (bits != 0u) {
             const int m = base + FIRST(bits);
             bits &= bits - 1u;
-            float* const U = stage + blob[0] + 44 * m;
-            const int friction = (int)U[23];
-            wp::spatial_vector yv;
-            for (int k = 0; k < 6; ++k) yv[k] = yh[k];
-            const auto unit = RegionLaw::block_unit(blk_stage, blob[0] + 44 * m, yv, U[38]);
+            const int at = blob[0] + 44 * m;
+            const auto unit = RegionLaw::block_unit(blk_stage, at, yh, stage[at + 38]);
             const wp::vec3 phi = unit.v0;
-            for (int k = 0; k < 6; ++k) {
-                yh[k] += unit.v1[k];
-                Jf[k] += unit.v1[k];
-            }
+            yh = wp::add(yh, unit.v1);
+            Jf = wp::add(Jf, unit.v1);
             if (mine == 0) {
-                U[39] = phi[0];
-                U[40] = phi[1];
-                U[41] = phi[2];
-                const int row = istage[blob[0] + 44 * m];
+                stage[at + 39] = phi[0];
+                stage[at + 40] = phi[1];
+                stage[at + 41] = phi[2];
+                const int row = istage[at];
                 if (row >= 0) {
                     lambda[row] = phi[0];
                     lambda[row + 1] = phi[1];
-                    if (friction == 3) lambda[row + 2] = phi[2];
+                    if ((int)stage[at + 23] == 3) lambda[row + 2] = phi[2];
                 }
             }
             if (unit.v2) slid = true;
@@ -707,37 +694,28 @@ _PAIR_BLOCK = """if ((kind & 16) != 0) {
     }
     // The normals as one compliant block: their own impulses leave, Newton on the six coordinates; the candidates
     // over the team's lanes, the sums reduced over them.
-    float ys[6];
-    for (int k = 0; k < 6; ++k) ys[k] = yh[k] - Jn0[k];
+    const wp::spatial_vector ys = wp::sub(yh, Jn0);
     int last_count = -1, last_sum = 0, last_square = 0;
     for (int step = 0; step < 16; ++step) {
-        float S[21], q[6];
-        for (int k = 0; k < 21; ++k) S[k] = 0.0f;
-        for (int k = 0; k < 6; ++k) q[k] = 0.0f;
+        wp::spatial_matrix S;
+        wp::spatial_vector q;
         int count = 0, index_sum = 0, index_square = 0;
         for (int c = mine; c < blob[3]; c += team) {
-            float* const Z = stage + blob[2] + 12 * c;
-            float r = Z[6];
-            for (int k = 0; k < 6; ++k) r += Z[k] * yh[k];
-            float lam = 0.0f;
-            if (r < 0.0f) {
-                const float ie = 1.0f / Z[7];
-                lam = -r * ie;
-                int p = 0;
-                for (int a = 0; a < 6; ++a) {
-                    const float za = Z[a] * ie;
-                    for (int b = 0; b <= a; ++b) S[p++] += za * Z[b];
-                    q[a] += za * Z[6];
-                }
+            const int at = blob[2] + 12 * c;
+            const auto cand = RegionLaw::block_candidate(blk_stage, at, yh, S, q);
+            S = cand.v0;
+            q = cand.v1;
+            if (cand.v3) {
                 count += 1;
                 index_sum += c;
                 index_square += c * c;
             }
-            Z[8] = lam;
-            lambda[istage[blob[2] + 12 * c]] = lam;
+            stage[at + 8] = cand.v2;
+            lambda[istage[at]] = cand.v2;
         }
         if (team > 1) {
-            for (int k = 0; k < 21; ++k) SUM(S[k]);
+            for (int a = 0; a < 6; ++a)
+                for (int b = 0; b <= a; ++b) SUM(S.data[a][b]);
             for (int k = 0; k < 6; ++k) SUM(q[k]);
             SUM(count, index_sum, index_square);
         }
@@ -745,41 +723,12 @@ _PAIR_BLOCK = """if ((kind & 16) != 0) {
         last_count = count;
         last_sum = index_sum;
         last_square = index_square;
-        // (I + S) yh = ys - q by Cholesky (S packed lower by rows).
-        float Lc[21];
-        for (int a = 0; a < 6; ++a) {
-            for (int b = 0; b <= a; ++b) {
-                float t = S[a * (a + 1) / 2 + b] + (a == b ? 1.0f : 0.0f);
-                for (int k = 0; k < b; ++k) t -= Lc[a * (a + 1) / 2 + k] * Lc[b * (b + 1) / 2 + k];
-                Lc[a * (a + 1) / 2 + b] = a == b ? sqrtf(fmaxf(t, 1.0e-30f)) : t / Lc[b * (b + 1) / 2 + b];
-            }
-        }
-        float x[6];
-        for (int a = 0; a < 6; ++a) {
-            float t = ys[a] - q[a];
-            for (int k = 0; k < a; ++k) t -= Lc[a * (a + 1) / 2 + k] * x[k];
-            x[a] = t / Lc[a * (a + 1) / 2 + a];
-        }
-        for (int a = 5; a >= 0; --a) {
-            float t = x[a];
-            for (int k = a + 1; k < 6; ++k) t -= Lc[k * (k + 1) / 2 + a] * x[k];
-            x[a] = t / Lc[a * (a + 1) / 2 + a];
-        }
-        for (int k = 0; k < 6; ++k) yh[k] = x[k];
+        yh = RegionLaw::block_newton(S, q, ys);
     }
     if (team > 1) WARP_SYNC();
     // The held wrenches (whitened) and their change, back to the bodies: J = L^-T (L^T J).
-    float Jn[6], held[6], own[6], dJ[6];
-    for (int k = 0; k < 6; ++k) {
-        Jn[k] = yh[k] - ys[k];
-        held[k] = Jn[k] + Jf[k];
-        own[k] = held[k] - (Jn0[k] + Jf0[k]);
-    }
-    for (int i = 5; i >= 0; --i) {
-        float t = own[i];
-        for (int j = i + 1; j < 6; ++j) t -= Lm.data[j][i] * dJ[j];
-        dJ[i] = t * Li[i];
-    }
+    const auto leave = RegionLaw::block_leave(Lm, yh, ys, Jf, Jn0, Jf0);
+    const wp::spatial_vector held = leave.v1, own = leave.v2, dJ = leave.v3;
     const wp::vec3 dF(dJ[0], dJ[1], dJ[2]);
     const wp::vec3 dT = wp::add(wp::vec3(dJ[3], dJ[4], dJ[5]), wp::cross(dd, dF));
     const float dJb[6] = {dJ[0], dJ[1], dJ[2], dT[0], dT[1], dT[2]};
@@ -799,16 +748,12 @@ _PAIR_BLOCK = """if ((kind & 16) != 0) {
             body_seen.data[ff] = uu;
         }
     };
-    push_body(ua, ba, dJ, 1.0f, first_pa, fa, ver_a);
+    push_body(ua, ba, dJ.c, 1.0f, first_pa, fa, ver_a);
     if (fb >= 0) push_body(ub, bb, dJb, -1.0f, first_pb, fb, ver_b);
     v = wp::vec3(wp::dot(basis[0], u), wp::dot(basis[1], u), wp::dot(basis[2], u));
     w = wp::vec3(wp::dot(basis[3], u), wp::dot(basis[4], u), wp::dot(basis[5], u));
-    {
-        wp::spatial_vector held_n, held_f;
-        for (int k = 0; k < 6; ++k) { held_n[k] = Jn[k]; held_f[k] = Jf[k]; }
-        blk_wrench.data[2 * bid] = held_n;
-        blk_wrench.data[2 * bid + 1] = held_f;
-    }
+    blk_wrench.data[2 * bid] = leave.v0;
+    blk_wrench.data[2 * bid + 1] = Jf;
     bool changed = slid;
     for (int k = 0; k < 6; ++k) {
         changed = changed || own[k] != 0.0f;
