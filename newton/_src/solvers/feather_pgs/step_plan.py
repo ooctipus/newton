@@ -431,7 +431,7 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
     cut, factor, laws, placement, sweep = attrgetter("cut", "factor", "laws", "placement", "sweep")(solver)
     model, options, forest, diagnostics = solver.model, solver.options, spec.forest, spec.diagnostics
     articulated, particles, pure, warm = spec.articulated, spec.particles, spec.pure_forest, spec.laws.warm_start
-    v_hat, v_out, colored = solver.v_hat, solver.v_out, sweep.colored_units
+    v_hat, v_out, colored, rest = solver.v_hat, solver.v_out, sweep.colored_units, solver.sleep
     device, limited, preelimination = model.device, options.enable_joint_velocity_limits, spec.laws.preelimination
 
     # The drives' stage takes the held plan's coordinates (a one-coordinate tree's predict decides its own drive) and
@@ -552,9 +552,13 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
         (s5j, "start_velocity", True, (wp, "copy", v_out, v_hat)),
         (s5j, "build_colored_units", colored is not None, (sweep, "join_claims"), build),
         (s6, "solve", True, (sweep, "solve", v_hat, v_out)),
+        # The rest law (sleep.py): an asleep tree's solved velocity is zero.
+        (s6, "hold_asleep", rest is not None, (rest, "hold", v_out)),
         (dynamics, "audit_step", "audit" in diagnostics, (solver._audit, "launch")),
         # Stage 7: the finish (qdd, integration, publication), the carry the next step reads, the leave.
         (s7, "finish", True, (factor, "finish", STATE_IN, STATE_OUT, DT)),
+        # Each tree's quiet substeps, from the published velocities and the substep's contact forces.
+        (s7, "rest_test", rest is not None, (rest, "test", STATE_IN, STATE_OUT, CONTROL, CONTACTS, DT)),
         (call, "integrate_particles", particles, (solver, "integrate_particles", model, STATE_IN, STATE_OUT, DT)),
         # The carry: the patches' history, then under the warm start the contacts' normals and normal impulses.
         (s7p, "carry_patches", True, (sweep, "finish_patches", STATE_IN, STATE_OUT, CONTACTS, DT)),

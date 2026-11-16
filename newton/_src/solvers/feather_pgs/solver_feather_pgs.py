@@ -45,6 +45,7 @@ from .path_selection import applied_options, measurement_selection, route_select
 from .placement import Placement
 from .route_table import Pins, RouteRow
 from .rows import RowLaws
+from .sleep import Sleep
 from .step_plan import Capacities, Step, StepPlan, StepSpec
 from .sweep_plan import Sweep
 from .tree_factor import TreeFactor
@@ -581,6 +582,8 @@ class SolverFeatherPGS(SolverBase):
                 "dense": self.spec.classes.dense_size if support == "diagonal" else None,
             },
         )
+        # The rest law (sleep.py), where a tree can rest: its stages hold the asleep trees and count the quiet ones.
+        self.sleep = Sleep.build(self)
         # The step: its stages bound to the owners above from the spec and the route, the sweep's kernels and streams,
         # and its per-stage dispatch tables, which the route record reads.
         self._plan = StepPlan.build(self.spec, route, self)
@@ -723,6 +726,10 @@ class SolverFeatherPGS(SolverBase):
             # The mimics' coefficients and enable bits, of both representations (forest_plan.MimicRelations).
             self.laws.refresh_mimics(self.model)
         self.factor.notify_model_changed(flags, kinematic)
+        if self.sleep is not None and int(flags) != int(ModelFlags.JOINT_PROPERTIES):
+            # A changed model changes every tree's rest: the trees that never rest are read again and all wake. A
+            # fixed root's re-pose alone (the held tree's proof keeps the cached dynamics) moves no tree.
+            self.sleep.refresh()
         if flags & (
             ModelFlags.BODY_PROPERTIES
             | ModelFlags.BODY_INERTIAL_PROPERTIES
@@ -766,6 +773,8 @@ class SolverFeatherPGS(SolverBase):
         self.laws.friction_patches.reset(world_mask)
         self.factor.reset_cache(world_mask)
         self.sweep.clear_history(world_mask)
+        if self.sleep is not None:
+            self.sleep.wake(world_mask)
 
     def set_loop_joint_enabled(self, joint: int, enabled: bool) -> None:
         """Enable or disable the closure of a loop joint, of any type, at runtime.
@@ -814,6 +823,8 @@ class SolverFeatherPGS(SolverBase):
                 state changed. ``None`` invalidates every articulation.
         """
         self.factor.notify_state_changed(self.cut.trees(articulations))
+        if self.sleep is not None:
+            self.sleep.wake_articulations(self.cut.trees(articulations))
 
     def _allocate_common_buffers(self, model):
         arrays = self._arrays
@@ -891,6 +902,18 @@ class SolverFeatherPGS(SolverBase):
         if observables is not None and observables.is_requested(SolverBase.ObservableKind.CONTACT_F):
             self.sweep.forces(contacts, observables.contact_f)
         return state_out
+
+    def collision_sleep_filter(self) -> tuple[wp.array[wp.vec2i], wp.array2d[wp.int32]] | None:
+        """Return the shapes' sleep index and the live sleep state for
+        :meth:`~newton.CollisionPipeline.configure_sleep_filter`, or ``None`` where no tree can rest.
+
+        A tree rests (sleeps) once it has been quiet for a number of substeps: its kinetic energy under that of its
+        mass at 3 mm/s, its contacts sticking, and no drive gain, joint force or body wrench on it. Its contacts with
+        static, kinematic and asleep shapes are then not made, and its coordinates are held; it wakes at the pass
+        whose grown boxes join it to an awake body or a moving kinematic one, before its contacts are made, and at a
+        reset or a notified state write of its world. A tree joined to another by a loop or a mimic never rests.
+        """
+        return None if self.sleep is None else self.sleep.collision_sleep_filter()
 
     def constraint_capacity_status(self, *, clear: bool = False) -> dict[str, bool]:
         """Return sticky capacity-overflow flags without enabling row telemetry.
