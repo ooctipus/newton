@@ -56,6 +56,7 @@ from ..geometry.flags import MeshProperties, ShapeFlags
 from ..geometry.kernels import create_soft_contacts
 from ..geometry.narrow_phase import NarrowPhase
 from ..geometry.sdf_hydroelastic import HydroelasticSDF
+from ..geometry.sleep_filter import SleepFilter
 from ..geometry.soft_contacts_heightfield import _HEIGHTFIELD_CELLS_PER_TASK, launch_soft_heightfield_contacts
 from ..geometry.soft_contacts_mesh import (
     MeshContactData,
@@ -2895,6 +2896,8 @@ class CollisionPipeline:
         self._body_pair_reduction = body_pair_reduction
         self.requires_grad = requires_grad
         self.include_static_kinematic_pairs = include_static_kinematic_pairs
+        # A solver's sleep state, once bound (configure_sleep_filter).
+        self._sleep_filter: SleepFilter | None = None
         if include_immobile_pairs is None:
             immobile_filter = os.environ.get("NEWTON_BROAD_PHASE_IMMOBILE_FILTER")
             if immobile_filter not in (None, "0", "1"):
@@ -4539,6 +4542,32 @@ class CollisionPipeline:
         )
         return self.soft_contact_pair_count
 
+    def configure_sleep_filter(
+        self,
+        shape_sleep_index: wp.array[wp.vec2i],
+        tree_asleep: wp.array2d[wp.int32],
+    ) -> None:
+        """Bind a solver's sleep state, so every pass decides which resting trees it holds and makes no contact
+        between two held sides.
+
+        At each pass, between the broad and the narrow phase, the candidate pairs whose grown boxes overlap join
+        trees into islands; an island whose trees are all ready sleeps, and an asleep tree whose island holds an
+        awake tree that is not ready, or touches a moving kinematic body, wakes before its contacts are made
+        (:mod:`newton._src.geometry.sleep_filter`). Use the arrays of the solver's ``collision_sleep_filter()``.
+
+        Args:
+            shape_sleep_index: Each shape's ``(world, tree)``; ``(world, -1)`` for a static shape and
+                ``(world, -2)`` for a shape on a body the solver never holds. Shape ``(shape_count,)``.
+            tree_asleep: The solver's live sleep state, shape ``(world_count, trees)``: ``>= 0`` asleep, ``-1``
+                awake and ready to sleep, below ``-1`` awake.
+
+        Raises:
+            ValueError: If ``shape_sleep_index`` does not hold one entry per shape.
+        """
+        if shape_sleep_index.shape != (self.shape_count,):
+            raise ValueError("shape_sleep_index must have one entry per collision shape")
+        self._sleep_filter = SleepFilter(shape_sleep_index, tree_asleep, self.model.shape_body, self.device)
+
     def contacts(self) -> Contacts:
         """
         Allocate and return a new :class:`newton.Contacts` object for this pipeline.
@@ -5333,6 +5362,15 @@ class CollisionPipeline:
                 skip_count_zero=True,  # Already zeroed by compute_shape_aabbs
                 shape_displacement=self._shape_displacement if speculative_active else None,
                 forecast=forecast,
+            )
+        if self._sleep_filter is not None:
+            # Sleep and wake are decided before the narrow phase, so a woken tree's contacts are made in this pass.
+            self._sleep_filter.apply(
+                self.broad_phase_shape_pairs,
+                self.broad_phase_pair_count,
+                self.narrow_phase.shape_aabb_lower,
+                self.narrow_phase.shape_aabb_upper,
+                state.body_qd,
             )
 
         # Create ContactWriterData struct for custom contact writing
