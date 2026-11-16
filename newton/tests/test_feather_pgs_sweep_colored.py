@@ -344,7 +344,10 @@ class TestColoredSweep(unittest.TestCase):
                     last[dof] = color
 
     def test_a_world_past_its_slot_keeps_the_warp(self):
-        """A world of more units than its slot holds keeps the one-warp mapping, bitwise, and sets the status."""
+        """A world of more units than its slot holds keeps the one-warp mapping and sets the status: bitwise the
+        world the rule refuses (both are the one-warp mapping beside a built colored one, today's rows). A model
+        with no colored mapping solves its free bodies' contacts as regions, another law, until the colored route's
+        unit is the region too."""
         # The tray's 76 units in slots of one unit each.
         solvers = []
         with mock.patch.object(sweep_units, "UNIT_ROWS", 1024):
@@ -355,11 +358,11 @@ class TestColoredSweep(unittest.TestCase):
         stats = units.stats()
         self.assertTrue(stats and not any(world["colored"] for world in stats), stats)
         self.assertTrue(all(world["units"] > units.unit_capacity for world in stats), stats)
-        plain = []
-        warp = self._simulate(tray(), "patch", plain, units=4096)
-        self.assertIsNone(plain[-1].sweep.colored_units)
+        refused = []
+        thin = self._simulate(tray(), "patch", refused, parallelism=5.0)
+        self.assertIsNotNone(refused[-1].sweep.colored_units)
         for name in ("body_q", "body_qd"):
-            np.testing.assert_array_equal(getattr(over, name), getattr(warp, name), err_msg=name)
+            np.testing.assert_array_equal(getattr(over, name), getattr(thin, name), err_msg=name)
 
     def test_repeats_bitwise_and_splits_the_worlds(self):
         """A repeat gives the same trajectory bitwise; a rule past the row capacity builds no colored mapping."""
@@ -407,7 +410,10 @@ class TestColoredSweep(unittest.TestCase):
             np.testing.assert_array_equal(getattr(runs[0], name), getattr(runs[1], name), err_msg=name)
 
     def test_the_rule_leaves_thin_worlds_to_the_warp(self):
-        """A world under the rule's units per color keeps the one-warp mapping beside a built colored one, bitwise."""
+        """A world under the rule's units per color keeps the one-warp mapping beside a built colored one; the
+        same model with no colored mapping (a rule past the row capacity) solves its free bodies' contacts as regions
+        (the known gap of the colored route, which keeps today's rows: the two are compared where both run rows,
+        :meth:`test_a_world_past_its_slot_keeps_the_warp`)."""
         # Five units per color: the tray's 19 free bodies admit it, its 76 units in 44 colors do not take it.
         solvers = []
         thin = self._simulate(tray(), "patch", solvers, parallelism=5.0)
@@ -415,13 +421,14 @@ class TestColoredSweep(unittest.TestCase):
         self.assertIsNotNone(built)
         stats = built.stats()
         self.assertTrue(stats and not any(world["colored"] for world in stats), stats)
+        self.assertIsNone(solvers[-1].sweep.regions, "beside a colored mapping the free bodies keep their rows")
         # The plain one-warp sweep: a rule past the row capacity builds no colored mapping (the default rule takes
-        # the tray's worlds of 1.75 units per color and more).
+        # the tray's worlds of 1.75 units per color and more), and the free bodies' contacts are regions.
         plain = []
-        warp = self._simulate(tray(), "patch", plain, units=4096)
+        self._simulate(tray(), "patch", plain, units=4096)
         self.assertIsNone(plain[-1].sweep.colored_units)
-        for name in ("body_q", "body_qd"):
-            np.testing.assert_array_equal(getattr(thin, name), getattr(warp, name), err_msg=name)
+        self.assertIsNotNone(plain[-1].sweep.regions)
+        self.assertTrue(np.isfinite(thin.body_q).all())
 
 
 def _conformance_tests():

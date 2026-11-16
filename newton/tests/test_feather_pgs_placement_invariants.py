@@ -12,7 +12,7 @@ import warp as wp
 import newton
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_scenes as scenes
-from newton.tests.feather_pgs_law_harness import free_body_incident_gaps, incident_gaps
+from newton.tests.feather_pgs_law_harness import free_body_incident_gaps, incident_gaps, region_incident_gaps
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
 ROUNDING = 32 * 2.0**-24
@@ -23,8 +23,8 @@ FLOOR = 1.0e-9
 
 
 def _gaps(scene, device, steps, pins=None, solvers=None):
-    """Step ``scene`` (with the test ``pins``) and yield each step's dense and free-body gaps and terms; ``solvers``
-    collects the solver."""
+    """Step ``scene`` (with the test ``pins``) and yield each step's dense and free-body gaps and terms (the free
+    bodies' regions' candidates where their contacts are regions); ``solvers`` collects the solver."""
     model = scene.build(device)
     pipeline = newton.CollisionPipeline(model, growable_contacts=True)
     contacts = pipeline.contacts()
@@ -39,12 +39,15 @@ def _gaps(scene, device, steps, pins=None, solvers=None):
         state.clear_forces()
         pipeline.collide(state, contacts)
         solver.step(state, out, control, contacts, scene.dt)
-        yield incident_gaps(solver), free_body_incident_gaps(solver)
+        free = region_incident_gaps(solver) if solver.sweep.regions is not None else free_body_incident_gaps(solver)
+        yield incident_gaps(solver), free
         state, out = out, state
 
 
 def test_incident_is_the_whitened_rows_term(test, device):
-    """Hold the invariant on dense rows (a hand and its object) and free-body rows (a stack)."""
+    """Hold the invariant on dense rows (a hand and its object) and on the free bodies' rows (a stack): the rows'
+    stored terms, or, where the free bodies' contacts are regions, each candidate's row over its region's frame
+    (the law writes no free-body row: a candidate's incident is its record's right-hand side less its bias)."""
     for scene in (scenes.hand(), scenes.box_stack()):
         rows = 0
         for step, pairs in enumerate(_gaps(scene, device, 6)):

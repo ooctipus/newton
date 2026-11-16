@@ -23,6 +23,7 @@ from newton._src.solvers.feather_pgs import (
     field_group,
     law_source,
     projection_laws,
+    region_sweep,
     row_kernels,
     row_laws,
     spatial_laws,
@@ -1140,6 +1141,43 @@ def free_body_incident_gaps(solver) -> tuple[np.ndarray, np.ndarray]:
                 term = np.concatenate((term, Z[world, row] * walked[world, first : first + 6]))
             gaps[world, row] = abs(incident[world, row] - term.sum())
             terms[world, row] = np.abs(term).sum()
+    return gaps, terms
+
+
+def region_incident_gaps(solver) -> tuple[np.ndarray, np.ndarray]:
+    """:func:`free_body_incident_gaps` where the free bodies' contacts are regions (:mod:`.region_sweep`): each
+    candidate's incident velocity, its record's right-hand side less its row's bias (``cand[2] - rhs``), against
+    its row over the region's normal coordinates ``(1, a1, a2) . N`` with ``N`` the pair's twist in the region's
+    frame, each body's twist its basis over ``u_hat`` (:func:`_walked_coordinates`); and its terms' magnitude. Flat
+    arrays over the stream's candidates."""
+    regions = solver.sweep.regions
+    count, candidates = (int(v) for v in regions.cursor.numpy()[:2])
+    walked = _walked_coordinates(solver)
+    span, body, frame = regions.reg_cand.numpy(), regions.reg_body.numpy(), regions.reg_frame.numpy()
+    arm, arm_b, kind = regions.reg_arm.numpy(), regions.reg_arm_b.numpy(), regions.reg_kind.numpy()
+    basis, first, world = regions.body_basis.numpy(), regions.body_first.numpy(), regions.body_world.numpy()
+    cand, row = regions.cand.numpy().astype(np.float64), regions.cand_row.numpy()
+    rhs = solver.placement.rhs.numpy().reshape(-1).astype(np.float64)
+    gaps, terms = np.zeros(candidates), np.zeros(candidates)
+
+    def twist(f: int, r: np.ndarray, n: np.ndarray, t0: np.ndarray, t1: np.ndarray) -> np.ndarray:
+        u = walked[int(world[f]), int(first[f]) : int(first[f]) + 6]
+        b = basis[f].astype(np.float64)
+        v, w = b[:3] @ u, b[3:] @ u
+        return np.array([n @ (v + np.cross(w, r)), t0 @ w, t1 @ w])
+
+    for g in range(count):
+        n, t0, t1 = frame[g].astype(np.float64)
+        sign = -1.0 if kind[g] & int(region_sweep.KIND_SECOND) else 1.0
+        f, f_b = (int(v) for v in body[g])
+        N = twist(f, arm[g].astype(np.float64), n, t0, t1)
+        if f_b >= 0:
+            N = N - twist(f_b, arm_b[g].astype(np.float64), n, t0, t1)
+        N = sign * N
+        for i in range(int(span[g][0]), int(span[g][1])):
+            parts = np.array([1.0, cand[i, 0], cand[i, 1]]) * N
+            gaps[i] = abs(cand[i, 2] - rhs[row[i]] - parts.sum())
+            terms[i] = np.abs(parts).sum()
     return gaps, terms
 
 
