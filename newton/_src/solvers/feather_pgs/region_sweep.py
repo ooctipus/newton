@@ -403,8 +403,11 @@ def reset_bodies(
     body_open: wp.array[int],
     body_count: wp.array2d[int],
     body_regions: wp.array[wp.vec2i],
+    body_seen: wp.array[wp.spatial_vector],
+    body_version: wp.array[int],
 ):
-    """Each free body without a region and closed, and the stream empty, before a step's regions are listed."""
+    """Each free body without a region, closed and at rest in the sweeps' coordinates (its version zero), and the
+    stream empty, before a step's regions are listed."""
     f = wp.tid()
     if f < 4:
         cursor[f] = 0
@@ -413,6 +416,8 @@ def reset_bodies(
         for k in range(3):
             body_count[f, k] = 0
         body_regions[f] = wp.vec2i(0, 0)
+        body_seen[f] = wp.spatial_vector()
+        body_version[f] = 0
 
 
 @wp.kernel(enable_backward=False, module="unique")
@@ -794,7 +799,7 @@ _REGION_FIELDS = (
     ("reg_set", wp.vec3i, 1),
     ("reg_spring", wp.vec3, 1),
     ("reg_state", wp.int32, 1),
-    ("reg_seen", wp.spatial_vector, 2),
+    ("reg_stamp", wp.int32, 1),
 )
 """The regions' stream, by contact row of the pool: a region's record and state at its place, a candidate's at its
 own (no step holds more regions or candidates than contacts)."""
@@ -842,6 +847,8 @@ class Regions:
         self.body_open = wp.ones(count, dtype=wp.int32, device=device)
         self.body_count = wp.zeros((count, 3), dtype=wp.int32, device=device)
         self.body_cand = wp.zeros(count, dtype=wp.int32, device=device)
+        self.body_seen = wp.zeros(count, dtype=wp.spatial_vector, device=device)
+        self.body_version = wp.zeros(count, dtype=wp.int32, device=device)
         self.body_regions = wp.zeros(count, dtype=wp.vec2i, device=device)
         self.lanes = wp.zeros(count, dtype=wp.int32, device=device)
         self.cursor = wp.zeros(4, dtype=wp.int32, device=device)
@@ -878,7 +885,7 @@ class Regions:
         wp.launch(
             reset_bodies,
             dim=max(self.count, 4),
-            outputs=[self.cursor, self.body_open, self.body_count, self.body_regions],
+            outputs=[self.cursor, self.body_open, self.body_count, self.body_regions, self.body_seen, self.body_version],
             device=device,
         )
         if contacts is None or contacts.rigid_contact_count is None or contacts._rigid_contact_rows <= 0:
@@ -1050,7 +1057,8 @@ class Regions:
     def operands(self) -> dict:
         """The stream as the general sweep's region phase takes it (:data:`.sweep_routes.REGION_OPERANDS`)."""
         names = "world_regions body_first body_basis body_inertia reg_frame reg_arm reg_arm_b reg_body reg_cand reg_law"
-        names += " reg_bf reg_kind reg_row cand cand_row reg_wrench reg_phi reg_set reg_spring reg_state reg_seen"
+        names += " reg_bf reg_kind reg_row cand cand_row reg_wrench reg_phi reg_set reg_spring reg_state reg_stamp"
+        names += " body_seen body_version"
         return {**{name: getattr(self, name) for name in names.split()}, "region_cfm": float(self.options.pgs_cfm)}
 
 

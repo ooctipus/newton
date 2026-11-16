@@ -637,59 +637,113 @@ REGION_OPERANDS = (
     ("reg_set", wp.array[wp.vec3i]),
     ("reg_spring", wp.array[wp.vec3]),
     ("reg_state", wp.array[int]),
-    ("reg_seen", wp.array[wp.spatial_vector]),
+    ("reg_stamp", wp.array[int]),
+    ("body_seen", wp.array[wp.spatial_vector]),
+    ("body_version", wp.array[int]),
     ("region_cfm", float),
 )
 """The operands of a sweep that visits regions (:mod:`.region_sweep`'s stream): each world's open regions, each free
-body's first world coordinate, basis and inverse inertia, the regions' records, candidates and state (``reg_seen``:
-two a region, its bodies' walk coordinates as its last settled visit left them), the friction units' regularization."""
+body's first world coordinate, basis and inverse inertia, the regions' records, candidates and state, each open
+body's walk coordinates as its last visit or sweep left them with its version (``body_seen``, ``body_version``: the
+pass rule's; ``reg_stamp`` a region's second body's version at its last settled visit), the friction units'
+regularization."""
 
 
 def region_phase(pad: str = "        ") -> str:
-    """Native statements of a sweep's region phase: the world's open regions (those a dense row, a speed row or a
-    second movable body touches; :func:`.region_sweep.fill_regions`) in their order, each by the one visit
-    (:func:`.region_laws.region_visit`), on the world's velocity change in walk coordinates (``s_v``), by the
-    world's first lane.
+    """Native statements of a sweep's region phase: the world's open regions (those of a free body that a dense row,
+    a speed row or a region between two movable bodies touches; :func:`.region_sweep.fill_regions`), body by body in
+    their order, each by the one visit (:func:`.region_laws.region_visit`), on the world's velocity change in walk
+    coordinates (``s_v``), by the world's first lane.
 
-    A region's bodies' twists are their bases' of their walk coordinates, its response the sum of its bodies'
-    (:func:`.region_laws.frame_response`), and its wrench's change returns through the bases. The pass rule is
-    exact: a region that holds a wrench and whose last visit settled it is passed while its bodies' walk coordinates
-    have the bits that visit left; one that holds nothing is opened only if a candidate closes at its bodies' twist.
-    A visit votes for another sweep by the exit law: a coordinate of the region whose own change is past the floor
-    (:data:`.solve_policy.QUIET`) of its terms."""
+    The regions follow each other by their first body. That body's twist is formed once from its walk coordinates
+    through its basis and kept until a visit changes it; a region between two movable bodies reads its second
+    body's the same way where it is visited. A region's response is the sum of its bodies'
+    (:func:`.region_laws.frame_response`), and its wrench's change returns through their bases.
+
+    The pass rule is exact, by a version a body: the version is raised whenever a bit of the body's walk coordinates
+    differs from those its last visit, or its last sweep, left (``body_seen``). A region that holds a wrench and
+    whose last visit settled it is stamped with its bodies' versions (``reg_state`` its first body's, ``reg_stamp``
+    its second's) and passed while both stand; one that holds nothing is opened only if a candidate closes at its
+    bodies' twists. A visit votes for another sweep by the exit law: a coordinate of the region whose own change is
+    past the floor (:data:`.solve_policy.QUIET`) of its terms."""
+    gather = """const wp::spatial_vector seen = body_seen.data[{f}];
+bool same = true;
+for (int k = 0; k < 6; ++k) {{
+    {u}[k] = s_v[{first} + k];
+    same = same && {u}[k] == seen[k];
+}}
+{version} = body_version.data[{f}];
+if (!same) {{
+    {version} += 1;
+    body_version.data[{f}] = {version};
+    body_seen.data[{f}] = {u};
+}}"""
+    push = """bool moved = false;
+for (int k = 0; k < 6; ++k) {{
+    const float now = {u}[k] {op} sign * ({basis}[0][k] * {wrench}.v0[0] + {basis}[1][k] * {wrench}.v0[1] + {basis}[2][k] * {wrench}.v0[2]
+                                     + {basis}[3][k] * {wrench}.v1[0] + {basis}[4][k] * {wrench}.v1[1] + {basis}[5][k] * {wrench}.v1[2]);
+    moved = moved || now != {u}[k];
+    {u}[k] = now;
+    s_v[{first} + k] = now;
+}}
+if (moved) {{
+    {version} += 1;
+    body_version.data[{f}] = {version};
+    body_seen.data[{f}] = {u};
+}}"""
+    first_body = indent(gather.format(f="f", u="u", first="first", version="version"), "            ")
+    second_body = indent(gather.format(f="f_b", u="u_b", first="first_b", version="version_b"), "            ")
+    push_a = indent(push.format(u="u", op="+", basis="basis", wrench="push", first="first", version="version", f="f"), "            ")
+    push_b = indent(
+        push.format(u="u_b", op="-", basis="basis_b", wrench="push_b", first="first_b", version="version_b", f="f_b"),
+        "            ",
+    )
     text = f"""SYNC();
 if (lane == 0) {{
     const wp::vec2i region_span = world_regions.data[world];
+    int body = -1, first = 0, version = 0;
+    wp::spatial_vector u;
+    wp::vec3 v, w;
+    const wp::spatial_vector* basis = body_basis.data;
+    const wp::mat33* inertia = body_inertia.data;
     for (int g = region_span[0]; g < region_span[1]; ++g) {{
         const wp::vec2i sides = reg_body.data[g];
-        const int kind = reg_kind.data[g];
-        const float sign = (kind & {int(KIND_SECOND)}) != 0 ? -1.0f : 1.0f;
-        const int first_a = body_first.data[sides[0]];
-        const int first_b = sides[1] >= 0 ? body_first.data[sides[1]] : -1;
-        wp::spatial_vector u_a, u_b;
-        for (int k = 0; k < 6; ++k) {{
-            u_a[k] = s_v[first_a + k];
-            u_b[k] = first_b >= 0 ? s_v[first_b + k] : 0.0f;
+        const int f = sides[0], f_b = sides[1];
+        if (f != body) {{
+            // The next first body: its walk coordinates, its version and its twist.
+            body = f;
+            first = body_first.data[f];
+            basis = body_basis.data + (size_t)f * 6;
+            inertia = body_inertia.data + (size_t)f * 3;
+            {{
+{first_body}
+            }}
+            v = wp::vec3(wp::dot(basis[0], u), wp::dot(basis[1], u), wp::dot(basis[2], u));
+            w = wp::vec3(wp::dot(basis[3], u), wp::dot(basis[4], u), wp::dot(basis[5], u));
+        }}
+        // A region between two movable bodies: its second body's walk coordinates and version.
+        int first_b = -1, version_b = 0;
+        wp::spatial_vector u_b;
+        const wp::spatial_vector* basis_b = basis;
+        if (f_b >= 0) {{
+            first_b = body_first.data[f_b];
+            basis_b = body_basis.data + (size_t)f_b * 6;
+            {{
+{second_body}
+            }}
         }}
         const int state = reg_state.data[g];
-        if (state >= 0) {{
-            const wp::spatial_vector seen_a = reg_seen.data[2 * g], seen_b = reg_seen.data[2 * g + 1];
-            bool same = true;
-            for (int k = 0; k < 6; ++k) same = same && u_a[k] == seen_a[k] && u_b[k] == seen_b[k];
-            if (same) continue;
-        }}
-        const wp::spatial_vector* const basis_a = body_basis.data + (size_t)sides[0] * 6;
-        const wp::spatial_vector* const basis_b = body_basis.data + (size_t)(sides[1] >= 0 ? sides[1] : sides[0]) * 6;
-        const wp::vec3 v_a(wp::dot(basis_a[0], u_a), wp::dot(basis_a[1], u_a), wp::dot(basis_a[2], u_a));
-        const wp::vec3 w_a(wp::dot(basis_a[3], u_a), wp::dot(basis_a[4], u_a), wp::dot(basis_a[5], u_a));
+        if (state == version && (f_b < 0 || reg_stamp.data[g] == version_b)) continue;
+        const int kind = reg_kind.data[g];
+        const float sign = (kind & {int(KIND_SECOND)}) != 0 ? -1.0f : 1.0f;
         const wp::mat33 frame = reg_frame.data[g];
         const wp::vec3 n(frame.data[0][0], frame.data[0][1], frame.data[0][2]);
         const wp::vec3 t0(frame.data[1][0], frame.data[1][1], frame.data[1][2]);
         const wp::vec3 t1(frame.data[2][0], frame.data[2][1], frame.data[2][2]);
-        const wp::vec3 arm_a = reg_arm.data[g], arm_b = reg_arm_b.data[g];
-        const auto twist_a = RegionLaw::frame_twist(v_a, w_a, arm_a, n, t0, t1);
-        wp::vec3 sn = wp::mul(twist_a.v0, sign), sf = wp::mul(twist_a.v1, sign);
-        if (first_b >= 0) {{
+        const wp::vec3 arm = reg_arm.data[g], arm_b = reg_arm_b.data[g];
+        const auto twist = RegionLaw::frame_twist(v, w, arm, n, t0, t1);
+        wp::vec3 sn = wp::mul(twist.v0, sign), sf = wp::mul(twist.v1, sign);
+        if (f_b >= 0) {{
             const wp::vec3 v_b(wp::dot(basis_b[0], u_b), wp::dot(basis_b[1], u_b), wp::dot(basis_b[2], u_b));
             const wp::vec3 w_b(wp::dot(basis_b[3], u_b), wp::dot(basis_b[4], u_b), wp::dot(basis_b[5], u_b));
             const auto twist_b = RegionLaw::frame_twist(v_b, w_b, arm_b, n, t0, t1);
@@ -705,39 +759,35 @@ if (lane == 0) {{
             }}
             if (!closes) continue;
         }}
-        const wp::mat33* const inertia_a = body_inertia.data + (size_t)sides[0] * 3;
-        auto response = RegionLaw::frame_response(inertia_a[0], inertia_a[1], inertia_a[2], arm_a, n, t0, t1);
-        if (first_b >= 0) {{
-            const wp::mat33* const inertia_b = body_inertia.data + (size_t)sides[1] * 3;
+        auto response = RegionLaw::frame_response(inertia[0], inertia[1], inertia[2], arm, n, t0, t1);
+        if (f_b >= 0) {{
+            const wp::mat33* const inertia_b = body_inertia.data + (size_t)f_b * 3;
             const auto other = RegionLaw::frame_response(inertia_b[0], inertia_b[1], inertia_b[2], arm_b, n, t0, t1);
             response.v0 = wp::add(response.v0, other.v0);
             response.v1 = wp::add(response.v1, other.v1);
             response.v2 = wp::add(response.v2, other.v2);
         }}
         const wp::vec2 law = reg_law.data[g];
+        const wp::vec3 rhs_f = reg_bf.data[g];
         const wp::vec3 wrench_old = reg_wrench.data[g], phi_old = reg_phi.data[g];
         const wp::vec3i set_old = reg_set.data[g];
         const auto out = RegionLaw::region_visit(
-            sn, sf, response.v0, response.v1, response.v2, region_cfm, reg_bf.data[g], law[0], law[1],
+            sn, sf, response.v0, response.v1, response.v2, region_cfm, rhs_f, law[0], law[1],
             kind & {int(FRICTION_ROWS)}, cand, span[0], span[1], wrench_old, phi_old, set_old[0], set_old[1], set_old[2],
             reg_spring.data[g], {REGION_TOLERANCE!r}f);
         // The change of the region's wrench through its bodies' bases.
         const wp::vec3 d_wrench = wp::sub(out.v0, wrench_old), d_phi = wp::sub(out.v1, phi_old);
-        const auto push_a = RegionLaw::frame_wrench(d_wrench, d_phi, arm_a, n, t0, t1);
-        for (int k = 0; k < 6; ++k) {{
-            const float change = sign * (basis_a[0][k] * push_a.v0[0] + basis_a[1][k] * push_a.v0[1] + basis_a[2][k] * push_a.v0[2]
-                                         + basis_a[3][k] * push_a.v1[0] + basis_a[4][k] * push_a.v1[1] + basis_a[5][k] * push_a.v1[2]);
-            u_a[k] += change;
-            s_v[first_a + k] = u_a[k];
-        }}
-        if (first_b >= 0) {{
-            const auto push_b = RegionLaw::frame_wrench(d_wrench, d_phi, arm_b, n, t0, t1);
-            for (int k = 0; k < 6; ++k) {{
-                const float change = sign * (basis_b[0][k] * push_b.v0[0] + basis_b[1][k] * push_b.v0[1] + basis_b[2][k] * push_b.v0[2]
-                                             + basis_b[3][k] * push_b.v1[0] + basis_b[4][k] * push_b.v1[1] + basis_b[5][k] * push_b.v1[2]);
-                u_b[k] -= change;
-                s_v[first_b + k] = u_b[k];
+        {{
+            const auto push = RegionLaw::frame_wrench(d_wrench, d_phi, arm, n, t0, t1);
+{push_a}
+            if (moved) {{
+                v = wp::vec3(wp::dot(basis[0], u), wp::dot(basis[1], u), wp::dot(basis[2], u));
+                w = wp::vec3(wp::dot(basis[3], u), wp::dot(basis[4], u), wp::dot(basis[5], u));
             }}
+        }}
+        if (f_b >= 0) {{
+            const auto push_b = RegionLaw::frame_wrench(d_wrench, d_phi, arm_b, n, t0, t1);
+{push_b}
         }}
         // The exit law's vote: a coordinate of the region whose own change is past the floor of its terms (its
         // velocity, its right-hand side, what the region's wrench holds of it).
@@ -747,7 +797,6 @@ if (lane == 0) {{
             const wp::vec3 own_f = wp::add(wp::mul(coupling, d_wrench), wp::mul(response.v2, d_phi));
             const wp::vec3 held_n = wp::add(wp::mul(response.v0, out.v0), wp::mul(response.v1, out.v1));
             const wp::vec3 held_f = wp::add(wp::mul(coupling, out.v0), wp::mul(response.v2, out.v1));
-            const wp::vec3 rhs_f = reg_bf.data[g];
             for (int k = 0; k < 3; ++k) {{
                 if (!(fabsf(own_n[k]) <= {QUIET_LITERAL} * (fabsf(sn[k]) + fabsf(held_n[k])))) iteration_changed = 1;
                 if (!(fabsf(own_f[k]) <= {QUIET_LITERAL} * (fabsf(sf[k]) + fabsf(rhs_f[k]) + fabsf(held_f[k]))))
@@ -779,15 +828,8 @@ if (lane == 0) {{
         reg_phi.data[g] = out.v1;
         reg_set.data[g] = wp::vec3i(out.v2, out.v3, out.v4);
         reg_spring.data[g] = out.v6;
-        if (out.v8 == {int(REGION_SLIDE)}) {{
-            reg_state.data[g] = {int(REGION_LOOSE)};
-        }} else if (out.v0[0] > 0.0f) {{
-            reg_state.data[g] = 0;
-            reg_seen.data[2 * g] = u_a;
-            reg_seen.data[2 * g + 1] = u_b;
-        }} else {{
-            reg_state.data[g] = {int(REGION_IDLE)};
-        }}
+        reg_state.data[g] = out.v8 == {int(REGION_SLIDE)} ? {int(REGION_LOOSE)} : out.v0[0] > 0.0f ? version : {int(REGION_IDLE)};
+        reg_stamp.data[g] = version_b;
     }}
 }}
 SYNC();"""
