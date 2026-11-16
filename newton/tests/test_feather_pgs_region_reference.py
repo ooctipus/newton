@@ -152,6 +152,32 @@ class TestRegionBlock(unittest.TestCase):
         _, states, _ = ref.solve([centred], 6, 1)
         np.testing.assert_allclose(states[0].lam, GRAVITY * DT / (eps + 4.0 / MASS), rtol=1e-12)
 
+    def test_compliant_block_as_newton_on_the_velocity(self):
+        """The form a kernel takes for compliant candidates (a sum over the candidates and one solve in the
+        velocity's coordinates a step) returns the block's solve, with the friction unit held and free, in a few
+        steps however many candidates close."""
+        rng = np.random.default_rng(5)
+        points = np.column_stack([rng.uniform(-HALF, HALF, size=(13, 2)), np.full(13, -HALF)])
+        normals = np.tile(UP, (13, 1))
+        rows = ref.body_rows(MASS, INERTIA, points, normals)
+        unit = box_on_ground(FALL, STILL).unit
+        most_steps, most_closing = 0, 0
+        for trial in range(60):
+            rhs = point_speed(points, normals, FALL * rng.uniform(0.2, 3.0), rng.normal(size=3) * 0.3) + rng.uniform(
+                -0.01, 0.02, size=13
+            )
+            region = ref.Region(rows, rhs, rng.uniform(0.05, 2.0, size=13), unit)
+            start = rng.normal(size=6) * 0.02
+            metric = ref.held_metric(unit, 6) if trial % 2 else np.eye(6)
+            lam, velocity, _, bounded = ref.candidates_block(region, start, metric)
+            newton_lam, newton_velocity, steps = ref.compliant_block(region, start, metric)
+            self.assertTrue(bounded)
+            np.testing.assert_allclose(newton_velocity, velocity, atol=1e-13)
+            np.testing.assert_allclose(newton_lam, lam, atol=1e-13)
+            most_steps, most_closing = max(most_steps, steps), max(most_closing, int((lam > 0.0).sum()))
+        self.assertLessEqual(most_steps, 6)
+        self.assertGreater(most_closing, 6)
+
     def test_rigid_and_compliant_candidates_in_one_region(self):
         region = box_on_ground(FALL, np.array([0.1, 0.25, 0.0]), mu=5.0)
         region.eps[:2] = 0.5
@@ -177,7 +203,9 @@ class TestRegionBlock(unittest.TestCase):
             free_linear = FALL * rng.uniform(0.2, 3.0) + np.append(rng.normal(size=2) * 0.01, 0.0)
             free_angular = rng.normal(size=3) * 0.3
             rhs = point_speed(points, normals, free_linear, free_angular) + rng.uniform(0.0, 0.02, size=13)
-            unit.rhs[:] = np.append(point_speed(np.tile(ANCHOR, (2, 1)), TANGENTS, free_linear, free_angular), free_angular @ UP)
+            unit.rhs[:] = np.append(
+                point_speed(np.tile(ANCHOR, (2, 1)), TANGENTS, free_linear, free_angular), free_angular @ UP
+            )
             region = ref.Region(rows, rhs, np.zeros(13), unit)
             velocity, states, log = ref.solve([region], 6, 1)
             if log[0] != ["stick"]:

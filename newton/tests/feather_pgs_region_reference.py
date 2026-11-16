@@ -167,6 +167,42 @@ def candidates_block(region: Region, start: np.ndarray, metric: np.ndarray, warm
     return lam, start + metric @ (Z.T @ lam), steps, bounded
 
 
+def compliant_block(region: Region, start: np.ndarray, metric: np.ndarray, max_steps: int = 60):
+    """:func:`candidates_block` for a region whose candidates are all compliant, in the form a kernel takes: Newton on
+    the velocity, a sum over the candidates a step. A compliant candidate that closes at ``v`` holds
+    ``lam = -(z . v + b) / eps``, so with ``C`` the closing candidates the block is
+    ``(I + K S) v = start - K q``, ``S = sum_C z z^T / eps``, ``q = sum_C z b / eps``: one pass over the candidates
+    and one solve in the velocity's coordinates, however many candidates close. The step is exact once the closing
+    set stands at its own solution; before that it is shortened to lower the block's energy
+    ``1/2 |v - start|^2 + 1/2 sum max(0, -(z . v + b))^2 / eps``, which the solution minimizes.
+    Returns ``(lam, velocity, steps)``."""
+    Z, rhs, eps = region.rows, region.rhs, region.eps
+    identity = np.eye(len(start))
+
+    def energy(v):
+        closing_speed = np.minimum(Z @ v + rhs, 0.0)
+        return 0.5 * float((v - start) @ (v - start)) + 0.5 * float((closing_speed * closing_speed / eps).sum())
+
+    velocity = start.copy()
+    steps = 0
+    while steps < max_steps:
+        steps += 1
+        closing = Z @ velocity + rhs < 0.0
+        rows = Z[closing]
+        S = (rows.T / eps[closing]) @ rows
+        q = rows.T @ (rhs[closing] / eps[closing])
+        target = np.linalg.solve(identity + metric @ S, start - metric @ q)
+        if np.array_equal(Z @ target + rhs < 0.0, closing):
+            velocity = target
+            break
+        share, before = 1.0, energy(velocity)
+        while share > 1.0e-12 and energy(velocity + share * (target - velocity)) > before:
+            share *= 0.5
+        velocity = velocity + share * (target - velocity)
+    speed = Z @ velocity + rhs
+    return np.where(speed < 0.0, -speed / eps, 0.0), velocity, steps
+
+
 def cone_law(unit: FrictionUnit, residual: np.ndarray, old: np.ndarray, load: float) -> np.ndarray:
     """The unit's block at a fixed load: the minimizer of ``1/2 d^T G d + residual . d`` over the impulses
     ``old + d`` in the elliptic cone ``|impulse / coef| <= load`` (``projection_laws.friction_triple``, exactly)."""
