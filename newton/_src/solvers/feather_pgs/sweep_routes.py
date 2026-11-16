@@ -616,6 +616,230 @@ def coordinate_levels(
     return marks, phase, skip
 
 
+_PAIR_BLOCK = """if ((kind & 16) != 0) {
+    // The group's block over its six relative coordinates y = t_a - P t_b, whitened by W = L L^T
+    // (yh = L^-1 y), from its staged records (region_sweep.stage_blocks): each member's friction unit by the region
+    // law's cone law at the load its region holds, then every member candidate's normal as one compliant block (the
+    // region law's closing springs, Newton on the six). The held wrenches are kept whitened (L^T J). A chain world's
+    // lanes all walk its order (alone), so its block's candidate passes take the group's lanes (team).
+    const int team = alone ? STRIDE : 1, mine = alone ? lane : 0;
+    const int bid = world * 2 + (kind >> 8);
+    const wp::vec2i pair = blk_pair.data[bid];
+    const bool flip = pair[0] != f;
+    wp::spatial_vector& ua = flip ? u_b : u;
+    wp::spatial_vector& ub = flip ? u : u_b;
+    int& ver_a = flip ? version_b : version;
+    int& ver_b = flip ? version : version_b;
+    const int fa = pair[0], fb = pair[1];
+    const int first_pa = flip ? first_b : first, first_pb = flip ? first : first_b;
+    const wp::spatial_vector* ba = body_basis.data + (size_t)fa * 6;
+    const wp::spatial_vector* bb = body_basis.data + (size_t)(fb >= 0 ? fb : fa) * 6;
+    const wp::vec3 dd = blk_d.data[bid];
+    const wp::spatial_matrix Lm = blk_L.data[bid];
+    float Li[6];
+    for (int i = 0; i < 6; ++i) Li[i] = 1.0f / Lm.data[i][i];
+    float ta[6], tb[6];
+    for (int k = 0; k < 6; ++k) { ta[k] = wp::dot(ba[k], ua); tb[k] = fb >= 0 ? wp::dot(bb[k], ub) : 0.0f; }
+    const wp::vec3 wbd = wp::cross(wp::vec3(tb[3], tb[4], tb[5]), dd);
+    const float y[6] = {ta[0] - tb[0] - wbd[0], ta[1] - tb[1] - wbd[1], ta[2] - tb[2] - wbd[2],
+                        ta[3] - tb[3], ta[4] - tb[4], ta[5] - tb[5]};
+    float yh[6];
+    for (int i = 0; i < 6; ++i) {
+        float t = y[i];
+        for (int j = 0; j < i; ++j) t -= Lm.data[i][j] * yh[j];
+        yh[i] = t * Li[i];
+    }
+    const wp::spatial_vector Jn0 = blk_wrench.data[2 * bid], Jf0 = blk_wrench.data[2 * bid + 1];
+    float Jf[6];
+    for (int k = 0; k < 6; ++k) Jf[k] = Jf0[k];
+    const wp::vec4i blob = blk_blob.data[bid];
+    float* const stage = blk_stage.data;
+    const int* const istage = blk_istage.data;
+    float* const lambda = world_impulses.data;
+    bool slid = false;
+    if (team > 1) WARP_SYNC();
+    // The units, member by member, at the loads the members hold (each the sum of its candidates' impulses): the
+    // team's lanes read a batch of members at once (their loads, whether they hold anything), then take the batch's
+    // live members in order.
+    for (int base = 0; base < blob[1]; base += team) {
+        bool live = false;
+        if (base + mine < blob[1]) {
+            float* const Uj = stage + blob[0] + 44 * (base + mine);
+            if ((int)Uj[23] != 0) {
+                const int nc = (int)Uj[37], c0 = (int)Uj[42];
+                float load = 0.0f;
+                for (int i = 0; i < nc; ++i) load += stage[blob[2] + 12 * (c0 + i) + 8];
+                Uj[38] = load;
+                live = load > 0.0f || Uj[39] != 0.0f || Uj[40] != 0.0f || Uj[41] != 0.0f;
+            }
+        }
+        unsigned bits = live ? 1u : 0u;
+        if (team > 1) {
+            bits = BALLOT(live);
+            WARP_SYNC();
+        }
+        while (bits != 0u) {
+            const int m = base + FIRST(bits);
+            bits &= bits - 1u;
+            float* const U = stage + blob[0] + 44 * m;
+            const int friction = (int)U[23];
+            const float load = U[38];
+            const wp::vec3 phi_old(U[39], U[40], U[41]);
+            float s0 = U[18], s1 = U[19], s2 = 0.0f;
+            for (int k = 0; k < 6; ++k) { s0 += U[k] * yh[k]; s1 += U[6 + k] * yh[k]; }
+            if (friction == 3) {
+                s2 = U[20];
+                for (int k = 0; k < 6; ++k) s2 += U[12 + k] * yh[k];
+            }
+            const float mu = U[21], mu_t = U[22];
+            const wp::mat33 M(U[25], U[26], U[27], U[28], U[29], U[30], U[31], U[32], U[33]);
+            wp::vec3 phi;
+            if (mu_t > 0.0f)
+                phi = ConeLaw::friction_triple_from_metric(wp::vec3(U[34], U[35], U[36]), M, wp::vec3(s0, s1, s2),
+                                                           phi_old, mu, mu_t, load, 1.0f);
+            else
+                phi = ConeLaw::friction_triple(M, wp::vec3(s0, s1, s2), phi_old, mu, mu_t, load, 1.0f);
+            const float e0 = phi[0] - phi_old[0], e1 = phi[1] - phi_old[1], e2 = phi[2] - phi_old[2];
+            for (int k = 0; k < 6; ++k) {
+                const float push = U[k] * e0 + U[6 + k] * e1 + U[12 + k] * e2;
+                yh[k] += push;
+                Jf[k] += push;
+            }
+            if (mine == 0) {
+                U[39] = phi[0];
+                U[40] = phi[1];
+                U[41] = phi[2];
+                const int row = istage[blob[0] + 44 * m];
+                if (row >= 0) {
+                    lambda[row] = phi[0];
+                    lambda[row + 1] = phi[1];
+                    if (friction == 3) lambda[row + 2] = phi[2];
+                }
+            }
+            const float sx = phi[0] / mu, sy = phi[1] / mu, sz = mu_t > 0.0f ? phi[2] / mu_t : 0.0f;
+            if (load > 0.0f && sx * sx + sy * sy + sz * sz >= load * load * (1.0f - 1.0e-5f)) slid = true;
+        }
+    }
+    // The normals as one compliant block: their own impulses leave, Newton on the six coordinates; the candidates
+    // over the team's lanes, the sums reduced over them.
+    float ys[6];
+    for (int k = 0; k < 6; ++k) ys[k] = yh[k] - Jn0[k];
+    int last_count = -1, last_sum = 0, last_square = 0;
+    for (int step = 0; step < 16; ++step) {
+        float S[21], q[6];
+        for (int k = 0; k < 21; ++k) S[k] = 0.0f;
+        for (int k = 0; k < 6; ++k) q[k] = 0.0f;
+        int count = 0, index_sum = 0, index_square = 0;
+        for (int c = mine; c < blob[3]; c += team) {
+            float* const Z = stage + blob[2] + 12 * c;
+            float r = Z[6];
+            for (int k = 0; k < 6; ++k) r += Z[k] * yh[k];
+            float lam = 0.0f;
+            if (r < 0.0f) {
+                const float ie = 1.0f / Z[7];
+                lam = -r * ie;
+                int p = 0;
+                for (int a = 0; a < 6; ++a) {
+                    const float za = Z[a] * ie;
+                    for (int b = 0; b <= a; ++b) S[p++] += za * Z[b];
+                    q[a] += za * Z[6];
+                }
+                count += 1;
+                index_sum += c;
+                index_square += c * c;
+            }
+            Z[8] = lam;
+            lambda[istage[blob[2] + 12 * c]] = lam;
+        }
+        if (team > 1) {
+            for (int k = 0; k < 21; ++k) SUM(S[k]);
+            for (int k = 0; k < 6; ++k) SUM(q[k]);
+            SUM(count, index_sum, index_square);
+        }
+        if (count == last_count && index_sum == last_sum && index_square == last_square) break;
+        last_count = count;
+        last_sum = index_sum;
+        last_square = index_square;
+        // (I + S) yh = ys - q by Cholesky (S packed lower by rows).
+        float Lc[21];
+        for (int a = 0; a < 6; ++a) {
+            for (int b = 0; b <= a; ++b) {
+                float t = S[a * (a + 1) / 2 + b] + (a == b ? 1.0f : 0.0f);
+                for (int k = 0; k < b; ++k) t -= Lc[a * (a + 1) / 2 + k] * Lc[b * (b + 1) / 2 + k];
+                Lc[a * (a + 1) / 2 + b] = a == b ? sqrtf(fmaxf(t, 1.0e-30f)) : t / Lc[b * (b + 1) / 2 + b];
+            }
+        }
+        float x[6];
+        for (int a = 0; a < 6; ++a) {
+            float t = ys[a] - q[a];
+            for (int k = 0; k < a; ++k) t -= Lc[a * (a + 1) / 2 + k] * x[k];
+            x[a] = t / Lc[a * (a + 1) / 2 + a];
+        }
+        for (int a = 5; a >= 0; --a) {
+            float t = x[a];
+            for (int k = a + 1; k < 6; ++k) t -= Lc[k * (k + 1) / 2 + a] * x[k];
+            x[a] = t / Lc[a * (a + 1) / 2 + a];
+        }
+        for (int k = 0; k < 6; ++k) yh[k] = x[k];
+    }
+    if (team > 1) WARP_SYNC();
+    // The held wrenches (whitened) and their change, back to the bodies: J = L^-T (L^T J).
+    float Jn[6], held[6], own[6], dJ[6];
+    for (int k = 0; k < 6; ++k) {
+        Jn[k] = yh[k] - ys[k];
+        held[k] = Jn[k] + Jf[k];
+        own[k] = held[k] - (Jn0[k] + Jf0[k]);
+    }
+    for (int i = 5; i >= 0; --i) {
+        float t = own[i];
+        for (int j = i + 1; j < 6; ++j) t -= Lm.data[j][i] * dJ[j];
+        dJ[i] = t * Li[i];
+    }
+    const wp::vec3 dF(dJ[0], dJ[1], dJ[2]);
+    const wp::vec3 dT = wp::add(wp::vec3(dJ[3], dJ[4], dJ[5]), wp::cross(dd, dF));
+    const float dJb[6] = {dJ[0], dJ[1], dJ[2], dT[0], dT[1], dT[2]};
+    auto push_body = [&](wp::spatial_vector& uu, const wp::spatial_vector* bs, const float* J, const float sgn,
+                         const int fst, const int ff, int& ver) {
+        bool moved = false;
+        for (int k = 0; k < 6; ++k) {
+            const float now = uu[k] + sgn * (bs[0][k] * J[0] + bs[1][k] * J[1] + bs[2][k] * J[2]
+                                             + bs[3][k] * J[3] + bs[4][k] * J[4] + bs[5][k] * J[5]);
+            moved = moved || now != uu[k];
+            uu[k] = now;
+            s_v[fst + k] = now;
+        }
+        if (moved) {
+            ver += 1;
+            body_version.data[ff] = ver;
+            body_seen.data[ff] = uu;
+        }
+    };
+    push_body(ua, ba, dJ, 1.0f, first_pa, fa, ver_a);
+    if (fb >= 0) push_body(ub, bb, dJb, -1.0f, first_pb, fb, ver_b);
+    v = wp::vec3(wp::dot(basis[0], u), wp::dot(basis[1], u), wp::dot(basis[2], u));
+    w = wp::vec3(wp::dot(basis[3], u), wp::dot(basis[4], u), wp::dot(basis[5], u));
+    {
+        wp::spatial_vector held_n, held_f;
+        for (int k = 0; k < 6; ++k) { held_n[k] = Jn[k]; held_f[k] = Jf[k]; }
+        blk_wrench.data[2 * bid] = held_n;
+        blk_wrench.data[2 * bid + 1] = held_f;
+    }
+    bool changed = slid;
+    for (int k = 0; k < 6; ++k) {
+        changed = changed || own[k] != 0.0f;
+        if (!(fabsf(own[k]) <= QUIET_ * (fabsf(yh[k]) + fabsf(held[k])))) iteration_changed = 1;
+    }
+    // Settled only by a visit that changed nothing (the units read the loads the normals leave).
+    reg_state.data[g] = changed ? (-1) : version;
+    reg_stamp.data[g] = version_b;
+    if (team > 1) WARP_SYNC();
+    continue;
+}
+"""
+"""The native visit of a group's block (:func:`.region_sweep.form_blocks`), at the region that stands for it; ``QUIET_``
+stands for the exit law's floor."""
+
+
 REGION_OPERANDS = (
     ("world_regions", wp.array[wp.vec2i]),
     ("world_levels", wp.array[int]),
@@ -652,6 +876,13 @@ REGION_OPERANDS = (
     ("reg_stamp", wp.array[int]),
     ("body_seen", wp.array[wp.spatial_vector]),
     ("body_version", wp.array[int]),
+    ("blk_pair", wp.array[wp.vec2i]),
+    ("blk_blob", wp.array[wp.vec4i]),
+    ("blk_L", wp.array[wp.spatial_matrix]),
+    ("blk_d", wp.array[wp.vec3]),
+    ("blk_wrench", wp.array[wp.spatial_vector]),
+    ("blk_stage", wp.array[float]),
+    ("blk_istage", wp.array[int]),
     ("region_cfm", float),
 )
 """The operands of a sweep that visits regions (:mod:`.region_sweep`'s stream): each world's open regions, each free
@@ -719,6 +950,7 @@ if (moved) {{
         "            ",
     )
     parallelism = repr(float(sweep_units.COLORED_RULE.parallelism))
+    pair_block = indent(_PAIR_BLOCK.replace("QUIET_", QUIET_LITERAL), "        ")
     text = f"""SYNC();
 {{
     const wp::vec2i region_span = world_regions.data[world];
@@ -726,7 +958,9 @@ if (moved) {{
     // The colored rule's measure (sweep_units.COLORED_RULE): a world whose levels hold fewer regions than its
     // parallelism, a chain, is walked by its first lane in the order the levels were made from, a body's twist kept
     // from one region to the next of the same body; the others' levels take the lanes. Both are the same sweep.
-    const bool alone = (float)(region_span[1] - region_span[0]) < {parallelism}f * (float)levels;
+    const int kept_end = levels > 0 ? level_end.data[region_span[0] + levels - 1] : region_span[0];
+    const bool alone = (float)(kept_end - region_span[0]) < {parallelism}f * (float)levels;
+    // A chain world's lanes all walk its order, each doing the same work (a block's candidate passes split over them).
     const int stride = alone ? 1 : STRIDE;
     int level_first = region_span[0];
     int body = -1, first = 0, version = 0;
@@ -737,8 +971,9 @@ if (moved) {{
     // span; the others take the levels.
     const int spans = alone ? 1 : levels;
     for (int level = 0; level < spans; ++level) {{
-    const int level_last = alone ? region_span[1] : level_end.data[region_span[0] + level];
-    for (int place = level_first + lane; lane < stride && place < level_last; place += stride) {{
+    const int level_last = alone ? kept_end : level_end.data[region_span[0] + level];
+    for (int place = level_first + (alone ? 0 : lane); place < level_last; place += stride) {{
+        if (alone) WARP_SYNC();
         const int g = alone ? reg_order.data[place] : level_region.data[place];
         const wp::vec2i sides = reg_body.data[g];
         const int f = sides[0], f_b = sides[1];
@@ -767,6 +1002,7 @@ if (moved) {{
         const int state = reg_state.data[g];
         if (state == version && (f_b < 0 || reg_stamp.data[g] == version_b)) continue;
         const int kind = reg_kind.data[g];
+{pair_block}
         const float sign = (kind & {int(KIND_SECOND)}) != 0 ? -1.0f : 1.0f;
         const wp::mat33 frame = reg_frame.data[g];
         const wp::vec3 n(frame.data[0][0], frame.data[0][1], frame.data[0][2]);

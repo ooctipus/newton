@@ -27,6 +27,7 @@ import numpy as np
 import warp as wp
 
 from ...core.contact_pool import ContactField
+from ...geometry.flags import ShapeFlags
 from .contact_input import ContactInput, contact_frame
 from .device_preludes import dual_native
 from .factor.walk import FREE_BODY_WALK, WALK_COORDINATE, WALK_LINK, WalkTrees, walk_down_prelude
@@ -57,11 +58,34 @@ KIND_SPRINGS = wp.constant(4)
 """The bit of a region's kind that says a candidate of it is compliant."""
 KIND_SECOND = wp.constant(8)
 """The bit of a region's kind that says its listed body is the pair's second (its twist enters with a minus)."""
+KIND_BLOCK = wp.constant(16)
+"""The bit of a region's kind that says it stands for its pair's block (:func:`form_blocks`): its visit is the pair's."""
+KIND_MEMBER = wp.constant(32)
+"""The bit of a region's kind that says it is visited by its pair's block, not on its own."""
+BLOCK_SHIFT = wp.constant(8)
+"""A block region's kind holds its block's place among its world's blocks from this bit on."""
+PAIR_BLOCKS = wp.constant(2)
+"""Blocks a world holds at most (its table's slots); a group past them keeps its regions."""
+STAGE_UNIT = wp.constant(44)
+"""Words of a block member's staged record (:func:`stage_blocks`): its unit's whitened rows (18), right-hand sides
+(3), ``mu``, ``mu_t``, rows (1), the cone law's block or metric (9 + 3), its candidates' count, its load and its
+friction (state, 1 + 3), two spare."""
+STAGE_CAND = wp.constant(12)
+"""Words of a block candidate's staged record: its whitened row (6), right-hand side, compliance, impulse (state),
+three spare. A block's members' records come first (``STAGE_UNIT`` words each), then its candidates'."""
+STAGE_WORDS = 1 << 23
+"""The staged blocks' arena [words] (32 MB), allocated where a shape authors its material; a block that does not fit is
+not formed and ``blk_cursor[1]`` says so."""
 
 REGION_TOLERANCE = 1.0e-7
 """The closing threshold [m/s]: a candidate closes when its residual is below minus this."""
 
 _BIG = wp.constant(1 << 30)
+
+BLOCK_CLOSING = 6
+"""A group of regions (a pair of movable bodies, or a body against immovable partners) whose regions closing at the
+predictor outnumber this, its relative coordinates, over-determines them: with every candidate compliant it is one
+block (:func:`form_blocks`)."""
 
 _THREAD_CAP = 1 << 20
 """Lanes of the kernels that stride over the contacts or the regions, at most."""
@@ -879,17 +903,295 @@ def fill_regions(
 
 
 @wp.kernel(enable_backward=False, module="unique")
+def form_blocks(
+    world_regions: wp.array[wp.vec2i],
+    world_free_start: wp.array[int],
+    world_free: wp.array[int],
+    reg_body: wp.array[wp.vec2i],
+    reg_arm: wp.array[wp.vec3],
+    reg_arm_b: wp.array[wp.vec3],
+    body_inertia: wp.array2d[wp.mat33],
+    least: int,
+    reg_cand: wp.array[wp.vec2i],
+    cand: wp.array[wp.vec4],
+    tol: float,
+    capacity: int,
+    body_level: wp.array[int],
+    blk_count: wp.array2d[int],
+    blk_cursor: wp.array[int],
+    blk_blob: wp.array[wp.vec4i],
+    blk_head: wp.array[int],
+    reg_stage: wp.array[wp.vec3i],
+    reg_kind: wp.array[int],
+    blk_pair: wp.array[wp.vec2i],
+    blk_L: wp.array[wp.spatial_matrix],
+    blk_d: wp.array[wp.vec3],
+    blk_wrench: wp.array[wp.spatial_vector],
+):
+    """A world's groups (a pair of movable bodies, or a body against immovable partners) with more than ``least``
+    regions closing at the predictor (a candidate's gap term below ``-tol``; ``least`` the group's six relative
+    coordinates: its rows then over-determine them), every candidate compliant, as blocks (the
+    largest first, :data:`PAIR_BLOCKS` at most), a thread a world: the pair's first region in the stream stands for
+    the block (:data:`KIND_BLOCK`), the others are its members (:data:`KIND_MEMBER`). A block's pair ``(a, b)``, the
+    bodies' origins' offset ``d = o_a - o_b``, the factor ``L`` of the pair's relative response
+    ``W = A_a + P A_b P^T`` (``P`` moves b's twist to a's origin; ``W = L L^T``, lower) and its held wrenches (normal,
+    friction; zero). ``blk_count`` counts a world's pairs by its bodies' places (``body_level`` holds them here); a
+    world of more free bodies than its table's side lists no block."""
+    world = wp.tid()
+    for k in range(PAIR_BLOCKS):
+        blk_pair[world * PAIR_BLOCKS + k] = wp.vec2i(-1, -1)
+        blk_wrench[2 * (world * PAIR_BLOCKS + k)] = wp.spatial_vector()
+        blk_wrench[2 * (world * PAIR_BLOCKS + k) + 1] = wp.spatial_vector()
+    span = world_regions[world]
+    s = span[0]
+    e = span[1]
+    f0 = world_free_start[world]
+    side = int(16)
+    if e - s <= least or world_free_start[world + 1] - f0 > side:
+        return
+    for i in range(f0, world_free_start[world + 1]):
+        body_level[world_free[i]] = i - f0
+    for c in range(side * side):
+        blk_count[world, c] = 0
+    rigid = int(1 << 20)
+    for g in range(s, e):
+        sides = reg_body[g]
+        la = body_level[sides[0]]
+        lb = la
+        if sides[1] >= 0:
+            lb = body_level[sides[1]]
+        cell = wp.min(la, lb) * side + wp.max(la, lb)
+        # A region counts where a candidate of it closes at the predictor (its gap term).
+        add = int(0)
+        span_c = reg_cand[g]
+        for i in range(span_c[0], span_c[1]):
+            if cand[i][2] < -tol:
+                add = 1
+        if (reg_kind[g] & KIND_SPRINGS) == 0:
+            add = rigid
+        blk_count[world, cell] = blk_count[world, cell] + add
+    for k in range(PAIR_BLOCKS):
+        best = int(least)
+        best_cell = int(-1)
+        for c in range(side * side):
+            count = blk_count[world, c]
+            if count < rigid and count > best:
+                best = count
+                best_cell = c
+        if best_cell < 0:
+            break
+        blk_count[world, best_cell] = 0
+        # Its staged records' words, taken from the arena.
+        words = int(0)
+        regions = int(0)
+        candidates = int(0)
+        for g in range(s, e):
+            sides = reg_body[g]
+            la = body_level[sides[0]]
+            lb = la
+            if sides[1] >= 0:
+                lb = body_level[sides[1]]
+            if wp.min(la, lb) * side + wp.max(la, lb) == best_cell:
+                span_c = reg_cand[g]
+                regions += 1
+                candidates += span_c[1] - span_c[0]
+        words = STAGE_UNIT * regions + STAGE_CAND * candidates
+        at = wp.atomic_add(blk_cursor, 0, words)
+        if at + words > capacity:
+            blk_cursor[1] = 1
+            break
+        best_g = int(-1)
+        members = int(0)
+        first_cand = int(0)
+        for g in range(s, e):
+            sides = reg_body[g]
+            la = body_level[sides[0]]
+            lb = la
+            if sides[1] >= 0:
+                lb = body_level[sides[1]]
+            if wp.min(la, lb) * side + wp.max(la, lb) == best_cell:
+                reg_stage[g] = wp.vec3i(at + STAGE_UNIT * members, world * PAIR_BLOCKS + k, first_cand)
+                members += 1
+                span_m = reg_cand[g]
+                first_cand += span_m[1] - span_m[0]
+                if best_g < 0:
+                    best_g = g
+                    reg_kind[g] = reg_kind[g] | KIND_BLOCK | (k << BLOCK_SHIFT)
+                else:
+                    reg_kind[g] = reg_kind[g] | KIND_MEMBER | (k << BLOCK_SHIFT)
+        blk_blob[world * PAIR_BLOCKS + k] = wp.vec4i(at, members, at + STAGE_UNIT * members, first_cand)
+        blk_head[world * PAIR_BLOCKS + k] = best_g
+        sides = reg_body[best_g]
+        # A body against immovable partners is the pair (a, -1): W = A_a.
+        a = sides[0]
+        b = sides[1]
+        if b >= 0:
+            a = wp.min(sides[0], sides[1])
+            b = wp.max(sides[0], sides[1])
+        d = wp.vec3(0.0, 0.0, 0.0)
+        Wvv = body_inertia[a, 0]
+        Wvw = body_inertia[a, 1]
+        Www = body_inertia[a, 2]
+        if b >= 0:
+            d = reg_arm_b[best_g] - reg_arm[best_g]
+            if sides[0] != a:
+                d = -d
+            # W = A_a + P A_b P^T, P = [[I, -[d]x], [0, I]].
+            X = wp.skew(d)
+            Bvv = body_inertia[b, 0]
+            Bvw = body_inertia[b, 1]
+            Bww = body_inertia[b, 2]
+            Pvv = Bvv - X * wp.transpose(Bvw) - Bvw * wp.transpose(X) + X * Bww * wp.transpose(X)
+            Pvw = Bvw - X * Bww
+            Wvv = Wvv + Pvv
+            Wvw = Wvw + Pvw
+            Www = Www + Bww
+        Wm = wp.spatial_matrix()
+        for i in range(3):
+            for j in range(3):
+                Wm[i, j] = Wvv[i, j]
+                Wm[i, j + 3] = Wvw[i, j]
+                Wm[i + 3, j] = Wvw[j, i]
+                Wm[i + 3, j + 3] = Www[i, j]
+        Lm = wp.spatial_matrix()
+        for j in range(6):
+            t = Wm[j, j]
+            for k2 in range(j):
+                t -= Lm[j, k2] * Lm[j, k2]
+            ljj = wp.sqrt(wp.max(t, 1.0e-30))
+            Lm[j, j] = ljj
+            for i in range(j + 1, 6):
+                t2 = Wm[i, j]
+                for k2 in range(j):
+                    t2 -= Lm[i, k2] * Lm[j, k2]
+                Lm[i, j] = t2 / ljj
+        blk_pair[world * PAIR_BLOCKS + k] = wp.vec2i(a, b)
+        blk_L[world * PAIR_BLOCKS + k] = Lm
+        blk_d[world * PAIR_BLOCKS + k] = d
+
+
+@wp.kernel(enable_backward=False, module="unique")
+def stage_blocks(
+    cursor: wp.array[int],
+    threads: int,
+    reg_stage: wp.array[wp.vec3i],
+    blk_blob: wp.array[wp.vec4i],
+    blk_pair: wp.array[wp.vec2i],
+    blk_L: wp.array[wp.spatial_matrix],
+    reg_body: wp.array[wp.vec2i],
+    reg_kind: wp.array[int],
+    reg_frame: wp.array[wp.mat33],
+    reg_arm: wp.array[wp.vec3],
+    reg_arm_b: wp.array[wp.vec3],
+    reg_cand: wp.array[wp.vec2i],
+    reg_law: wp.array[wp.vec2],
+    reg_bf: wp.array[wp.vec3],
+    reg_row: wp.array[int],
+    reg_wff: wp.array[wp.mat33],
+    reg_ball_values: wp.array[wp.vec3],
+    reg_ball_vectors: wp.array[wp.mat33],
+    cand: wp.array[wp.vec4],
+    cand_row: wp.array[int],
+    cfm: float,
+    blk_stage: wp.array[float],
+    blk_istage: wp.array[int],
+):
+    """Each block member staged at its place in its block's arena words (``reg_stage``: the place and the block,
+    :func:`form_blocks`), ``threads`` lanes striding over the stream's listed regions (``cursor[0]``): the member's record
+    (:data:`STAGE_UNIT`: its unit's rows whitened by the pair's factor, ``L^T f`` for ``f = sigma [(t0, r x t0),
+    (t1, r x t1), (0, n)]`` about a's origin, their right-hand sides, the cone law's block (``G`` plus ``cfm``) or
+    metric, no load, no friction), then its candidates' (:data:`STAGE_CAND`: ``L^T j`` for
+    ``j = sigma (n, r x n + a1 t0 + a2 t1)``, the right-hand side, the compliance); their impulse rows
+    at the same words of ``blk_istage``."""
+    if cursor[3] != 0:
+        return
+    for g in range(wp.tid(), cursor[0], threads):
+        kind = reg_kind[g]
+        if (kind & (KIND_BLOCK | KIND_MEMBER)) == 0:
+            continue
+        where = reg_stage[g]
+        off = where[0]
+        pair = blk_pair[where[1]]
+        Lt = wp.transpose(blk_L[where[1]])
+        frame = reg_frame[g]
+        n = frame[0]
+        t0 = frame[1]
+        t1 = frame[2]
+        sg = float(1.0)
+        if (kind & KIND_SECOND) != 0:
+            sg = -1.0
+        r = reg_arm[g]
+        if reg_body[g][0] != pair[0]:
+            r = reg_arm_b[g]
+            sg = -sg
+        c0 = wp.cross(r, t0)
+        c1 = wp.cross(r, t1)
+        h0 = Lt * wp.spatial_vector(sg * t0[0], sg * t0[1], sg * t0[2], sg * c0[0], sg * c0[1], sg * c0[2])
+        h1 = Lt * wp.spatial_vector(sg * t1[0], sg * t1[1], sg * t1[2], sg * c1[0], sg * c1[1], sg * c1[2])
+        h2 = Lt * wp.spatial_vector(0.0, 0.0, 0.0, sg * n[0], sg * n[1], sg * n[2])
+        for k in range(6):
+            blk_stage[off + k] = h0[k]
+            blk_stage[off + 6 + k] = h1[k]
+            blk_stage[off + 12 + k] = h2[k]
+        friction = kind & FRICTION_ROWS
+        bf = reg_bf[g]
+        law = reg_law[g]
+        blk_stage[off + 18] = bf[0]
+        blk_stage[off + 19] = bf[1]
+        blk_stage[off + 20] = bf[2]
+        blk_stage[off + 21] = law[0]
+        blk_stage[off + 22] = law[1]
+        blk_stage[off + 23] = float(friction)
+        M = reg_ball_vectors[g]
+        values = reg_ball_values[g]
+        if law[1] <= 0.0:
+            G = reg_wff[g]
+            M = G
+            if friction < 3:
+                M = wp.mat33(G[0, 0], G[0, 1], 0.0, G[1, 0], G[1, 1], 0.0, 0.0, 0.0, 1.0)
+            M = M + wp.mat33(cfm, 0.0, 0.0, 0.0, cfm, 0.0, 0.0, 0.0, cfm)
+            values = wp.vec3(0.0, 0.0, 0.0)
+        for i in range(3):
+            for j in range(3):
+                blk_stage[off + 25 + 3 * i + j] = M[i, j]
+            blk_stage[off + 34 + i] = values[i]
+        span_c = reg_cand[g]
+        blk_stage[off + 37] = float(span_c[1] - span_c[0])
+        blk_stage[off + 38] = 0.0
+        blk_stage[off + 39] = 0.0
+        blk_stage[off + 40] = 0.0
+        blk_stage[off + 41] = 0.0
+        blk_stage[off + 42] = float(where[2])
+        blk_istage[off] = reg_row[g]
+        rn = wp.cross(r, n)
+        at = blk_blob[where[1]][2] + STAGE_CAND * where[2]
+        for i in range(span_c[0], span_c[1]):
+            rec = cand[i]
+            ang = rn + t0 * rec[0] + t1 * rec[1]
+            z = Lt * wp.spatial_vector(sg * n[0], sg * n[1], sg * n[2], sg * ang[0], sg * ang[1], sg * ang[2])
+            for k in range(6):
+                blk_stage[at + k] = z[k]
+            blk_stage[at + 6] = rec[2]
+            blk_stage[at + 7] = rec[3]
+            blk_stage[at + 8] = 0.0
+            blk_istage[at] = cand_row[i]
+            at += STAGE_CAND
+
+
+@wp.kernel(enable_backward=False, module="unique")
 def level_regions(
     world_regions: wp.array[wp.vec2i],
     world_free_start: wp.array[int],
     world_free: wp.array[int],
     reg_body: wp.array[wp.vec2i],
+    reg_kind: wp.array[int],
     body_level: wp.array[int],
     reg_level: wp.array[int],
     reg_order: wp.array[int],
     level_end: wp.array[int],
     level_region: wp.array[int],
     world_levels: wp.array[int],
+    blk_members: wp.array[wp.vec2i],
 ):
     """A world's open regions in their order from the free end down (the contact graph's), by the exact levels of
     that order, a thread a world.
@@ -908,23 +1210,26 @@ def level_regions(
     span = world_regions[world]
     s = span[0]
     e = span[1]
+    for k in range(PAIR_BLOCKS):
+        blk_members[world * PAIR_BLOCKS + k] = wp.vec2i(0, 0)
     if e <= s:
         world_levels[world] = 0
         return
     far = int(1 << 29)
+    # A block's members (form_blocks) leave the order: the region that stands for the block takes their place.
     # The depths: relaxed over the regions until they stand (each pass takes them in the stream's order).
     for i in range(world_free_start[world], world_free_start[world + 1]):
         body_level[world_free[i]] = far
     for g in range(s, e):
         sides = reg_body[g]
-        if sides[1] < 0:
+        if sides[1] < 0 and (reg_kind[g] & KIND_MEMBER) == 0:
             body_level[sides[0]] = 1
     changed = int(1)
     while changed != 0:
         changed = int(0)
         for g in range(s, e):
             sides = reg_body[g]
-            if sides[1] >= 0:
+            if sides[1] >= 0 and (reg_kind[g] & KIND_MEMBER) == 0:
                 a = body_level[sides[0]]
                 b = body_level[sides[1]]
                 if b < far and b + 1 < a:
@@ -936,6 +1241,8 @@ def level_regions(
     deepest = int(0)
     unreached = int(0)
     for g in range(s, e):
+        if (reg_kind[g] & KIND_MEMBER) != 0:
+            continue
         sides = reg_body[g]
         depth = body_level[sides[0]]
         if sides[1] >= 0:
@@ -950,23 +1257,39 @@ def level_regions(
     top = deepest + unreached
     for k in range(top):
         level_end[s + k] = 0
+    kept = int(0)
     for g in range(s, e):
+        if (reg_kind[g] & KIND_MEMBER) != 0:
+            continue
         reg_level[g] = top - wp.min(reg_level[g], deepest + 1)
         level_end[s + reg_level[g]] += 1
+        kept += 1
     at = s
     for k in range(top):
         count = level_end[s + k]
         level_end[s + k] = at
         at += count
     for g in range(s, e):
+        if (reg_kind[g] & KIND_MEMBER) != 0:
+            continue
         place = level_end[s + reg_level[g]]
         reg_order[place] = g
         level_end[s + reg_level[g]] = place + 1
+    # The members after the order, block by block, in the stream's order.
+    at = s + kept
+    for k in range(PAIR_BLOCKS):
+        m0 = at
+        for g in range(s, e):
+            kind = reg_kind[g]
+            if (kind & KIND_MEMBER) != 0 and (kind >> BLOCK_SHIFT) == k:
+                reg_order[at] = g
+                at += 1
+        blk_members[world * PAIR_BLOCKS + k] = wp.vec2i(m0, at)
     # The levels of that order.
     for i in range(world_free_start[world], world_free_start[world + 1]):
         body_level[world_free[i]] = 0
     levels = int(0)
-    for p in range(s, e):
+    for p in range(s, s + kept):
         g = reg_order[p]
         sides = reg_body[g]
         level = body_level[sides[0]]
@@ -979,14 +1302,14 @@ def level_regions(
         levels = wp.max(levels, level + 1)
     for level in range(levels):
         level_end[s + level] = 0
-    for p in range(s, e):
+    for p in range(s, s + kept):
         level_end[s + reg_level[reg_order[p]]] += 1
     at = s
     for level in range(levels):
         count = level_end[s + level]
         level_end[s + level] = at
         at += count
-    for p in range(s, e):
+    for p in range(s, s + kept):
         g = reg_order[p]
         place = level_end[s + reg_level[g]]
         level_region[place] = g
@@ -1031,6 +1354,7 @@ _REGION_FIELDS = (
     ("reg_order", wp.int32, 1),
     ("level_region", wp.int32, 1),
     ("level_end", wp.int32, 1),
+    ("reg_stage", wp.vec3i, 1),
 )
 """The regions' stream, by contact row of the pool: a region's record and state at its place, a candidate's at its
 own (no step holds more regions or candidates than contacts)."""
@@ -1091,6 +1415,22 @@ class Regions:
         self.world_regions = wp.zeros(worlds, dtype=wp.vec2i, device=device)
         self.world_levels = wp.zeros(worlds, dtype=wp.int32, device=device)
         self.body_level = wp.zeros(max(count, 1), dtype=wp.int32, device=device)
+        blocks = worlds * int(PAIR_BLOCKS)
+        self.blk_pair = wp.full(blocks, wp.vec2i(-1, -1), dtype=wp.vec2i, device=device)
+        self.blk_members = wp.zeros(blocks, dtype=wp.vec2i, device=device)
+        self.blk_L = wp.zeros(blocks, dtype=wp.spatial_matrix, device=device)
+        self.blk_d = wp.zeros(blocks, dtype=wp.vec3, device=device)
+        self.blk_wrench = wp.zeros(2 * blocks, dtype=wp.spatial_vector, device=device)
+        # Blocks are the law of compliant candidates only: a model whose shapes author no material lists none.
+        flags = model.shape_flags.numpy() if model.shape_count else np.zeros(0, dtype=np.int32)
+        self.blocks = bool((flags & int(ShapeFlags.CONTACT_MATERIAL)).any())
+        self.blk_count = wp.zeros((worlds if self.blocks else 1, 256), dtype=wp.int32, device=device)
+        self.blk_cursor = wp.zeros(2, dtype=wp.int32, device=device)
+        self.blk_blob = wp.zeros(blocks, dtype=wp.vec4i, device=device)
+        self.blk_head = wp.zeros(blocks, dtype=wp.int32, device=device)
+        words = STAGE_WORDS if self.blocks else 1
+        self.blk_stage = wp.zeros(words, dtype=wp.float32, device=device)
+        self.blk_istage = wp.zeros(words, dtype=wp.int32, device=device)
         lines = int(placement.impulses.shape[0])
         self.row_contact = wp.zeros((lines, int(placement.mf_max_constraints)), dtype=wp.int32, device=device)
         self.capacity = 0
@@ -1246,10 +1586,44 @@ class Regions:
             ],
             **live,
         )
+        if self.blocks:
+            self.blk_cursor.zero_()
+            wp.launch(
+                form_blocks,
+                dim=forest.world_count,
+                inputs=[
+                    self.world_regions,
+                    self.world_free_start,
+                    self.world_free,
+                    self.reg_body,
+                    self.reg_arm,
+                    self.reg_arm_b,
+                    self.body_inertia,
+                    BLOCK_CLOSING,
+                    self.reg_cand,
+                    self.cand,
+                    REGION_TOLERANCE,
+                    int(self.blk_stage.shape[0]),
+                ],
+                outputs=[
+                    self.body_level,
+                    self.blk_count,
+                    self.blk_cursor,
+                    self.blk_blob,
+                    self.blk_head,
+                    self.reg_stage,
+                    self.reg_kind,
+                    self.blk_pair,
+                    self.blk_L,
+                    self.blk_d,
+                    self.blk_wrench,
+                ],
+                device=device,
+            )
         wp.launch(
             level_regions,
             dim=forest.world_count,
-            inputs=[self.world_regions, self.world_free_start, self.world_free, self.reg_body],
+            inputs=[self.world_regions, self.world_free_start, self.world_free, self.reg_body, self.reg_kind],
             outputs=[
                 self.body_level,
                 self.reg_level,
@@ -1257,9 +1631,40 @@ class Regions:
                 self.level_end,
                 self.level_region,
                 self.world_levels,
+                self.blk_members,
             ],
             device=device,
         )
+        if self.blocks:
+            pool.launch(
+                stage_blocks,
+                threads,
+                inputs=[
+                    self.cursor,
+                    threads,
+                    self.reg_stage,
+                    self.blk_blob,
+                    self.blk_pair,
+                    self.blk_L,
+                    self.reg_body,
+                    self.reg_kind,
+                    self.reg_frame,
+                    self.reg_arm,
+                    self.reg_arm_b,
+                    self.reg_cand,
+                    self.reg_law,
+                    self.reg_bf,
+                    self.reg_row,
+                    self.reg_wff,
+                    self.reg_ball_values,
+                    self.reg_ball_vectors,
+                    self.cand,
+                    self.cand_row,
+                    float(self.options.pgs_cfm),
+                ],
+                outputs=[self.blk_stage, self.blk_istage],
+                **live,
+            )
 
     def sweep_closed(self, du: wp.array) -> None:
         """The closed bodies' sweeps (:func:`sweep_closed_bodies`), a lane a free body: each adds its body's change to
@@ -1350,7 +1755,7 @@ class Regions:
         names += " reg_frame reg_arm reg_arm_b reg_body reg_cand reg_law reg_wnn reg_wnf reg_wff reg_ball_values"
         names += " reg_ball_vectors reg_ginv reg_k reg_lk reg_lw"
         names += " reg_bf reg_kind reg_row cand cand_row reg_wrench reg_phi reg_set reg_spring reg_state reg_stamp"
-        names += " body_seen body_version"
+        names += " body_seen body_version blk_pair blk_blob blk_L blk_d blk_wrench blk_stage blk_istage"
         return {**{name: getattr(self, name) for name in names.split()}, "region_cfm": float(self.options.pgs_cfm)}
 
 
