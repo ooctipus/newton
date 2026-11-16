@@ -39,15 +39,19 @@ def tangent_basis(n):
 class Bodies:
     """Synthetic free bodies with their regions: the kernel's stream and the reference's regions."""
 
-    def __init__(self, count: int, compliance: int, seed: int):
+    def __init__(self, count: int, compliance: int, seed: int, light: bool = False):
+        """``light``: parts of 5 to 50 g with gyration radii of 2 to 6 mm and their regions' candidates within a
+        patch of 0.1 to 0.6 mm (a screw or a nut on a hardware pile), where the region's tilt response is 1e4 to
+        1e6 times its normal one."""
         rng = np.random.default_rng(seed)
         self.count = count
         self.spans, self.frames, self.arms, self.cands, self.cand_spans = [], [], [], [], []
         self.laws, self.bfs, self.kinds, self.inertia, self.bases, self.regions = [], [], [], [], [], []
         for _ in range(count):
-            mass = rng.uniform(0.02, 0.5)
+            mass = rng.uniform(0.005, 0.05) if light else rng.uniform(0.02, 0.5)
             q = np.linalg.qr(rng.normal(size=(3, 3)))[0]
-            inertia = q @ np.diag(mass * rng.uniform(1.0e-4, 9.0e-4, size=3)) @ q.T
+            gyration = (4.0e-6, 3.6e-5) if light else (1.0e-4, 9.0e-4)
+            inertia = q @ np.diag(mass * rng.uniform(*gyration, size=3)) @ q.T
             A = np.zeros((6, 6))
             A[:3, :3] = np.eye(3) / mass
             A[3:, 3:] = np.linalg.inv(inertia)
@@ -57,20 +61,23 @@ class Bodies:
             first = len(self.frames)
             regions = []
             predicted = np.concatenate([rng.normal(size=3) * 0.02 + [0.0, 0.0, -0.0125], rng.normal(size=3) * 0.2])
+            if light:
+                predicted = np.concatenate([rng.normal(size=3) * 0.3 + [0.0, 0.0, -1.0], rng.normal(size=3) * 30.0])
             for _ in range(rng.integers(1, 9)):
                 n = rng.normal(size=3)
                 n[2] = abs(n[2]) + 0.5
                 n /= np.linalg.norm(n)
                 t0, t1 = tangent_basis(n)
-                arm = rng.normal(size=3) * 0.02
-                size = int(rng.choice([1, 1, 2, 3, 4, 4, 6, 9, 13]))
-                points = rng.uniform(-0.01, 0.01, size=(size, 2)) * (size > 1)
+                arm = rng.normal(size=3) * (0.004 if light else 0.02)
+                size = int(rng.choice([2, 3, 4, 4, 5, 6] if light else [1, 1, 2, 3, 4, 4, 6, 9, 13]))
+                patch = rng.uniform(1.0e-4, 6.0e-4) if light else 0.01
+                points = rng.uniform(-patch, patch, size=(size, 2)) * (size > 1)
                 a = np.ones((size, 3))
                 a[:, 1] = [np.cross(x * t0 + y * t1, n) @ t0 for x, y in points]
                 a[:, 2] = [np.cross(x * t0 + y * t1, n) @ t1 for x, y in points]
                 normal = np.stack([np.r_[n, np.cross(arm, n)], np.r_[0, 0, 0, t0], np.r_[0, 0, 0, t1]])
                 friction = np.stack([np.r_[t0, np.cross(arm, t0)], np.r_[t1, np.cross(arm, t1)], np.r_[0, 0, 0, n]])
-                gap = rng.uniform(-2.0e-5, 6.0e-5, size=size)
+                gap = rng.uniform(-2.0e-4, 1.0e-5, size=size) if light else rng.uniform(-2.0e-5, 6.0e-5, size=size)
                 rhs = (a @ normal) @ predicted + np.where(gap < 0.0, 0.05 * gap / 0.00125, gap / 0.00125)
                 eps = np.zeros(size)
                 if compliance == COMPLIANT or (compliance == MIXED and rng.random() < 0.5):
@@ -149,8 +156,8 @@ class TestRegionLaw(unittest.TestCase):
 
     SWEEPS = 8
 
-    def check(self, compliance: int, bodies: int, median: float, largest: float):
-        problem = Bodies(bodies, compliance, seed=compliance)
+    def check(self, compliance: int, bodies: int, median: float, largest: float, light: bool = False):
+        problem = Bodies(bodies, compliance, seed=compliance + (7 if light else 0), light=light)
         change, impulses = problem.sweep(self.SWEEPS, wp.get_device("cpu"))
         errors, loads = [], []
         for b, regions in enumerate(problem.regions):
@@ -176,6 +183,14 @@ class TestRegionLaw(unittest.TestCase):
     def test_mixed_candidates(self):
         """The rigid set solved in the closing springs' metric."""
         self.check(MIXED, 120, 5.0e-8, 2.0e-5)
+
+    def test_light_parts_with_small_patches(self):
+        """The rank rule and the set's multipliers from the set's rows orthonormal in the block's metric: candidates
+        a fraction of a millimetre apart on a part whose tilt response is 1e4 to 1e6 times its normal one keep the
+        reference's solve. In the normal equations (``A K A^T`` formed and inverted) the rule's measure is a
+        difference of nearly equal Gram entries, and float32 read 5e-4 m/s off the reference here (on hardware's
+        pile, a near-dependent third row entered and threw a 13 g part to 200 m/s)."""
+        self.check(RIGID, 300, 2.0e-6, 1.0e-4, light=True)
 
     def test_the_laws_render_for_native_sweeps(self):
         """Every law of the family has a native form (the general sweep's region phase calls them)."""
