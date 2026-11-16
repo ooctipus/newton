@@ -17,6 +17,7 @@ from pathlib import Path
 import numpy as np
 import warp as wp
 
+from newton._src.core.execution import Buckets, Queue
 from newton._src.sim import JointType
 from newton._src.solvers.feather_pgs import (
     contact_laws,
@@ -692,6 +693,14 @@ def row_lines(device) -> wp.array:
     if key not in _ROW_LINES:
         _ROW_LINES[key] = wp.array(np.arange(1 << 14), dtype=wp.int32, device=device)
     return _ROW_LINES[key]
+
+
+def one_world(device) -> Buckets:
+    """A sweep's world list of a hand-built scene: its one world, the claims' one bucket read as a list."""
+    claims = Queue(1, device)
+    claims.items.zero_()
+    claims.count.fill_(1)
+    return claims.span(0, 1)
 
 
 def anchored_patches(contacts: int, device) -> FrictionPatches:

@@ -79,6 +79,7 @@ from string import Template
 import warp as wp
 
 from ...core import memory
+from ...core.execution import Buckets
 
 # The ordered mode of the L0 reservation, shared with the collision pipeline's writers.
 from ...core.ordered_reserve import (  # noqa: F401
@@ -772,3 +773,85 @@ def lane_first(bits: wp.uint32, lanes: int) -> int:
 )
 def lane_last(bits: wp.uint32, lanes: int) -> int:
     """The highest lane ``bits`` holds, -1 for none."""
+
+
+# The lane group reads a list of consecutive buckets (a :class:`~newton._src.core.execution.Buckets`): a bucket a lane a
+# round, the counts' loads issued together, the lanes' prefix by ``SCAN`` and the item's bucket by ``BALLOT``. A list
+# of ``width`` buckets takes ``width / lanes`` rounds; on the CPU one thread walks it.
+_SPAN_ROUND = """        const int k = from + LANE;
+        const int n = k < width ? wp::min(count.data[first + k], region) : 0;
+        const int start = base + SCAN(n);
+        const unsigned hits = BALLOT(place >= start && place < start + n);
+"""
+_SPAN_NEXT = "        base = READ(start + n, WIDTH - 1);\n"
+_SPAN_SUM = (
+    "    int total = 0;\n"
+    "    for (int k = LANE; k < width; k += STRIDE) total += wp::min(count.data[first + k], region);\n"
+    "    SUM(total);\n"
+)
+
+
+@wp.func_native(
+    lane_word(
+        _SPAN_SUM + "    return total;\n",
+        "lanes",
+    )
+)
+def _span_total(count: wp.array[int], first: int, width: int, region: int, lanes: int) -> int:
+    """The items of the list's ``width`` buckets from ``first`` (``region`` slots a bucket), on every lane."""
+
+
+@wp.func_native(
+    lane_word(
+        "    int base = 0;\n"
+        "    for (int from = 0; from < width; from += STRIDE) {\n" + _SPAN_ROUND + "        if (hits != 0u) {\n"
+        "            const int at = FIRST(hits);\n"
+        "            return items.data[(first + from + at) * region + place - READ(start, at)];\n"
+        "        }\n" + _SPAN_NEXT + "    }\n    return -1;\n",
+        "lanes",
+    )
+)
+def _span_item(
+    count: wp.array[int], items: wp.array[int], first: int, width: int, region: int, place: int, lanes: int
+) -> int:
+    """The list's ``place``-th item, bucket by bucket (-1 past its items), on every lane."""
+
+
+@wp.func_native(
+    lane_word(
+        _SPAN_SUM + "    if (total == 0) return 0;\n"
+        "    const int place = total / 2;\n"
+        "    int base = 0, filled = -1, middle = -1;\n"
+        "    for (int from = 0; from < width && middle < 0; from += STRIDE) {\n"
+        + _SPAN_ROUND
+        + "        const unsigned full = BALLOT(n > 0);\n"
+        "        if (filled < 0 && full != 0u) filled = from + FIRST(full);\n"
+        "        if (hits != 0u) middle = from + FIRST(hits);\n" + _SPAN_NEXT + "    }\n"
+        "    return 2 * total + (filled + above <= middle ? 1 : 0);\n",
+        "lanes",
+    )
+)
+def _span_open(count: wp.array[int], first: int, width: int, region: int, above: int, lanes: int) -> int:
+    """Twice the list's items, plus one where its first filled bucket is at least ``above`` before its middle item's,
+    on every lane."""
+
+
+@wp.func
+def span_total(span: Buckets, lanes: int) -> int:
+    """The items of ``span``, read by this thread's group of ``lanes`` lanes (a power of two up to 32, consecutive
+    threads), on every lane."""
+    return _span_total(span.count, span.first, span.last - span.first, span.region, lanes)
+
+
+@wp.func
+def span_item(span: Buckets, place: int, lanes: int) -> int:
+    """The ``place``-th item of ``span``, bucket by bucket (-1 past its items), read by the group of ``lanes`` lanes."""
+    return _span_item(span.count, span.items, span.first, span.last - span.first, span.region, place, lanes)
+
+
+@wp.func
+def span_open(span: Buckets, above: int, lanes: int) -> int:
+    """The items of ``span`` and whether it has a head past ``above`` buckets (items in buckets at least ``above``
+    before the bucket of its middle item; for buckets ordered by a measure, items that far above the middle one's), as
+    twice the items plus one for a head: one read by the group of ``lanes`` lanes, every lane's."""
+    return _span_open(span.count, span.first, span.last - span.first, span.region, above, lanes)

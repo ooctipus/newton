@@ -32,9 +32,10 @@ from typing import Any
 
 import warp as wp
 
+from ...core.execution import Buckets, warp_mates
 from ...core.memory import STAGE_PARAMETER
 from . import field_group
-from .device_preludes import DevicePrelude, cuda_native, dual_native, substitute
+from .device_preludes import DevicePrelude, cuda_native, dual_native, span_item, span_open, span_total, substitute
 
 __all__ = [
     "Dispatch",
@@ -106,6 +107,9 @@ def items(
     flat: bool = False,
     guard: str | None = None,
     queue: tuple[str, ...] | None = None,
+    span: tuple[str, str] | None = None,
+    mates: int = 1,
+    above: int = 0,
     lane: bool = False,
     sub: str | None = None,
 ) -> Dispatch:
@@ -122,6 +126,12 @@ def items(
     - a ``queue`` ``(count, stride[, items])`` (wrapper operands: the device count array, the grid's stride, and the
       list's items if the position indexes a list) walks a device list with the grid's stride: a
       :class:`~newton._src.core.execution.Work` over a :class:`~newton._src.core.execution.Queue`;
+    - a ``span`` ``(list, stride)`` (wrapper operands: a :class:`~newton._src.core.execution.Buckets` of a queue's
+      buckets read as one list, and the grid's stride) walks that list the same way; where ``mates`` lane groups share
+      a warp and the list has a head (items in buckets at least ``above`` before its middle item's), each warp takes
+      its first item from the list's head and its others from its tail
+      (:func:`~newton._src.core.execution.warp_mates`), so a list ordered heaviest first with a heavy head gives each
+      heavy item light warp-mates; a list without one is walked in order, neighbours sharing a warp;
     - the body takes the item, then the thread's ``lane`` if asked, then each ``sub``-item ``sub`` the lanes share:
       ``for sub in range(lane, sub, lanes)`` (``sub`` names the item's width, as an expression of the operands).
 
@@ -135,6 +145,9 @@ def items(
         flat: The launch is one-dimensional.
         guard: The host count that guards the tail.
         queue: The device list's count array, its grid stride and, for an indexed list, its items.
+        span: The device list as a queue's buckets, and its grid stride.
+        mates: Lane groups a warp, which a ``span`` pairs from its two ends.
+        above: The buckets before its middle item's from which a ``span``'s items are its head.
         lane: Pass the thread's lane in its launch dimension to the body.
         sub: The item's width: the body runs for each sub-item its lanes share.
     """
@@ -142,12 +155,15 @@ def items(
         raise ValueError("a flat launch reads no block or lane")
     if (groups is not None or sub is not None) and lanes is None:
         raise ValueError("lane groups and sub-items need their lanes")
+    if queue is not None and span is not None:
+        raise ValueError("a dispatch walks one device list: a queue or a span")
     count, stride, *listed = queue or (None, None)
-    at = f"{item}_at" if listed else item  # the position: the item itself, or its place in a listed queue
+    # The position: the item itself, or its place in a listed queue or span.
+    at = f"{item}_at" if listed or span is not None else item
     if flat:
         # The thread itself, read once by the call, needs no name.
         head = [f"{at} = wp.tid()" + ("" if lanes is None else f" // {lanes}")]
-        if lanes is None and guard is None and queue is None:
+        if lanes is None and guard is None and queue is None and span is None:
             head, at = [], "wp.tid()"
     elif groups is not None:
         head = ["block, lane = wp.tid()", f"{at} = block * {groups} + lane // {lanes}"]
@@ -158,7 +174,17 @@ def items(
         call = f"for sub in range({'lane' if groups is None else f'lane % {lanes}'}, {sub}, {lanes}):\n    {call}"
     if listed:
         call = f"{item} = {listed[0]}[{at}]\n{call}"
-    extra = ()
+    extra = constants = ()
+    if span is not None:
+        listing, stride = span
+        # An item's lanes read the list together: a warp's at most (device_preludes.span_total).
+        readers = min(int(lanes or 1), 32)
+        if readers & (readers - 1):
+            raise ValueError(f"a span is read by a power of two of lanes, got {lanes}")
+        place = at if mates <= 1 else f"warp_mates({at}, {item}_end, {item}_head, {int(mates)})"
+        call = f"{item} = span_item({listing}, {place}, {readers})\n{call}"
+        constants = (("span_item", span_item), ("span_total", span_total), ("span_open", span_open))
+        constants += (("warp_mates", warp_mates),)
     if guard is not None:
         call = f"if {at} < {guard}:\n{_indented(call)}"
         extra = ((guard, int),)
@@ -166,9 +192,22 @@ def items(
         head.insert(1, f"{item}_end = {count}[0]")
         call = f"while {at} < {item}_end:\n{_indented(call)}\n    {at} += {stride}"
         extra = ((count, wp.array[int]), (stride, int), *((name, wp.array[int]) for name in listed))
+    if span is not None:
+        if mates > 1:
+            # One read gives the list's items and whether it has a heavy head: a list with one pairs its two ends warp
+            # by warp, one without neighbours.
+            head[1:1] = [
+                f"{item}_open = span_open({listing}, {int(above)}, {readers})",
+                f"{item}_end = {item}_open // 2",
+            ]
+            head.append(f"{item}_head = wp.where({item}_open % 2 == 1, {item}_end, 0)")
+        else:
+            head.insert(1, f"{item}_end = span_total({listing}, {readers})")
+        call = f"while {at} < {item}_end:\n{_indented(call)}\n    {at} += {stride}"
+        extra = ((listing, Buckets), (stride, int))
     names = (item, *(("lane",) if lane else ()), *(("sub",) if sub is not None else ()))
     arguments = (at if at == "wp.tid()" else item, *names[1:])
-    return Dispatch("\n".join((*head, call)), arguments, tuple((name, int) for name in names), extra)
+    return Dispatch("\n".join((*head, call)), arguments, tuple((name, int) for name in names), extra, constants)
 
 
 def _indented(text: str) -> str:

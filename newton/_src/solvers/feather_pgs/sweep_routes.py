@@ -62,6 +62,7 @@ from .sweep import (
     unit_visit,
     velocity_limit_pass,
 )
+from .sweep_levels import COST_MATES
 
 # The row loops leave the velocity-limit and speed rows to the passes at the end of every sweep (the last word).
 _DENSE_ADMISSION = f"if (row_type == {ROW_JOINT_VELOCITY_LIMIT}) continue;"
@@ -69,14 +70,30 @@ _LINE_ADMISSION = f"if (row_type == {ROW_JOINT_VELOCITY_LIMIT} || row_type == {R
 _MF_ADMISSION = f"if (mf_rt == {ROW_SPEED}) continue;"
 
 
-def worlds(groups: int | None = None, lanes: int | None = None) -> kernel_template.Dispatch:
+def worlds(groups: int | None = None, lanes: int | None = None, classes: bool = False) -> kernel_template.Dispatch:
     """The worlds a sweep launch covers: its claim's bucket of the claims' worlds (:func:`.sweep_levels.claim_worlds`),
-    a device list (``general_worlds``, its count first) walked with the grid's stride (``groups`` worlds a block)."""
+    a device list (``general_worlds``, its count first) walked with the grid's stride (``groups`` worlds a block); the
+    general sweep's (``classes``) its cost classes, heaviest first, read as one list (``general_claims``, by each
+    world's lanes together). Where lane groups of ``lanes`` share a warp and the classes hold heavy worlds
+    (:data:`.sweep_levels.COST_MATES` classes above the middle world's), each warp's first world is the list's next
+    from its head and its others the next from its tail (:func:`~newton._src.core.execution.warp_mates`): a heavy world
+    starts first with the lightest mates. A list of like costs is walked in order, neighbours (of their own cost, near
+    their data) sharing a warp."""
+    if not classes:
+        return kernel_template.items(
+            "world",
+            groups=groups,
+            lanes=lanes,
+            queue=("general_world_count", "general_world_grid_stride", "general_worlds"),
+        )
+    mates = 32 // lanes if groups is not None and lanes is not None and lanes < 32 else 1
     return kernel_template.items(
         "world",
         groups=groups,
         lanes=lanes,
-        queue=("general_world_count", "general_world_grid_stride", "general_worlds"),
+        span=("general_claims", "general_world_grid_stride"),
+        mates=min(mates, groups or 1),
+        above=COST_MATES,
     )
 
 
@@ -1085,6 +1102,15 @@ def mf_gs_staging(
     )
 
 
+_OWN_CYCLES_START = """    const unsigned int own_from = (unsigned int)clock();"""
+_OWN_CYCLES_END = """        if (lane == 0) world_cost.data[world] = 32 - __clz((int)((unsigned int)clock() - own_from));
+"""
+"""A world's cost for the next call's order (:func:`.sweep_levels.claim_worlds`): the bit length of its own cycles,
+from its start to its last sweep's end, stored at each sweep's end inside the sweep loop (before the loop's exit makes
+a world wait for the warp-mate it shares lanes with), so only its start's 32-bit clock stays live across the loop. A lane group's body is CUDA's only (:func:`.device_preludes.group_native`); the CPU's
+one thread keeps no cost: its worlds run one at a time."""
+
+
 def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     """The native body of the matrix-free Gauss-Seidel sweep and its staging: a world's dense rows
     (:func:`packed_operator`) and free-body rows (:func:`free_body_rows`), then its end-of-sweep passes, on the world's
@@ -1208,8 +1234,13 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         )
     else:
         violation = active_violation(dense, dense_op, count="m_dense") if sweep.active_rows else None
-        sweep_end = end_sweep(solve_policy, iteration=ITERATION, violation=violation)
-        head = "    const int lane = LANE;"
+        # The world's own cycles (its cost class, sweep_levels.COST_CLASSES): read at each sweep's end inside the
+        # loop, where the world's lanes have not yet waited for a warp-mate at the loop's exit.
+        owns = lanes > 1
+        sweep_end = (_OWN_CYCLES_END if owns else "") + end_sweep(
+            solve_policy, iteration=ITERATION, violation=violation
+        )
+        head = "    const int lane = LANE;" + ("\n" + _OWN_CYCLES_START if owns else "")
         first_warp = end_first_warp = ""
         barrier = "SYNC();"
         free_phase = ""
@@ -1566,7 +1597,11 @@ class GeneralSweep(SweepConfig):
         )
 
     def dispatch(self, staging: Staging) -> Dispatch:
-        return worlds(self.groups, self.lanes) if self.groups > 1 else worlds()
+        # The warp mapping walks the general sweep's cost classes (sweep_levels.COST_CLASSES), the colored one its bucket.
+        classes = not self.colored
+        return (
+            worlds(self.groups, self.lanes, classes) if self.groups > 1 else worlds(lanes=self.lanes, classes=classes)
+        )
 
     def operands(self) -> tuple[RowArgument, ...]:
         return (
@@ -1598,6 +1633,8 @@ class GeneralSweep(SweepConfig):
             ),
             # Where the free bodies' contacts are regions, their stream.
             *((RowArgument(name, dtype, after="omega") for name, dtype in REGION_OPERANDS) if self.regions else ()),
+            # The warp mapping's worlds' costs, which order its next call (sweep_levels.claim_worlds).
+            *((RowArgument("world_cost", wp.array[wp.int32], after="omega"),) if not self.colored else ()),
             *self.law_operands(),
         )
 

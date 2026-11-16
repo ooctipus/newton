@@ -199,6 +199,23 @@ def bucket_item(buckets: Buckets, item: int) -> int:
     return -1
 
 
+@wp.func
+def warp_mates(position: int, total: int, head: int, mates: int) -> int:
+    """The list item a launch's ``position`` takes when ``mates`` consecutive positions share a warp: each of the
+    list's first ``head`` items takes a warp of its own, its other positions the list's last items, from the last
+    down; then the rest of the list in order. A bijection of ``[0, total)``: the head's warps take items ``[0,
+    head)`` and the tail's ``(mates - 1) head`` items, the positions past them the items between (``head`` is at
+    most ``total / mates``)."""
+    pairs = wp.min(head, total // wp.max(mates, 1))
+    if mates <= 1 or position >= pairs * mates:
+        return position - pairs * (mates - 1) if mates > 1 else position
+    warp = position // mates
+    slot = position - warp * mates
+    if slot == 0:
+        return warp
+    return total - 1 - (warp * (mates - 1) + slot - 1)
+
+
 _APPEND = r"""
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
     // The warp's lanes that append to one bucket share one atomic: the lowest takes their slots, each its rank.

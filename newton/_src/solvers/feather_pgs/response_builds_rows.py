@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import warp as wp
 
-from ...core.execution import Buckets, bucket_item
-from .device_preludes import CPU_MATH, CPU_WORDS, dual_native
+from ...core.execution import Buckets
+from .device_preludes import CPU_MATH, CPU_WORDS, dual_native, span_item, span_total
 from .row_metadata import HEADER_WORDS, RECORD_WORDS, pack_row_record
 from .row_records import DenseRows
 
@@ -144,8 +144,11 @@ def store_row_records(
     rows' records: the free rows' start after their contacts' (``mf_contact_end``), at the speed rows."""
     item, lane = wp.tid()
     pitch = rows.rhs.shape[1]
-    world = bucket_item(worlds, item)
-    while world >= 0:
+    # A world's lanes read the list together, a warp's at most (``lanes`` is a multiple of 32 or below it).
+    readers = wp.min(lanes, 32)
+    total = span_total(worlds, readers)
+    while item < total:
+        world = span_item(worlds, item, readers)
         line = rows.first[world]
         for slot in range(records.first + lane, wp.min(count[world], records.base), lanes):
             write_row_record(records, rows, incident[line, slot], line, slot)
@@ -155,7 +158,6 @@ def store_row_records(
         for slot in range(free_first, wp.min(records.base + mf_count[world], pitch), lanes):
             write_row_record(records, rows, incident[line, slot], line, slot)
         item += grid
-        world = bucket_item(worlds, item)
 
 
 def bind_row_records(placement) -> RowRecords:

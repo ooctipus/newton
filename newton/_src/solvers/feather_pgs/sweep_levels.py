@@ -152,12 +152,33 @@ def tier_world(rows: int, free_body_rows: int, speed_first: wp.array[int], world
     return free_body_rows == 0 and rows <= bound and rows <= speed_first[world]
 
 
+COST_CLASSES = 32
+"""The general sweep's cost classes, a bucket each: a world's class is the bit length of its own cycles in the sweep's
+last call (``world_cost``, written by the sweep: 0 before one), heaviest first, so the classes read as one list order
+the worlds by cost to a factor of two (:func:`cost_bucket`)."""
+
+
+COST_MATES = 2
+"""The classes above the middle world's that make a world heavy: two, about four times the middle world's cost. A
+warp's worlds take about their sum where their paths part, so where the general sweep's list holds a heavy world its
+warps pair the list's two ends (a heavy world with the lightest), and where it holds none, neighbours of like cost
+share a warp, on like paths and near their data (:func:`~newton._src.core.execution.warp_mates`)."""
+
+
+@wp.func
+def cost_bucket(general: int, cost: int) -> int:
+    """The general sweep's bucket of a world whose own cycles in the sweep's last call have ``cost`` bits: the classes
+    from ``general`` on, heaviest first (:data:`COST_CLASSES`)."""
+    return general + COST_CLASSES - 1 - wp.clamp(cost, 0, COST_CLASSES - 1)
+
+
 @wp.kernel
 def claim_worlds(
     rows: wp.array[int],
     free_body_rows: wp.array[int],
     speed_first: wp.array[int],
     slot: wp.array[wp.int32],
+    world_cost: wp.array[wp.int32],
     bound: int,
     width: int,
     general: int,
@@ -172,27 +193,31 @@ def claim_worlds(
     are dense only and at most ``bound`` into its Jacobi tier's, ``(rows - 1) // width``; any other world with a colored
     storage ``slot`` (``slot[world] >= 0``, :class:`.sweep_units.ColoredUnits`) into ``candidate``, which the unit
     builder walks and splits into the colored bucket and the general one (``candidate`` negative: no colored mapping,
-    and ``slot`` is not read); the rest into ``general``, the general sweep's. A world without rows takes none, nor one
+    and ``slot`` is not read); the rest into the general sweep's cost classes from ``general`` on, by the bits of its
+    own cycles in the sweep's last call (``world_cost``, :func:`cost_bucket`). A world without rows takes none, nor one
     none of whose rows can act (its ``acts`` word, :data:`.placement.WORLD_ACTS`). A free
     body's rows are not dense only: those in the free bodies' run (``free_body_rows``) and the line's speed rows (its
     rows from ``speed_first``).
 
     A claim's worlds share nothing with another's, so each is a component of its own and the order inside a bucket is
     free (:func:`~newton._src.core.execution.append`'s, an atomic a warp a bucket); tier ``t`` serves
-    ``(t * width, (t + 1) * width]`` rows and walks bucket ``t``, the general sweep bucket ``general`` (an exiting block
-    of a grid over every world paid four dependent global loads: about 55 us a launch at 16k worlds).
+    ``(t * width, (t + 1) * width]`` rows and walks bucket ``t``, the general sweep its classes as one list, heaviest
+    first (an exiting block of a grid over every world paid four dependent global loads: about 55 us a launch at 16k
+    worlds). The order is a move: a world's sweep reads and writes its own rows and coordinates only.
     """
     world = wp.tid()
     m = rows[world]
     mf = free_body_rows[world]
     if (m <= 0 and mf <= 0) or (acts.shape[0] > 0 and acts[world] == 0):
         return
-    bucket = general
+    bucket = int(-1)
     if tier_world(m, mf, speed_first, world, bound):
         bucket = (m - 1) // width
     elif candidate >= 0:
         if slot[world] >= 0:
             bucket = candidate
+    if bucket < 0:
+        bucket = cost_bucket(general, world_cost[world])
     append(items, count, bucket, region, world)
 
 

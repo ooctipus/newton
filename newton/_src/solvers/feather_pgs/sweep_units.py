@@ -48,6 +48,7 @@ from .field_group import Field, FieldGroup
 from .kernel_template import KernelTemplate
 from .row_laws import ROW_CONTACT, ROW_FRICTION, ROW_TORSION
 from .row_metadata import HEADER_WORDS, record_parent
+from .sweep_levels import COST_CLASSES
 
 BUILD_WARPS = 8
 """Warps of a world's unit builder block: they share the parallel passes; the first levels the units."""
@@ -342,7 +343,7 @@ SHARED_DECLARATIONS
         if (tid == 0) {
             unit_count.data[world] = 0;
             color_count.data[world] = 0;
-            APPEND_CLAIM(general_bucket)
+            APPEND_CLAIM(GENERAL_CLAIM)
         }
         return;
     }
@@ -395,7 +396,7 @@ SHARED_DECLARATIONS
         if (tid == 0) {
             unit_count.data[world] = units;
             color_count.data[world] = 0;
-            APPEND_CLAIM(general_bucket)
+            APPEND_CLAIM(GENERAL_CLAIM)
             if (atomicOr(&unit_status.data[0], 1) == 0)
                 printf("Warning: FeatherPGS colored sweep: world %d has %d contact units, over its slot's %d; the "
                        "one-warp mapping keeps it.\n", world, units, UNITS);
@@ -447,7 +448,7 @@ LEVEL_OFFSETS
     }
     if (tid == 0) {
         unit_count.data[world] = units;
-        APPEND_CLAIM(COLORED(units, colors) ? colored_bucket : general_bucket)
+        APPEND_CLAIM(COLORED(units, colors) ? colored_bucket : GENERAL_CLAIM)
     }
 #endif
 """
@@ -528,8 +529,9 @@ def build_units_kernel(
     (``row_record`` from the line's word ``free_records``, :func:`.row_metadata.record_layout`); outputs:
     :data:`WORLD_FIELDS` (``world_slot`` is read) and its slot's :data:`UNIT_FIELDS`, and each world appended to the
     claims' colored bucket or their general one by ``rule`` (:func:`~newton._src.core.execution.append`'s
-    statements). A world with fewer contact rows than the rule's units takes no units, and a world of more units than
-    its slot holds sets ``unit_status``: the one-warp sweep keeps both. Its shared working set (:func:`build_staging`)
+    statements; the general one is the sweep's cost class of the world, ``world_cost``, from ``general_bucket`` on,
+    :func:`.sweep_levels.cost_bucket`). A world with fewer contact rows than the rule's units takes no units, and a
+    world of more units than its slot holds sets ``unit_status``: the one-warp sweep keeps both. Its shared working set (:func:`build_staging`)
     must fit the stage budget of the architecture ``device_arch`` it is built for (:func:`.memory.arch_budget`).
     """
     staging = build_staging(dofs)
@@ -546,6 +548,8 @@ def build_units_kernel(
         f"#define THREADS {32 * BUILD_WARPS}\n#define NODES {dofs // 6 + 1}\n#define WORDS {words}\n"
         f"#define CONTACT {int(ROW_CONTACT)}\n#define FRICTION {int(ROW_FRICTION)}\n"
         f"#define PARENT(PACKED_WORD) ({parent})\n"
+        # The general sweep's cost class of the world (sweep_levels.cost_bucket), from the general one on.
+        f"#define GENERAL_CLAIM (general_bucket + {COST_CLASSES - 1} - min(max(world_cost.data[world], 0), {COST_CLASSES - 1}))\n"
         + body.replace("SHARED_DECLARATIONS", staging.declarations())
         .replace("LEVEL_PASS", _LEVEL_PASS)
         .replace("LEVEL_OFFSETS", _LEVEL_OFFSETS)
@@ -553,7 +557,7 @@ def build_units_kernel(
             "#endif",
             "#undef MF_ROWS\n#undef HEADER_WORDS\n#undef UNITS\n#undef MIN_UNITS\n#undef COLORED\n#undef WARPS\n#undef THREADS\n#undef NODES\n"
             "#undef WORDS\n"
-            "#undef CONTACT\n#undef FRICTION\n#undef PARENT\n#endif",
+            "#undef CONTACT\n#undef FRICTION\n#undef PARENT\n#undef GENERAL_CLAIM\n#endif",
         )
     )
     # The appends last: their statements hold a preprocessor branch of their own.
@@ -573,6 +577,7 @@ def build_units_kernel(
         ("claim_region", int),
         ("colored_bucket", int),
         ("general_bucket", int),
+        ("world_cost", wp.array[wp.int32]),
     )
     return KernelTemplate(
         f"sweep_units_{mf_rows}_{dofs}_{int(units)}_{rule.name}_w{BUILD_WARPS}" + ("_torsion" if torsion else ""),
@@ -605,7 +610,8 @@ class ColoredUnits:
         torsion: Contact torsion: a unit's spin row follows its friction pair (:func:`slot_layout`).
         weighted: The laws' weighted rows: a unit stages its normal row's weight (:func:`stage_slots`).
         claims: The step's claims (:attr:`.sweep_plan.Sweep.claims`).
-        buckets: Its candidate, colored and general buckets.
+        buckets: Its candidate and colored buckets and the general sweep's first cost class.
+        world_cost: The bits of each world's own cycles in the general sweep's last call (its cost class).
         support: The line's packed rows' entries (:func:`.packed_rows.support_width`): twelve or more, since a capable
             world holds two free bodies (:func:`capable_worlds`); :func:`stage_slots` reads twelve unguarded.
     """
@@ -623,6 +629,7 @@ class ColoredUnits:
         weighted: bool = False,
         claims: Queue,
         buckets: tuple[int, int, int],
+        world_cost: wp.array,
         support: int = 12,
     ):
         if int(support) < 12:
@@ -630,6 +637,7 @@ class ColoredUnits:
         self.world_count, self.mf_rows = int(world_count), int(mf_rows)
         self.claims = claims
         self.candidate, self.colored, self.general = buckets
+        self.world_cost = world_cost
         self.unit_capacity = unit_capacity(self.mf_rows)
         slot_world = np.asarray(worlds, dtype=np.int32)
         self.slot_count = int(slot_world.size)
@@ -698,6 +706,7 @@ class ColoredUnits:
                 claims.region,
                 self.colored,
                 self.general,
+                self.world_cost,
             ],
             block_dim=32 * BUILD_WARPS,
             device=self.device,

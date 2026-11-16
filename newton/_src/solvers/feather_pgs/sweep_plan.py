@@ -576,11 +576,15 @@ class Sweep:
             # Each sweep walks its bucket of the claims' worlds (claim_worlds), a bucket of every world's slots: a tier's,
             # the general sweep's, and with the colored mapping its candidates' (which the unit builder walks) and the
             # colored worlds' (which it appends).
+            # The general sweep's buckets are its cost classes (sweep_levels.COST_CLASSES), heaviest first, by each
+            # world's own cycles in the sweep's last call (world_cost, which the sweep writes).
             self.claim_general = len(self.tiers)
-            self.claim_candidate = self.claim_general + 1 if colored else -1
-            self.claim_colored = self.claim_general + 2 if colored else -1
-            buckets = self.claim_general + (3 if colored else 1)
+            classes = self.claim_general + sweep_levels.COST_CLASSES
+            self.claim_candidate = classes if colored else -1
+            self.claim_colored = classes + 1 if colored else -1
+            buckets = classes + (2 if colored else 0)
             self.claims = Queue(buckets * worlds, model.device, buckets=buckets)
+            self.world_cost = wp.zeros(worlds, dtype=wp.int32, device=model.device)
             # The claim stage runs beside the step's stream until its first reader (claim_worlds).
             self.claims_beside = Beside(model.device)
             if colored:
@@ -595,11 +599,14 @@ class Sweep:
                     weighted=self.laws.set.weighted,
                     claims=self.claims,
                     buckets=(self.claim_candidate, self.claim_colored, self.claim_general),
+                    world_cost=self.world_cost,
                     support=self.placement.packed_support,
                 )
             # The general sweep walks its bucket on a persistent grid, a warp a world (its work's shape); the colored
             # bucket a block a world of its slots, a color's units at once.
-            general = self._claim_launch(self.general_sweep, self.mf_gs_kernel, worlds, self.claim_general)
+            general = self._claim_launch(
+                self.general_sweep, self.mf_gs_kernel, worlds, self.claim_general, sweep_levels.COST_CLASSES
+            )
             mapped = (general,)
             if colored:
                 slots = self.colored_units.slot_count
@@ -675,6 +682,7 @@ class Sweep:
                 self.placement.mf_constraint_count,
                 self.placement.speed_first,
                 units.units["world_slot"] if units is not None else self.placement.dummy_is_free_rigid,
+                self.world_cost,
                 self.par_tiers[-1][0] if self.par_tiers else 0,
                 sweep_routes_tiers.TIER_ROWS,
                 self.claim_general,
@@ -687,10 +695,10 @@ class Sweep:
         )
 
     def general_claims(self) -> Buckets:
-        """The claims' worlds the general sweep and the unit builder read: the general bucket and the candidates'
-        (consecutive), which the unit builder splits."""
-        general = self.claim_general
-        return self.claims.span(general, general + (1 if self.colored_units is None else 2))
+        """The claims' worlds the general sweep and the unit builder read: the general sweep's cost classes and the
+        candidates' (consecutive), which the unit builder splits."""
+        general = self.claim_general + sweep_levels.COST_CLASSES
+        return self.claims.span(self.claim_general, general + (0 if self.colored_units is None else 1))
 
     def _emits(self) -> bool:
         """Whether the tiers' rows take the one writer's EMIT sink (:class:`.walk_rows.RowSeeds`): where the writer
@@ -844,39 +852,45 @@ class Sweep:
         layout = shape(self._launch_work(config, items), device(self.model.device))
         return dataclasses.replace(config, places=config.places.placed(layout.staging))
 
-    def _claim_launch(self, config: SweepConfig, kernel: wp.Kernel, items: int, bucket: int) -> SweepLaunch:
-        """The launch of a matrix-free mapping over its claim's ``bucket``: the layer's shape of :meth:`_launch_work`."""
+    def _claim_launch(
+        self, config: SweepConfig, kernel: wp.Kernel, items: int, bucket: int, buckets: int = 1
+    ) -> SweepLaunch:
+        """The launch of a matrix-free mapping over its claim's ``buckets`` from ``bucket``: the layer's shape of
+        :meth:`_launch_work`."""
         layout = shape(self._launch_work(config, items), device(self.model.device))
         return SweepLaunch(
             config,
             kernel,
             layout.grid,
             layout.block,
-            functools.partial(self._mapped_operands, bucket, layout.grid * layout.groups),
+            functools.partial(self._mapped_operands, bucket, buckets, layout.grid * layout.groups),
         )
 
     def _walk(self) -> dict:
         """The walk's view, where the sweeps leave by the walk and find a free body's tree in it."""
         return {} if self.factor.walk_arts is None else {"walk": self.factor.walk_view()}
 
-    def _queued(self, bucket: int, grid: int) -> dict:
-        """The world queue of the claims' ``bucket`` (claim_worlds, the step's claim stage), walked at ``grid``'s
-        stride (the launch's lane groups)."""
+    def _queued(self, bucket: int, buckets: int, grid: int) -> dict:
+        """The world list of the claims' ``buckets`` from ``bucket`` (claim_worlds, the step's claim stage), walked at
+        ``grid``'s stride (the launch's lane groups): one bucket as its queue, more (the general sweep's cost classes)
+        as one span."""
+        if buckets > 1:
+            return {"general_claims": self.claims.span(bucket, bucket + buckets), "general_world_grid_stride": grid}
         count, worlds = self.claims.bucket(bucket)
         return {"general_world_count": count, "general_worlds": worlds, "general_world_grid_stride": grid}
 
     def _tier_operands(self, config, bucket: int, grid: int) -> dict:
         """A Jacobi tier's operands: its bucket, the in-kernel response's trees and, under EMIT, the rows' seeds."""
-        named = dict(self._walk(), **self._queued(bucket, grid))
+        named = dict(self._walk(), **self._queued(bucket, 1, grid))
         named.update(self.placement.inkernel_response_inputs())
         if config.emit:
             named["row_seeds"] = self.placement.row_seeds
         return named
 
-    def _mapped_operands(self, bucket: int, grid: int) -> dict:
-        """A matrix-free mapping's operands: its bucket and the colored storage's units."""
+    def _mapped_operands(self, bucket: int, buckets: int, grid: int) -> dict:
+        """A matrix-free mapping's operands: its buckets, the worlds' costs and the colored storage's units."""
         colored = {} if self.mf_colored_kernel is None else self.colored_units.operands()
-        return {**self._walk(), **colored, **self._queued(bucket, grid)}
+        return {**self._walk(), **colored, **self._queued(bucket, buckets, grid), "world_cost": self.world_cost}
 
     def _sparse_operands(self) -> dict:
         """Case K1's operands: its rows' factor entries and coordinates, and its change in factor coordinates."""

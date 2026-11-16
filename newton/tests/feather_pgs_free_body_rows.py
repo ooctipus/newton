@@ -20,7 +20,7 @@ from newton._src.solvers.feather_pgs.factor.walk import unpack_walk_records
 from newton._src.solvers.feather_pgs.row_laws import ROW_SPEED
 from newton._src.solvers.feather_pgs.row_metadata import HEADER_WORDS, record_layout
 from newton._src.solvers.feather_pgs.sweep import sweep_kernel
-from newton.tests.feather_pgs_law_harness import chain_walk, free_body_Z
+from newton.tests.feather_pgs_law_harness import chain_walk, free_body_Z, one_world
 
 
 def free_body_jacobians(solver, Z_a=None, Z_b=None):
@@ -96,8 +96,7 @@ def sweep_free_body_rows(
         return wp.array(out, device=device)
 
     values = {
-        "general_world_count": wp.array((1,), dtype=wp.int32, device=device),
-        "general_worlds": wp.zeros(1, dtype=wp.int32, device=device),
+        "general_claims": one_world(device),
         "general_world_grid_stride": 1,
         "world_constraint_count": wp.zeros(1, dtype=wp.int32, device=device),
         "world_dof_indices": wp.array(np.arange(6, dtype=np.int32)[None], device=device),

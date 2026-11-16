@@ -23,7 +23,7 @@ import unittest
 import numpy as np
 import warp as wp
 
-from newton._src.core.execution import Buckets, Queue, bucket_item
+from newton._src.core.execution import Buckets, Queue, bucket_item, warp_mates
 from newton._src.solvers.feather_pgs import sweep_levels
 
 
@@ -208,11 +208,18 @@ class TestLevelsAreTheRowOrder(unittest.TestCase):
         _same(self, world.sweep(body + tree), world.sweep(range(50)))
 
 
+@wp.kernel
+def _mates_kernel(total: int, head: int, mates: int, taken: wp.array[int]):
+    position = wp.tid()
+    taken[position] = warp_mates(position, total, head, mates)
+
+
 class TestWorldLists(unittest.TestCase):
     def test_each_world_lands_in_its_claim_s_bucket(self):
         """A world of dense rows only (no speed row) and at most the bound lands in the bucket of its 32-row tier, once;
         any other world with rows in the colored candidates' bucket where it has a slot (and the claims have one), else
-        in the general bucket; a world without rows in none."""
+        in the general sweep's bucket of its cost class (heaviest first, the last class the lightest); a world without
+        rows in none."""
         rng = np.random.default_rng(7)
         worlds, bound, width = 500, 100, 32
         rows = rng.integers(0, 140, worlds).astype(np.int32)
@@ -223,9 +230,13 @@ class TestWorldLists(unittest.TestCase):
         # The worlds' acts words: a world none of whose rows can act takes no bucket (empty: every world acts).
         words = (rng.random(worlds) < 0.8).astype(np.int32)
         tiers = -(-bound // width)
+        # Each world's cost: the bits of its own cycles in the general sweep's last call (0: none yet), some past the
+        # classes' range.
+        cost = rng.integers(0, sweep_levels.COST_CLASSES + 8, worlds).astype(np.int32)
+        classes = sweep_levels.COST_CLASSES
         for device, candidates, acts in itertools.product(_devices(), (False, True), (words[:0], words)):
             with self.subTest(device=device, candidates=candidates, acts=acts.size):
-                buckets = tiers + 1 + int(candidates)
+                buckets = tiers + classes + int(candidates)
                 claims = Queue(buckets * worlds, device, buckets=buckets)
                 wp.launch(
                     sweep_levels.claim_worlds,
@@ -235,10 +246,11 @@ class TestWorldLists(unittest.TestCase):
                         wp.array(free, dtype=int, device=device),
                         wp.array(speed_first, dtype=int, device=device),
                         wp.array(slot, dtype=wp.int32, device=device),
+                        wp.array(cost, dtype=wp.int32, device=device),
                         bound,
                         width,
                         tiers,
-                        tiers + 1 if candidates else -1,
+                        tiers + classes if candidates else -1,
                         claims.region,
                         wp.array(acts, dtype=int, device=device),
                     ],
@@ -254,12 +266,31 @@ class TestWorldLists(unittest.TestCase):
                     if bucket < tiers:
                         lo, hi = bucket * width, min((bucket + 1) * width, bound)
                         want = np.flatnonzero((rows > lo) & (rows <= hi) & tiered)
-                    elif bucket == tiers:
-                        want = np.flatnonzero(rest & ~slotted)
+                    elif bucket < tiers + classes:
+                        # The general sweep's classes, heaviest first.
+                        heaviest = classes - 1 - (bucket - tiers)
+                        want = np.flatnonzero(rest & ~slotted & (np.minimum(cost, classes - 1) == heaviest))
                     else:
                         want = np.flatnonzero(rest & slotted)
                     self.assertEqual(int(count[0]), want.size)
                     np.testing.assert_array_equal(np.sort(items[: count[0]]), want)
+
+    def test_warp_mates_pair_the_list_s_head_with_its_tail(self):
+        """The positions of a list walked by lane groups ``mates`` a warp take every item once; each of the list's
+        first ``head`` items takes a warp whose other positions take the list's last items, the rest of the list
+        follows in order."""
+        for device in _devices():
+            for total, mates, head in itertools.product((1, 2, 7, 64, 1001), (1, 2, 4), (0, 1, 5, 600)):
+                with self.subTest(device=device, total=total, mates=mates, head=head):
+                    taken = wp.zeros(total, dtype=int, device=device)
+                    wp.launch(_mates_kernel, dim=total, inputs=[total, head, mates], outputs=[taken], device=device)
+                    taken = taken.numpy()
+                    np.testing.assert_array_equal(np.sort(taken), np.arange(total))
+                    pairs = min(head, total // mates) if mates > 1 else 0
+                    np.testing.assert_array_equal(taken[: pairs * mates : mates], np.arange(pairs))
+                    if pairs:
+                        self.assertEqual(int(taken[1]), total - 1)
+                    np.testing.assert_array_equal(np.diff(taken[pairs * mates :]), 1)
 
     def test_appends_past_a_region_are_dropped(self):
         """A bucket keeps its first ``region`` appends, each world once, and its counter the demand (the reservation's
@@ -277,6 +308,7 @@ class TestWorldLists(unittest.TestCase):
                         wp.zeros(worlds, dtype=int, device=device),
                         wp.array(rows, dtype=int, device=device),
                         wp.zeros(1, dtype=wp.int32, device=device),
+                        wp.zeros(worlds, dtype=wp.int32, device=device),
                         3 * width,
                         width,
                         3,
