@@ -318,7 +318,7 @@ class Sweep:
         return {
             "solve_policy": self.policy,
             "weighted": bool(self.laws.set.weighted),
-            "material": bool(self.options.contact_compliance),
+            "material": bool(self.laws.set.material),
             "torsion": bool(self.laws.spin_rows),
         }
 

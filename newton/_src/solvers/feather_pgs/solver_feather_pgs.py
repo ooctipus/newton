@@ -274,7 +274,13 @@ class SolverFeatherPGS(SolverBase):
                 law. The law is the row law's compliance ``eps = 1 / (dt (dt k + c))``: a material normal takes
                 neither restitution nor ``pgs_contact_regularization``. The contacts must carry the three
                 per-contact arrays. Every placement takes it: each sweep steps a material normal by the weight
-                ``d / (d + eps)`` of the diagonal it forms. Defaults to False.
+                ``d / (d + eps)`` of the diagonal it forms. Defaults to False. Independently of this option, a
+                contact of a shape that authors its stiffness or damping (:attr:`~newton.ShapeFlags.CONTACT_MATERIAL`)
+                is a material contact by MuJoCo's soft contact at rest: the mean of the two shapes' ``solref``
+                ``(2 / kd, kd / (2 sqrt(ke)))`` (an unauthored side its stored default), a time constant of at least
+                ``2 dt``, MuJoCo's default ``solimp``, a spring and dashpot per unit effective mass, so its compliance
+                is relative to the row's diagonal; it takes no restitution. A model without such a shape keeps the
+                rigid law.
             angular_damping (float, optional): Angular damping factor. Defaults to 0.05.
             update_mass_matrix_interval (int, optional): How often to update the mass matrix (every n-th time the
                 :meth:`step` function gets called). The cadence flag is evaluated on the host each step, so under

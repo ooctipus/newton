@@ -67,6 +67,12 @@ CONTACT_INPUT = (
     Field("stiffness", wp.float32, ("contact",), attr="contact_stiffness"),
     Field("damping", wp.float32, ("contact",), attr="contact_damping"),
     Field("friction_weight", wp.float32, ("contact",), attr="contact_friction_weight"),
+    # Authored contact materials: 1 where a colliding shape authors one (ShapeFlags.CONTACT_MATERIAL); such a shape's
+    # contacts take its and its partner's stiffness and damping by MuJoCo's rule (row_laws.authored_contact_law).
+    Field("authored", wp.int32, owner="laws", attr="authored_materials"),
+    Field("shape_flags", wp.int32, ("shape",), owner="laws"),
+    Field("material_ke", wp.float32, ("shape",), owner="laws", attr="shape_material_ke"),
+    Field("material_kd", wp.float32, ("shape",), owner="laws", attr="shape_material_kd"),
     # Contact torsion: 1 gives every friction contact the authored torsional coefficient, 0 none.
     Field("torsion", wp.int32, owner="laws", attr="torsion_rows"),
     # Which friction contacts carry a spin row (a fourth row), the plan's one fact (RowLaws.spin_rows): 0 none, 1 those

@@ -9,10 +9,25 @@ import warp as wp
 from ...sim import BodyFlags
 from .contact_filters import contact_normal_gap_limit
 from .contact_input import ContactInput
-from .contact_laws import contact_endpoints, contact_materials, contact_points, contact_responds, jacobian_entry
+from .contact_laws import (
+    contact_authored,
+    contact_endpoints,
+    contact_materials,
+    contact_points,
+    contact_responds,
+    jacobian_entry,
+)
 from .device_preludes import dual_native, lane_group, lane_scan, lane_sum, lane_sync, reserve, reserved_count
 from .friction_patches import FrictionPatches, patch_spin_rows
-from .row_laws import contact_capped_beta, contact_depenetration_cap, contact_restitution_rhs, contact_rhs, separates
+from .row_laws import (
+    authored_contact_law,
+    contact_capped_beta,
+    contact_depenetration_cap,
+    contact_material_rhs,
+    contact_restitution_rhs,
+    contact_rhs,
+    separates,
+)
 from .row_records import UNIT_CONTACT, unit_source
 
 # FeatherPGS takes no gradients: its kernels compile no adjoints.
@@ -79,7 +94,8 @@ def _admit_contact(
     two, nor none without an articulation) and a gap within the normal gap limit.
     Its normal row separates where its residual at the predictor (the body ``twists`` it publishes; none: never) does
     (:func:`.row_laws.separates`), and its friction and spin rows, bounded by a finite non-negative coefficient of
-    its ring's load, keep zero with it.
+    its ring's load, keep zero with it. The residual's bias is the row's law: an authored material's rhs
+    (:func:`.row_laws.authored_contact_law`, no restitution) where a shape authors one, else the hard law's.
     """
     body_a, body_b, art_a, art_b, world = contact_endpoints(
         data.shape0[c], data.shape1[c], data.shape_body, body_to_articulation, art_to_world
@@ -139,7 +155,14 @@ def _admit_contact(
             mu, restitution = contact_materials(
                 data.shape0[c], data.shape1[c], data.material_mu, data.material_restitution
             )
-            if restitution > 0.0:
+            if data.authored != 0 and contact_authored(data.shape0[c], data.shape1[c], data.shape_flags):
+                s0 = data.shape0[c]
+                s1 = data.shape1[c]
+                kappa, damping = authored_contact_law(
+                    data.material_ke[s0], data.material_kd[s0], data.material_ke[s1], data.material_kd[s1], phi, data.dt
+                )
+                bias, _rho = contact_material_rhs(phi, 0.0, kappa, damping, data.dt)
+            elif restitution > 0.0:
                 fires, bounce = contact_restitution_rhs(
                     phi, incident, 0.0, restitution, data.dt, data.restitution_threshold
                 )

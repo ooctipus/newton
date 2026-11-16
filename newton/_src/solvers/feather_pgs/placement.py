@@ -56,7 +56,9 @@ DENSE_ROW_WEIGHTS = FieldGroup(Field("row_w", wp.float32, ("world", "row"), fill
 law) or a material contact's ``d / (d + eps)``."""
 
 DENSE_ROW_EPS = FieldGroup(Field("row_eps", wp.float32, ("world", "row"), owner="placement"))
-"""Per-row compliance of material contact normals (``contact_compliance``); zero elsewhere."""
+"""Per-row compliance of material contact normals (:attr:`.route_table.Laws.material`): positive [1/kg] from a
+contact's stiffness, negative ``-rho`` (relative, of the row's diagonal; its weight ``1 / (1 + rho)``) from authored
+shape materials; zero elsewhere."""
 
 FUSED_DIAGONAL_LIMITS = FieldGroup(
     Field("fused_diagonal_limit_active", wp.int32, ("world", "world_dof"), owner="placement"),
@@ -572,7 +574,7 @@ class Placement:
             arrays.allocate(DENSE_ROW_WEIGHTS, **sizes)
         else:
             self.row_w = self.contact_row_w_dummy
-        if self.options.contact_compliance:
+        if self.laws.set.material:
             arrays.allocate(DENSE_ROW_EPS, **sizes)
         else:
             self.row_eps = self.contact_row_eps_dummy

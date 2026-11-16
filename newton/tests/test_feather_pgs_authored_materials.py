@@ -5,7 +5,8 @@
 
 A contact of a shape that authors its stiffness and damping takes MuJoCo's soft contact at rest
 (:func:`~newton._src.solvers.feather_pgs.row_laws.authored_contact_law`): the law is checked against MJWarp's own
-constraint parameters and against the numbers MJWarp produced on the NIST assembly scene.
+constraint parameters and against the numbers MJWarp produced on the NIST assembly scene, and a resting sphere is
+checked to sink to MuJoCo's static depth. A model without an authored shape keeps the rigid law and its routes.
 """
 
 import unittest
@@ -13,7 +14,10 @@ import unittest
 import numpy as np
 import warp as wp
 
+import newton
 from newton._src.solvers.feather_pgs.row_laws import authored_contact_law, contact_material_rhs
+from newton.solvers import SolverFeatherPGS
+from newton.tests.unittest_utils import add_function_test, get_test_devices
 
 SUBSTEP = 0.0125 / 10.0
 """NIST's substep, 1.25 ms, where MuJoCo's time-constant floor ``2 dt`` (2.5 ms) binds its stiff pairs."""
@@ -109,6 +113,124 @@ class TestAuthoredContactLaw(unittest.TestCase):
         _kappa, _beta, rho = authored([(PART, PART), (PART, GROUND)], [-2.0e-3, 0.0])
         self.assertAlmostEqual(rho[0], 0.04, delta=5e-4)
         self.assertAlmostEqual(rho[1], 0.451, delta=2e-3)
+
+
+def rest_depth(material, dt=SUBSTEP):
+    """MuJoCo's static depth of a body resting on one contact with the ground: ``kappa(phi) phi + g = 0``."""
+    low, high = 0.0, 0.1
+    for _ in range(200):
+        depth = 0.5 * (low + high)
+        kappa, _beta = mujoco_reference(material, GROUND, -depth, dt)
+        if kappa * depth < 9.81:
+            low = depth
+        else:
+            high = depth
+    return 0.5 * (low + high)
+
+
+def resting_sphere(device, *, articulated, authored_material, steps=800):
+    """A 50 g sphere dropped onto the ground (default material) through FeatherPGS at NIST's substep: its final height
+    over its radius (negative: depth), its speed, and the solver. A free sphere has a twin far beside it, so the free
+    bodies keep their own run (regions on the CPU, the colored mapping on CUDA)."""
+    radius = 0.02
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+    builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=0.5))
+    xform = wp.transform(wp.vec3(0.0, 0.0, radius + 0.002), wp.quat_identity())
+    if articulated:
+        body = builder.add_link(xform=xform)
+        joint = builder.add_joint_prismatic(parent=-1, child=body, axis=newton.Axis.Z, parent_xform=xform)
+        builder.add_articulation([joint])
+    else:
+        body = builder.add_body(xform=xform)
+    cfg = newton.ModelBuilder.ShapeConfig(density=0.05 / (4.0 / 3.0 * np.pi * radius**3), mu=0.5)
+    if authored_material:
+        cfg.ke, cfg.kd = PART
+    builder.add_shape_sphere(body, radius=radius, cfg=cfg)
+    if not articulated:
+        twin = builder.add_body(xform=wp.transform(wp.vec3(0.5, 0.0, radius + 0.002), wp.quat_identity()))
+        builder.add_shape_sphere(twin, radius=radius, cfg=cfg)
+    model = builder.finalize(device=device)
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=16)
+    contacts = pipeline.contacts()
+    solver = SolverFeatherPGS(model, pgs_iterations=16, dense_max_constraints=16, mf_max_constraints=64)
+    state, next_state = model.state(), model.state()
+    newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+    control = model.control()
+    for _ in range(steps):
+        state.clear_forces()
+        pipeline.collide(state, contacts)
+        solver.step(state, next_state, control, contacts, SUBSTEP)
+        state, next_state = next_state, state
+    height = float(state.body_q.numpy()[body, 2]) - radius
+    speed = float(np.linalg.norm(state.body_qd.numpy()[body]))
+    return height, speed, solver
+
+
+def test_routes_follow_authorship(test, device):
+    """A model without an authored shape takes no compliance law (today's rows and sweeps); one with an authored
+    shape takes it, keeps its worlds' acts word (a weighted step from zero at a positive residual stays at zero), and
+    its contact's normal row stores ``-rho`` and the weight ``1 / (1 + rho)``."""
+    for authored_material in (False, True):
+        # Resting, so its world acts (a world whose rows all separate holds them unwritten).
+        _height, _speed, solver = resting_sphere(device, articulated=True, authored_material=authored_material, steps=200)
+        laws = solver.laws.set
+        test.assertEqual(laws.authored, authored_material)
+        test.assertEqual(laws.material, authored_material)
+        test.assertEqual(laws.weighted, authored_material)
+        test.assertTrue(laws.separable)
+        if authored_material:
+            count = int(solver.placement.constraint_count.numpy()[0])
+            normal = solver.placement.row_type.numpy()[0, :count] == 0
+            eps = solver.placement.row_eps.numpy()[0, :count][normal]
+            weight = solver.placement.row_w.numpy()[0, :count][normal]
+            test.assertGreater(len(eps), 0)
+            test.assertTrue(np.all(eps < 0.0))
+            np.testing.assert_allclose(weight, 1.0 / (1.0 - eps), rtol=1e-6)
+
+
+def test_rest_depth_is_mujocos(test, device):
+    """An authored sphere rests at MuJoCo's static depth (the mass cancels), as a dense row (articulated) and as a free
+    body's region; the same sphere unauthored rests rigid."""
+    expected = rest_depth(PART)
+    for articulated in (True, False):
+        with test.subTest(articulated=articulated):
+            height, speed, solver = resting_sphere(device, articulated=articulated, authored_material=True)
+            # The free body's contact is a region on the CPU: the region law reads the row's relative compliance.
+            if not articulated and wp.get_device(device).is_cpu:
+                test.assertIsNotNone(solver.sweep.regions)
+            test.assertAlmostEqual(-height, expected, delta=0.02 * expected)
+            test.assertLess(speed, 1e-3)
+            rigid, rigid_speed, _ = resting_sphere(device, articulated=articulated, authored_material=False)
+            test.assertLess(abs(rigid), 0.1 * expected)
+            test.assertLess(rigid_speed, 1e-3)
+
+
+class TestAuthoredContacts(unittest.TestCase):
+    @unittest.skipUnless(wp.get_device().is_cuda, "The predictor publishes its body twists on CUDA")
+    def test_separated_worlds_match_the_complete_path(self):
+        """Arms over tossed free boxes, every shape authored: a world none of whose rows can act at the predictor (by
+        the authored law's residual) takes no sweep, and every world steps as on the complete path."""
+        from newton.tests.test_feather_pgs_separated_worlds import _rollout  # noqa: PLC0415
+        from newton.tests.test_feather_pgs_mixed_tree_free_body import _build  # noqa: PLC0415
+
+        model = _build(wp.get_device(), worlds=6)
+        model.shape_flags.assign(model.shape_flags.numpy() | int(newton.ShapeFlags.CONTACT_MATERIAL))
+        model.shape_material_ke.fill_(PART[0])
+        model.shape_material_kd.fill_(PART[1])
+        plain_solver, plain, plain_masks = _rollout(model, separated=False)
+        self.assertTrue(plain_solver.laws.set.authored)
+        self.assertEqual(plain_masks.shape[1], 0)
+        _solver, poses, masks = _rollout(model)
+        self.assertGreater(int(masks.sum()), 0)
+        self.assertLess(int(masks.sum()), masks.size)
+        np.testing.assert_array_equal(poses, plain)
+
+
+for _name, _function in (
+    ("test_routes_follow_authorship", test_routes_follow_authorship),
+    ("test_rest_depth_is_mujocos", test_rest_depth_is_mujocos),
+):
+    add_function_test(TestAuthoredContacts, _name, _function, devices=get_test_devices())
 
 
 if __name__ == "__main__":

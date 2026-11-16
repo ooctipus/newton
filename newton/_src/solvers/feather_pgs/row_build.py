@@ -18,6 +18,7 @@ import warp as wp
 from .contact_input import ContactFrame, ContactInput
 from .contact_laws import (
     CONTACT_SPIN_ROW,
+    contact_authored,
     contact_friction,
     contact_materials,
     contact_row_entry,
@@ -30,6 +31,7 @@ from .row_laws import (
     ROW_CONTACT,
     ROW_FRICTION,
     ROW_TORSION,
+    authored_contact_law,
     contact_capped_beta,
     contact_depenetration_cap,
     contact_material_rhs,
@@ -109,6 +111,11 @@ def contact_row_writer(kinds: bool = True, laws: bool = True) -> wp.Function:
     ``contact_compliance`` a contact of positive stiffness is a material contact: its normal row's rhs and compliance
     are :func:`.row_laws.contact_material_rhs`'s (``row_eps``, zero on every other contact row), written whether or not
     ``with_rhs``; it takes no restitution, and its tangents' coefficient takes its friction scale (zero meaning one).
+    Any other contact of a shape that authors its material (:func:`.contact_laws.contact_authored`) is a material
+    contact by its shapes' law (:func:`.row_laws.authored_contact_law`): the same rhs, and its relative compliance
+    ``rho`` stored as ``row_eps = -rho`` and as its weight ``row_w = 1 / (1 + rho)`` (the row's compliance ``rho d`` on
+    whichever diagonal its placement forms: every sweep steps it by that weight); it takes no restitution and keeps its
+    friction coefficient.
     """
 
     def writer(data: ContactInput, law: PatchRowLaw, frame: ContactFrame, c: int, row: int, with_rhs: bool):
@@ -126,7 +133,10 @@ def contact_row_writer(kinds: bool = True, laws: bool = True) -> wp.Function:
         stiffness = float(0.0)
         if data.material != 0:
             stiffness = data.stiffness[c]
-        if stiffness > 0.0:
+        authored = False
+        if data.authored != 0 and stiffness <= 0.0:
+            authored = contact_authored(data.shape0[c], data.shape1[c], data.shape_flags)
+        if stiffness > 0.0 or authored:
             restitution = 0.0
         if wp.static(laws):
             direction, row_point = contact_row_frame(
@@ -174,11 +184,22 @@ def contact_row_writer(kinds: bool = True, laws: bool = True) -> wp.Function:
                 data.phi[line, r] = tangent_phi
                 data.restitution[line, r] = 0.0
         if wp.static(laws):
-            if data.material != 0:
+            if data.material != 0 or data.authored != 0:
                 eps = float(0.0)
                 if row == 0 and stiffness > 0.0:
                     material_rhs, eps = contact_material_rhs(phi, target, stiffness, data.damping[c], data.dt)
                     data.rhs[line, r] = material_rhs
+                elif row == 0 and authored:
+                    s0 = data.shape0[c]
+                    s1 = data.shape1[c]
+                    kappa, beta = authored_contact_law(
+                        data.material_ke[s0], data.material_kd[s0], data.material_ke[s1], data.material_kd[s1], phi,
+                        data.dt,
+                    )  # fmt: skip
+                    material_rhs, rho = contact_material_rhs(phi, target, kappa, beta, data.dt)
+                    data.rhs[line, r] = material_rhs
+                    data.row_w[line, r] = 1.0 / (1.0 + rho)
+                    eps = -rho
                 data.row_eps[line, r] = eps
             data.target[line, r] = target
             data.sides[line, r] = row_sides(art_a, art_b, data.response_dofs)
@@ -189,6 +210,9 @@ def contact_row_writer(kinds: bool = True, laws: bool = True) -> wp.Function:
                 weight = float(1.0)
                 if row == 0 and stiffness > 0.0:
                     rhs = data.rhs[line, r]
+                elif row == 0 and authored:
+                    rhs = data.rhs[line, r]
+                    weight = data.row_w[line, r]
                 elif row == 0:
                     rhs, weight = contact_rhs(
                         phi, normal_beta, target, inv_dt, data.bias_scale, data.speculative_scale, data.contact_w

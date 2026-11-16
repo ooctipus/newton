@@ -74,7 +74,10 @@ class Laws:
     """Spin rows may follow friction pairs: on a patch region with a footprint (one wrench a region), or on every
     friction contact under ``contact_torsion``; the sweeps read each contact's rows from the data."""
     compliance: bool
-    """Material contacts take the row law's compliance (``contact_compliance``)."""
+    """Contacts of positive per-contact stiffness take the row law's compliance (``contact_compliance``)."""
+    authored: bool
+    """Contacts of shapes that author their material (:attr:`~newton.ShapeFlags.CONTACT_MATERIAL`) take its law (read
+    from the model)."""
     limits: bool
     """Joint position limits take rows (``enable_joint_limits``)."""
     velocity_limits: bool
@@ -88,15 +91,30 @@ class Laws:
 
     @property
     def separable(self) -> bool:
-        """Every row starts at zero and keeps it at a positive predictor residual: the hard contact law, its friction
-        and spin rows, position limits; no warm start, weighted contact, joint velocity limit, mimic or eliminated row."""
-        return not (self.warm_start or self.weighted or self.velocity_limits or self.mimic or self.preelimination)
+        """Every row starts at zero and keeps it at a positive predictor residual, the residual the contacts'
+        admission forms: the hard contact law, an authored material's, their friction and spin rows, position limits;
+        no warm start, relatively regularized or per-contact compliant contact, joint velocity limit, mimic or
+        eliminated row. (A weighted step from zero at a positive residual stays at zero; the admission forms an
+        authored row's residual by its law, :func:`.row_slots.contact_separates`.)"""
+        return not (
+            self.warm_start
+            or self.regularized
+            or self.compliance
+            or self.velocity_limits
+            or self.mimic
+            or self.preelimination
+        )
+
+    @property
+    def material(self) -> bool:
+        """Contact normals may carry a compliance: a per-contact stiffness's, or an authored material's."""
+        return self.compliance or self.authored
 
     @property
     def weighted(self) -> bool:
         """Contact rows step by their weights: the relative regularization's, or a material contact's from its
         compliance (every placement's sweep reads them)."""
-        return self.regularized or self.compliance
+        return self.regularized or self.material
 
     @classmethod
     def build(cls, laws, options, model, *, preelimination: bool) -> Laws:
@@ -106,6 +124,7 @@ class Laws:
             regularized=bool(laws.regularization_enabled),
             torsion=bool(laws.spin_rows),
             compliance=bool(options.contact_compliance),
+            authored=bool(laws.authored_materials),
             limits=bool(options.enable_joint_limits),
             velocity_limits=bool(options.enable_joint_velocity_limits),
             warm_start=bool(options.pgs_warmstart),
@@ -115,7 +134,7 @@ class Laws:
 
     def record(self) -> dict:
         """The laws as a JSON-compliant record, with the derived ones."""
-        return {**asdict(self), "weighted": self.weighted}
+        return {**asdict(self), "material": self.material, "weighted": self.weighted}
 
 
 @dataclass(frozen=True)

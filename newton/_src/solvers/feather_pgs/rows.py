@@ -31,6 +31,7 @@ import warp as wp
 
 from ...core import memory
 from ...core.execution import Shape, Work, launch, shape
+from ...geometry.flags import ShapeFlags
 from ...sim import Contacts, Model, State
 from ...sim.enums import JointType
 from . import field_group, host_index, prefix_rows, walk_rows
@@ -343,6 +344,7 @@ class RowLaws:
             laws.shape_material_restitution = model.shape_material_restitution
         else:
             laws.shape_material_restitution = wp.zeros((1,), dtype=wp.float32, device=model.device)
+        laws._authored_materials(model)
 
         # The joint velocity prescale's lanes per articulation and threads (it writes every DOF of qd_work).
         if model.joint_count:
@@ -379,6 +381,23 @@ class RowLaws:
         if mu_torsional is None:
             mu_torsional = wp.zeros((1,), dtype=wp.float32, device=model.device, requires_grad=model.requires_grad)
         self.shape_material_mu_torsional = mu_torsional
+
+    def _authored_materials(self, model) -> None:
+        """Authored contact materials: whether a colliding shape authors its stiffness and damping
+        (:attr:`~newton.ShapeFlags.CONTACT_MATERIAL`, read once from the model), and the arrays its contacts read. A
+        model without one writes, places and sweeps its rows as it did before the flag existed."""
+        if model.shape_count:
+            flags = model.shape_flags.numpy()
+            colliding = (flags & int(ShapeFlags.COLLIDE_SHAPES)) != 0
+            self.authored_materials = int(bool(((flags & int(ShapeFlags.CONTACT_MATERIAL)) != 0)[colliding].any()))
+            self.shape_flags = model.shape_flags
+            self.shape_material_ke = model.shape_material_ke
+            self.shape_material_kd = model.shape_material_kd
+        else:
+            self.authored_materials = 0
+            placeholder = wp.zeros((1,), dtype=wp.float32, device=model.device)
+            self.shape_flags = wp.zeros((1,), dtype=wp.int32, device=model.device)
+            self.shape_material_ke = self.shape_material_kd = placeholder
 
     def decide(self, *, preelimination: bool) -> None:
         """Read the route table's laws axis (:attr:`set`) once the bilateral pre-elimination is decided."""
@@ -952,7 +971,7 @@ class RowLaws:
         bias = RowBias()
         bias.dt, bias.speculative_scale = dt, options.contact_speculative_scale
         bias.contact_w, bias.restitution_threshold = self.contact_w, self.effective_restitution_velocity_threshold
-        bias.weighted, bias.material = int(self.set.weighted), int(options.contact_compliance)
+        bias.weighted, bias.material = int(self.set.weighted), int(self.set.material)
         return bias
 
     def write_walked(
@@ -1183,7 +1202,8 @@ class RowLaws:
                 "friction_anchor_beta": json_value(self.friction_anchor_beta),
                 "anchor_beta_source": self.friction_anchor_beta_source,
                 "torsion": bool(self.spin_rows),
-                "compliance": bool(self.options.contact_compliance),
+                "compliance": bool(self.set.material),
+                "authored_materials": bool(self.authored_materials),
                 "reason": _BETA_REASONS[self.friction_anchor_beta_source],
                 "pair_sort": self.friction_patches.record(),
             },

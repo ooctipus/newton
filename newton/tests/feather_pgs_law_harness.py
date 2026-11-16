@@ -1404,6 +1404,7 @@ def plain_laws(**changes) -> Laws:
         "regularized": False,
         "torsion": False,
         "compliance": False,
+        "authored": False,
         "limits": True,
         "velocity_limits": False,
         "warm_start": False,

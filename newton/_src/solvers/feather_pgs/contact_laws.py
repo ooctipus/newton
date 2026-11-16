@@ -33,6 +33,7 @@ One law each, written once for Warp kernels and native CUDA (:mod:`.law_source`)
 
 import warp as wp
 
+from ...geometry.flags import ShapeFlags
 from ...sim import BodyFlags
 from .law_source import LawFamily
 from .spatial_laws import SPATIAL, point_velocity
@@ -229,6 +230,22 @@ def contact_materials(
 ) -> tuple[float, float]:
     """Return a contact's friction coefficient and restitution (:func:`contact_friction`, :func:`contact_restitution`)."""
     return contact_friction(shape_a, shape_b, shape_mu), contact_restitution(shape_a, shape_b, shape_restitution)
+
+
+CONTACT_MATERIAL = wp.constant(int(ShapeFlags.CONTACT_MATERIAL))
+
+
+@CONTACT_LAW.law(cuda=False)
+def contact_authored(shape_a: int, shape_b: int, shape_flags: wp.array[wp.int32]) -> bool:
+    """Return whether a contact takes its shapes' material: either shape authors one
+    (:attr:`~newton.ShapeFlags.CONTACT_MATERIAL`); an unauthored side enters with its stored default, as MuJoCo mixes
+    it (:func:`.row_laws.authored_contact_law`)."""
+    authored = False
+    if shape_a >= 0:
+        authored = (shape_flags[shape_a] & CONTACT_MATERIAL) != 0
+    if shape_b >= 0:
+        authored = authored or (shape_flags[shape_b] & CONTACT_MATERIAL) != 0
+    return authored
 
 
 @CONTACT_LAW.law

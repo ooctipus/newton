@@ -209,7 +209,7 @@ def row_bias(rows: DenseRows, bias: RowBias, line: int, i: int, incident: float)
     their regularization weight."""
     kind = rows.row_type[line, i]
     if bias.material != 0 and kind == ROW_CONTACT:
-        if rows.row_eps[line, i] > 0.0:
+        if rows.row_eps[line, i] != 0.0:
             return
     inv_dt = 1.0 / bias.dt
     phi = rows.phi[line, i]

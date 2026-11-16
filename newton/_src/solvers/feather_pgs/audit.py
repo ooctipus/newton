@@ -92,7 +92,7 @@ AuditRows = struct(
         Field("mf_counts", int, ("line",), owner="placement", attr="mf_constraint_count"),
         Field("speed_first", int, ("line",), owner="placement"),
         Field("weighted", int, owner="step"),
-        Field("material", int, owner="options", attr="contact_compliance"),
+        Field("material", int, owner="step"),
         Field("capacity", int, owner="placement", attr="dense_max_constraints"),
         Field("acts", int, ("line",), owner="placement", attr="world_acts"),
     ),
@@ -104,9 +104,12 @@ world's acts word (:data:`.placement.WORLD_ACTS`)."""
 
 @wp.func
 def contact_compliance(weight: float, eps: float, diagonal: float) -> float:
-    """A contact normal's ``eps_i``: a material contact's, else ``g d`` from its weight ``1 / (1 + g)``."""
+    """A contact normal's ``eps_i``: a material contact's (positive), an authored one's ``rho d`` (stored ``-rho``),
+    else ``g d`` from its weight ``1 / (1 + g)``."""
     if eps > 0.0:
         return eps
+    if eps < 0.0:
+        return -eps * diagonal
     return (1.0 / weight - 1.0) * diagonal
 
 
@@ -577,7 +580,10 @@ class Audit:
     def _operands(self):
         solver, placement = self.solver, self.solver.placement
         owners = {"placement": placement, "classes": solver.spec.classes, "options": solver.options}
-        return bind(AuditRows, rows=bind_dense_rows(placement), weighted=solver.laws.set.weighted, **owners)
+        laws = solver.laws.set
+        return bind(
+            AuditRows, rows=bind_dense_rows(placement), weighted=laws.weighted, material=laws.material, **owners
+        )
 
     def _walk_coordinates(self, velocity: wp.array, coordinates: wp.array) -> None:
         """The walked trees' walk coordinates of ``velocity`` (:func:`.factor.walk.walk_enter_kernel`)."""
