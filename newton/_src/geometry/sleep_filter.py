@@ -102,19 +102,9 @@ def _moving(shape: int, shape_body: wp.array[wp.int32], body_qd: wp.array[wp.spa
 
 
 @wp.kernel
-def _seed(
-    tree_asleep: wp.array2d[wp.int32],
-    trees: int,
-    parent: wp.array[wp.int32],
-    held_back: wp.array[wp.int32],
-    acted: wp.array[wp.int32],
-):
-    """Each tree its own island, held back where it is awake and not ready, acted on where the solver says so."""
+def _identity(parent: wp.array[wp.int32]):
     i = wp.tid()
     parent[i] = i
-    state = tree_asleep[i // trees, i % trees]
-    held_back[i] = wp.where(state < READY, 1, 0)
-    acted[i] = wp.where(state == ACTED, 1, 0)
 
 
 @wp.kernel
@@ -161,15 +151,22 @@ def _join(
 
 @wp.kernel
 def _close(
-    parent: wp.array[wp.int32], root: wp.array[wp.int32], held_back: wp.array[wp.int32], acted: wp.array[wp.int32]
+    tree_asleep: wp.array2d[wp.int32],
+    trees: int,
+    parent: wp.array[wp.int32],
+    root: wp.array[wp.int32],
+    held_back: wp.array[wp.int32],
+    acted: wp.array[wp.int32],
 ):
-    """Each tree's island root; a held-back tree holds back its island, an acted-on tree loads it."""
+    """Each tree's island root; a tree awake and not ready (or one a moving unheld body reaches) holds back its
+    island, an acted-on tree loads it."""
     i = wp.tid()
     r = _find(parent, i)
     root[i] = r
-    if held_back[i] != 0:
+    state = tree_asleep[i // trees, i % trees]
+    if held_back[i] != 0 or state < READY:
         held_back[r] = 1
-    if acted[i] != 0:
+    if state == ACTED:
         acted[r] = 1
 
 
@@ -214,9 +211,17 @@ def _mask(
     shape_sleep_index: wp.array[wp.vec2i],
     tree_asleep: wp.array2d[wp.int32],
     threads: int,
+    parent: wp.array[wp.int32],
+    held_back: wp.array[wp.int32],
+    acted: wp.array[wp.int32],
 ):
     """Drop a candidate pair whose two sides are each static, unheld or asleep: no contact is made for it (a moving
-    unheld body woke its asleep partner in :func:`_decide`)."""
+    unheld body woke its asleep partner in :func:`_decide`). Then seed the next pass, whose islands start as single
+    trees (:func:`_decide` was this pass's last reader of the island arrays)."""
+    for i in range(wp.tid(), parent.shape[0], threads):
+        parent[i] = i
+        held_back[i] = 0
+        acted[i] = 0
     n = wp.min(pair_count[0], pairs.shape[0])
     for k in range(wp.tid(), n, threads):
         pair = pairs[k]
@@ -247,7 +252,10 @@ class SleepFilter:
         self.device = device
         self.trees = int(tree_asleep.shape[1])
         count = max(1, int(tree_asleep.shape[0]) * self.trees)
-        self.parent = wp.zeros(count, dtype=wp.int32, device=device)
+        # Each tree its own island: the first pass's seed (a launch, so a binding inside a graph capture records no
+        # host copy), which every pass's mask writes again for the next.
+        self.parent = wp.empty(count, dtype=wp.int32, device=device)
+        wp.launch(_identity, dim=count, outputs=[self.parent], device=device, record_tape=False)
         self.root = wp.zeros(count, dtype=wp.int32, device=device)
         self.held_back = wp.zeros(count, dtype=wp.int32, device=device)
         self.acted = wp.zeros(count, dtype=wp.int32, device=device)
@@ -263,16 +271,8 @@ class SleepFilter:
         islands = int(self.tree_asleep.shape[0]) * self.trees
         if islands == 0:
             return
-        threads = max(1, min(int(pairs.shape[0]), self.pair_threads))
+        threads = max(1, min(max(int(pairs.shape[0]), islands), self.pair_threads))
         device = self.device
-        wp.launch(
-            _seed,
-            dim=islands,
-            inputs=[self.tree_asleep, self.trees],
-            outputs=[self.parent, self.held_back, self.acted],
-            device=device,
-            record_tape=False,
-        )
         wp.launch(
             _join,
             dim=threads,
@@ -294,7 +294,7 @@ class SleepFilter:
         wp.launch(
             _close,
             dim=islands,
-            inputs=[self.parent],
+            inputs=[self.tree_asleep, self.trees, self.parent],
             outputs=[self.root, self.held_back, self.acted],
             device=device,
             record_tape=False,
@@ -311,6 +311,7 @@ class SleepFilter:
             _mask,
             dim=threads,
             inputs=[pairs, pair_count, self.shape_sleep_index, self.tree_asleep, threads],
+            outputs=[self.parent, self.held_back, self.acted],
             device=device,
             record_tape=False,
         )
