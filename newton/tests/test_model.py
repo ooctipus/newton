@@ -2443,6 +2443,29 @@ class TestModelMesh(unittest.TestCase):
 
 
 class TestShapeConfigValidation(unittest.TestCase):
+    def test_contact_material_flag_records_authorship(self):
+        """An authored stiffness or damping sets CONTACT_MATERIAL; the stored values are the defaults otherwise."""
+        cfg_type = newton.ModelBuilder.ShapeConfig
+        material = int(newton.ShapeFlags.CONTACT_MATERIAL)
+        builder = newton.ModelBuilder()
+        body = builder.add_body()
+        plain = builder.add_shape_sphere(body, radius=0.1)
+        stiff = builder.add_shape_sphere(body, radius=0.1, cfg=cfg_type(ke=1.0e5))
+        damped = builder.add_shape_sphere(body, radius=0.1, cfg=cfg_type(kd=10.0))
+        model = builder.finalize(device="cpu")
+
+        flags = model.shape_flags.numpy()
+        self.assertFalse(flags[plain] & material)
+        self.assertTrue(flags[stiff] & material)
+        self.assertTrue(flags[damped] & material)
+        assert_np_equal(model.shape_material_ke.numpy(), np.array([cfg_type.DEFAULT_KE, 1.0e5, cfg_type.DEFAULT_KE]))
+        assert_np_equal(model.shape_material_kd.numpy(), np.array([cfg_type.DEFAULT_KD, cfg_type.DEFAULT_KD, 10.0]))
+
+        cfg = cfg_type(ke=1.0e5, kd=10.0)
+        cfg.flags = cfg.flags & ~material
+        self.assertIsNone(cfg.ke)
+        self.assertIsNone(cfg.kd)
+
     def test_shape_config_rejects_invalid_density(self):
         """Reject negative and non-finite density values."""
         for density in (-1.0, float("nan"), float("inf"), float("-inf")):

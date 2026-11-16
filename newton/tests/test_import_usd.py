@@ -8211,11 +8211,21 @@ def Xform "Articulation" (
         self.assertAlmostEqual(model.shape_material_kf.numpy()[idx_partial], builder.default_shape_cfg.kf, places=1)
         self.assertAlmostEqual(model.shape_material_ka.numpy()[idx_partial], builder.default_shape_cfg.ka, places=4)
 
-        # No material: all from builder defaults
-        self.assertAlmostEqual(model.shape_material_ke.numpy()[idx_none], builder.default_shape_cfg.ke, places=1)
-        self.assertAlmostEqual(model.shape_material_kd.numpy()[idx_none], builder.default_shape_cfg.kd, places=1)
+        # No material: all from builder defaults, stiffness and damping unauthored
+        self.assertAlmostEqual(
+            model.shape_material_ke.numpy()[idx_none], newton.ModelBuilder.ShapeConfig.DEFAULT_KE, places=1
+        )
+        self.assertAlmostEqual(
+            model.shape_material_kd.numpy()[idx_none], newton.ModelBuilder.ShapeConfig.DEFAULT_KD, places=1
+        )
         self.assertAlmostEqual(model.shape_material_kf.numpy()[idx_none], builder.default_shape_cfg.kf, places=1)
         self.assertAlmostEqual(model.shape_material_ka.numpy()[idx_none], builder.default_shape_cfg.ka, places=4)
+
+        flags = model.shape_flags.numpy()
+        material = int(newton.ShapeFlags.CONTACT_MATERIAL)
+        self.assertTrue(flags[idx_all] & material)
+        self.assertTrue(flags[idx_partial] & material)
+        self.assertFalse(flags[idx_none] & material)
 
     @requires("pxr.Usd")
     def test_contact_response_inf_sentinel(self):
@@ -8250,8 +8260,13 @@ def Xform "Articulation" (
         model = builder.finalize()
 
         idx = result["path_shape_map"]["/Articulation/Body/Col"]
-        self.assertAlmostEqual(model.shape_material_ke.numpy()[idx], builder.default_shape_cfg.ke, places=1)
-        self.assertAlmostEqual(model.shape_material_kd.numpy()[idx], builder.default_shape_cfg.kd, places=1)
+        self.assertAlmostEqual(
+            model.shape_material_ke.numpy()[idx], newton.ModelBuilder.ShapeConfig.DEFAULT_KE, places=1
+        )
+        self.assertAlmostEqual(
+            model.shape_material_kd.numpy()[idx], newton.ModelBuilder.ShapeConfig.DEFAULT_KD, places=1
+        )
+        self.assertFalse(model.shape_flags.numpy()[idx] & int(newton.ShapeFlags.CONTACT_MATERIAL))
         self.assertAlmostEqual(model.shape_material_kf.numpy()[idx], builder.default_shape_cfg.kf, places=1)
         self.assertAlmostEqual(model.shape_material_ka.numpy()[idx], builder.default_shape_cfg.ka, places=4)
 

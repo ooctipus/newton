@@ -268,6 +268,9 @@ def build_reduction_groups(model, material_attributes: tuple[str, ...] | None = 
         arr = getattr(model, name, None)
         if arr is not None:
             mats.append(arr.numpy())
+    # Whether a shape authors its stiffness and damping is part of its law: equal stored values of an authored
+    # and an unauthored shape are different laws for a solver whose default contact is rigid.
+    mats.append(model.shape_flags.numpy() & int(ShapeFlags.CONTACT_MATERIAL))
     registered = shape_material_attribute_names(model)
     if material_attributes is None:
         material_attributes = registered

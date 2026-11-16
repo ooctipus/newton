@@ -1258,12 +1258,23 @@ class ModelBuilder:
         see solver-specific documentation for behavior.
         """
 
+        DEFAULT_KE: ClassVar[float] = 2.5e3
+        """The normal contact stiffness [N/m] a shape stores when :attr:`ke` is not authored."""
+        DEFAULT_KD: ClassVar[float] = 100.0
+        """The normal contact damping [N·s/m] a shape stores when :attr:`kd` is not authored."""
+
         density: float = 1000.0
         """The density of the shape material."""
-        ke: float = 2.5e3
-        """The normal contact stiffness [N/m]."""
-        kd: float = 100.0
-        """The normal contact damping coefficient [N·s/m]."""
+        ke: float | None = None
+        """The normal contact stiffness [N/m], or ``None`` when the shape authors none.
+
+        A shape that sets :attr:`ke` or :attr:`kd` carries :attr:`~newton.ShapeFlags.CONTACT_MATERIAL`;
+        an unset value is stored as :attr:`DEFAULT_KE`, so solvers that read the stored
+        stiffness see the same number either way."""
+        kd: float | None = None
+        """The normal contact damping coefficient [N·s/m], or ``None`` when the shape authors none.
+
+        An unset value is stored as :attr:`DEFAULT_KD`; see :attr:`ke`."""
         kf: float = 1000.0
         """The contact friction gain [N·s/m].
 
@@ -1555,6 +1566,7 @@ class ModelBuilder:
             shape_flags |= ShapeFlags.COLLIDE_PARTICLES if self.has_particle_collision else 0
             shape_flags |= ShapeFlags.SITE if self.is_site else 0
             shape_flags |= ShapeFlags.HYDROELASTIC if self.is_hydroelastic else 0
+            shape_flags |= ShapeFlags.CONTACT_MATERIAL if self.ke is not None or self.kd is not None else 0
             return shape_flags
 
         @flags.setter
@@ -1563,6 +1575,11 @@ class ModelBuilder:
 
             self.is_visible = bool(value & ShapeFlags.VISIBLE)
             self.is_hydroelastic = bool(value & ShapeFlags.HYDROELASTIC)
+            # The bit is derived from the values: clearing it drops an authored material; setting it keeps the
+            # values this config already holds.
+            if not value & ShapeFlags.CONTACT_MATERIAL:
+                self.ke = None
+                self.kd = None
 
             # Check if SITE flag is being set
             is_site_flag = bool(value & ShapeFlags.SITE)
@@ -9654,8 +9671,8 @@ class ModelBuilder:
         self.shape_opacity.append(resolved_opacity)
         self.shape_margin.append(cfg.margin)
         self.shape_is_solid.append(cfg.is_solid)
-        self.shape_material_ke.append(cfg.ke)
-        self.shape_material_kd.append(cfg.kd)
+        self.shape_material_ke.append(cfg.ke if cfg.ke is not None else ModelBuilder.ShapeConfig.DEFAULT_KE)
+        self.shape_material_kd.append(cfg.kd if cfg.kd is not None else ModelBuilder.ShapeConfig.DEFAULT_KD)
         self.shape_material_kf.append(cfg.kf)
         self.shape_material_ka.append(cfg.ka)
         self.shape_material_mu.append(cfg.mu)

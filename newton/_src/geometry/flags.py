@@ -44,6 +44,16 @@ class ShapeFlags(IntEnum):
     HYDROELASTIC = 1 << 4
     """Indicates that the shape uses hydroelastic collision."""
 
+    CONTACT_MATERIAL = 1 << 5
+    """Indicates that the shape authors its contact stiffness or damping.
+
+    Set by :class:`~newton.ModelBuilder` when a shape's :attr:`~newton.ModelBuilder.ShapeConfig.ke` or
+    :attr:`~newton.ModelBuilder.ShapeConfig.kd` is given. :attr:`~newton.Model.shape_material_ke` and
+    :attr:`~newton.Model.shape_material_kd` hold a value for every shape either way; a solver whose
+    default contact is not a spring and damper (such as :class:`~newton.solvers.SolverFeatherPGS`)
+    uses them only where this flag is set. Writing those arrays directly does not set it.
+    """
+
 
 class MeshSignMethod(IntEnum):
     """Method used to determine the inside/outside sign of a mesh point query."""
