@@ -1,0 +1,510 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
+# SPDX-License-Identifier: Apache-2.0
+
+"""The region law: a contact region solved as one block in its frame's six coordinates.
+
+A *region* is one friction patch of one body pair. It has one frame at its
+anchor: a normal ``n`` and a tangent pair ``t0``, ``t1``. The pair's relative
+twist at the anchor, in that frame, splits three and three:
+
+* ``N = (v_n, w_t0, w_t1)``: the closing speed at the anchor and the two
+  tilts. Every contact of the region, a *candidate*, is a row over ``N``:
+  ``r_i = v_n + a_i1 w_t0 + a_i2 w_t1 + b_i (+ eps_i lambda_i)`` with
+  ``(a_i1, a_i2) = ((d_i x n) . t0, (d_i x n) . t1)`` for its point ``d_i``
+  from the anchor. A candidate's record is ``(a_i1, a_i2, b_i, eps_i)``.
+* ``F = (v_t0, v_t1, w_n)``: the two slips at the anchor and the spin, the
+  region's friction unit, on the cone ``|(f_0 / mu, f_1 / mu, f_2 / mu_t)| <=
+  load`` at the region's load, the sum of its candidates' impulses.
+
+The pair's response in those coordinates is one symmetric 6 x 6 matrix
+(:func:`frame_response`, summed over the bodies that move): ``Wnn`` over
+``N``, ``G`` over ``F`` and their coupling ``C``. The visit never sees the
+support the bodies' coordinates live on: a caller gathers the pair's twist
+into the frame (:func:`frame_twist`), calls :func:`region_visit`, and
+scatters the change of the region's wrench (:func:`frame_wrench`). So one
+visit serves a free body against an immovable partner, two movable bodies,
+and a body at a tree's endpoint.
+
+The visit (``newton/tests/feather_pgs_region_reference.py`` is its float64
+reference): the region's own wrench leaves the velocity; if no candidate
+closes there the region holds nothing (*open*); else *stick first*: the
+candidates' block with the friction unit held at zero residual, which stands
+when the friction that holds the unit lies in its cone at the block's load;
+else the region *slides*: the candidates' block with the friction as it was,
+then the unit's cone law at the block's load, once.
+
+The candidates' block (:func:`region_block`) is exact for any mix of rigid
+and compliant candidates. Rigid candidates (``eps = 0``) are a projection
+onto their polyhedron in the block's metric: a dual active set of at most
+three rows, three coordinates holding no more independent ones. A compliant
+candidate (``eps > 0``) holds ``-(r_i) / eps_i`` wherever it closes: the
+closing ones change the block's metric and start (Newton on the three
+coordinates, one sum over the candidates a step), and the rigid set is
+solved in that metric.
+"""
+
+import warp as wp
+
+from .law_source import LawFamily
+from .projection_laws import BILATERAL_PIVOT, CONE_LAW, friction_triple
+
+REGION_LAW = LawFamily("RegionLaw", requires=(CONE_LAW,))
+"""The region law's family; native code calls ``RegionLaw::region_visit(...)``."""
+
+REGION_OPEN = wp.constant(0)
+"""A visit's outcome: the region holds nothing."""
+REGION_STICK = wp.constant(1)
+"""A visit's outcome: the friction unit is held inside its cone (settled)."""
+REGION_SLIDE = wp.constant(2)
+"""A visit's outcome: the friction unit is on its cone (visited again next sweep)."""
+
+REGION_STEPS = wp.constant(16)
+"""Steps a block takes at most: its active-set steps and its Newton steps together."""
+
+_NONE = wp.constant(1.0e30)
+
+
+@REGION_LAW.law
+def set_multipliers(a0: wp.vec3, a1: wp.vec3, a2: wp.vec3, K: wp.mat33, n: int, rhs: wp.vec3) -> wp.vec3:
+    """``(A K A^T)^-1 rhs`` over the set's ``n`` rows (the unused rows, zero, an identity)."""
+    k0 = K * a0
+    k1 = K * a1
+    k2 = K * a2
+    g01 = wp.dot(a0, k1)
+    g02 = wp.dot(a0, k2)
+    g12 = wp.dot(a1, k2)
+    g00 = wp.where(n < 1, 1.0, wp.dot(a0, k0))
+    g11 = wp.where(n < 2, 1.0, wp.dot(a1, k1))
+    g22 = wp.where(n < 3, 1.0, wp.dot(a2, k2))
+    return wp.inverse(wp.mat33(g00, g01, g02, g01, g11, g12, g02, g12, g22)) * rhs
+
+
+@REGION_LAW.law
+def set_start(
+    start: wp.vec3,
+    K: wp.mat33,
+    a0_in: wp.vec3,
+    a1_in: wp.vec3,
+    a2_in: wp.vec3,
+    ab_in: wp.vec3,
+    i0_in: int,
+    i1_in: int,
+    i2_in: int,
+    n_in: int,
+) -> tuple[wp.vec3, wp.vec3, wp.vec3, wp.vec3, int, int, int, wp.vec3, int]:
+    """The given set's multipliers at ``start`` in the metric ``K``; a row whose multiplier is not positive leaves the
+    set. Returns the set (its rows, their right-hand sides, their candidates), its multipliers and its size."""
+    a0 = a0_in
+    a1 = a1_in
+    a2 = a2_in
+    ab = ab_in
+    i0 = i0_in
+    i1 = i1_in
+    i2 = i2_in
+    n = n_in
+    zero = wp.vec3(0.0, 0.0, 0.0)
+    mu = zero
+    turn = int(0)
+    while n > 0 and turn < 4:
+        turn += 1
+        residual = wp.vec3(wp.dot(a0, start) + ab[0], wp.dot(a1, start) + ab[1], wp.dot(a2, start) + ab[2])
+        mu = set_multipliers(a0, a1, a2, K, n, zero - residual)
+        worst = float(0.0)
+        leaving = int(-1)
+        for k in range(3):
+            if k < n and mu[k] <= worst:
+                worst = mu[k]
+                leaving = k
+        if leaving < 0:
+            break
+        a0 = wp.where(leaving == 0, a1, a0)
+        a1 = wp.where(leaving <= 1, a2, a1)
+        a2 = wp.vec3(0.0, 0.0, 0.0)
+        ab = wp.vec3(wp.where(leaving == 0, ab[1], ab[0]), wp.where(leaving <= 1, ab[2], ab[1]), 0.0)
+        i0 = wp.where(leaving == 0, i1, i0)
+        i1 = wp.where(leaving <= 1, i2, i1)
+        i2 = -1
+        n -= 1
+    if n == 0:
+        mu = wp.vec3(0.0, 0.0, 0.0)
+    return a0, a1, a2, ab, i0, i1, i2, mu, n
+
+
+@REGION_LAW.law
+def set_enter(
+    s_in: wp.vec3,
+    K: wp.mat33,
+    aj: wp.vec3,
+    bj: float,
+    j: int,
+    a0_in: wp.vec3,
+    a1_in: wp.vec3,
+    a2_in: wp.vec3,
+    ab_in: wp.vec3,
+    i0_in: int,
+    i1_in: int,
+    i2_in: int,
+    mu_in: wp.vec3,
+    n_in: int,
+) -> tuple[wp.vec3, wp.vec3, wp.vec3, wp.vec3, int, int, int, wp.vec3, int, wp.vec3, int]:
+    """One step of the dual active set (Goldfarb and Idnani) in the metric ``K``: candidate ``j`` (its row ``aj``, its
+    right-hand side ``bj``), which closes at ``s_in``, enters the set; rows whose multiplier reaches zero on the way
+    leave it. A candidate depends on the set when what the set leaves of its row falls to
+    :data:`.projection_laws.BILATERAL_PIVOT` of the row's own squared norm (the bilateral block's rank rule): it
+    then enters only as a row leaves. Returns the set, its multipliers, its size, the velocity and whether the step
+    ended (1; it does not where the rows admit no velocity)."""
+    s = s_in
+    a0 = a0_in
+    a1 = a1_in
+    a2 = a2_in
+    ab = ab_in
+    i0 = i0_in
+    i1 = i1_in
+    i2 = i2_in
+    mu = mu_in
+    n = n_in
+    ended = int(0)
+    kaj = K * aj
+    own = wp.dot(aj, kaj)
+    entering = float(0.0)
+    turn = int(0)
+    while turn < 5:
+        turn += 1
+        k0 = K * a0
+        k1 = K * a1
+        k2 = K * a2
+        d = set_multipliers(a0, a1, a2, K, n, wp.vec3(wp.dot(a0, kaj), wp.dot(a1, kaj), wp.dot(a2, kaj)))
+        direction = kaj - (k0 * d[0] + k1 * d[1] + k2 * d[2])
+        along = wp.dot(aj, direction)
+        primal = float(_NONE)
+        if n < 3 and along > BILATERAL_PIVOT * own:
+            primal = -(wp.dot(aj, s) + bj) / along
+        dual = float(_NONE)
+        leaving = int(-1)
+        for k in range(3):
+            if k < n and d[k] > 0.0:
+                ratio = mu[k] / d[k]
+                if ratio < dual:
+                    dual = ratio
+                    leaving = k
+        step = wp.min(primal, dual)
+        if step >= _NONE:
+            break
+        mu = mu - step * d
+        entering += step
+        if primal < _NONE:
+            s = s + step * direction
+        if primal <= dual:
+            a0 = wp.where(n == 0, aj, a0)
+            a1 = wp.where(n == 1, aj, a1)
+            a2 = wp.where(n == 2, aj, a2)
+            ab = wp.vec3(wp.where(n == 0, bj, ab[0]), wp.where(n == 1, bj, ab[1]), wp.where(n == 2, bj, ab[2]))
+            i0 = wp.where(n == 0, j, i0)
+            i1 = wp.where(n == 1, j, i1)
+            i2 = wp.where(n == 2, j, i2)
+            mu = wp.vec3(
+                wp.where(n == 0, entering, mu[0]), wp.where(n == 1, entering, mu[1]), wp.where(n == 2, entering, mu[2])
+            )
+            n += 1
+            ended = 1
+            break
+        a0 = wp.where(leaving == 0, a1, a0)
+        a1 = wp.where(leaving <= 1, a2, a1)
+        a2 = wp.vec3(0.0, 0.0, 0.0)
+        ab = wp.vec3(wp.where(leaving == 0, ab[1], ab[0]), wp.where(leaving <= 1, ab[2], ab[1]), 0.0)
+        i0 = wp.where(leaving == 0, i1, i0)
+        i1 = wp.where(leaving <= 1, i2, i1)
+        i2 = -1
+        mu = wp.vec3(wp.where(leaving == 0, mu[1], mu[0]), wp.where(leaving <= 1, mu[2], mu[1]), 0.0)
+        n -= 1
+    return a0, a1, a2, ab, i0, i1, i2, mu, n, s, ended
+
+
+@REGION_LAW.law
+def candidate_row(record: wp.vec4) -> wp.vec3:
+    """A candidate's row over the region's normal coordinates from its record ``(a1, a2, b, eps)``."""
+    return wp.vec3(1.0, record[0], record[1])
+
+
+@REGION_LAW.law
+def candidate_compliance(record: wp.vec4, a: wp.vec3, free: wp.mat33) -> float:
+    """A candidate's compliance ``eps`` [1/kg] from its record: a material's (positive), or, stored negative, a
+    relative weight's share ``-eps`` of the row's own response ``a . free a`` (:func:`.row_laws.contact_rhs`'s
+    ``contact_w``: ``eps = (1 / w - 1) d``)."""
+    eps = record[3]
+    if eps < 0.0:
+        eps = -eps * wp.dot(a, free * a)
+    return eps
+
+
+@REGION_LAW.law
+def region_block(
+    start: wp.vec3,
+    K: wp.mat33,
+    without: wp.vec3,
+    free: wp.mat33,
+    cand: wp.array[wp.vec4],
+    g0: int,
+    g1: int,
+    i0_in: int,
+    i1_in: int,
+    i2_in: int,
+    spring_in: wp.vec3,
+    tol: float,
+) -> tuple[wp.vec3, int, int, int, wp.vec3, wp.vec3, wp.vec3, int, int, int]:
+    """The candidates' block of the region whose candidates are ``cand[g0:g1]``, from the velocity ``start`` (the
+    region's normal coordinates) in the metric ``K``: the impulses ``lambda >= 0`` with
+    ``r = A (start + K A^T lambda) + b + eps lambda >= 0`` and ``lambda . r = 0``, solved exactly (the module's
+    statement), from the set and the springs' wrench its last solve left.
+
+    ``without`` is the velocity without the region and ``free`` the response the relative weights read: the block is
+    *open* when no candidate closes at ``without`` faster than ``tol``.
+
+    Returns ``(wrench, i0, i1, i2, multipliers, springs, velocity, open, bounded, steps)``: the block's wrench
+    ``A^T lambda`` (its first coordinate the load), the rigid set and its multipliers, the compliant candidates'
+    part of the wrench, the velocity it leaves, whether it is open (1) and whether the rigid rows admitted a
+    velocity (1)."""
+    zero = wp.vec3(0.0, 0.0, 0.0)
+    identity = wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+    v0 = cand[wp.max(i0_in, g0)]
+    v1 = cand[wp.max(i1_in, g0)]
+    v2 = cand[wp.max(i2_in, g0)]
+    a0 = wp.where(i0_in >= 0, candidate_row(v0), zero)
+    a1 = wp.where(i1_in >= 0, candidate_row(v1), zero)
+    a2 = wp.where(i2_in >= 0, candidate_row(v2), zero)
+    ab = wp.vec3(wp.where(i0_in >= 0, v0[2], 0.0), wp.where(i1_in >= 0, v1[2], 0.0), wp.where(i2_in >= 0, v2[2], 0.0))
+    n = wp.where(i0_in >= 0, 1, 0) + wp.where(i1_in >= 0, 1, 0) + wp.where(i2_in >= 0, 1, 0)
+    a0, a1, a2, ab, i0, i1, i2, mu, n = set_start(start, K, a0, a1, a2, ab, i0_in, i1_in, i2_in, n)
+    # The metric and the start with the closing springs in them: none yet.
+    Ks = K
+    ss = start
+    S = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    q = zero
+    s = start + K * (a0 * mu[0] + a1 * mu[1] + a2 * mu[2] + spring_in)
+    # The closing springs the velocity was solved with: none, or (-1) those of the last solve, which are not known.
+    last_count = int(0)
+    if spring_in[0] != 0.0:
+        last_count = -1
+    last_sum = int(0)
+    last_square = int(0)
+    opened = int(1)
+    bounded = int(1)
+    steps = int(0)
+    turn = int(0)
+    while turn < REGION_STEPS:
+        turn += 1
+        # One pass over the candidates, four loads a step: who closes without the region, the springs that close at
+        # the velocity (their sums), and the rigid candidate outside the set that closes fastest there.
+        s00 = float(0.0)
+        s01 = float(0.0)
+        s02 = float(0.0)
+        s11 = float(0.0)
+        s12 = float(0.0)
+        s22 = float(0.0)
+        qs = zero
+        count = int(0)
+        index_sum = int(0)
+        index_square = int(0)
+        j = int(-1)
+        worst = -tol
+        i = g0
+        while i < g1:
+            for k in range(4):
+                ii = wp.min(i + k, g1 - 1)
+                record = cand[ii]
+                a = candidate_row(record)
+                if i + k < g1:
+                    if wp.dot(a, without) + record[2] < -tol:
+                        opened = 0
+                    r = wp.dot(a, s) + record[2]
+                    if record[3] != 0.0:
+                        if r < 0.0:
+                            ai = a * (1.0 / candidate_compliance(record, a, free))
+                            s00 += ai[0] * a[0]
+                            s01 += ai[0] * a[1]
+                            s02 += ai[0] * a[2]
+                            s11 += ai[1] * a[1]
+                            s12 += ai[1] * a[2]
+                            s22 += ai[2] * a[2]
+                            qs += ai * record[2]
+                            count += 1
+                            index_sum += ii - g0
+                            index_square += (ii - g0) * (ii - g0)
+                    elif ii != i0 and ii != i1 and ii != i2 and r < worst:
+                        worst = r
+                        j = ii
+            i += 4
+        if opened == 1:
+            break
+        if count != last_count or index_sum != last_sum or index_square != last_square:
+            # The closing springs changed: Newton's step on the three coordinates, the rigid set solved in it.
+            last_count = count
+            last_sum = index_sum
+            last_square = index_square
+            S = wp.mat33(s00, s01, s02, s01, s11, s12, s02, s12, s22)
+            q = qs
+            shape = wp.inverse(identity + K * S)
+            Ks = shape * K
+            ss = shape * (start - K * q)
+            a0, a1, a2, ab, i0, i1, i2, mu, n = set_start(ss, Ks, a0, a1, a2, ab, i0, i1, i2, n)
+            s = ss + Ks * (a0 * mu[0] + a1 * mu[1] + a2 * mu[2])
+            steps += 1
+            continue
+        if j < 0:
+            break
+        record = cand[j]
+        a0, a1, a2, ab, i0, i1, i2, mu, n, s, ended = set_enter(
+            s, Ks, candidate_row(record), record[2], j, a0, a1, a2, ab, i0, i1, i2, mu, n
+        )
+        steps += 1
+        if ended == 0:
+            bounded = 0
+            break
+    if opened == 1:
+        return zero, -1, -1, -1, zero, zero, without, 1, 1, steps
+    spring = zero
+    if last_count > 0:
+        spring = zero - (S * s + q)
+    return a0 * mu[0] + a1 * mu[1] + a2 * mu[2] + spring, i0, i1, i2, mu, spring, s, 0, bounded, steps
+
+
+@REGION_LAW.law
+def region_visit(
+    sn: wp.vec3,
+    sf: wp.vec3,
+    Wnn: wp.mat33,
+    C: wp.mat33,
+    G: wp.mat33,
+    cfm: float,
+    bf: wp.vec3,
+    mu: float,
+    mu_t: float,
+    friction: int,
+    cand: wp.array[wp.vec4],
+    g0: int,
+    g1: int,
+    wrench_in: wp.vec3,
+    phi_in: wp.vec3,
+    i0_in: int,
+    i1_in: int,
+    i2_in: int,
+    spring_in: wp.vec3,
+    tol: float,
+) -> tuple[wp.vec3, wp.vec3, int, int, int, wp.vec3, wp.vec3, wp.vec3, int, int]:
+    """One visit of a region (the module's statement), every other impulse held.
+
+    Args:
+        sn: The pair's relative twist in the region's normal coordinates ``N``, with the region's wrench in it.
+        sf: The same in its friction coordinates ``F``.
+        Wnn: The pair's response over ``N``.
+        C: The response of ``N`` to a wrench over ``F`` (``Wnf``).
+        G: The response over ``F``.
+        cfm: The friction unit's regularization, added to ``G``'s diagonal in its solves.
+        bf: The friction rows' right-hand sides.
+        mu: The friction coefficient.
+        mu_t: The torsional coefficient [m], 0 for a unit without a spin row.
+        friction: The friction unit's rows: 0 (none), 2 (a tangent pair) or 3 (with the spin row).
+        cand: The candidates' records.
+        g0: The region's first candidate.
+        g1: One past its last.
+        wrench_in: The normal wrench the region holds (over ``N``).
+        phi_in: The friction it holds (over ``F``).
+        i0_in: The rigid set its last visit left (-1: none), as indices of ``cand``.
+        i1_in: Its second row.
+        i2_in: Its third row.
+        spring_in: The compliant candidates' part of ``wrench_in``.
+        tol: The closing threshold [m/s].
+
+    Returns:
+        ``(wrench, phi, i0, i1, i2, multipliers, springs, velocity, outcome, steps)``: the wrench and friction the
+        region holds now, its rigid set and that set's multipliers, its springs' wrench, its normal coordinates'
+        velocity after the visit (a compliant candidate's impulse is ``max(0, -(a . velocity + b)) / eps``), and
+        :data:`REGION_OPEN`, :data:`REGION_STICK` or :data:`REGION_SLIDE`.
+    """
+    zero = wp.vec3(0.0, 0.0, 0.0)
+    # A unit without a spin row holds two coordinates: the third is free (no coupling, no residual).
+    Cu = C
+    Gu = G
+    rf0 = sf + bf
+    if friction < 3:
+        Cu = wp.mat33(C[0, 0], C[0, 1], 0.0, C[1, 0], C[1, 1], 0.0, C[2, 0], C[2, 1], 0.0)
+        Gu = wp.mat33(G[0, 0], G[0, 1], 0.0, G[1, 0], G[1, 1], 0.0, 0.0, 0.0, 1.0)
+        rf0 = wp.vec3(rf0[0], rf0[1], 0.0)
+    # The region's own wrench leaves the velocity.
+    without = sn - Wnn * wrench_in
+    if friction > 0:
+        without = without - Cu * phi_in
+        rf0 = rf0 - wp.transpose(Cu) * wrench_in - Gu * phi_in
+    if friction == 0:
+        wrench, i0, i1, i2, multipliers, spring, velocity, opened, _bounded, steps = region_block(
+            without, Wnn, without, Wnn, cand, g0, g1, i0_in, i1_in, i2_in, spring_in, tol
+        )
+        if opened == 1:
+            return zero, zero, -1, -1, -1, zero, zero, without, REGION_OPEN, steps
+        return wrench, zero, i0, i1, i2, multipliers, spring, velocity, REGION_STICK, steps
+    # Stick first: the friction unit held at zero residual with the candidates' block.
+    Gs = Gu + wp.mat33(cfm, 0.0, 0.0, 0.0, cfm, 0.0, 0.0, 0.0, cfm)
+    Ginv = wp.inverse(Gs)
+    CG = Cu * Ginv
+    K = Wnn - CG * wp.transpose(Cu)
+    wrench, i0, i1, i2, multipliers, spring, velocity, opened, bounded, steps = region_block(
+        without - CG * rf0, K, without, Wnn, cand, g0, g1, i0_in, i1_in, i2_in, spring_in, tol
+    )
+    if opened == 1:
+        return zero, zero, -1, -1, -1, zero, zero, without, REGION_OPEN, steps
+    load = wrench[0]
+    phi = zero - Ginv * (rf0 + wp.transpose(Cu) * wrench)
+    scaled = wp.vec3(phi[0] / mu, phi[1] / mu, 0.0)
+    if mu_t > 0.0:
+        scaled = wp.vec3(phi[0] / mu, phi[1] / mu, phi[2] / mu_t)
+    if bounded == 1 and load > 0.0 and mu > 0.0 and wp.dot(scaled, scaled) <= load * load:
+        return wrench, phi, i0, i1, i2, multipliers, spring, velocity, REGION_STICK, steps
+    # Slide: the candidates' block with the friction as it was, then the unit's cone law at the block's load, once.
+    start = without + Cu * phi_in
+    wrench, i0, i1, i2, multipliers, spring, velocity, _opened, _bounded, more = region_block(
+        start, Wnn, without, Wnn, cand, g0, g1, i0, i1, i2, spring, tol
+    )
+    residual = rf0 + wp.transpose(Cu) * wrench + Gu * phi_in
+    phi = friction_triple(Gs, residual, phi_in, mu, mu_t, wrench[0], 1.0)
+    return wrench, phi, i0, i1, i2, multipliers, spring, velocity, REGION_SLIDE, steps + more
+
+
+@REGION_LAW.law
+def frame_twist(
+    v: wp.vec3, w: wp.vec3, r: wp.vec3, n: wp.vec3, t0: wp.vec3, t1: wp.vec3
+) -> tuple[wp.vec3, wp.vec3]:
+    """A body's twist ``(v, w)`` about its origin in a region's coordinates ``(N, F)``: the frame ``n``, ``t0``,
+    ``t1`` at the anchor ``r`` from the origin."""
+    at = v + wp.cross(w, r)
+    return wp.vec3(wp.dot(n, at), wp.dot(t0, w), wp.dot(t1, w)), wp.vec3(wp.dot(t0, at), wp.dot(t1, at), wp.dot(n, w))
+
+
+@REGION_LAW.law
+def frame_wrench(
+    wrench: wp.vec3, phi: wp.vec3, r: wp.vec3, n: wp.vec3, t0: wp.vec3, t1: wp.vec3
+) -> tuple[wp.vec3, wp.vec3]:
+    """A region's wrench ``(N, F)`` as a force and a torque about a body's origin, :func:`frame_twist`'s transpose."""
+    force = n * wrench[0] + t0 * phi[0] + t1 * phi[1]
+    return force, wp.cross(r, force) + t0 * wrench[1] + t1 * wrench[2] + n * phi[2]
+
+
+@REGION_LAW.law
+def frame_response(
+    Avv: wp.mat33, Avw: wp.mat33, Aww: wp.mat33, r: wp.vec3, n: wp.vec3, t0: wp.vec3, t1: wp.vec3
+) -> tuple[wp.mat33, wp.mat33, wp.mat33]:
+    """A body's response in a region's coordinates, ``(Wnn, C, G)``: the twist :func:`frame_twist` reads per unit of
+    the wrench :func:`frame_wrench` applies, from the body's inverse inertia about its origin
+    ``[[Avv, Avw], [Avw^T, Aww]]`` (its twist per wrench, linear part first)."""
+    R = wp.mat33(n[0], n[1], n[2], t0[0], t0[1], t0[2], t1[0], t1[1], t1[2])
+    Rt = wp.transpose(R)
+    X = wp.skew(r)
+    # At the anchor: v_p = v - r x w.
+    Pvw = Avw - X * Aww
+    Pvv = Avv - X * wp.transpose(Avw) + Pvw * X
+    V = R * Pvv * Rt
+    B = R * Pvw * Rt
+    O = R * Aww * Rt
+    Wnn = wp.mat33(V[0, 0], B[0, 1], B[0, 2], B[0, 1], O[1, 1], O[1, 2], B[0, 2], O[1, 2], O[2, 2])
+    C = wp.mat33(V[0, 1], V[0, 2], B[0, 0], B[1, 1], B[2, 1], O[1, 0], B[1, 2], B[2, 2], O[2, 0])
+    G = wp.mat33(V[1, 1], V[1, 2], B[1, 0], V[1, 2], V[2, 2], B[2, 0], B[1, 0], B[2, 0], O[0, 0])
+    return Wnn, C, G
