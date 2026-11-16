@@ -501,13 +501,6 @@ class Sweep:
                 )
             colored = bool(model.device.is_cuda and capable.size > 0)
             colored_sweep = self._staged(dataclasses.replace(declared, **_COLORED), capable.size) if colored else None
-            # The streamed rows' records, in the worlds the sweeps and the unit builder read: one layout, which every
-            # sweep reads whatever its own stage holds, with the dense rows' where any sweep streams theirs.
-            staged = [sweep for sweep in (self.general_sweep, colored_sweep) if sweep is not None]
-            self.placement.allocate_row_records(
-                min(sweep_routes.record_first(self.placement.dense_max_constraints, sweep.places) for sweep in staged)
-            )
-            self.general_sweep = dataclasses.replace(self.general_sweep, records=self.placement.record_first)
             # The free bodies' contacts are regions where no world can take the colored mapping, whose units are
             # rows until that route's unit is the region too; the sweeps then start from rest (the warm start by
             # contact identity seeds rows).
@@ -519,7 +512,16 @@ class Sweep:
                 and self.forest.free_rigid_body_count > 0
             ):
                 self.regions = Regions(model, self.forest, self.placement, self.factor, self.options)
-                self.general_sweep = dataclasses.replace(self.general_sweep, regions=True)
+                # The region visit holds more values than the register line of two warps a block keeps in registers
+                # (sweep_routes.WARP_LINE): a sweep that visits regions takes one warp a block and no line.
+                self.general_sweep = self._staged(dataclasses.replace(declared, regions=True, block_warps=1), worlds)
+            # The streamed rows' records, in the worlds the sweeps and the unit builder read: one layout, which every
+            # sweep reads whatever its own stage holds, with the dense rows' where any sweep streams theirs.
+            staged = [sweep for sweep in (self.general_sweep, colored_sweep) if sweep is not None]
+            self.placement.allocate_row_records(
+                min(sweep_routes.record_first(self.placement.dense_max_constraints, sweep.places) for sweep in staged)
+            )
+            self.general_sweep = dataclasses.replace(self.general_sweep, records=self.placement.record_first)
             if coordinate_levels:
                 rows = self.placement.dense_max_constraints
                 self.placement.arrays.allocate(
