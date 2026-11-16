@@ -143,6 +143,30 @@ class TestFeatherPGSSleep(unittest.TestCase):
         self.assertTrue(asleep[29].all())
         self.assertFalse(asleep[30].any())
 
+    def test_a_gravity_change_wakes_its_worlds_alone(self):
+        # Two worlds of resting boxes: the model's gravity is written for both, changed in world 1 only. World 0's
+        # boxes stay asleep (nothing changed for them, and nothing is read again on the host); world 1's wake.
+        world = newton.ModelBuilder()
+        world.add_ground_plane()
+        for x in (0.0, 0.2):
+            body = world.add_body(xform=wp.transform(wp.vec3(x, 0.0, _H + 0.005), wp.quat_identity()))
+            world.add_shape_box(body, hx=_H, hy=_H, hz=_H)
+        builder = newton.ModelBuilder()
+        builder.replicate(world, 2)
+        model = builder.finalize(device="cpu")
+
+        def lower_gravity(step, solver, state):
+            if step == 40:
+                gravity = model.gravity.numpy()
+                gravity[1, 2] *= 0.5
+                model.gravity.assign(gravity)
+                solver.notify_model_changed(newton.ModelFlags.MODEL_PROPERTIES)
+
+        _, asleep, _ = _run(model, 41, on_step=lower_gravity)
+        self.assertTrue(asleep[39].all())
+        self.assertTrue(asleep[40, :2].all(), "world 0's gravity is as it was: its boxes sleep on")
+        self.assertFalse(asleep[40, 2:].any(), "world 1's gravity changed: its boxes wake")
+
     def test_no_tree_that_can_rest_builds_no_sleep_state(self):
         builder = newton.ModelBuilder()
         body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 1.0), wp.quat_identity()))

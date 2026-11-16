@@ -79,6 +79,7 @@
   "sleep._hold": "274592196174bcc493d484f241f1247ca5b05276ef2f85ff03f8b34b316cfb79",
   "sleep._rest_test": "50040c089965aa3d62e70720133d8fc560949fb6f31abf5b95e391ba088dbdbf",
   "sleep._wake_articulation_worlds": "cb43c9146ead38b3f8ee64037ee41fd7a70ec2ae83a76875e87bcef93e14d671",
+  "sleep._wake_changed_worlds": "22e63485a59a5293a8c2ad562241dff6a2015dca61636886fcaa80ac9ecd35db",
   "sleep._wake_worlds": "ecd236f58505a200cac198b0a505f2d8fa5c241d52aa3df1e8005ab549a7d097",
   "solve_policy.count_skipped_solves": "ef1991c046cc0c7bdb1a44e464198a169bdd5499da5551646272de2fb3a9f28d",
   "sweep_levels._get_mark_independent_sparse_contact_candidates_kernel(1, '120')": "08369795eefb8c6e5282d1563e6c432fcb906531459bfe13f66f0e8b574245f4",

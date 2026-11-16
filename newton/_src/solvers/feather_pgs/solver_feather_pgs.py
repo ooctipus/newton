@@ -726,10 +726,15 @@ class SolverFeatherPGS(SolverBase):
             # The mimics' coefficients and enable bits, of both representations (forest_plan.MimicRelations).
             self.laws.refresh_mimics(self.model)
         self.factor.notify_model_changed(flags, kinematic)
-        if self.sleep is not None and int(flags) != int(ModelFlags.JOINT_PROPERTIES):
-            # A changed model changes every tree's rest: the trees that never rest are read again and all wake. A
-            # fixed root's re-pose alone (the held tree's proof keeps the cached dynamics) moves no tree.
-            self.sleep.refresh()
+        if self.sleep is not None:
+            # A fixed root's re-pose (the held tree's proof keeps the cached dynamics) moves no tree, and a change of
+            # the model's properties reaches a tree through its world's gravity alone: the worlds whose gravity
+            # changed (the factor found them above) wake. Any other change reads the trees that never rest again
+            # and wakes every tree.
+            if int(flags) & ~int(ModelFlags.JOINT_PROPERTIES | ModelFlags.MODEL_PROPERTIES):
+                self.sleep.refresh()
+            elif flags & ModelFlags.MODEL_PROPERTIES:
+                self.sleep.wake_changed_worlds(self.factor.gravity_changed)
         if flags & (
             ModelFlags.BODY_PROPERTIES
             | ModelFlags.BODY_INERTIAL_PROPERTIES

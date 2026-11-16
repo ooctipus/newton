@@ -279,6 +279,15 @@ def _wake_worlds(
 
 
 @wp.kernel
+def _wake_changed_worlds(
+    changed: wp.array[wp.int32], slot_never: wp.array[wp.int32], trees: int, tree_asleep: wp.array2d[wp.int32]
+):
+    i = wp.tid()
+    if changed[i // trees] != 0:
+        tree_asleep[i // trees, i % trees] = _awake(i, slot_never)
+
+
+@wp.kernel
 def _wake_articulation_worlds(
     articulations: wp.array[wp.int32],
     art_to_world: wp.array[wp.int32],
@@ -507,6 +516,17 @@ class Sleep:
             _wake_worlds,
             dim=self.world_count * self.trees,
             inputs=[self._every_world if world_mask is None else world_mask, self.slot_never, self.trees],
+            outputs=[self.tree_asleep],
+            device=self.solver.model.device,
+        )
+
+    def wake_changed_worlds(self, changed: wp.array) -> None:
+        """Wake every tree of the worlds whose entry of ``changed`` (an int a world, as the factor marks the worlds
+        whose gravity changed) is not zero, its quiet count restarted."""
+        wp.launch(
+            _wake_changed_worlds,
+            dim=self.world_count * self.trees,
+            inputs=[changed, self.slot_never, self.trees],
             outputs=[self.tree_asleep],
             device=self.solver.model.device,
         )
