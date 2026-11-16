@@ -1224,8 +1224,8 @@ class Regions:
 
     def operands(self) -> dict:
         """The stream as the general sweep's region phase takes it (:data:`.sweep_routes.REGION_OPERANDS`)."""
-        names = "world_regions world_levels level_end level_region body_first body_basis body_inertia reg_frame reg_arm"
-        names += " reg_arm_b reg_body reg_cand reg_law"
+        names = "world_regions world_levels level_end level_region reg_order body_first body_basis body_inertia"
+        names += " reg_frame reg_arm reg_arm_b reg_body reg_cand reg_law"
         names += " reg_bf reg_kind reg_row cand cand_row reg_wrench reg_phi reg_set reg_spring reg_state reg_stamp"
         names += " body_seen body_version"
         return {**{name: getattr(self, name) for name in names.split()}, "region_cfm": float(self.options.pgs_cfm)}

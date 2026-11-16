@@ -143,10 +143,9 @@ def set_upper(R: wp.mat33, y: wp.vec3) -> wp.vec3:
 
 
 @REGION_LAW.law
-def set_multipliers(a0: wp.vec3, a1: wp.vec3, a2: wp.vec3, L: wp.mat33, n: int, rhs: wp.vec3) -> wp.vec3:
-    """``(A K A^T)^-1 rhs`` over the set's ``n`` rows in the metric ``K = L L^T``, as ``R^-T R^-1 rhs``
-    (:func:`set_basis`; the unused rows' multipliers zero)."""
-    _e0, _e1, _e2, R = set_basis(a0, a1, a2, L, n)
+def set_solve(R: wp.mat33, n: int, rhs: wp.vec3) -> wp.vec3:
+    """``(A K A^T)^-1 rhs = R^-T R^-1 rhs`` over the set's ``n`` rows, ``R`` the set's factor (:func:`set_basis`; the
+    unused rows' multipliers zero)."""
     kept = wp.vec3(wp.where(n >= 1, rhs[0], 0.0), wp.where(n >= 2, rhs[1], 0.0), wp.where(n >= 3, rhs[2], 0.0))
     return set_upper(R, set_lower(R, kept))
 
@@ -163,9 +162,10 @@ def set_start(
     i1_in: int,
     i2_in: int,
     n_in: int,
-) -> tuple[wp.vec3, wp.vec3, wp.vec3, wp.vec3, int, int, int, wp.vec3, int]:
+) -> tuple[wp.vec3, wp.vec3, wp.vec3, wp.vec3, int, int, int, wp.vec3, int, wp.vec3, wp.vec3, wp.vec3, wp.mat33]:
     """The given set's multipliers at ``start`` in the metric ``K = L L^T``; a row whose multiplier is not positive
-    leaves the set. Returns the set (its rows, their right-hand sides, their candidates), its multipliers and its size."""
+    leaves the set. Returns the set (its rows, their right-hand sides, their candidates), its multipliers, its size
+    and its factor (:func:`set_basis`, made once and again only after a row leaves)."""
     a0 = a0_in
     a1 = a1_in
     a2 = a2_in
@@ -176,11 +176,12 @@ def set_start(
     n = n_in
     zero = wp.vec3(0.0, 0.0, 0.0)
     mu = zero
+    e0, e1, e2, R = set_basis(a0, a1, a2, L, n)
     turn = int(0)
     while n > 0 and turn < 4:
         turn += 1
         residual = wp.vec3(wp.dot(a0, start) + ab[0], wp.dot(a1, start) + ab[1], wp.dot(a2, start) + ab[2])
-        mu = set_multipliers(a0, a1, a2, L, n, zero - residual)
+        mu = set_solve(R, n, zero - residual)
         worst = float(0.0)
         leaving = int(-1)
         for k in range(3):
@@ -197,9 +198,10 @@ def set_start(
         i1 = wp.where(leaving <= 1, i2, i1)
         i2 = -1
         n -= 1
+        e0, e1, e2, R = set_basis(a0, a1, a2, L, n)
     if n == 0:
         mu = wp.vec3(0.0, 0.0, 0.0)
-    return a0, a1, a2, ab, i0, i1, i2, mu, n
+    return a0, a1, a2, ab, i0, i1, i2, mu, n, e0, e1, e2, R
 
 
 @REGION_LAW.law
@@ -218,13 +220,21 @@ def set_enter(
     i2_in: int,
     mu_in: wp.vec3,
     n_in: int,
-) -> tuple[wp.vec3, wp.vec3, wp.vec3, wp.vec3, int, int, int, wp.vec3, int, wp.vec3, int]:
+    e0_in: wp.vec3,
+    e1_in: wp.vec3,
+    e2_in: wp.vec3,
+    R_in: wp.mat33,
+) -> tuple[
+    wp.vec3, wp.vec3, wp.vec3, wp.vec3, int, int, int, wp.vec3, int, wp.vec3, int, wp.vec3, wp.vec3, wp.vec3, wp.mat33
+]:
     """One step of the dual active set (Goldfarb and Idnani) in the metric ``K = L L^T``: candidate ``j`` (its row ``aj``, its
     right-hand side ``bj``), which closes at ``s_in``, enters the set; rows whose multiplier reaches zero on the way
     leave it. A candidate depends on the set when what the set leaves of its row falls to
     :data:`.projection_laws.BILATERAL_PIVOT` of the row's own squared norm (the bilateral block's rank rule): it
-    then enters only as a row leaves. Returns the set, its multipliers, its size, the velocity and whether the step
-    ended (1; it does not where the rows admit no velocity)."""
+    then enters only as a row leaves. The set's factor (:func:`set_basis`) comes in with it and goes out with it: an
+    entering row's remainder is its new column, and the factor is made again only after a row leaves. Returns the
+    set, its multipliers, its size, the velocity, whether the step ended (1; it does not where the rows admit no
+    velocity) and the set's factor."""
     s = s_in
     a0 = a0_in
     a1 = a1_in
@@ -235,6 +245,10 @@ def set_enter(
     i2 = i2_in
     mu = mu_in
     n = n_in
+    e0 = e0_in
+    e1 = e1_in
+    e2 = e2_in
+    R = R_in
     ended = int(0)
     zj = wp.transpose(L) * aj
     own = wp.dot(zj, zj)
@@ -245,7 +259,6 @@ def set_enter(
         # What the set leaves of the candidate's whitened row, by the set's whitened rows made orthonormal
         # (set_basis): its square is the rank rule's measure and L times it the velocity's direction (K times the
         # row's remainder); its coordinates along them give the multipliers' change d = (A K A^T)^-1 A K aj = R^-T c.
-        e0, e1, e2, R = set_basis(a0, a1, a2, L, n)
         part, c0, c1 = set_residual(zj, e0, e1)
         rest, c2, _cz = set_residual(part, e2, wp.vec3(0.0, 0.0, 0.0))
         d = set_upper(R, wp.vec3(wp.where(n >= 1, c0, 0.0), wp.where(n >= 2, c1, 0.0), wp.where(n >= 3, c2, 0.0)))
@@ -280,6 +293,23 @@ def set_enter(
             mu = wp.vec3(
                 wp.where(n == 0, entering, mu[0]), wp.where(n == 1, entering, mu[1]), wp.where(n == 2, entering, mu[2])
             )
+            # The entering row's remainder is the factor's new column: set_basis's own arithmetic for the grown set.
+            r = wp.length(rest)
+            column = rest * (1.0 / wp.max(r, 1.0e-30))
+            e0 = wp.where(n == 0, column, e0)
+            e1 = wp.where(n == 1, column, e1)
+            e2 = wp.where(n == 2, column, e2)
+            R = wp.mat33(
+                wp.where(n == 0, r, R[0, 0]),
+                0.0,
+                0.0,
+                wp.where(n == 1, c0, R[1, 0]),
+                wp.where(n == 1, r, R[1, 1]),
+                0.0,
+                wp.where(n == 2, c0, R[2, 0]),
+                wp.where(n == 2, c1, R[2, 1]),
+                wp.where(n == 2, r, R[2, 2]),
+            )
             n += 1
             ended = 1
             break
@@ -292,7 +322,8 @@ def set_enter(
         i2 = -1
         mu = wp.vec3(wp.where(leaving == 0, mu[1], mu[0]), wp.where(leaving <= 1, mu[2], mu[1]), 0.0)
         n -= 1
-    return a0, a1, a2, ab, i0, i1, i2, mu, n, s, ended
+        e0, e1, e2, R = set_basis(a0, a1, a2, L, n)
+    return a0, a1, a2, ab, i0, i1, i2, mu, n, s, ended, e0, e1, e2, R
 
 
 @REGION_LAW.law
@@ -350,7 +381,7 @@ def region_block(
     ab = wp.vec3(wp.where(i0_in >= 0, v0[2], 0.0), wp.where(i1_in >= 0, v1[2], 0.0), wp.where(i2_in >= 0, v2[2], 0.0))
     n = wp.where(i0_in >= 0, 1, 0) + wp.where(i1_in >= 0, 1, 0) + wp.where(i2_in >= 0, 1, 0)
     Lk = metric_factor(K)
-    a0, a1, a2, ab, i0, i1, i2, mu, n = set_start(start, Lk, a0, a1, a2, ab, i0_in, i1_in, i2_in, n)
+    a0, a1, a2, ab, i0, i1, i2, mu, n, e0, e1, e2, R = set_start(start, Lk, a0, a1, a2, ab, i0_in, i1_in, i2_in, n)
     # The metric and the start with the closing springs in them: none yet.
     Ks = K
     Ls = Lk
@@ -424,15 +455,15 @@ def region_block(
             Ks = shape * K
             Ls = metric_factor(Ks)
             ss = shape * (start - K * q)
-            a0, a1, a2, ab, i0, i1, i2, mu, n = set_start(ss, Ls, a0, a1, a2, ab, i0, i1, i2, n)
+            a0, a1, a2, ab, i0, i1, i2, mu, n, e0, e1, e2, R = set_start(ss, Ls, a0, a1, a2, ab, i0, i1, i2, n)
             s = ss + Ks * (a0 * mu[0] + a1 * mu[1] + a2 * mu[2])
             steps += 1
             continue
         if j < 0:
             break
         record = cand[j]
-        a0, a1, a2, ab, i0, i1, i2, mu, n, s, ended = set_enter(
-            s, Ls, candidate_row(record), record[2], j, a0, a1, a2, ab, i0, i1, i2, mu, n
+        a0, a1, a2, ab, i0, i1, i2, mu, n, s, ended, e0, e1, e2, R = set_enter(
+            s, Ls, candidate_row(record), record[2], j, a0, a1, a2, ab, i0, i1, i2, mu, n, e0, e1, e2, R
         )
         steps += 1
         if ended == 0:

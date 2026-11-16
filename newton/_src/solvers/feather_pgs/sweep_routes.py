@@ -621,6 +621,7 @@ REGION_OPERANDS = (
     ("world_levels", wp.array[int]),
     ("level_end", wp.array[int]),
     ("level_region", wp.array[int]),
+    ("reg_order", wp.array[int]),
     ("body_first", wp.array[int]),
     ("body_basis", wp.array2d[wp.spatial_vector]),
     ("body_inertia", wp.array2d[wp.mat33]),
@@ -661,8 +662,9 @@ def region_phase(pad: str = "        ") -> str:
     The order is taken by its exact levels (:func:`.region_sweep.level_regions`): a level's regions share no body,
     so the world's lanes visit them at once, and a barrier ends a level; that is the sequential sweep itself. A
     world whose levels hold fewer regions than the colored rule's parallelism (a chain: a tangled pair's regions
-    share both bodies, one a level) is walked by its first lane in the levels' order, a first body's twist kept from
-    one of its regions to the next, as a sequential walk does; the result is the same either way. A region's
+    share both bodies, one a level) is walked by its first lane in the order the levels were made from
+    (``reg_order``: a body's regions together within a depth), a first body's twist kept from one of its regions to
+    the next, as a sequential walk does; the result is the same either way. A region's
     response is the sum of its bodies' (:func:`.region_laws.frame_response`), and its wrench's change returns
     through their bases.
 
@@ -713,8 +715,8 @@ if (moved) {{
     const wp::vec2i region_span = world_regions.data[world];
     const int levels = world_levels.data[world];
     // The colored rule's measure (sweep_units.COLORED_RULE): a world whose levels hold fewer regions than its
-    // parallelism, a chain, is walked by its first lane in the levels' order, a body's twist kept from one region
-    // to the next of the same body; the others' levels take the lanes. Both are the same order, the same sweep.
+    // parallelism, a chain, is walked by its first lane in the order the levels were made from, a body's twist kept
+    // from one region to the next of the same body; the others' levels take the lanes. Both are the same sweep.
     const bool alone = (float)(region_span[1] - region_span[0]) < {parallelism}f * (float)levels;
     const int stride = alone ? 1 : STRIDE;
     int level_first = region_span[0];
@@ -723,10 +725,13 @@ if (moved) {{
     wp::vec3 v, w;
     const wp::spatial_vector* basis = body_basis.data;
     const wp::mat33* inertia = body_inertia.data;
-    for (int level = 0; level < levels; ++level) {{
-    const int level_last = level_end.data[region_span[0] + level];
+    // A chain world walks its order itself (reg_order: a body's regions together, so its twist stays kept), as one
+    // span; the others take the levels.
+    const int spans = alone ? 1 : levels;
+    for (int level = 0; level < spans; ++level) {{
+    const int level_last = alone ? region_span[1] : level_end.data[region_span[0] + level];
     for (int place = level_first + lane; lane < stride && place < level_last; place += stride) {{
-        const int g = level_region.data[place];
+        const int g = alone ? reg_order.data[place] : level_region.data[place];
         const wp::vec2i sides = reg_body.data[g];
         const int f = sides[0], f_b = sides[1];
         if (!alone || f != body) {{
