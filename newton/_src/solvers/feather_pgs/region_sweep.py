@@ -40,7 +40,7 @@ from .region_laws import (
     frame_wrench,
     region_visit,
 )
-from .row_kernels import RowBias, row_bias
+from .row_kernels import RIGID_SPEED_ROWS, RowBias, row_bias
 from .row_laws import ROW_CONTACT, ROW_FRICTION, ROW_TORSION
 from .row_records import DenseRows
 
@@ -61,6 +61,9 @@ REGION_TOLERANCE = 1.0e-7
 """The closing threshold [m/s]: a candidate closes when its residual is below minus this."""
 
 _BIG = wp.constant(1 << 30)
+
+_THREAD_CAP = 1 << 20
+"""Lanes of the kernels that stride over the contacts or the regions, at most."""
 
 
 @wp.func
@@ -395,143 +398,197 @@ def ring_head(parent: wp.array2d[int], line: int, row: int, limit: int) -> int:
 
 
 @wp.kernel(enable_backward=False, module="unique")
-def index_regions(
-    rows: DenseRows,
-    constraint_count: wp.array[int],
-    mf_constraint_count: wp.array[int],
-    mf_contact_rows_end: wp.array[int],
-    dense_max: int,
-    mf_max: int,
-    pitch: int,
-    world_free_start: wp.array[int],
-    world_free: wp.array[int],
-    art_free: wp.array[int],
-    capacity: int,
+def reset_bodies(
     cursor: wp.array[int],
     body_open: wp.array[int],
-    body_cursor: wp.array[wp.vec2i],
+    body_count: wp.array2d[int],
     body_regions: wp.array[wp.vec2i],
+):
+    """Each free body without a region and closed, and the stream empty, before a step's regions are listed."""
+    f = wp.tid()
+    if f < 4:
+        cursor[f] = 0
+    if f < body_open.shape[0]:
+        body_open[f] = 0
+        for k in range(3):
+            body_count[f, k] = 0
+        body_regions[f] = wp.vec2i(0, 0)
+
+
+@wp.kernel(enable_backward=False, module="unique")
+def mark_regions(
+    data: ContactInput,
+    rows: DenseRows,
+    mf_max: int,
+    threads: int,
+    art_free: wp.array[int],
+    head_size: wp.array[int],
+    body_open: wp.array[int],
+    body_count: wp.array2d[int],
+):
+    """Each contact with rows, ``threads`` lanes striding over them: a dense contact opens the free bodies it
+    touches, a free one between two movable bodies both of them; a contact whose normal row heads its ring (the
+    ring's lowest row, :func:`ring_head`) is a region's head: it takes the ring's size (``head_size``, 0 on every
+    other contact) and counts a region and its candidates on its first body (``body_count``)."""
+    for c in range(wp.tid(), data.count[0], threads):
+        head_size[c] = 0
+        slot = data.slot[c]
+        if slot < 0:
+            continue
+        if data.path[c] == 0:
+            for side in range(2):
+                art = data.art0[c]
+                if side == 1:
+                    art = data.art1[c]
+                if art >= 0:
+                    f = art_free[art]
+                    if f >= 0:
+                        body_open[f] = 1
+            continue
+        if data.path[c] != 1:
+            continue
+        line = rows.first[data.world[c]]
+        sides = rows.sides[line, slot]
+        if sides[0] < 0:
+            continue
+        f = art_free[sides[0]]
+        if sides[1] >= 0:
+            body_open[f] = 1
+            body_open[art_free[sides[1]]] = 1
+        size = ring_head(rows.row_parent, line, slot, mf_max)
+        if size > 0:
+            head_size[c] = size
+            wp.atomic_add(body_count, f, 0, 1)
+            wp.atomic_add(body_count, f, 1, size)
+
+
+@wp.kernel(enable_backward=False, module="unique")
+def place_bodies(
+    world_free_start: wp.array[int],
+    world_free: wp.array[int],
+    speed_slot: wp.array[int],
+    speed_rows: int,
+    capacity: wp.array[int],
+    body_count: wp.array2d[int],
+    cursor: wp.array[int],
+    body_open: wp.array[int],
+    body_regions: wp.array[wp.vec2i],
+    body_cand: wp.array[int],
     lanes: wp.array[int],
     world_regions: wp.array[wp.vec2i],
-    reg_head: wp.array[wp.vec2i],
-    reg_cand: wp.array[wp.vec2i],
-    reg_state: wp.array[int],
-    impulses: wp.array2d[float],
 ):
-    """A world's regions placed in the stream, one thread a world (the rows' rings are walked in order; only the
-    rows' kinds, parents and sides are read).
+    """A world's bodies placed in the regions' stream, a thread a world (it reads its free bodies' counts only).
 
-    A region is a ring of the free bodies' normal rows (the patch link's, :mod:`.friction_patches`) with the
-    friction rows of the ring's carrier, headed by its lowest row; the regions follow each other by their heads.
-    A free body is *open* when a dense row, a speed row or a region between two movable bodies touches it, else
-    *closed*. The regions' stream holds a world's closed bodies' regions body by body (``body_regions``; each such
-    body a lane of ``lanes``, counted in ``cursor[2]``), then its open regions in their order (``world_regions``).
-    The stream's places are taken from ``cursor`` as worlds arrive: they decide no result. A world whose regions do
-    not fit ``capacity`` lists none and sets ``cursor[3]``.
-
-    Each region takes its head (its row in the store and its world, ``reg_head``), its candidates' places
-    (``reg_cand``) and the state of a region not yet filled; :func:`fill_regions` forms the rest, a thread a
-    region."""
+    A free body is *open* when a dense row, a region between two movable bodies (:func:`mark_regions`) or a speed
+    row (``speed_slot``, ``speed_rows`` a body) touches it, else *closed*. The stream holds the world's closed
+    bodies' regions body by body, each such body a lane of ``lanes`` (counted in ``cursor[2]``), then its open
+    bodies' (``world_regions``): each body takes its regions' places (``body_regions``) and its candidates' first
+    (``body_cand``). The places are taken from ``cursor`` as worlds arrive: they decide no result. A world whose
+    regions do not fit the stream (``capacity``: the contact pool's ready rows) lists none and sets ``cursor[3]``."""
     world = wp.tid()
-    line = rows.first[world]
     world_regions[world] = wp.vec2i(0, 0)
     f_begin = world_free_start[world]
     f_end = world_free_start[world + 1]
+    regions = int(0)
+    candidates = int(0)
     for k in range(f_begin, f_end):
         f = world_free[k]
-        body_open[f] = 0
-        body_cursor[f] = wp.vec2i(0, 0)
-        body_regions[f] = wp.vec2i(0, 0)
-    if line < 0:
-        return
-    m_dense = wp.min(constraint_count[world], dense_max)
-    m = wp.min(mf_constraint_count[world], mf_max)
-    end = dense_max + wp.min(mf_contact_rows_end[world], m)
-    # The contact rows hold their candidates' and friction units' impulses, which the visits publish: none yet.
-    for r in range(dense_max, end):
-        impulses[line, r] = 0.0
-    # Open bodies: a dense row's, a speed row's, a two-body region's.
-    for i in range(m_dense):
-        sides = rows.sides[line, i]
-        for s in range(2):
-            if sides[s] >= 0:
-                f = art_free[sides[s]]
-                if f >= 0:
-                    body_open[f] = 1
-    for r in range(end, dense_max + m):
-        art = rows.sides[line, r][0]
-        if art >= 0:
-            if art_free[art] >= 0:
-                body_open[art_free[art]] = 1
-    for r in range(dense_max, end):
-        if rows.row_type[line, r] == ROW_CONTACT:
-            sides = rows.sides[line, r]
-            if sides[1] >= 0:
-                body_open[art_free[sides[0]]] = 1
-                body_open[art_free[sides[1]]] = 1
-    # Count each closed body's regions and candidates, and the open ones.
-    open_regions = int(0)
-    open_candidates = int(0)
-    closed_regions = int(0)
-    closed_candidates = int(0)
-    for r in range(dense_max, end):
-        if rows.row_type[line, r] != ROW_CONTACT:
-            continue
-        size = ring_head(rows.row_parent, line, r, mf_max)
-        if size == 0:
-            continue
-        f = art_free[rows.sides[line, r][0]]
-        if body_open[f] == 0:
-            body_cursor[f] = body_cursor[f] + wp.vec2i(1, size)
-            closed_regions += 1
-            closed_candidates += size
-        else:
-            open_regions += 1
-            open_candidates += size
-    regions = closed_regions + open_regions
-    candidates = closed_candidates + open_candidates
+        for row in range(speed_rows):
+            if speed_slot[speed_rows * f + row] >= 0:
+                body_open[f] = 1
+        regions += body_count[f, 0]
+        candidates += body_count[f, 1]
     if regions == 0:
         return
     region_at = wp.atomic_add(cursor, 0, regions)
     candidate_at = wp.atomic_add(cursor, 1, candidates)
-    if region_at + regions > capacity or candidate_at + candidates > capacity:
+    if region_at + regions > capacity[0] or candidate_at + candidates > capacity[0]:
         cursor[3] = 1
         return
-    # The stream's places: the closed bodies' regions body by body, each a lane, then the open regions.
     for k in range(f_begin, f_end):
         f = world_free[k]
-        count = body_cursor[f]
-        if body_open[f] == 0 and count[0] > 0:
-            body_regions[f] = wp.vec2i(region_at, region_at + count[0])
-            body_cursor[f] = wp.vec2i(region_at, candidate_at)
+        count = body_count[f, 0]
+        if body_open[f] == 0 and count > 0:
+            body_regions[f] = wp.vec2i(region_at, region_at + count)
+            body_cand[f] = candidate_at
             lanes[wp.atomic_add(cursor, 2, 1)] = f
-            region_at += count[0]
-            candidate_at += count[1]
-    world_regions[world] = wp.vec2i(region_at, region_at + open_regions)
-    for r in range(dense_max, end):
-        if rows.row_type[line, r] != ROW_CONTACT:
-            continue
-        size = ring_head(rows.row_parent, line, r, mf_max)
-        if size == 0:
-            continue
-        f = art_free[rows.sides[line, r][0]]
-        g = region_at
-        c0 = candidate_at
-        if body_open[f] == 0:
-            at = body_cursor[f]
-            g = at[0]
-            c0 = at[1]
-            body_cursor[f] = wp.vec2i(g + 1, c0 + size)
-        else:
-            region_at += 1
-            candidate_at += size
-        reg_head[g] = wp.vec2i(line * pitch + r, world)
-        reg_cand[g] = wp.vec2i(c0, c0 + size)
-        reg_state[g] = REGION_IDLE
+            region_at += count
+            candidate_at += body_count[f, 1]
+    first = region_at
+    for k in range(f_begin, f_end):
+        f = world_free[k]
+        count = body_count[f, 0]
+        if body_open[f] != 0 and count > 0:
+            body_regions[f] = wp.vec2i(region_at, region_at + count)
+            body_cand[f] = candidate_at
+            region_at += count
+            candidate_at += body_count[f, 1]
+    world_regions[world] = wp.vec2i(first, region_at)
 
 
 @wp.kernel(enable_backward=False, module="unique")
-def fill_regions(
+def place_regions(
+    data: ContactInput,
+    rows: DenseRows,
+    pitch: int,
+    threads: int,
+    art_free: wp.array[int],
+    head_size: wp.array[int],
+    body_regions: wp.array[wp.vec2i],
+    body_count: wp.array2d[int],
+    reg_head: wp.array[wp.vec2i],
+    reg_cand: wp.array[wp.vec2i],
+):
+    """Each region's head into a place of its body's (:func:`place_bodies`), in the order its thread arrives
+    (:func:`order_regions` orders them): its row in the store and its world (``reg_head``) and its size."""
+    for c in range(wp.tid(), data.count[0], threads):
+        size = head_size[c]
+        if size == 0:
+            continue
+        world = data.world[c]
+        line = rows.first[world]
+        slot = data.slot[c]
+        f = art_free[rows.sides[line, slot][0]]
+        span = body_regions[f]
+        if span[1] == span[0]:
+            continue
+        g = span[0] + wp.atomic_add(body_count, f, 2, 1)
+        reg_head[g] = wp.vec2i(line * pitch + slot, world)
+        reg_cand[g] = wp.vec2i(size, 0)
+
+
+@wp.kernel(enable_backward=False, module="unique")
+def order_regions(
+    body_regions: wp.array[wp.vec2i],
+    body_cand: wp.array[int],
+    reg_head: wp.array[wp.vec2i],
+    reg_cand: wp.array[wp.vec2i],
+    reg_state: wp.array[int],
+):
+    """A body's regions in their order, a thread a body: by their heads' rows (the order of the world's rows), then
+    each one's candidates' places after the last one's, and the state of a region that holds nothing."""
+    span = body_regions[wp.tid()]
+    for i in range(span[0] + 1, span[1]):
+        head = reg_head[i]
+        held = reg_cand[i]
+        j = i - 1
+        while j >= span[0] and reg_head[j][0] > head[0]:
+            reg_head[j + 1] = reg_head[j]
+            reg_cand[j + 1] = reg_cand[j]
+            j -= 1
+        reg_head[j + 1] = head
+        reg_cand[j + 1] = held
+    at = body_cand[wp.tid()]
+    for g in range(span[0], span[1]):
+        size = reg_cand[g][0]
+        reg_cand[g] = wp.vec2i(at, at + size)
+        at += size
+        reg_state[g] = REGION_IDLE
+
+
+@wp.func
+def fill_region(
+    g: int,
     rows: DenseRows,
     bias: RowBias,
     data: ContactInput,
@@ -544,7 +601,6 @@ def fill_regions(
     row_contact: wp.array2d[int],
     art_free: wp.array[int],
     body_twist: wp.array[wp.spatial_vector],
-    cursor: wp.array[int],
     reg_head: wp.array[wp.vec2i],
     reg_cand: wp.array[wp.vec2i],
     reg_frame: wp.array[wp.mat33],
@@ -562,16 +618,7 @@ def fill_regions(
     reg_set: wp.array[wp.vec3i],
     reg_spring: wp.array[wp.vec3],
 ):
-    """The regions :func:`index_regions` placed, formed a thread a region (the first ``cursor[0]`` of the stream).
-
-    A region's frame is its carrier's (its head's without one): the contact's normal, the tangent pair every
-    friction row uses for it, at the region's friction location. Its candidates are the ring's contacts, each a
-    point on that frame with the row law's right-hand side at the predictor (:func:`.row_kernels.row_bias`, the
-    incident velocity the frame's); its friction rows' right-hand sides are the row law's with the predictor's
-    slips and spin. It starts holding nothing."""
-    g = wp.tid()
-    if g >= cursor[0] or cursor[3] != 0:
-        return
+    """Region ``g`` formed from its head and its candidates' places (:func:`fill_regions`)."""
     head = reg_head[g]
     world = head[1]
     line = head[0] / pitch
@@ -672,11 +719,64 @@ def fill_regions(
     reg_spring[g] = wp.vec3(0.0, 0.0, 0.0)
 
 
+
+@wp.kernel(enable_backward=False, module="unique")
+def fill_regions(
+    rows: DenseRows,
+    bias: RowBias,
+    data: ContactInput,
+    law: PatchRowLaw,
+    mf_constraint_count: wp.array[int],
+    mf_contact_rows_end: wp.array[int],
+    dense_max: int,
+    mf_max: int,
+    pitch: int,
+    row_contact: wp.array2d[int],
+    art_free: wp.array[int],
+    body_twist: wp.array[wp.spatial_vector],
+    cursor: wp.array[int],
+    threads: int,
+    reg_head: wp.array[wp.vec2i],
+    reg_cand: wp.array[wp.vec2i],
+    reg_frame: wp.array[wp.mat33],
+    reg_arm: wp.array[wp.vec3],
+    reg_arm_b: wp.array[wp.vec3],
+    reg_body: wp.array[wp.vec2i],
+    reg_law: wp.array[wp.vec2],
+    reg_bf: wp.array[wp.vec3],
+    reg_kind: wp.array[int],
+    reg_row: wp.array[int],
+    cand: wp.array[wp.vec4],
+    cand_row: wp.array[int],
+    reg_wrench: wp.array[wp.vec3],
+    reg_phi: wp.array[wp.vec3],
+    reg_set: wp.array[wp.vec3i],
+    reg_spring: wp.array[wp.vec3],
+):
+    """The placed regions formed (:func:`order_regions`; the first ``cursor[0]`` of the stream), ``threads`` lanes
+    striding over them.
+
+    A region's frame is its carrier's (its head's without one): the contact's normal, the tangent pair every
+    friction row uses for it, at the region's friction location. Its candidates are the ring's contacts, each a
+    point on that frame with the row law's right-hand side at the predictor (:func:`.row_kernels.row_bias`, the
+    incident velocity the frame's); its friction rows' right-hand sides are the row law's with the predictor's
+    slips and spin. It starts holding nothing."""
+    if cursor[3] != 0:
+        return
+    for g in range(wp.tid(), cursor[0], threads):
+        fill_region(
+            g, rows, bias, data, law, mf_constraint_count, mf_contact_rows_end, dense_max, mf_max, pitch, row_contact,
+            art_free, body_twist, reg_head, reg_cand, reg_frame, reg_arm, reg_arm_b, reg_body, reg_law, reg_bf, reg_kind,
+            reg_row, cand, cand_row, reg_wrench, reg_phi, reg_set, reg_spring,
+        )  # fmt: skip
+
+
 # ---------------------------------------------------------------------------------------------------------------------
 # The step's regions: their storage and launches
 # ---------------------------------------------------------------------------------------------------------------------
 
 _REGION_FIELDS = (
+    ("head_size", wp.int32, 1),
     ("reg_head", wp.vec2i, 1),
     ("reg_frame", wp.mat33, 1),
     ("reg_arm", wp.vec3, 1),
@@ -740,7 +840,8 @@ class Regions:
         self.body_twist = wp.zeros(count, dtype=wp.spatial_vector, device=device)
         # A body no world lists (it has no world) is open: only a world's sweep may visit its regions.
         self.body_open = wp.ones(count, dtype=wp.int32, device=device)
-        self.body_cursor = wp.zeros(count, dtype=wp.vec2i, device=device)
+        self.body_count = wp.zeros((count, 3), dtype=wp.int32, device=device)
+        self.body_cand = wp.zeros(count, dtype=wp.int32, device=device)
         self.body_regions = wp.zeros(count, dtype=wp.vec2i, device=device)
         self.lanes = wp.zeros(count, dtype=wp.int32, device=device)
         self.cursor = wp.zeros(4, dtype=wp.int32, device=device)
@@ -748,6 +849,10 @@ class Regions:
         lines = int(placement.impulses.shape[0])
         self.row_contact = wp.zeros((lines, int(placement.mf_max_constraints)), dtype=wp.int32, device=device)
         self.capacity = 0
+        # The stream's capacity on the device: the pool's ready rows, which follow its growth between captures.
+        self.ready = placement.contact_pool.ready_rows
+        if self.ready is None:
+            self.ready = wp.zeros(1, dtype=wp.int32, device=device)
         self.rows = placement.contact_pool.rows(
             [ContactField(name, dtype, per_contact=per) for name, dtype, per in _REGION_FIELDS], on_rows=self._on_rows
         )
@@ -756,17 +861,26 @@ class Regions:
         """Take the stream's arrays at the contact pool's ready rows, on creation and after each growth."""
         rows.publish(self)
         self.capacity = int(rows.rows)
+        if self.placement.contact_pool.ready_rows is None:
+            self.ready.fill_(self.capacity)
 
     def list(self, solver, state_in, contacts, dt: float) -> None:
         """The step's regions, once the rows' records are written and the patch link made their rings: each free
-        body's basis (:func:`free_body_basis`), then each world's regions placed (:func:`index_regions`) and formed
-        (:func:`fill_regions`)."""
+        body's basis (:func:`free_body_basis`), then the regions marked and counted a contact
+        (:func:`mark_regions`), each world's bodies placed in the stream (:func:`place_bodies`), the regions placed
+        and ordered a body (:func:`place_regions`, :func:`order_regions`) and formed a region (:func:`fill_regions`)."""
         from .contact_input import bind as bind_contact_input  # noqa: PLC0415
         from .friction_patches import patch_row_law  # noqa: PLC0415
         from .row_records import bind as bind_dense_rows  # noqa: PLC0415
 
         placement, forest, device = self.placement, self.forest, self.model.device
-        self.cursor.zero_()
+        pool = placement.contact_pool
+        wp.launch(
+            reset_bodies,
+            dim=max(self.count, 4),
+            outputs=[self.cursor, self.body_open, self.body_count, self.body_regions],
+            device=device,
+        )
         if contacts is None or contacts.rigid_contact_count is None or contacts._rigid_contact_rows <= 0:
             self.world_regions.zero_()
             return
@@ -778,50 +892,65 @@ class Regions:
             device=device,
         )
         rows, bias = bind_dense_rows(placement), solver.laws.bias(self.options, dt)
-        counts = [placement.mf_constraint_count, placement.mf_contact_rows_end]
-        sizes = [int(placement.dense_max_constraints), int(placement.mf_max_constraints), int(placement.row_pitch)]
+        data = bind_contact_input(solver, state_in, self.factor, contacts, dt, 1.0)
+        mf_max, pitch = int(placement.mf_max_constraints), int(placement.row_pitch)
+        # Sized for the pool's launch rows: a capture's replays run them at the live count (ContactPool.launch).
+        threads = min(pool.launch_rows(), _THREAD_CAP)
+        live = {"extent": contacts.rigid_contact_count, "clamp": True}
+        pool.launch(
+            mark_regions,
+            threads,
+            inputs=[data, rows, mf_max, threads, self.art_free],
+            outputs=[self.head_size, self.body_open, self.body_count],
+            **live,
+        )
+        speed = placement.rigid_velocity_limit_slot
         wp.launch(
-            index_regions,
+            place_bodies,
             dim=forest.world_count,
             inputs=[
-                rows,
-                placement.constraint_count,
-                *counts,
-                *sizes,
                 self.world_free_start,
                 self.world_free,
-                self.art_free,
-                self.capacity,
+                self.lanes if speed is None else speed,
+                0 if speed is None else RIGID_SPEED_ROWS,
+                self.ready,
+                self.body_count,
             ],
-            outputs=[
-                self.cursor,
-                self.body_open,
-                self.body_cursor,
-                self.body_regions,
-                self.lanes,
-                self.world_regions,
-                self.reg_head,
-                self.reg_cand,
-                self.reg_state,
-                placement.impulses,
-            ],
+            outputs=[self.cursor, self.body_open, self.body_regions, self.body_cand, self.lanes, self.world_regions],
             device=device,
         )
-        # A thread a region of the stream: no step holds more regions than the pool's launch rows.
+        pool.launch(
+            place_regions,
+            threads,
+            inputs=[data, rows, pitch, threads, self.art_free, self.head_size, self.body_regions],
+            outputs=[self.body_count, self.reg_head, self.reg_cand],
+            **live,
+        )
         wp.launch(
+            order_regions,
+            dim=self.count,
+            inputs=[self.body_regions, self.body_cand],
+            outputs=[self.reg_head, self.reg_cand, self.reg_state],
+            device=device,
+        )
+        pool.launch(
             fill_regions,
-            dim=min(self.capacity, placement.contact_pool.launch_rows()),
+            threads,
             inputs=[
                 rows,
                 bias,
-                bind_contact_input(solver, state_in, self.factor, contacts, dt, 1.0),
+                data,
                 patch_row_law(solver),
-                *counts,
-                *sizes,
+                placement.mf_constraint_count,
+                placement.mf_contact_rows_end,
+                int(placement.dense_max_constraints),
+                mf_max,
+                pitch,
                 self.row_contact,
                 self.art_free,
                 self.body_twist,
                 self.cursor,
+                threads,
                 self.reg_head,
                 self.reg_cand,
             ],
@@ -841,7 +970,7 @@ class Regions:
                 self.reg_set,
                 self.reg_spring,
             ],
-            device=device,
+            **live,
         )
 
     def sweep_closed(self, du: wp.array) -> None:
