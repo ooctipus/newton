@@ -161,7 +161,7 @@ class Bodies:
 
         bodies, regions, candidates = self.count, len(self.frames), len(self.cands)
         impulses = wp.zeros(candidates + 3 * regions, dtype=float, device=device)
-        du = wp.zeros(6 * bodies, dtype=float, device=device)
+        change = wp.zeros(bodies, dtype=wp.spatial_vector, device=device)
         inertia = wp.array(np.asarray(self.inertia, dtype=np.float32), dtype=wp.mat33, device=device)
         frames, arms, laws = array(self.frames, wp.mat33), array(self.arms, wp.vec3), array(self.laws, wp.vec2)
         region_body = np.concatenate([np.full(last - first, b) for b, (first, last) in enumerate(self.spans)])
@@ -185,7 +185,6 @@ class Bodies:
                 array(self.spans, wp.vec2i),
                 inertia,
                 wp.array(np.asarray(self.bases, dtype=np.float32), dtype=wp.spatial_vector, device=device),
-                array(6 * np.arange(bodies), int),
                 frames,
                 arms,
                 array(self.cand_spans, wp.vec2i),
@@ -207,11 +206,11 @@ class Bodies:
                 wp.zeros(regions, dtype=wp.vec3, device=device),
                 array(np.full(regions, int(region_sweep.REGION_IDLE)), int),
                 impulses,
-                du,
+                change,
             ],
             device=device,
         )
-        return du.numpy().reshape(bodies, 6).astype(np.float64), impulses.numpy().astype(np.float64)
+        return change.numpy().reshape(bodies, 6).astype(np.float64), impulses.numpy().astype(np.float64)
 
 
 class TestRegionLaw(unittest.TestCase):

@@ -169,7 +169,6 @@ def sweep_closed_bodies(
     body_regions: wp.array[wp.vec2i],
     body_inertia: wp.array2d[wp.mat33],
     body_basis: wp.array2d[wp.spatial_vector],
-    body_dof: wp.array[int],
     reg_frame: wp.array[wp.mat33],
     reg_arm: wp.array[wp.vec3],
     reg_cand: wp.array[wp.vec2i],
@@ -197,7 +196,7 @@ def sweep_closed_bodies(
     reg_spring: wp.array[wp.vec3],
     reg_state: wp.array[int],
     impulses: wp.array[float],
-    du: wp.array[float],
+    lane_change: wp.array[wp.spatial_vector],
 ):
     """The closed bodies' sweeps (the module's statement): lane ``tid`` takes the free body ``lanes[tid]`` (their
     count ``cursor[2]``), whose regions are ``body_regions`` of the region stream (``reg_*``, their candidates
@@ -207,7 +206,8 @@ def sweep_closed_bodies(
     ``reg_law`` (``mu``, ``mu_t``) and its friction rows' right-hand sides ``reg_bf``; its
     kind ``reg_kind`` (:data:`FRICTION_ROWS`, :data:`KIND_SPRINGS`, :data:`KIND_SECOND`); ``reg_row`` its friction
     rows' first impulse row (-1: none) and ``cand_row`` each candidate's. The lane writes the regions' state, their
-    impulses, and the body's change in walk coordinates (``du``, through the body's basis)."""
+    impulses, and the body's change in walk coordinates (``lane_change[tid]``, through the body's basis), which
+    :func:`add_closed_changes` adds to the walk's ``du`` once the other sweeps are done."""
     tid = wp.tid()
     if tid >= cursor[2]:
         return
@@ -367,7 +367,25 @@ def sweep_closed_bodies(
         + body_basis[b, 4] * torque[1]
         + body_basis[b, 5] * torque[2]
     )
-    dof = body_dof[b]
+    lane_change[tid] = change
+
+
+@wp.kernel(enable_backward=False, module="unique")
+def add_closed_changes(
+    cursor: wp.array[int],
+    lanes: wp.array[int],
+    body_dof: wp.array[int],
+    lane_change: wp.array[wp.spatial_vector],
+    du: wp.array[float],
+):
+    """The closed bodies' changes (:func:`sweep_closed_bodies`'s ``lane_change``) into the walk's ``du``, a thread a
+    lane. The other sweeps add zero at a closed body's coordinates (a world's sweep adds its whole span), so the sum
+    is the change itself in either order."""
+    tid = wp.tid()
+    if tid >= cursor[2]:
+        return
+    change = lane_change[tid]
+    dof = body_dof[lanes[tid]]
     for k in range(6):
         du[dof + k] += change[k]
 
@@ -1683,6 +1701,7 @@ class Regions:
         self.body_touch = wp.zeros(max(count, 1), dtype=wp.int32, device=device)
         self.body_pair = wp.zeros(count, dtype=wp.int32, device=device)
         self.lanes = wp.zeros(count, dtype=wp.int32, device=device)
+        self.lane_change = wp.zeros(count, dtype=wp.spatial_vector, device=device)
         self.cursor = wp.zeros(4, dtype=wp.int32, device=device)
         # Whether a step lists its regions anew ([0]) and whether the last listing fit the stream ([1]: none yet).
         self.relist = wp.array([1, 0], dtype=wp.int32, device=device)
@@ -1993,9 +2012,9 @@ class Regions:
                 **live,
             )
 
-    def sweep_closed(self, du: wp.array) -> None:
-        """The closed bodies' sweeps (:func:`sweep_closed_bodies`), a lane a free body: each adds its body's change to
-        the walk's ``du``."""
+    def sweep_closed(self) -> None:
+        """The closed bodies' sweeps (:func:`sweep_closed_bodies`), a lane a free body: each stores its body's change
+        (:meth:`add_closed`). They touch nothing another sweep touches, so they may run beside them."""
         if self.count == 0:
             return
         impulses = self.placement.impulses
@@ -2008,7 +2027,6 @@ class Regions:
                 self.body_regions,
                 self.body_inertia,
                 self.body_basis,
-                self.body_dof,
                 self.reg_frame,
                 self.reg_arm,
                 self.reg_cand,
@@ -2038,8 +2056,20 @@ class Regions:
                 self.reg_spring,
                 self.reg_state,
                 impulses.reshape((impulses.size,)),
-                du,
+                self.lane_change,
             ],
+            device=self.model.device,
+        )
+
+    def add_closed(self, du: wp.array) -> None:
+        """The closed bodies' changes into the walk's ``du`` (:func:`add_closed_changes`), after every sweep."""
+        if self.count == 0:
+            return
+        wp.launch(
+            add_closed_changes,
+            dim=self.count,
+            inputs=[self.cursor, self.lanes, self.body_dof, self.lane_change],
+            outputs=[du],
             device=self.model.device,
         )
 

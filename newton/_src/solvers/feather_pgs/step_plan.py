@@ -225,6 +225,7 @@ class StepPlan:
         streams = (
             ("dynamics", getattr(solver.factor.dynamics, "stream", None)),
             *((f"claim{i}", stream) for i, stream in enumerate(sweep.claim_streams)),
+            ("closed", sweep.closed_stream),
         )
         return cls(
             route=route,

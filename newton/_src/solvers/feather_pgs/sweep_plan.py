@@ -646,12 +646,22 @@ class Sweep:
         they run factorizations and articulation data. The claims do (the tiers), between the fork and the join
         only, and the launch stream, which the pool registers, waits for the join before it goes on. A trim that waits
         for the launch stream therefore waits for them too (:meth:`ContactPool.add_reader_stream`).
+
+        The closed free bodies' sweep (:meth:`.region_sweep.Regions.sweep_closed`) is a claim of the same kind: its
+        bodies' regions, rows and twists are no other sweep's, and it stores its change, which the launch stream adds
+        to the walk's after the join (a world's sweep adds its whole span, zero at a closed body's coordinates). Its
+        call is its slowest warps' chains, a few warps an SM: beside the matrix-free sweep it takes their time.
         """
         model = self.model
-        claims = len(self.tiers) if wp.get_device(model.device).is_cuda and overlap else 0
+        cuda = wp.get_device(model.device).is_cuda and overlap
+        claims = len(self.tiers) if cuda else 0
         self.claim_streams = tuple(wp.Stream(model.device) for _ in range(claims))
         self.claims_ready = wp.Event(model.device) if claims else None
         self.claims_done = tuple(wp.Event(model.device) for _ in range(claims))
+        closed = cuda and self.regions is not None and self.regions.count > 0
+        self.closed_stream = wp.Stream(model.device) if closed else None
+        self.closed_ready = wp.Event(model.device) if closed else None
+        self.closed_done = wp.Event(model.device) if closed else None
 
     def claim_worlds(self) -> None:
         """The claim stage: every world with rows into its claim's bucket of :attr:`claims`
@@ -952,6 +962,20 @@ class Sweep:
         if self.options.pgs_iterations <= 0 and not self.seeded:
             return
         operands = self._operands(v_hat, v_out)
+        main = None if self.claims_ready is None and self.closed_ready is None else wp.get_stream(self.model.device)
+        # The closed free bodies' regions: their own launch, a lane a body (no other row touches them), on their
+        # stream where it is open (open_streams). It forks before the launch stream clears du, which it does not read,
+        # so that its blocks are placed before the other sweeps fill the device: its call is its slowest lanes' chains.
+        closed = self.closed_stream
+        if self.regions is not None:
+            if closed is None:
+                self.regions.sweep_closed()
+            else:
+                main.record_event(self.closed_ready)
+                closed.wait_event(self.closed_ready)
+                with wp.ScopedStream(closed, sync_enter=False):
+                    self.regions.sweep_closed()
+                closed.record_event(self.closed_done)
         # The sweeps' change: into the walk's du, from zero, or (the support placement's sparse sweep) its own in factor
         # coordinates at each tree's offset (support_du_base).
         factor_change = self.support_du_base is not None
@@ -961,15 +985,11 @@ class Sweep:
         self.readout.count_skipped(
             self.placement.constraint_count, self.placement.mf_constraint_count, self.placement.world_acts
         )
-        # The closed free bodies' regions: their own launch, a lane a body (no other row touches them).
-        if self.regions is not None:
-            self.regions.sweep_closed(self.factor.walk_view().du)
         streams = self.claim_streams
         if not streams:
             for launch in self.launches:
                 self._launch(launch, operands)
         else:
-            main = wp.get_stream(self.model.device)
             main.record_event(self.claims_ready)
             first, *beside = self.claim_groups
             for launch in first:
@@ -981,6 +1001,10 @@ class Sweep:
                         self._launch(launch, operands)
                 stream.record_event(done)
                 main.wait_event(done)
+        if self.regions is not None:
+            if closed is not None:
+                main.wait_event(self.closed_done)
+            self.regions.add_closed(self.factor.walk_view().du)
         if self.leaves:
             # The step's one leave: every walking tree's change in the walk's coordinates (the sparse sweep's in its
             # factor coordinates).
