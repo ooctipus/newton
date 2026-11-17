@@ -95,13 +95,16 @@ def pack_row_record(
     n_a: str = "n_a",
     n_b: str = "n_b",
     mu: str = "mu",
+    key: str = "key",
+    root: str = "root",
     indent: str = "    ",
 ) -> str:
     """Store a row's record of ``words`` words (:func:`record_words`) at the ``int`` pointer ``record``: its header, its
     sides' first world coordinates ``dof_a`` and ``dof_b`` (16-bit halves, -1 for none), the bits of its stored
     ``diagonal`` (a free row's inverse) and of its ``rhs`` at ``du = 0``, and its kind and parent word
     (:func:`record_kind`); a dense row's then its sides' widths ``n_a`` and ``n_b`` (two 16-bit halves), its friction
-    coefficient ``mu`` and two zero words. Each field is a native expression, by default the local of its name, and
+    coefficient ``mu``, its idle ``key`` and its idle ``root`` (:func:`.projection_laws.idle_key`, ``idle_root``: the
+    bounds the live order passes idle rows by, formed once with the record). Each field is a native expression, by default the local of its name, and
     ``words`` a class's count or, a native expression, the row's."""
     if words not in (HEADER_WORDS, RECORD_WORDS) and not isinstance(words, str):
         raise ValueError(f"a record holds {HEADER_WORDS} or {RECORD_WORDS} words, not {words}")
@@ -115,7 +118,7 @@ def pack_row_record(
     text += f"\n{indent}*reinterpret_cast<int4*>({record}) = record_a;"
     if words == HEADER_WORDS:
         return text
-    tail = f"*reinterpret_cast<int4*>({record} + 4) = make_int4({n_a} | ({n_b} << 16), __float_as_int({mu}), 0, 0);"
+    tail = f"*reinterpret_cast<int4*>({record} + 4) = make_int4({n_a} | ({n_b} << 16), __float_as_int({mu}), __float_as_int({key}), __float_as_int({root}));"
     return text + (f"\n{indent}if ({words} > {HEADER_WORDS}) " if isinstance(words, str) else f"\n{indent}") + tail
 
 

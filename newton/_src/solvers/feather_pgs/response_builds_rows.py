@@ -12,6 +12,7 @@ import warp as wp
 
 from ...core.execution import Buckets
 from .device_preludes import CPU_MATH, CPU_WORDS, dual_native, span_item, span_total
+from .projection_laws import idle_key, idle_root
 from .row_metadata import HEADER_WORDS, RECORD_WORDS, pack_row_record
 from .row_records import DenseRows
 
@@ -61,6 +62,8 @@ def store_row_record(
     kind: int,
     parent: int,
     mu: float,
+    key: float,
+    root: float,
 ): ...
 
 
@@ -104,6 +107,8 @@ def write_row_record(records: RowRecords, rows: DenseRows, incident: float, line
     n_a = int(0)
     n_b = int(0)
     mu = float(0.0)
+    key = float(0.0)
+    root = float(0.0)
     if slot >= records.base:
         words = _HEADER_WORDS
         inverse = float(0.0)
@@ -121,7 +126,11 @@ def write_row_record(records: RowRecords, rows: DenseRows, incident: float, line
             if sides[1] >= 0:
                 n_b = records.dofs[sides[1]]
         mu = rows.row_mu[line, slot]
-    store_row_record(records.record, at, words, firsts[0], firsts[1], n_a, n_b, diagonal, rhs, kind, parent, mu)
+        key = idle_key(rhs, diagonal)
+        root = idle_root(diagonal)
+    store_row_record(
+        records.record, at, words, firsts[0], firsts[1], n_a, n_b, diagonal, rhs, kind, parent, mu, key, root
+    )
 
 
 @wp.kernel(enable_backward=False)

@@ -187,6 +187,16 @@ class WorldRows:
     def diag(self, row: str) -> str:
         return f"__int_as_float({self.word(row, 1)})"
 
+    def idle_key(self, row: str) -> str:
+        """Row ``row``'s idle key (:func:`.projection_laws.idle_key`) as its streamed record holds it, formed by the
+        writer (:func:`.row_metadata.pack_row_record`)."""
+        return f"__int_as_float({self.word(row, 6)})"
+
+    def idle_root(self, row: str) -> str:
+        """Row ``row``'s idle root (:func:`.projection_laws.idle_root`) as its streamed record holds it, formed by the
+        writer (:func:`.row_metadata.pack_row_record`)."""
+        return f"__int_as_float({self.word(row, 7)})"
+
     def inverse(self, row: str) -> str:
         """A free row's stored inverse diagonal."""
         return f"__int_as_float({self.word(row, 1)})"
@@ -677,6 +687,9 @@ class RowContext:
     reach: str | None = None
     """The register that bounds the norm of the velocity the rows read, which every apply grows (the live order's
     bound, :func:`idle_reach`); ``None`` where the row loop keeps no bound."""
+    root: Callable[[str], str] | None = None
+    """A row's bound of ``sqrt(A_ii)`` as its streamed record holds it (:meth:`WorldRows.idle_root`); ``None``: the
+    growth forms it from the row's diagonal."""
     pair_residual: bool = False
     """A friction pair reduces its first tangent's residual again with the pair's terms
     (:func:`_pair_terms` with ``own``) and solves on it in place of the row's: the free-body loop's
@@ -764,7 +777,8 @@ def idle_growth(ctx: RowContext, changes: tuple[tuple[str, str], ...]) -> str:
     terms = []
     for row, delta in changes:
         name = ctx.row if row == "row" else row
-        term = f"fabsf({delta}) * IdleLaw::idle_root({ctx.diagonal.value(name)})"
+        root = ctx.root(name) if ctx.root else f"IdleLaw::idle_root({ctx.diagonal.value(name)})"
+        term = f"fabsf({delta}) * {root}"
         terms.append(f"(sib >= 0 ? {term} : 0.0f)" if row == "sib" else term)
     return f"{ctx.reach} = ({ctx.reach} + {' + '.join(terms)}) * {IDLE_MARGIN};"
 
@@ -1667,8 +1681,11 @@ class LiveOrder:
     def inner(self, pad: str) -> str:
         return pad + "        "
 
-    def key(self, rhs: str, diagonal: str) -> str:
-        """The bound up to which a unilateral row at a zero impulse stays idle (:func:`.projection_laws.idle_key`)."""
+    def key(self, row: str, rhs: str, diagonal: str) -> str:
+        """The bound up to which a unilateral row at a zero impulse stays idle (:func:`.projection_laws.idle_key`):
+        a streamed record's (:meth:`WorldRows.idle_key`), else of the staged ``rhs`` and ``diagonal``."""
+        if self.rows.record:
+            return self.rows.idle_key(row)
         return f"IdleLaw::idle_key({rhs}, {diagonal})"
 
     def test(self) -> str:
@@ -1707,7 +1724,7 @@ class LiveOrder:
             f"            if ({rows.peek('r')} != 0.0f) live_always = true;",
             f"            else if (!(r_diagonal <= 0.0f) && {ring_kinds}) {{",
             f"                if (r_kind == {ROW_CONTACT} || r_kind == {ROW_JOINT_LIMIT})",
-            f"                    live_key = fminf(live_key, {self.key(rows.rhs_of('r'), 'r_diagonal')});",
+            f"                    live_key = fminf(live_key, {self.key('r', rows.rhs_of('r'), 'r_diagonal')});",
             "                else live_always = true;",
             "            }",
             f"            r = {rows.parent('r', enclosed=True)};",
@@ -1716,7 +1733,7 @@ class LiveOrder:
             "    }",
             f"}} else if ({kinds} && !(t_diagonal <= 0.0f)) {{",
             f"    if (({unilateral}) && __float_as_int({rows.peek('t')}) == 0)",
-            f"        live_key = {self.key(f'__int_as_float({word(2)})', 't_diagonal')};",
+            f"        live_key = {self.key('t', f'__int_as_float({word(2)})', 't_diagonal')};",
             "    else live_always = true;",
             "}",
         ]
@@ -2311,6 +2328,7 @@ def row_step(
         formed=formed,
         friction=kind in (None, ROW_FRICTION),
         reach=reach,
+        **({"root": rows.idle_root} if reach is not None and getattr(rows, "record", False) else {}),
     )
     hold = {}
     if held:
