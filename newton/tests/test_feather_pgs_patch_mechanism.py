@@ -1091,7 +1091,9 @@ def _record_patch_routes(patches):
 
 class TestPatchSolverRoutes(unittest.TestCase):
     def test_solver_passes_every_patch_route(self):
-        """Link and finish every route that holds patch rows, warm-started or not: no step seeds friction."""
+        """Finish every route that holds patch rows, warm-started or not: no step seeds friction. The row writers form
+        each normal row's ring parent with its kind, so no step links apart (only the free bodies' regions do, whose
+        rows their fill writes after the listing), and the link's rule leaves the rows' parents as the step did."""
         # Both modes route the fixed-base arm's contacts and the free box's through the line's rows (a free body is a
         # one-node tree; only colored worlds keep a free bodies' run); no route builds the other families.
         configs = [("cpu", {}, (1, 0, 0))]
@@ -1129,12 +1131,23 @@ class TestPatchSolverRoutes(unittest.TestCase):
                         state, out = out, state
                         count = int(contacts.rigid_contact_count.numpy()[0])
                         paths.update(solver.placement.contact_path.numpy()[:count].tolist())
-                        self.assertEqual([name for name, _ in calls], ["link", "finish"], f"step {step}")
+                        self.assertEqual([name for name, _ in calls], ["finish"], f"step {step}")
                         for name, routes in calls:
                             self.assertEqual(tuple(routes.enabled), enabled, f"step {step} {name}")
                             for route in np.flatnonzero(enabled):
                                 for field, array in zip(("parents", "mu", "impulses"), arrays[route], strict=True):
                                     self.assertEqual(getattr(routes, f"{field}{route}").ptr, array.ptr, field)
+                        parents = solver.placement.row_parent.numpy().copy()
+                        solver.laws.friction_patches.link(
+                            solver.placement.contact_world,
+                            solver.placement.contact_slot,
+                            solver.placement.contact_path,
+                            solver.placement.contact_slots_needed,
+                            solver.sweep.patch_routes(),
+                        )
+                        np.testing.assert_array_equal(
+                            solver.placement.row_parent.numpy(), parents, f"step {step}: the writers' ring parents"
+                        )
                         calls.clear()
                     # A step without a frame finishes no route; a step without contacts
                     # drops the stored anchors without calling the patch state.

@@ -26,7 +26,7 @@ from .contact_laws import (
     prescribed_spin_target,
     prescribed_target,
 )
-from .friction_patches import PatchRowLaw, patch_spin_row, patch_tangent_row
+from .friction_patches import PatchRowLaw, patch_spin_row, patch_tangent_row, ring_parent
 from .row_laws import (
     ROW_CONTACT,
     ROW_FRICTION,
@@ -97,10 +97,10 @@ def contact_normal_beta(data: ContactInput, c: int, body_a: int, body_b: int, ph
 @cache
 def contact_row_writer(kinds: bool = True, laws: bool = True) -> wp.Function:
     """Write contact ``c``'s row ``row`` (0 the normal, 1 and 2 the tangents, 3 the spin row under contact torsion) at
-    ``slot + row``: with ``kinds`` its kind (its type and parent, what the patch link and the warm start read before
-    any reader; a normal's parent -1, which the link replaces), with ``laws`` its other records from its front end
-    ``frame`` (:func:`.contact_input.contact_frame`) and, ``with_rhs``, its position-pass ``rhs`` and CFM seed,
-    returning ``(body_a, body_b, direction, row_point)``; both, :data:`write_contact_row`.
+    ``slot + row``: with ``kinds`` its kind (its type and parent, what the warm start reads before any reader; a
+    normal's parent its ring's next row, :func:`.friction_patches.ring_parent`), with ``laws`` its other records from
+    its front end ``frame`` (:func:`.contact_input.contact_frame`) and, ``with_rhs``, its position-pass ``rhs`` and CFM
+    seed, returning ``(body_a, body_b, direction, row_point)``; both, :data:`write_contact_row`.
 
     A tangent row follows the friction row law (:func:`.friction_patches.patch_tangent_row`): the anchor's tangential
     displacement as its gap, the law's beta and the undivided coefficient ``mu``. A normal row's rhs is
@@ -167,7 +167,7 @@ def contact_row_writer(kinds: bool = True, laws: bool = True) -> wp.Function:
                 normal_beta = contact_normal_beta(data, c, body_a, body_b, phi)
             if wp.static(kinds):
                 data.row_type[line, r] = ROW_CONTACT
-                data.row_parent[line, r] = -1
+                data.row_parent[line, r] = ring_parent(law.patches, data.world, data.slot, data.path, c, data.path[c])
             if wp.static(laws):
                 data.row_mu[line, r] = mu
                 data.row_beta[line, r] = normal_beta

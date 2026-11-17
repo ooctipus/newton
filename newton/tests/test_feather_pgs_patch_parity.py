@@ -12,9 +12,9 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs.friction_patches import link_patch_routes
 from newton._src.solvers.feather_pgs.row_laws import ROW_CONTACT, ROW_FRICTION, ROW_TORSION
 from newton._src.solvers.feather_pgs.row_metadata import record_views
+from newton._src.solvers.feather_pgs.warm_start import prepare_world_impulses
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_sparse_scene as sparse_scene
 from newton.tests.feather_pgs_patch_parity import (
@@ -65,13 +65,13 @@ def _standing_cases(count, *, twin=False, iterations=8, **shape):
 
 @contextlib.contextmanager
 def _ring_pool_dropped(solver):
-    """Cut the normal rows out of their patch rings after the link, so each anchor's budget pools its own normal only:
-    in the row store and in the streamed rows' records, which the link wrote too."""
+    """Cut the normal rows out of their patch rings once the rows are final (their writers form each normal's ring
+    parent with its kind and store the streamed records), before the impulses start: each anchor's budget pools its own
+    normal only, in the row store and in the streamed rows' records."""
     launch = wp.launch
 
     def cut(kernel, *args, **kwargs):
-        result = launch(kernel, *args, **kwargs)
-        if kernel is link_patch_routes:
+        if kernel is prepare_world_impulses:
             placement = solver.placement
             kinds, parents = placement.row_type.numpy(), placement.row_parent.numpy()
             normals = kinds == ROW_CONTACT
@@ -88,7 +88,7 @@ def _ring_pool_dropped(solver):
                     # The kind in the low half, no parent (0xFFFF) in the high half (row_metadata.record_kind).
                     words[..., 3][cut_rows] = (words[..., 3][cut_rows] & 0xFFFF) | np.int32(-0x10000)
                 placement.row_record.assign(records)
-        return result
+        return launch(kernel, *args, **kwargs)
 
     with mock.patch.object(wp, "launch", cut):
         yield
@@ -312,7 +312,7 @@ class TestFeatherPGSPatchParity(unittest.TestCase):
         Both feet slide (SLIDING_FEET) with every anchor at its pooled ring
         budget, so kinetic friction fixes each region's friction. A one-ulp twin
         stays within SLIDING_REGION_BOUNDS; an arm whose normal rows leave their
-        rings after the patch link, so each anchor's divided budget pools only its
+        rings once the rows are final, so each anchor's divided budget pools only its
         own normal, does not.
         """
         reference, twin = _standing_cases(2, twin=True, iterations=SLIDING_ITERATIONS, **SLIDING_FEET)

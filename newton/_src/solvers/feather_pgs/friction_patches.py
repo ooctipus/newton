@@ -185,10 +185,11 @@ PatchRowLaw = field_group.struct("PatchRowLaw", PATCH_ROW_LAW, __name__)
 """The friction row law, for producers that write their own friction rows.
 
 A tangent row acts at its region's friction location, carries the anchor's tangential displacement as phi and
-corrects it with ``beta`` (``friction_anchor_beta``, the stick's gain, positive). Producers write the undivided friction coefficient; the patch
-link (``_FrictionPatchState.link``, which launches ``link_patch_routes``) divides it and links the
-ring. The Warp producers apply the law through :func:`.contact_input.contact_frame` and
-:func:`patch_tangent_row`.
+corrects it with ``beta`` (``friction_anchor_beta``, the stick's gain, positive). Producers write the undivided friction
+coefficient and each normal row's ring parent (:func:`ring_parent`); the patch link (``_FrictionPatchState.link``,
+which launches ``link_patch_routes``) links the rings whose normal rows no producer writes before the rings are read
+(the free bodies' regions, which their fill writes after the listing). The Warp producers apply the law through
+:func:`.contact_input.contact_frame` and :func:`patch_tangent_row`.
 """
 
 
@@ -2634,6 +2635,30 @@ def _route_impulses(routes: _PatchRoutes, route: int):
 
 
 @wp.func
+def ring_parent(
+    patches: FrictionPatches, world: wp.array[int], slot: wp.array[int], path: wp.array[int], c: int, route: int
+) -> int:
+    """Contact ``c``'s normal row's parent in its region's ring: the row of the ring's next member with rows on
+    ``route`` in ``c``'s world, ``c``'s own row where no other member has one, -1 without a patch (the row is its own
+    ring's). Every slot is reserved before (the allocation), so the writer of a normal row forms its parent with its
+    kind (:func:`.row_build.write_contact_row`).
+
+    A region has one anchor, so its friction rows' coefficients are whole: the pooled normal load of the ring bounds
+    them once.
+    """
+    row = patches.next_contact[c]
+    if row < 0:
+        return -1
+    next_slot = slot[c]
+    while row != c:
+        if slot[row] >= 0 and path[row] == route and world[row] == world[c]:
+            next_slot = slot[row]
+            break
+        row = patches.next_contact[row]
+    return next_slot
+
+
+@wp.func
 def _link_contact(
     c: int,
     patches: FrictionPatches,
@@ -2644,23 +2669,8 @@ def _link_contact(
     parents: wp.array2d[int],
     first: wp.array[int],
 ):
-    """Link contact ``c``'s normal row into its region's ring: its parent is the next member's row on the route.
-
-    A region has one anchor, so its friction rows' coefficients are whole: the pooled normal load of the ring bounds
-    them once.
-    """
-    row = patches.next_contact[c]
-    if row < 0:
-        # No patch: the normal row is its own ring's.
-        parents[first[world[c]], slot[c]] = -1
-        return
-    next_slot = slot[c]
-    while row != c:
-        if slot[row] >= 0 and path[row] == route and world[row] == world[c]:
-            next_slot = slot[row]
-            break
-        row = patches.next_contact[row]
-    parents[first[world[c]], slot[c]] = next_slot
+    """Link contact ``c``'s normal row into its region's ring (:func:`ring_parent`)."""
+    parents[first[world[c]], slot[c]] = ring_parent(patches, world, slot, path, c, route)
 
 
 @wp.kernel(enable_backward=False)

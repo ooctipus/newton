@@ -67,6 +67,7 @@ from .row_slots import (
     finalize_constraint_counts_with_status,
     snapshot_dense_phase_bound,
 )
+from .sweep_plan import FREE_ROUTE
 
 VELOCITY_LIMIT_SLOTS = FieldGroup(
     Field("velocity_limit_slot", wp.int32, ("limit_row",), fill=-1, owner="laws"),
@@ -1165,18 +1166,17 @@ class RowLaws:
                 friction_gap=solver.options.contact_friction_gap_threshold,
             )
 
-    def link_patches(self, solver, contacts, route: int | None = None):
-        """Link the patches' shared normal loads once every contact row's records are written, before any consumer reads
-        them: after the row pass, or after the one writer where it writes them (the stage list's order). Every route, or
-        only ``route`` (:data:`.sweep_plan.DENSE_ROUTE`, :data:`.sweep_plan.FREE_ROUTE`): a contact links only its own
-        route's rows, so the routes link apart as they link together."""
+    def link_regions(self, solver, contacts):
+        """Link the free bodies' regions' rings (:data:`.sweep_plan.FREE_ROUTE`) before their listing reads them: their
+        rows are their fill's, written after it. Every other normal row's writer forms its ring parent with its kind
+        (:func:`.friction_patches.ring_parent`); a contact links only its own route's rows."""
         if solver.sweep.patch_frame_built(contacts):
             self.friction_patches.link(
                 solver.placement.contact_world,
                 solver.placement.contact_slot,
                 solver.placement.contact_path,
                 solver.placement.contact_slots_needed,
-                solver.sweep.patch_routes(route),
+                solver.sweep.patch_routes(FREE_ROUTE),
             )
 
     def record(self, solver) -> dict:
