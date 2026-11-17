@@ -3,7 +3,6 @@
 
 """Test sticky overflow visibility independently of opt-in row telemetry."""
 
-import inspect
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -14,7 +13,7 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs import row_slots
 from newton.solvers import SolverFeatherPGS
-from newton.tests.feather_pgs_law_harness import anchored_patches, contact_input
+from newton.tests.feather_pgs_law_harness import allocate_contacts, anchored_patches, contact_input
 
 
 def _allocator_arrays(capacity, *, route=0, count=205, device="cpu"):
@@ -79,16 +78,9 @@ def _allocate(arrays):
 
     Reservations record the first rejected slot; the families' count finalizers raise the status.
     """
-    kernel = row_slots.allocate_world_contact_slots
     device = arrays["contact_count"].device
     data, _arrays = contact_input(arrays, device)
-    values = {**arrays, "data": data}
-    wp.launch(
-        kernel,
-        dim=1,
-        inputs=[values[name] for name in inspect.signature(kernel.func).parameters],
-        device=device,
-    )
+    allocate_contacts({**arrays, "data": data}, 1, device)
     for family, counter, capacity, first_rejected in (
         (0, "world_slot_counter", "max_constraints", "dense_first_rejected_slot"),
         (1, "mf_slot_counter", "mf_max_constraints", "mf_first_rejected_slot"),

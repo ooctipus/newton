@@ -23,12 +23,9 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs import field_group, row_slots, rows
 from newton._src.solvers.feather_pgs.contact_input import ContactInput
-from newton._src.solvers.feather_pgs.row_slots import (
-    allocate_world_contact_slots,
-    finalize_constraint_counts_with_status,
-)
+from newton._src.solvers.feather_pgs.row_slots import finalize_constraint_counts_with_status
 from newton.solvers import SolverFeatherPGS
-from newton.tests.feather_pgs_law_harness import anchored_patches, row_lines
+from newton.tests.feather_pgs_law_harness import allocate_contacts, anchored_patches, row_lines
 from newton.tests.test_feather_pgs_sparse_solver import _build_model
 
 _UNBOUNDED = 2**31 - 1
@@ -69,10 +66,8 @@ def _allocate_overflowing_contacts(device, contact_count, row_capacity):
     dropped = wp.zeros((1,), dtype=wp.int32, device=device)
     first_rejected = wp.full((1,), _UNBOUNDED, dtype=wp.int32, device=device)
     count = wp.zeros((1,), dtype=wp.int32, device=device)
-    wp.launch(
-        allocate_world_contact_slots,
-        dim=contact_count,
-        inputs=[
+    allocate_contacts(
+        [
             field_group.upload(
                 ContactInput,
                 device,
@@ -113,8 +108,6 @@ def _allocate_overflowing_contacts(device, contact_count, row_capacity):
             1,
             anchored_patches(contact_count, device),
             wp.empty(0, dtype=wp.spatial_vector, device=device),
-        ],
-        outputs=[
             wp.empty(0, dtype=wp.int32, device=device),
             counter,
             wp.zeros((1,), dtype=wp.int32, device=device),
@@ -124,7 +117,8 @@ def _allocate_overflowing_contacts(device, contact_count, row_capacity):
             wp.full((1,), _UNBOUNDED, dtype=wp.int32, device=device),
             wp.zeros((0, 0), dtype=wp.int32, device=device),
         ],
-        device=device,
+        contact_count,
+        device,
     )
     # The dense family's finalizer, as the solver launches it for these rows.
     wp.launch(

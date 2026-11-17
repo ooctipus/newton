@@ -174,9 +174,8 @@ def _admit_contact(
 
 
 @wp.kernel
-def allocate_world_contact_slots(
+def admit_world_contacts(
     data: ContactInput,
-    total_num_threads: int,
     body_to_articulation: wp.array[int],
     art_to_world: wp.array[int],
     body_flags: wp.array[wp.int32],
@@ -186,15 +185,80 @@ def allocate_world_contact_slots(
     contact_gap_gate: float,
     same_articulation_contact_gap_gate: float,
     articulation_pair_contact_gap_gate: float,
-    max_constraints: int,
-    mf_max_constraints: int,
     enable_friction: int,
     contact_friction_gap_threshold: float,
-    row_capacity_telemetry: int,
     friction_patches: FrictionPatches,
     twists: wp.array[wp.spatial_vector],
     # outputs
     acts: wp.array[int],
+):
+    """Classify every active contact and size its rows, a thread a contact in the frame's order (``data`` binds the
+    frame's records), so its records and allocation are read and written where every later kernel reads them; its
+    rows are reserved after, in the collision's written order (:func:`allocate_world_contact_slots`).
+
+    A contact admitted by :func:`_admit_contact` needs 1 row for its normal and, when enabled below the friction gap
+    threshold (and, under persistent patches, for a loaded anchor), 2 adjacent rows for its friction, and a third for
+    its spin row where the plan lets it carry one (``data.spin``: its region has a footprint, or contact torsion gives
+    every friction contact one) (:func:`.friction_patches.patch_spin_rows`). Contacts where both sides are free rigid
+    bodies (or ground) take matrix-free rows (``path`` 1), the others world-level dense rows (``path`` 0); a contact
+    without rows has ``slot`` and ``path`` -1. A positive contact gap gate excludes wider speculative contacts before
+    any route reserves rows; zero disables the gate.
+
+    An admitted contact whose rows may act at the predictor marks its world's ``acts`` word
+    (:data:`.placement.WORLD_ACTS`; empty: no word).
+    """
+    c = wp.tid()
+    if c >= data.count[0]:
+        return
+    admitted, separating, art_a, art_b, world, phi = _admit_contact(
+        c,
+        data,
+        body_to_articulation,
+        art_to_world,
+        body_flags,
+        body_has_response_dofs,
+        is_free_rigid,
+        contact_gap_gate,
+        same_articulation_contact_gap_gate,
+        articulation_pair_contact_gap_gate,
+        twists,
+    )
+    if not admitted:
+        data.slot[c] = -1
+        data.path[c] = -1
+        return
+    if not separating and acts.shape[0] > 0:
+        acts[world] = 1
+    a_has_dofs = art_a >= 0 and data.response_dofs[art_a] > 0
+    b_has_dofs = art_b >= 0 and data.response_dofs[art_b] > 0
+    # Classify: MF path if both sides are free rigid or ground.
+    is_mf = 0
+    if has_free_rigid != 0:
+        a_is_mf_compatible = not a_has_dofs or is_free_rigid[art_a] != 0
+        b_is_mf_compatible = not b_has_dofs or is_free_rigid[art_b] != 0
+        if a_is_mf_compatible and b_is_mf_compatible:
+            is_mf = 1
+
+    # Every normal survives; only the selected patch anchors receive tangent rows.
+    slots_needed = 1
+    add_friction = enable_friction != 0 and phi <= contact_friction_gap_threshold and friction_patches.weight[c] > 0.0
+    if add_friction:
+        slots_needed = 3 + patch_spin_rows(friction_patches, c, data.spin)
+    data.slots_needed[c] = slots_needed
+    data.world[c] = world
+    data.art0[c] = art_a
+    data.art1[c] = art_b
+    data.path[c] = is_mf
+
+
+@wp.kernel
+def allocate_world_contact_slots(
+    data: ContactInput,
+    total_num_threads: int,
+    max_constraints: int,
+    mf_max_constraints: int,
+    row_capacity_telemetry: int,
+    # outputs
     world_slot_counter: wp.array[int],
     mf_slot_counter: wp.array[int],
     dense_dropped_contact_rows: wp.array[int],
@@ -203,26 +267,19 @@ def allocate_world_contact_slots(
     mf_first_rejected_slot: wp.array[int],
     units: wp.array2d[int],
 ):
-    """Classify and allocate the rows of every active contact, with work proportional to the materialized prefix.
+    """Reserve the rows of every admitted contact (:func:`admit_world_contacts`), with work proportional to the
+    materialized prefix.
 
-    The contacts are visited in the collision's written order, their records read there (``data`` binds the
-    collision's records), and each one's allocation written at its frame position (``data.position``), so the
-    reservations keep the order of the collision's writes.
+    The contacts are visited in the collision's written order (``data.position`` maps it to the frame's), so the
+    reservations keep the order of the collision's writes, and with it the rows' order. A contact's slot is its first
+    row in its world's line, the free bodies' rows from the dense capacity ``max_constraints``; the counters count
+    each family's own rows.
 
     Where the one writer takes the rows (``units`` holds the placement's unit sources; empty otherwise), each dense
     row's unit source is written with its slot: the contact's rows are the writer's to fill.
 
-    A contact admitted by :func:`_admit_contact` reserves 1 slot for the normal row and, when enabled below the
-    friction gap threshold (and, under persistent patches, for a loaded anchor), 2 adjacent slots for the friction
-    rows, and a third for its spin row where the plan lets it carry one (``data.spin``: its region has a footprint, or
-    contact torsion gives every friction contact one) (:func:`.friction_patches.patch_spin_rows`). Contacts where both sides are free rigid bodies (or ground) take matrix-free rows, the others world-level
-    dense rows. A contact's slot is its first row in its world's line, the free bodies' rows from the dense capacity
-    ``max_constraints``; the counters count each class's own rows. A positive contact gap gate excludes wider speculative contacts before any route reserves slots;
-    zero disables the gate.
-
-    A collision pass clamps :paramref:`contact_count` to the rows its writers
-    filled, every one of them, and flags an overflow in its own capacity
-    status, so the count always describes a materialized prefix.
+    A collision pass clamps the contact count to the rows its writers filled, every one of them, and flags an overflow
+    in its own capacity status, so the count always describes a materialized prefix.
 
     Slot counters only grow. A contact whose reservation does not fit records its
     slot in the family's ``*_first_rejected_slot`` (per world, preset to a large
@@ -230,58 +287,17 @@ def allocate_world_contact_slots(
     or past that slot, so the finalize kernels truncate the row count there and
     no accepted contact can hold a slot at or beyond the count. Rolling back
     raced with concurrent reservations and left accepted rows past the count,
-    which the friction patch links then chained into.
-
-    An admitted contact whose rows may act at the predictor marks its world's ``acts`` word
-    (:data:`.placement.WORLD_ACTS`; empty: no word).
+    which the friction patch links then chained into. Such a contact has no rows
+    (``slot`` and ``path`` -1).
     """
     thread = wp.tid()
-    # A collision pass clamps the count to the rows it wrote, all of them, and flags the overflow itself.
-    total_contacts = data.count[0]
-
-    # The collision's contacts in its written order: the reservations keep the order of the collision's writes, and
-    # with it the rows' order. A contact's records are read at its written index (``data`` binds the collision's), its
-    # allocation and patch view at its frame position.
-    for written in range(thread, total_contacts, total_num_threads):
+    for written in range(thread, data.count[0], total_num_threads):
         c = data.position[written]
-        admitted, separating, art_a, art_b, world, phi = _admit_contact(
-            written,
-            data,
-            body_to_articulation,
-            art_to_world,
-            body_flags,
-            body_has_response_dofs,
-            is_free_rigid,
-            contact_gap_gate,
-            same_articulation_contact_gap_gate,
-            articulation_pair_contact_gap_gate,
-            twists,
-        )
-        if not admitted:
-            data.slot[c] = -1
-            data.path[c] = -1
+        is_mf = data.path[c]
+        if is_mf < 0:
             continue
-        if not separating and acts.shape[0] > 0:
-            acts[world] = 1
-        a_has_dofs = art_a >= 0 and data.response_dofs[art_a] > 0
-        b_has_dofs = art_b >= 0 and data.response_dofs[art_b] > 0
-        # Classify: MF path if both sides are free rigid or ground.
-        is_mf = 0
-        if has_free_rigid != 0:
-            a_is_mf_compatible = not a_has_dofs or is_free_rigid[art_a] != 0
-            b_is_mf_compatible = not b_has_dofs or is_free_rigid[art_b] != 0
-            if a_is_mf_compatible and b_is_mf_compatible:
-                is_mf = 1
-
-        # Every normal survives; only the selected patch anchors receive tangent rows.
-        slots_needed = 1
-        add_friction = (
-            enable_friction != 0 and phi <= contact_friction_gap_threshold and friction_patches.weight[c] > 0.0
-        )
-        if add_friction:
-            slots_needed = 3 + patch_spin_rows(friction_patches, c, data.spin)
-        data.slots_needed[c] = slots_needed
-
+        world = data.world[c]
+        slots_needed = data.slots_needed[c]
         # The matrix-free or the dense family's counter.
         slot = int(-1)
         if is_mf != 0:
@@ -299,11 +315,7 @@ def allocate_world_contact_slots(
         if is_mf != 0:
             # The free bodies' rows follow the dense class's in the world's line: one row index for both classes.
             slot += max_constraints
-        data.world[c] = world
         data.slot[c] = slot
-        data.art0[c] = art_a
-        data.art1[c] = art_b
-        data.path[c] = is_mf
         if is_mf == 0 and units.shape[0] > 0:
             for r in range(slots_needed):
                 units[data.first[world], slot + r] = unit_source(UNIT_CONTACT, 4 * c + r)

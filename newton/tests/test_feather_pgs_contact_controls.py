@@ -13,9 +13,8 @@ from newton._src.solvers.feather_pgs import field_group
 from newton._src.solvers.feather_pgs.contact_forces import compute_contact_linear_force_from_impulses
 from newton._src.solvers.feather_pgs.contact_input import ContactInput, ContactRoutes
 from newton._src.solvers.feather_pgs.row_records import DenseRows
-from newton._src.solvers.feather_pgs.row_slots import allocate_world_contact_slots
 from newton.solvers import SolverFeatherPGS
-from newton.tests.feather_pgs_law_harness import anchored_patches, bias_rows, row_bias, row_lines
+from newton.tests.feather_pgs_law_harness import allocate_contacts, anchored_patches, bias_rows, row_bias, row_lines
 
 PATH_DENSE = 0
 PATH_MATRIX_FREE = 1
@@ -51,10 +50,8 @@ def _launch_contact_allocator(
         "mf_first_rejected": wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
     }
     is_free = route == PATH_MATRIX_FREE
-    wp.launch(
-        allocate_world_contact_slots,
-        dim=1,
-        inputs=[
+    allocate_contacts(
+        [
             field_group.upload(
                 ContactInput,
                 device,
@@ -95,8 +92,6 @@ def _launch_contact_allocator(
             0,
             anchored_patches(1, device),
             wp.empty(0, dtype=wp.spatial_vector, device=device),
-        ],
-        outputs=[
             wp.empty(0, dtype=wp.int32, device=device),
             counters["dense_count"],
             counters["mf_count"],
@@ -106,7 +101,8 @@ def _launch_contact_allocator(
             counters["mf_first_rejected"],
             wp.zeros((0, 0), dtype=wp.int32, device=device),
         ],
-        device=device,
+        1,
+        device,
     )
     wp.synchronize_device(device)
     return {name: int(array.numpy()[0]) for name, array in (outputs | counters).items()}
@@ -131,10 +127,8 @@ def _launch_articulation_pair_contact_allocator(
     dense_count = wp.zeros((1,), dtype=wp.int32, device=device)
     dense_dropped = wp.zeros((1,), dtype=wp.int32, device=device)
     mf_dropped = wp.zeros((1,), dtype=wp.int32, device=device)
-    wp.launch(
-        allocate_world_contact_slots,
-        dim=1,
-        inputs=[
+    allocate_contacts(
+        [
             field_group.upload(
                 ContactInput,
                 device,
@@ -175,8 +169,6 @@ def _launch_articulation_pair_contact_allocator(
             0,
             anchored_patches(2, device),
             wp.empty(0, dtype=wp.spatial_vector, device=device),
-        ],
-        outputs=[
             wp.empty(0, dtype=wp.int32, device=device),
             dense_count,
             wp.zeros((1,), dtype=wp.int32, device=device),
@@ -186,7 +178,8 @@ def _launch_articulation_pair_contact_allocator(
             wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
             wp.zeros((0, 0), dtype=wp.int32, device=device),
         ],
-        device=device,
+        1,
+        device,
     )
     wp.synchronize_device(device)
     slots_needed = max(0, int(contact_slots_needed.numpy()[0]))

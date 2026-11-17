@@ -45,6 +45,7 @@ from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches, Pa
 from newton._src.solvers.feather_pgs.joint_table import JointTable
 from newton._src.solvers.feather_pgs.route_table import Laws
 from newton._src.solvers.feather_pgs.row_records import UNIT_MIMIC, UNIT_SHIFT, DenseRows, MfRows, RowSupport
+from newton._src.solvers.feather_pgs.row_slots import admit_world_contacts, allocate_world_contact_slots
 from newton._src.solvers.feather_pgs.tree_scan import WalkClass
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
@@ -1425,3 +1426,47 @@ def plain_laws(**changes) -> Laws:
         "mimic": False,
     }
     return Laws(**{**laws, **changes})
+
+
+ALLOCATION = (
+    "data",
+    "total_num_threads",
+    "body_to_articulation",
+    "art_to_world",
+    "body_flags",
+    "body_has_response_dofs",
+    "is_free_rigid",
+    "has_free_rigid",
+    "contact_gap_gate",
+    "same_articulation_contact_gap_gate",
+    "articulation_pair_contact_gap_gate",
+    "max_constraints",
+    "mf_max_constraints",
+    "enable_friction",
+    "contact_friction_gap_threshold",
+    "row_capacity_telemetry",
+    "friction_patches",
+    "twists",
+    "acts",
+    "world_slot_counter",
+    "mf_slot_counter",
+    "dense_dropped_contact_rows",
+    "mf_dropped_contact_rows",
+    "dense_first_rejected_slot",
+    "mf_first_rejected_slot",
+    "units",
+)
+"""The row allocation's operands by name (:func:`allocate_contacts`)."""
+
+
+def allocate_contacts(operands, dim: int, device) -> None:
+    """Allocate contact rows as the solver does: each contact admitted and sized
+    (:func:`.row_slots.admit_world_contacts`, a thread a contact), then its rows reserved
+    (:func:`.row_slots.allocate_world_contact_slots`, ``dim`` threads), from ``operands``: a mapping of
+    :data:`ALLOCATION`'s names, or a sequence in its order."""
+    values = operands if isinstance(operands, dict) else dict(zip(ALLOCATION, operands, strict=True))
+    # A thread a contact slot (past the count a thread returns): no read-back, so a graph capture holds it.
+    slots = values["data"].slot.shape[0]
+    for kernel, threads in ((admit_world_contacts, slots), (allocate_world_contact_slots, dim)):
+        args = [values[name] for name in inspect.signature(kernel.func).parameters]
+        wp.launch(kernel, dim=max(threads, 1), inputs=args, device=device)

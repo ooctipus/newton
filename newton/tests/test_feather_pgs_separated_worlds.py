@@ -20,9 +20,8 @@ from newton._src.sim.enums import BodyFlags
 from newton._src.solvers.feather_pgs import field_group
 from newton._src.solvers.feather_pgs.contact_input import ContactInput
 from newton._src.solvers.feather_pgs.friction_patches import patch_routes
-from newton._src.solvers.feather_pgs.row_slots import allocate_world_contact_slots
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
-from newton.tests.feather_pgs_law_harness import anchored_patches, row_lines
+from newton.tests.feather_pgs_law_harness import allocate_contacts, anchored_patches, row_lines
 from newton.tests.feather_pgs_patch_parity import assert_history_close
 from newton.tests.test_feather_pgs_friction_patches import _patch_fixture
 from newton.tests.test_feather_pgs_mixed_tree_free_body import DT, _add_quadruped, _build
@@ -90,12 +89,18 @@ def _contact_acts(
     # no free bodies' run, no gap gates, capacities of eight rows, friction, its gap, no telemetry, the patches, twists.
     inputs = [data, 1, ints([0, 1]), ints([0, 0]), ints(flags), ints([1, 1]), ints([0, 0]), 0, 0.0, 0.0, 0.0, 8, 8, 1]
     outputs = [acts, counter, ints([0]), ints([0]), ints([0]), ints([2**31 - 1]), ints([2**31 - 1])]
-    wp.launch(
-        allocate_world_contact_slots,
-        dim=1,
-        inputs=[*inputs, float("inf"), 0, anchored_patches(1, device), published],
-        outputs=[*outputs, wp.zeros((0, 0), dtype=wp.int32, device=device)],
-        device=device,
+    allocate_contacts(
+        [
+            *inputs,
+            float("inf"),
+            0,
+            anchored_patches(1, device),
+            published,
+            *outputs,
+            wp.zeros((0, 0), dtype=wp.int32, device=device),
+        ],
+        1,
+        device,
     )
     return int(acts.numpy()[0]), int(data.slot.numpy()[0])
 

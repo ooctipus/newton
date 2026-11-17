@@ -138,7 +138,7 @@ def _law_contact_admission(
 
 
 def test_contact_endpoints_match_row_allocation(test, device):
-    """Admit, place and size the contacts ``allocate_world_contact_slots`` admits (gap gate, worlds, responders)."""
+    """Admit, place and size the contacts the row allocation admits (gap gate, worlds, responders)."""
     from newton._src.sim import BodyFlags  # noqa: PLC0415
 
     rng = np.random.default_rng(34)
@@ -166,10 +166,7 @@ def test_contact_endpoints_match_row_allocation(test, device):
         "contact_friction_gap_threshold": 0.05,
     }
     big = 1 << 20
-    out = call(
-        row_slots.allocate_world_contact_slots,
-        contacts,
-        device,
+    values = dict(
         contact_count=np.array([contacts], dtype=np.int32),
         total_num_threads=contacts,
         shape_transform=transforms(rng, 16),
@@ -200,6 +197,8 @@ def test_contact_endpoints_match_row_allocation(test, device):
         capacity_status=np.zeros(4, dtype=np.int32),
         **common,
     )
+    out = call(row_slots.admit_world_contacts, contacts, device, **values)
+    out.update(call(row_slots.allocate_world_contact_slots, contacts, device, **{**values, **out}))
     law = call(
         _law_contact_admission,
         contacts,

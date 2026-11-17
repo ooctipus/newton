@@ -182,13 +182,12 @@ def bind_routes(placement, contacts):
     )
 
 
-def bind(solver, state_in, state_aug, contacts, dt, bias_scale, data=None, records=None):
-    """Bind the solver's live storage into a :data:`ContactInput`, without allocating device memory or reading back.
+def bind(solver, state_in, state_aug, contacts, dt, bias_scale, data=None):
+    """Bind the solver's live storage into a :data:`ContactInput`, without allocating device memory or reading back:
+    the contact records are the frame's copy, in the frame's order (:class:`.friction_patches.ContactRecords`).
 
     Args:
         data: An instance to refill, or ``None`` for a new one.
-        records: The contact records to bind (:class:`.friction_patches.ContactRecords`): the frame's copy in the
-            frame's order (``None``), or the collision's in its written order, which the row allocation visits.
     """
     return field_group.bind(
         ContactInput,
@@ -200,7 +199,7 @@ def bind(solver, state_in, state_aug, contacts, dt, bias_scale, data=None, recor
         laws=solver.laws,
         options=solver.options,
         contacts=contacts,
-        records=solver.laws.friction_patches.records if records is None else records,
+        records=solver.laws.friction_patches.records,
         frame_order=solver.laws.friction_patches,
         model=solver.model,
         state_in=state_in,

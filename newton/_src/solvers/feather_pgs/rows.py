@@ -42,7 +42,7 @@ from .factor.fields import Preelim
 from .field_group import Field, FieldGroup, SolverArrays
 from .forest_plan import ForestPlan, RowLaw
 from .friction_patches import _FrictionPatchState as FrictionPatchState
-from .friction_patches import collision_records, patch_row_law
+from .friction_patches import patch_row_law
 from .joint_table import FreeBodies, bind_free_bodies
 from .joint_table import bind as bind_joint_table
 from .kernel_template import KernelTemplate, items, params
@@ -61,7 +61,12 @@ from .row_kernels import (
 from .row_laws import LINK_ROWS, ROW_LAW
 from .row_records import UNIT_LIMIT, UNIT_MIMIC, UNIT_SHIFT, UNIT_VELOCITY, RowSupport
 from .row_records import bind as bind_dense_rows
-from .row_slots import allocate_world_contact_slots, finalize_constraint_counts_with_status, snapshot_dense_phase_bound
+from .row_slots import (
+    admit_world_contacts,
+    allocate_world_contact_slots,
+    finalize_constraint_counts_with_status,
+    snapshot_dense_phase_bound,
+)
 
 VELOCITY_LIMIT_SLOTS = FieldGroup(
     Field("velocity_limit_slot", wp.int32, ("limit_row",), fill=-1, owner="laws"),
@@ -797,24 +802,16 @@ class RowLaws:
 
             self._build_friction_patches(solver, state_in, contacts)
 
-            # The allocator reads the contacts, the bodies and the row law, and writes the
-            # contacts' allocation records, through one struct (contact_input.ContactInput), bound for this step: it
-            # visits the collision's contacts in their written order and reads their records there.
-            contact_input = bind_contact_input(
-                solver, state_in, state_aug, contacts, dt, 1.0, records=collision_records(contacts)
-            )
-
-            # The route's producer writes every contact row (get_path_selection() records it, routes.contact_rows).
-            # The one writer's contact rows are its own to fill: their unit sources are written where their slots are
-            # reserved.
-            units = solver.placement.unit_source if producer == "walk" else solver.placement.no_units
+            # The allocation reads the contacts, the bodies and the row law, and writes the contacts' allocation
+            # records, through one struct (contact_input.ContactInput) bound to the frame's records: each contact is
+            # admitted and sized in the frame's order, then its rows reserved in the collision's written order.
+            contact_input = bind_contact_input(solver, state_in, state_aug, contacts, dt, 1.0)
             # A contact whose rows may act at the predictor marks its world (Placement.world_acts).
             pool.launch(
-                allocate_world_contact_slots,
-                contact_build_threads,
+                admit_world_contacts,
+                rows,
                 inputs=[
                     contact_input,
-                    contact_build_threads,
                     solver.forest.body_to_articulation,
                     solver.forest.art_to_world,
                     model.body_flags,
@@ -824,16 +821,30 @@ class RowLaws:
                     solver.options.contact_gap_gate,
                     solver.options.same_articulation_contact_gap_gate,
                     solver.options.articulation_pair_contact_gap_gate,
-                    max_constraints,
-                    solver.placement.mf_max_constraints,
                     enable_friction_flag,
                     solver.options.contact_friction_gap_threshold,
-                    1,
                     self.friction_patches.view,
                     solver.placement.acts_twists,
                 ],
+                outputs=[solver.placement.world_acts],
+                extent=count,
+                max_blocks=solver.placement.contact_capacity_blocks,
+            )
+            # The route's producer writes every contact row (get_path_selection() records it, routes.contact_rows).
+            # The one writer's contact rows are its own to fill: their unit sources are written where their slots are
+            # reserved.
+            units = solver.placement.unit_source if producer == "walk" else solver.placement.no_units
+            pool.launch(
+                allocate_world_contact_slots,
+                contact_build_threads,
+                inputs=[
+                    contact_input,
+                    contact_build_threads,
+                    max_constraints,
+                    solver.placement.mf_max_constraints,
+                    1,
+                ],
                 outputs=[
-                    solver.placement.world_acts,
                     solver.placement.slot_counter,
                     mf_slot_counter,
                     dense_dropped_rows,
