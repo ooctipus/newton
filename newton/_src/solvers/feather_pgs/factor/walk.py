@@ -37,6 +37,7 @@ __all__ = [
     "WALK_NOW",
     "WALK_PIVOT",
     "WALK_UNPACKED",
+    "leave_columns",
     "leave_work",
     "walk_down_prelude",
     "walk_leave_kernel",
@@ -758,7 +759,12 @@ def _release_text(rows: int) -> str:
         batch=WALK_SLIP_BATCH,
         slip_on=ts.statements(ts.slip("R", "z[e + r * stride]", "s[r]", "b", "a", "g", "z[e + r * stride] = {};"), 16),
         back="\n".join(
-            substitute(_RELEASE_BACK, name=name, back=back, step=ts.statements(ts.slip(kind, "v", "t", "b", "a", "g", "return {};"), 16))
+            substitute(
+                _RELEASE_BACK,
+                name=name,
+                back=back,
+                step=ts.statements(ts.slip(kind, "v", "t", "b", "a", "g", "return {};"), 16),
+            )
             for name, back, kind in (("WALK_RELEASE_T", "true", "RT"), ("WALK_RELEASE_IT", "false", "RIT"))
         ),
     )
@@ -1089,6 +1095,44 @@ def _walk_down(
         (void)cls;
 {walk}
     }};"""
+
+
+def leave_columns(walk: WalkClass, group: int) -> str:
+    """The leave ``P^T L^-T e_m`` of every unit coordinate ``m`` of a one-body class's tree, ``group`` columns a pass
+    over its coordinates' records: each record read once a pass (``WALK_IN``) and each column's chain stepped by the
+    leave's own step (:func:`.tree_scan.walk_texts`, :data:`.tree_scan.LEAVE`), so column ``m`` is the walk down of
+    ``e_m`` (``WALK_DOWN``), its every value formed by the same expressions. Native statements under
+    :func:`walk_down_prelude`'s words for the class, from the tree's first record ``data``, into ``out.data[m]``
+    (``wp::spatial_matrix``, column ``m``'s coordinates)."""
+    coordinates = walk.first[-1]
+    if len(walk.parent) != 1 or coordinates > 6 or not walk.half or not 0 < group <= coordinates:
+        raise ValueError(
+            "a leave by columns walks one body of at most six coordinates of known halves, a group of them"
+        )
+    step = ts.walk_texts(
+        ts.LEAVE,
+        source="$U",
+        sink="out.data[$m][$c] = q;",
+        value="0.0f",
+        prior="0.0f",
+        coordinate=WALK_COORDINATE,
+        link=WALK_LINK,
+    )["step"]
+    lines = [f"TOUCH(data + {WALK_COORDINATE} * ({c}));" for c in range(coordinates)]
+    for g in range(0, coordinates, group):
+        columns = range(g, min(g + group, coordinates))
+        lines += [f"float walk_v{m}[6] = {{0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f}};" for m in columns]
+        for c in range(coordinates):
+            lines.append(
+                f"const auto walk_x{g}_{c} = WALK_IN(data + {WALK_COORDINATE} * ({c}), 0.0f, 0.0f, {walk.half[c]});"
+            )
+            for m in columns:
+                lines.append(
+                    Template(step).substitute(
+                        U="1.0f" if m == c else "0.0f", X=f"walk_x{g}_{c}", V=f"walk_v{m}", m=m, c=c
+                    )
+                )
+    return "\n".join(lines)
 
 
 @functools.cache

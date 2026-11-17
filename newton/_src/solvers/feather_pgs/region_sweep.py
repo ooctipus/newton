@@ -43,7 +43,7 @@ from .device_preludes import (
     lane_sum,
     lane_sync,
 )
-from .factor.walk import FREE_BODY_WALK, WALK_COORDINATE, WALK_LINK, WalkTrees, walk_down_prelude
+from .factor.walk import FREE_BODY_WALK, WALK_COORDINATE, WalkTrees, leave_columns, walk_down_prelude
 from .friction_patches import PatchRowLaw, patch_friction_location
 from .projection_laws import friction_ball_metric
 from .region_laws import (
@@ -61,6 +61,7 @@ from .row_build import member_contact_row, member_row_law
 from .row_kernels import RIGID_SPEED_ROWS, RowBias, row_bias_words
 from .row_laws import ROW_CONTACT, ROW_TORSION
 from .row_records import DenseRows, row_sides
+from .tree_scan import indent_text
 
 REGION_IDLE = wp.constant(-2)
 """A region's state: it holds nothing."""
@@ -407,28 +408,26 @@ def add_closed_changes(
 # A free body's basis: its twist per unit of walk coordinates
 # ---------------------------------------------------------------------------------------------------------------------
 
-_LEAVE = dual_native(
+LEAVE_GROUP = 3
+"""The columns of a free body's leave (:func:`free_body_leaves`) walked together, a pass over its records each."""
+
+_LEAVES = dual_native(
     f"""
-    const int j0 = walk.joint_start.data[art], d0 = walk.dof_start.data[art];
+    const int d0 = walk.dof_start.data[art];
     const float* data = walk.data.data + (size_t)d0 * {WALK_COORDINATE};
-    const float* link = walk.link.data + (size_t)j0 * {WALK_LINK};
-    float values[6] = {{0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f}};
-    values[coordinate] = 1.0f;
-    WALK_DOWN(0, data, link, [&](const int c) -> float {{ return values[c]; }},
-              [](const int) -> float {{ return 0.0f; }},
-              [&](const int c, const float q, const float) {{ values[c] = q; }}, [](const int, const float*) {{}});
-    wp::spatial_vector left;
-    for (int c = 0; c < 6; ++c) left[c] = values[c];
-    return left;
+    wp::spatial_matrix out;
+{indent_text(leave_columns(FREE_BODY_WALK, LEAVE_GROUP), 4)}
+    return out;
 """,
     preludes=(walk_down_prelude((FREE_BODY_WALK,), ahead=0),),
 )
 
 
-@wp.func_native(_LEAVE)
-def free_body_leave(walk: WalkTrees, art: int, coordinate: int) -> wp.spatial_vector:
-    """The leave of the free body ``art`` (a one-body tree, :data:`.factor.walk.FREE_BODY_WALK`) of the unit walk
-    coordinate ``coordinate``: its six joint velocities, a column of ``P^T L^-T``."""
+@wp.func_native(_LEAVES)
+def free_body_leaves(walk: WalkTrees, art: int) -> wp.spatial_matrix:
+    """The leave of the free body ``art`` (a one-body tree, :data:`.factor.walk.FREE_BODY_WALK`) of each unit walk
+    coordinate ``m``: row ``m`` its six joint velocities, column ``m`` of ``P^T L^-T``. The walk's own steps, the
+    columns :data:`LEAVE_GROUP` a pass over the body's records (:func:`.factor.walk.leave_columns`)."""
     ...
 
 
@@ -455,8 +454,9 @@ def free_body_basis(
     first = dof_start[art]
     T = wp.spatial_matrix()
     predicted = wp.spatial_vector()
+    lefts = free_body_leaves(walk, art)
     for m in range(6):
-        left = free_body_leave(walk, art, m)
+        left = lefts[m]
         column = wp.spatial_vector()
         for k in range(6):
             column += motion[first + k] * left[k]
