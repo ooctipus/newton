@@ -6062,7 +6062,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             ],
             outputs=[
                 self.mjw_data.geom_xpos,
-                self.mjw_data.geom_xmat,
+                self.mjw_data.geom_xquat,
             ],
             device=self.model.device,
         )
@@ -6083,7 +6083,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             ],
             outputs=[
                 self.mjw_data.site_xpos,
-                self.mjw_data.site_xmat,
+                self.mjw_data.site_xquat,
             ],
             device=self.model.device,
         )
@@ -6833,7 +6833,9 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 contact_f.zero_()
             wp.launch(
                 self._convert_mjw_contacts_to_newton_kernel,
-                dim=contacts.rigid_contact_max if preserve_geometry else mj_data.naconmax,
+                dim=min(contacts.rigid_contact_max, self._contact_tid_to_cid.shape[0])
+                if preserve_geometry
+                else mj_data.naconmax,
                 inputs=[
                     self.mjc_geom_to_newton_shape,
                     self.mjw_model.opt.cone,

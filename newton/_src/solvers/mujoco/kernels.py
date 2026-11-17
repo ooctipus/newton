@@ -2616,16 +2616,15 @@ def sync_worldbody_geom_xposes_kernel(
     geom_pos: wp.array2d[wp.vec3],
     geom_quat: wp.array2d[wp.quat],
     geom_xpos: wp.array2d[wp.vec3],
-    geom_xmat: wp.array2d[wp.mat33],
+    geom_xquat: wp.array2d[wp.quat],
 ):
     """Refresh per-world poses for geoms attached directly to the world body."""
     world, geom = wp.tid()
     if geom_bodyid[geom] != 0:
         return
 
-    geom_q = quat_wxyz_to_xyzw(geom_quat[world, geom])
     geom_xpos[world, geom] = geom_pos[world, geom]
-    geom_xmat[world, geom] = wp.quat_to_matrix(geom_q)
+    geom_xquat[world, geom] = geom_quat[world, geom]
 
 
 @wp.kernel
@@ -2636,7 +2635,7 @@ def sync_site_xposes_kernel(
     body_xpos: wp.array2d[wp.vec3],
     body_xquat: wp.array2d[wp.quat],
     site_xpos: wp.array2d[wp.vec3],
-    site_xmat: wp.array2d[wp.mat33],
+    site_xquat: wp.array2d[wp.quat],
 ):
     """Refresh derived site poses after per-world model updates."""
     world, site = wp.tid()
@@ -2644,7 +2643,7 @@ def sync_site_xposes_kernel(
     body_q = quat_wxyz_to_xyzw(body_xquat[world, body])
     site_q = quat_wxyz_to_xyzw(site_quat[world, site])
     site_xpos[world, site] = body_xpos[world, body] + wp.quat_rotate(body_q, site_pos[world, site])
-    site_xmat[world, site] = wp.quat_to_matrix(body_q * site_q)
+    site_xquat[world, site] = quat_xyzw_to_wxyz(body_q * site_q)
 
 
 @wp.kernel

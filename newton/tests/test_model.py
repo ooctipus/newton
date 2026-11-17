@@ -554,6 +554,13 @@ class TestModelMesh(unittest.TestCase):
         shape_source_ptr = model.shape_source_ptr.numpy()
         self.assertEqual(shape_source_ptr[0], shape_source_ptr[1])
 
+        if wp.get_cuda_devices():
+            builder.shape_sdf_max_resolution[:] = [16, 16]
+            model = builder.finalize(device=wp.get_cuda_devices()[0])
+            sdf_indices = model._shape_sdf_index.numpy()
+            self.assertGreaterEqual(sdf_indices[0], 0)
+            self.assertEqual(sdf_indices[0], sdf_indices[1])
+
     def test_finalize_deduplicates_convex_collision_vertices(self):
         """Deduplicate exact convex vertices in the finalized collision mesh."""
         vertices = np.array(
