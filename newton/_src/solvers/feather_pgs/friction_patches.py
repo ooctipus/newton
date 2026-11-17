@@ -836,7 +836,9 @@ def _region_footprint(
     far_y = float(0.0)
     far = float(0.0)
     for _step in range(count + 1):
-        # The next hull vertex: the member every other lies left of (the farther one on a tie).
+        # The next hull vertex: the member every other lies left of (the farther one on a tie). Each point's test is
+        # a select, not a branch: the scan is a chain through the running best, and a branch a point held each step
+        # of it to its reconvergence.
         best_x = float(0.0)
         best_y = float(0.0)
         found = int(0)
@@ -845,12 +847,14 @@ def _region_footprint(
             x = point[0] - x_now
             y = point[1] - y_now
             length = x * x + y * y
-            if length > tolerance:
-                cross = best_x * y - best_y * x
-                if found == 0 or cross < 0.0 or (cross == 0.0 and length > best_x * best_x + best_y * best_y):
-                    best_x = x
-                    best_y = y
-                    found = 1
+            cross = best_x * y - best_y * x
+            best_length = best_x * best_x + best_y * best_y
+            take = int(length > tolerance) * (
+                int(found == 0) | int(cross < 0.0) | (int(cross == 0.0) * int(length > best_length))
+            )
+            best_x = wp.where(take != 0, x, best_x)
+            best_y = wp.where(take != 0, y, best_y)
+            found = wp.where(take != 0, 1, found)
         if found == 0:
             break
         next_x = x_now + best_x
