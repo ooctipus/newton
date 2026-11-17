@@ -640,12 +640,13 @@ def region_visit(
 
 @REGION_LAW.law(dense=("stage",))
 def block_unit(
-    stage: wp.array[float], at: int, yh: wp.spatial_vector, load: float
+    stage: wp.array[float], at: int, yh: wp.spatial_vector, load: float, slid: bool
 ) -> tuple[wp.vec3, wp.spatial_vector, bool]:
     """A group block's member's friction unit (:func:`.region_sweep.stage_blocks`' record at ``at`` of ``stage``: its
     whitened rows, right-hand sides, ``mu``, ``mu_t``, rows, the cone law's block or metric, its friction) at the
     ``load`` its candidates hold, on the group's whitened twist ``yh``: the region law's own cone law. Returns the
-    unit's new friction, its push on ``yh`` and whether it slides (on its cone at a positive load).
+    unit's new friction, its push on ``yh`` and whether this unit or one before it in the visit slid (``slid``: on
+    its cone at a positive load); the cone test is taken only while none has.
 
     Every word of the record is read before the law branches on any (one round of loads a unit)."""
     h0 = wp.spatial_vector(
@@ -698,13 +699,15 @@ def block_unit(
             h0[5] * e0 + h1[5] * e1 + h2[5] * e2,
         ),
     )
-    sx = phi[0] / mu
-    sy = phi[1] / mu
-    sz = float(0.0)
-    if mu_t > 0.0:
-        sz = phi[2] / mu_t
-    slid = load > 0.0 and sx * sx + sy * sy + sz * sz >= load * load * (1.0 - 1.0e-5)
-    return phi, push, slid
+    slides = slid
+    if not slid:
+        sx = phi[0] / mu
+        sy = phi[1] / mu
+        sz = float(0.0)
+        if mu_t > 0.0:
+            sz = phi[2] / mu_t
+        slides = load > 0.0 and sx * sx + sy * sy + sz * sz >= load * load * (1.0 - 1.0e-5)
+    return phi, push, slides
 
 
 @REGION_LAW.law

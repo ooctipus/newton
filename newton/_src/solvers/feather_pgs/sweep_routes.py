@@ -694,14 +694,14 @@ _PAIR_BLOCK = """if ((kind & 16) != 0) {
             const int j = FIRST(bits);
             bits &= bits - 1u;
             const float member_load = team > 1 ? READ(own_load, j) : own_load;
-            const auto unit = RegionLaw::block_unit(blk_stage, blob[0] + 44 * (base + j), yh, member_load);
+            const auto unit = RegionLaw::block_unit(blk_stage, blob[0] + 44 * (base + j), yh, member_load, slid);
             yh = wp::add(yh, unit.v1);
             Jf = wp::add(Jf, unit.v1);
             if (mine == j) {
                 own_phi = unit.v0;
                 own_set = true;
             }
-            if (unit.v2) slid = true;
+            slid = unit.v2;
         }
         if (own_set) {
             const int at = blob[0] + 44 * (base + mine);
