@@ -746,8 +746,7 @@ class Placement:
 
     def allocate_row_records(self, first: int) -> None:
         """Allocate the streamed rows' records (:data:`.row_records.ROW_RECORDS`, :func:`.row_metadata.record_layout`)
-        from the line's row ``first``; their pass stores them in the worlds the general sweep and the unit builder read
-        (:func:`.response_builds_rows.store_row_records`)."""
+        from the line's row ``first``; the rows' writers store them (:func:`.response_builds_rows.write_row_record`)."""
         self.record_first = int(first)
         rows = self.row_pitch - self.record_first
         free_rows = self.mf_max_constraints if self.free_contact_rows else 0

@@ -48,8 +48,6 @@ from .friction_patches import patch_routes
 from .path_selection import json_value, kernel_key
 from .placement import SPARSE_CONTACT_LEVELS
 from .region_sweep import Regions
-from .response_builds_rows import bind_row_records, store_row_records
-from .row_records import bind as bind_dense_rows
 from .solve_policy import QUIET_UNITS, UNIT_ROUNDOFF, SolvePolicy, SolveReadoutRecord
 from .sparse_mass_matrix import _SparseRowSupport, row_supports
 from .sweep import EXACT, FRICTION_METRIC_FLOATS, LevelLaw, SweepConfig, sweep_kernel
@@ -440,10 +438,6 @@ class Sweep:
                 Place.STREAMED if line else Place.SHARED, in_place, Place.GLOBAL if line else Place.SHARED
             )
             parallel_rows = self.classes.tier_rows
-            # The records' pass: a warp of lanes per 256 rows of the line, at most a block, over a wave of the device.
-            self.record_lanes = min(256, 32 * -(-self.placement.row_pitch // 256))
-            threads = max(int(model.device.sm_count), 1) * 512
-            self.record_grid = min(self.forest.world_count, max(threads // self.record_lanes, 1))
             # The warp mapping: the placement's rows, the sparse sweep's rule for the enumeration and units, lanes by the
             # rows' support where the stage a world keeps alone fits a warp's worlds (two warps a block where theirs
             # do), and the places the stage gives the mapping's launch.
@@ -737,29 +731,6 @@ class Sweep:
         """Whether the tiers' rows take the one writer's EMIT sink (:class:`.walk_rows.RowSeeds`): where the writer
         closes no bilateral block, whose closure reads every row's stored ``Z``, and no test pins the store."""
         return not (self.factor.eliminates and self.factor.block_capacity) and self.pins.sink != "store"
-
-    def store_records(self) -> None:
-        """The streamed rows' records of the worlds :meth:`general_claims` lists, once their writers and the patch link
-        left their rows final (:func:`.response_builds_rows.store_row_records`), a lane group a world."""
-        self.join_claims()
-        placement = self.placement
-        wp.launch(
-            store_row_records,
-            dim=(self.record_grid, self.record_lanes),
-            inputs=[
-                self.general_claims(),
-                self.record_grid,
-                self.record_lanes,
-                bind_row_records(placement),
-                bind_dense_rows(placement),
-                placement.row_incident,
-                placement.constraint_count,
-                placement.mf_constraint_count,
-                placement.mf_contact_rows_end,
-                int(self.regions is not None),
-            ],
-            device=self.model.device,
-        )
 
     def schedule_diagonal(self) -> None:
         """Publish the levels of the rows written (after every producer and the records): K2's from its slots, the

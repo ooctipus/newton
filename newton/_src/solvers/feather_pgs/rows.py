@@ -47,6 +47,7 @@ from .joint_table import FreeBodies, bind_free_bodies
 from .joint_table import bind as bind_joint_table
 from .kernel_template import KernelTemplate, items, params
 from .path_selection import json_value, kernel_key
+from .response_builds_rows import bind_row_records
 from .route_table import Laws
 from .row_kernels import (
     LINK_PLAN,
@@ -939,7 +940,8 @@ class RowLaws:
         head = (walk_rows.free_body_sink(solver), bind_dense_rows(placement))
         if solver.sweep.regions is not None:
             threads = walk_rows.support_threads(speed_bodies, model.device, walk_rows.WRITERS["free_body"])
-            writer, inputs = walk_rows.write_free_body_regions, [*head, *tail, threads, self.bias(solver.options, dt)]
+            writer = walk_rows.write_free_body_regions
+            inputs = [*head, *tail, threads, self.bias(solver.options, dt), bind_row_records(placement)]
         else:
             # The free bodies' contacts are theirs only where they keep their own run (Placement.free_contact_rows).
             if _holds_contact_rows(contacts) and placement.free_contact_rows:
@@ -952,6 +954,7 @@ class RowLaws:
             threads = walk_rows.support_threads(rows + speed_bodies, model.device, walk_rows.WRITERS["free_body"])
             writer = walk_rows.write_free_body_rows
             inputs = [*head, data, patch_row_law(solver), *tail, threads, self.bias(solver.options, dt)]
+            inputs.append(bind_row_records(placement))
         wp.launch(
             writer(model.device.arch),
             dim=threads,
@@ -1057,6 +1060,7 @@ class RowLaws:
             int(part),
             self.row_seeds(solver, dt, *law),
             placement.world_acts,
+            bind_row_records(placement),
         ]
         wp.launch(
             walk_rows.writer_kernel(solver, part),

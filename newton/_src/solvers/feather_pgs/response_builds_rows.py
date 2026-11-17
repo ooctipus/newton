@@ -2,16 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """The streamed rows' records (:func:`.row_metadata.pack_row_record`), which the sweeps' row loops load a row ahead:
-one pass stores the records of the worlds the general sweep and the unit builder read, once their rows are final
-(:func:`store_row_records`).
+each row's writer stores its record once the row is final, from the values it wrote (:func:`write_row_record`): the
+general placement's writer a world's dense rows after its last part (:func:`write_world_records`), the free bodies'
+writer each free row after its rhs.
 """
 
 from __future__ import annotations
 
 import warp as wp
 
-from ...core.execution import Buckets
-from .device_preludes import CPU_MATH, CPU_WORDS, dual_native, span_item, span_total
+from .device_preludes import CPU_MATH, CPU_WORDS, dual_native
 from .projection_laws import idle_key, idle_root
 from .row_laws import ROW_CONTACT, ROW_JOINT_LIMIT, ROW_JOINT_VELOCITY_LIMIT, ROW_TORSION
 from .row_metadata import HEADER_WORDS, RECORD_WORDS, pack_row_record
@@ -148,40 +148,16 @@ def write_row_record(records: RowRecords, rows: DenseRows, incident: float, line
     )
 
 
-@wp.kernel(enable_backward=False)
-def store_row_records(
-    worlds: Buckets,
-    grid: int,
-    lanes: int,
-    records: RowRecords,
-    rows: DenseRows,
-    incident: wp.array2d[float],
-    count: wp.array[int],
-    mf_count: wp.array[int],
-    mf_contact_end: wp.array[int],
-    regions: int,
+@wp.func
+def write_world_records(
+    records: RowRecords, rows: DenseRows, incident: wp.array2d[float], line: int, lane: int, lanes: int, count: int
 ):
-    """Store the records of the rows of ``worlds`` (the claims' worlds the general sweep and the unit builder read,
-    :func:`.sweep_levels.claim_worlds`), once their writers and the patch link have left them final: a world's dense
-    rows (``count``) from ``first``, then its free rows (``mf_count``) from ``base``, ``lanes`` lanes a world
-    and ``grid`` worlds at once. Where the free bodies' contacts are regions (``regions``) no sweep reads their
-    rows' records: the free rows' start after their contacts' (``mf_contact_end``), at the speed rows."""
-    item, lane = wp.tid()
-    pitch = rows.rhs.shape[1]
-    # A world's lanes read the list together, a warp's at most (``lanes`` is a multiple of 32 or below it).
-    readers = wp.min(lanes, 32)
-    total = span_total(worlds, readers)
-    while item < total:
-        world = span_item(worlds, item, readers)
-        line = rows.first[world]
-        for slot in range(records.first + lane, wp.min(count[world], records.base), lanes):
-            write_row_record(records, rows, incident[line, slot], line, slot)
-        free_first = records.base + lane
-        if regions != 0:
-            free_first += mf_contact_end[world]
-        for slot in range(free_first, wp.min(records.base + mf_count[world], pitch), lanes):
-            write_row_record(records, rows, incident[line, slot], line, slot)
-        item += grid
+    """Store the records of a world's ``count`` dense rows from ``records.first``, ``lanes`` lanes striding over them
+    (:func:`write_row_record`), once its writer and the closure left them final: the general placement's writer, after
+    the part that writes the world's last rows. A world none of whose rows a sweep reads (no row can act, or a tier
+    walks them) stores none."""
+    for slot in range(records.first + lane, wp.min(count, records.base), lanes):
+        write_row_record(records, rows, incident[line, slot], line, slot)
 
 
 def bind_row_records(placement) -> RowRecords:

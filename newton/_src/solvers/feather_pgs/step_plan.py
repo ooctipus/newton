@@ -544,9 +544,9 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
         (s4, "latch_status", True, (placement, "latch_status", CONTACTS)),
         (s4, "warn_overflow", options.diagnostics.overflow_warning, (placement, "warn_overflow")),
         # The one writer writes its contact rows' records after the row pass, each normal row's ring parent with its
-        # kind; only the free bodies' regions, whose rows their fill writes, are linked here, before their listing
-        # reads the rings. The streamed rows' records follow the rows; the sparse diagonal's schedule reads the rows it
-        # wrote and the marks of their slots.
+        # kind and each row's streamed record once the row is final; only the free bodies' regions, whose rows their
+        # fill writes, are linked here, before their listing reads the rings. The sparse diagonal's schedule reads the
+        # rows the writer wrote and the marks of their slots.
         (s4r, "diagonals", placement.clears_diagonals and topology is None, (placement, "diagonals")),
         (s4r, "write_walked", holds and not beside_rest, *join, (*walk, rest_part)),
         (s4r, "write_walked_beside", beside_rest, (STEP, "beside", topology, *walk, WRITE_REST)),
@@ -555,7 +555,6 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
         (s4r, "join_bases", regions, (bases, "join")),
         (s4r, "list_regions", regions, (sweep, "list_regions", solver, STATE_IN, CONTACTS, DT)),
         (s4r, "join_writer", beside_rest, (topology, "join")),
-        (s4r, "store_records", placement.writes_records, (sweep, "store_records")),
         (s4r, "schedule_diagonal", sweep.sparse_contact_schedule is not None, (sweep, "schedule_diagonal")),
         # Stages 5 and 6: the impulses' start (the warm start's normals, the closures' seeds: the one writer closed the
         # bilateral blocks and corrected the other rows, the blocks' kept rows start at -r_Q, after the warm start's
