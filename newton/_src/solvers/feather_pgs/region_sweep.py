@@ -28,7 +28,7 @@ import warp as wp
 
 from ...core.contact_pool import ContactField
 from ...geometry.flags import ShapeFlags
-from .contact_input import ContactFrame, ContactInput, contact_front_end
+from .contact_input import ContactFrame, ContactInput, contact_frame
 from .device_preludes import (
     dual_native,
     lane_any,
@@ -718,40 +718,6 @@ def place_regions(
         reg_place[g] = wp.vec4i(rows.first[data.world[c]] * pitch + data.slot[c], size, f, c)
 
 
-@wp.struct
-class CandidateRecords:
-    """The listed candidates' collision records, a copy in candidate order (:func:`stage_candidates`): what a
-    contact's front end reads of the collision pipeline's arrays, fixed for the contact frame, which the fill then
-    reads as each region's run (:func:`candidate_frame`)."""
-
-    shape0: wp.array[int]
-    shape1: wp.array[int]
-    point0: wp.array[wp.vec3]
-    point1: wp.array[wp.vec3]
-    normal: wp.array[wp.vec3]
-    margin0: wp.array[float]
-    margin1: wp.array[float]
-
-
-@wp.func
-def candidate_frame(data: ContactInput, law: PatchRowLaw, records: CandidateRecords, at: int, c: int) -> ContactFrame:
-    """The front end of candidate ``at``, contact ``c`` (:func:`.contact_input.contact_frame`), from its record's copy in
-    candidate order."""
-    return contact_front_end(
-        at,
-        records.shape0,
-        records.shape1,
-        records.point0,
-        records.point1,
-        records.normal,
-        records.margin0,
-        records.margin1,
-        data.shape_body,
-        data.body_q,
-        patch_friction_location(law.patches, c),
-    )
-
-
 @wp.kernel(enable_backward=False, module="unique")
 def order_regions(
     relist: wp.array[int],
@@ -804,31 +770,6 @@ def order_regions(
                 if data.slot[c] >= 0 and data.path[c] == data.path[head] and data.world[c] == data.world[head]:
                     break
                 c = law.patches.next_contact[c]
-
-
-@wp.kernel(enable_backward=False, module="unique")
-def stage_candidates(
-    relist: wp.array[int],
-    cursor: wp.array[int],
-    threads: int,
-    data: ContactInput,
-    cand_contact: wp.array[int],
-    records: CandidateRecords,
-):
-    """Where the step lists its regions anew, each listed candidate's collision record copied into candidate order
-    (``records``), ``threads`` lanes striding over the candidates: the frame's later steps read it as their regions'
-    runs (:func:`candidate_frame`)."""
-    if relist[0] == 0 or cursor[3] != 0:
-        return
-    for k in range(wp.tid(), cursor[1], threads):
-        c = cand_contact[k]
-        records.shape0[k] = data.shape0[c]
-        records.shape1[k] = data.shape1[c]
-        records.point0[k] = data.point0[c]
-        records.point1[k] = data.point1[c]
-        records.normal[k] = data.normal[c]
-        records.margin0[k] = data.margin0[c]
-        records.margin1[k] = data.margin1[c]
 
 
 @wp.func
@@ -899,7 +840,6 @@ def fill_region_head(
     mf_max: int,
     pitch: int,
     cand_contact: wp.array[int],
-    records: CandidateRecords,
     art_free: wp.array[int],
     body_twist: wp.array[wp.spatial_vector],
     body_inertia: wp.array2d[wp.mat33],
@@ -961,7 +901,7 @@ def fill_region_head(
     source = r
     if carrier >= 0:
         source = carrier
-    frame = candidate_frame(data, law, records, at, c)
+    frame = contact_frame(data, law, c)
     member_laws(rows, bias, data, law, frame, c)
     n = frame.normal
     t0 = frame.tangent0
@@ -1046,7 +986,6 @@ def fill_region_member(
     law: PatchRowLaw,
     pitch: int,
     cand_contact: wp.array[int],
-    records: CandidateRecords,
     reg_frame: wp.array[wp.mat33],
     reg_wnn: wp.array[wp.mat33],
     cand: wp.array[wp.vec4],
@@ -1066,7 +1005,7 @@ def fill_region_member(
     j = data.slot[cj]
     member_point = point
     if j != source:
-        member = candidate_frame(data, law, records, c0 + k, cj)
+        member = contact_frame(data, law, cj)
         member_laws(rows, bias, data, law, member, cj)
         member_point = member.point
     lever = wp.cross(member_point - friction_point, n)
@@ -1101,7 +1040,6 @@ def fill_regions(
     mf_max: int,
     pitch: int,
     cand_contact: wp.array[int],
-    records: CandidateRecords,
     art_free: wp.array[int],
     body_twist: wp.array[wp.spatial_vector],
     body_inertia: wp.array2d[wp.mat33],
@@ -1171,7 +1109,7 @@ def fill_regions(
         if holds:
             kind, c0, size, line, source, c, sn, point = fill_region_head(
                 g, rows, bias, data, law, mf_constraint_count, mf_contact_rows_end, dense_max, mf_max, pitch,
-                cand_contact, records, art_free, body_twist, body_inertia, cfm, reg_head, reg_cand, reg_frame, reg_arm,
+                cand_contact, art_free, body_twist, body_inertia, cfm, reg_head, reg_cand, reg_frame, reg_arm,
                 reg_arm_b,
                 reg_body, reg_law, reg_bf, reg_kind, reg_row, reg_wnn, reg_wnf, reg_wff, reg_ball_values,
                 reg_ball_vectors, reg_ginv, reg_k, reg_lk, reg_lw, reg_wrench, reg_phi, reg_set, reg_spring, reg_state,
@@ -1210,7 +1148,7 @@ def fill_regions(
             if q < total:
                 springs = fill_region_member(
                     owner_g, q - owner_first, owner_c0, owner_line, owner_source, owner_c, owner_sn, owner_point,
-                    rows, bias, data, law, pitch, cand_contact, records, reg_frame, reg_wnn, cand, cand_row,
+                    rows, bias, data, law, pitch, cand_contact, reg_frame, reg_wnn, cand, cand_row,
                 )  # fmt: skip
             spring_bits = wp.uint64(lane_ballot(springs, _FILL_LANES))
             # This lane's region's candidates in this round are lanes [lo, hi).
@@ -1704,13 +1642,6 @@ _REGION_FIELDS = (
     ("cand", wp.vec4, 1),
     ("cand_row", wp.int32, 1),
     ("cand_contact", wp.int32, 1),
-    ("cand_shape0", wp.int32, 1),
-    ("cand_shape1", wp.int32, 1),
-    ("cand_point0", wp.vec3, 1),
-    ("cand_point1", wp.vec3, 1),
-    ("cand_normal", wp.vec3, 1),
-    ("cand_margin0", wp.float32, 1),
-    ("cand_margin1", wp.float32, 1),
     ("reg_wrench", wp.vec3, 1),
     ("reg_phi", wp.vec3, 1),
     ("reg_set", wp.vec3i, 1),
@@ -1818,9 +1749,6 @@ class Regions:
         """Take the stream's arrays at the contact pool's ready rows, on creation and after each growth: the next step
         lists its regions anew."""
         rows.publish(self)
-        self.records = CandidateRecords()
-        for name in CandidateRecords.vars:
-            setattr(self.records, name, getattr(self, f"cand_{name}"))
         self.relist.zero_()
         self.capacity = int(rows.rows)
         if self.placement.contact_pool.ready_rows is None:
@@ -1963,13 +1891,6 @@ class Regions:
             **live,
         )
         pool.launch(
-            stage_candidates,
-            threads,
-            inputs=[self.relist, self.cursor, threads, data, self.cand_contact],
-            outputs=[self.records],
-            **live,
-        )
-        pool.launch(
             fill_regions,
             threads,
             inputs=[
@@ -1983,7 +1904,6 @@ class Regions:
                 mf_max,
                 pitch,
                 self.cand_contact,
-                self.records,
                 self.art_free,
                 self.body_twist,
                 self.body_inertia,
