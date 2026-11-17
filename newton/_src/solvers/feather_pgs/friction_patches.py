@@ -275,6 +275,22 @@ class _PatchFrame:
 
 
 @wp.func
+def _listed_region(regions: wp.array[int], live: int, region: int):
+    """The listed position of a held frame's ``region``-th region: those of several contacts first (listed from the
+    list's back below the live count), then those of one contact (from its front), each part in the frame's order.
+
+    A region of several contacts holds its thread through member loops, a footprint's hull and a longer ring; one of
+    a single contact does not. Visited first, the long ones start in the launch's first wave and the short ones fill
+    the SMs behind them, while a warp's 32 regions still lie together in the frame's order: a carry or finish that
+    sorted the regions by size would read every member from a line of its own (35% slower on NIST)."""
+    several = regions[1]
+    listed = live - 1 - region
+    if region >= several:
+        listed = region - several
+    return listed
+
+
+@wp.func
 def _region_starts(frame: _PatchFrame, j: int, live: int):
     """Whether a region of one contact and whether one of several starts at live position ``j`` (its build marks
     each region where its members start: ``region_stop``)."""
@@ -1715,8 +1731,8 @@ def _build(
 ):
     """Build the frame's regions: carry those of a held frame, make any other frame's.
 
-    A held frame's build strides over the regions its first build listed, those of one contact first, one thread a
-    region; regions write disjoint current/previous records.
+    A held frame's build strides over the regions its first build listed, those of several contacts first
+    (:func:`_listed_region`), one thread a region; regions write disjoint current/previous records.
 
     Any other build strides over the live sorted positions and builds the body pair whose run starts at each; body
     pairs write disjoint current/previous records. A thread seeks its next pair before it builds it, so the
@@ -1748,12 +1764,17 @@ def _build(
         fresh[0] = 0
     carry = extent[_CARRY_EXTENT]
     if carry > 0:
-        single = regions[0]
         for region in range(thread, carry, threads):
-            listed = region
-            if region >= single:
-                listed = live - 1 - (region - single)
-            _carry_region(frame.regions[listed], q, previous_q, shape_transform, shape_radius, frame, prev, patches)
+            _carry_region(
+                frame.regions[_listed_region(regions, live, region)],
+                q,
+                previous_q,
+                shape_transform,
+                shape_radius,
+                frame,
+                prev,
+                patches,
+            )
         return
     if thread == 0:
         built[0] = live
@@ -2828,12 +2849,8 @@ def _finish_regions(
     if routes.enabled[0] + routes.enabled[1] + routes.enabled[2] == 0:
         return
     live = extent[1]
-    single = regions[0]
-    for region in range(wp.tid(), single + regions[1], threads):
-        listed = region
-        if region >= single:
-            listed = live - 1 - (region - single)
-        c = frame.carrier[frame.regions[listed]]
+    for region in range(wp.tid(), regions[0] + regions[1], threads):
+        c = frame.carrier[frame.regions[_listed_region(regions, live, region)]]
         if frame.valid[c] != 0:
             route = _contact_route(routes, slot, path, c)
             if route >= 0 and routes.acts.shape[0] > 0 and routes.acts[world[c]] == 0:
