@@ -311,13 +311,15 @@ class _PatchContacts:
 
 @wp.func
 def _prepare_contact_fields(
-    c: int, live: int, held: int, inputs: _PatchContacts, frame: _PatchFrame, patches: FrictionPatches
+    c: int, live: int, kept: int, held: int, inputs: _PatchContacts, frame: _PatchFrame, patches: FrictionPatches
 ):
     """Prepare contact ``c``'s frame record, all but slot ``c``'s pair key and index; return the pair key.
 
     Past ``live`` the record is empty and the key the empty key. A build stores the key and the index in
     slot ``c``; a build that reuses sorted pairs can leave the slots' keys and indices untouched. A ``held`` frame's
-    live contacts keep the region that owns them and their link in its ring: the frame's regions are made once.
+    live contacts keep the region that owns them and their link in its ring: the frame's regions are made once. A
+    ``kept`` frame's live contacts keep what their shapes alone decide, which an earlier prepare of the frame wrote:
+    their bodies and shapes in pair order, the flip, the friction coefficients, the radius and the support gap limit.
     """
     if held == 0 or c >= live:
         frame.owner[c] = -1
@@ -354,11 +356,6 @@ def _prepare_contact_fields(
         art_b = inputs.body_to_articulation[b]
     a_non_free = art_a >= 0 and inputs.is_free_rigid[art_a] == 0
     b_non_free = art_b >= 0 and inputs.is_free_rigid[art_b] == 0
-    support_gap_limit = float(0.0)
-    if sa >= 0:
-        support_gap_limit += inputs.shape_gap[sa]
-    if sb >= 0:
-        support_gap_limit += inputs.shape_gap[sb]
     normal_gap_limit = contact_normal_gap_limit(
         a_non_free,
         b_non_free,
@@ -367,11 +364,17 @@ def _prepare_contact_fields(
         inputs.articulation_pair_gap_gate,
         inputs.same_articulation_gap_gate,
     )
-    support_gap_limit = wp.min(support_gap_limit, normal_gap_limit)
     eligible = gap <= normal_gap_limit and gap <= inputs.friction_gap
     # Friction-only filters suppress rows without ending contact support;
     # filtered regions must still be able to carry their anchor history.
-    frame.support_gap_limit[c] = wp.max(support_gap_limit, 0.0)
+    if kept == 0:
+        support_gap_limit = float(0.0)
+        if sa >= 0:
+            support_gap_limit += inputs.shape_gap[sa]
+        if sb >= 0:
+            support_gap_limit += inputs.shape_gap[sb]
+        support_gap_limit = wp.min(support_gap_limit, normal_gap_limit)
+        frame.support_gap_limit[c] = wp.max(support_gap_limit, 0.0)
     frame.eligible[c] = int(eligible)
     flip = int(ka > kb)
     if flip != 0:
@@ -385,28 +388,29 @@ def _prepare_contact_fields(
         sa = sb
         sb = t
         n = -n
-    frame.body_a[c] = a
-    frame.body_b[c] = b
-    frame.shape_a[c] = sa
-    frame.shape_b[c] = sb
-    frame.flipped[c] = flip
     frame.surface_a[c] = surface_b if flip != 0 else surface_a
     frame.surface_b[c] = surface_a if flip != 0 else surface_b
     frame.center[c] = contact_point(translation_a, offset_a, separation)
     frame.normal[c] = n
-    mu_a = float(0.0)
-    mu_b = float(0.0)
-    if sa >= 0:
-        mu_a = inputs.shape_mu[sa]
-    if sb >= 0:
-        mu_b = inputs.shape_mu[sb]
-    frame.mu[c] = wp.vec2(mu_a, mu_b)
-    r = float(1.0e10)
-    if a >= 0:
-        r = wp.min(r, inputs.body_radius[a])
-    if b >= 0:
-        r = wp.min(r, inputs.body_radius[b])
-    frame.radius[c] = wp.max(r, 1.0e-4)
+    if kept == 0:
+        frame.body_a[c] = a
+        frame.body_b[c] = b
+        frame.shape_a[c] = sa
+        frame.shape_b[c] = sb
+        frame.flipped[c] = flip
+        mu_a = float(0.0)
+        mu_b = float(0.0)
+        if sa >= 0:
+            mu_a = inputs.shape_mu[sa]
+        if sb >= 0:
+            mu_b = inputs.shape_mu[sb]
+        frame.mu[c] = wp.vec2(mu_a, mu_b)
+        r = float(1.0e10)
+        if a >= 0:
+            r = wp.min(r, inputs.body_radius[a])
+        if b >= 0:
+            r = wp.min(r, inputs.body_radius[b])
+        frame.radius[c] = wp.max(r, 1.0e-4)
     # ka and kb are below key_stride, so the key orders pairs as (ka, kb) does
     # and occupies only the low bits that build() sorts.
     return wp.int64(ka) * wp.int64(inputs.key_stride) + wp.int64(kb)
@@ -482,7 +486,7 @@ def _prepare(
             regions[0] = 0
             regions[1] = 0
     for c in range(thread, end, threads):
-        key = _prepare_contact_fields(c, live, held, inputs, frame, patches)
+        key = _prepare_contact_fields(c, live, kept, held, inputs, frame, patches)
         # A kept slot holds the sorted pair at position c, not contact c's key.
         if kept == 0 or c >= live:
             frame.indices[c] = c
