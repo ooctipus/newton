@@ -757,14 +757,14 @@ def idle_reach(name: str, velocity: Velocity, count: str, lanes: Lanes, pad: str
 
 def idle_growth(ctx: RowContext, changes: tuple[tuple[str, str], ...]) -> str:
     """Grow the live order's bound by an apply of ``changes`` (``(row, delta)``; a row named ``"sib"`` exists where
-    ``sib >= 0``): each row moves the velocity by at most ``|delta| sqrt(A_ii)`` (``A_ii = |Z|^2 + cfm``), the apply's
-    rounding inside the margin."""
+    ``sib >= 0``): each row moves the velocity by at most ``|delta| sqrt(A_ii)`` (``A_ii = |Z|^2 + cfm``; the root's
+    bound :func:`.projection_laws.idle_root`), the apply's rounding inside the margin."""
     if ctx.reach is None:
         return ""
     terms = []
     for row, delta in changes:
         name = ctx.row if row == "row" else row
-        term = f"fabsf({delta}) * sqrtf({ctx.diagonal.value(name)})"
+        term = f"fabsf({delta}) * IdleLaw::idle_root({ctx.diagonal.value(name)})"
         terms.append(f"(sib >= 0 ? {term} : 0.0f)" if row == "sib" else term)
     return f"{ctx.reach} = ({ctx.reach} + {' + '.join(terms)}) * {IDLE_MARGIN};"
 

@@ -97,6 +97,14 @@ def idle_key(rhs: float, diagonal: float) -> float:
     return rhs / wp.sqrt(diagonal) * 0.9999847412109375
 
 
+@IDLE_LAW.law(native=("return diagonal * rsqrtf(diagonal) * 1.0000152587890625f;",))
+def idle_root(diagonal: float) -> float:
+    """A bound of ``sqrt(A_ii)``, the most a unit change of a row moves the velocity (``A_ii = |Z|^2 + cfm``): times
+    ``1 + 2^-16``, far beyond the rounding of the CUDA form's approximate reciprocal square root (2 ulp) and of the
+    CPU's root. The CUDA form of a zero diagonal is NaN, which leaves the bound NaN: the loop passes no row after it."""
+    return wp.sqrt(diagonal) * 1.0000152587890625
+
+
 @PROJECTION_LAW.law
 def relaxed_step(old: float, delta: float, omega: float) -> float:
     """Return a row's relaxed update, ``old + omega delta``, for its step ``delta`` (``-r / d``, or regularized)."""
