@@ -399,11 +399,12 @@ def walked_rows_kernel(
        blocks (:func:`.factor.closure.close_block`; its rows are the links', and the mimics' with
        ``mimic_blocks``), then correct every other row on the blocks its sides touch
        (:func:`.factor.closure.close_row`);
-    3. *records*: the lanes store every streamed row's record (:func:`.response_builds_rows.write_world_records`)
-       from what the world's rows hold, each normal's ring parent included (formed with its kind).
+    3. *records*: each streamed row's record (:func:`.response_builds_rows.write_row_record`) where the row is final,
+       each normal's ring parent included (formed with its kind): by its lane after its rhs, or, where the closure
+       follows, by the world's lanes after it (:func:`.response_builds_rows.write_world_records`).
 
     The closure's seed stays a launch after the warm start's gather (:meth:`.tree_factor.TreeFactor.seed_blocks`). The
-    closure and the records run in the launch that writes the world's last rows.
+    closure runs in the launch that writes the world's last rows.
 
     ``part`` (:data:`WRITE_ROWS`, :data:`WRITE_TOPOLOGY`, :data:`WRITE_REST`): the rows a world's topology fixes (its
     links, mimics, limits and velocity limits, the slots below its family bound ``bounds[world, 1]``,
@@ -496,7 +497,10 @@ def walked_rows_kernel(
                 rows_here = wp.min(end - start, wp.static(block))
                 walk_block(sink, line, start, rows_here, arts, dof0, value0, dof1, value1)
                 for slot in range(start, start + rows_here):
-                    row_bias(rows, bias, line, slot, sink.row_incident[line, slot])
+                    incident = sink.row_incident[line, slot]
+                    row_bias(rows, bias, line, slot, incident)
+                    if wp.static(not has_blocks):
+                        write_row_record(records, rows, incident, line, slot)
             return
         # The sink, by the reading tier (emits): STORE walks the row here; EMIT leaves its law to the tier's prologue
         # (emit_rows), and writes here a contact row's kind, which the patch link and the warm start read before it.
@@ -517,6 +521,9 @@ def walked_rows_kernel(
                 if source >> UNIT_SHIFT == UNIT_SPEED:
                     incident = speed_axis(sink, line, slot, unit.art_a, unit.dof0)
                 row_bias(rows, bias, line, slot, incident)
+                # A row no closure follows is final here: its lane stores its record.
+                if wp.static(not has_blocks):
+                    write_row_record(records, rows, incident, line, slot)
         if wp.static(has_blocks):
             # The closure reads every row of the world: the launch that writes the last of them closes.
             if part != WRITE_TOPOLOGY:
@@ -533,11 +540,10 @@ def walked_rows_kernel(
                             line, slot, rows.sides[line, slot], wp.static(capacity), preelim, rows.cfm, sink.entries,
                             rows.rhs, rows.diag,
                         )  # fmt: skip
-        # The launch that writes the world's last rows (and closes) stores every row's record from what the world's
-        # lanes left, each normal's ring parent included.
-        if part != WRITE_TOPOLOGY:
-            world_sync(lanes)
-            write_world_records(records, rows, sink.row_incident, line, lane, lanes, counts[world])
+                # The closure changes the rows its blocks touch: every row's record after it, from what the world's
+                # lanes left, each normal's ring parent included.
+                world_sync(lanes)
+                write_world_records(records, rows, sink.row_incident, line, lane, lanes, counts[world])
 
     name = "write_walked_rows" + (f"_blocks{blocks}" if has_blocks else "")
     name += "_mimics" if mimic_blocks else ""
