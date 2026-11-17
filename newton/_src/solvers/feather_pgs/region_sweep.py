@@ -33,6 +33,9 @@ from .device_preludes import (
     dual_native,
     lane_any,
     lane_ballot,
+    lane_below,
+    lane_count,
+    lane_first,
     lane_index,
     lane_read,
     lane_scan,
@@ -70,6 +73,12 @@ FRICTION_ROWS = wp.constant(3)
 KIND_SPRINGS = wp.constant(4)
 # The lanes that share a warp's regions' candidates in the fill (fill_regions).
 _FILL_LANES = wp.constant(32)
+# The lanes that list a world's blocks and levels together (form_blocks, level_regions): a world's serial passes over
+# its regions taken a stride at a time.
+_WORLD_LANES = wp.constant(32)
+# Their block: two worlds' lane groups, so a frame's worlds spread over every multiprocessor (a thread a world filled 32
+# blocks of 256).
+_WORLD_BLOCK = 64
 """The bit of a region's kind that says a candidate of it is compliant."""
 KIND_SECOND = wp.constant(8)
 """The bit of a region's kind that says its listed body is the pair's second (its twist enters with a minus)."""
@@ -1180,6 +1189,17 @@ def fill_regions(
         g += threads
 
 
+@wp.func
+def _pair_cell(reg_body: wp.array[wp.vec2i], body_level: wp.array[int], g: int, side: int) -> int:
+    """Region ``g``'s cell in its world's pair table: its bodies' places (``body_level`` holds them), least first."""
+    sides = reg_body[g]
+    la = body_level[sides[0]]
+    lb = la
+    if sides[1] >= 0:
+        lb = body_level[sides[1]]
+    return wp.min(la, lb) * side + wp.max(la, lb)
+
+
 @wp.kernel(enable_backward=False, module="unique")
 def form_blocks(
     relist: wp.array[int],
@@ -1204,15 +1224,24 @@ def form_blocks(
     """A world's groups (a pair of movable bodies, or a body against immovable partners) with more than ``least``
     regions closing at the predictor (a candidate's gap term below ``-tol``; ``least`` the group's six relative
     coordinates: its rows then over-determine them), every candidate compliant, as blocks (the
-    largest first, :data:`PAIR_BLOCKS` at most), a thread a world: the pair's first region in the stream stands for
-    the block (:data:`KIND_BLOCK`), the others are its members (:data:`KIND_MEMBER`); its pair ``(a, b)``
-    (:func:`factor_blocks` forms its response each step). The blocks are the contact frame's: they are formed where
-    the step lists its regions anew, at that step's predictor. ``blk_count`` counts a world's pairs by its bodies' places (``body_level`` holds them here), a
-    side of the world's free bodies; a world of more than 16 free bodies lists no block."""
+    largest first, :data:`PAIR_BLOCKS` at most), a world a lane group (:data:`_WORLD_LANES`): the pair's first region
+    in the stream stands for the block (:data:`KIND_BLOCK`), the others are its members (:data:`KIND_MEMBER`); its
+    pair ``(a, b)`` (:func:`factor_blocks` forms its response each step). The blocks are the contact frame's: they are
+    formed where the step lists its regions anew, at that step's predictor. ``blk_count`` counts a world's pairs by its
+    bodies' places (``body_level`` holds them here), a side of the world's free bodies; a world of more than 16 free
+    bodies lists no block.
+
+    The lanes take the world's regions a stride at a time: their counts add up in any order (integers), the largest
+    count is the lanes' greatest (its first cell on a tie, as a scan in cell order finds it), and a block's regions
+    take their places in the stream's order (the lanes' votes rank them)."""
     if relist[0] == 0:
         return
-    world = wp.tid()
-    for k in range(PAIR_BLOCKS):
+    lanes = lane_stride(_WORLD_LANES)
+    lane = lane_index(_WORLD_LANES)
+    world = wp.tid() // lanes
+    if world >= world_regions.shape[0]:
+        return
+    for k in range(lane, PAIR_BLOCKS, lanes):
         blk_pair[world * PAIR_BLOCKS + k] = wp.vec2i(-1, -1)
     span = world_regions[world]
     s = span[0]
@@ -1223,18 +1252,13 @@ def form_blocks(
     side = world_free_start[world + 1] - f0
     if e - s <= least or side > 16:
         return
-    for i in range(f0, world_free_start[world + 1]):
+    for i in range(f0 + lane, world_free_start[world + 1], lanes):
         body_level[world_free[i]] = i - f0
-    for c in range(side * side):
+    for c in range(lane, side * side, lanes):
         blk_count[world, c] = 0
+    lane_sync(_WORLD_LANES)
     rigid = int(1 << 20)
-    for g in range(s, e):
-        sides = reg_body[g]
-        la = body_level[sides[0]]
-        lb = la
-        if sides[1] >= 0:
-            lb = body_level[sides[1]]
-        cell = wp.min(la, lb) * side + wp.max(la, lb)
+    for g in range(s + lane, e, lanes):
         # A region counts where a candidate of it closes at the predictor (its gap term).
         add = int(0)
         span_c = reg_cand[g]
@@ -1243,66 +1267,86 @@ def form_blocks(
                 add = 1
         if (reg_kind[g] & KIND_SPRINGS) == 0:
             add = rigid
-        blk_count[world, cell] = blk_count[world, cell] + add
+        wp.atomic_add(blk_count, world, _pair_cell(reg_body, body_level, g, side), add)
+    lane_sync(_WORLD_LANES)
     for k in range(PAIR_BLOCKS):
         best = int(least)
         best_cell = int(-1)
-        for c in range(side * side):
+        for c in range(lane, side * side, lanes):
             count = blk_count[world, c]
             if count < rigid and count > best:
                 best = count
                 best_cell = c
+        for step in range(5):
+            other = lane_read(best, lane ^ (1 << step), _WORLD_LANES)
+            other_cell = lane_read(best_cell, lane ^ (1 << step), _WORLD_LANES)
+            if other_cell >= 0 and (best_cell < 0 or other > best or (other == best and other_cell < best_cell)):
+                best = other
+                best_cell = other_cell
         if best_cell < 0:
             break
-        blk_count[world, best_cell] = 0
+        lane_sync(_WORLD_LANES)
+        if lane == 0:
+            blk_count[world, best_cell] = 0
         # Its staged records' words, taken from the arena.
-        words = int(0)
         regions = int(0)
         candidates = int(0)
-        for g in range(s, e):
-            sides = reg_body[g]
-            la = body_level[sides[0]]
-            lb = la
-            if sides[1] >= 0:
-                lb = body_level[sides[1]]
-            if wp.min(la, lb) * side + wp.max(la, lb) == best_cell:
+        for g in range(s + lane, e, lanes):
+            if _pair_cell(reg_body, body_level, g, side) == best_cell:
                 span_c = reg_cand[g]
                 regions += 1
                 candidates += span_c[1] - span_c[0]
+        regions = lane_sum(regions, _WORLD_LANES)
+        candidates = lane_sum(candidates, _WORLD_LANES)
         words = STAGE_UNIT * regions + STAGE_CAND * candidates
-        at = wp.atomic_add(blk_cursor, 0, words)
+        at = int(0)
+        if lane == 0:
+            at = wp.atomic_add(blk_cursor, 0, words)
+        at = lane_read(at, 0, _WORLD_LANES)
         if at + words > capacity:
-            blk_cursor[1] = 1
+            if lane == 0:
+                blk_cursor[1] = 1
             break
         best_g = int(-1)
         members = int(0)
         first_cand = int(0)
-        for g in range(s, e):
-            sides = reg_body[g]
-            la = body_level[sides[0]]
-            lb = la
-            if sides[1] >= 0:
-                lb = body_level[sides[1]]
-            if wp.min(la, lb) * side + wp.max(la, lb) == best_cell:
-                reg_stage[g] = wp.vec3i(at + STAGE_UNIT * members, world * PAIR_BLOCKS + k, first_cand)
-                members += 1
-                span_m = reg_cand[g]
-                first_cand += span_m[1] - span_m[0]
-                if best_g < 0:
-                    best_g = g
+        for base in range(s, e, lanes):
+            g = base + lane
+            mine = bool(False)
+            size = int(0)
+            if g < e:
+                if _pair_cell(reg_body, body_level, g, side) == best_cell:
+                    mine = True
+                    span_m = reg_cand[g]
+                    size = span_m[1] - span_m[0]
+            votes = lane_ballot(mine, _WORLD_LANES)
+            before = lane_scan(size, _WORLD_LANES)
+            if mine:
+                reg_stage[g] = wp.vec3i(
+                    at + STAGE_UNIT * (members + lane_below(votes, _WORLD_LANES)),
+                    world * PAIR_BLOCKS + k,
+                    first_cand + before,
+                )
+                if best_g < 0 and lane == lane_first(votes, _WORLD_LANES):
                     reg_kind[g] = reg_kind[g] | KIND_BLOCK | (k << BLOCK_SHIFT)
                 else:
                     reg_kind[g] = reg_kind[g] | KIND_MEMBER | (k << BLOCK_SHIFT)
-        blk_blob[world * PAIR_BLOCKS + k] = wp.vec4i(at, members, at + STAGE_UNIT * members, first_cand)
-        blk_head[world * PAIR_BLOCKS + k] = best_g
-        sides = reg_body[best_g]
-        # A body against immovable partners is the pair (a, -1).
-        a = sides[0]
-        b = sides[1]
-        if b >= 0:
-            a = wp.min(sides[0], sides[1])
-            b = wp.max(sides[0], sides[1])
-        blk_pair[world * PAIR_BLOCKS + k] = wp.vec2i(a, b)
+            if best_g < 0 and votes != wp.uint32(0):
+                best_g = base + lane_first(votes, _WORLD_LANES)
+            members += lane_count(votes, _WORLD_LANES)
+            first_cand += lane_sum(size, _WORLD_LANES)
+        if lane == 0:
+            blk_blob[world * PAIR_BLOCKS + k] = wp.vec4i(at, members, at + STAGE_UNIT * members, first_cand)
+            blk_head[world * PAIR_BLOCKS + k] = best_g
+            sides = reg_body[best_g]
+            # A body against immovable partners is the pair (a, -1).
+            a = sides[0]
+            b = sides[1]
+            if b >= 0:
+                a = wp.min(sides[0], sides[1])
+                b = wp.max(sides[0], sides[1])
+            blk_pair[world * PAIR_BLOCKS + k] = wp.vec2i(a, b)
+        lane_sync(_WORLD_LANES)
 
 
 @wp.kernel(enable_backward=False, module="unique")
@@ -1479,6 +1523,40 @@ def stage_blocks(
             at += STAGE_CAND
 
 
+@wp.func
+def _level_starts(level_end: wp.array[int], s: int, count: int, lane: int, lanes: int):
+    """Turn the counts ``level_end[s : s + count]`` into their starts from ``s``, a lane group's prefix."""
+    at = s
+    for base in range(0, count, lanes):
+        k = base + lane
+        n = int(0)
+        if k < count:
+            n = level_end[s + k]
+        start = at + lane_scan(n, _WORLD_LANES)
+        if k < count:
+            level_end[s + k] = start
+        at += lane_sum(n, _WORLD_LANES)
+    lane_sync(_WORLD_LANES)
+
+
+@wp.func
+def _place_by_key(level_end: wp.array[int], s: int, key: int, item: int, places: wp.array[int], lane: int):
+    """A lane group's chunk of items in order, each with its ``key`` (-1: none), placed at its key's next places in
+    lane order (``level_end[s + key]`` advances): a stable counting sort's chunk."""
+    pending = lane_ballot(key >= 0, _WORLD_LANES)
+    while pending != wp.uint32(0):
+        leader = lane_read(key, lane_first(pending, _WORLD_LANES), _WORLD_LANES)
+        peers = lane_ballot(key == leader, _WORLD_LANES)
+        first = level_end[s + leader]
+        if key == leader:
+            places[first + lane_below(peers, _WORLD_LANES)] = item
+        lane_sync(_WORLD_LANES)
+        if lane == lane_first(peers, _WORLD_LANES):
+            level_end[s + leader] = first + lane_count(peers, _WORLD_LANES)
+        lane_sync(_WORLD_LANES)
+        pending = pending & ~peers
+
+
 @wp.kernel(enable_backward=False, module="unique")
 def level_regions(
     relist: wp.array[int],
@@ -1497,7 +1575,7 @@ def level_regions(
     blk_members: wp.array[wp.vec2i],
 ):
     """A world's open regions in their order from the free end down (the contact graph's), by the exact levels of
-    that order, a thread a world.
+    that order, a world a lane group (:data:`_WORLD_LANES`).
 
     The order: a body's depth is its distance on the contact graph from the immovable partners (one for a body
     with a region against one, one more for each region between two movable bodies on the way), a region's the
@@ -1511,120 +1589,152 @@ def level_regions(
     (``level_region``) and, at ``s + L``, the end of level ``L`` (``level_end``); ``world_levels`` the count.
 
     The levels are the contact frame's: they are made where the step lists its regions anew, whose listing then
-    stands for the frame's later steps if it fit (``relist[1]``)."""
+    stands for the frame's later steps if it fit (``relist[1]``).
+
+    The lanes take the world's regions a stride at a time: the depths are the relaxation's fixpoint (each body's
+    distance on the contact graph, whatever order relaxes it), the counting sorts keep the stream's order (a chunk's
+    lanes of one key take their places in lane order) and the levels of the order are one lane's pass, as the
+    sequential sweep is.
+    """
     if relist[0] == 0:
         return
-    world = wp.tid()
-    if world == 0:
+    lanes = lane_stride(_WORLD_LANES)
+    lane = lane_index(_WORLD_LANES)
+    world = wp.tid() // lanes
+    if world >= world_regions.shape[0]:
+        return
+    if world == 0 and lane == 0:
         relist[1] = int(cursor[3] == 0)
     span = world_regions[world]
     s = span[0]
     e = span[1]
-    for k in range(PAIR_BLOCKS):
+    for k in range(lane, PAIR_BLOCKS, lanes):
         blk_members[world * PAIR_BLOCKS + k] = wp.vec2i(0, 0)
     if e <= s:
-        world_levels[world] = 0
+        if lane == 0:
+            world_levels[world] = 0
         return
     far = int(1 << 29)
+    f0 = world_free_start[world]
+    f1 = world_free_start[world + 1]
     # A block's members (form_blocks) leave the order: the region that stands for the block takes their place.
-    # The depths: relaxed over the regions until they stand (each pass takes them in the stream's order).
-    for i in range(world_free_start[world], world_free_start[world + 1]):
+    # The depths: relaxed over the regions until they stand.
+    for i in range(f0 + lane, f1, lanes):
         body_level[world_free[i]] = far
-    for g in range(s, e):
+    lane_sync(_WORLD_LANES)
+    for g in range(s + lane, e, lanes):
         sides = reg_body[g]
         if sides[1] < 0 and (reg_kind[g] & KIND_MEMBER) == 0:
             body_level[sides[0]] = 1
-    changed = int(1)
-    while changed != 0:
-        changed = int(0)
-        for g in range(s, e):
+    lane_sync(_WORLD_LANES)
+    changed = bool(True)
+    while changed:
+        lowered = bool(False)
+        for g in range(s + lane, e, lanes):
             sides = reg_body[g]
             if sides[1] >= 0 and (reg_kind[g] & KIND_MEMBER) == 0:
                 a = body_level[sides[0]]
                 b = body_level[sides[1]]
                 if b < far and b + 1 < a:
-                    body_level[sides[0]] = b + 1
-                    changed = 1
-                elif a < far and a + 1 < b:
-                    body_level[sides[1]] = a + 1
-                    changed = 1
+                    if wp.atomic_min(body_level, sides[0], b + 1) > b + 1:
+                        lowered = True
+                if a < far and a + 1 < b:
+                    if wp.atomic_min(body_level, sides[1], a + 1) > a + 1:
+                        lowered = True
+        lane_sync(_WORLD_LANES)
+        changed = lane_any(lowered, _WORLD_LANES)
     deepest = int(0)
     unreached = int(0)
-    for g in range(s, e):
-        if (reg_kind[g] & KIND_MEMBER) != 0:
-            continue
-        sides = reg_body[g]
-        depth = body_level[sides[0]]
-        if sides[1] >= 0:
-            depth = wp.max(depth, body_level[sides[1]])
-        reg_level[g] = depth
-        if depth < far:
-            deepest = wp.max(deepest, depth)
-        else:
-            unreached = 1
+    kept = int(0)
+    for g in range(s + lane, e, lanes):
+        if (reg_kind[g] & KIND_MEMBER) == 0:
+            sides = reg_body[g]
+            depth = body_level[sides[0]]
+            if sides[1] >= 0:
+                depth = wp.max(depth, body_level[sides[1]])
+            reg_level[g] = depth
+            kept += 1
+            if depth < far:
+                deepest = wp.max(deepest, depth)
+            else:
+                unreached = 1
+    for step in range(5):
+        deepest = wp.max(deepest, lane_read(deepest, lane ^ (1 << step), _WORLD_LANES))
+        unreached = wp.max(unreached, lane_read(unreached, lane ^ (1 << step), _WORLD_LANES))
+    kept = lane_sum(kept, _WORLD_LANES)
     # By decreasing depth (unreached first), stable: a counting sort on the span's slots. A body at depth d has d
     # regions on its way down, so the keys (the depths, and the unreached where some are) are at most e - s.
     top = deepest + unreached
-    for k in range(top):
+    for k in range(lane, top, lanes):
         level_end[s + k] = 0
-    kept = int(0)
-    for g in range(s, e):
-        if (reg_kind[g] & KIND_MEMBER) != 0:
-            continue
-        reg_level[g] = top - wp.min(reg_level[g], deepest + 1)
-        level_end[s + reg_level[g]] += 1
-        kept += 1
-    at = s
-    for k in range(top):
-        count = level_end[s + k]
-        level_end[s + k] = at
-        at += count
-    for g in range(s, e):
-        if (reg_kind[g] & KIND_MEMBER) != 0:
-            continue
-        place = level_end[s + reg_level[g]]
-        reg_order[place] = g
-        level_end[s + reg_level[g]] = place + 1
+    lane_sync(_WORLD_LANES)
+    for g in range(s + lane, e, lanes):
+        if (reg_kind[g] & KIND_MEMBER) == 0:
+            key = top - wp.min(reg_level[g], deepest + 1)
+            reg_level[g] = key
+            wp.atomic_add(level_end, s + key, 1)
+    lane_sync(_WORLD_LANES)
+    _level_starts(level_end, s, top, lane, lanes)
+    for base in range(s, e, lanes):
+        g = base + lane
+        key = int(-1)
+        if g < e and (reg_kind[g] & KIND_MEMBER) == 0:
+            key = reg_level[g]
+        _place_by_key(level_end, s, key, g, reg_order, lane)
     # The members after the order, block by block, in the stream's order.
     at = s + kept
     for k in range(PAIR_BLOCKS):
         m0 = at
-        for g in range(s, e):
-            kind = reg_kind[g]
-            if (kind & KIND_MEMBER) != 0 and (kind >> BLOCK_SHIFT) == k:
-                reg_order[at] = g
-                at += 1
-        blk_members[world * PAIR_BLOCKS + k] = wp.vec2i(m0, at)
-    # The levels of that order.
-    for i in range(world_free_start[world], world_free_start[world + 1]):
+        for base in range(s, e, lanes):
+            g = base + lane
+            mine = bool(False)
+            if g < e:
+                kind = reg_kind[g]
+                mine = (kind & KIND_MEMBER) != 0 and (kind >> BLOCK_SHIFT) == k
+            votes = lane_ballot(mine, _WORLD_LANES)
+            if mine:
+                reg_order[at + lane_below(votes, _WORLD_LANES)] = g
+            at += lane_count(votes, _WORLD_LANES)
+        if lane == 0:
+            blk_members[world * PAIR_BLOCKS + k] = wp.vec2i(m0, at)
+    lane_sync(_WORLD_LANES)
+    # The levels of that order: one lane's pass, a region's level one past the last level of a region before it on
+    # either of its bodies.
+    for i in range(f0 + lane, f1, lanes):
         body_level[world_free[i]] = 0
+    lane_sync(_WORLD_LANES)
     levels = int(0)
-    for p in range(s, s + kept):
-        g = reg_order[p]
-        sides = reg_body[g]
-        level = body_level[sides[0]]
-        if sides[1] >= 0:
-            level = wp.max(level, body_level[sides[1]])
-        reg_level[g] = level
-        body_level[sides[0]] = level + 1
-        if sides[1] >= 0:
-            body_level[sides[1]] = level + 1
-        levels = wp.max(levels, level + 1)
-    for level in range(levels):
-        level_end[s + level] = 0
-    for p in range(s, s + kept):
-        level_end[s + reg_level[reg_order[p]]] += 1
-    at = s
-    for level in range(levels):
-        count = level_end[s + level]
-        level_end[s + level] = at
-        at += count
-    for p in range(s, s + kept):
-        g = reg_order[p]
-        place = level_end[s + reg_level[g]]
-        level_region[place] = g
-        level_end[s + reg_level[g]] = place + 1
-    world_levels[world] = levels
+    if lane == 0:
+        for p in range(s, s + kept):
+            g = reg_order[p]
+            sides = reg_body[g]
+            level = body_level[sides[0]]
+            if sides[1] >= 0:
+                level = wp.max(level, body_level[sides[1]])
+            reg_level[g] = level
+            body_level[sides[0]] = level + 1
+            if sides[1] >= 0:
+                body_level[sides[1]] = level + 1
+            levels = wp.max(levels, level + 1)
+    levels = lane_read(levels, 0, _WORLD_LANES)
+    lane_sync(_WORLD_LANES)
+    for k in range(lane, levels, lanes):
+        level_end[s + k] = 0
+    lane_sync(_WORLD_LANES)
+    for p in range(s + lane, s + kept, lanes):
+        wp.atomic_add(level_end, s + reg_level[reg_order[p]], 1)
+    lane_sync(_WORLD_LANES)
+    _level_starts(level_end, s, levels, lane, lanes)
+    for base in range(s, s + kept, lanes):
+        p = base + lane
+        key = int(-1)
+        g = int(0)
+        if p < s + kept:
+            g = reg_order[p]
+            key = reg_level[g]
+        _place_by_key(level_end, s, key, g, level_region, lane)
+    if lane == 0:
+        world_levels[world] = levels
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -1957,10 +2067,12 @@ class Regions:
             ],
             **live,
         )
+        # The world kernels: a world a lane group (a warp on the GPU, one thread on the CPU).
+        world_threads = forest.world_count * (int(_WORLD_LANES) if device.is_cuda else 1)
         if self.blocks:
             wp.launch(
                 form_blocks,
-                dim=forest.world_count,
+                dim=world_threads,
                 inputs=[
                     self.relist,
                     self.world_regions,
@@ -1984,6 +2096,7 @@ class Regions:
                     self.blk_pair,
                 ],
                 device=device,
+                block_dim=_WORLD_BLOCK,
             )
             wp.launch(
                 factor_blocks,
@@ -1994,7 +2107,7 @@ class Regions:
             )
         wp.launch(
             level_regions,
-            dim=forest.world_count,
+            dim=world_threads,
             inputs=[
                 self.relist,
                 self.cursor,
@@ -2014,6 +2127,7 @@ class Regions:
                 self.blk_members,
             ],
             device=device,
+            block_dim=_WORLD_BLOCK,
         )
         if self.blocks:
             pool.launch(
