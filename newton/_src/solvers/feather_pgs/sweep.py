@@ -230,6 +230,11 @@ class WorldRows:
         """A row's parent from its record's packed ``kind | parent << 16`` word."""
         return record_parent(packed, self.capacity)
 
+    def live_head(self, row: str) -> tuple[str, str, str, str]:
+        """Row ``row``'s kind, diagonal, parent and right-hand side as the live order's test reads them, from its
+        words (:func:`record_head`)."""
+        return record_head(lambda k: self.word(row, k), self.parent_of)
+
     def scan(self) -> tuple[Callable[[str], str], Callable[[str], str]]:
         """A row's kind and parent as a scan over the rows reads them (:func:`friction_metric_stage`)."""
         return (lambda row: f"({self.kind(row, scan=True)})"), self.parent
@@ -415,6 +420,8 @@ class StagedRows:
 
     owned: ClassVar[bool] = True
     """The first lane stores the staged impulses, which every lane reads."""
+    record: ClassVar[bool] = False
+    """The rows are staged whole, not streamed as records."""
 
     def load(self, row: str) -> str:
         return f"s_impulse[{row}]"
@@ -433,6 +440,10 @@ class StagedRows:
 
     def inverse(self, row: str) -> str:
         return f"s_inverse[{row}]"
+
+    def live_head(self, row: str) -> tuple[str, str, str, str]:
+        """Row ``row``'s kind, diagonal, parent and right-hand side as the live order's test reads them."""
+        return f"static_cast<int>({self.kind(row)})", self.diag(row), self.parent(row), self.rhs_of(row)
 
     def diagonal(self, own: str) -> Diagonal:
         return Diagonal(lambda row: own if row == "i" else self.diag(row), self.inverse if self.reciprocal else None)
@@ -1647,6 +1658,12 @@ class SlotOrder:
         return f"{pad}for (int i = 0; i < {self.end}; ++i) {{\n{visit}\n{pad}}}"
 
 
+def record_head(word: Callable[[int], str], parent_of: Callable[[str], str]) -> tuple[str, str, str, str]:
+    """A row's kind, diagonal, parent and right-hand side from its record's words (``word(k)``, pack_row_record): the
+    kind word holds its kind and its parent."""
+    return f"{word(3)} & 0xFFFF", f"__int_as_float({word(1)})", parent_of(word(3)), f"__int_as_float({word(2)})"
+
+
 @dataclasses.dataclass(frozen=True)
 class LiveOrder:
     """A dense row loop's rows ``[0, end)`` in slot order, each step taken to the next row whose visit can act: the
@@ -1692,19 +1709,19 @@ class LiveOrder:
         """Row ``t``'s test data, ``live_always`` (it acts whatever the bound) and ``live_key`` (it acts once the bound
         passes it; infinite: never)."""
         rows = self.rows
+        head = []
         if rows.record:
             # The record's first quad: its sides, diagonal, right-hand side and kind word (pack_row_record).
             head = [
                 f"const int4 ta = *reinterpret_cast<const int4*>(&row_record.data[{rows.records} + t * {rows.words}]);"
             ]
-            word = {1: "ta.y", 2: "ta.z", 3: "ta.w"}.__getitem__
+            kind, diagonal, parent, rhs = record_head({1: "ta.y", 2: "ta.z", 3: "ta.w"}.__getitem__, rows.parent_of)
         else:
-            head = []
-            word = lambda k: rows.word("t", k)  # noqa: E731
+            kind, diagonal, parent, rhs = rows.live_head("t")
         never = (*self.never, ROW_TORSION) if self.torsion else self.never
-        kinds = " && ".join(f"t_kind != {k}" for k in never)
+        kinds = " && ".join(f"t_kind != {k}" for k in never) or "true"
         unilateral = f"t_kind == {ROW_CONTACT} || t_kind == {ROW_JOINT_LIMIT}"
-        ring_kinds = " && ".join(f"r_kind != {k}" for k in never)
+        ring_kinds = " && ".join(f"r_kind != {k}" for k in never) or "true"
         spin = rows.spin_of("t_parent", self.end) if self.torsion else "-1"
         # The patch ring's normals from the pair's own, as the visit's pooled load walks them (RING_LOAD). A streamed
         # ring row's record holds its key as the test takes it (:func:`.response_builds_rows.row_idle_key`: minus
@@ -1727,10 +1744,10 @@ class LiveOrder:
             ]
         lines = [
             *head,
-            f"const int t_kind = {word(3)} & 0xFFFF;",
-            f"const float t_diagonal = __int_as_float({word(1)});",
+            f"const int t_kind = {kind};",
+            f"const float t_diagonal = {diagonal};",
             f"if (t_kind == {ROW_FRICTION}) {{",
-            f"    const int t_parent = {rows.parent_of(word(3))};",
+            f"    const int t_parent = {parent};",
             "    if (t == t_parent + 1) {",
             f"        const int t_spin = {spin};",
             f"        live_always = {rows.peek('t')} != 0.0f || {rows.peek('t + 1')} != 0.0f"
@@ -1744,7 +1761,7 @@ class LiveOrder:
             "    }",
             f"}} else if ({kinds} && !(t_diagonal <= 0.0f)) {{",
             f"    if (({unilateral}) && __float_as_int({rows.peek('t')}) == 0)",
-            f"        live_key = {self.key('t', f'__int_as_float({word(2)})', 't_diagonal')};",
+            f"        live_key = {self.key('t', rhs, 't_diagonal')};",
             "    else live_always = true;",
             "}",
         ]
@@ -2355,7 +2372,7 @@ def row_step(
         formed=formed,
         friction=kind in (None, ROW_FRICTION),
         reach=reach,
-        **({"root": rows.idle_root} if reach is not None and getattr(rows, "record", False) else {}),
+        **({"root": rows.idle_root} if reach is not None and rows.record else {}),
     )
     hold = {}
     if held:

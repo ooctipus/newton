@@ -13,8 +13,9 @@ acts on is the factor-coordinate delta from ``v_hat``, staged per world and publ
   from the register line and the data (:data:`REGISTER_LINE`);
 - the **operator's layout**: packed rows read through explicit row indices (``row_dof``) or the shared support
   table, or (``local_factors``) packed rows expanded once per call into dense rows in shared memory;
-- the **schedule**: every row in slot order, or (``active_rows``) the rows selected at sweep entry, popped from
-  a bitset (:func:`.sweep.active_scan`); patch rings (``linked_rows``) select their friction pairs through the ring; under
+- the **schedule**: every row in slot order, stepping to the rows that can act (:class:`.sweep.LiveOrder`: an
+  idle row is passed by the exact bound of the velocity's norm), or (``active_rows``) the rows selected at sweep
+  entry, popped from a bitset (:func:`.sweep.active_scan`); patch rings (``linked_rows``) select their friction pairs through the ring; under
   contact ``torsion`` the friction triples (a contact's pair and its spin row) in a phase of their own after each
   sweep's rows (:func:`.sweep.triple_phase`), so the row loop carries none of their code;
 - the **contact unit** (``contact_triplets``): a contact normal and its friction pair in one visit on their Gram
@@ -41,6 +42,7 @@ from ...core.execution import Work, device_lanes
 from ...core.memory import Buffer, Staging
 from . import kernel_template
 from .kernel_template import Dispatch
+from .projection_laws import IDLE_LAW
 from .response_operator import Lanes, SparseFactor
 from .row_inputs import RowArgument
 from .row_laws import ROW_CONTACT, ROW_JOINT_VELOCITY_LIMIT, ROW_TORSION
@@ -49,6 +51,7 @@ from .sweep import (
     FORMED_RECORD,
     ITERATION,
     Diagonal,
+    LiveOrder,
     RowContext,
     RowLaws,
     SelectedRows,
@@ -64,6 +67,7 @@ from .sweep import (
     end_sweep,
     formed_friction_laws,
     friction_metric,
+    idle_reach,
     impulse_seed,
     level_loop,
     row_step,
@@ -232,6 +236,12 @@ class SparseSweep(SweepConfig):
         return kernel_template.items("world", groups=self.groups, lanes=self.lanes, guard="world_count")
 
     @property
+    def live(self) -> bool:
+        """The row loop visits every row in slot order, stepping to the rows that can act (:class:`.sweep.LiveOrder`):
+        without an active scan or contact units, its row applies are the only ones inside it."""
+        return not self.active_rows and not self.contact_triplets
+
+    @property
     def records(self) -> bool:
         """Contact units read their contacts' records, and where spin rows may appear every triple its metric: the
         support writer forms them (:func:`.walk_rows.contact_record`)."""
@@ -391,8 +401,16 @@ def _source(sweep: SparseSweep) -> tuple[str, Staging]:
         setup.append(active_selection(rows, count="count", linked=sweep.linked_rows, pad="    "))
     if sweep.warm_start:
         setup.append(warm_start_seed(op, "    "))
-    # The row loop's enumeration: the rows the active scan selected, or every row.
-    order = SelectedRows("count") if sweep.active_rows else SlotOrder("count")
+    # The row loop's enumeration: the rows the active scan selected, or every row in slot order stepping to the rows
+    # that can act (LiveOrder), whose applies are then the only ones inside the loop.
+    live = sweep.live
+    if sweep.active_rows:
+        order = SelectedRows("count")
+    elif live:
+        never = (ROW_JOINT_VELOCITY_LIMIT,) if sweep.velocity_limits else ()
+        order = LiveOrder("count", rows, "idle_reach", laws.torsion, never)
+    else:
+        order = SlotOrder("count")
     body_pad = order.inner("        ")
     unit = contact_units(sweep, rows, op, laws, body_pad) if sweep.contact_triplets else ""
 
@@ -415,9 +433,22 @@ def _source(sweep: SparseSweep) -> tuple[str, Staging]:
     # Velocity-limit rows wait for the last-word pass; under contact torsion the triples are the triple phase's.
     admission = f"if (row_type == {ROW_JOINT_VELOCITY_LIMIT}) continue;" if sweep.velocity_limits else ""
     update = row_step(
-        rows, op, laws, end="count", admission=admission, held=True, triple_phase=sweep.torsion, pad=body_pad
+        rows,
+        op,
+        laws,
+        end="count",
+        admission=admission,
+        held=True,
+        triple_phase=sweep.torsion,
+        reach="idle_reach" if live else None,
+        pad=body_pad,
     )
-    row_loop = order.wrap(f"{unit}\n{update}", "        ")
+    if live:
+        # The bound of the velocity's norm the live order tests against, formed at the loop's start (sweep.idle_reach).
+        bound = idle_reach("idle_reach", op.velocity, str(D), lanes, "            ")
+        row_loop = f"        {{\n{bound}\n{order.wrap(update, '            ')}\n        }}"
+    else:
+        row_loop = order.wrap(f"{unit}\n{update}", "        ")
     triples = ""
     if sweep.torsion:
         # A triple reads its contact's record (the general sweep's triple phase); its normal is a contact whose next
@@ -464,4 +495,4 @@ def _source(sweep: SparseSweep) -> tuple[str, Staging]:
     for (int d = lane; d < {D}; d += {L}) factor_velocity_delta.data[world * {D} + d] = s_delta[d];
 {rows.stores("    ")}
 """
-    return sweep.native(body, lanes=L), staging
+    return sweep.native(body, lanes=L, laws=(IDLE_LAW,) if live else ()), staging
