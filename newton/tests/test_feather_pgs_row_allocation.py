@@ -23,9 +23,8 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs import field_group, row_slots, rows
 from newton._src.solvers.feather_pgs.contact_input import ContactInput
-from newton._src.solvers.feather_pgs.row_slots import finalize_constraint_counts_with_status
 from newton.solvers import SolverFeatherPGS
-from newton.tests.feather_pgs_law_harness import allocate_contacts, anchored_patches, row_lines
+from newton.tests.feather_pgs_law_harness import allocate_contacts, anchored_patches, finalize_counts, row_lines
 from newton.tests.test_feather_pgs_sparse_solver import _build_model
 
 _UNBOUNDED = 2**31 - 1
@@ -122,7 +121,7 @@ def _allocate_overflowing_contacts(device, contact_count, row_capacity):
     )
     # The dense family's finalizer, as the solver launches it for these rows.
     wp.launch(
-        finalize_constraint_counts_with_status,
+        finalize_counts,
         dim=1,
         inputs=[counter, row_capacity, 0, first_rejected],
         outputs=[count, wp.zeros(2, dtype=wp.int32, device=device)],

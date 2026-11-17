@@ -30,7 +30,7 @@ from newton._src.solvers.feather_pgs import (
     spatial_laws,
 )
 from newton._src.solvers.feather_pgs.contact_input import ContactInput
-from newton._src.solvers.feather_pgs.device_preludes import cuda_native, dual_native
+from newton._src.solvers.feather_pgs.device_preludes import cuda_native, dual_native, reserved_count
 from newton._src.solvers.feather_pgs.factor.walk import (
     WALK_FRAME,
     WALK_LINK,
@@ -1457,6 +1457,23 @@ ALLOCATION = (
     "units",
 )
 """The row allocation's operands by name (:func:`allocate_contacts`)."""
+
+
+@wp.kernel
+def finalize_counts(
+    slot_counter: wp.array[int],
+    capacity: int,
+    family: int,
+    first_rejected_slot: wp.array[int],
+    constraint_count: wp.array[int],
+    capacity_status: wp.array[int],
+):
+    """One row class's counts as the row pass's close forms them (:func:`.placement._close_row_pass`): each world's
+    accepted prefix, with sticky overflow (``reserved_count``)."""
+    world = wp.tid()
+    constraint_count[world] = reserved_count(
+        slot_counter, world, capacity, first_rejected_slot, capacity_status, family
+    )
 
 
 def allocate_contacts(operands, dim: int, device) -> None:

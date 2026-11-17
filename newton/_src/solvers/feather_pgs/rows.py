@@ -65,7 +65,6 @@ from .row_records import bind as bind_dense_rows
 from .row_slots import (
     admit_world_contacts,
     allocate_world_contact_slots,
-    finalize_constraint_counts_with_status,
     snapshot_dense_phase_bound,
 )
 from .sweep_plan import FREE_ROUTE
@@ -640,8 +639,8 @@ class RowLaws:
     # glued to that sequence. The stage list (:func:`.step_plan._stages`) runs the families a class holds, in this
     # order: :meth:`begin`, :meth:`write_mimics`, :meth:`write_links`, :meth:`prepare_fused_limits`,
     # :meth:`write_limits`, :meth:`bound_phase` (0), :meth:`write_velocity_limits`, :meth:`bound_phase` (1),
-    # :meth:`write_contacts`, :meth:`bound_free_body_contacts`, :meth:`allocate_free_body_limits`,
-    # :meth:`write_free_bodies`, :meth:`finalize_dense`.
+    # :meth:`build_patches`, :meth:`write_contacts`, :meth:`bound_free_body_contacts`, :meth:`allocate_free_body_limits`,
+    # :meth:`write_free_bodies`; the placement closes the pass (:meth:`.placement.Placement.close_rows`).
     #
     # Dense row-family layout: slots are handed out in the order [mimic][joint-limit][joint-velocity-limit]
     # [contact/friction], so each family owns one contiguous dense row range:
@@ -928,7 +927,7 @@ class RowLaws:
         their contacts' rows and their speed rows (:func:`.walk_rows.write_free_body_rows`), on its threads at its own
         line (:data:`.walk_rows.WRITERS`); where their contacts are regions (``Sweep.regions``) the regions' fill
         writes their contacts' rows and the writer the speed rows alone (:func:`.walk_rows.write_free_body_regions`);
-        their counts finalized with status."""
+        the pass's close finalizes their counts (:meth:`.placement.Placement.close_rows`)."""
         placement, model = solver.placement, solver.model
         speed = placement.rigid_velocity_limit_slot is not None
         speed_bodies = solver.forest.free_rigid_body_count if speed else 0
@@ -962,27 +961,6 @@ class RowLaws:
             block_dim=walk_rows.WRITERS["free_body"].block,
             device=model.device,
         )
-        self._finalize(solver, 1)
-
-    def _finalize(self, solver, family: int) -> None:
-        """Finalize a row class's counts with status (0: the dense rows, 1: the free bodies')."""
-        placement = solver.placement
-        wp.launch(
-            finalize_constraint_counts_with_status,
-            dim=solver.forest.world_count,
-            inputs=[
-                placement.row_slot_counter[family],
-                (placement.dense_max_constraints, placement.mf_max_constraints)[family],
-                family,
-                placement.row_first_rejected[family],
-            ],
-            outputs=[placement.row_count[family], placement.constraint_capacity_status],
-            device=solver.model.device,
-        )
-
-    def finalize_dense(self, solver) -> None:
-        """Finalize the dense rows' counts with status, after every dense producer."""
-        self._finalize(solver, 0)
 
     def bias(self, options, dt: float) -> RowBias:
         """The rows' law's step parameters (:class:`.row_kernels.RowBias`) of a step of ``dt``."""

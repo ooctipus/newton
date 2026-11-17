@@ -17,7 +17,7 @@ from .contact_laws import (
     contact_responds,
     jacobian_entry,
 )
-from .device_preludes import dual_native, lane_group, lane_scan, lane_sum, lane_sync, reserve, reserved_count
+from .device_preludes import dual_native, lane_group, lane_scan, lane_sum, lane_sync, reserve
 from .friction_patches import FrictionPatches, patch_spin_rows
 from .row_laws import (
     authored_contact_law,
@@ -589,22 +589,6 @@ def place_world_contact_runs(
         run_first[world, block] = _CONTACT_RUN_EMPTY
         run_last[world, block] = -1
         run_rows[world, block] = wp.vec2i(0, 0)
-
-
-@wp.kernel
-def finalize_constraint_counts_with_status(
-    slot_counter: wp.array[int],
-    capacity: int,
-    family: int,
-    first_rejected_slot: wp.array[int],
-    constraint_count: wp.array[int],
-    capacity_status: wp.array[int],
-):
-    """Clamp the accepted prefix while retaining sticky overflow from every row producer."""
-    world = wp.tid()
-    constraint_count[world] = reserved_count(
-        slot_counter, world, capacity, first_rejected_slot, capacity_status, family
-    )
 
 
 @wp.kernel

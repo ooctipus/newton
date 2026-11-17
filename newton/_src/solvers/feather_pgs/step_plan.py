@@ -537,12 +537,17 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
         (s4, "bound_speed_rows", speed_rows, (laws, "bound_speed_rows", solver)),
         (s4, "allocate_free_body_limits", free_limits, (laws, "allocate_free_body_limits", solver)),
         (s4, "write_free_bodies", run, (laws, "write_free_bodies", solver, STATE_IN, CONTACTS, DT)),
-        (s4, "finalize_dense", True, (laws, "finalize_dense", solver)),
+        # The pass's close: the row classes' counts with status (the free bodies' where their run is staged), the
+        # overflow latch and the warning, one launch.
+        (
+            s4,
+            "close_rows",
+            True,
+            (placement, "close_rows", CONTACTS, 2 if run else 1, options.diagnostics.overflow_warning),
+        ),
         # The claim stage: each world into its claim's bucket once the counts are final; the unit builder and the
         # sweeps walk their buckets.
         (s4, "claim_worlds", sweep.claims is not None, (sweep, "claim_worlds")),
-        (s4, "latch_status", True, (placement, "latch_status", CONTACTS)),
-        (s4, "warn_overflow", options.diagnostics.overflow_warning, (placement, "warn_overflow")),
         # The one writer writes its contact rows' records after the row pass, each normal row's ring parent with its
         # kind and each row's streamed record once the row is final; only the free bodies' regions, whose rows their
         # fill writes, are linked here, before their listing reads the rings. The sparse diagonal's schedule reads the

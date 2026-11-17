@@ -13,7 +13,7 @@
 - the status: the per-world overflow latch, the sticky flags, dropped rows, warnings and watermarks.
 
 A step calls :meth:`Placement.begin` (clear the allocation state), then the row pass writes into its slots
-(:meth:`Placement.place_sorted_contact_rows`, :meth:`Placement.latch_status`, :meth:`Placement.warn_overflow`),
+(:meth:`Placement.place_sorted_contact_rows`, :meth:`Placement.close_rows`),
 :meth:`Placement.diagonals` and :meth:`Placement.prepare_impulses`; the rows' writers store their records.
 
 It also holds which placement the class takes: the native sparse size, the sparse-diagonal pair and the row producers.
@@ -30,6 +30,7 @@ from ...sim import Contacts
 from ...sim.contacts import CAPACITY_BLOCKS_PER_SM, contact_capacity_blocks
 from ...sim.enums import JointType
 from . import field_group, host_index, packed_rows
+from .device_preludes import reserved_count
 from .factor.walk import walk_tables
 from .field_group import Field, FieldGroup, SolverArrays, fields_of
 from .forest_plan import RowLaw
@@ -225,8 +226,9 @@ def _clear_dense_row_state(
         acts[world] = 0
 
 
-@wp.kernel
-def _finalize_constraint_status(
+@wp.func
+def _latch_world(
+    world: int,
     slot_counter: wp.array2d[int],
     dropped: wp.array2d[int],
     contact_count: wp.array[int],
@@ -235,9 +237,8 @@ def _finalize_constraint_status(
     contact_capacity: int,
     overflow: wp.array[wp.bool],
 ):
-    """Latch invalid-world status until reset: a row class (by class and world) that reserved past its ``capacity`` or
-    dropped rows, or the contacts' overflow; counts come from the per-class finalize kernels."""
-    world = wp.tid()
+    """Latch ``world``'s invalid status until reset: a row class (by class and world) that reserved past its
+    ``capacity`` or dropped rows, or the contacts' overflow."""
     invalid = contact_count[0] > contact_capacity or reduction_overflow[0] != 0
     for row_class in range(2):
         if slot_counter[row_class, world] > capacity[row_class] or dropped[row_class, world] > 0:
@@ -264,44 +265,72 @@ def _reset_solver_status(
             mass_update_requested[tid] = 1
 
 
-@wp.kernel
-def _warn_constraint_row_overflow(
-    dense_raw_counts: wp.array[wp.int32],
-    dense_dropped_contact_rows: wp.array[wp.int32],
-    dense_capacity: int,
-    mf_raw_counts: wp.array[wp.int32],
-    mf_dropped_contact_rows: wp.array[wp.int32],
-    mf_capacity: int,
+@wp.func
+def _warn_world(
+    world: int,
+    raw_counts: wp.array2d[int],
+    dropped_rows: wp.array2d[int],
+    capacity: wp.vec2i,
     mf_active: int,
     warning_emitted: wp.array[wp.int32],
 ):
-    """Emit one device-side warning per overflowing FeatherPGS row family."""
-    world = wp.tid()
-
-    dense_dropped = dense_dropped_contact_rows[world]
-    dense_requested = dense_raw_counts[world]
-    if dense_requested > dense_capacity and wp.atomic_exch(warning_emitted, 0, 1) == 0:
+    """Emit one device-side warning per overflowing FeatherPGS row family (``raw_counts``: each class's reservations,
+    ``dropped_rows`` its dropped contact rows)."""
+    dense_dropped = dropped_rows[0, world]
+    dense_requested = raw_counts[0, world]
+    if dense_requested > capacity[0] and wp.atomic_exch(warning_emitted, 0, 1) == 0:
         wp.printf(
             "Warning: FeatherPGS dense constraint-row overflow in world %d: requested %d rows, limit %d; "
             "dropped %d contact/friction rows. Increase dense_max_constraints.\n",
             world,
             dense_requested,
-            dense_capacity,
+            capacity[0],
             dense_dropped,
         )
 
     if mf_active != 0:
-        mf_dropped = mf_dropped_contact_rows[world]
-        mf_requested = mf_raw_counts[world]
-        if mf_requested > mf_capacity and wp.atomic_exch(warning_emitted, 1, 1) == 0:
+        mf_dropped = dropped_rows[1, world]
+        mf_requested = raw_counts[1, world]
+        if mf_requested > capacity[1] and wp.atomic_exch(warning_emitted, 1, 1) == 0:
             wp.printf(
                 "Warning: FeatherPGS matrix-free constraint-row overflow in world %d: requested %d rows, "
                 "limit %d; dropped %d contact/friction rows. Increase mf_max_constraints.\n",
                 world,
                 mf_requested,
-                mf_capacity,
+                capacity[1],
                 mf_dropped,
             )
+
+
+@wp.kernel
+def _close_row_pass(
+    slot_counter: wp.array2d[int],
+    first_rejected: wp.array2d[int],
+    capacity: wp.vec2i,
+    families: int,
+    dropped: wp.array2d[int],
+    contact_count: wp.array[int],
+    reduction_overflow: wp.array[int],
+    contact_capacity: int,
+    warn: int,
+    mf_active: int,
+    warning_emitted: wp.array[wp.int32],
+    count: wp.array2d[int],
+    capacity_status: wp.array[int],
+    overflow: wp.array[wp.bool],
+):
+    """Close each world's row pass once every row producer reserved: the first ``families`` row classes' counts (the
+    dense rows', then the free bodies' run), each its accepted prefix with sticky overflow (:func:`.row_slots`'
+    ``reserved_count``), the world's invalid-status latch (:func:`_latch_world`) and, with ``warn``, one device-side
+    warning per overflowing class (:func:`_warn_world`)."""
+    world = wp.tid()
+    for family in range(families):
+        count[family, world] = reserved_count(
+            slot_counter[family], world, capacity[family], first_rejected[family], capacity_status, family
+        )
+    _latch_world(world, slot_counter, dropped, contact_count, reduction_overflow, capacity, contact_capacity, overflow)
+    if warn != 0:
+        _warn_world(world, slot_counter, dropped, capacity, mf_active, warning_emitted)
 
 
 _WARP = 32
@@ -600,7 +629,7 @@ class Placement:
         CUDA without free rigid bodies still passes the
         ``mf_*`` arrays to kernels (the fused GS solve, the PGS diagnostics),
         but ``mf_constraint_count`` stays zero (``_clear_dense_row_state`` and
-        ``finalize_constraint_counts_with_status`` write it only when MF is
+        the row pass's close (``_close_row_pass``) write it only when MF is
         active), so every access sits inside a loop bounded by
         ``m_mf == 0`` and no element is ever read or written. The rows' records
         follow the sweep's plan (:meth:`allocate_row_records`).
@@ -877,40 +906,29 @@ class Placement:
             device=device,
         )
 
-    def latch_status(self, contacts: Contacts | None) -> None:
-        """Latch current per-world capacity failures for every row owner."""
-        # The contact capacity (argument 6) follows the ready rows in a capture whose launches bind.
+    def close_rows(self, contacts: Contacts | None, families: int, warn: bool) -> None:
+        """Close the row pass once every row producer reserved (:func:`_close_row_pass`): the first ``families`` row
+        classes' counts with status (the dense rows', and the free bodies' run where its writer is staged), each world's
+        invalid-status latch and, with ``warn`` (``Diagnostics.overflow_warning``), one warning per overflowing class."""
+        # The contact capacity (argument 8) follows the ready rows in a capture whose launches bind.
         self.contact_pool.launch(
-            _finalize_constraint_status,
+            _close_row_pass,
             self.forest.world_count,
             inputs=[
                 self.row_slot_counter,
+                self.row_first_rejected,
+                wp.vec2i(self.dense_max_constraints, self.mf_max_constraints),
+                int(families),
                 self.row_dropped_all,
                 contacts.rigid_contact_count if contacts is not None else self.dummy_contact_count,
                 contacts._reduction_overflow if contacts is not None else self.dummy_contact_count,
-                wp.vec2i(self.dense_max_constraints, self.mf_max_constraints),
                 contacts._rigid_contact_rows if contacts is not None else 0,
-                self.constraint_overflow,
-            ],
-            row_args=(6,) if contacts is not None else (),
-        )
-
-    def warn_overflow(self):
-        """One device-side warning per overflowing row family (staged under ``Diagnostics.overflow_warning``)."""
-        wp.launch(
-            _warn_constraint_row_overflow,
-            dim=self.forest.world_count,
-            inputs=[
-                self.slot_counter,
-                self.row_dropped_dense,
-                self.dense_max_constraints,
-                self.mf_slot_counter,
-                self.row_dropped_mf,
-                self.mf_max_constraints,
+                int(warn),
                 int(self.forest.has_free_rigid_bodies),
-                self.row_overflow_warning_emitted,
+                self.row_overflow_warning_emitted if warn else self.dummy_contact_count,
             ],
-            device=self.model.device,
+            outputs=[self.row_count, self.constraint_capacity_status, self.constraint_overflow],
+            row_args=(8,) if contacts is not None else (),
         )
 
     def reset_status(self, world_mask):
