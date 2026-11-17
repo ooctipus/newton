@@ -673,13 +673,14 @@ _PAIR_BLOCK = """if ((kind & 16) != 0) {
     if (team > 1) WARP_SYNC();
     // The units, member by member, at the loads the members hold (each the sum of its candidates' impulses): the
     // team's lanes read a batch of members at once (their loads, whether they hold anything), then take the batch's
-    // live members in order.
+    // live members in order. The lane that read a member's load keeps its new friction and stores it after the batch,
+    // so no store stands between two units (no unit reads another's friction).
     for (int base = 0; base < blob[1]; base += team) {
         bool live = false;
+        float own_load = 0.0f;
         if (base + mine < blob[1]) {
-            const int at = blob[0] + 44 * (base + mine);
-            const auto member = RegionLaw::block_load(blk_stage, at, blob[2]);
-            stage[at + 38] = member.v0;
+            const auto member = RegionLaw::block_load(blk_stage, blob[0] + 44 * (base + mine), blob[2]);
+            own_load = member.v0;
             live = member.v1;
         }
         unsigned bits = live ? 1u : 0u;
@@ -687,26 +688,32 @@ _PAIR_BLOCK = """if ((kind & 16) != 0) {
             bits = BALLOT(live);
             WARP_SYNC();
         }
+        wp::vec3 own_phi;
+        bool own_set = false;
         while (bits != 0u) {
-            const int m = base + FIRST(bits);
+            const int j = FIRST(bits);
             bits &= bits - 1u;
-            const int at = blob[0] + 44 * m;
-            const auto unit = RegionLaw::block_unit(blk_stage, at, yh, stage[at + 38]);
-            const wp::vec3 phi = unit.v0;
+            const float member_load = team > 1 ? READ(own_load, j) : own_load;
+            const auto unit = RegionLaw::block_unit(blk_stage, blob[0] + 44 * (base + j), yh, member_load);
             yh = wp::add(yh, unit.v1);
             Jf = wp::add(Jf, unit.v1);
-            if (mine == 0) {
-                stage[at + 39] = phi[0];
-                stage[at + 40] = phi[1];
-                stage[at + 41] = phi[2];
-                const int row = istage[at];
-                if (row >= 0) {
-                    lambda[row] = phi[0];
-                    lambda[row + 1] = phi[1];
-                    if ((int)stage[at + 23] == 3) lambda[row + 2] = phi[2];
-                }
+            if (mine == j) {
+                own_phi = unit.v0;
+                own_set = true;
             }
             if (unit.v2) slid = true;
+        }
+        if (own_set) {
+            const int at = blob[0] + 44 * (base + mine);
+            stage[at + 39] = own_phi[0];
+            stage[at + 40] = own_phi[1];
+            stage[at + 41] = own_phi[2];
+            const int row = istage[at];
+            if (row >= 0) {
+                lambda[row] = own_phi[0];
+                lambda[row + 1] = own_phi[1];
+                if ((int)stage[at + 23] == 3) lambda[row + 2] = own_phi[2];
+            }
         }
     }
     // The normals as one compliant block: their own impulses leave, Newton on the six coordinates; the candidates

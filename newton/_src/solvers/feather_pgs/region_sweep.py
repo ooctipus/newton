@@ -81,8 +81,8 @@ PAIR_BLOCKS = wp.constant(2)
 """Blocks a world holds at most (its table's slots); a group past them keeps its regions."""
 STAGE_UNIT = wp.constant(44)
 """Words of a block member's staged record (:func:`stage_blocks`): its unit's whitened rows (18), right-hand sides
-(3), ``mu``, ``mu_t``, rows (1), the cone law's block or metric (9 + 3), its candidates' count, its load and its
-friction (state, 1 + 3), two spare."""
+(3), ``mu``, ``mu_t``, rows (1), the cone law's block or metric (9 + 3), its candidates' count, its friction (state,
+3) and its first candidate, three spare (words 24, 38, 43)."""
 STAGE_CAND = wp.constant(12)
 """Words of a block candidate's staged record: its whitened row (6), right-hand side, compliance, impulse (state),
 three spare. A block's members' records come first (``STAGE_UNIT`` words each), then its candidates'."""
@@ -1376,7 +1376,7 @@ def stage_blocks(
     :func:`form_blocks`), ``threads`` lanes striding over the stream's listed regions (``cursor[0]``): the member's record
     (:data:`STAGE_UNIT`: its unit's rows whitened by the pair's factor, ``L^T f`` for ``f = sigma [(t0, r x t0),
     (t1, r x t1), (0, n)]`` about a's origin, their right-hand sides, the cone law's block (``G`` plus ``cfm``) or
-    metric, no load, no friction), then its candidates' (:data:`STAGE_CAND`: ``L^T j`` for
+    metric, no friction), then its candidates' (:data:`STAGE_CAND`: ``L^T j`` for
     ``j = sigma (n, r x n + a1 t0 + a2 t1)``, the right-hand side, the compliance); their impulse rows
     at the same words of ``blk_istage``."""
     if cursor[3] != 0:
@@ -1433,7 +1433,6 @@ def stage_blocks(
             blk_stage[off + 34 + i] = values[i]
         span_c = reg_cand[g]
         blk_stage[off + 37] = float(span_c[1] - span_c[0])
-        blk_stage[off + 38] = 0.0
         blk_stage[off + 39] = 0.0
         blk_stage[off + 40] = 0.0
         blk_stage[off + 41] = 0.0
