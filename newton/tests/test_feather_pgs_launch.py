@@ -101,11 +101,18 @@ class TestShapeAgainstTodaysRules(unittest.TestCase):
             return types.SimpleNamespace(count=bodies, dof_start=np.array([0, dofs]))
 
         for device in (PRO, GB300):
-            for bodies, groups, lanes in ((1, 16384, 8), (3, 16384, 8), (13, 16384, 16), (30, 16384, 32), (40, 3, 64)):
+            for bodies, groups, lanes in ((3, 16384, 8), (13, 16384, 16), (30, 16384, 32), (40, 3, 64)):
                 with self.subTest(arch=device.arch, bodies=bodies):
                     self.assertEqual(tree_kinetic_state.held_lanes(tree(bodies, bodies), groups, device), lanes)
-            # A one-body rest tree (no coordinates) takes one lane; a two-body one scans its weld at eight.
+            # A one-body tree fills one wave of its finish's residency, up to its coordinates: a free body at eight
+            # lanes where its trees are few, at four for one a world of 16,384, at one for NIST's 81,920 (10 a world
+            # of 8,192); a rest tree (no coordinates) and a one-coordinate body at one. A two-body rest tree scans its
+            # weld at eight.
+            for groups, lanes in ((1344, 8), (16384, 4), (81920, 1)):
+                with self.subTest(arch=device.arch, groups=groups):
+                    self.assertEqual(tree_kinetic_state.held_lanes(tree(1, 6), groups, device), lanes)
             self.assertEqual(tree_kinetic_state.held_lanes(tree(1, 0), 16384, device), 1)
+            self.assertEqual(tree_kinetic_state.held_lanes(tree(1, 1), 16384, device), 1)
             self.assertEqual(tree_kinetic_state.held_lanes(tree(2, 0), 16384, device), 8)
             # Whole 32-thread blocks: three one-body trees take a warp each.
             self.assertEqual(tree_kinetic_state.held_lanes(tree(1, 1), 3, device), 32)

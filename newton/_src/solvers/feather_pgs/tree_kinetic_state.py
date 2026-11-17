@@ -440,18 +440,33 @@ def held_lanes(tree: TreePlan, groups: int, device: Device) -> int:
     bodies), widened until the group fills whole 32-thread blocks. Measured on the RTX PRO 6000 (finish, predict and
     repair of 4096 trees at each lane width, and the construction-time timings the replaced lane choice recorded in
     the gate's tasks): this width ran within 3% of the fastest width of every tree of up to 32 bodies. The
-    coordinates do not set it: the 13-body, 21-coordinate Franka forest runs 27% slower at 32 lanes than at 16, a
-    one-body tree 8% slower at 4 lanes than at 8. A one-body rest tree (no coordinates: its finish publishes a pose)
-    takes one lane, bitwise with eight (`79e9e7b9`). On the CPU each tree takes a block of its own (32 lanes, two warps
-    past 32 bodies): one thread runs it serially.
+    coordinates do not set it: the 13-body, 21-coordinate Franka forest runs 27% slower at 32 lanes than at 16.
+
+    A one-body tree has no scan: its lanes stride its coordinates (none for a rest tree, which takes one lane), and
+    every lane runs its chain of loads, so the trees in flight set its kernels' time. The held finish's
+    :data:`HELD_REGISTERS` keep 16 warps a multiprocessor whatever the block, so the group takes the most lanes, up to
+    its coordinates, that keep every tree in one wave (``Use.FEED``), down to one (32 trees a warp); bitwise with
+    eight (test_feather_pgs_tree_stages). Measured (11 kinematic and 10 free boxes a world, every held kernel of both
+    groups, one lane against eight): at 8,192 worlds on the GB300 the prescribed group 132 to 63 us, the free boxes
+    233 to 129; on the PRO 114 to 78 and 201 to 144 (two lanes 134); at 16,384 one-box worlds on the PRO 66 us at
+    eight lanes, 58 at one, 52 at four (the fit's); at 64 worlds eight lanes fastest (the fit's).
+    On the CPU each tree takes a block of its own (32 lanes, two warps past 32 bodies): one thread runs it serially.
     """
     if not device.cuda:
         return 64 if tree.count > 32 else 32
-    least = 1 if tree.count == 1 and int(tree.dof_start[-1]) == 0 else 8
-    lanes = shape(Work(groups, Use.SCAN, width=tree.count, least=least, most=64), device).lanes
+    if tree.count == 1:
+        work = Work(groups, Use.FEED, width=int(tree.dof_start[-1]), least=1, block=32, registers=HELD_REGISTERS)
+    else:
+        work = Work(groups, Use.SCAN, width=tree.count, least=8, most=64)
+    lanes = shape(work, device).lanes
     while lanes < 32 and groups % (32 // lanes):
         lanes *= 2
     return lanes
+
+
+HELD_REGISTERS = 128
+"""The held finish's and repair's registers a lane (122 to 128 on sm_103 and sm_120, NIST's one-body groups):
+16 warps a multiprocessor, the residency :func:`held_lanes` fills with one-body trees."""
 
 
 HELD_HIDING = 2
