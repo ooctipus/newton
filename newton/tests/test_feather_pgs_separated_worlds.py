@@ -123,7 +123,8 @@ class TestSeparatedWorlds(unittest.TestCase):
     def test_patch_finish_releases_the_contacts_of_a_world_that_does_not_act(self):
         """The finish releases the anchor of a contact on its route in a world that does not act (its rows' zero
         load), keeps a capacity-rejected one's and finishes the others; without acts words every world acts."""
-        model, state, _, patches = _patch_fixture([[-0.2, 0, 0], [0.0, 0, 0], [0.2, 0, 0], [0.4, 0, 0]])
+        # Four regions of one contact each, so each contact carries its region's anchor: the finish visits carriers.
+        model, state, _, patches = _patch_fixture([[-1.5, 0, 0], [0.0, 0, 0], [1.5, 0, 0], [3.0, 0, 0]])
         count = 4
         state.body_qd = wp.zeros(model.body_count, dtype=wp.spatial_vector, device="cpu")
         com = wp.zeros(model.body_count, dtype=wp.vec3, device="cpu")

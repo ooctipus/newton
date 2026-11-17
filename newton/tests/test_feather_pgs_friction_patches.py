@@ -1151,7 +1151,7 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
     def test_lazy_publication_precedes_the_release_test(self):
         """Publish the integrated body state before the anchor release test reads it, eager and lazy alike.
 
-        The release test (``_finish_and_store``) reads ``state_out``'s body poses
+        The release test (``_finish_regions``) reads ``state_out``'s body poses
         and twists. Every substep publishes them, with or without lazy
         kinematics. In each arm, the release test's inputs, captured as it
         launches, and the published state must equal forward kinematics of the
@@ -1189,8 +1189,8 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
 
         def release_inputs(kernel, *args, **kwargs):
             """Copy the poses and twists the release test reads, before it runs."""
-            if kernel is friction_patches._finish_and_store and kwargs["inputs"][2] is not None:
-                released.append((kwargs["inputs"][2].numpy().copy(), kwargs["inputs"][3].numpy().copy()))
+            if kernel is friction_patches._finish_regions and kwargs["inputs"][3] is not None:
+                released.append((kwargs["inputs"][3].numpy().copy(), kwargs["inputs"][4].numpy().copy()))
             return launch(kernel, *args, **kwargs)
 
         solver = newton.solvers.SolverFeatherPGS(

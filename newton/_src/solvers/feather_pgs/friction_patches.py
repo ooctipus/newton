@@ -1869,7 +1869,7 @@ class _FrictionPatchState:
         # emptied, and a held frame's builds carry them (_build).
         self.regions = wp.zeros(2, dtype=int, device=device)
         # Whether a store followed the last build: the stored frame then holds that build, and a build of the same
-        # contact frame is held. _finish_and_store sets it and a build clears it.
+        # contact frame is held. _store_frame sets it and a build clears it.
         self.fresh = wp.zeros(1, dtype=int, device=device)
         self.extent = wp.zeros(_CARRY_EXTENT + 1, dtype=int, device=device)
 
@@ -2253,16 +2253,17 @@ class _FrictionPatchState:
 
     def _finish(self, q, q_out, qd_out, com, world, slot, path, slots_needed, routes, dt):
         self._grids(self.pool.launch_rows())
+        # The regions, none more than the live contacts: a thread a region, striding over the frame's count.
         self.pool.launch(
-            _finish_and_store,
+            _finish_regions,
             self.threads,
             inputs=[
                 self.extent,
+                self.regions,
                 q,
                 q_out,
                 qd_out,
                 com,
-                self.body_world,
                 world,
                 slot,
                 path,
@@ -2270,6 +2271,19 @@ class _FrictionPatchState:
                 routes,
                 self.view,
                 dt,
+                self.threads,
+                self.current,
+            ],
+            extent=self.extent[1:2],
+            clamp=True,
+        )
+        self.pool.launch(
+            _store_frame,
+            self.threads,
+            inputs=[
+                self.extent,
+                q,
+                self.body_world,
                 self.threads,
                 self.current,
                 self.previous,
@@ -2560,13 +2574,13 @@ def _finish_contact(
 
 
 @wp.kernel(enable_backward=False)
-def _finish_and_store(
+def _finish_regions(
     extent: wp.array[int],
+    regions: wp.array[int],
     q: wp.array[wp.transform],
     q_out: wp.array[wp.transform],
     qd_out: wp.array[wp.spatial_vector],
     com: wp.array[wp.vec3],
-    body_world: wp.array[int],
     world: wp.array[int],
     slot: wp.array[int],
     path: wp.array[int],
@@ -2576,32 +2590,26 @@ def _finish_and_store(
     dt: float,
     threads: int,
     frame: _PatchFrame,
-    prev: _PatchFrame,
-    previous_world: wp.array[int],
-    previous_q: wp.array[wp.transform],
-    stored: wp.array[int],
-    fresh: wp.array[int],
 ):
-    """Finish each live anchor on its route, then store every slot this frame visits.
+    """Finish each live anchor on its route, a thread a region of the frame (:func:`_build` lists them): only a
+    region's carrier holds an anchor, so the threads visit the anchors and no other contact.
 
-    Finishing writes only the contact's own validity and tangent impulse and
-    reads other contacts only through the row arrays, so finishing and storing
-    contact by contact matches finishing every route before storing. A contact
-    on its route in a world none of whose rows can act (the routes' ``acts`` word: the sweeps left its rows unwritten
-    at zero) releases its anchor, as its zero load does on the complete path. Other
-    anchors without rows (capacity rejection, or a disabled route) keep their
-    history. Thread 0 publishes the stored count and that the stored frame now
-    holds the last build, which this launch never reads.
+    Finishing writes only the carrier's own validity, centre of pressure and twist, and reads other contacts only
+    through the row arrays and its region's ring, so the regions finish in any order. A contact on its route in a
+    world none of whose rows can act (the routes' ``acts`` word: the sweeps left its rows unwritten at zero) releases
+    its anchor, as its zero load does on the complete path. Other anchors without rows (capacity rejection, or a
+    disabled route) keep their history.
     """
-    thread = wp.tid()
+    if routes.enabled[0] + routes.enabled[1] + routes.enabled[2] == 0:
+        return
     live = extent[1]
-    if thread == 0:
-        stored[0] = live
-        fresh[0] = 1
-    finishing = routes.enabled[0] + routes.enabled[1] + routes.enabled[2] > 0
-    carried = extent[_CARRY_EXTENT]
-    for c in range(thread, extent[0], threads):
-        if finishing and c < live and frame.valid[c] != 0:
+    single = regions[0]
+    for region in range(wp.tid(), single + regions[1], threads):
+        listed = region
+        if region >= single:
+            listed = live - 1 - (region - single)
+        c = frame.carrier[frame.regions[listed]]
+        if frame.valid[c] != 0:
             route = _contact_route(routes, slot, path, c)
             if route >= 0 and routes.acts.shape[0] > 0 and routes.acts[world[c]] == 0:
                 frame.valid[c] = 0
@@ -2627,6 +2635,30 @@ def _finish_and_store(
                     dt,
                     _route_first(routes, route),
                 )
+
+
+@wp.kernel(enable_backward=False)
+def _store_frame(
+    extent: wp.array[int],
+    q: wp.array[wp.transform],
+    body_world: wp.array[int],
+    threads: int,
+    frame: _PatchFrame,
+    prev: _PatchFrame,
+    previous_world: wp.array[int],
+    previous_q: wp.array[wp.transform],
+    stored: wp.array[int],
+    fresh: wp.array[int],
+):
+    """Store every slot this frame visits (:func:`_store_contact`), after its anchors are finished
+    (:func:`_finish_regions`). Thread 0 publishes the stored count and that the stored frame now holds the last
+    build, which this launch never reads."""
+    thread = wp.tid()
+    if thread == 0:
+        stored[0] = extent[1]
+        fresh[0] = 1
+    carried = extent[_CARRY_EXTENT]
+    for c in range(thread, extent[0], threads):
         _store_contact(c, carried, q, body_world, frame, prev, previous_world, previous_q)
 
 
