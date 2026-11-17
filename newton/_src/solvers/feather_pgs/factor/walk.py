@@ -12,6 +12,7 @@ table in constant memory: the walk's preludes (:func:`walk_prelude`, :func:`walk
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import hashlib
 from string import Template
@@ -1139,8 +1140,59 @@ def walk_down_prelude(
 def leave_work(trees: int) -> Work:
     """The step's leave (:func:`walk_leave_kernel`): a lane group a tree, of a measured 4 lanes on CUDA. They fetch the
     tree's changes and velocities into L1 in one parallel trip and one of them walks, its records and links asked of
-    L1 :data:`WALK_TOUCH` items ahead (WALK_MAPPING §4, B5: 4 lanes ran at or under 8 on g1, franka and allegro)."""
+    L1 :data:`WALK_TOUCH` items ahead (WALK_MAPPING §4, B5: 4 lanes ran at or under 8 on g1, franka and allegro). A
+    one-body tree keeps them: NIST's 81,920 free parts at one lane ran the leave 26% slower on the PRO (30.7 to 38.5
+    us a substep), 16% faster on the GB300."""
     return Work(trees, lanes=4)
+
+
+@dataclasses.dataclass(frozen=True)
+class TreeLanes:
+    """The walk's refresh's lane groups, by the trees' bodies: the trees of more than one body first (``split`` of them,
+    ``first`` lanes a tree), then the one-body trees (``second`` lanes a tree) from thread ``boundary``, the first
+    part's whole blocks of ``block`` threads, so no lane group straddles a block. A one-body tree has no chain to share
+    among lanes: its group is its own shape's, not the articulated trees' (:func:`tree_lane` reads a thread's place).
+
+    Args:
+        trees: The launch's trees.
+        split: The trees of more than one body, which come first.
+        first: The lanes of an articulated tree.
+        second: The lanes of a one-body tree.
+        block: Threads a block, a multiple of both lane counts.
+    """
+
+    trees: int
+    split: int
+    first: int
+    second: int
+    block: int
+
+    @property
+    def boundary(self) -> int:
+        """The first thread of the one-body trees: the articulated trees' whole blocks."""
+        return -(-self.split * self.first // self.block) * self.block
+
+    @property
+    def threads(self) -> int:
+        """The launch's threads: every tree's group, in whole blocks."""
+        return self.boundary + -(-(self.trees - self.split) * self.second // self.block) * self.block
+
+    def inputs(self) -> list[int]:
+        """The kernel's lane operands (:func:`tree_lane`): split, first, second, boundary."""
+        return [self.split, self.first, self.second, self.boundary]
+
+
+@wp.func
+def tree_lane(tid: int, split: int, first: int, second: int, boundary: int) -> wp.vec3i:
+    """Thread ``tid``'s tree, lane and lanes in a :class:`TreeLanes` launch; the tree is -1 for a thread of the
+    articulated trees' last block past them."""
+    if tid >= boundary:
+        t = tid - boundary
+        return wp.vec3i(split + t // second, t - (t // second) * second, second)
+    tree = tid // first
+    if tree >= split:
+        tree = -1
+    return wp.vec3i(tree, tid - (tid // first) * first, first)
 
 
 def leave_ahead(walk: WalkClass) -> int:
@@ -1473,6 +1525,9 @@ def walk_work(trees: int, bodies: int, joins: int) -> Work:
 
     Measured on both GPUs (``SP/core/FL/HANDOFF_ZR.md``): with more trees than the device holds a group of four
     wins (g1, kuka, franka-reach at 16,384 trees: 4 lanes), with fewer the batch widens (chain_106 at 4,096: 16).
+    A one-body tree's chain is its one body (``bodies`` 1, no join): one lane, so the one-body trees are shaped apart
+    from the articulated ones (:class:`TreeLanes`; NIST at 8,192 worlds, 81,920 free parts beside 8,192 robots: the
+    refresh 95.6 to 42.8 us on the GB300).
 
     Args:
         trees: The trees the launch walks.
@@ -1723,9 +1778,9 @@ def walk_tables(classes) -> tuple[tuple[tuple[int, ...], tuple[int, ...]], ...]:
 
 @functools.cache
 def walk_step_kernel(classes: tuple[WalkClass, ...]) -> wp.Kernel:
-    """The walk's refresh of the walking classes ``classes``, a group of ``lanes`` threads per tree
-    (:meth:`TreeFactor.walk_step`), float32, at the poses ``body_q`` holds, on the trees the refresh just factored
-    (``mass_update_mask``; every other tree returns): the step's geometry the finish published (``walk_now``,
+    """The walk's refresh of the walking classes ``classes``, a lane group per tree (a :class:`TreeLanes` launch:
+    an articulated tree's :func:`walk_work` lanes, a one-body tree's own; :meth:`TreeFactor.walk_step`), float32, at
+    the poses ``body_q`` holds, on the trees the refresh just factored (``mass_update_mask``; every other tree returns): the step's geometry the finish published (``walk_now``,
     ``walk_now_link``, ``walk_now_com``) becomes the factor's frames, with the articulation's origin they are relative
     to, and the group runs the refresh (the inward pass, the lane feed's batches; each tree's path and join slots its
     class's in constant memory, ``walk_class``), so the walk and ``L`` are one factor. Its first thread advances the
@@ -1763,7 +1818,10 @@ def walk_step_kernel(classes: tuple[WalkClass, ...]) -> wp.Kernel:
 
     def walk_step(
         arts: wp.array[int],
-        lanes: int,
+        split: int,
+        first: int,
+        second: int,
+        boundary: int,
         mass_update_mask: wp.array[int],
         articulation_start: wp.array[int],
         articulation_joint_end: wp.array[int],
@@ -1787,9 +1845,14 @@ def walk_step_kernel(classes: tuple[WalkClass, ...]) -> wp.Kernel:
         walk_link: wp.array2d[float],
         walk_origin: wp.array[wp.vec3],
     ):
-        tree, lane = wp.tid()
-        if tree == 0 and lane == 0:
+        tid = wp.tid()
+        if tid == 0:
             clock_advance(clock, dt)
+        # The thread's tree, lane and lanes (TreeLanes): the articulated trees' groups, then the one-body trees'.
+        place = tree_lane(tid, split, first, second, boundary)
+        tree, lane, lanes = place[0], place[1], place[2]
+        if tree < 0 or tree >= arts.shape[0]:
+            return
         art = arts[tree]
         if mass_update_mask[art] == 0:
             return

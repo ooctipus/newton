@@ -62,6 +62,7 @@ from .factor.walk import (
     WALK_COORDINATE,
     WALK_JOIN_SLOTS,
     WALK_LINK,
+    TreeLanes,
     TreeWalk,
     WalkTrees,
     leave_work,
@@ -799,14 +800,13 @@ class TreeFactor:
         """
         model, forest = self.model, self.forest
         device = model.device
-        free = forest.is_free_rigid_host if forest.is_free_rigid is not None else np.zeros(1, dtype=np.int32)
         arts = np.asarray(articulations, dtype=np.int32)
-        if forest.is_free_rigid is not None:
-            # The free rigid bodies (one-body trees) after the articulated trees, so no group of an articulated
-            # tree shares its warp with one.
-            arts = np.concatenate([arts[free[arts] == 0], arts[free[arts] != 0]]).astype(np.int32)
         start = model.articulation_start.numpy()
         end = forest.articulation_joint_end_host
+        # The trees of more than one body first, then the one-body trees (free rigid bodies among them): the
+        # refresh gives each part its own lane groups (TreeLanes), whole blocks apart; the leave's groups are one.
+        single = end[arts] - start[arts] <= 1
+        arts = np.concatenate([arts[~single], arts[single]]).astype(np.int32)
         qd_start = model.joint_qd_start.numpy()
         joint_parent, joint_child = model.joint_parent.numpy(), model.joint_child.numpy()
         joint_of = np.full(max(int(model.body_count), 1), -1, dtype=np.int64)
@@ -865,12 +865,13 @@ class TreeFactor:
         held = max((walk.slots[1] for walk in classes), default=0)
         if held > WALK_JOIN_SLOTS:
             raise ValueError(f"The walk holds at most {WALK_JOIN_SLOTS} joins of a tree at once, a tree needs {held}")
-        # The refresh's launch (walk_work): on CUDA a lane a body of a batch and a join slot, the trees in flight
-        # those with a chain to walk (a free rigid body leaves its group after the batch's first body).
+        # The refresh's launch (walk_work): on CUDA a lane a body of a batch and a join slot, the articulated trees'
+        # groups by their own count; a one-body tree's chain is its one body, a group of its own shape (TreeLanes).
         bodies = max([1, *(len(walk.parent) for walk in classes)])
-        sizes = (end[arts] - start[arts]).astype(np.int64)
-        walked = int(np.count_nonzero(sizes > 1)) or int(arts.size)
-        self.walk_shape = execution.shape(walk_work(walked, bodies, held), memory.device(device))
+        split = int(np.count_nonzero(~single))
+        first = execution.shape(walk_work(split or 1, bodies, held), memory.device(device))
+        second = execution.shape(walk_work(max(arts.size - split, 1), 1, 0), memory.device(device))
+        self.walk_shape = TreeLanes(int(arts.size), split, first.lanes, second.lanes, first.block)
         self.walk_refresh = walk_step_kernel(self.walk_classes)
         # The one flag every walk reader's text is chosen by: whether a record (and a step column) can have a side.
         self.walk_side = both
@@ -1048,13 +1049,12 @@ class TreeFactor:
         coordinates' factor. A tree that does not refresh takes nothing here. Its first thread advances the step's clock
         past this step (``dt``); a model where no tree walks advances it alone (:meth:`advance_clock`)."""
         model = self.model
-        lanes = self.walk_shape.lanes
         wp.launch(
             self.walk_refresh,
-            dim=(self.walk_arts.shape[0], lanes),
+            dim=self.walk_shape.threads,
             inputs=[
                 self.walk_arts,
-                lanes,
+                *self.walk_shape.inputs(),
                 self.mass_update_mask,
                 model.articulation_start,
                 self.forest.articulation_joint_end,
