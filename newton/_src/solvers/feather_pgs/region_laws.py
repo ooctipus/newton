@@ -821,6 +821,45 @@ def frame_twist(v: wp.vec3, w: wp.vec3, r: wp.vec3, n: wp.vec3, t0: wp.vec3, t1:
     return wp.vec3(wp.dot(n, at), wp.dot(t0, w), wp.dot(t1, w)), wp.vec3(wp.dot(t0, at), wp.dot(t1, at), wp.dot(n, w))
 
 
+IDLE_MARGIN = wp.constant(1.00390625)
+"""The idle pass's margin, ``1 + 2^-8`` (:func:`idle_reach`, :func:`twist_reach`): far beyond the rounding of the
+bound's terms and of the closing test it stands for (a few ``2^-24`` relative to their magnitudes)."""
+
+
+@REGION_LAW.law
+def twist_reach(v: wp.vec3, w: wp.vec3) -> float:
+    """A bound of a body's twist ``|(v, w)|`` as computed: the root of its rounded square, times :data:`IDLE_MARGIN`."""
+    return wp.sqrt(wp.dot(v, v) + wp.dot(w, w)) * IDLE_MARGIN
+
+
+@REGION_LAW.law
+def idle_reach(cand: wp.array[wp.vec4], g0: int, g1: int, arm: wp.vec3, arm_b: wp.vec3, second: bool) -> wp.vec2:
+    """The coefficients ``(c_a, c_b)`` up to which a region that holds nothing stays open: while ``c_a R_a + c_b R_b
+    <= 1``, ``R`` its bodies' :func:`twist_reach`, no candidate of ``cand[g0:g1]`` closes (``b`` its right-hand side).
+
+    A candidate's closing ``n . (v + w x arm) + a1 t0 . w + a2 t1 . w + b`` (:func:`frame_twist`, the frame unit) moves
+    from ``b`` by at most ``(1 + |arm| + |a1| + |a2|) |(v, w)|`` a body. So ``c = (1 + |arm| + max |a1| + |a2|) / min b``,
+    times :data:`IDLE_MARGIN` cubed, which covers the rounding of the bound and of the test: the test's computed
+    closing stays positive. A candidate whose ``b`` is not positive (or NaN) gives infinite coefficients, which no
+    twist passes; a region without a second body has ``c_b = 0``."""
+    least = float(_NONE)
+    lever = float(0.0)
+    passable = bool(True)
+    for i in range(g0, g1):
+        record = cand[i]
+        if not (record[2] > 0.0):
+            passable = False
+        least = wp.min(least, record[2])
+        lever = wp.max(lever, wp.abs(record[0]) + wp.abs(record[1]))
+    if not passable:
+        return wp.vec2(wp.inf, wp.inf)
+    scale = IDLE_MARGIN * IDLE_MARGIN * IDLE_MARGIN / least
+    c_b = float(0.0)
+    if second:
+        c_b = (1.0 + wp.length(arm_b) + lever) * scale
+    return wp.vec2((1.0 + wp.length(arm) + lever) * scale, c_b)
+
+
 @REGION_LAW.law
 def frame_wrench(
     wrench: wp.vec3, phi: wp.vec3, r: wp.vec3, n: wp.vec3, t0: wp.vec3, t1: wp.vec3

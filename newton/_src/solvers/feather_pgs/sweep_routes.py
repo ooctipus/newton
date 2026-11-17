@@ -829,6 +829,7 @@ REGION_OPERANDS = (
     ("reg_spring", wp.array[wp.vec3]),
     ("reg_state", wp.array[int]),
     ("reg_stamp", wp.array[int]),
+    ("reg_reach", wp.array[wp.vec2]),
     ("body_seen", wp.array[wp.spatial_vector]),
     ("body_version", wp.array[int]),
     ("blk_pair", wp.array[wp.vec2i]),
@@ -921,6 +922,7 @@ if (moved) {{
     int body = -1, first = 0, version = 0;
     wp::spatial_vector u;
     wp::vec3 v, w;
+    float reach = 0.0f;
     const wp::spatial_vector* basis = body_basis.data;
     // A chain world walks its order itself (reg_order: a body's regions together, so its twist stays kept), as one
     // span; the others take the levels.
@@ -942,22 +944,34 @@ if (moved) {{
             }}
             v = wp::vec3(wp::dot(basis[0], u), wp::dot(basis[1], u), wp::dot(basis[2], u));
             w = wp::vec3(wp::dot(basis[3], u), wp::dot(basis[4], u), wp::dot(basis[5], u));
+            reach = RegionLaw::twist_reach(v, w);
         }}
-        // A region between two movable bodies: its second body's walk coordinates and version.
+        // A region between two movable bodies: its second body's walk coordinates, version and twist.
         int first_b = -1, version_b = 0;
         wp::spatial_vector u_b;
         const wp::spatial_vector* basis_b = basis;
+        wp::vec3 v_b, w_b;
+        float reach_b = 0.0f;
         if (f_b >= 0) {{
             first_b = body_first.data[f_b];
             basis_b = body_basis.data + (size_t)f_b * 6;
             {{
 {second_body}
             }}
+            v_b = wp::vec3(wp::dot(basis_b[0], u_b), wp::dot(basis_b[1], u_b), wp::dot(basis_b[2], u_b));
+            w_b = wp::vec3(wp::dot(basis_b[3], u_b), wp::dot(basis_b[4], u_b), wp::dot(basis_b[5], u_b));
+            reach_b = RegionLaw::twist_reach(v_b, w_b);
         }}
         const int state = reg_state.data[g];
         if (state == version && (f_b < 0 || reg_stamp.data[g] == version_b)) continue;
         const int kind = reg_kind.data[g];
 {pair_block}
+        // A region that holds nothing stays open while its bodies' twists stay within its idle reach: no candidate
+        // can close (region_laws.idle_reach), so the closing test below would leave it.
+        if (state == {int(REGION_IDLE)}) {{
+            const wp::vec2 idle = reg_reach.data[g];
+            if (idle[0] * reach + idle[1] * reach_b <= 1.0f) continue;
+        }}
         const float sign = (kind & {int(KIND_SECOND)}) != 0 ? -1.0f : 1.0f;
         const wp::mat33 frame = reg_frame.data[g];
         const wp::vec3 n(frame.data[0][0], frame.data[0][1], frame.data[0][2]);
@@ -967,8 +981,6 @@ if (moved) {{
         const auto twist = RegionLaw::frame_twist(v, w, arm, n, t0, t1);
         wp::vec3 sn = wp::mul(twist.v0, sign), sf = wp::mul(twist.v1, sign);
         if (f_b >= 0) {{
-            const wp::vec3 v_b(wp::dot(basis_b[0], u_b), wp::dot(basis_b[1], u_b), wp::dot(basis_b[2], u_b));
-            const wp::vec3 w_b(wp::dot(basis_b[3], u_b), wp::dot(basis_b[4], u_b), wp::dot(basis_b[5], u_b));
             const auto twist_b = RegionLaw::frame_twist(v_b, w_b, arm_b, n, t0, t1);
             sn = wp::sub(sn, wp::mul(twist_b.v0, sign));
             sf = wp::sub(sf, wp::mul(twist_b.v1, sign));
@@ -1000,6 +1012,7 @@ if (moved) {{
             if (moved) {{
                 v = wp::vec3(wp::dot(basis[0], u), wp::dot(basis[1], u), wp::dot(basis[2], u));
                 w = wp::vec3(wp::dot(basis[3], u), wp::dot(basis[4], u), wp::dot(basis[5], u));
+                reach = RegionLaw::twist_reach(v, w);
             }}
         }}
         if (f_b >= 0) {{

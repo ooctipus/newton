@@ -37,6 +37,16 @@ def tangent_basis(n):
 
 
 @wp.kernel(enable_backward=False)
+def _region_reach(
+    cand: wp.array[wp.vec4], spans: wp.array[wp.vec2i], arms: wp.array[wp.vec3], reach: wp.array[wp.vec2]
+):
+    """Each region's idle reach (:func:`.region_laws.idle_reach`), as the listing's fill forms it (no second body)."""
+    g = wp.tid()
+    span = spans[g]
+    reach[g] = region_laws.idle_reach(cand, span[0], span[1], arms[g], wp.vec3(0.0), False)
+
+
+@wp.kernel(enable_backward=False)
 def _region_terms(
     body_inertia: wp.array2d[wp.mat33],
     region_body: wp.array[int],
@@ -176,6 +186,9 @@ class Bodies:
             outputs=terms,
             device=device,
         )
+        cands, cand_spans = array(self.cands, wp.vec4), array(self.cand_spans, wp.vec2i)
+        reach = wp.zeros(regions, dtype=wp.vec2, device=device)
+        wp.launch(_region_reach, dim=regions, inputs=[cands, cand_spans, arms], outputs=[reach], device=device)
         wp.launch(
             region_sweep.sweep_closed_bodies,
             dim=bodies,
@@ -187,13 +200,13 @@ class Bodies:
                 wp.array(np.asarray(self.bases, dtype=np.float32), dtype=wp.spatial_vector, device=device),
                 frames,
                 arms,
-                array(self.cand_spans, wp.vec2i),
+                cand_spans,
                 laws,
                 array(self.bfs, wp.vec3),
                 array(self.kinds, int),
                 array(candidates + 3 * np.arange(regions), int),
                 *terms,
-                array(self.cands, wp.vec4),
+                cands,
                 array(np.arange(candidates), int),
                 sweeps,
                 region_sweep.REGION_TOLERANCE,
@@ -205,6 +218,7 @@ class Bodies:
                 array(-np.ones((regions, 3)), wp.vec3i),
                 wp.zeros(regions, dtype=wp.vec3, device=device),
                 array(np.full(regions, int(region_sweep.REGION_IDLE)), int),
+                reach,
                 impulses,
                 change,
             ],

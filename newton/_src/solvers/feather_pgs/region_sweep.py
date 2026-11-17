@@ -49,8 +49,10 @@ from .region_laws import (
     frame_response,
     frame_twist,
     frame_wrench,
+    idle_reach,
     region_visit,
     stick_terms,
+    twist_reach,
 )
 from .row_build import contact_row_law, write_contact_row
 from .row_kernels import RIGID_SPEED_ROWS, RowBias, row_bias
@@ -195,6 +197,7 @@ def sweep_closed_bodies(
     reg_set: wp.array[wp.vec3i],
     reg_spring: wp.array[wp.vec3],
     reg_state: wp.array[int],
+    reg_reach: wp.array[wp.vec2],
     impulses: wp.array[float],
     lane_change: wp.array[wp.spatial_vector],
 ):
@@ -243,7 +246,8 @@ def sweep_closed_bodies(
                 if state != version:
                     if state >= REGION_LOOSE:
                         live = 1
-                    else:
+                    elif not (reg_reach[g][0] * twist_reach(v, w) <= 1.0 and reg_reach[g][1] == 0.0):
+                        # Within its idle reach a region that holds nothing stays open (region_laws.idle_reach).
                         frame = reg_frame[g]
                         arm = reg_arm[g]
                         at = v + wp.cross(w, arm)
@@ -1066,6 +1070,7 @@ def fill_regions(
     reg_set: wp.array[wp.vec3i],
     reg_spring: wp.array[wp.vec3],
     reg_state: wp.array[int],
+    reg_reach: wp.array[wp.vec2],
 ):
     """The placed regions formed (:func:`order_regions`; the first ``cursor[0]`` of the stream), ``threads`` lanes
     striding over them.
@@ -1076,7 +1081,8 @@ def fill_regions(
     incident velocity the frame's); its friction rows' right-hand sides are the row law's with the predictor's
     slips and spin. Each member's rows take their laws where its front end is formed (:func:`member_laws`), the
     carrier's first, so the region reads them: the free bodies' writer leaves the regions' rows their kinds alone. It
-    starts holding nothing.
+    starts holding nothing, with the coefficients up to which its bodies' twists leave it open
+    (:func:`.region_laws.idle_reach`), formed once its candidates are.
 
     A region's candidates are the work a region has, 1 to tens of them, and a warp's 32 regions would hold its lanes
     to its largest: each lane forms its region's frame, terms and records (:func:`fill_region_head`), then the warp
@@ -1149,8 +1155,10 @@ def fill_regions(
                 mine = (wp.uint64(1) << wp.uint64(hi)) - (wp.uint64(1) << wp.uint64(lo))
                 if (spring_bits & mine) != wp.uint64(0):
                     kind = kind | KIND_SPRINGS
+        lane_sync(_FILL_LANES)
         if holds:
             reg_kind[g] = kind
+            reg_reach[g] = idle_reach(cand, c0, c0 + size, reg_arm[g], reg_arm_b[g], reg_body[g][1] >= 0)
         g += threads
 
 
@@ -1637,6 +1645,7 @@ _REGION_FIELDS = (
     ("reg_spring", wp.vec3, 1),
     ("reg_state", wp.int32, 1),
     ("reg_stamp", wp.int32, 1),
+    ("reg_reach", wp.vec2, 1),
     ("reg_level", wp.int32, 1),
     ("reg_order", wp.int32, 1),
     ("level_region", wp.int32, 1),
@@ -1926,6 +1935,7 @@ class Regions:
                 self.reg_set,
                 self.reg_spring,
                 self.reg_state,
+                self.reg_reach,
             ],
             **live,
         )
@@ -2061,6 +2071,7 @@ class Regions:
                 self.reg_set,
                 self.reg_spring,
                 self.reg_state,
+                self.reg_reach,
                 impulses.reshape((impulses.size,)),
                 self.lane_change,
             ],
@@ -2118,7 +2129,7 @@ class Regions:
         names += " reg_frame reg_arm reg_arm_b reg_body reg_cand reg_law reg_wnn reg_wnf reg_wff reg_ball_values"
         names += " reg_ball_vectors reg_ginv reg_k reg_lk reg_lw"
         names += " reg_bf reg_kind reg_row cand cand_row reg_wrench reg_phi reg_set reg_spring reg_state reg_stamp"
-        names += " body_seen body_version blk_pair blk_blob blk_L blk_d blk_wrench blk_stage blk_istage"
+        names += " reg_reach body_seen body_version blk_pair blk_blob blk_L blk_d blk_wrench blk_stage blk_istage"
         return {**{name: getattr(self, name) for name in names.split()}, "region_cfm": float(self.options.pgs_cfm)}
 
 
