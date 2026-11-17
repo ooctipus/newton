@@ -694,12 +694,14 @@ class TestQ11Stack(unittest.TestCase):
         model = builder.finalize(device=DEVICE)
         solver, state = _roll(model, 120, pgs_iterations=sweeps, mf_max_constraints=12 * count + 12)
         mass = float(model.body_mass.numpy()[0])
-        rows = line_rows(solver, 0)
-        lam = solver.placement.impulses.numpy()[0, rows]
-        kinds = solver.placement.row_type.numpy()[0, rows]
-        sides = solver.placement.row_sides.numpy()[0, rows]
-        ground = (kinds == 0) & ((sides[:, 0] < 0) | (sides[:, 1] < 0))
-        return float(np.sum(lam[ground])) / (H * mass * G0 * count), float(state.body_q.numpy()[-1, 2]) - (
+        # The ground's normal rows: the contacts' with rows whose one side is the ground (no articulation), each at its
+        # slot of the world's line (a region member's row stores no sides: no kernel reads them).
+        placement = solver.placement
+        slot = placement.contact_slot.numpy()
+        art_a, art_b = placement.contact_art_a.numpy(), placement.contact_art_b.numpy()
+        ground = (slot >= 0) & (placement.contact_world.numpy() == 0) & ((art_a < 0) | (art_b < 0))
+        lam = placement.impulses.numpy()[0, slot[ground]]
+        return float(np.sum(lam)) / (H * mass * G0 * count), float(state.body_q.numpy()[-1, 2]) - (
             half + 2.0 * half * (count - 1)
         )
 

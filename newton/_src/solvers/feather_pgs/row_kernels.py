@@ -201,34 +201,55 @@ class RowBias:
     material: int
 
 
-@wp.func
-def row_bias(rows: DenseRows, bias: RowBias, line: int, i: int, incident: float):
-    """Row ``i``'s rhs by its row law (:func:`.row_laws.row_rhs`, its parameters ``bias``) from its records, and a
-    bouncing contact's rebound from its incident velocity ``J v_hat`` (:func:`.row_laws.contact_restitution_rhs`,
-    weight 1); a material contact (its writer stored its rhs and compliance) keeps its rhs. ``weighted`` rows store
-    their regularization weight."""
-    kind = rows.row_type[line, i]
-    if bias.material != 0 and kind == ROW_CONTACT:
-        if rows.row_eps[line, i] != 0.0:
-            return
-    inv_dt = 1.0 / bias.dt
-    phi = rows.phi[line, i]
-    target = rows.target[line, i]
-    rhs, row_w = row_rhs(
-        kind, phi, rows.row_beta[line, i], target, inv_dt, 1.0, bias.speculative_scale, 1.0, bias.contact_w
-    )
-    if kind == ROW_CONTACT:
-        restitution = rows.restitution[line, i]
-        if restitution > 0.0:
-            fires, bounce = contact_restitution_rhs(
-                phi, incident - target, target, restitution, bias.dt, bias.restitution_threshold
-            )
-            if fires:
-                rhs = bounce
-                row_w = 1.0
-    rows.rhs[line, i] = rhs
-    if bias.weighted != 0:
-        rows.row_w[line, i] = row_w
+def _row_bias(stored: bool) -> wp.Function:
+    """Row ``i``'s rhs by its row law (:func:`.row_laws.row_rhs`, its parameters ``bias``), and a bouncing contact's
+    rebound from its incident velocity ``J v_hat`` (:func:`.row_laws.contact_restitution_rhs`, weight 1); a material
+    contact (its writer stored its rhs and compliance) keeps its rhs. ``weighted`` rows store their regularization
+    weight. Its law words (``phi``, ``beta``, ``target``, ``restitution``) are its records' where ``stored``
+    (:data:`row_bias`, which takes none), else given by its writer (:data:`row_bias_words`: a region member's row,
+    whose words no later kernel reads, :func:`.row_build.contact_row_writer`)."""
+
+    def bias_row(
+        rows: DenseRows,
+        bias: RowBias,
+        line: int,
+        i: int,
+        incident: float,
+        phi: float = 0.0,
+        beta: float = 0.0,
+        target: float = 0.0,
+        restitution: float = 0.0,
+    ):
+        kind = rows.row_type[line, i]
+        if bias.material != 0 and kind == ROW_CONTACT:
+            if rows.row_eps[line, i] != 0.0:
+                return
+        inv_dt = 1.0 / bias.dt
+        if wp.static(stored):
+            phi = rows.phi[line, i]
+            target = rows.target[line, i]
+            beta = rows.row_beta[line, i]
+        rhs, row_w = row_rhs(kind, phi, beta, target, inv_dt, 1.0, bias.speculative_scale, 1.0, bias.contact_w)
+        if kind == ROW_CONTACT:
+            if wp.static(stored):
+                restitution = rows.restitution[line, i]
+            if restitution > 0.0:
+                fires, bounce = contact_restitution_rhs(
+                    phi, incident - target, target, restitution, bias.dt, bias.restitution_threshold
+                )
+                if fires:
+                    rhs = bounce
+                    row_w = 1.0
+        rows.rhs[line, i] = rhs
+        if bias.weighted != 0:
+            rows.row_w[line, i] = row_w
+
+    bias_row.__name__ = bias_row.__qualname__ = "row_bias" if stored else "row_bias_words"
+    return wp.func(bias_row)
+
+
+row_bias = _row_bias(stored=True)
+row_bias_words = _row_bias(stored=False)
 
 
 RIGID_SPEED_ROWS = wp.constant(2)

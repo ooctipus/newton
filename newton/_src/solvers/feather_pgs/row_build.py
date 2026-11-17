@@ -95,12 +95,17 @@ def contact_normal_beta(data: ContactInput, c: int, body_a: int, body_b: int, ph
 
 
 @cache
-def contact_row_writer(kinds: bool = True, laws: bool = True) -> wp.Function:
+def contact_row_writer(kinds: bool = True, laws: bool = True, stores: bool = True) -> wp.Function:
     """Write contact ``c``'s row ``row`` (0 the normal, 1 and 2 the tangents, 3 the spin row under contact torsion) at
     ``slot + row``: with ``kinds`` its kind (its type and parent, what the warm start reads before any reader; a
     normal's parent its ring's next row, :func:`.friction_patches.ring_parent`), with ``laws`` its other records from
     its front end ``frame`` (:func:`.contact_input.contact_frame`) and, ``with_rhs``, its position-pass ``rhs`` and CFM
-    seed, returning ``(body_a, body_b, direction, row_point)``; both, :data:`write_contact_row`.
+    seed, returning ``(body_a, body_b, direction, row_point)``; both, :data:`write_contact_row`. A row's law words
+    that only its rhs reads (``phi``, ``beta``, ``target``, ``restitution``) and its sides are stored where ``stores``,
+    for the readers of the one writer's rows (the seeds' rhs, the streamed records); a region member's rows have no
+    reader of them after their fill, which forms their rhs from the words the writer returns in place
+    (:func:`.region_sweep.member_laws`: :data:`member_row_law`, :data:`member_contact_row`), ``(phi, beta, target,
+    restitution)``, and takes no ``with_rhs``.
 
     A tangent row follows the friction row law (:func:`.friction_patches.patch_tangent_row`): the anchor's tangential
     displacement as its gap, the law's beta and the undivided coefficient ``mu``. A normal row's rhs is
@@ -152,6 +157,10 @@ def contact_row_writer(kinds: bool = True, laws: bool = True) -> wp.Function:
         friction_mu = mu
         if stiffness > 0.0 and data.friction_weight[data.contact_of[c]] > 0.0:
             friction_mu *= data.friction_weight[data.contact_of[c]]
+        if wp.static(not stores):
+            word_phi = float(0.0)
+            word_beta = float(0.0)
+            word_restitution = float(0.0)
         if row == CONTACT_SPIN_ROW:
             spin_phi, spin_beta, spin_mu = patch_spin_row(law, c, friction_mu, contact_torsion_mu(data, c))
             if wp.static(kinds):
@@ -159,9 +168,13 @@ def contact_row_writer(kinds: bool = True, laws: bool = True) -> wp.Function:
                 data.row_parent[line, r] = slot
             if wp.static(laws):
                 data.row_mu[line, r] = spin_mu
-                data.row_beta[line, r] = spin_beta
-                data.phi[line, r] = spin_phi
-                data.restitution[line, r] = 0.0
+                if wp.static(stores):
+                    data.row_beta[line, r] = spin_beta
+                    data.phi[line, r] = spin_phi
+                    data.restitution[line, r] = 0.0
+                else:
+                    word_phi = spin_phi
+                    word_beta = spin_beta
         elif row == 0:
             if wp.static(laws):
                 normal_beta = contact_normal_beta(data, c, body_a, body_b, phi)
@@ -170,9 +183,14 @@ def contact_row_writer(kinds: bool = True, laws: bool = True) -> wp.Function:
                 data.row_parent[line, r] = ring_parent(law.patches, data.world, data.slot, data.path, c, data.path[c])
             if wp.static(laws):
                 data.row_mu[line, r] = mu
-                data.row_beta[line, r] = normal_beta
-                data.phi[line, r] = phi
-                data.restitution[line, r] = restitution
+                if wp.static(stores):
+                    data.row_beta[line, r] = normal_beta
+                    data.phi[line, r] = phi
+                    data.restitution[line, r] = restitution
+                else:
+                    word_phi = phi
+                    word_beta = normal_beta
+                    word_restitution = restitution
         else:
             tangent_phi, beta = patch_tangent_row(law, c, row)
             if wp.static(kinds):
@@ -180,9 +198,13 @@ def contact_row_writer(kinds: bool = True, laws: bool = True) -> wp.Function:
                 data.row_parent[line, r] = slot
             if wp.static(laws):
                 data.row_mu[line, r] = friction_mu
-                data.row_beta[line, r] = beta
-                data.phi[line, r] = tangent_phi
-                data.restitution[line, r] = 0.0
+                if wp.static(stores):
+                    data.row_beta[line, r] = beta
+                    data.phi[line, r] = tangent_phi
+                    data.restitution[line, r] = 0.0
+                else:
+                    word_phi = tangent_phi
+                    word_beta = beta
         if wp.static(laws):
             if data.material != 0 or data.authored != 0:
                 eps = float(0.0)
@@ -203,9 +225,12 @@ def contact_row_writer(kinds: bool = True, laws: bool = True) -> wp.Function:
                     data.row_w[line, r] = 1.0 / (1.0 + rho)
                     eps = -rho
                 data.row_eps[line, r] = eps
-            data.target[line, r] = target
-            data.sides[line, r] = row_sides(art_a, art_b, data.response_dofs)
-        if wp.static(laws):
+            if wp.static(stores):
+                data.target[line, r] = target
+                data.sides[line, r] = row_sides(art_a, art_b, data.response_dofs)
+        if wp.static(laws and not stores):
+            return word_phi, word_beta, target, word_restitution
+        if wp.static(laws and stores):
             if with_rhs:
                 inv_dt = 1.0 / data.dt
                 rhs = float(0.0)
@@ -243,7 +268,13 @@ def contact_row_writer(kinds: bool = True, laws: bool = True) -> wp.Function:
                     data.row_w[line, slot + row] = weight
             return body_a, body_b, direction, row_point
 
-    name = {(True, True): "write_contact_row", (True, False): "contact_row_kind"}.get((kinds, laws), "contact_row_law")
+    name = {
+        (True, True, True): "write_contact_row",
+        (True, False, True): "contact_row_kind",
+        (False, True, True): "contact_row_law",
+        (True, True, False): "member_contact_row",
+        (False, True, False): "member_row_law",
+    }[(kinds, laws, stores)]
     writer.__name__ = writer.__qualname__ = name
     return wp.func(writer)
 
@@ -251,3 +282,5 @@ def contact_row_writer(kinds: bool = True, laws: bool = True) -> wp.Function:
 write_contact_row = contact_row_writer()
 contact_row_kind = contact_row_writer(laws=False)
 contact_row_law = contact_row_writer(kinds=False)
+member_contact_row = contact_row_writer(stores=False)
+member_row_law = contact_row_writer(kinds=False, stores=False)

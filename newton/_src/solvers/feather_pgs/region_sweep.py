@@ -54,8 +54,8 @@ from .region_laws import (
     stick_terms,
     twist_reach,
 )
-from .row_build import contact_row_law, write_contact_row
-from .row_kernels import RIGID_SPEED_ROWS, RowBias, row_bias
+from .row_build import member_contact_row, member_row_law
+from .row_kernels import RIGID_SPEED_ROWS, RowBias, row_bias_words
 from .row_laws import ROW_CONTACT, ROW_TORSION
 from .row_records import DenseRows, row_sides
 
@@ -813,18 +813,22 @@ def region_terms(
 def member_laws(rows: DenseRows, bias: RowBias, data: ContactInput, law: PatchRowLaw, frame: ContactFrame, c: int):
     """A region member's rows, contact ``c`` at its front end ``frame``, as the free bodies' rows hold them: each row's
     kind (its normal row's parent is the patch link's ring), its records by the contact law
-    (:func:`.row_build.write_contact_row`), its friction and spin rows' rhs by the row law
-    (:func:`.row_kernels.row_bias`, no incident velocity: the region's own slips enter where the fill reads them)."""
+    (:func:`.row_build.contact_row_writer`), its friction and spin rows' rhs by the row law
+    (:func:`.row_kernels.row_bias_words`, no incident velocity: the region's own slips enter where the fill reads
+    them). A row stores what a later kernel reads: its kind, parent, coefficient, compliance, rhs and weight; the law
+    words only its rhs reads go from the writer to the rhs in place, and its normal row's, ``(phi, beta, target,
+    restitution)``, are returned for its rhs at the region's incident velocity (:func:`fill_region_member`)."""
     slot = data.slot[c]
     line = rows.first[data.world[c]]
     count = int(1)
     if data.slots_needed[c] >= 3:
         count = data.slots_needed[c]
     rows.row_type[line, slot] = ROW_CONTACT
-    contact_row_law(data, law, frame, c, 0, False)
+    phi, beta, target, restitution = member_row_law(data, law, frame, c, 0, False)
     for row in range(1, count):
-        write_contact_row(data, law, frame, c, row, False)
-        row_bias(rows, bias, line, slot + row, 0.0)
+        row_phi, row_beta, row_target, row_restitution = member_contact_row(data, law, frame, c, row, False)
+        row_bias_words(rows, bias, line, slot + row, 0.0, row_phi, row_beta, row_target, row_restitution)
+    return phi, beta, target, restitution
 
 
 @wp.func
@@ -871,9 +875,9 @@ def fill_region_head(
 ):
     """Region ``g`` formed from its world, its candidates' contacts and their places, all but its candidates
     (:func:`fill_region_member`) and its kind, which it returns with what its candidates read: ``(kind, c0, size, line,
-    source, c, sn, point)``, the first candidate, the candidates, the world's row line, the slot that holds its frame's
-    rows, the contact its frame is, the predictor's normal and friction slips at its friction location, and its
-    frame's point."""
+    source, c, sn, point, words)``, the first candidate, the candidates, the world's row line, the slot that holds its
+    frame's rows, the contact its frame is, the predictor's normal and friction slips at its friction location, its
+    frame's point, and its frame's normal row's law words (:func:`member_laws`)."""
     world = reg_head[g][1]
     line = rows.first[world]
     span = reg_cand[g]
@@ -902,7 +906,8 @@ def fill_region_head(
     if carrier >= 0:
         source = carrier
     frame = contact_frame(data, law, c)
-    member_laws(rows, bias, data, law, frame, c)
+    word_phi, word_beta, word_target, word_restitution = member_laws(rows, bias, data, law, frame, c)
+    words = wp.vec4(word_phi, word_beta, word_target, word_restitution)
     n = frame.normal
     t0 = frame.tangent0
     t1 = frame.tangent1
@@ -967,7 +972,7 @@ def fill_region_head(
     reg_set[g] = wp.vec3i(-1, -1, -1)
     reg_spring[g] = wp.vec3(0.0, 0.0, 0.0)
     reg_state[g] = REGION_IDLE
-    return kind, c0, size, line, source, c, sn, frame.point
+    return kind, c0, size, line, source, c, sn, frame.point, words
 
 
 @wp.func
@@ -980,6 +985,7 @@ def fill_region_member(
     c: int,
     sn: wp.vec3,
     point: wp.vec3,
+    words: wp.vec4,
     rows: DenseRows,
     bias: RowBias,
     data: ContactInput,
@@ -993,9 +999,9 @@ def fill_region_member(
 ) -> bool:
     """Candidate ``k`` of region ``g`` (:func:`fill_region_head`'s returns): a point on the region's frame (its normal
     and tangents ``reg_frame[g]``, its friction location contact ``c``'s), its rows' laws where its front end is formed
-    unless its rows are the frame's own (``source``), its rhs at the predictor, and its compliance [1/kg], the row's
-    (a material's) or its relative one's share of the candidate's own response a . Wnn a (``reg_wnn[g]``). Returns
-    whether it is compliant."""
+    unless its rows are the frame's own (``source``, whose normal row's law ``words`` the head formed), its rhs at the
+    predictor, and its compliance [1/kg], the row's (a material's) or its relative one's share of the candidate's own
+    response a . Wnn a (``reg_wnn[g]``). Returns whether it is compliant."""
     basis = reg_frame[g]
     n = wp.vec3(basis[0, 0], basis[0, 1], basis[0, 2])
     t0 = wp.vec3(basis[1, 0], basis[1, 1], basis[1, 2])
@@ -1004,15 +1010,17 @@ def fill_region_member(
     cj = cand_contact[c0 + k]
     j = data.slot[cj]
     member_point = point
+    member_words = wp.vec4(words)
     if j != source:
         member = contact_frame(data, law, cj)
-        member_laws(rows, bias, data, law, member, cj)
+        word_phi, word_beta, word_target, word_restitution = member_laws(rows, bias, data, law, member, cj)
+        member_words = wp.vec4(word_phi, word_beta, word_target, word_restitution)
         member_point = member.point
     lever = wp.cross(member_point - friction_point, n)
     a1 = wp.dot(lever, t0)
     a2 = wp.dot(lever, t1)
     incident = sn[0] + a1 * sn[1] + a2 * sn[2]
-    row_bias(rows, bias, line, j, incident)
+    row_bias_words(rows, bias, line, j, incident, member_words[0], member_words[1], member_words[2], member_words[3])
     eps = float(0.0)
     if bias.material != 0:
         eps = rows.row_eps[line, j]
@@ -1079,7 +1087,7 @@ def fill_regions(
 
     A region's frame is its carrier's (its head's without one): the contact's normal, the tangent pair every
     friction row uses for it, at the region's friction location. Its candidates are the ring's contacts, each a
-    point on that frame with the row law's right-hand side at the predictor (:func:`.row_kernels.row_bias`, the
+    point on that frame with the row law's right-hand side at the predictor (:func:`.row_kernels.row_bias_words`, the
     incident velocity the frame's); its friction rows' right-hand sides are the row law's with the predictor's
     slips and spin. Each member's rows take their laws where its front end is formed (:func:`member_laws`), the
     carrier's first, so the region reads them: the free bodies' writer leaves the regions' rows their kinds alone. It
@@ -1106,8 +1114,9 @@ def fill_regions(
         c = int(0)
         sn = wp.vec3(0.0)
         point = wp.vec3(0.0)
+        words = wp.vec4(0.0)
         if holds:
-            kind, c0, size, line, source, c, sn, point = fill_region_head(
+            kind, c0, size, line, source, c, sn, point, words = fill_region_head(
                 g, rows, bias, data, law, mf_constraint_count, mf_contact_rows_end, dense_max, mf_max, pitch,
                 cand_contact, art_free, body_twist, body_inertia, cfm, reg_head, reg_cand, reg_frame, reg_arm,
                 reg_arm_b,
@@ -1144,11 +1153,17 @@ def fill_regions(
                 lane_read(point[1], owner, _FILL_LANES),
                 lane_read(point[2], owner, _FILL_LANES),
             )
+            owner_words = wp.vec4(
+                lane_read(words[0], owner, _FILL_LANES),
+                lane_read(words[1], owner, _FILL_LANES),
+                lane_read(words[2], owner, _FILL_LANES),
+                lane_read(words[3], owner, _FILL_LANES),
+            )
             springs = False
             if q < total:
                 springs = fill_region_member(
                     owner_g, q - owner_first, owner_c0, owner_line, owner_source, owner_c, owner_sn, owner_point,
-                    rows, bias, data, law, pitch, cand_contact, reg_frame, reg_wnn, cand, cand_row,
+                    owner_words, rows, bias, data, law, pitch, cand_contact, reg_frame, reg_wnn, cand, cand_row,
                 )  # fmt: skip
             spring_bits = wp.uint64(lane_ballot(springs, _FILL_LANES))
             # This lane's region's candidates in this round are lanes [lo, hi).
