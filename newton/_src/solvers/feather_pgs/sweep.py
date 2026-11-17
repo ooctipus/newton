@@ -1706,24 +1706,16 @@ class LiveOrder:
         unilateral = f"t_kind == {ROW_CONTACT} || t_kind == {ROW_JOINT_LIMIT}"
         ring_kinds = " && ".join(f"r_kind != {k}" for k in never)
         spin = rows.spin_of("t_parent", self.end) if self.torsion else "-1"
-        # A streamed first tangent's record holds its ring's least key (:func:`.response_builds_rows.ring_key`): the
-        # walk reads the ring's impulses alone. A staged one's walk forms the key.
-        walk = f"        for (int hop = 0; !live_always && r >= 0 && hop <= {rows.capacity}; ++hop) {{"
-        step = [
-            f"            r = {rows.parent('r', enclosed=True)};",
-            "            if (r == t_parent) break;",
-            "        }",
-        ]
+        # The patch ring's normals from the pair's own, as the visit's pooled load walks them (RING_LOAD). A streamed
+        # ring row's record holds its key as the test takes it (:func:`.response_builds_rows.row_idle_key`: minus
+        # infinity for a row that acts whatever the bound, infinity for one the test passes).
         if rows.record:
             ring = [
-                f"        live_key = {rows.idle_key('t')};",
-                walk,
                 f"            if ({rows.peek('r')} != 0.0f) live_always = true;",
-                *step,
+                f"            else live_key = fminf(live_key, {rows.idle_key('r')});",
             ]
         else:
             ring = [
-                walk,
                 f"            const int r_kind = {rows.kind('r')};",
                 f"            const float r_diagonal = {rows.diag('r')};",
                 f"            if ({rows.peek('r')} != 0.0f) live_always = true;",
@@ -1732,7 +1724,6 @@ class LiveOrder:
                 f"                    live_key = fminf(live_key, {self.key('r', rows.rhs_of('r'), 'r_diagonal')});",
                 "                else live_always = true;",
                 "            }",
-                *step,
             ]
         lines = [
             *head,
@@ -1744,9 +1735,12 @@ class LiveOrder:
             f"        const int t_spin = {spin};",
             f"        live_always = {rows.peek('t')} != 0.0f || {rows.peek('t + 1')} != 0.0f"
             f" || (t_spin >= 0 && {rows.peek('t_spin')} != 0.0f);",
-            # The patch ring's normals from the pair's own, as the visit's pooled load walks them (RING_LOAD).
             "        int r = t_parent;",
+            f"        for (int hop = 0; !live_always && r >= 0 && hop <= {rows.capacity}; ++hop) {{",
             *ring,
+            f"            r = {rows.parent('r', enclosed=True)};",
+            "            if (r == t_parent) break;",
+            "        }",
             "    }",
             f"}} else if ({kinds} && !(t_diagonal <= 0.0f)) {{",
             f"    if (({unilateral}) && __float_as_int({rows.peek('t')}) == 0)",

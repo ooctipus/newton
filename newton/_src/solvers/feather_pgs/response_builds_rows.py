@@ -13,7 +13,7 @@ import warp as wp
 from ...core.execution import Buckets
 from .device_preludes import CPU_MATH, CPU_WORDS, dual_native, span_item, span_total
 from .projection_laws import idle_key, idle_root
-from .row_laws import ROW_CONTACT, ROW_FRICTION, ROW_JOINT_LIMIT, ROW_JOINT_VELOCITY_LIMIT, ROW_TORSION
+from .row_laws import ROW_CONTACT, ROW_JOINT_LIMIT, ROW_JOINT_VELOCITY_LIMIT, ROW_TORSION
 from .row_metadata import HEADER_WORDS, RECORD_WORDS, pack_row_record
 from .row_records import DenseRows
 
@@ -92,39 +92,26 @@ def record_firsts(records: RowRecords, sides: wp.vec2i) -> wp.vec2i:
 
 
 @wp.func
-def ring_key(rows: DenseRows, incident: wp.array2d[float], line: int, first: int, hops: int) -> float:
-    """The least idle key of the patch ring of normal row ``first`` (the rows the live order's test walks for a first
-    tangent, :class:`.sweep.LiveOrder`): over its contact normals and joint limits of a positive diagonal; minus
-    infinity where it holds a row of another kind of a positive diagonal (it acts whatever the bound), infinity where
-    it holds none. The test's own part is the ring's impulses. ``hops`` at least the test's guard: a ring that does not
-    close is walked as far, or further (a lower key: more visits)."""
+def row_idle_key(kind: int, rhs: float, diagonal: float) -> float:
+    """A dense row's idle key as the live order's tests take it (:class:`.sweep.LiveOrder`), a patch ring's least key
+    over its rows included: a contact normal's or joint limit's :func:`.projection_laws.idle_key`; minus infinity for
+    another row of a positive diagonal (it acts whatever the bound); infinity for a row the tests pass (a velocity
+    limit, a spin row, a diagonal that is not positive)."""
     key = float(wp.inf)
-    r = first
-    for _hop in range(hops + 1):
-        if r < 0:
-            break
-        kind = rows.row_type[line, r]
-        diagonal = rows.diag[line, r]
-        if not (diagonal <= 0.0) and kind != ROW_JOINT_VELOCITY_LIMIT and kind != ROW_TORSION:
-            if kind == ROW_CONTACT or kind == ROW_JOINT_LIMIT:
-                key = wp.min(key, idle_key(rows.rhs[line, r] + incident[line, r], diagonal))
-            else:
-                key = -wp.inf
-        r = rows.row_parent[line, r]
-        if r == first:
-            break
+    if not (diagonal <= 0.0) and kind != ROW_JOINT_VELOCITY_LIMIT and kind != ROW_TORSION:
+        key = -wp.inf
+        if kind == ROW_CONTACT or kind == ROW_JOINT_LIMIT:
+            key = idle_key(rhs, diagonal)
     return key
 
 
 @wp.func
-def write_row_record(records: RowRecords, rows: DenseRows, incidents: wp.array2d[float], line: int, slot: int):
+def write_row_record(records: RowRecords, rows: DenseRows, incident: float, line: int, slot: int):
     """Store row ``slot``'s record (:func:`.row_metadata.pack_row_record`) from the row as its writers left it (its rhs
-    plus its incident velocity). A free row's is its header, with its diagonal's inverse and its parent from ``base``.
-    A dense row's idle key is its own, a first tangent's its patch ring's (:func:`ring_key`)."""
+    plus ``incident``). A free row's is its header, with its diagonal's inverse and its parent from ``base``."""
     at = record_at(records, line, slot)
     if at < 0:
         return
-    incident = incidents[line, slot]
     diagonal = rows.diag[line, slot]
     parent = rows.row_parent[line, slot]
     rhs = rows.rhs[line, slot] + incident
@@ -154,9 +141,7 @@ def write_row_record(records: RowRecords, rows: DenseRows, incidents: wp.array2d
             if sides[1] >= 0:
                 n_b = records.dofs[sides[1]]
         mu = rows.row_mu[line, slot]
-        key = idle_key(rhs, diagonal)
-        if kind == ROW_FRICTION and parent >= 0 and slot == parent + 1:
-            key = ring_key(rows, incidents, line, parent, rows.rhs.shape[1])
+        key = row_idle_key(kind, rhs, diagonal)
         root = idle_root(diagonal)
     store_row_record(
         records.record, at, words, firsts[0], firsts[1], n_a, n_b, diagonal, rhs, kind, parent, mu, key, root
@@ -190,12 +175,12 @@ def store_row_records(
         world = span_item(worlds, item, readers)
         line = rows.first[world]
         for slot in range(records.first + lane, wp.min(count[world], records.base), lanes):
-            write_row_record(records, rows, incident, line, slot)
+            write_row_record(records, rows, incident[line, slot], line, slot)
         free_first = records.base + lane
         if regions != 0:
             free_first += mf_contact_end[world]
         for slot in range(free_first, wp.min(records.base + mf_count[world], pitch), lanes):
-            write_row_record(records, rows, incident, line, slot)
+            write_row_record(records, rows, incident[line, slot], line, slot)
         item += grid
 
 
