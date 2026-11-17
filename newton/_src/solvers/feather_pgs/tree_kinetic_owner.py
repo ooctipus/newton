@@ -535,6 +535,12 @@ class TreeKineticState:
             return
         solver = self.solver
         force = self._force_input(state_in, state_aug, control, stage3_qd, dt)
+        # A group of prescribed roots answers zero, and nothing reads that answer: its coordinates' v_hat and qdd, which
+        # the finish overwrites (v_out = qd, qdd = 0) and the rows never read (a row takes a prescribed body's motion
+        # from its published twist, contact_laws.prescribed_target). It launches only where the contacts read its
+        # predicted twists (publish_twists).
+        if self.prescribed and not force.publish_twists:
+            return
         walk = solver.factor.walk_view()
         inputs = [self.sparse.plan, self.sparse.data, self.plan, self.data, force, walk, self.trial]
         device = solver.model.device
