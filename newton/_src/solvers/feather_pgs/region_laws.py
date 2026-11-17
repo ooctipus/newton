@@ -645,38 +645,42 @@ def block_unit(
     """A group block's member's friction unit (:func:`.region_sweep.stage_blocks`' record at ``at`` of ``stage``: its
     whitened rows, right-hand sides, ``mu``, ``mu_t``, rows, the cone law's block or metric, its friction) at the
     ``load`` its candidates hold, on the group's whitened twist ``yh``: the region law's own cone law. Returns the
-    unit's new friction, its push on ``yh`` and whether it slides (on its cone at a positive load)."""
-    friction = int(stage[at + 23])
-    phi_old = wp.vec3(stage[at + 39], stage[at + 40], stage[at + 41])
-    s0 = stage[at + 18]
-    s1 = stage[at + 19]
-    s2 = float(0.0)
-    for k in range(6):
-        s0 += stage[at + k] * yh[k]
-        s1 += stage[at + 6 + k] * yh[k]
-    if friction == 3:
-        s2 = stage[at + 20]
-        for k in range(6):
-            s2 += stage[at + 12 + k] * yh[k]
+    unit's new friction, its push on ``yh`` and whether it slides (on its cone at a positive load).
+
+    Every word of the record is read before the law branches on any (one round of loads a unit)."""
+    h0 = wp.spatial_vector(
+        wp.vec3(stage[at + 0], stage[at + 1], stage[at + 2]), wp.vec3(stage[at + 3], stage[at + 4], stage[at + 5])
+    )
+    h1 = wp.spatial_vector(
+        wp.vec3(stage[at + 6], stage[at + 7], stage[at + 8]), wp.vec3(stage[at + 9], stage[at + 10], stage[at + 11])
+    )
+    h2 = wp.spatial_vector(
+        wp.vec3(stage[at + 12], stage[at + 13], stage[at + 14]), wp.vec3(stage[at + 15], stage[at + 16], stage[at + 17])
+    )
+    rhs = wp.vec3(stage[at + 18], stage[at + 19], stage[at + 20])
     mu = stage[at + 21]
     mu_t = stage[at + 22]
+    friction = int(stage[at + 23])
     M = wp.mat33(
         stage[at + 25], stage[at + 26], stage[at + 27],
         stage[at + 28], stage[at + 29], stage[at + 30],
         stage[at + 31], stage[at + 32], stage[at + 33],
     )  # fmt: skip
+    values = wp.vec3(stage[at + 34], stage[at + 35], stage[at + 36])
+    phi_old = wp.vec3(stage[at + 39], stage[at + 40], stage[at + 41])
+    s0 = rhs[0]
+    s1 = rhs[1]
+    s2 = float(0.0)
+    for k in range(6):
+        s0 += h0[k] * yh[k]
+        s1 += h1[k] * yh[k]
+    if friction == 3:
+        s2 = rhs[2]
+        for k in range(6):
+            s2 += h2[k] * yh[k]
     phi = wp.vec3(0.0)
     if mu_t > 0.0:
-        phi = friction_triple_from_metric(
-            wp.vec3(stage[at + 34], stage[at + 35], stage[at + 36]),
-            M,
-            wp.vec3(s0, s1, s2),
-            phi_old,
-            mu,
-            mu_t,
-            load,
-            1.0,
-        )
+        phi = friction_triple_from_metric(values, M, wp.vec3(s0, s1, s2), phi_old, mu, mu_t, load, 1.0)
     else:
         phi = friction_triple(M, wp.vec3(s0, s1, s2), phi_old, mu, mu_t, load, 1.0)
     e0 = phi[0] - phi_old[0]
@@ -684,14 +688,14 @@ def block_unit(
     e2 = phi[2] - phi_old[2]
     push = wp.spatial_vector(
         wp.vec3(
-            stage[at + 0] * e0 + stage[at + 6] * e1 + stage[at + 12] * e2,
-            stage[at + 1] * e0 + stage[at + 7] * e1 + stage[at + 13] * e2,
-            stage[at + 2] * e0 + stage[at + 8] * e1 + stage[at + 14] * e2,
+            h0[0] * e0 + h1[0] * e1 + h2[0] * e2,
+            h0[1] * e0 + h1[1] * e1 + h2[1] * e2,
+            h0[2] * e0 + h1[2] * e1 + h2[2] * e2,
         ),
         wp.vec3(
-            stage[at + 3] * e0 + stage[at + 9] * e1 + stage[at + 15] * e2,
-            stage[at + 4] * e0 + stage[at + 10] * e1 + stage[at + 16] * e2,
-            stage[at + 5] * e0 + stage[at + 11] * e1 + stage[at + 17] * e2,
+            h0[3] * e0 + h1[3] * e1 + h2[3] * e2,
+            h0[4] * e0 + h1[4] * e1 + h2[4] * e2,
+            h0[5] * e0 + h1[5] * e1 + h2[5] * e2,
         ),
     )
     sx = phi[0] / mu
