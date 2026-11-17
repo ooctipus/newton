@@ -464,6 +464,10 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
     clear = ((placement, "diagonals"),) if placement.clears_diagonals else ()
     walk = (laws, "write_walked", solver, STATE_IN, CONTACTS, DT)
     join = ((topology, "join"),) if topology is not None else ()
+    # The free bodies' bases read only the factor and the predictor, so they run beside the contact pass from the
+    # predictor on, joined before the regions' listing.
+    regions = sweep.regions is not None
+    bases = Beside(device) if regions else None
     # The closure's seed and the colored worlds' units read the row store, which a model without worlds does not hold:
     # each is bound only where its stage runs. The colored worlds' units and colors follow the rows and records their
     # writers published, over the claims' candidates.
@@ -504,6 +508,7 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
         (s3, "predict", True, (factor, "predict", STATE_IN, CONTROL, QD, DT)),
         (s3, "correct_free_roots", free_roots, (factor, "correct_free_roots", STATE_IN, QD, DT, v_hat)),
         (s3, "damp_spin", options.angular_damping != 0.0, (factor, "damp_spin", DT, v_hat)),
+        (s3, "free_body_bases", regions, (STEP, "beside", bases, sweep.regions, "bases", v_hat, CONTACTS)),
         (dynamics, "snapshots", "snapshots" in diagnostics, *snapshots),
         (dynamics, "wait_for_collision", not particles, (STEP, "wait_for_collision", device)),
         # Stage 4: the rows. The row pass (each family's slots and seeds, and each world's acts word), the status and the
@@ -539,8 +544,9 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
         (s4r, "diagonals", placement.clears_diagonals and topology is None, (placement, "diagonals")),
         (s4r, "write_walked", holds, *join, (*walk, WRITE_ROWS if topology is None else WRITE_REST)),
         (s4r, "link_patches", True, (laws, "link_patches", solver, CONTACTS)),
-        # The free bodies' regions follow the rings the link made.
-        (s4r, "list_regions", sweep.regions is not None, (sweep, "list_regions", solver, STATE_IN, CONTACTS, DT)),
+        # The free bodies' regions follow the rings the link made, from their bases.
+        (s4r, "join_bases", regions, (bases, "join")),
+        (s4r, "list_regions", regions, (sweep, "list_regions", solver, STATE_IN, CONTACTS, DT)),
         (s4r, "store_records", placement.writes_records, (sweep, "store_records")),
         (s4r, "schedule_diagonal", sweep.sparse_contact_schedule is not None, (sweep, "schedule_diagonal")),
         # Stages 5 and 6: the impulses' start (the warm start's normals, the closures' seeds: the one writer closed the

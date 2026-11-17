@@ -1742,10 +1742,30 @@ class Regions:
         if self.placement.contact_pool.ready_rows is None:
             self.ready.fill_(self.capacity)
 
-    def list(self, solver, state_in, contacts, dt: float) -> None:
-        """The step's regions, once the rows' kinds are written and the patch link made their rings.
+    def bases(self, v_hat: wp.array, contacts) -> None:
+        """Each free body's basis (:func:`free_body_basis`), on a step with contacts: it reads the factor's walk and the
+        predictor's ``v_hat`` only, so it runs from the predictor on, before the regions are listed (:meth:`list`)."""
+        if contacts is None or contacts.rigid_contact_count is None or contacts._rigid_contact_rows <= 0:
+            return
+        wp.launch(
+            free_body_basis,
+            dim=self.count,
+            inputs=[
+                self.free_art,
+                self.factor.walk_view(),
+                self.factor.joint_S_s,
+                self.forest.articulation_dof_start,
+                v_hat,
+            ],
+            outputs=[self.body_basis, self.body_inertia, self.body_twist],
+            device=self.model.device,
+        )
 
-        Every step: each free body's basis (:func:`free_body_basis`) and the checks of the listing it holds
+    def list(self, solver, state_in, contacts, dt: float) -> None:
+        """The step's regions, once the rows' kinds are written and the patch link made their rings, and each free
+        body's basis (:meth:`bases`).
+
+        Every step: the checks of the listing it holds
         (:func:`begin_listing`, :func:`check_contacts`, :func:`check_bodies`). Where the patch builder made the contact
         frame's regions anew, or a check failed, the step lists them anew: the regions marked and counted a contact
         (:func:`mark_regions`), each world's bodies placed in the stream (:func:`place_bodies`), the regions placed
@@ -1777,19 +1797,6 @@ class Regions:
             dim=max(self.count, 1),
             inputs=[solver.laws.friction_patches.held_regions()],
             outputs=[self.relist, self.body_seen, self.body_version, self.body_touch],
-            device=device,
-        )
-        wp.launch(
-            free_body_basis,
-            dim=self.count,
-            inputs=[
-                self.free_art,
-                self.factor.walk_view(),
-                self.factor.joint_S_s,
-                forest.articulation_dof_start,
-                solver.v_hat,
-            ],
-            outputs=[self.body_basis, self.body_inertia, self.body_twist],
             device=device,
         )
         rows, bias = bind_dense_rows(placement), solver.laws.bias(self.options, dt)
