@@ -1666,6 +1666,7 @@ def _build(
 @wp.func
 def _store_contact(
     c: int,
+    carried: int,
     q: wp.array[wp.transform],
     body_world: wp.array[int],
     frame: _PatchFrame,
@@ -1673,11 +1674,13 @@ def _store_contact(
     previous_world: wp.array[int],
     previous_q: wp.array[wp.transform],
 ):
-    """Carry contact history and input poses, independent of solver velocity passes."""
+    """Carry contact history and input poses, independent of solver velocity passes. A ``carried`` build (a held
+    frame's) kept the frame's sorted index, which the store after the frame's earlier build already holds."""
     # Pair searches need the complete sorted index, but only live anchors own
     # geometric history. Retire stale validity and reset ownership before exit.
-    prev.keys[c] = frame.keys[c]
-    prev.indices[c] = frame.indices[c]
+    if carried == 0:
+        prev.keys[c] = frame.keys[c]
+        prev.indices[c] = frame.indices[c]
     prev.valid[c] = frame.valid[c]
     previous_world[c] = -1
     # The centre of pressure of the last solve, in body a's frame, sliding or stuck: the next build's anchor.
@@ -2596,6 +2599,7 @@ def _finish_and_store(
         stored[0] = live
         fresh[0] = 1
     finishing = routes.enabled[0] + routes.enabled[1] + routes.enabled[2] > 0
+    carried = extent[_CARRY_EXTENT]
     for c in range(thread, extent[0], threads):
         if finishing and c < live and frame.valid[c] != 0:
             route = _contact_route(routes, slot, path, c)
@@ -2623,7 +2627,7 @@ def _finish_and_store(
                     dt,
                     _route_first(routes, route),
                 )
-        _store_contact(c, q, body_world, frame, prev, previous_world, previous_q)
+        _store_contact(c, carried, q, body_world, frame, prev, previous_world, previous_q)
 
 
 @wp.kernel(enable_backward=False)
