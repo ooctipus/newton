@@ -309,7 +309,9 @@ BLOCK_WARPS, WARP_LINE = 2, 64
 """The warp mapping's block where its worlds' stages fit, and its register line then (the sparse sweeps')."""
 
 COLORED_THREADS = 256
-"""Threads of a colored world's block: a color's units beyond them run in turns."""
+"""Threads of a colored world's block: a color's units beyond them run in turns. The block is the world's (its staging,
+its barriers and its ``tid``), so the mapping declares it; the layer would otherwise pack worlds of 32 lanes or fewer
+into one block."""
 
 COLOR_SLOT = "LOAD_slots(reinterpret_cast<const int4*>(&color_slot.data[(off_unit + {}) * 4]))"
 """The colored unit at a place of its world's colors: its first row, rows and bodies (:data:`.sweep_units.UNIT_FIELDS`)."""
@@ -1688,7 +1690,9 @@ class GeneralSweep(SweepConfig):
         a multiprocessor). The warp mapping: ``lanes_per_world`` lanes a world on a persistent grid, at the register
         line :data:`WARP_LINE` in blocks of :data:`BLOCK_WARPS` warps."""
         if self.colored:
-            return Work(int(items), lanes=COLORED_THREADS, registers=REGISTERS_PER_THREAD, shared=shared)
+            return Work(
+                int(items), lanes=COLORED_THREADS, block=COLORED_THREADS, registers=REGISTERS_PER_THREAD, shared=shared
+            )
         block, lanes = 32 * self.block_warps, self.lanes_per_world
         line = WARP_LINE if self.block_warps > 1 else None
         return Work(int(items), lanes=lanes, block=block, registers=line, persistent=True, shared=shared)
