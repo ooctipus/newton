@@ -276,6 +276,33 @@ class TestContactPoolPolicy(unittest.TestCase):
         pool.restart_transit()
         self.assertFalse(pool._settled, "a measured state starts a graph's transit")
 
+    def test_rows_stay_ahead_of_a_demand_that_doubles_every_pass(self):
+        """A scene's first landing doubles the contacts every pass (NIST's parts, seed 0: 11k, 22k, 45k, 92k, 175k).
+        A bound graph never recaptures, so nothing but the service grows the rows; reading the record a few replays
+        behind the device, it holds, at every service, the rows the pass of the replay launched next will need, though
+        the forecast (one pass in eight) still holds the first landing's share, which the landing outruns."""
+        pool = ContactPool(device="cpu")
+        pool.rows((ContactField("value", wp.int32, -1),))
+        lag = contact_pool.FORECAST_QUEUE + 1
+        demand = [1_000 * 2**k for k in range(8)]
+        forecast = 80_000
+        for k, mark in enumerate(demand):
+            pool._high_water_host.assign([mark, mark, k + 1, forecast, 0, 0, 0, 0, 0])
+            pool.service()
+            ahead = demand[k + lag] if k + lag < len(demand) else demand[-1]
+            if k > 0:
+                self.assertGreaterEqual(pool.ready, ahead, f"pass {k + 1 + lag} would drop contacts")
+        held = pool.ready
+        for k in range(3):
+            pool._high_water_host.assign([demand[-1], demand[-1], len(demand) + 1 + k, forecast, 0, 0, 0, 0, 0])
+            pool.service()
+        self.assertEqual(pool.ready, held, "a mark that holds still grows nothing")
+        self.assertLessEqual(
+            held,
+            contact_pool.reserved_rows(contact_pool.HEADROOM * max(forecast, demand[-1]), pool.bound),
+            "no more than the headroom over the forecast or the mark",
+        )
+
     def test_service_waits_for_a_device_behind_the_queue(self):
         """Hold the host at most FORECAST_QUEUE replays ahead, and let go when no replay comes."""
         pool = ContactPool(device="cpu")

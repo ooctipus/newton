@@ -1008,6 +1008,9 @@ class ContactPool:
         """Trims completed so far."""
         # The high-water mark the trim watches, and the recorded passes when it last rose.
         self._still = (0, 0)
+        # The high-water mark and the recorded passes at the last service that saw the passes advance: the demand's
+        # own rate of rise, which the rows must stay ahead of over the replays the record lags (_rising_rows).
+        self._rise = (0, 0)
         # A trim between its withdrawal and its unmap: (events to join, rows, protected rows, rows before, bytes before).
         self._trim = None
         # Streams that may read the ready rows or the rows past them, by raw handle: where collision passes and
@@ -1533,10 +1536,14 @@ class ContactPool:
             high_water = self.high_water
             target = grown_rows(high_water, self.ready, self.bound)
             if not self._settled:
-                # The demand is in transit: hold the rows the forecast bounds it by.
+                # The demand is in transit: hold the rows the forecast bounds it by, and the rows its own rise reaches
+                # by the time a replay launched now runs.
                 forecast = self.forecast
                 if forecast > self.ready:
                     target = max(target, reserved_rows(forecast, self.bound))
+                rising = self._rising_rows(high_water)
+                if rising > self.ready:
+                    target = max(target, reserved_rows(rising, self.bound))
             if target > self.ready:
                 return self._grow_logged(target, high_water)
         if not self.fixed:
@@ -1561,6 +1568,32 @@ class ContactPool:
             # The headroom did not hold the demand: the forecast's bound sizes the rows until it settles again.
             self._drops_watched = dropped
             self._settled = False
+
+    def _rising_rows(self, high_water: int) -> int:
+        """Return the contacts a rising demand reaches by the time a replay launched now runs, at most
+        :data:`HEADROOM` times the forecast (and the model's estimate, :attr:`forecast_limit`); 0 while it does not
+        rise.
+
+        The record lags the device by the replays the host may run ahead (:data:`FORECAST_QUEUE`), and a pass of the
+        replay launched next runs one replay later, so rows sized for the mark as read are already behind a demand
+        that rises from pass to pass, as a scene's first landing does (NIST's parts: the contacts double every pass
+        for five passes). The mark's own rate of rise per pass since the last service that saw the passes advance,
+        carried over those replays' passes, sizes the rows instead. The forecast bounds the same demand from the
+        pairs within reach, but runs only one pass in :data:`FORECAST_PASSES` of a replay, and its share of the worst
+        case was measured on the first contacts, which a landing outruns: the rise may pass it by the headroom a
+        settled demand keeps, no more.
+        """
+        passes = self.recorded_passes
+        last_mark, last_passes = self._rise
+        if passes <= last_passes:
+            return 0
+        self._rise = (high_water, passes)
+        if last_mark <= 0 or high_water <= last_mark:
+            return 0
+        rate = (high_water / last_mark) ** (1.0 / (passes - last_passes))
+        ahead = (FORECAST_QUEUE + 1) * max(max(self._captured_passes.values(), default=1), 1)
+        reach = math.ceil(high_water * rate**ahead)
+        return int(min(reach, HEADROOM * max(self.forecast, high_water), self.forecast_limit))
 
     def restart_transit(self) -> None:
         """Put the demand in transit: a measured state starts a graph, whose first replays the forecast sizes until
