@@ -387,14 +387,14 @@ def _prepare_contact_fields(
 
     Past ``live`` the record is empty. A ``held`` frame's
     live contacts keep the region that owns them and their link in its ring: the frame's regions are made once. A
-    ``kept`` frame's live contacts keep what their shapes alone decide, which an earlier prepare of the frame wrote:
-    their bodies and shapes in pair order, the flip, the friction coefficients, the radius and the support gap limit.
+    ``kept`` frame's live contacts keep what their records alone decide, which an earlier prepare of the frame wrote:
+    their bodies and shapes in pair order, the flip, the normal, the friction coefficients, the radius and the support
+    gap limit.
     """
     if held == 0 or c >= live:
         frame.owner[c] = -1
         patches.next_contact[c] = -1
     frame.valid[c] = 0
-    frame.used[c] = 0
     frame.source[c] = -1
     frame.eligible[c] = 0
     frame.pressured[c] = 0
@@ -456,8 +456,8 @@ def _prepare_contact_fields(
     frame.surface_a[c] = surface_b if flip != 0 else surface_a
     frame.surface_b[c] = surface_a if flip != 0 else surface_b
     frame.center[c] = contact_point(translation_a, offset_a, separation)
-    frame.normal[c] = n
     if kept == 0:
+        frame.normal[c] = n
         frame.body_a[c] = a
         frame.body_b[c] = b
         frame.shape_a[c] = sa
@@ -1948,8 +1948,9 @@ _BUILD_FIELDS = frozenset(
     )
 )
 """Patch frame fields only a build reads: the stored frame (:attr:`_FrictionPatchState.previous`) holds none."""
-_STORED_FIELDS = frozenset(("centres",))
-"""Patch frame fields only the stored frame holds: a build's scratch over the stored contacts."""
+_STORED_FIELDS = frozenset(("centres", "used"))
+"""Patch frame fields only the stored frame holds: a build's scratch over the stored contacts, and which of them a
+region took."""
 
 
 class _FrictionPatchState:
@@ -2243,7 +2244,6 @@ class _FrictionPatchState:
                 "flipped",
                 "owner",
                 "valid",
-                "used",
                 "source",
                 "eligible",
                 "members",
@@ -2255,7 +2255,7 @@ class _FrictionPatchState:
         ]
         if stored:
             fields = [field for field in fields if field.name not in _BUILD_FIELDS]
-            fields.append(ContactField("centres", wp.vec3))
+            fields += [ContactField("centres", wp.vec3), ContactField("used", wp.int32)]
         return fields
 
     def build(

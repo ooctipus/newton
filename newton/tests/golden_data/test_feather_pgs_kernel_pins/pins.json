@@ -45,7 +45,7 @@
   "friction_patches._finish_regions": "88cb98a6a67d2c7a84c9576f80d6b6e1c5b1bc95ad813014e6d7ac44eda8cc07",
   "friction_patches._invalidate_geometry_history": "35ec7021e062d0734fafe61fd6350ae1457d3937146e93af145efb0898e5d76d",
   "friction_patches._prepare": "f7d8fa1aa43198d7fbeb2116adda405d51d42777508cbe9bfe876d4027909912",
-  "friction_patches._prepare_contacts": "dfc7cee1fa45e40c53ddd03135050e1ac7e25ee61e3be9172b1b9890dc8edfe0",
+  "friction_patches._prepare_contacts": "0f1c3165b35427cafb574fe11a944c57a9032b5f773c8573dac46ffece319840",
   "friction_patches._reset_history": "d1024f6372fbe2dbca2bf4cedf19a137e51b9d00c4a64bc0f6e954e72bbf325e",
   "friction_patches._store_frame": "f9a4c0a41cdfaca894f4bf26b98a7174d829a3ad75c5c1d3d8e81646baad16fb",
   "friction_patches.link_patch_routes": "9b3f7f0edf442c0b3c0eadb9bc83198d2e55fa75397d754eded2576dec29e6af",
