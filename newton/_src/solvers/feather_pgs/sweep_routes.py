@@ -532,7 +532,27 @@ const float mf_diag = __int_as_float(meta.y);"""
 {_unit_terms(" " * 20, torsion=torsion)}
 {unit}
 {_unit_apply(" " * 20, torsion=torsion)}"""
-    return f"{ring_sum}\n{COLORS.wrap(visit, ' ' * 12)}"
+    record_words = [(4 * k + c) * units for k in range(len(FORMED_RECORD)) for c in range(4) if 4 * k + c != 3]
+
+    def touch(place: str) -> str:
+        # Every word the unit at ``place`` loads: its slot's fields and words, its contact's record and its slot
+        # (TOUCH, the memory toolkit's, which the free bodies' walks declare).
+        fields_at = f"&slot_data.data[unit_slot * {fields * units} + ahead]"
+        words_at = f"&slot_words.data[unit_slot * {words * units} + ahead]"
+        return f"""const int ahead = {place};
+if (ahead < {units}) {{
+    const float* const touch_fields = {fields_at};
+    const int* const touch_words = {words_at};
+    const float* const touch_record = {record("ahead")};
+#pragma unroll
+    for (int f = 0; f < {fields}; ++f) TOUCH(touch_fields + f * {units});
+#pragma unroll
+    for (int f = 0; f < {words}; ++f) TOUCH(touch_words + f * {units});
+{chr(10).join(f"    TOUCH(touch_record + {offset});" for offset in record_words)}
+    TOUCH(&color_slot.data[(off_unit + ahead) * 4]);
+}}"""
+
+    return f"{ring_sum}\n{dataclasses.replace(COLORS, touch=touch).wrap(visit, ' ' * 12)}"
 
 
 def dense_units(
