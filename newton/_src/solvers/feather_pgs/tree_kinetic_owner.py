@@ -234,6 +234,9 @@ class TreeKineticState:
         if np.any(prescribed != prescribed[0]):
             raise ValueError("Tree kinetic state requires each root prescribed in every group or in none")
         self._twist_roots = sum(1 << r for r, held in enumerate(prescribed[0].tolist()) if held)
+        # A group every root of which is prescribed (kinematic free bodies) integrates nothing: its finish keeps its
+        # own publication wherever its output bank already holds the input bank's words (get_state_kernel).
+        self.prescribed = bool(np.all(prescribed))
         self._response = response
         self._bind_kernels()
         self._plan_dimensions = self._dimensions()
@@ -304,6 +307,7 @@ class TreeKineticState:
             self.schedules,
             layout=layout,
             twist_roots=self._twist_roots,
+            bank_coordinates=self.bank_coordinates if self.prescribed else 0,
             clocked=self.clocked,
             diagonal=self.diagonal_mass,
             two_half=self.two_half,
@@ -560,9 +564,10 @@ class TreeKineticState:
                 self.data,
                 self.solver.factor.mass_update_requested,
                 self.solver.factor.clock,
-                # The repair inputs of the shared launch ABI, unread by a finish.
+                # The repair's motion input of the shared launch ABI, unread by a finish; the input bank, which a
+                # prescribed group's finish compares its output bank with.
                 state_in.joint_qd,
-                self._no_bank,
+                self._bank(state_in) if self.prescribed else self._no_bank,
             ],
             block_dim=self.block_dim,
             device=self.solver.model.device,

@@ -107,10 +107,12 @@ KINETIC_CACHE = field_group.FieldGroup(
     Field("status", wp.int32, ("group",), owner="cache"),
     Field("source_q", wp.uint64, ("group",), owner="cache"),
     Field("source_qd", wp.uint64, ("group",), owner="cache"),
+    Field("finished", wp.int32, ("group",), owner="cache"),
     Field("stage_clocks", wp.int64, ("group", "stage"), owner="step"),
 )
 """The held tree's cache. ``diagonal`` is a compact diagonal's K-free mass ``H_ii + R_ii`` (a group without one has
-none). Geometry, forces
+none). ``finished`` names the kernel of the cache's last publication: 1 a finish, 0 a repair (the prescribed finish
+keeps only its own words, :func:`get_state_kernel`). Geometry, forces
 and source tags follow factor groups (the cache allocates them);
 current validity follows articulation IDs, shared with the ordinary FK/ID cache (the solver's); the stage clocks
 are the owner's."""
@@ -579,12 +581,16 @@ $DIAGONAL            if(!wp::isfinite(mass))RAISE(cache.status.data[group],2);
     }
     SYNC();
 $CLOCK2    if(lane==0) {
-        cache.generation.data[group]+=1;
+$PUBLISHED    }
+"""
+
+_PUBLISHED = r"""        cache.generation.data[group]+=1;
         $CURRENT_VALID
         cache.geometry_valid.data[group]=refresh&&cache.status.data[group]==0;
         if(refresh)cache.geometry_generation.data[group]=cache.generation.data[group];
-    }
 """
+"""A publication's record of itself, lane 0's: a new generation, the articulations current where no stage failed, the
+geometry current where it refreshed (the collection's end, and a prescribed finish that keeps its words)."""
 
 _DIAGONAL = "            cache.diagonal.data[group*$DOFS+dof]=mass+data.armature.data[ds+dof];\n"
 """A compact diagonal's K-free mass ``H_ii + R_ii``, for a group with a diagonal root (:func:`get_helpers`'s
@@ -886,7 +892,7 @@ def get_helpers(
         preludes=(STATUS_CLOCK,),
         # A rest tree (no coordinates) collects nothing: no bias, no H_ii.
         REDUCE=reduction if layout.dofs else "",
-        CURRENT_VALID=_current_valid(layout),
+        PUBLISHED=layout.render(_PUBLISHED, CURRENT_VALID=_current_valid(layout)),
         DIAGONAL=_DIAGONAL if diagonal else "",
         **_native_clocks(clocked, "cache", stages=2, column=13),
     )
@@ -995,6 +1001,9 @@ def get_helpers(
                     data.stage_clocks[g.group, column + 1] = clock_b2 - clock_b1
                     data.stage_clocks[g.group, column + 2] = clock_b3 - clock_b2
 
+    @wp.func_native(layout.render(_PUBLISHED, CURRENT_VALID=_current_valid(layout)))
+    def _record(plan: HeldPlan, cache: KineticData, group: int, refresh: int): ...
+
     @wp.func_native(collect_source)
     def _collect(
         address: wp.uint64,
@@ -1010,6 +1019,7 @@ def get_helpers(
     return SimpleNamespace(
         _body_terms=_body_terms,
         _collect=_collect,
+        _record=_record,
         _scan_motion=_scan_motion,
         _scan_poses=_scan_poses,
         _storage=_storage,
@@ -1049,7 +1059,22 @@ def get_state_kernel(
     ``bank_coordinates`` (a group's coordinate count) builds the repair that
     compares input banks inside its blocks: a valid group stamped with the
     ``bank`` argument compares the two banks (see :func:`_bank_binding`) and,
-    when they are equal, is restamped and takes the early exit. ``schedules``
+    when they are equal, is restamped and takes the early exit. With
+    ``finish`` it builds the finish of a group every root of which is
+    prescribed (a kinematic free body, whose integration copies its
+    coordinates): a group whose last publication was a finish's (the cache's
+    ``finished``) from the input bank's words (stamped with the input bank,
+    current, no stage failed, its geometry current where this finish
+    refreshes) and whose output bank holds the input bank's words, compared
+    with the ``bank`` argument (the input bank), has every word the finish
+    would publish in place: the same stage functions of the same words. It
+    writes the solve's words alone (each coordinate's ``v_out`` and ``qdd``,
+    :func:`accelerations`), records the publication and stamps the output
+    bank, as the finish does, and exits. It reads the solver's contract for
+    writes between steps as the repair does: a write to the input bank alone
+    differs from the output bank and runs the finish; one to both banks the
+    solver is not told of (``notify_state_changed``, ``reset``) is not seen.
+    ``schedules``
     are the scans' schedules;
     ``twist_roots`` names, a bit a root, the roots whose bodies publish their
     twists about their articulation's origin (``body_v_s``), which only a row
@@ -1064,13 +1089,17 @@ def get_state_kernel(
     """
     if finish and motion_velocity:
         raise ValueError("Alternate motion velocity is a repair-only contract")
-    if bank_coordinates and (finish or motion_velocity):
+    if bank_coordinates and motion_velocity:
         raise ValueError("A compared input bank is a contract of the repair of ordinary motion")
+    if finish and bank_coordinates and twist_roots != (1 << len(layout.roots)) - 1:
+        raise ValueError("A finish keeps its publication only where every root is prescribed")
     h = get_helpers(layout, schedules, twist_roots, clocked=clocked, diagonal=diagonal)
     _lanes, _sync, _sub, _different_motion = _thread_helpers(layout)
     banked = bank_coordinates != 0
+    kept = finish and banked
     _bank_matches = _bank_binding(bank_coordinates, layout) if banked else None
     scan_poses, scan_motion, collect, body_terms = h._scan_poses, h._scan_motion, h._collect, h._body_terms
+    record = h._record
     _storage = h._storage
     # The words of a tree's block (TreeLayout): each body's pose and bias acceleration (body_words a body) from 0,
     # then each body's twist (6), the axes (6 a coordinate) and each root's origin and shift (3 each); the bias
@@ -1102,6 +1131,21 @@ def get_state_kernel(
         if wp.static(forest):
             return plan.arts[g.group, root]
         return g.art
+
+    @wp.func
+    def accelerations(g: TreeGroup, data: PublicationData):
+        """Recover each coordinate's acceleration from its solved velocity."""
+        for local in range(g.lane, dofs, g.stride):
+            dof = g.ds + local
+            kernels._light_update_qdd_from_velocity(
+                dof,
+                data.joint_qd,
+                data.kinematic_dof_mask,
+                1.0 / data.dt,
+                data.v_out,
+                data.joint_qdd,
+            )
+        _sync()
 
     @wp.func
     def admit(
@@ -1183,6 +1227,39 @@ def get_state_kernel(
                     if rebind != 0 and g.lane == 0:
                         _stamp_source(cache, g.group, data.joint_q, data.joint_qd)
                 return g
+        if wp.static(kept):
+            if (
+                valid != 0
+                and cache.status[g.group] == 0
+                and cache.finished[g.group] != 0
+                and _same_source(cache, g.group, data.joint_q, data.joint_qd) != 0
+                and (
+                    refresh == 0
+                    or (
+                        cache.geometry_valid[g.group] != 0
+                        and cache.geometry_generation[g.group] == cache.generation[g.group]
+                    )
+                )
+            ):
+                if (
+                    _bank_matches(
+                        bank,
+                        data.joint_q_start[g.js],
+                        g.ds,
+                        g.js,
+                        data.joint_q_new,
+                        data.joint_qd_new,
+                        data.joint_child,
+                        data.body_q,
+                        data.body_qd,
+                    )
+                    != 0
+                ):
+                    accelerations(g, data)
+                    if g.lane == 0:
+                        record(plan, cache, g.group, refresh)
+                        _stamp_source(cache, g.group, data.joint_q_new, data.joint_qd_new)
+                    return g
         g.refresh = refresh
         g.body = data.joint_child[g.js]
         g.qs = data.joint_q_start[g.js]
@@ -1192,21 +1269,6 @@ def get_state_kernel(
                 cache.current_valid[plan.arts[g.group, root]] = 0
         g.admitted = 1
         return g
-
-    @wp.func
-    def accelerations(g: TreeGroup, data: PublicationData):
-        """Recover each coordinate's acceleration from its solved velocity."""
-        for local in range(g.lane, dofs, g.stride):
-            dof = g.ds + local
-            kernels._light_update_qdd_from_velocity(
-                dof,
-                data.joint_qd,
-                data.kinematic_dof_mask,
-                1.0 / data.dt,
-                data.v_out,
-                data.joint_qdd,
-            )
-        _sync()
 
     @wp.func
     def transport(g: TreeGroup, plan: HeldPlan, data: PublicationData):
@@ -1448,6 +1510,7 @@ def get_state_kernel(
         """Collect bias, geometry and validity, and record the state bank the cache now holds."""
         collect(g.address, g.group, g.ds, p, plan, data, cache, g.refresh)
         if g.lane == 0:
+            cache.finished[g.group] = wp.static(int(finish))
             if wp.static(motion_velocity):
                 # An override source must not be reused when a later begin returns to
                 # ordinary motion, even if no finish occurred between the two calls.
@@ -1549,7 +1612,7 @@ def get_state_kernel(
     if motion_velocity:
         name += "_motion"
     if banked:
-        name += "_banked"
+        name += "_kept" if kept else "_banked"
     if diagonal:
         name += "_diagonal"
     if two_half:
