@@ -22,6 +22,7 @@ from .device_preludes import memory_words
 from .factor.walk import FREE_BODY_WALK, WALK_COORDINATE, WALK_LINK, WalkTrees, walk_down_prelude
 from .kernel_template import Dispatch
 from .packed_rows import CLASS_SIDES, PACKED_SIDES_BY_SIDE, PACKED_SIDES_DENSE
+from .projection_laws import IDLE_LAW
 from .region_laws import REGION_LAW, REGION_SLIDE
 from .region_sweep import FRICTION_ROWS, KIND_SECOND, KIND_SPRINGS, REGION_IDLE, REGION_LOOSE, REGION_TOLERANCE
 from .response_operator import Lanes, SparseFactor, Velocity
@@ -1344,6 +1345,12 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
             dense, dense_op, laws, metric=metric, formed=dense_record, triple_phase=bool(triples)
         )
         units = f"{skip}\n{units}" if units else skip
+    # The warp mapping's dense rows step to the rows that can act (sweep.LiveOrder) where their applies are the only
+    # ones inside their loop.
+    live = None
+    if dense.owned and not (units or sweep.active_rows or colored):
+        never = (ROW_JOINT_VELOCITY_LIMIT, ROW_SPEED) if speed_rows else (ROW_JOINT_VELOCITY_LIMIT,)
+        live = (dense_op.velocity, str(D), never)
     dense_phase = rows_block(
         dense,
         dense_op,
@@ -1354,6 +1361,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         selected=sweep.active_rows,
         unit=units,
         triple_phase=bool(triples),
+        live=live,
         pad="        ",
     )
     if units and sweep.contact_units:
@@ -1451,7 +1459,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     packed = PACKED_SIDES_DENSE if not sweep.support_classes and max_row_dofs == D else PACKED_SIDES_BY_SIDE
     sides = (packed, *((CLASS_SIDES,) if sweep.support_classes else ()), *((memory_words(_SLOTS),) if colored else ()))
     records = bool(contact_torsion or colored)
-    families = (REGION_LAW,) if sweep.regions else ()
+    families = ((REGION_LAW,) if sweep.regions else ()) + ((IDLE_LAW,) if live is not None else ())
     return sweep.native(
         body, lanes=lanes, rows=sides, walks=(FREE_BODY_WALKS,), records=records, laws=families
     ), staging

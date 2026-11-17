@@ -42,6 +42,10 @@ CONE_LAW = LawFamily("ConeLaw", requires=(PROJECTION_LAW,))
 """The friction cone of a contact with a spin row (contact torsion), which only the sweeps of such contacts declare;
 native code calls ``ConeLaw::ball(...)``."""
 
+IDLE_LAW = LawFamily("IdleLaw")
+"""The bound up to which a row stays idle (:func:`idle_key`), which only the sweeps whose dense rows step to the rows
+that can act declare (:class:`.sweep.LiveOrder`); native code calls ``IdleLaw::idle_key(...)``."""
+
 RECORD_LAW = LawFamily("RecordLaw", requires=(PROJECTION_LAW,))
 """A friction contact's record (:func:`friction_record`), which only the places that form records declare; native code
 calls ``RecordLaw::friction_record(...)``."""
@@ -82,6 +86,15 @@ def quotient(a: float, b: float) -> float:
     callers divide exactly.
     """
     return a / b
+
+
+@IDLE_LAW.law(native=("return rhs * rsqrtf(diagonal) * 0.9999847412109375f;",))
+def idle_key(rhs: float, diagonal: float) -> float:
+    """The bound of the velocity's norm up to which a unilateral row at a zero impulse stays idle, ``rhs / sqrt(A_ii)``
+    (``A_ii = |Z|^2 + cfm`` bounds the row's norm), kept below its value: times ``1 - 2^-16``, far beyond the rounding
+    of the CUDA form's approximate reciprocal square root (2 ulp) and of the CPU's quotient. A non-positive ``rhs``
+    gives a key no positive bound stays under, a NaN one that none does (:class:`.sweep.LiveOrder`)."""
+    return rhs / wp.sqrt(diagonal) * 0.9999847412109375
 
 
 @PROJECTION_LAW.law

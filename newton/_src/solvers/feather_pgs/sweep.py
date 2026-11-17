@@ -674,6 +674,9 @@ class RowContext:
     spin_row: Callable[[str], str] | None = None
     """The spin row of the contact whose normal is row ``parent`` (-1 for none), as the row store reads it
     (:func:`spin_row`), where the laws allow spin rows."""
+    reach: str | None = None
+    """The register that bounds the norm of the velocity the rows read, which every apply grows (the live order's
+    bound, :func:`idle_reach`); ``None`` where the row loop keeps no bound."""
     pair_residual: bool = False
     """A friction pair reduces its first tangent's residual again with the pair's terms
     (:func:`_pair_terms` with ``own``) and solves on it in place of the row's: the free-body loop's
@@ -725,6 +728,45 @@ class RowContext:
         overwrites (:attr:`first_store`); nothing otherwise."""
         barrier = self.lanes.sync() if self.owned else ""
         return f"if ({self.first_store}) {barrier}" if barrier and self.first_store else barrier
+
+
+IDLE_MARGIN = "1.0009765625f"
+"""``1 + 2^-10``: the live order's factor over its bound, far above the rounding of the bound's own sums and of a
+row's residual (a 16-term sum, a few ulp)."""
+
+IDLE_FLOOR = "8.673617379884035e-19f"
+"""``2^-60``: what the bound adds for the velocity's coordinates whose squares underflow (each below ``2^-74``)."""
+
+
+def idle_reach(name: str, velocity: Velocity, count: str, lanes: Lanes, pad: str) -> str:
+    """Declare ``name``, a bound of the norm of the velocity a row loop's rows read: the velocity's ``count``
+    coordinates' norm at the loop's start, over the lanes, times :data:`IDLE_MARGIN`, plus :data:`IDLE_FLOOR`; a
+    relaxation that is not positive leaves it NaN, which passes no row (:class:`LiveOrder`). Every lane holds the same value (the
+    lanes' sums reduce to one), and every apply grows it (:func:`idle_growth`)."""
+    lines = [
+        "float idle_sq = 0.0f;",
+        f"for (int d = {lanes.lane if lanes.parallel else '0'}; d < {count}; d += {lanes.width}) {{",
+        f"    const float x = {velocity.at('d')};",
+        "    idle_sq += x * x;",
+        "}",
+        lanes.reduce("idle_sq"),
+        f"float {name} = omega > 0.0f ? sqrtf(idle_sq) * {IDLE_MARGIN} + {IDLE_FLOOR} : __int_as_float(0x7fc00000);",
+    ]
+    return indent("\n".join(line for line in lines if line), pad)
+
+
+def idle_growth(ctx: RowContext, changes: tuple[tuple[str, str], ...]) -> str:
+    """Grow the live order's bound by an apply of ``changes`` (``(row, delta)``; a row named ``"sib"`` exists where
+    ``sib >= 0``): each row moves the velocity by at most ``|delta| sqrt(A_ii)`` (``A_ii = |Z|^2 + cfm``), the apply's
+    rounding inside the margin."""
+    if ctx.reach is None:
+        return ""
+    terms = []
+    for row, delta in changes:
+        name = ctx.row if row == "row" else row
+        term = f"fabsf({delta}) * sqrtf({ctx.diagonal.value(name)})"
+        terms.append(f"(sib >= 0 ? {term} : 0.0f)" if row == "sib" else term)
+    return f"{ctx.reach} = ({ctx.reach} + {' + '.join(terms)}) * {IDLE_MARGIN};"
 
 
 def row_update(ctx: RowContext, laws: RowLaws, *, residual: str, pad: str) -> str:
@@ -789,6 +831,7 @@ def row_update(ctx: RowContext, laws: RowLaws, *, residual: str, pad: str) -> st
                     f"if ({delta} != 0.0f) {{",
                     change_vote(laws, (change,), "    "),
                     indent(op.axpy(((sibling, delta),), "", row=sibling).lstrip("\n"), "    "),
+                    indent(idle_growth(ctx, ((sibling, delta),)), "    "),
                     "}",
                 )
                 if line
@@ -854,6 +897,7 @@ def _row_tail(ctx: RowContext, laws: RowLaws) -> list[str]:
             indent(
                 op.axpy((("spin", "spin_delta"),), "", row=None if op.pair_with_visit else "spin").lstrip("\n"), "    "
             ),
+            indent(idle_growth(ctx, (("spin", "spin_delta"),)), "    "),
             "}",
         ]
     row_change = ctx.diagonal.change("delta_impulse", "row_bound", kind, row)
@@ -865,6 +909,7 @@ def _row_tail(ctx: RowContext, laws: RowLaws) -> list[str]:
             "if (delta_impulse != 0.0f || sib_delta != 0.0f) {",
             change_vote(laws, (row_change, sib_change), "    "),
             indent(op.axpy((("sib", "sib_delta"), ("row", "delta_impulse")), "").lstrip("\n"), "    "),
+            indent(idle_growth(ctx, (("sib", "sib_delta"), ("row", "delta_impulse"))), "    "),
             "}",
         ]
     else:
@@ -873,12 +918,14 @@ def _row_tail(ctx: RowContext, laws: RowLaws) -> list[str]:
                 "if (sib_delta != 0.0f) {",
                 change_vote(laws, (sib_change,), "    "),
                 indent(op.axpy((("sib", "sib_delta"),), "", row="sib").lstrip("\n"), "    "),
+                indent(idle_growth(ctx, (("sib", "sib_delta"),)), "    "),
                 "}",
             ]
         lines += [
             "if (delta_impulse != 0.0f) {",
             change_vote(laws, (row_change,), "    "),
             indent(op.axpy((("row", "delta_impulse"),), "").lstrip("\n"), "    "),
+            indent(idle_growth(ctx, (("row", "delta_impulse"),)), "    "),
             "}",
         ]
     lines.append(ctx.sync() if ctx.synced else "")
@@ -1587,6 +1634,122 @@ class SlotOrder:
 
 
 @dataclasses.dataclass(frozen=True)
+class LiveOrder:
+    """A dense row loop's rows ``[0, end)`` in slot order, each step taken to the next row whose visit can act: the
+    lane group holds a window of rows, a row a lane, and the loop visits the window's rows that can act in order,
+    each read at its row (``rec_a``, ``rec_b`` where the records stream).
+
+    A window's rows are tested once a sweep, from their records and the staged impulses: a row whose visit passes it
+    without a look at the velocity never acts (a spin row, solved with its pair; a velocity limit, which the last word
+    solves; a second tangent, solved with its first; a row other than a friction row whose diagonal is not positive). A contact normal
+    or joint limit at a zero impulse is idle while the loop's bound of the velocity's norm ``reach`` stays at most its
+    key ``rhs / sqrt(A_ii)``: ``A_ii = |Z|^2 + cfm`` bounds the row's norm, so ``|Z . u| <= sqrt(A_ii) |u|`` and the
+    residual ``Z . u + rhs`` is not negative, its computed sum included (the bound's margin covers its rounding and the
+    key's, formed below its value): the step ``-r / A_ii`` is not positive, the regularized and relaxed steps keep
+    its sign (weights in ``(0, 1]``, a relaxation the bound requires positive) and the projection returns the zero
+    the row holds. A first tangent whose rows (pair and spin row) and patch ring's normals hold no impulse is a zero
+    disk while the bound stays at most its ring's least key: a ring normal changes only at a visit, which the bound
+    passing its key allows, and the bound only grows. Every other row acts. After each visit (whose applies grew the
+    bound, :func:`idle_growth`) the window's later rows are tested again against the bound by one comparison and the
+    lanes' vote; a row that acts is visited by the row step's text, its own skips included, so the loop visits the
+    rows slot order would change, in that order, with the same values: a move.
+
+    A warp's lane groups step to their next acting rows together: a step is a visit for each, where slot order held
+    each group at its mate's rows."""
+
+    end: str
+    rows: WorldRows
+    reach: str
+    torsion: bool
+    never: tuple[int, ...] = (ROW_JOINT_VELOCITY_LIMIT,)
+    """The kinds the loop's admission passes (velocity limits, and the line's speed rows where it holds them)."""
+
+    def inner(self, pad: str) -> str:
+        return pad + "        "
+
+    def key(self, rhs: str, diagonal: str) -> str:
+        """The bound up to which a unilateral row at a zero impulse stays idle (:func:`.projection_laws.idle_key`)."""
+        return f"IdleLaw::idle_key({rhs}, {diagonal})"
+
+    def test(self) -> str:
+        """Row ``t``'s test data, ``live_always`` (it acts whatever the bound) and ``live_key`` (it acts once the bound
+        passes it; infinite: never)."""
+        rows = self.rows
+        if rows.record:
+            # The record's first quad: its sides, diagonal, right-hand side and kind word (pack_row_record).
+            head = [
+                f"const int4 ta = *reinterpret_cast<const int4*>(&row_record.data[{rows.records} + t * {rows.words}]);"
+            ]
+            word = {1: "ta.y", 2: "ta.z", 3: "ta.w"}.__getitem__
+        else:
+            head = []
+            word = lambda k: rows.word("t", k)  # noqa: E731
+        never = (*self.never, ROW_TORSION) if self.torsion else self.never
+        kinds = " && ".join(f"t_kind != {k}" for k in never)
+        unilateral = f"t_kind == {ROW_CONTACT} || t_kind == {ROW_JOINT_LIMIT}"
+        ring_kinds = " && ".join(f"r_kind != {k}" for k in never)
+        spin = rows.spin_of("t_parent", self.end) if self.torsion else "-1"
+        lines = [
+            *head,
+            f"const int t_kind = {word(3)} & 0xFFFF;",
+            f"const float t_diagonal = __int_as_float({word(1)});",
+            f"if (t_kind == {ROW_FRICTION}) {{",
+            f"    const int t_parent = {rows.parent_of(word(3))};",
+            "    if (t == t_parent + 1) {",
+            f"        const int t_spin = {spin};",
+            f"        live_always = {rows.peek('t')} != 0.0f || {rows.peek('t + 1')} != 0.0f"
+            f" || (t_spin >= 0 && {rows.peek('t_spin')} != 0.0f);",
+            # The patch ring's normals from the pair's own, as the visit's pooled load walks them (RING_LOAD).
+            "        int r = t_parent;",
+            f"        for (int hop = 0; !live_always && r >= 0 && hop <= {rows.capacity}; ++hop) {{",
+            f"            const int r_kind = {rows.kind('r')};",
+            f"            const float r_diagonal = {rows.diag('r')};",
+            f"            if ({rows.peek('r')} != 0.0f) live_always = true;",
+            f"            else if (!(r_diagonal <= 0.0f) && {ring_kinds}) {{",
+            f"                if (r_kind == {ROW_CONTACT} || r_kind == {ROW_JOINT_LIMIT})",
+            f"                    live_key = fminf(live_key, {self.key(rows.rhs_of('r'), 'r_diagonal')});",
+            "                else live_always = true;",
+            "            }",
+            f"            r = {rows.parent('r', enclosed=True)};",
+            "            if (r == t_parent) break;",
+            "        }",
+            "    }",
+            f"}} else if ({kinds} && !(t_diagonal <= 0.0f)) {{",
+            f"    if (({unilateral}) && __float_as_int({rows.peek('t')}) == 0)",
+            f"        live_key = {self.key(f'__int_as_float({word(2)})', 't_diagonal')};",
+            "    else live_always = true;",
+            "}",
+        ]
+        return "\n".join(lines)
+
+    def wrap(self, visit: str, pad: str) -> str:
+        rows, lanes = self.rows, self.rows.lanes
+        lane = lanes.lane if lanes.parallel else "0"
+        acts = f"live_always || !({self.reach} <= live_key)"
+        test = indent(self.test(), pad + "            ")
+        record = indent(rows.visit("i"), pad + "        ") + "\n" if rows.record else ""
+        return f"""{pad}for (int live_first = 0; live_first < {self.end}; live_first += {lanes.width}) {{
+{pad}    bool live_always = false;
+{pad}    float live_key = __int_as_float(0x7f800000);
+{pad}    {{
+{pad}        const int t = live_first + {lane};
+{pad}        if (t < {self.end}) {{
+{test}
+{pad}        }}
+{pad}    }}
+{pad}    unsigned live_votes = BALLOT({acts});
+{pad}    while (live_votes != 0u) {{
+{pad}        const int live_at = FIRST(live_votes);
+{pad}        const int i = live_first + live_at;
+{record}{pad}        do {{
+{visit}
+{pad}        }} while (false);
+{pad}        live_votes = BALLOT({lane} > live_at && ({acts}));
+{pad}    }}
+{pad}}}"""
+
+
+@dataclasses.dataclass(frozen=True)
 class SelectedRows:
     """The rows a scan at the sweep's entry selected into the bitset ``words`` (the active enumeration,
     :func:`active_scan`), popped in slot order, row ``i`` at a time."""
@@ -2115,6 +2278,7 @@ def row_step(
     triple_phase: bool = False,
     metric: str | None = None,
     formed: Callable[[str], str] | None = None,
+    reach: str | None = None,
     pad: str = "            ",
 ) -> str:
     """Row ``i``'s step in a row loop over a store's rows ``[0, end)``: its kind read from the store, the schedule's
@@ -2136,7 +2300,8 @@ def row_step(
       sparse-diagonal sweep's chains).
 
     A spin row is skipped first (solved with its pair, here or in the triple phase), then ``admission``, the
-    schedule's own skips (velocity limits, which the last word solves).
+    schedule's own skips (velocity limits, which the last word solves); with ``reach`` (the live order's bound of the
+    velocity, :class:`LiveOrder`) every apply grows the bound (:func:`idle_growth`).
     """
     ctx = RowContext.of(
         rows,
@@ -2145,6 +2310,7 @@ def row_step(
         metric=metric,
         formed=formed,
         friction=kind in (None, ROW_FRICTION),
+        reach=reach,
     )
     hold = {}
     if held:
@@ -2182,6 +2348,7 @@ def rows_block(
     selected: bool = False,
     unit: str = "",
     triple_phase: bool = False,
+    live: tuple[Velocity, str, tuple[int, ...]] | None = None,
     pad: str = "        ",
 ) -> str:
     """The Gauss-Seidel loop over a world's rows of one class ``[0, end)`` in slot order (:class:`WorldRows`): the
@@ -2199,7 +2366,11 @@ def rows_block(
 
     ``metric`` and ``formed`` are the friction laws' (:func:`friction_laws`). ``selected``: the active enumeration's rows
     (:class:`SelectedRows`), each record loaded at its visit; ``unit``: a contact unit's visit (:func:`unit_visit`);
-    ``triple_phase``: the dense rows' friction triples are a phase's (:func:`row_step`).
+    ``triple_phase``: the dense rows' friction triples are a phase's (:func:`row_step`). ``live`` (the velocity the
+    rows read, its coordinates' count and the kinds ``admission`` passes): the dense rows step to the rows that can act
+    (:class:`LiveOrder`), on a
+    bound of the velocity formed at the loop's start (:func:`idle_reach`) and grown at each of its applies, which are
+    the only ones inside it.
     """
     inner = pad + "    "
     if end is None:
@@ -2207,6 +2378,13 @@ def rows_block(
     if (selected or unit) and rows.free:
         raise ValueError("the active enumeration and the contact unit visit the dense rows")
     step = {"end": end, "admission": admission, "metric": metric, "formed": formed, "triple_phase": triple_phase}
+    if live is not None and (selected or unit or rows.free or not rows.owned):
+        raise ValueError("the live order bounds a dense loop whose own row applies are the only ones inside it")
+    if live is not None:
+        order = LiveOrder(end, rows, "idle_reach", laws.torsion, live[2])
+        visit = row_step(rows, op, laws, **step, reach="idle_reach", pad=order.inner(pad + "    "))
+        bound = idle_reach("idle_reach", live[0], live[1], rows.lanes, pad + "    ")
+        return f"{pad}{{\n{bound}\n{order.wrap(visit, pad + '    ')}\n{pad}}}"
     if selected:
         order = SelectedRows(end)
         inner = order.inner(pad)
