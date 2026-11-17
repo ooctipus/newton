@@ -602,40 +602,66 @@ def region_visit(
     if friction > 0:
         without = without - Cu * phi_in
         rf0 = rf0 - wp.transpose(Cu) * wrench_in - Gu * phi_in
-    if friction == 0:
-        wrench, i0, i1, i2, multipliers, spring, velocity, opened, _bounded, steps = region_block(
-            without, Wnn, Lw, without, cand, g0, g1, i0_in, i1_in, i2_in, spring_in, tol
+    # The candidates' block, one text for both of its solves: with friction it sticks first (the unit held at zero
+    # residual, in the stick metric), and where the unit slides it is solved once more with the friction as it was
+    # (in Wnn's metric), from the set and the springs the stick left; without friction it is solved once.
+    start = without
+    metric = Wnn
+    factor = Lw
+    if friction > 0:
+        CG = Cu * Ginv
+        start = without - CG * rf0
+        metric = K
+        factor = Lk
+    j0 = i0_in
+    j1 = i1_in
+    j2 = i2_in
+    held = spring_in
+    stuck = int(-1)
+    wrench = zero
+    i0 = int(-1)
+    i1 = int(-1)
+    i2 = int(-1)
+    multipliers = zero
+    spring = zero
+    velocity = zero
+    steps = int(0)
+    while True:
+        wrench, i0, i1, i2, multipliers, spring, velocity, opened, bounded, steps = region_block(
+            start, metric, factor, without, cand, g0, g1, j0, j1, j2, held, tol
         )
+        if stuck >= 0:
+            break
         if opened == 1:
             return zero, zero, -1, -1, -1, zero, zero, without, REGION_OPEN, steps
-        return wrench, zero, i0, i1, i2, multipliers, spring, velocity, REGION_STICK, steps
-    # Stick first: the friction unit held at zero residual with the candidates' block.
-    Gs = Gu + wp.mat33(cfm, 0.0, 0.0, 0.0, cfm, 0.0, 0.0, 0.0, cfm)
-    CG = Cu * Ginv
-    wrench, i0, i1, i2, multipliers, spring, velocity, opened, bounded, steps = region_block(
-        without - CG * rf0, K, Lk, without, cand, g0, g1, i0_in, i1_in, i2_in, spring_in, tol
-    )
-    if opened == 1:
-        return zero, zero, -1, -1, -1, zero, zero, without, REGION_OPEN, steps
-    load = wrench[0]
-    phi = zero - Ginv * (rf0 + wp.transpose(Cu) * wrench)
-    scaled = wp.vec3(phi[0] / mu, phi[1] / mu, 0.0)
-    if mu_t > 0.0:
-        scaled = wp.vec3(phi[0] / mu, phi[1] / mu, phi[2] / mu_t)
-    if bounded == 1 and load > 0.0 and mu > 0.0 and wp.dot(scaled, scaled) <= load * load:
-        return wrench, phi, i0, i1, i2, multipliers, spring, velocity, REGION_STICK, steps
-    # Slide: the candidates' block with the friction as it was, then the unit's cone law at the block's load, once.
-    start = without + Cu * phi_in
-    wrench, i0, i1, i2, multipliers, spring, velocity, _opened, _bounded, more = region_block(
-        start, Wnn, Lw, without, cand, g0, g1, i0, i1, i2, spring, tol
-    )
+        if friction == 0:
+            return wrench, zero, i0, i1, i2, multipliers, spring, velocity, REGION_STICK, steps
+        load = wrench[0]
+        phi = zero - Ginv * (rf0 + wp.transpose(Cu) * wrench)
+        scaled = wp.vec3(phi[0] / mu, phi[1] / mu, 0.0)
+        if mu_t > 0.0:
+            scaled = wp.vec3(phi[0] / mu, phi[1] / mu, phi[2] / mu_t)
+        if bounded == 1 and load > 0.0 and mu > 0.0 and wp.dot(scaled, scaled) <= load * load:
+            return wrench, phi, i0, i1, i2, multipliers, spring, velocity, REGION_STICK, steps
+        # Slide: the block with the friction as it was, then the unit's cone law at the block's load, once.
+        start = without + Cu * phi_in
+        metric = Wnn
+        factor = Lw
+        j0 = i0
+        j1 = i1
+        j2 = i2
+        held = spring
+        stuck = steps
     residual = rf0 + wp.transpose(Cu) * wrench + Gu * phi_in
-    phi = wp.vec3(0.0, 0.0, 0.0)
+    friction_phi = wp.vec3(0.0, 0.0, 0.0)
     if mu_t > 0.0:
-        phi = friction_triple_from_metric(ball_values, ball_vectors, residual, phi_in, mu, mu_t, wrench[0], 1.0)
+        friction_phi = friction_triple_from_metric(
+            ball_values, ball_vectors, residual, phi_in, mu, mu_t, wrench[0], 1.0
+        )
     else:
-        phi = friction_triple(Gs, residual, phi_in, mu, mu_t, wrench[0], 1.0)
-    return wrench, phi, i0, i1, i2, multipliers, spring, velocity, REGION_SLIDE, steps + more
+        Gs = Gu + wp.mat33(cfm, 0.0, 0.0, 0.0, cfm, 0.0, 0.0, 0.0, cfm)
+        friction_phi = friction_triple(Gs, residual, phi_in, mu, mu_t, wrench[0], 1.0)
+    return wrench, friction_phi, i0, i1, i2, multipliers, spring, velocity, REGION_SLIDE, stuck + steps
 
 
 @REGION_LAW.law(dense=("stage",))
