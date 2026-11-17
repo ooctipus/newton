@@ -49,7 +49,6 @@ from .spatial_laws import (
     SPATIAL,
     body_wrench,
     inertia_at,
-    inertia_matrix,
     inertia_record,
     joint_columns,
     joint_frame_pose,
@@ -229,52 +228,6 @@ _DIFFERENT_MOTION_SOURCE = r"""
         different|=state_qd.data[start+i]!=motion_qd.data[start+i];
     return ANY(different);
 """
-
-
-@wp.func
-def body_dynamics(
-    body: int,
-    articulation: int,
-    pose: wp.transform,
-    pose_com: wp.transform,
-    origin: wp.vec3,
-    velocity: wp.spatial_vector,
-    acceleration: wp.spatial_vector,
-    mass: float,
-    inertia: wp.mat33,
-    com: wp.vec3,
-    gravity: wp.vec3,
-    write_matrix: int,
-    write_record: int,
-    publish_twist: int,
-    body_I_s: wp.array[wp.spatial_matrix],
-    body_inertia_terms: wp.array[inertia_record],
-    body_f_s: wp.array[wp.spatial_vector],
-    body_qd: wp.array[wp.spatial_vector],
-):
-    """Store a body's inverse-dynamics wrench about the origin (:func:`.spatial_laws.body_wrench`); optionally
-    its inertia there and its COM twist.
-
-    ``write_matrix`` stores the dense spatial inertia, ``write_record`` the inertia record. A body outside an
-    articulation (``articulation < 0``) only publishes its COM twist.
-    """
-    if articulation < 0:
-        if publish_twist != 0:
-            linear = point_velocity(velocity, wp.transform_point(pose, com))
-            body_qd[body] = wp.spatial_vector(linear, wp.spatial_bottom(velocity))
-        return
-    offset = wp.transform_get_translation(pose_com) - origin
-    rotation = wp.transform_get_rotation(pose_com)
-    if write_matrix != 0 or write_record != 0:
-        body_mass, moment, rotational = inertia_at(mass, inertia, rotation, offset)
-        if write_matrix != 0:
-            body_I_s[body] = inertia_matrix(body_mass, moment, rotational)
-        if write_record != 0:
-            body_inertia_terms[body] = pack_inertia(body_mass, moment, rotational)
-    body_f_s[body] = body_wrench(mass, rotation, inertia, offset, velocity, acceleration, gravity)
-    if publish_twist != 0:
-        linear = point_velocity(velocity, wp.transform_point(pose, com) - origin)
-        body_qd[body] = wp.spatial_vector(linear, wp.spatial_bottom(velocity))
 
 
 @functools.cache
@@ -924,14 +877,6 @@ def get_helpers(
     @wp.func_native(motion_source)
     def _scan_motion(address: wp.uint64, p: HeldPlan): ...
 
-    # A root-only free body is a free rigid body (in a forest, a free root may
-    # be one): the matrix-free contact path reads its spatial inertia and bias
-    # wrench every substep, so publish them through the ordinary free-rigid
-    # finalization; the runtime free-rigid test skips tree bodies. A single
-    # free-root tree of several bodies never takes this branch (it cost Cassie
-    # flat and Humanoid 3-4% in the finish kernel).
-    free_rigid = (layout.bodies == 1 and layout.free_root) or (layout.forest and layout.free_root_count > 0)
-
     @wp.func
     def _body_terms(
         g: TreeGroup,
@@ -980,30 +925,6 @@ def get_helpers(
         store_words(g.address, wp.static(wrench_word) + 6 * local, wrench)
         if g.refresh != 0:
             store_words(g.address, wp.static(moment_word) + 13 * local, record)
-        if wp.static(free_rigid):
-            if data.is_free_rigid[data.body_to_articulation[body]] != 0:
-                data.body_q_com[body] = pose_com
-                data.body_a_s[body] = acceleration
-                body_dynamics(
-                    body,
-                    data.body_to_articulation[body],
-                    pose,
-                    pose_com,
-                    origin,
-                    velocity,
-                    acceleration,
-                    data.body_mass[body],
-                    data.body_inertia[body],
-                    data.body_com[body],
-                    gravity,
-                    1,
-                    0,
-                    1,
-                    data.body_I_s,
-                    data.body_inertia_terms,
-                    data.body_f_s,
-                    data.body_qd,
-                )
         if wp.static(clocked):
             clock_b3 = _clock()
             if data.stage_clocks.shape[0] > g.group:

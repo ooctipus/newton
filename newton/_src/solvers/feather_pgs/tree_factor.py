@@ -36,7 +36,6 @@ from .factor.fields import (
     ARTICULATION_ORIGIN,
     ARTICULATION_WORK,
     AUGMENTED_DRIVE_ROWS,
-    BODY_INERTIA,
     PREELIMINATION,
     PREELIMINATION_PLAN,
     STATE_AUX,
@@ -170,8 +169,7 @@ class TreeFactor:
         # The held tree's cache of next-step dynamics.
         self.fk_id_cache_valid = wp.zeros(model.articulation_count, dtype=wp.int32, device=model.device)
         # The augmented state is allocated here rather than on the first step: a wp.zeros() issued inside a CUDA
-        # graph capture becomes a memset node that replays every launch and wiped the cached bias forces (body_f_s)
-        # at the first substep of each replay.
+        # graph capture becomes a memset node that replays every launch.
         if model.body_count:
             self._arrays.allocate(STATE_AUX, dof=model.joint_dof_count, body=model.body_count)
         # Each body's gravity compensation fraction: the model's attribute (the kernels read its array), or none.
@@ -492,8 +490,7 @@ class TreeFactor:
         self.parallel_drives = True
 
     def allocate_common(self) -> None:
-        """Allocate the mass-update mask, the compact diagonal's inverse mass, the body inertia records and the
-        articulation origins."""
+        """Allocate the mass-update mask, the compact diagonal's inverse mass and the articulation origins."""
         model, forest, arrays = self.model, self.forest, self._arrays
         if model.joint_count:
             arrays.allocate(ARTICULATION_WORK, articulation=model.articulation_count)
@@ -502,11 +499,6 @@ class TreeFactor:
         self.diagonal_inverse_mass = (
             wp.zeros_like(model.joint_qd) if forest.diagonal_mass_sizes else arrays.placeholder(wp.float32)
         )
-        if model.body_count:
-            arrays.allocate(BODY_INERTIA, body=model.body_count)
-        else:
-            arrays.release(BODY_INERTIA)
-
         if not model.articulation_count or not model.joint_count:
             self.articulation_origin = None
             return

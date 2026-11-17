@@ -28,8 +28,8 @@ mass is ``M |S|^2``); a family with turning leaves reads each leaf's kind from i
 the moments about the articulation origin and ``S^T I S`` from each body's inertia there; a family with welded bodies
 walks each leaf's welds (a CSR of the template's joints, :class:`CoordinateTopology`) in its coordinate's thread.
 Validity is a word an articulation: one launch holds every coordinate of an articulation, the repair reads it, the
-finish sets it. The class never writes ``body_q_com``, ``body_v_s``, ``body_a_s``, ``body_f_s``, ``body_I_s`` or the
-compact inertia terms of its bodies, which no consumer on its route reads.
+finish sets it. The class never writes its bodies' twists about the origin (``body_v_s``), which no consumer on its
+route reads.
 
 A leaf's inverse mass, ``1 / (H_ii + armature + K)``, depends on the inertial values, the armature and the drive's
 ``K = ke dt^2 + kd dt``, never on the pose, so a root re-pose leaves it unchanged. It refreshes wherever the solver's

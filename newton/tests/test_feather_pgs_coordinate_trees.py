@@ -30,10 +30,9 @@ from newton.tests.test_feather_pgs_cache_validity import _set_clock
 
 DT = 1.0 / 240.0
 GRAVITY = (0.7, -1.2, -9.1)
-# Fields the one-coordinate class never writes for its bodies; no consumer on its route reads them.
-DROPPED_FIELDS = ("body_q_com", "body_v_s", "body_a_s", "body_f_s", "body_I_s", "body_inertia_terms")
-# The held owner writes them only for free bodies, and body_v_s only for a prescribed articulation's: not for a
-# fixed-base arm.
+# The field the one-coordinate class never writes for its bodies; no consumer on its route reads it. The held owner
+# writes it only for a prescribed articulation's bodies: not for a fixed-base arm.
+DROPPED_FIELDS = ("body_v_s",)
 # CUDA bounds against ordinary dynamics: the keys' are FMA contraction and the rounding of the
 # inverse-mass projection and gravity force, which ordinary dynamics evaluates in another order;
 # the arm leaves the serial route for the held owner's float order.

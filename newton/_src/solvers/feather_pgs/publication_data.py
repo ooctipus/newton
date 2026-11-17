@@ -7,7 +7,6 @@ import warp as wp
 
 from . import field_group
 from .field_group import Field
-from .spatial_laws import inertia_record
 
 PUBLICATION = (
     Field("joint_type", wp.int32, ("joint",), owner="model"),
@@ -41,7 +40,6 @@ PUBLICATION = (
     Field("joint_qd_new", wp.float32, ("dof",), owner="state_out", attr="joint_qd"),
     Field("body_q", wp.transform, ("body",), owner="state_out"),
     Field("body_qd", wp.spatial_vector, ("body",), owner="state_out"),
-    Field("body_q_com", wp.transform, ("body",), owner="state_aug"),
     Field("joint_S_s", wp.spatial_vector, ("dof",), owner="state_aug"),
     Field("articulation_origin", wp.vec3, ("articulation",), owner="factor"),
     # The walk's step geometry (factor.walk.WalkTrees.now, .now_link; empty where nothing walks): each coordinate's
@@ -55,10 +53,6 @@ PUBLICATION = (
     Field("row_H", wp.float32, ("drive_row",), owner="factor", attr="aug_row_H"),
     Field("armature", wp.float32, ("dof",), owner="factor", attr="dof_armature"),
     Field("body_v_s", wp.spatial_vector, ("body",), owner="state_aug"),
-    Field("body_a_s", wp.spatial_vector, ("body",), owner="state_aug"),
-    Field("body_f_s", wp.spatial_vector, ("body",), owner="state_aug"),
-    Field("body_I_s", wp.spatial_matrix, ("body",), owner="state_aug"),
-    Field("body_inertia_terms", inertia_record, ("body",), owner="factor"),
     Field("fk_id_cache_valid", wp.int32, ("articulation",), owner="factor"),
     Field("dt", wp.float32, owner="step"),
     # Per-group stage cycle counts under Diagnostics.stage_clocks (a 1x1 placeholder otherwise).

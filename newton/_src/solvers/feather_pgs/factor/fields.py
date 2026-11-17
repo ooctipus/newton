@@ -11,17 +11,11 @@ import warp as wp
 
 from .. import field_group
 from ..field_group import Field, FieldGroup
-from ..spatial_laws import FACTOR_REQUEST, drive_force, drive_stiffness, inertia_record, limited_drive_force
+from ..spatial_laws import FACTOR_REQUEST, drive_force, drive_stiffness, limited_drive_force
 
 ARTICULATION_WORK = FieldGroup(
     Field("mass_update_mask", wp.int32, ("articulation",), owner="factor"),
 )
-
-BODY_INERTIA = FieldGroup(
-    Field("body_inertia_terms", inertia_record, ("body",), fill=None),
-)
-"""Body inertia about the articulation origin as inertia records (:data:`.spatial_laws.inertia_record`): each
-body's own (``body_inertia_terms``) and its subtree's composite (``body_I_c``)."""
 
 ARTICULATION_ORIGIN = FieldGroup(Field("articulation_origin", wp.vec3, ("articulation",), owner="factor"))
 
@@ -117,13 +111,7 @@ STATE_AUX = FieldGroup(
     Field("joint_qdd", wp.float32, ("dof",), owner="factor"),
     Field("joint_tau", wp.float32, ("dof",), fill=None, owner="factor"),
     Field("joint_S_s", wp.spatial_vector, ("dof",), fill=None, owner="factor"),
-    Field("body_q_com", wp.transform, ("body",), fill=None, owner="factor"),
-    Field("body_I_s", wp.spatial_matrix, ("body",), fill=None, owner="factor"),
     Field("body_v_s", wp.spatial_vector, ("body",), fill=None, owner="factor"),
-    Field("body_a_s", wp.spatial_vector, ("body",), fill=None, owner="factor"),
-    # Without a memset: the first step may run inside a CUDA graph capture, and a captured memset would erase the
-    # cached body forces on every replay while the FK/ID cache stays valid. Stage 1 writes body_f_s before reading it.
-    Field("body_f_s", wp.spatial_vector, ("body",), fill=None, owner="factor"),
 )
 """The augmented state: the step's derived dynamics (maximal coordinates), allocated on the tree factor."""
 
