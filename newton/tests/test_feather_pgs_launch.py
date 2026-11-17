@@ -20,7 +20,7 @@ import warp as wp
 
 from newton._src.core import execution, memory
 from newton._src.core.execution import Queue, Use, Work, shape
-from newton._src.core.memory import CPU, Buffer, Device, Place, Staging, carveout
+from newton._src.core.memory import CPU, Buffer, Device, Place, Staging, carveout, carveout_share
 from newton._src.solvers.feather_pgs import kernel_template, sweep_routes, tree_kinetic_state, walk_rows
 from newton._src.solvers.feather_pgs.device_preludes import SHARED_STORAGE, DevicePrelude, dual_native, lane_group
 from newton._src.solvers.feather_pgs.factor import walk as factor_walk
@@ -176,6 +176,18 @@ class TestShapeAgainstTodaysRules(unittest.TestCase):
         self.assertEqual(carveout(CPU, 8, 4776), 0)
         got = shape(Work(4096, lanes=32, block=32, shared=1664), PRO)
         self.assertEqual((got.blocks_per_sm, got.carveout_kb, got.l1_kb), (24, 64, 64))
+
+    def test_a_share_lands_on_its_step(self):
+        # The driver reads a preferred carveout as a share of the unified memory and takes the next step up: each
+        # step's share lands on it (the PRO's 64 KiB step is 50%; the share of its largest step, 64%, is 82 KiB of the
+        # unified 128 and lands on 100 KiB, the driver's default, which leaves the general sweep 28 KiB of L1).
+        for device in (PRO, GB300):
+            for step in device.carveouts_kb:
+                with self.subTest(arch=device.arch, step=step):
+                    asked = carveout_share(device, step) * device.unified_kb / 100
+                    self.assertEqual(next(s for s in device.carveouts_kb if s >= asked), step)
+        self.assertEqual(carveout_share(PRO, 64), 50)
+        self.assertEqual(carveout_share(CPU, 64), 0)
 
     def test_stage_pays_in_warps(self):
         """franka-cabinet's general sweep streams its records (6 and 14 warps staged, 32 streamed), g1's stages them at
@@ -368,7 +380,7 @@ class TestLaunch(unittest.TestCase):
                 hooks = kernel.module.load(device, 128).get_kernel_hooks(kernel)
                 share = ctypes.c_int(-2)
                 memory._call("cuFuncGetAttribute", ctypes.byref(share), ctypes.c_int(9), ctypes.c_void_p(hooks.forward))
-                self.assertEqual(share.value, step * 100 // spec.carveouts_kb[-1])
+                self.assertEqual(share.value, memory.carveout_share(spec, step))
                 out = wp.zeros(3, dtype=float, device=device)
                 wp.launch_tiled(kernel, dim=[3], inputs=[out], block_dim=128, device=device)
                 np.testing.assert_allclose(out.numpy(), expected)

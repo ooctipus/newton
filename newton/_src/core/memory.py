@@ -279,6 +279,16 @@ def carveout(device: Device, resident: int, shared: int) -> int:
     return device.carveouts_kb[-1]
 
 
+def carveout_share(device: Device, step: int) -> int:
+    """The preferred carveout [percent] that lands on ``step`` [KiB]: the driver reads a preference as a share of the
+    unified L1 and shared memory (not of the largest step) and takes the next step up, so the share is the step's of
+    the unified memory, rounded down (sm_120: the 64 KiB step is 50% of 128 KiB; 64% would be 82 KiB, the 100 KiB
+    step); 0 on the CPU."""
+    if not device.cuda:
+        return 0
+    return int(step) * 100 // device.unified_kb
+
+
 _CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES = 1
 _CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT = 9
 _fitted: dict[tuple[wp.Kernel, int, int], int] = {}
@@ -301,7 +311,7 @@ def fit_carveout(kernel: wp.Kernel, block: int, device=None) -> int:
     on ``device``, the carveout step that holds the blocks its loaded code keeps resident (:func:`carveout`, the
     driver's occupancy: its registers, its static and dynamic shared memory), once a kernel and device, and return the
     step [KiB]; 0 on the CPU. The kernel's module is loaded here if its launch has not loaded it yet. The preference is
-    the step's share of the largest, rounded down: the driver takes the next step up, which is this one."""
+    the step's share of the unified memory (:func:`carveout_share`), on which the driver lands this step."""
     found = wp.get_device(device)
     if not found.is_cuda:
         return 0
@@ -331,7 +341,7 @@ def fit_carveout(kernel: wp.Kernel, block: int, device=None) -> int:
         )
         spec = _read(found.alias)
         step = carveout(spec, resident.value, static.value + dynamic)
-        share = step * 100 // spec.carveouts_kb[-1]
+        share = carveout_share(spec, step)
         _call(
             "cuFuncSetAttribute",
             function,
