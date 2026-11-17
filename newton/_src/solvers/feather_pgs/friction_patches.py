@@ -776,10 +776,11 @@ def _carried_displacement(q: wp.array[wp.transform], prev: _PatchFrame, p: int, 
 
 
 @wp.func
-def _footprint_point(frame: _PatchFrame, c: int, origin: wp.vec3, t0: wp.vec3, t1: wp.vec3):
-    """Member ``c``'s contact centre in the region's tangent plane, relative to ``origin``."""
+def _footprint_point(frame: _PatchFrame, c: int, origin: wp.vec3, t0: wp.vec3, t1: wp.vec3, normal: wp.vec3):
+    """Member ``c``'s contact centre relative to ``origin``: in the region's tangent plane, and its height along
+    ``normal``."""
     d = frame.center[c] - origin
-    return wp.dot(d, t0), wp.dot(d, t1)
+    return wp.dot(d, t0), wp.dot(d, t1), wp.dot(d, normal)
 
 
 @wp.func
@@ -791,27 +792,32 @@ def _region_footprint(
     origin: wp.vec3,
     t0: wp.vec3,
     t1: wp.vec3,
+    normal: wp.vec3,
 ):
     """The region's footprint in its tangent plane: the centroid of its members' convex hull relative to ``origin``,
-    and its spin arm, :data:`_SPIN_ARM` times the hull's polar radius of gyration (core-docs/WRENCH/VERDICT.md U6).
+    and its spin arm, :data:`_SPIN_ARM` times the hull's polar radius of gyration (core-docs/WRENCH/VERDICT.md U6);
+    and the sum of its members' heights along ``normal`` with their count, for the region's mean height.
 
     The hull is gift-wrapped over the members' points, and its moments accumulate over a triangle fan from the first
     hull vertex. Every step of the wrap scans the points, so the first pass over the members leaves them in the
     region's own positions of ``frame.foot``, one contiguous run: a step then reads one line of points where it
     would chase each member's index, its eligibility and its centre. A hull of no area is a line: its arm is a
-    uniform segment's. Returns ``(x, y, arm)``; a region of one point has arm 0.
+    uniform segment's. The first pass sums the heights, which the region would otherwise read its members again
+    for. Returns ``(x, y, arm, height, count)``; a region of one point has arm 0.
     """
     count = int(0)
     sum_x = float(0.0)
     sum_y = float(0.0)
     sum_rr = float(0.0)
+    height = float(0.0)
     start_x = float(1.0e30)
     start_y = float(1.0e30)
     for j in range(member_start, member_stop):
         c = frame.members[j]
         if carry_only != 0 or frame.eligible[c] != 0:
-            x, y = _footprint_point(frame, c, origin, t0, t1)
+            x, y, z = _footprint_point(frame, c, origin, t0, t1, normal)
             frame.foot[member_start + count] = wp.vec2(x, y)
+            height += z
             count += 1
             sum_x += x
             sum_y += y
@@ -823,7 +829,7 @@ def _region_footprint(
     mean_y = sum_y / float(wp.max(count, 1))
     spread = wp.max(sum_rr / float(wp.max(count, 1)) - mean_x * mean_x - mean_y * mean_y, 0.0)
     if count < 2 or spread <= 0.0:
-        return mean_x, mean_y, 0.0
+        return mean_x, mean_y, 0.0, height, count
     tolerance = 1.0e-10 * spread
     x_now = start_x
     y_now = start_y
@@ -880,11 +886,11 @@ def _region_footprint(
     span = 0.5 * perimeter
     if wp.abs(area) <= 1.0e-6 * span * span:
         # A line: the walk goes out and back.
-        return start_x + 0.5 * far_x, start_y + 0.5 * far_y, _SPIN_ARM * span / wp.sqrt(12.0)
+        return start_x + 0.5 * far_x, start_y + 0.5 * far_y, _SPIN_ARM * span / wp.sqrt(12.0), height, count
     centre_x = moment_x / area
     centre_y = moment_y / area
     gyration = wp.max(polar / area - centre_x * centre_x - centre_y * centre_y, 0.0)
-    return start_x + centre_x, start_y + centre_y, _SPIN_ARM * wp.sqrt(gyration)
+    return start_x + centre_x, start_y + centre_y, _SPIN_ARM * wp.sqrt(gyration), height, count
 
 
 def _region_placement(search: bool, settle: bool):
@@ -930,16 +936,9 @@ def _region_placement(search: bool, settle: bool):
             normal = frame.normal[seed]
             plane_t0, plane_t1 = contact_tangent_basis(normal)
             origin = frame.center[first]
-            foot_x, foot_y, spin_arm = _region_footprint(
-                frame, member_start, member_stop, carry_only, origin, plane_t0, plane_t1
+            foot_x, foot_y, spin_arm, height, height_count = _region_footprint(
+                frame, member_start, member_stop, carry_only, origin, plane_t0, plane_t1, normal
             )
-            height = float(0.0)
-            height_count = int(0)
-            for j in range(member_start, member_stop):
-                c = frame.members[j]
-                if carry_only != 0 or frame.eligible[c] != 0:
-                    height += wp.dot(frame.center[c] - origin, normal)
-                    height_count += 1
             location = (
                 origin + foot_x * plane_t0 + foot_y * plane_t1 + normal * (height / float(wp.max(height_count, 1)))
             )
@@ -1666,11 +1665,14 @@ def _carry_region(
     """
     member_stop = frame.region_stop[member_start]
     seed = frame.members[member_start]
+    # Its last member that may carry friction rows: the scan from its end stops at the first it meets.
     first = int(-1)
-    for j in range(member_start, member_stop):
+    j = member_stop - 1
+    while j >= member_start and first < 0:
         c = frame.members[j]
         if frame.eligible[c] != 0:
             first = c
+        j -= 1
     carry_only = int(0)
     if first < 0:
         carry_only = int(1)
