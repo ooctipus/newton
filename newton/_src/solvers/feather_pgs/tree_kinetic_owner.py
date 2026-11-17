@@ -318,8 +318,12 @@ class TreeKineticState:
             return
         classes = self._walk_classes()
         arch = self.solver.model.device.arch
-        self.force_kernel = native.get_force_kernel(
-            self.schedules, layout=layout, response=self._response, classes=classes, device_arch=arch
+        self.force_kernel = (
+            native.get_force_kernel(
+                self.schedules, layout=layout, response=self._response, classes=classes, device_arch=arch
+            )
+            if native.forces(layout)
+            else None
         )
         self.walk_solve_kernel = (
             native.get_walk_solve_kernel(layout=layout, classes=classes) if native.walk_solves(layout) else None
@@ -534,11 +538,12 @@ class TreeKineticState:
         walk = solver.factor.walk_view()
         inputs = [self.sparse.plan, self.sparse.data, self.plan, self.data, force, walk, self.trial]
         device = solver.model.device
-        # The force half, the walk's solve (a thread a tree root; none where every root is diagonal), the response
-        # half (Z4.2).
-        wp.launch_tiled(
-            self.force_kernel, dim=[self.launch_count], inputs=inputs, block_dim=self.block_dim, device=device
-        )
+        # The force half (none where every root is prescribed), the walk's solve (a thread a tree root; none where no
+        # root is walked), the response half (Z4.2).
+        if self.force_kernel is not None:
+            wp.launch_tiled(
+                self.force_kernel, dim=[self.launch_count], inputs=inputs, block_dim=self.block_dim, device=device
+            )
         if self.walk_solve_kernel is not None:
             wp.launch(
                 self.walk_solve_kernel,

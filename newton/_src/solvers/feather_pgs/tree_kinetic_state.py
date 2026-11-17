@@ -717,7 +717,7 @@ _RESPONSE_STAGE = r"""$START    for(int col=lane;col<$DOFS;col+=stride) {
 _RESPONSE_HALF = r"""    const auto MOVE=[&](int bits){RAISE(moved,bits);};
     if(lane==0)moved=0;
 $CLOCK0    for(int i=lane;i<$DOFS;i+=stride) {
-        s[$SIX_BODIES+i]=trial.force.data[ds+i];
+        s[$SIX_BODIES+i]=$FORCE;
         s[$WHITE+i]=$RESPONSE;
     }
     SYNC();
@@ -731,8 +731,9 @@ $CLOCK4    if(moved!=0) {
     $TRANSPORT_BLOCK
 $TWIST_BLOCK$CLOCK5"""
 """The predictor's response half (Z4.2): the force and the walk's response read back into the block (a diagonal root's
-its one division, :data:`_DIAGONAL_TRIAL`), then the trial's response (``qdd``, ``v_hat``), the drives' decision and
-the border's decided step, the root transport and the twists."""
+its one division, :data:`_DIAGONAL_TRIAL`, a prescribed root's zero, :func:`_trial_response`), then the trial's
+response (``qdd``, ``v_hat``), the drives' decision and the border's decided step, the root transport and the
+twists."""
 
 
 @wp.struct
@@ -1911,8 +1912,8 @@ $passes
 
 def _walk_roots(layout: TreeLayout) -> list[tuple[int, int, int]]:
     """``(root, coordinate offset, family)`` of each root the predictor solves: one tree, or each root of a forest. A
-    prescribed root (family 0) responds with zero; a diagonal root (a negative family, :func:`_diagonal_roots`) by one
-    division."""
+    prescribed root (family 0) responds with zero (:func:`_trial_response`); a diagonal root (a negative family,
+    :func:`_diagonal_roots`) by one division."""
     return list(zip(range(len(layout.roots)), layout.root_offsets, layout.root_families, strict=True))
 
 
@@ -1935,13 +1936,43 @@ def _diagonal_roots(layout: TreeLayout) -> tuple[int, ...]:
     return tuple(r for r, _, family in _walk_roots(layout) if family < 0)
 
 
-def _on_diagonal(layout: TreeLayout, index: str) -> str:
-    """Native test of whether coordinate ``index`` of the group lies on a diagonal root (:func:`_diagonal_roots`):
-    compiled for one tree, the forest's root of the coordinate against the diagonal roots' mask otherwise."""
-    roots = _diagonal_roots(layout)
+def _prescribed_roots(layout: TreeLayout) -> tuple[int, ...]:
+    """The prescribed roots (family 0): kinematic free bodies, outside the solver's unknowns, which respond with zero."""
+    return tuple(r for r, _, family in _walk_roots(layout) if family == 0)
+
+
+def _on_roots(layout: TreeLayout, roots: tuple[int, ...], index: str) -> str:
+    """Native test of whether coordinate ``index`` of the group lies on one of ``roots``: compiled for one tree, the
+    forest's root of the coordinate against the roots' mask otherwise."""
     if not layout.forest:
         return "true" if roots else "false"
     return f"((({sum(1 << r for r in roots)})>>{_root(layout).replace('[i]', f'[{index}]')})&1)"
+
+
+def _on_diagonal(layout: TreeLayout, index: str) -> str:
+    """Native test of whether coordinate ``index`` of the group lies on a diagonal root (:func:`_diagonal_roots`)."""
+    return _on_roots(layout, _diagonal_roots(layout), index)
+
+
+def forces(layout: TreeLayout) -> bool:
+    """Whether a group's predictor launches its force half (:func:`get_force_kernel`): a root that responds to a
+    force, walked or diagonal. A group of prescribed roots alone responds with zero whatever its force, which nothing
+    else reads (a prescribed root is a free joint, which holds no drive row), so it launches none."""
+    return any(family != 0 for _, _, family in _walk_roots(layout))
+
+
+def _trial_response(layout: TreeLayout) -> str:
+    """Native expression of coordinate ``i``'s trial response: zero on a prescribed root, a diagonal root's force over
+    its mass (:data:`_DIAGONAL_TRIAL`), else the walk's solve (``trial.response``)."""
+    if not forces(layout):
+        return "0.0f"
+    response = (
+        substitute(_DIAGONAL_TRIAL, layout.sizes(), ON=_on_diagonal(layout, "i"))
+        if _diagonal_roots(layout)
+        else "trial.response.data[ds+i]"
+    )
+    zero = _prescribed_roots(layout)
+    return f"({_on_roots(layout, zero, 'i')}?0.0f:({response}))" if zero else response
 
 
 def _diagonal_mass(index: str, stiffness: str) -> str:
@@ -2173,8 +2204,8 @@ def get_force_kernel(
     """The predictor's force half (Z4.2, :data:`_FORCE_HALF`): the force on every coordinate into ``trial.force``; it
     clears each root's slip count for the response half's border. The columns' half is the walked classes'
     (:func:`.tree_scan.classes_half`), a diagonal root's its joint's (:data:`_DIAGONAL_PROJECT`). A group none of whose
-    roots responds (prescribed roots, rest trees) takes no external wrench, which no coordinate of it answers. Both
-    halves are built for the architecture ``device_arch`` (their launch bound)."""
+    roots responds (prescribed roots alone, :func:`forces`) launches none. Both halves are built for the architecture
+    ``device_arch`` (their launch bound)."""
 
     walked = tuple(cls for cls in classes if cls is not None)
     diagonal = _diagonal_roots(layout)
@@ -2234,9 +2265,9 @@ $ROOTS
 
 
 def walk_solves(layout: TreeLayout) -> bool:
-    """Whether a group's predictor launches the walk's solve (:func:`get_walk_solve_kernel`): a root it walks or answers
-    with zero, not only diagonal roots."""
-    return any(family >= 0 for _, _, family in _walk_roots(layout))
+    """Whether a group's predictor launches the walk's solve (:func:`get_walk_solve_kernel`): a root it walks, not only
+    diagonal and prescribed roots."""
+    return any(family > 0 for _, _, family in _walk_roots(layout))
 
 
 @functools.cache
@@ -2244,9 +2275,9 @@ def get_walk_solve_kernel(*, layout: TreeLayout = REFERENCE_LAYOUT, classes):
     """The walk's solve of the trial (Z4.2, WALK_MAPPING E5): a thread a tree root, the class's walk compiled into
     straight-line code (:meth:`.tree_scan.WalkClass.walk` up to :data:`.tree_scan.WALK_UNROLL` coordinates), the
     walk up of ``trial.force`` into registers and the walk down into ``trial.response``, ``P^T L^-T L^-1 P f`` on the
-    all-``K`` walk (:func:`.tree_scan.walk_texts`). A prescribed root responds with zero; a diagonal root holds no walk
-    (the response half's division, :data:`_DIAGONAL_TRIAL`), so a group of diagonal roots alone launches none
-    (:func:`walk_solves`)."""
+    all-``K`` walk (:func:`.tree_scan.walk_texts`). A diagonal root holds no walk (the response half's division,
+    :data:`_DIAGONAL_TRIAL`), nor a prescribed root (the response half's zero, :func:`_trial_response`), so a group of
+    such roots alone launches none (:func:`walk_solves`)."""
     from .tree_scan import WALK_UNROLL  # noqa: PLC0415
 
     sizes = {"coordinate": WALK_COORDINATE, "link": WALK_LINK}
@@ -2264,15 +2295,11 @@ def get_walk_solve_kernel(*, layout: TreeLayout = REFERENCE_LAYOUT, classes):
     hand = "WALK_HAND($X, u[$c], 0.0f)"
     walked = {r: k for r, _, k in _walked(layout, classes)}
     cases = []
-    for r, offset, family in _walk_roots(layout):
-        if family < 0:
-            # A diagonal root holds no walk: the response half divides its force by its mass.
+    for r, _, _ in _walk_roots(layout):
+        if r not in walked:
+            # A diagonal or prescribed root holds no walk: the response half divides its force by its mass, or reads
+            # a prescribed root's zero.
             body = ""
-        elif r not in walked:
-            body = (
-                f"const int ds = p.art_dof_start.data[art];"
-                f"for (int k = 0; k < {layout.root_coordinates[r]}; ++k) trial.response.data[ds + {offset} + k] = 0.0f;"
-            )
         else:
             cls = classes[r]
             body = (
@@ -2350,11 +2377,9 @@ def get_predictor_kernel(
         device_arch=device_arch,
         TRIAL=held_lambdas(layout, slips, ts.record_half(side))
         + stage("float value=s[$WHITE+col];", clocks["CLOCK2"] + clocks["CLOCK3"], QUIET_DRIVE),
-        RESPONSE=(
-            substitute(_DIAGONAL_TRIAL, layout.sizes(), ON=_on_diagonal(layout, "i"))
-            if _diagonal_roots(layout)
-            else "trial.response.data[ds+i]"
-        ),
+        # A group without a force half (forces) reads no force: nothing of it reads the words.
+        FORCE="trial.force.data[ds+i]" if forces(layout) else "0.0f",
+        RESPONSE=_trial_response(layout),
         SATURATE=substitute(SATURATE_DRIVES, layout.sizes(), ROOT=_root(layout)),
         BORDER=border_solve(layout, classes),
         SECOND_RESPONSE=stage(changed + "float value=s[$WHITE+col];"),

@@ -202,8 +202,8 @@ class HeldGroupPlan:
     """``"sparse"``, ``"cholesky"`` (by the walk), or ``"diagonal"`` (a compact diagonal family, or no response)."""
     root_families: tuple = ()
     """Each root's family: its coordinates, negated for the compact diagonal's (its walk is the compact inverse: no walk
-    holds it), 0 when prescribed; a forest's per root, a compact diagonal's tree group's one root, empty for the other
-    groups (each tree walks its coordinates)."""
+    holds it), 0 when prescribed; a forest's per root, a compact diagonal's or the prescribed group's one root, empty
+    for the other groups (each tree walks its coordinates)."""
 
     @property
     def diagonal(self) -> np.ndarray:
@@ -361,7 +361,11 @@ def _size_groups(inputs, member, compact, coordinate) -> list:
     trees, places = _part(_prescribed_articulations(forest), member)
     if trees.size:
         host = _fit(model, forest, trees, _FREE_BODY, prescribed=True)
-        groups.append(HeldGroupPlan("prescribed", (3,), trees, places, host, size=6, response="diagonal"))
+        # A prescribed root responds with zero (family 0), as a forest's does: its coordinates are outside the solver's
+        # unknowns.
+        groups.append(
+            HeldGroupPlan("prescribed", (3,), trees, places, host, size=6, response="diagonal", root_families=(0,))
+        )
     for first, last in itertools.pairwise(forest.rest_topologies):
         trees, places = _part(forest.rest_articulations[first:last], member, int(first))
         if trees.size:
