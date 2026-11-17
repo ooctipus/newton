@@ -1515,6 +1515,8 @@ class GeneralSweep(SweepConfig):
             )
         if self.formed != "inline" and (self.colored or not self.torsion):
             raise ValueError("the dense friction records form ahead of the warp mapping's sweep, where it forms them")
+        if self.formed == "stage" and self.solve_policy.counts:
+            raise ValueError("the records stage runs no sweep: it is no solve and carries no readout")
         if self.colored and (self.active_rows or self.contact_units or self.block_warps != 1):
             raise ValueError(
                 "the colored mapping visits every dense row in turn, a world a block: its exit votes over it"

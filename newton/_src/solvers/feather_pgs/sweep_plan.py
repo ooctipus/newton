@@ -540,10 +540,13 @@ class Sweep:
                 )
             if self.general_sweep.torsion:
                 # The dense contacts' records form in a launch of their own, ahead of the sweep: the formation's
-                # code (its eigen solves) leaves the sweep's, whose instruction supply bounds it (SAT).
-                self.general_records = dataclasses.replace(self.general_sweep, formed="stage")
+                # code (its eigen solves) leaves the sweep's, whose instruction supply bounds it (SAT). The stage is no
+                # solve: it runs no sweep, so it carries no readout and no route counts it.
+                self.general_records = dataclasses.replace(
+                    self.general_sweep, formed="stage", solve_policy=SolvePolicy()
+                )
                 self.general_sweep = dataclasses.replace(self.general_sweep, formed="ahead")
-                self.mf_records_kernel = self.sweep("mf_gs_records", self.general_records)
+                self.mf_records_kernel = sweep_kernel(self.general_records)
             self.mf_gs_kernel = self.sweep("mf_gs", self.general_sweep)
             if colored:
                 self.colored_sweep = dataclasses.replace(colored_sweep, records=self.placement.record_first)
