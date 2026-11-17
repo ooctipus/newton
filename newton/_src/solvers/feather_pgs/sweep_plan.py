@@ -1139,7 +1139,7 @@ class Sweep:
         pool.launch(
             forget_carried_contacts,
             pool.launch_rows(),
-            inputs=[placement.contact_world, world_mask],
+            inputs=[self.laws.friction_patches.position, placement.contact_world, world_mask],
             outputs=[bind_carry(placement)],
             extent=pool.ready_rows,
         )

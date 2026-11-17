@@ -67,6 +67,36 @@ def pair_codes(keys, stride=None):
     return codes
 
 
+_RECORDS = ("shape0", "shape1", "point0", "point1", "normal", "margin0", "margin1")
+
+
+def frame_order(model, contacts):
+    """The frame's order of the live ``contacts``, computed on the host: the stable order of their body pairs, a side's
+    code its body plus one, or a static or missing shape's code above every body's (``friction_patches._pair_code``)."""
+    live = max(int(contacts.rigid_contact_count.numpy()[0]), 0)
+    shape_body = model.shape_body.numpy()
+    bodies, shapes = model.body_count, len(shape_body)
+    codes = []
+    for name in ("rigid_contact_shape0", "rigid_contact_shape1"):
+        shape = getattr(contacts, name).numpy()[:live].astype(np.int64)
+        body = np.where(shape >= 0, shape_body[np.maximum(shape, 0)], -1)
+        codes.append(np.where(body >= 0, body + 1, bodies + np.where(shape >= 0, shape, shapes) + 1))
+    low, high = np.minimum(*codes), np.maximum(*codes)
+    return np.lexsort((high, low))
+
+
+def in_frame_order(model, contacts):
+    """``contacts`` with their live records in the frame's order (:func:`frame_order`), every other attribute theirs."""
+    order = frame_order(model, contacts)
+    ordered = SimpleNamespace(**vars(contacts))
+    for name in _RECORDS:
+        array = getattr(contacts, f"rigid_contact_{name}")
+        values = array.numpy().copy()
+        values[: len(order)] = values[order]
+        setattr(ordered, f"rigid_contact_{name}", wp.array(values, dtype=array.dtype, device=array.device))
+    return ordered
+
+
 @wp.kernel(enable_backward=False)
 def _prepare(
     count: wp.array[int],
@@ -504,6 +534,9 @@ class ReferencePatches:
         articulation_pair_gap_gate=0.0,
         friction_gap=float("inf"),
     ):
+        """Build the frame from ``contacts`` taken in the frame's order (:func:`frame_order`), as the patch state
+        orders its own frame."""
+        contacts = in_frame_order(model, contacts)
         wp.launch(
             _prepare,
             dim=self.capacity,

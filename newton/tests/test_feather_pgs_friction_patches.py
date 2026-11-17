@@ -830,8 +830,10 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
             spin.append(s0.body_qd.numpy()[:, 3:].copy())
             count = int(contacts.rigid_contact_count.numpy()[0])
             weight = solver.laws.friction_patches.view.weight.numpy()[:count]
-            shape0, shape1 = contacts.rigid_contact_shape0.numpy(), contacts.rigid_contact_shape1.numpy()
-            point0, point1 = contacts.rigid_contact_point0.numpy(), contacts.rigid_contact_point1.numpy()
+            # The patch view lies in the frame's order: each position's records are its collision contact's.
+            frame = solver.laws.friction_patches.contact_of.numpy()[:count]
+            shape0, shape1 = contacts.rigid_contact_shape0.numpy()[frame], contacts.rigid_contact_shape1.numpy()[frame]
+            point0, point1 = contacts.rigid_contact_point0.numpy()[frame], contacts.rigid_contact_point1.numpy()[frame]
             # Name each anchor by its world and the corner that carries its rows.
             held = [[] for _ in range(model.world_count)]
             for c in np.flatnonzero(weight > 0.0):
@@ -907,9 +909,11 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
                 yaw_rates.append(body_qd[:, 5].copy())
                 count = int(contacts.rigid_contact_count.numpy()[0])
                 weight = solver.laws.friction_patches.view.weight.numpy()[:count]
+                # The view and the allocation lie in the frame's order: each position's shapes are its contact's.
+                frame = solver.laws.friction_patches.contact_of.numpy()[:count]
                 bodies = np.maximum(
-                    shape_body[contacts.rigid_contact_shape0.numpy()[:count]],
-                    shape_body[contacts.rigid_contact_shape1.numpy()[:count]],
+                    shape_body[contacts.rigid_contact_shape0.numpy()[frame]],
+                    shape_body[contacts.rigid_contact_shape1.numpy()[frame]],
                 )
                 for world in np.flatnonzero(speeds[-1] > 0.2):
                     held = (body_world[bodies] == world) & (weight > 0.0)
@@ -1066,6 +1070,8 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         contacts.rigid_contact_shape0.assign(boxes[::-1].copy())
         contacts.rigid_contact_shape1.assign(grounds[::-1].copy())
         contacts.rigid_contact_point0.assign([[0, 0, 0.002]] * 2)
+        # A writer of new contacts advances their generation: the solver reads a frame's records once.
+        contacts.contact_generation.assign(contacts.contact_generation.numpy() + 1)
         solver.step(s1, s0, model.control(), contacts, 0.005)
         self.assertTrue((solver.placement.contact_slot.numpy()[:2] == -1).all())
         bodies = patches.current.body_a.numpy()[:2]
@@ -1245,7 +1251,9 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         shapes = (contacts.rigid_contact_shape0.numpy()[:count], contacts.rigid_contact_shape1.numpy()[:count])
         box_contacts = [c for c in range(count) if {int(shape_body[s[c]]) for s in shapes} & box_bodies]
         self.assertTrue(box_contacts)
-        np.testing.assert_array_equal(solver.laws.friction_patches.previous.valid.numpy()[box_contacts], 0)
+        # The stored frame lies in the frame's order: each contact at its position.
+        stored = solver.laws.friction_patches.position.numpy()[box_contacts]
+        np.testing.assert_array_equal(solver.laws.friction_patches.previous.valid.numpy()[stored], 0)
 
     def test_planar_patch_reduces_friction_rows(self):
         """Retain a box face's four normals while using only two friction anchors."""

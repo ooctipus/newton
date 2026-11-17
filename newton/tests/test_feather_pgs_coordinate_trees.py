@@ -899,8 +899,10 @@ def _arm_within(test, reference, actual, bodies, tag, *, again=None):
 
 
 def _contact_rows(test, solver, count):
-    """The ``(world, slot)`` normal row of each of the first ``count`` contacts, in contact order."""
-    world, slot = solver.placement.contact_world.numpy()[:count], solver.placement.contact_slot.numpy()[:count]
+    """The ``(world, slot)`` normal row of each of the first ``count`` contacts, in contact order (each contact's
+    allocation at its frame position)."""
+    at = solver.laws.friction_patches.position.numpy()[:count]
+    world, slot = solver.placement.contact_world.numpy()[at], solver.placement.contact_slot.numpy()[at]
     test.assertTrue(np.all(slot >= 0), "every held contact owns a row")
     return world, slot
 
@@ -908,7 +910,8 @@ def _contact_rows(test, solver, count):
 def _normal_impulses(test, solver, count):
     """The solved normal impulse [N·s] of each of the first ``count`` contacts, in contact order: zero, as prepared,
     in a world none of whose rows can act."""
-    world, slot = solver.placement.contact_world.numpy()[:count], solver.placement.contact_slot.numpy()[:count]
+    at = solver.laws.friction_patches.position.numpy()[:count]
+    world, slot = solver.placement.contact_world.numpy()[at], solver.placement.contact_slot.numpy()[at]
     test.assertTrue(np.all(slot >= 0), "every contact owns a row")
     return solver.placement.impulses.numpy()[world, slot].astype(np.float64)
 
@@ -1536,6 +1539,8 @@ class TestCoordinateTreesOwner(unittest.TestCase):
             depth = rate * min(step + 1, descend)
             for contact in contacts:
                 contact.rigid_contact_point1.assign(top - np.array([0.0, 0.0, depth], np.float32))
+                # A writer of new contacts advances their generation: the solver reads a frame's records once.
+                contact.contact_generation.assign(contact.contact_generation.numpy() + 1)
             advance()
             for index, solver in enumerate(solvers):
                 impulses[index].append(_normal_impulses(self, solver, worlds))

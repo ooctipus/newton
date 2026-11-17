@@ -302,7 +302,8 @@ def patch_rows(solver, contacts, dt, *, jacobian=False):
     weight = patches.view.weight.numpy()[:count]
     location = patches.view.point.numpy()[:count].astype(np.float64)
     tangent_phi = patches.view.phi.numpy()[:count].astype(np.float64)
-    normal = contacts.rigid_contact_normal.numpy()[:count].astype(np.float64)
+    # The rows' records lie at each contact's frame position, as do the frame's copies of its collision records.
+    normal = patches.records.normal.numpy()[:count].astype(np.float64)
 
     def bias(c, row):
         return row["rhs"].astype(np.float64)

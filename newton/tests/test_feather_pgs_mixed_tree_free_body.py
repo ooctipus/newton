@@ -634,7 +634,9 @@ def _box_anchor_corners(model, solver, contacts, box=4):
     count = int(contacts.rigid_contact_count.numpy()[0])
     bodies_per_world = model.body_count // model.world_count
     shape_body = model.shape_body.numpy()
-    carriers = np.flatnonzero(solver.laws.friction_patches.view.weight.numpy()[:count] > 0.0)
+    # The patch view lies in the frame's order: its carriers are the collision's contacts contact_of names.
+    patches = solver.laws.friction_patches
+    carriers = patches.contact_of.numpy()[np.flatnonzero(patches.view.weight.numpy()[:count] > 0.0)]
     corners = [set() for _ in range(model.world_count)]
     for shapes, points in (
         (contacts.rigid_contact_shape0.numpy(), contacts.rigid_contact_point0.numpy()),

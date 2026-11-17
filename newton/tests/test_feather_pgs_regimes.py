@@ -1072,17 +1072,21 @@ class FrictionUnit:
 def patch_units(solver, count):
     """The law's units on the step ``solver`` took (its patch view): each region's anchor at its friction
     location, on its region's pooled normal impulse, with its region's spin arm."""
-    view = solver.laws.friction_patches.view
+    patches = solver.laws.friction_patches
+    view, contact = patches.view, patches.contact_of.numpy()[:count]
     weight, ring = view.weight.numpy()[:count], view.next_contact.numpy()[:count]
     location = view.point.numpy()[:count].astype(np.float64)
     arm = view.spin_arm.numpy()[:count].astype(np.float64)
     units = []
+    # The view lies in the frame's order; a unit names the collision's contacts (contact_of).
     for c in np.flatnonzero(weight > 0.0):
-        members, m = [int(c)], ring[c]
+        members, m = [int(contact[c])], ring[c]
         while m >= 0 and m != c:
-            members.append(int(m))
+            members.append(int(contact[m]))
             m = ring[m]
-        units.append(FrictionUnit(int(c), tuple(members), float(weight[c]), tuple(location[c]), float(arm[c])))
+        units.append(
+            FrictionUnit(int(contact[c]), tuple(members), float(weight[c]), tuple(location[c]), float(arm[c]))
+        )
     return units
 
 
@@ -1320,13 +1324,18 @@ class Manufactured:
             margin = array.numpy()
             margin[: self.count] = values
             array.assign(margin)
+        # A writer of new contacts advances their generation: the solver reads a frame's records once.
+        generation = self.contacts.contact_generation
+        generation.assign(generation.numpy() + 1)
 
     def _held(self, solver):
         """Each contact's row store, world and first row where its world holds its rows (:func:`walked_worlds`), else
         ``None``; each contact must hold the rows the law states, a normal and its unit's."""
         rows = solver.placement
-        paths, slots, worlds = rows.contact_path.numpy(), rows.contact_slot.numpy(), rows.contact_world.numpy()
-        needed = rows.contact_slots_needed.numpy()
+        # Each contact's allocation lies at its frame position.
+        at = solver.laws.friction_patches.position.numpy()[: self.count]
+        paths, slots, worlds = rows.contact_path.numpy()[at], rows.contact_slot.numpy()[at], rows.contact_world.numpy()[at]
+        needed = rows.contact_slots_needed.numpy()[at]
         held = ~walked_worlds(solver)
         stores = [
             (paths[c], worlds[c], slots[c]) if slots[c] >= 0 and paths[c] in (0, 1) and held[worlds[c]] else None

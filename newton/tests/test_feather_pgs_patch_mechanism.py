@@ -1622,6 +1622,7 @@ class TestPatchLaunchShapes(unittest.TestCase):
             {
                 ("_prepare", 1536, 1536, None),
                 ("_merge_runs", 1024, 1024, None),
+                ("_prepare_contacts", 1536, 1536, None),
                 ("_build", 2048, 2048, 32),
             },
         )
@@ -2120,12 +2121,13 @@ class TestHeldRegions(unittest.TestCase):
         self.assertGreater(live, 0)
         assert_same_state(held, plain, "second build without a store", records=False)
 
-    def test_rewritten_points_move_the_contacts_and_not_the_regions(self):
-        """Keep a held frame's regions when a writer moves contact points under one generation, until it forgets.
+    def test_rewritten_points_wait_for_a_new_frame(self):
+        """Keep a held frame's contacts and regions when a writer moves contact points under one generation, until it
+        forgets.
 
-        Every build prepares the contacts anew, so their centres follow the points at once; the regions stay the
-        frame's until the writer advances the generation or forgets the frame, and the next build then groups the
-        contacts as a build that sorts does.
+        The frame reads its contacts' records once, at its first build: their centres and regions stay the frame's
+        until the writer advances the generation or forgets the frame, and the next build then groups the contacts
+        as a build that sorts does.
         """
         scene, plain, held, decisions = self._states(63)
         rng = np.random.default_rng(63)
@@ -2143,7 +2145,8 @@ class TestHeldRegions(unittest.TestCase):
             state.build(scene.model, scene.state, scene.contacts)
         self.assertEqual(decisions[-1], "keep")
         np.testing.assert_array_equal(held.current.owner.numpy()[:live], owner, "the held frame's regions")
-        self.assertTrue(np.any(held.current.center.numpy()[:live] != center), "the centres follow the points")
+        np.testing.assert_array_equal(held.current.center.numpy()[:live], center, "the frame's contacts")
+        self.assertTrue(np.any(plain.current.center.numpy()[:live] != center), "a build that sorts reads the points")
         sorted_owner = plain.current.owner.numpy()[:live].copy()
         self.assertTrue(np.any(sorted_owner != owner), "the rewrite must regroup the contacts of a build that sorts")
         held.forget_frame()
@@ -2317,7 +2320,7 @@ class TestPatchFrameModes(unittest.TestCase):
         patches.current.keys.assign(keys)
         patches.current.indices.assign(indices)
         generation = scene.contacts.contact_generation
-        inputs = patches._prepare_inputs(scene.model, scene.state, scene.contacts)
+        _, inputs = patches._prepare_inputs(scene.model, scene.state, scene.contacts)
         patches._launch_prepare([*inputs, generation, patches.stream_token(generation), patches.sorted_frame])
         np.testing.assert_array_equal(patches.current.keys.numpy(), keys)
         np.testing.assert_array_equal(patches.current.indices.numpy(), indices)
@@ -2363,13 +2366,14 @@ class TestPatchFrameModes(unittest.TestCase):
                 self.assertTrue(np.any(patches.previous.valid.numpy()), "the sorted frame keeps its anchors")
 
     def test_kept_builds_miss_rewrites_of_equal_generation_and_count(self):
-        """Keep the pairs through in-place rewrites that keep the generation and count, as documented.
+        """Keep the frame through in-place rewrites that keep the generation and count, as documented.
 
-        The device compares the generation and the live count only. A rewrite
-        of points, normals and margins alone keeps every pair, so the kept
-        build equals a sorting build bitwise. Reordering the contacts in place
-        goes unseen: the kept build groups them by the previous order's pairs,
-        with indices still below the live count.
+        The device compares the generation and the live count only, and the
+        frame reads its contacts' records once. A rewrite of points, normals and
+        margins goes unseen: the kept build equals the frame's first build
+        bitwise, where a sorting build reads the rewrite. Reordering the
+        contacts in place goes unseen too: the kept frame holds the previous
+        order's contacts, each at its own sorted index.
         """
         rng = np.random.default_rng(48)
         for rewrite in ("geometry", "order"):
@@ -2382,7 +2386,8 @@ class TestPatchFrameModes(unittest.TestCase):
                 self.assertGreater(live, 2)
                 for state in (plain, recording):
                     state.build(scene.model, scene.state, scene.contacts)
-                kept = recording.current.indices.numpy()[:live].copy()
+                kept = recording.contact_of.numpy()[:live].copy()
+                center = recording.current.center.numpy()[:live].copy()
                 contacts = scene.contacts
                 if rewrite == "geometry":
                     for name in ("rigid_contact_point0", "rigid_contact_point1", "rigid_contact_normal"):
@@ -2399,12 +2404,13 @@ class TestPatchFrameModes(unittest.TestCase):
                 self.assertEqual(decisions, ["sort", "keep"], "the rewrite keeps the recorded frame")
                 self.assertEqual(int(recording.extent.numpy()[1]), live)
                 if rewrite == "geometry":
-                    assert_same_state(recording, plain, rewrite, records=False)
+                    np.testing.assert_array_equal(recording.current.center.numpy()[:live], center, rewrite)
+                    self.assertTrue(np.any(plain.current.center.numpy()[:live] != center), "a sort reads the rewrite")
                     continue
-                indices = recording.current.indices.numpy()[:live]
-                np.testing.assert_array_equal(indices, kept, "the kept build holds the previous order")
-                self.assertFalse(np.array_equal(indices, plain.current.indices.numpy()[:live]), "the order is stale")
-                np.testing.assert_array_equal(np.sort(indices), np.arange(live), "indices stay below the live count")
+                order = recording.contact_of.numpy()[:live]
+                np.testing.assert_array_equal(order, kept, "the kept build holds the previous order")
+                self.assertFalse(np.array_equal(order, plain.contact_of.numpy()[:live]), "the order is stale")
+                np.testing.assert_array_equal(recording.current.indices.numpy()[:live], np.arange(live), "indices")
 
 
 def _expected_pairs(model, contacts, capacity):
@@ -2559,7 +2565,8 @@ class _SolverTwin:
         return True
 
     def assert_sorted(self, test, stream, context):
-        """Require the slots to hold the host-sorted pairs of a stream's live contacts."""
+        """Require the slots to hold the host-sorted pairs of a stream's live contacts: the frame's contacts are the
+        stream's in that order (``contact_of``), each at its own sorted index."""
         keys, order = _expected_pairs(self.model, self.streams[stream], self.patches.capacity)
         live = len(keys)
         np.testing.assert_array_equal(
@@ -2567,7 +2574,10 @@ class _SolverTwin:
             pair_codes(keys, self.patches.key_stride),
             f"{context} keys",
         )
-        np.testing.assert_array_equal(self.patches.current.indices.numpy()[:live], order, f"{context} indices")
+        np.testing.assert_array_equal(self.patches.contact_of.numpy()[:live], order, f"{context} frame order")
+        np.testing.assert_array_equal(
+            self.patches.current.indices.numpy()[:live], np.arange(live), f"{context} indices"
+        )
         np.testing.assert_array_equal(
             self.patches.current.keys.numpy()[live : self.patches.capacity], SENTINEL, f"{context} empty keys"
         )

@@ -205,6 +205,10 @@ def allocate_world_contact_slots(
 ):
     """Classify and allocate the rows of every active contact, with work proportional to the materialized prefix.
 
+    The contacts are visited in the collision's written order, their records read there (``data`` binds the
+    collision's records), and each one's allocation written at its frame position (``data.position``), so the
+    reservations keep the order of the collision's writes.
+
     Where the one writer takes the rows (``units`` holds the placement's unit sources; empty otherwise), each dense
     row's unit source is written with its slot: the contact's rows are the writer's to fill.
 
@@ -235,9 +239,13 @@ def allocate_world_contact_slots(
     # A collision pass clamps the count to the rows it wrote, all of them, and flags the overflow itself.
     total_contacts = data.count[0]
 
-    for c in range(thread, total_contacts, total_num_threads):
+    # The collision's contacts in its written order: the reservations keep the order of the collision's writes, and
+    # with it the rows' order. A contact's records are read at its written index (``data`` binds the collision's), its
+    # allocation and patch view at its frame position.
+    for written in range(thread, total_contacts, total_num_threads):
+        c = data.position[written]
         admitted, separating, art_a, art_b, world, phi = _admit_contact(
-            c,
+            written,
             data,
             body_to_articulation,
             art_to_world,
@@ -421,6 +429,7 @@ def record_world_contact_runs(
     total_num_threads: int,
     lanes: int,
     contact_shape0: wp.array[int],
+    position: wp.array[int],
     contact_world: wp.array[int],
     contact_path: wp.array[int],
     contact_slots_needed: wp.array[int],
@@ -440,6 +449,7 @@ def record_world_contact_runs(
 ):
     """Record each (world, block) run's first and last routed contact and its rows by family: the line's other rows,
     then the free bodies' contacts (their own run, or with ``free_line`` rows of the line placed after the others).
+    The runs hold the collision's contacts, whose records lie at their frame ``position``.
 
     ``total_num_threads`` is a multiple of ``lanes`` (32 on CUDA, 1 on CPU), so each warp
     iteration covers 32 consecutive contacts.
@@ -454,11 +464,12 @@ def record_world_contact_runs(
         dense = int(0)
         mf = int(0)
         if c < total_contacts:
-            path = contact_path[c]
-            world = contact_world[c]
+            j = position[c]
+            path = contact_path[j]
+            world = contact_world[j]
             shape = contact_shape0[c]
-            needed = contact_slots_needed[c]
-            free = _free_body_family(path, free_line, c, contact_art_a, contact_art_b, is_free_rigid, response_dofs)
+            needed = contact_slots_needed[j]
+            free = _free_body_family(path, free_line, j, contact_art_a, contact_art_b, is_free_rigid, response_dofs)
             if path == 0 and order_dense != 0:
                 if free:
                     mf = needed
@@ -474,6 +485,7 @@ def record_world_contact_runs(
 @wp.kernel(enable_backward=False)
 def place_world_contact_runs(
     contact_shape0: wp.array[int],
+    position: wp.array[int],
     contact_world: wp.array[int],
     contact_path: wp.array[int],
     contact_slots_needed: wp.array[int],
@@ -528,16 +540,18 @@ def place_world_contact_runs(
             last = -1
         for base in range(run_first[world, block], last + 1, lanes):
             c = base + lane
+            j = int(0)
             dense = int(0)
             mf = int(0)
             if c <= last:
-                path = contact_path[c]
-                owner = contact_world[c]
+                j = position[c]
+                path = contact_path[j]
+                owner = contact_world[j]
                 shape = contact_shape0[c]
-                needed = contact_slots_needed[c]
+                needed = contact_slots_needed[j]
                 if owner == world and _contact_run_block(shape, global_lead, global_trail_start) == block:
                     free = _free_body_family(
-                        path, free_line, c, contact_art_a, contact_art_b, is_free_rigid, response_dofs
+                        path, free_line, j, contact_art_a, contact_art_b, is_free_rigid, response_dofs
                     )
                     if path == 0 and place_dense and not free:
                         dense = needed
@@ -546,15 +560,15 @@ def place_world_contact_runs(
             dense_below = lane_scan(dense, 32)
             mf_below = lane_scan(mf, 32)
             if dense > 0:
-                contact_slot[c] = next_dense + dense_below
+                contact_slot[j] = next_dense + dense_below
                 if units.shape[0] > 0:
                     for r in range(dense):
-                        units[dense_first[world], next_dense + dense_below + r] = unit_source(UNIT_CONTACT, 4 * c + r)
+                        units[dense_first[world], next_dense + dense_below + r] = unit_source(UNIT_CONTACT, 4 * j + r)
             if mf > 0:
-                contact_slot[c] = next_mf + mf_below
+                contact_slot[j] = next_mf + mf_below
                 if free_line != 0 and units.shape[0] > 0:
                     for r in range(mf):
-                        units[dense_first[world], next_mf + mf_below + r] = unit_source(UNIT_CONTACT, 4 * c + r)
+                        units[dense_first[world], next_mf + mf_below + r] = unit_source(UNIT_CONTACT, 4 * j + r)
             next_dense += lane_sum(dense, 32)
             next_mf += lane_sum(mf, 32)
     # Every lane has read the records before any is reset.

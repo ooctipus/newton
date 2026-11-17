@@ -748,7 +748,8 @@ def test_multiworld_restitution_keeps_case_data_isolated(test, device):
             count = int(contacts.rigid_contact_count.numpy()[0])
             after = state_out.body_qd.numpy()[:, 2]
             end_gap = state_out.body_q.numpy()[:, 2] - RADIUS
-            paths = solver.placement.contact_path.numpy()[:count]
+            # Each contact's allocation lies at its frame position.
+            paths = solver.placement.contact_path.numpy()[solver.laws.friction_patches.position.numpy()[:count]]
             # Each contact pairs a world's sphere with that world's plane, which has no body.
             shapes = np.stack(
                 (contacts.rigid_contact_shape0.numpy()[:count], contacts.rigid_contact_shape1.numpy()[:count])

@@ -843,6 +843,7 @@ class Placement:
                 record_threads,
                 lanes,
                 contacts.rigid_contact_shape0,
+                self.laws.friction_patches.position,
                 self.contact_world,
                 self.contact_path,
                 self.contact_slots_needed,
@@ -859,6 +860,7 @@ class Placement:
             dim=(self.forest.world_count, lanes),
             inputs=[
                 contacts.rigid_contact_shape0,
+                self.laws.friction_patches.position,
                 self.contact_world,
                 self.contact_path,
                 self.contact_slots_needed,

@@ -42,7 +42,7 @@ from .factor.fields import Preelim
 from .field_group import Field, FieldGroup, SolverArrays
 from .forest_plan import ForestPlan, RowLaw
 from .friction_patches import _FrictionPatchState as FrictionPatchState
-from .friction_patches import patch_row_law
+from .friction_patches import collision_records, patch_row_law
 from .joint_table import FreeBodies, bind_free_bodies
 from .joint_table import bind as bind_joint_table
 from .kernel_template import KernelTemplate, items, params
@@ -798,8 +798,11 @@ class RowLaws:
             self._build_friction_patches(solver, state_in, contacts)
 
             # The allocator reads the contacts, the bodies and the row law, and writes the
-            # contacts' allocation records, through one struct (contact_input.ContactInput), bound for this step.
-            contact_input = bind_contact_input(solver, state_in, state_aug, contacts, dt, 1.0)
+            # contacts' allocation records, through one struct (contact_input.ContactInput), bound for this step: it
+            # visits the collision's contacts in their written order and reads their records there.
+            contact_input = bind_contact_input(
+                solver, state_in, state_aug, contacts, dt, 1.0, records=collision_records(contacts)
+            )
 
             # The route's producer writes every contact row (get_path_selection() records it, routes.contact_rows).
             # The one writer's contact rows are its own to fill: their unit sources are written where their slots are

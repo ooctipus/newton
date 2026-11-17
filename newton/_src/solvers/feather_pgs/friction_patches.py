@@ -121,6 +121,9 @@ _SORT_EXTENT = wp.constant(2)
 # held frame's build carries, then those regions again (none unless the frame is held), which says which it is.
 _BUILD_EXTENT = wp.constant(2 + int(EXTENT_SIZE))
 _CARRY_EXTENT = wp.constant(3 + int(EXTENT_SIZE))
+# Then whether the frame is kept (its pairs sorted, its contacts in the frame's order) and whether it is held.
+_KEPT_EXTENT = wp.constant(4 + int(EXTENT_SIZE))
+_HELD_EXTENT = wp.constant(5 + int(EXTENT_SIZE))
 # Contact paths 0 and 1 hold dense and matrix-free rows, and -1 holds none.
 # A region's spin arm over the polar radius of gyration of its contacts' hull: the mean radius of a convex patch under
 # uniform pressure over its gyration radius is 0.937 on a square, 0.943 on a disc and 0.866 on a line, and 0.94 holds
@@ -140,6 +143,29 @@ class FrictionPatches:
     phi: wp.array[wp.vec2]
     spin_arm: wp.array[float]
     spin_phi: wp.array[float]
+
+
+@wp.struct
+class ContactRecords:
+    """What the solver reads of the collision pipeline's contact records: the shapes, points, normal and margins of
+    each contact. The collision's arrays in its written order, or the frame's copy in the frame's order (the member
+    store, :class:`_FrictionPatchState`), which every solver kernel after the frame's prepare reads."""
+
+    shape0: wp.array[int]
+    shape1: wp.array[int]
+    point0: wp.array[wp.vec3]
+    point1: wp.array[wp.vec3]
+    normal: wp.array[wp.vec3]
+    margin0: wp.array[float]
+    margin1: wp.array[float]
+
+
+def collision_records(contacts) -> ContactRecords:
+    """The collision pipeline's records of ``contacts``, in its written order."""
+    records = ContactRecords()
+    for name in ContactRecords.vars:
+        setattr(records, name, getattr(contacts, f"rigid_contact_{name}"))
+    return records
 
 
 PATCH_ROW_LAW = (
@@ -310,13 +336,37 @@ class _PatchContacts:
 
 
 @wp.func
+def _pair_code(body: int, shape: int, inputs: _PatchContacts):
+    """A contact side's code in its pair key: its body plus one, or for a static or missing shape a code above every
+    body's."""
+    code = body + 1
+    if body < 0:
+        code = inputs.q.shape[0] + (shape if shape >= 0 else inputs.shape_body.shape[0]) + 1
+    return code
+
+
+@wp.func
+def _pair_key(c: int, live: int, inputs: _PatchContacts):
+    """Contact ``c``'s pair key, the empty key past ``live``: its sides' codes (:func:`_pair_code`) in order. Both are
+    below key_stride, so the key orders pairs as the codes do and occupies only the low bits that build() sorts."""
+    if c >= live:
+        return wp.int64(0x7FFFFFFFFFFFFFFF)
+    sa = inputs.shape0[c]
+    sb = inputs.shape1[c]
+    a, b = contact_bodies(sa, sb, inputs.shape_body)
+    ka = _pair_code(a, sa, inputs)
+    kb = _pair_code(b, sb, inputs)
+    return wp.int64(wp.min(ka, kb)) * wp.int64(inputs.key_stride) + wp.int64(wp.max(ka, kb))
+
+
+@wp.func
 def _prepare_contact_fields(
     c: int, live: int, kept: int, held: int, inputs: _PatchContacts, frame: _PatchFrame, patches: FrictionPatches
 ):
-    """Prepare contact ``c``'s frame record, all but slot ``c``'s pair key and index; return the pair key.
+    """Prepare contact ``c``'s frame record, all but its pair key and index (:func:`_prepare`), from its collision
+    record in ``inputs``: the frame's copy, in the frame's order.
 
-    Past ``live`` the record is empty and the key the empty key. A build stores the key and the index in
-    slot ``c``; a build that reuses sorted pairs can leave the slots' keys and indices untouched. A ``held`` frame's
+    Past ``live`` the record is empty. A ``held`` frame's
     live contacts keep the region that owns them and their link in its ring: the frame's regions are made once. A
     ``kept`` frame's live contacts keep what their shapes alone decide, which an earlier prepare of the frame wrote:
     their bodies and shapes in pair order, the flip, the friction coefficients, the radius and the support gap limit.
@@ -333,16 +383,12 @@ def _prepare_contact_fields(
     patches.phi[c] = wp.vec2(0.0)
     patches.spin_phi[c] = 0.0
     if c >= live:
-        return wp.int64(0x7FFFFFFFFFFFFFFF)
+        return
     sa = inputs.shape0[c]
     sb = inputs.shape1[c]
     a, b = contact_bodies(sa, sb, inputs.shape_body)
-    ka = a + 1
-    kb = b + 1
-    if a < 0:
-        ka = inputs.q.shape[0] + (sa if sa >= 0 else inputs.shape_body.shape[0]) + 1
-    if b < 0:
-        kb = inputs.q.shape[0] + (sb if sb >= 0 else inputs.shape_body.shape[0]) + 1
+    ka = _pair_code(a, sa, inputs)
+    kb = _pair_code(b, sb, inputs)
     n, translation_a, offset_a, translation_b, offset_b, separation, gap = contact_points(
         inputs.normal[c], inputs.point0[c], inputs.point1[c], inputs.margin0[c], inputs.margin1[c], a, b, inputs.q
     )
@@ -411,9 +457,6 @@ def _prepare_contact_fields(
         if b >= 0:
             r = wp.min(r, inputs.body_radius[b])
         frame.radius[c] = wp.max(r, 1.0e-4)
-    # ka and kb are below key_stride, so the key orders pairs as (ka, kb) does
-    # and occupies only the low bits that build() sorts.
-    return wp.int64(ka) * wp.int64(inputs.key_stride) + wp.int64(kb)
 
 
 @wp.func
@@ -444,7 +487,6 @@ def _prepare(
     built: wp.array[int],
     threads: int,
     frame: _PatchFrame,
-    patches: FrictionPatches,
     generation: wp.array[wp.int32],
     stream: wp.int64,
     sorted_frame: wp.array[wp.int64],
@@ -452,19 +494,20 @@ def _prepare(
     extent: wp.array[int],
     regions: wp.array[int],
 ):
-    """Fill this frame's contact slots and clear every slot an earlier frame used; keep a recorded frame's pairs.
+    """Decide this frame and give a new frame's contacts their pair keys, in the collision's order (``inputs``).
 
     A collision pass clamps the count to the rows it wrote, so every slot below
     it is live. Slots past the stored and the last built frame already hold the empty
     record. ``sorted_frame`` names the frame whose pairs the slots hold sorted
     (its generation, live count and contact stream; :func:`_build` records it).
-    That frame keeps its live slots' keys and indices and publishes no sort;
-    any other writes them and publishes the sort of its live slots. A kept
-    frame whose last build the stored frame holds (``fresh``: a store followed
-    that build) is held: its contacts keep their regions, and its build carries
+    That frame is kept: its live slots keep their keys and indices and it
+    publishes no sort; any other writes them and publishes the sort of its live
+    slots, which orders the frame (:func:`_prepare_contacts`). A kept frame
+    whose last build the stored frame holds (``fresh``: a store followed that
+    build) is held: its contacts keep their regions, and its build carries
     them where any other build makes the regions anew and empties their list
-    (:func:`_build`). Thread 0 publishes the extent and the empty list, which
-    this launch reads nowhere.
+    (:func:`_build`). Thread 0 publishes the extent, whether the frame is kept
+    and held, and the empty list, which this launch reads nowhere.
     """
     thread = wp.tid()
     live = count[0]
@@ -482,15 +525,57 @@ def _prepare(
     held = kept * fresh[0]
     if thread == 0:
         _publish_extent(extent, end, live, live * (1 - kept), end * (1 - held), (regions[0] + regions[1]) * held)
+        extent[_KEPT_EXTENT] = kept
+        extent[_HELD_EXTENT] = held
         if held == 0:
             regions[0] = 0
             regions[1] = 0
-    for c in range(thread, end, threads):
-        key = _prepare_contact_fields(c, live, kept, held, inputs, frame, patches)
-        # A kept slot holds the sorted pair at position c, not contact c's key.
-        if kept == 0 or c >= live:
-            frame.indices[c] = c
-            frame.keys[c] = key
+    # A kept frame's live slots hold its sorted pairs.
+    for c in range(live * kept + thread, end, threads):
+        frame.indices[c] = c
+        frame.keys[c] = _pair_key(c, live, inputs)
+
+
+@wp.kernel(enable_backward=False)
+def _prepare_contacts(
+    extent: wp.array[int],
+    collision: ContactRecords,
+    inputs: _PatchContacts,
+    threads: int,
+    frame: _PatchFrame,
+    patches: FrictionPatches,
+    contact_of: wp.array[int],
+    position: wp.array[int],
+):
+    """Prepare every slot this frame visits (:func:`_prepare_contact_fields`) in the frame's order, from the frame's
+    copy of its collision records (``inputs``, the member store).
+
+    The frame's order is its pair sort's: the contact at sorted position ``j`` is the frame's contact ``j``, so a
+    body pair's contacts, and with them each of its regions' members, lie together. A new frame takes it here: the
+    contact the sort placed at ``j`` (``frame.indices``) has its collision record copied to ``j``, the maps both ways
+    (``contact_of[j]``, ``position[c]``) and the sorted index ``j`` itself. A kept frame's copy and maps stand. Every
+    later kernel of the frame reads a contact by its position; those that keep the collision's order (the row
+    allocation, the contact forces) visit the collision's contacts and read the frame at ``position``.
+    """
+    thread = wp.tid()
+    end = extent[0]
+    live = extent[1]
+    kept = extent[_KEPT_EXTENT]
+    held = extent[_HELD_EXTENT]
+    for j in range(thread, end, threads):
+        if kept == 0 and j < live:
+            c = frame.indices[j]
+            inputs.shape0[j] = collision.shape0[c]
+            inputs.shape1[j] = collision.shape1[c]
+            inputs.point0[j] = collision.point0[c]
+            inputs.point1[j] = collision.point1[c]
+            inputs.normal[j] = collision.normal[c]
+            inputs.margin0[j] = collision.margin0[c]
+            inputs.margin1[j] = collision.margin1[c]
+            contact_of[j] = c
+            position[c] = j
+            frame.indices[j] = j
+        _prepare_contact_fields(j, live, kept, held, inputs, frame, patches)
 
 
 @wp.func
@@ -1798,19 +1883,23 @@ class _FrictionPatchState:
     advance, the live count, and the contact stream, a token of the generation
     counter array that is never reused (see :meth:`stream_token`). Contacts
     without a generation sort every build, and :meth:`forget_frame` makes the
-    next build sort. A writer that keeps the generation and the count but changes
-    the shapes of a contact slot, or the contacts' order, goes unseen, and the kept
-    build groups its contacts by the stale pairs; its kept indices still lie
-    below the live count.
+    next build sort.
+
+    A frame's contacts are the solver's in the frame's order, its pair sort's
+    (:func:`_prepare_contacts`): the frame's first prepare copies their
+    collision records into the member store (``records``) at their sorted
+    positions, with the maps between those positions and the collision's
+    contacts (``contact_of``, ``position``), and every later kernel of the frame
+    reads a contact at its position, so a body pair's contacts, and each of its
+    regions' members, lie together. The records are the frame's: a writer that
+    changes a contact under one generation and count, its shapes, points,
+    normal or margins, or the contacts' order, goes unseen until it advances the
+    generation or calls :meth:`forget_frame`.
 
     A kept frame whose last build the stored frame holds (a store followed that
     build: ``fresh``) is held: its build carries the regions the frame's first
     build made (see the module docstring). A kept frame without that store is
-    built as a new one is, without the sort. So a writer that rewrites points,
-    normals or margins under one generation moves each contact's centre, gap
-    and eligibility at once, as every build prepares them anew, but not the
-    regions: they stay those of the frame's first build until the writer
-    advances the generation or calls :meth:`forget_frame`. A reset
+    built as a new one is, without the sort. A reset
     (:meth:`reset`) drops the stored anchors and centres of pressure of its
     worlds and leaves their regions the frame's, as it leaves their contacts:
     the next build carries those regions and places their anchors anew.
@@ -1851,6 +1940,23 @@ class _FrictionPatchState:
             ),
             on_rows=self._on_view_rows,
         )
+        # The member store: the frame's copy of its collision records in the frame's order, and the maps between the
+        # frame's positions and the collision's contacts (_prepare_contacts writes them once a frame).
+        self.records = ContactRecords()
+        self._record_rows = pool.rows(
+            (
+                ContactField("shape0", wp.int32, -1),
+                ContactField("shape1", wp.int32, -1),
+                ContactField("point0", wp.vec3),
+                ContactField("point1", wp.vec3),
+                ContactField("normal", wp.vec3),
+                ContactField("margin0", wp.float32),
+                ContactField("margin1", wp.float32),
+                ContactField("contact_of", wp.int32, -1),
+                ContactField("position", wp.int32, -1),
+            ),
+            on_rows=self._on_record_rows,
+        )
         self._current_rows = pool.rows(self._frame_fields(), on_rows=self._on_current_rows)
         self._previous_rows = pool.rows(
             (*self._frame_fields(stored=True), ContactField("previous_world", wp.int32, -1)),
@@ -1871,10 +1977,16 @@ class _FrictionPatchState:
         # Whether a store followed the last build: the stored frame then holds that build, and a build of the same
         # contact frame is held. _store_frame sets it and a build clears it.
         self.fresh = wp.zeros(1, dtype=int, device=device)
-        self.extent = wp.zeros(_CARRY_EXTENT + 1, dtype=int, device=device)
+        self.extent = wp.zeros(_HELD_EXTENT + 1, dtype=int, device=device)
 
     def _on_view_rows(self, rows):
         rows.publish(self.view)
+
+    def _on_record_rows(self, rows):
+        for name in ContactRecords.vars:
+            setattr(self.records, name, rows.views[name])
+        self.contact_of = rows.views["contact_of"]
+        self.position = rows.views["position"]
 
     def _on_current_rows(self, rows):
         rows.publish(self.current)
@@ -2083,7 +2195,7 @@ class _FrictionPatchState:
         self._grids(self.pool.launch_rows())
         source = getattr(contacts, "_rigid_contact_pool", None)
         self._rows_used = source.rows_used if source is self.pool else None
-        prepare_inputs = self._prepare_inputs(
+        collision, prepare_inputs = self._prepare_inputs(
             model,
             state,
             contacts,
@@ -2101,6 +2213,7 @@ class _FrictionPatchState:
         stream = self.stream_token(generation)
         self._launch_prepare([*prepare_inputs, generation, stream, self.sorted_frame])
         self._order_pairs()
+        self._launch_prepare_contacts(collision, prepare_inputs[1])
         self._launch_build(model, state, generation, stream)
 
     def _launch_prepare(self, inputs):
@@ -2122,6 +2235,21 @@ class _FrictionPatchState:
             clamp=True,
         )
         self.pool.begin_updates()
+
+    def _launch_prepare_contacts(self, collision, inputs):
+        """Prepare the slots in the frame's order (:func:`_prepare_contacts`), from the member store, which a new frame
+        fills from ``collision``: the inputs the prepare read the collision's arrays through, bound to the store."""
+        store = _PatchContacts()
+        for name in _PatchContacts.vars:
+            setattr(store, name, getattr(self.records if name in ContactRecords.vars else inputs, name))
+        self.pool.launch(
+            _prepare_contacts,
+            self.threads,
+            inputs=[self.extent, collision, store, self.threads, self.current, self.view],
+            outputs=[self.contact_of, self.position],
+            extent=self.extent[0:1],
+            clamp=True,
+        )
 
     def _launch_build(self, model, state, generation, stream):
         """Build the regions of the prepared, sorted slots and record their frame: ``generation``'s, of ``stream``."""
@@ -2163,7 +2291,9 @@ class _FrictionPatchState:
         articulation_pair_gap_gate=0.0,
         friction_gap=float("inf"),
     ):
-        """Return the inputs of :func:`_prepare` that ``contacts`` and :meth:`build`'s gates give."""
+        """Return the collision's records of ``contacts`` and the inputs of :func:`_prepare` that they and
+        :meth:`build`'s gates give."""
+        collision = collision_records(contacts)
         inputs = _PatchContacts()
         inputs.shape0, inputs.shape1 = contacts.rigid_contact_shape0, contacts.rigid_contact_shape1
         inputs.point0, inputs.point1 = contacts.rigid_contact_point0, contacts.rigid_contact_point1
@@ -2181,14 +2311,13 @@ class _FrictionPatchState:
         inputs.articulation_pair_gap_gate = articulation_pair_gap_gate
         inputs.friction_gap = friction_gap
         inputs.key_stride = self.key_stride
-        return [
+        return collision, [
             contacts.rigid_contact_count,
             inputs,
             self.stored,
             self.built,
             self.threads,
             self.current,
-            self.view,
         ]
 
     def _order_pairs(self):

@@ -77,6 +77,7 @@ def _allocate_overflowing_contacts(device, contact_count, row_capacity):
                 ContactInput,
                 device,
                 count=wp.array([contact_count], dtype=wp.int32, device=device),
+                position=wp.array(np.arange(contact_count, dtype=np.int32), device=device),
                 shape0=contact_shape0,
                 shape1=contact_shape1,
                 point0=contact_point0,
@@ -177,9 +178,11 @@ def _step_tripods(device, *, threads=None, steps=4, deterministic=True, launched
             state_in.clear_forces()
             solver.step(state_in, state_out, control, contacts, 1.0 / 240.0)
             live = int(contacts.rigid_contact_count.numpy()[0])
-            # On CPU numpy() views the solver's buffers, which the next step overwrites.
+            # On CPU numpy() views the solver's buffers, which the next step overwrites. The allocation records lie at
+            # each contact's frame position; the record takes them in the collision's order.
+            position = solver.laws.friction_patches.position.numpy()[:live]
             record = {
-                name: getattr(solver.placement, f"contact_{name}").numpy()[:live].copy()
+                name: getattr(solver.placement, f"contact_{name}").numpy()[position].copy()
                 for name in ("world", "path", "slot")
             }
             # Each family's contact rows in the world's line: the free bodies' from the store's body base.
