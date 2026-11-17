@@ -811,7 +811,9 @@ class TreeFactor:
         joint_parent, joint_child = model.joint_parent.numpy(), model.joint_child.numpy()
         joint_of = np.full(max(int(model.body_count), 1), -1, dtype=np.int64)
         joint_of[joint_child[joint_child >= 0]] = np.flatnonzero(joint_child >= 0)
+        # Each joint's parent within its walked tree (-1: a root, and every joint outside the walk) and first coordinate.
         path = np.zeros((max(int(model.joint_count), 1), 2), dtype=np.int32)
+        path[:, 0] = -1
         dof_body = np.full(max(int(model.joint_dof_count), 1), -1, dtype=np.int32)
         # Every joint of the walked trees, tree by tree: its tree's place in arts, its rank in the tree.
         tree, rank = host_index.expand(np.maximum(end[arts] - start[arts], 0))

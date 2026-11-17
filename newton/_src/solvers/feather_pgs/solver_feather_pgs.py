@@ -522,12 +522,12 @@ class SolverFeatherPGS(SolverBase):
         self.placement.allocate_free_body_rows(model)
         self.factor.scatter_armature()
         self.sweep.place_tiers(classes.tiers)
-        # The walk is the trees' factor (Z4): the predictor solves every tree of its groups by it, a prescribed tree
-        # beside a responding one in a size group included (the dense factor held it before Z4.2), the placements
-        # that walk read it for their rows and leave, and the border decides a slipping tree's step on it. The held
-        # plan names its trees (held_tree.HeldPlan.walking): the compact diagonal's walk is its inverse (one division a
-        # coordinate, which the star's rows and the sparse diagonal's leave already take), so it takes no walk, in a
-        # held tree group or in the one-coordinate class (coordinate_trees.py). The packed rows' classes read it.
+        # The walk is the responding trees' factor (Z4): the predictor solves every responding root of its groups by
+        # it, the placements that walk read it for their rows and leave, and the border decides a slipping tree's step
+        # on it. The held plan names its trees (held_tree.HeldPlan.walking): a prescribed tree answers its predictor
+        # with zero and is no row's side, so it takes no walk; the compact diagonal's walk is its inverse (one division
+        # a coordinate, which the star's rows and the sparse diagonal's leave already take), so it takes none either,
+        # in a held tree group or in the one-coordinate class (coordinate_trees.py). The packed rows' classes read it.
         walking = classes.held.walking
         if walking.size:
             self.factor.plan_walk(walking)

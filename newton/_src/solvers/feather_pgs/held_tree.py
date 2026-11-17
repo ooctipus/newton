@@ -240,8 +240,10 @@ class HeldPlan:
     """The dense groups' coverage (:func:`_coverage`), which the held tree proves on notification; ``None`` for the
     sparse group or no tree."""
     walking: np.ndarray
-    """The articulations the walk holds: every one with coordinates but the compact diagonal's, whose walk is the
-    compact inverse (:attr:`HeldGroupPlan.diagonal`, and the one-coordinate class's trees)."""
+    """The articulations the walk holds: every one that responds (:attr:`.forest_plan.ForestPlan.response_dof_count`)
+    but the compact diagonal's, whose walk is the compact inverse (:attr:`HeldGroupPlan.diagonal`, and the
+    one-coordinate class's trees). A prescribed one is no row's side, its predictor answers zero and its finish
+    publishes its given velocity: nothing reads a walk of it."""
     drive_dofs: np.ndarray | None
     """The coordinates whose drives the drive stage prepares, ``None`` for every one: a one-coordinate tree's predict
     decides its own."""
@@ -471,7 +473,7 @@ def plan(inputs, *, packed=None, compact=None) -> HeldPlan:
         other = np.ones(model.joint_dof_count, dtype=bool)
         other[coordinate.dofs[(coordinate.dofs >= 0) & (coordinate.dofs < model.joint_dof_count)]] = False
         drive_dofs = np.flatnonzero(other).astype(np.int32)
-    walking = np.flatnonzero(forest.articulation_dof_count_host > 0)
+    walking = np.flatnonzero(forest.response_dof_count > 0)
     if not (model.joint_count and model.articulation_count):
         return HeldPlan((), (), compact, None, walking, drive_dofs, coordinate, coordinate_reason)
     try:
