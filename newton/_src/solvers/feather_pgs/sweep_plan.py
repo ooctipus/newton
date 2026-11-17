@@ -76,6 +76,10 @@ _COLORED = {
 }
 """The colored mapping's fields over the warp mapping's."""
 
+DENSE_ROUTE, FREE_ROUTE = 0, 1
+"""The patch rows' routes (:meth:`Sweep.patch_row_arrays`, a contact's ``path``): the line's dense rows and the free
+bodies' rows."""
+
 SPARSE_ROWS = FieldGroup(
     Field("sparse_row_dof", wp.int32, ("index_world", "index_row", "index_support"), fill=None, owner="placement"),
     Field("sparse_row_factor", wp.float32, ("world", "row", "support"), fill=None, owner="placement"),
@@ -1063,9 +1067,11 @@ class Sweep:
             dt,
         )
 
-    def patch_routes(self):
-        """Pack the routes that can hold patch rows into one launch argument, with the worlds' acts words."""
-        routes = patch_routes(row for row in self.patch_row_arrays() if row[1] is not None)
+    def patch_routes(self, route: int | None = None):
+        """Pack the routes that can hold patch rows (or only ``route``: :data:`DENSE_ROUTE`, :data:`FREE_ROUTE`) into
+        one launch argument, with the worlds' acts words."""
+        rows = (row for row in self.patch_row_arrays() if row[1] is not None and route in (None, row[0]))
+        routes = patch_routes(rows)
         routes.acts = self.placement.world_acts
         return routes
 

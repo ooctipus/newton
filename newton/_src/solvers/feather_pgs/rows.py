@@ -1151,16 +1151,18 @@ class RowLaws:
                 friction_gap=solver.options.contact_friction_gap_threshold,
             )
 
-    def link_patches(self, solver, contacts):
+    def link_patches(self, solver, contacts, route: int | None = None):
         """Link the patches' shared normal loads once every contact row's records are written, before any consumer reads
-        them: after the row pass, or after the one writer where it writes them (the stage list's order)."""
+        them: after the row pass, or after the one writer where it writes them (the stage list's order). Every route, or
+        only ``route`` (:data:`.sweep_plan.DENSE_ROUTE`, :data:`.sweep_plan.FREE_ROUTE`): a contact links only its own
+        route's rows, so the routes link apart as they link together."""
         if solver.sweep.patch_frame_built(contacts):
             self.friction_patches.link(
                 solver.placement.contact_world,
                 solver.placement.contact_slot,
                 solver.placement.contact_path,
                 solver.placement.contact_slots_needed,
-                solver.sweep.patch_routes(),
+                solver.sweep.patch_routes(route),
             )
 
     def record(self, solver) -> dict:

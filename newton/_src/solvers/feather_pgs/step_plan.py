@@ -39,6 +39,7 @@ from .class_plan import ClassPlan
 from .forest_plan import ForestPlan
 from .path_selection import json_value, kernel_key
 from .route_table import Laws, Pins, RouteRow
+from .sweep_plan import DENSE_ROUTE, FREE_ROUTE
 from .walk_rows import WRITE_REST, WRITE_ROWS, WRITE_TOPOLOGY
 
 __all__ = [
@@ -464,10 +465,15 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
     clear = ((placement, "diagonals"),) if placement.clears_diagonals else ()
     walk = (laws, "write_walked", solver, STATE_IN, CONTACTS, DT)
     join = ((topology, "join"),) if topology is not None else ()
+    rest_part = WRITE_ROWS if topology is None else WRITE_REST
     # The free bodies' bases read only the factor and the predictor, so they run beside the contact pass from the
     # predictor on, joined before the regions' listing.
     regions = sweep.regions is not None
     bases = Beside(device) if regions else None
+    # The free bodies' regions read no row the one writer writes, and it none of theirs: their link (the free route's
+    # rings), listing and fill run on the step's stream while the writer's rest walks beside them on the topology
+    # part's stream, after it; the step joins the writer before the dense route's link, which follows its rows.
+    beside_rest = topology is not None and regions
     # The closure's seed and the colored worlds' units read the row store, which a model without worlds does not hold:
     # each is bound only where its stage runs. The colored worlds' units and colors follow the rows and records their
     # writers published, over the claims' candidates.
@@ -542,11 +548,15 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
         # streamed rows' records follow the linked rows; the sparse diagonal's schedule reads the rows it wrote and the
         # marks of their slots.
         (s4r, "diagonals", placement.clears_diagonals and topology is None, (placement, "diagonals")),
-        (s4r, "write_walked", holds, *join, (*walk, WRITE_ROWS if topology is None else WRITE_REST)),
-        (s4r, "link_patches", True, (laws, "link_patches", solver, CONTACTS)),
+        (s4r, "write_walked", holds and not beside_rest, *join, (*walk, rest_part)),
+        (s4r, "write_walked_beside", beside_rest, (STEP, "beside", topology, *walk, WRITE_REST)),
+        (s4r, "link_patches", not beside_rest, (laws, "link_patches", solver, CONTACTS)),
+        (s4r, "link_free_patches", beside_rest, (laws, "link_patches", solver, CONTACTS, FREE_ROUTE)),
         # The free bodies' regions follow the rings the link made, from their bases.
         (s4r, "join_bases", regions, (bases, "join")),
         (s4r, "list_regions", regions, (sweep, "list_regions", solver, STATE_IN, CONTACTS, DT)),
+        (s4r, "join_writer", beside_rest, (topology, "join")),
+        (s4r, "link_dense_patches", beside_rest, (laws, "link_patches", solver, CONTACTS, DENSE_ROUTE)),
         (s4r, "store_records", placement.writes_records, (sweep, "store_records")),
         (s4r, "schedule_diagonal", sweep.sparse_contact_schedule is not None, (sweep, "schedule_diagonal")),
         # Stages 5 and 6: the impulses' start (the warm start's normals, the closures' seeds: the one writer closed the
