@@ -380,16 +380,38 @@ def region_block(
     velocity (1)."""
     zero = wp.vec3(0.0, 0.0, 0.0)
     identity = wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
-    v0 = cand[wp.max(i0_in, g0)]
-    v1 = cand[wp.max(i1_in, g0)]
-    v2 = cand[wp.max(i2_in, g0)]
-    a0 = wp.where(i0_in >= 0, candidate_row(v0), zero)
-    a1 = wp.where(i1_in >= 0, candidate_row(v1), zero)
-    a2 = wp.where(i2_in >= 0, candidate_row(v2), zero)
-    ab = wp.vec3(wp.where(i0_in >= 0, v0[2], 0.0), wp.where(i1_in >= 0, v1[2], 0.0), wp.where(i2_in >= 0, v2[2], 0.0))
-    n = wp.where(i0_in >= 0, 1, 0) + wp.where(i1_in >= 0, 1, 0) + wp.where(i2_in >= 0, 1, 0)
+    # The rigid set its last solve left: its rows are read where it holds them (a compliant region's is empty).
+    a0 = zero
+    a1 = zero
+    a2 = zero
+    ab = zero
+    n = int(0)
+    if i0_in >= 0:
+        v0 = cand[i0_in]
+        a0 = candidate_row(v0)
+        ab[0] = v0[2]
+        n += 1
+    if i1_in >= 0:
+        v1 = cand[i1_in]
+        a1 = candidate_row(v1)
+        ab[1] = v1[2]
+        n += 1
+    if i2_in >= 0:
+        v2 = cand[i2_in]
+        a2 = candidate_row(v2)
+        ab[2] = v2[2]
+        n += 1
     Lk = L
-    a0, a1, a2, ab, i0, i1, i2, mu, n, e0, e1, e2, R = set_start(start, Lk, a0, a1, a2, ab, i0_in, i1_in, i2_in, n)
+    i0 = i0_in
+    i1 = i1_in
+    i2 = i2_in
+    mu = zero
+    e0 = zero
+    e1 = zero
+    e2 = zero
+    R = identity
+    if n > 0:
+        a0, a1, a2, ab, i0, i1, i2, mu, n, e0, e1, e2, R = set_start(start, Lk, a0, a1, a2, ab, i0_in, i1_in, i2_in, n)
     # The metric and the start with the closing springs in them: none yet.
     Ks = K
     Ls = Lk
@@ -410,8 +432,9 @@ def region_block(
     turn = int(0)
     while turn < REGION_STEPS:
         turn += 1
-        # One pass over the candidates, four loads a step: who closes without the region, the springs that close at
-        # the velocity (their sums), and the rigid candidate outside the set that closes fastest there.
+        # One pass over the candidates, four a step, each read only where it exists: who closes without the region,
+        # the springs that close at the velocity (their sums), and the rigid candidate outside the set that closes
+        # fastest there.
         s00 = float(0.0)
         s01 = float(0.0)
         s02 = float(0.0)
@@ -427,10 +450,10 @@ def region_block(
         i = g0
         while i < g1:
             for k in range(4):
-                ii = wp.min(i + k, g1 - 1)
-                record = cand[ii]
-                a = candidate_row(record)
                 if i + k < g1:
+                    ii = i + k
+                    record = cand[ii]
+                    a = candidate_row(record)
                     if wp.dot(a, without) + record[2] < -tol:
                         opened = 0
                     r = wp.dot(a, s) + record[2]
@@ -469,7 +492,8 @@ def region_block(
                 Ls = metric_factor(Ks)
                 factored = 1
             ss = shape * (start - K * q)
-            a0, a1, a2, ab, i0, i1, i2, mu, n, e0, e1, e2, R = set_start(ss, Ls, a0, a1, a2, ab, i0, i1, i2, n)
+            if n > 0:
+                a0, a1, a2, ab, i0, i1, i2, mu, n, e0, e1, e2, R = set_start(ss, Ls, a0, a1, a2, ab, i0, i1, i2, n)
             s = ss + Ks * (a0 * mu[0] + a1 * mu[1] + a2 * mu[2])
             steps += 1
             continue
