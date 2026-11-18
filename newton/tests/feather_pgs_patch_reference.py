@@ -258,7 +258,7 @@ def _build(
         location, spin_arm = _region_location(
             frame.members[member_start], first, carry_only, member_start, member_stop, frame
         )
-        chosen = _region_anchor(
+        chosen, _following = _region_anchor(
             first,
             member_start,
             member_stop,
@@ -532,7 +532,8 @@ class ReferencePatches:
             setattr(frame, field, wp.zeros(n, dtype=wp.vec3, device=device))
         frame.mu = wp.zeros(n, dtype=wp.vec2, device=device)
         frame.foot = wp.zeros(n, dtype=wp.vec2, device=device)
-        frame.history = wp.zeros(n, dtype=wp.vec4i, device=device)
+        frame.history = wp.zeros(n, dtype=wp.vec3i, device=device)
+        frame.claim = wp.zeros(n, dtype=wp.vec2i, device=device)
         frame.proposal = wp.zeros(n, dtype=wp.vec4, device=device)
         frame.radius = wp.zeros(n, dtype=float, device=device)
         frame.support_gap_limit = wp.zeros(n, dtype=float, device=device)

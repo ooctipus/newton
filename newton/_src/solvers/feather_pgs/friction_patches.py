@@ -271,9 +271,11 @@ class _PatchFrame:
     region_stop: wp.array[int]
     carrier: wp.array[int]
     # Scratch of a new frame's placement, at each region's member start: its pair's stored history (the anchors from
-    # the first word to the second in ``prev.members``, the centres from the first to the third in ``prev.centres``)
-    # and its claim (_place), and its proposal (its location and spin arm).
-    history: wp.array[wp.vec4i]
+    # the first word to the second in ``prev.members``, the centres from the first to the third in ``prev.centres``),
+    # its claim (the stored anchor it takes, or none once it settled, and the next nearest: _place) and its proposal
+    # (its location and spin arm).
+    history: wp.array[wp.vec3i]
+    claim: wp.array[wp.vec2i]
     proposal: wp.array[wp.vec4]
     # Scratch: a region's footprint points, in its members' positions.
     foot: wp.array[wp.vec2]
@@ -957,13 +959,14 @@ def _region_anchor(
     frame: _PatchFrame,
     prev: _PatchFrame,
 ):
-    """The stored anchor the region at ``location``, carried by ``first``, takes: of the stored anchors
-    ``prev.members[anchor_start:anchor_stop]`` in sorted order, the nearest that passes its gates and no region has
-    taken (``prev.used``), the first of equal ones; -1 where none does.
+    """The stored anchor the region at ``location``, carried by ``first``, takes, and the next: of the stored anchors
+    ``prev.members[anchor_start:anchor_stop]`` in sorted order that pass its gates and no region has taken
+    (``prev.used``), the nearest, the first of equal ones, and the nearest after it in that order; -1 for none.
 
     Every gate but the distance's reads only the region and the anchor, so the choice is the nearest of the passing
-    set: where that is untaken, it is also the nearest of the untaken passing set (:func:`_place`'s claims). Stored
-    history moves with the bodies' pose increments since the stored poses.
+    set: where that is untaken, it is also the nearest of the untaken passing set, and where an earlier region took
+    it, the next is, if untaken (:func:`_claim_pair`). Stored history moves with the bodies' pose increments since
+    the stored poses.
     """
     c = first
     a = frame.body_a[c]
@@ -973,6 +976,8 @@ def _region_anchor(
     current_gap = _surface_gap(q, a, frame.surface_a[c], b, frame.surface_b[c], n)
     chosen = int(-1)
     nearest = float(1.0e30)
+    following = int(-1)
+    next_nearest = float(1.0e30)
     motion = wp.vec3(0.0)
     if anchor_stop > anchor_start:
         motion = _pose_motion(q, previous_q, a, location) - _pose_motion(q, previous_q, b, location)
@@ -998,7 +1003,7 @@ def _region_anchor(
         offset = 0.5 * (pa + pb) - location
         distance = wp.length_sq(offset)
         if not (
-            distance < nearest
+            distance < next_nearest
             and distance <= 4.0 * r * r
             and wp.abs(_surface_gap(q, a, prev.anchor_a[p], b, prev.anchor_b[p], n)) <= 0.1 * r
             and wp.abs(wp.dot(offset, n)) <= 0.05 * r
@@ -1038,9 +1043,15 @@ def _region_anchor(
                     connected = True
                     break
         if connected:
-            chosen = p
-            nearest = distance
-    return chosen
+            if distance < nearest:
+                following = chosen
+                next_nearest = nearest
+                chosen = p
+                nearest = distance
+            else:
+                following = p
+                next_nearest = distance
+    return chosen, following
 
 
 @wp.func
@@ -1153,7 +1164,7 @@ def _list_region(
         frame.regions[wp.atomic_add(regions, 0, 1)] = member_start
     else:
         frame.regions[end - 1 - wp.atomic_add(regions, 1, 1)] = member_start
-    frame.history[member_start] = wp.vec4i(anchor_start, anchor_stop, centre_stop, _SETTLED)
+    frame.history[member_start] = wp.vec3i(anchor_start, anchor_stop, centre_stop)
 
 
 @wp.func
@@ -1600,7 +1611,7 @@ def _propose_region(
     """
     member_stop = frame.region_stop[member_start]
     first, carry_only = _region_carrier(member_start, member_stop, frame)
-    history = wp.vec4i(member_start, member_start, member_start, _SETTLED)
+    history = wp.vec3i(member_start, member_start, member_start)
     if held != 0:
         p = frame.carrier[member_start]
         prev.used[p] = 0
@@ -1612,14 +1623,14 @@ def _propose_region(
         if prev.pressured[p] != 0:
             prev.centres[member_start] = prev.pressure[p]
             centre_stop = member_start + 1
-        history = wp.vec4i(member_start, anchor_stop, centre_stop, _SETTLED)
+        history = wp.vec3i(member_start, anchor_stop, centre_stop)
     else:
         history = frame.history[member_start]
     frame.carrier[member_start] = first
     location, spin_arm = _region_location(
         frame.members[member_start], first, carry_only, member_start, member_stop, frame
     )
-    chosen = _region_anchor(
+    chosen, following = _region_anchor(
         first,
         member_start,
         member_stop,
@@ -1656,7 +1667,7 @@ def _propose_region(
     else:
         frame.proposal[member_start] = wp.vec4(location[0], location[1], location[2], spin_arm)
     if held == 0:
-        frame.history[member_start] = wp.vec4i(history[0], history[1], history[2], chosen)
+        frame.claim[member_start] = wp.vec2i(chosen, following)
 
 
 @wp.func
@@ -1672,8 +1683,9 @@ def _claim_pair(
 ):
     """Step 1 of the placement (:func:`_place`): the regions of the body pair whose first region starts at live
     position ``start`` take their proposed anchors in the order the flood made them (their member starts ascending:
-    each region's members stop where the next one's start). An anchor no earlier region took is the region's; a
-    region whose anchor an earlier one took looks again among those left (``prev.used``)."""
+    each region's members stop where the next one's start). An anchor no earlier region took is the region's. A
+    region whose anchor an earlier one took takes the next nearest its search passed (none where it passed no other),
+    and where an earlier region took that one too, looks again among those left (``prev.used``)."""
     key = frame.keys[start]
     if frame.history[start][1] == frame.history[start][0]:
         # The pair holds no stored anchor: no region proposed one.
@@ -1683,26 +1695,30 @@ def _claim_pair(
         if frame.keys[member_start] != key:
             break
         member_stop = frame.region_stop[member_start]
-        history = frame.history[member_start]
-        chosen = history[3]
+        claim = frame.claim[member_start]
+        chosen = claim[0]
         if chosen >= 0:
             if prev.used[chosen] != 0:
-                proposal = frame.proposal[member_start]
-                chosen = _region_anchor(
-                    frame.carrier[member_start],
-                    member_start,
-                    member_stop,
-                    history[0],
-                    history[1],
-                    wp.vec3(proposal[0], proposal[1], proposal[2]),
-                    q,
-                    previous_q,
-                    shape_transform,
-                    shape_radius,
-                    frame,
-                    prev,
-                )
-                frame.history[member_start] = wp.vec4i(history[0], history[1], history[2], chosen)
+                chosen = claim[1]
+                if chosen >= 0:
+                    if prev.used[chosen] != 0:
+                        history = frame.history[member_start]
+                        proposal = frame.proposal[member_start]
+                        chosen, _following = _region_anchor(
+                            frame.carrier[member_start],
+                            member_start,
+                            member_stop,
+                            history[0],
+                            history[1],
+                            wp.vec3(proposal[0], proposal[1], proposal[2]),
+                            q,
+                            previous_q,
+                            shape_transform,
+                            shape_radius,
+                            frame,
+                            prev,
+                        )
+                frame.claim[member_start] = wp.vec2i(chosen, -1)
             if chosen >= 0:
                 prev.used[chosen] = 1
         member_start = member_stop
@@ -1753,9 +1769,10 @@ def _place(
             if _starts_pair(frame.keys, member_start):
                 _claim_pair(member_start, live, q, previous_q, shape_transform, shape_radius, frame, prev)
         else:
-            history = frame.history[member_start]
-            if history[3] != _SETTLED:
+            chosen = frame.claim[member_start][0]
+            if chosen != _SETTLED:
                 first = frame.carrier[member_start]
+                history = frame.history[member_start]
                 proposal = frame.proposal[member_start]
                 _settle_region(
                     first,
@@ -1766,7 +1783,7 @@ def _place(
                     history[2],
                     wp.vec3(proposal[0], proposal[1], proposal[2]),
                     proposal[3],
-                    history[3],
+                    chosen,
                     q,
                     previous_q,
                     frame,
@@ -1893,6 +1910,7 @@ _BUILD_FIELDS = frozenset(
         "eligible",
         "foot",
         "history",
+        "claim",
         "proposal",
     )
 )
@@ -2166,7 +2184,8 @@ class _FrictionPatchState:
             ContactField("indices", wp.int32, None, per_contact=halves, extra=slack),
             ContactField("mu", wp.vec2),
             ContactField("foot", wp.vec2),
-            ContactField("history", wp.vec4i),
+            ContactField("history", wp.vec3i),
+            ContactField("claim", wp.vec2i),
             ContactField("proposal", wp.vec4),
             ContactField("radius", wp.float32),
             ContactField("support_gap_limit", wp.float32),

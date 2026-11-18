@@ -525,9 +525,9 @@ def assert_empty_tail(patches, context=""):
 # regions leaves each pair's index of the stored history there, and a build that carries the regions only each
 # region's own.
 _BUILD_SCRATCH = ("members", "centres", "used")
-# Scratch of a new frame's placement (friction_patches._place): each region's pair history and proposal, which a build
-# that carries the regions neither writes nor reads.
-_PLACEMENT_SCRATCH = ("history", "proposal")
+# Scratch of a new frame's placement (friction_patches._place): each region's pair history, claim and proposal, which a
+# build that carries the regions neither writes nor reads.
+_PLACEMENT_SCRATCH = ("history", "claim", "proposal")
 
 
 def assert_same_state(twin, patches, context="", records=True):
