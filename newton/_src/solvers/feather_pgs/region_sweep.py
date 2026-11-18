@@ -26,7 +26,9 @@ running every configured sweep: every later visit would be passed or idle).
 import numpy as np
 import warp as wp
 
+from ...core import memory
 from ...core.contact_pool import ContactField
+from ...core.execution import Work, shape
 from ...geometry.flags import ShapeFlags
 from .contact_input import ContactFrame, ContactInput, contact_frame
 from .device_preludes import (
@@ -74,6 +76,14 @@ FRICTION_ROWS = wp.constant(3)
 KIND_SPRINGS = wp.constant(4)
 # The lanes that share a warp's regions' candidates in the fill (fill_regions).
 _FILL_LANES = wp.constant(32)
+FILL_LINE = 128
+"""The fill's register line (:func:`fill_regions`): four blocks of 128 a multiprocessor, 16 warps, where its unbounded
+code (149 registers) kept one block of 256, 8 warps, and left two fifths of the register file idle. Measured alone on
+NIST's replay at 8,192 worlds (every word equal): the RTX PRO 6000 299 -> 258 us a call, the GB300 305 -> 236; a line
+of 112 or less spills on the PRO (104: 289 us)."""
+_FILL_SHAPE = shape(
+    Work(0, lanes=int(_FILL_LANES), block=128, registers=FILL_LINE), memory.built_for(memory.REFERENCE_ARCH)
+)
 # The lanes that list a world's blocks and levels together (form_blocks, level_regions): a world's serial passes over
 # its regions taken a stride at a time.
 _WORLD_LANES = wp.constant(32)
@@ -1045,7 +1055,7 @@ def fill_region_member(
     return eps != 0.0
 
 
-@wp.kernel(enable_backward=False, module="unique")
+@wp.kernel(enable_backward=False, launch_bounds=_FILL_SHAPE.bounds, module="unique")
 def fill_regions(
     rows: DenseRows,
     bias: RowBias,
@@ -2065,6 +2075,7 @@ class Regions:
                 self.reg_state,
                 self.reg_reach,
             ],
+            block_dim=_FILL_SHAPE.block,
             **live,
         )
         # The world kernels: a world a lane group (a warp on the GPU, one thread on the CPU).
