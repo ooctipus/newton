@@ -15,7 +15,7 @@ contracts their float multiply-adds into fused multiply-adds. Which product of a
 sum it leaves unfused can follow the order in which Warp emits a module's
 kernels, and that order differs between processes that compile the same module,
 so two caches can hold different code under one module hash. The projection
-``error -= n * wp.dot(error, n)`` in ``_build_pair`` rounds either ``n.x * e.x``
+``error -= n * wp.dot(error, n)`` in ``_settle_region`` rounds either ``n.x * e.x``
 or ``n.y * e.y`` on its own; over the CUDA differentials (NVRTC 12.9, sm_120)
 the two choices moved phi and carried displacements by at most 1.12 * 2**-23
 times the field's largest magnitude and changed no other field. On CUDA,
@@ -525,12 +525,15 @@ def assert_empty_tail(patches, context=""):
 # regions leaves each pair's index of the stored history there, and a build that carries the regions only each
 # region's own.
 _BUILD_SCRATCH = ("members", "centres", "used")
+# Scratch of a new frame's placement (friction_patches._place): each region's pair history and proposal, which a build
+# that carries the regions neither writes nor reads.
+_PLACEMENT_SCRATCH = ("history", "proposal")
 
 
 def assert_same_state(twin, patches, context="", records=True):
     """Require bitwise-equal arrays in two patch states, the frames' state and what the builds place, and the same
-    listed regions. The builds' own scratch (:data:`_BUILD_SCRATCH`) differs between a build that makes a
-    frame's regions and one that carries them, so it is not compared.
+    listed regions. The builds' own scratch (:data:`_BUILD_SCRATCH`, :data:`_PLACEMENT_SCRATCH`) differs between a
+    build that makes a frame's regions and one that carries them, so it is not compared.
 
     ``records`` compares the frame records as well: the sorted frame, and the
     sort's extent, which a kept build leaves empty.
@@ -553,6 +556,8 @@ def assert_same_state(twin, patches, context="", records=True):
             if name == "regions":
                 continue  # the listed regions, compared above: threads list them in any order
             if frame == "previous" and name in _BUILD_SCRATCH:
+                continue
+            if frame == "current" and name in _PLACEMENT_SCRATCH:
                 continue
             np.testing.assert_array_equal(
                 getattr(getattr(twin, frame), name).numpy(),
@@ -1637,6 +1642,7 @@ class TestPatchLaunchShapes(unittest.TestCase):
                 ("_merge_runs", 1024, 1024, None),
                 ("_prepare_contacts", 1536, 1536, None),
                 ("_build", 2048, 2048, 32),
+                ("_place", 2048, 2048, 32),
             },
         )
 

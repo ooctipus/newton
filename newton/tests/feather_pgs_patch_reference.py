@@ -12,8 +12,9 @@ CPU, and on CUDA with computed float payloads within the FMA-contraction bound
 of ``assert_same_patches``, because NVRTC may contract this module's
 multiply-adds differently from the patch module's. Device
 functions that the mechanism work leaves unchanged are imported, and so is the
-per-pair and per-contact work of the one-wrench law (``_build_pair``,
-``_finish_contact``), which is law, not mechanism: this module keeps the launches,
+per-pair, per-region and per-contact work of the one-wrench law (``_build_pair``,
+the region's carrier, location, anchor and settle, ``_finish_contact``), which is
+law, not mechanism: this module keeps the launches,
 their extents and the history's storage of the old mechanism. ``_prepare`` forms
 the gaps from body-relative points (``contact_laws.contact_points``,
 ``_surface_gap``), which is not mechanism work either. This module holds shared test helpers; it defines no tests.
@@ -32,6 +33,10 @@ from newton._src.solvers.feather_pgs.friction_patches import (
     _finish_contact,
     _local_surface,
     _PatchFrame,
+    _region_anchor,
+    _region_carrier,
+    _region_location,
+    _settle_region,
     _starts_pair,
     patch_routes,
 )
@@ -241,20 +246,49 @@ def _build(
     stop = start + 1
     while stop < end and frame.keys[stop] == frame.keys[start]:
         stop += 1
-    _build_pair(
-        start,
-        stop,
-        end,
-        prev.center.shape[0],
-        q,
-        previous_q,
-        shape_transform,
-        shape_radius,
-        frame,
-        prev,
-        patches,
-        regions,
-    )
+    _build_pair(start, stop, end, prev.center.shape[0], shape_transform, shape_radius, frame, prev, patches, regions)
+    # The pair's regions placed one after another in the order the flood made them, each taking the nearest passing
+    # stored anchor that no region before it took: the order the solver's placement reproduces a thread a region.
+    member_start = start
+    while member_start < stop:
+        member_stop = frame.region_stop[member_start]
+        first, carry_only = _region_carrier(member_start, member_stop, frame)
+        frame.carrier[member_start] = first
+        history = frame.history[member_start]
+        location, spin_arm = _region_location(
+            frame.members[member_start], first, carry_only, member_start, member_stop, frame
+        )
+        chosen = _region_anchor(
+            first,
+            member_start,
+            member_stop,
+            history[0],
+            history[1],
+            location,
+            q,
+            previous_q,
+            shape_transform,
+            shape_radius,
+            frame,
+            prev,
+        )
+        _settle_region(
+            first,
+            carry_only,
+            member_start,
+            member_stop,
+            history[0],
+            history[2],
+            location,
+            spin_arm,
+            chosen,
+            q,
+            previous_q,
+            frame,
+            prev,
+            patches,
+        )
+        member_start = member_stop
 
 
 @wp.kernel(enable_backward=False)
@@ -498,6 +532,8 @@ class ReferencePatches:
             setattr(frame, field, wp.zeros(n, dtype=wp.vec3, device=device))
         frame.mu = wp.zeros(n, dtype=wp.vec2, device=device)
         frame.foot = wp.zeros(n, dtype=wp.vec2, device=device)
+        frame.history = wp.zeros(n, dtype=wp.vec4i, device=device)
+        frame.proposal = wp.zeros(n, dtype=wp.vec4, device=device)
         frame.radius = wp.zeros(n, dtype=float, device=device)
         frame.support_gap_limit = wp.zeros(n, dtype=float, device=device)
         frame.twist = wp.zeros(n, dtype=float, device=device)
