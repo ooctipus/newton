@@ -24,7 +24,16 @@ from .kernel_template import Dispatch
 from .packed_rows import CLASS_SIDES, PACKED_SIDES_BY_SIDE, PACKED_SIDES_DENSE
 from .projection_laws import IDLE_LAW
 from .region_laws import REGION_LAW, REGION_SLIDE
-from .region_sweep import FRICTION_ROWS, KIND_SECOND, KIND_SPRINGS, REGION_IDLE, REGION_LOOSE, REGION_TOLERANCE
+from .region_sweep import (
+    FRICTION_ROWS,
+    KIND_BLOCK,
+    KIND_SECOND,
+    KIND_SPRINGS,
+    PAIR_BLOCKS,
+    REGION_IDLE,
+    REGION_LOOSE,
+    REGION_TOLERANCE,
+)
 from .response_operator import Lanes, SparseFactor, Velocity
 from .row_inputs import RowArgument
 from .row_laws import ROW_CONTACT, ROW_FRICTION, ROW_JOINT_LIMIT, ROW_JOINT_VELOCITY_LIMIT, ROW_SPEED, ROW_TORSION
@@ -661,9 +670,9 @@ _PAIR_BLOCK = """if ((kind & 16) != 0) {
     // (yh = L^-1 y), from its staged records (region_sweep.stage_blocks), by the region law's block laws
     // (region_laws.block_*): each member's friction unit by the region law's cone law at the load its region holds,
     // then every member candidate's normal as one compliant block (the region law's closing springs, Newton on the
-    // six). The held wrenches are kept whitened (L^T J). A chain world's lanes all walk its order (alone), so its
-    // block's candidate passes take the group's lanes (team).
-    const int team = alone ? STRIDE : 1, mine = alone ? lane : 0;
+    // six). The held wrenches are kept whitened (L^T J). A block takes its world's lanes (teamed: region_phase), so
+    // its member batches and candidate passes split over them (team).
+    const int team = STRIDE, mine = lane;
     const int bid = world * 2 + (kind >> 8);
     const wp::vec2i pair = blk_pair.data[bid];
     const bool flip = pair[0] != f;
@@ -882,7 +891,9 @@ def region_phase(pad: str = "        ") -> str:
     world whose levels hold fewer regions than the colored rule's parallelism (a chain: a tangled pair's regions
     share both bodies, one a level) is walked by its first lane in the order the levels were made from
     (``reg_order``: a body's regions together within a depth), a first body's twist kept from one of its regions to
-    the next, as a sequential walk does; the result is the same either way. A region's response and the other terms
+    the next, as a sequential walk does; the result is the same either way. A pair block (:func:`.region_sweep.form_blocks`)
+    takes every lane of its world either way: its member batches and candidate passes split over them, so its sums
+    reduce in one order whatever its world's walk. A region's response and the other terms
     that stand for the step are the listing's (:func:`.region_sweep.region_terms`), and its wrench's change returns
     through its bodies' bases.
 
@@ -940,6 +951,8 @@ if (moved) {{
     const bool alone = (float)(kept_end - region_span[0]) < {parallelism}f * (float)levels;
     // A chain world's lanes all walk its order, each doing the same work (a block's candidate passes split over them).
     const int stride = alone ? 1 : STRIDE;
+    // Whether the world holds a pair block: its first is listed first (region_sweep.form_blocks).
+    const bool holds_block = blk_pair.data[world * {int(PAIR_BLOCKS)}][0] >= 0;
     int level_first = region_span[0];
     int body = -1, first = 0, version = 0;
     wp::spatial_vector u;
@@ -951,8 +964,21 @@ if (moved) {{
     const int spans = alone ? 1 : levels;
     for (int level = 0; level < spans; ++level) {{
     const int level_last = alone ? kept_end : level_end.data[region_span[0] + level];
-    for (int place = level_first + (alone ? 0 : lane); place < level_last; place += stride) {{
-        if (alone) WARP_SYNC();
+    for (int chunk = level_first; chunk < level_last; chunk += stride) {{
+    // A pair block takes every lane (teamed): the lanes visit a chunk's blocks together, one after another, then each
+    // lane its own other region; a level's regions share no body, so its order inside the level is the same sweep.
+    const unsigned blocks = alone || !holds_block ? 0u : BALLOT(chunk + lane < level_last
+        && (reg_kind.data[level_region.data[chunk + lane]] & {int(KIND_BLOCK)}) != 0);
+    unsigned left = blocks;
+    const int turns = alone ? 1 : COUNT(blocks) + 1;
+    // One copy of a region's visit: the turns are a schedule, not to be unrolled (each copy is the whole visit).
+    #pragma unroll 1
+    for (int turn = 0; turn < turns; ++turn) {{
+        const bool teamed = alone || left != 0u;
+        const int place = chunk + (left != 0u ? FIRST(left) : alone ? 0 : lane);
+        left &= left - 1u;
+        if (!teamed && (place >= level_last || ((blocks >> lane) & 1u) != 0u)) continue;
+        if (teamed) WARP_SYNC();
         const int g = alone ? reg_order.data[place] : level_region.data[place];
         const wp::vec2i sides = reg_body.data[g];
         const int f = sides[0], f_b = sides[1];
@@ -1082,6 +1108,7 @@ if (moved) {{
         reg_spring.data[g] = out.v6;
         reg_state.data[g] = out.v8 == {int(REGION_SLIDE)} ? {int(REGION_LOOSE)} : out.v0[0] > 0.0f ? version : {int(REGION_IDLE)};
         reg_stamp.data[g] = version_b;
+    }}
     }}
     level_first = level_last;
     if (!alone) SYNC();
