@@ -288,6 +288,8 @@ def _build(
             prev,
             patches,
         )
+        if chosen >= 0:
+            prev.used[chosen] = 1
         member_start = member_stop
 
 

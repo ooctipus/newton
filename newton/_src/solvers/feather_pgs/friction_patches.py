@@ -139,7 +139,7 @@ _LIST_CHUNK = wp.constant(1024)
 # uniform pressure over its gyration radius is 0.937 on a square, 0.943 on a disc and 0.866 on a line, and 0.94 holds
 # every convex footprint within 4% of quadrature (core-docs/WRENCH/VERDICT.md section 6).
 _SPIN_ARM = wp.constant(0.94)
-# A region's claim once it settled in the placement's first step (_place): it holds no proposal.
+# The second word of a region's claim once it settled in the placement's first step (_place): it holds no proposal.
 _SETTLED = wp.constant(-2)
 # The contact generation no stream takes: contacts without a generation, and a forgotten record.
 _NO_GENERATION = wp.constant(wp.int32(GENERATION_SENTINEL))
@@ -272,7 +272,7 @@ class _PatchFrame:
     carrier: wp.array[int]
     # Scratch of a new frame's placement, at each region's member start: its pair's stored history (the anchors from
     # the first word to the second in ``prev.members``, the centres from the first to the third in ``prev.centres``),
-    # its claim (the stored anchor it takes, or none once it settled, and the next nearest: _place) and its proposal
+    # its claim (the stored anchor it takes and the next nearest, or _SETTLED once it settled: _place) and its proposal
     # (its location and spin arm).
     history: wp.array[wp.vec3i]
     claim: wp.array[wp.vec2i]
@@ -1074,7 +1074,7 @@ def _settle_region(
     """Place the region's anchor and write its friction's record on its carrier ``first``: the anchor sits at the
     nearest stored centre of pressure ``prev.centres[centre_start:centre_stop]`` kept on the footprint, or at
     ``location``, and carries the ``chosen`` stored anchor's displacement and twist (none for -1), moved by the bodies'
-    pose increments at the anchor. The region takes ``chosen`` (``prev.used``)."""
+    pose increments at the anchor. Which anchor a region may take is the claims' (:func:`_claim_pair`)."""
     c = first
     a = frame.body_a[c]
     b = frame.body_b[c]
@@ -1107,7 +1107,6 @@ def _settle_region(
     anchor_b = _local_point(q, b, pa)
     error = wp.vec3(0.0)
     if chosen >= 0:
-        prev.used[chosen] = 1
         error = _carried_displacement(q, prev, chosen, n)
         error += _pose_motion(q, previous_q, a, pa) - _pose_motion(q, previous_q, b, pa)
         error -= n * wp.dot(error, n)
@@ -1644,9 +1643,9 @@ def _propose_region(
         frame,
         prev,
     )
-    # A held region's history is its own, and a region that passes no anchor passes none of those left: both choices
-    # are final.
-    if held != 0 or chosen < 0:
+    # A choice is final where no region before it can take the anchor: a held region's history is its own, a pair's
+    # first region has none before it, and a region that passes no anchor passes none of those left.
+    if held != 0 or chosen < 0 or _starts_pair(frame.keys, member_start):
         _settle_region(
             first,
             carry_only,
@@ -1663,7 +1662,7 @@ def _propose_region(
             prev,
             patches,
         )
-        chosen = _SETTLED
+        following = _SETTLED
     else:
         frame.proposal[member_start] = wp.vec4(location[0], location[1], location[2], spin_arm)
     if held == 0:
@@ -1683,9 +1682,10 @@ def _claim_pair(
 ):
     """Step 1 of the placement (:func:`_place`): the regions of the body pair whose first region starts at live
     position ``start`` take their proposed anchors in the order the flood made them (their member starts ascending:
-    each region's members stop where the next one's start). An anchor no earlier region took is the region's. A
-    region whose anchor an earlier one took takes the next nearest its search passed (none where it passed no other),
-    and where an earlier region took that one too, looks again among those left (``prev.used``)."""
+    each region's members stop where the next one's start), and mark each taken (``prev.used``): a settled region's
+    is its own, as is an anchor no earlier region took. A region whose anchor an earlier one took takes the next
+    nearest its search passed (none where it passed no other), and where an earlier region took that one too, looks
+    again among those left."""
     key = frame.keys[start]
     if frame.history[start][1] == frame.history[start][0]:
         # The pair holds no stored anchor: no region proposed one.
@@ -1697,7 +1697,7 @@ def _claim_pair(
         member_stop = frame.region_stop[member_start]
         claim = frame.claim[member_start]
         chosen = claim[0]
-        if chosen >= 0:
+        if chosen >= 0 and claim[1] != _SETTLED:
             if prev.used[chosen] != 0:
                 chosen = claim[1]
                 if chosen >= 0:
@@ -1719,8 +1719,8 @@ def _claim_pair(
                             prev,
                         )
                 frame.claim[member_start] = wp.vec2i(chosen, -1)
-            if chosen >= 0:
-                prev.used[chosen] = 1
+        if chosen >= 0:
+            prev.used[chosen] = 1
         member_start = member_stop
 
 
@@ -1743,9 +1743,11 @@ def _place(
     :func:`_listed_region`), in three steps, a launch each; regions write disjoint current records.
 
     0. Each region takes its carrier and location and the stored anchor it would take if no other region of its pair
-       took one (:func:`_propose_region`). A held frame's regions and those that find none settle here.
-    1. A thread a body pair, its first region's, walks the pair's regions in the order the flood made them and gives
-       each its anchor (:func:`_claim_pair`): the one-thread placement's, which places them in that order.
+       took one (:func:`_propose_region`). Where that choice is final it settles here: a held frame's regions, a pair's
+       first and those that find none.
+    1. A thread a body pair, its first region's, walks the pair's regions in the order the flood made them, gives
+       each its anchor and marks it taken (:func:`_claim_pair`): the one-thread placement's, which places them in
+       that order.
     2. Each region that held a proposal settles (:func:`_settle_region`).
 
     A held frame's regions are its first build's, each with its own history: its steps 1 and 2 have no work (their
@@ -1769,8 +1771,8 @@ def _place(
             if _starts_pair(frame.keys, member_start):
                 _claim_pair(member_start, live, q, previous_q, shape_transform, shape_radius, frame, prev)
         else:
-            chosen = frame.claim[member_start][0]
-            if chosen != _SETTLED:
+            claim = frame.claim[member_start]
+            if claim[1] != _SETTLED:
                 first = frame.carrier[member_start]
                 history = frame.history[member_start]
                 proposal = frame.proposal[member_start]
@@ -1783,7 +1785,7 @@ def _place(
                     history[2],
                     wp.vec3(proposal[0], proposal[1], proposal[2]),
                     proposal[3],
-                    chosen,
+                    claim[0],
                     q,
                     previous_q,
                     frame,
