@@ -309,8 +309,10 @@ def _mark(out: wp.array[int]):
 
 @wp.kernel
 def _copy_any(source: wp.array[Any], target: wp.array[Any]):
+    # A plain grid is whole blocks (grid * block threads): the kernel bounds its items, as the solver's do.
     i = wp.tid()
-    target[i] = source[i]
+    if i < target.shape[0]:
+        target[i] = source[i]
 
 
 _STAGE_WORDS = 16 * 1024
@@ -394,20 +396,28 @@ class TestLaunch(unittest.TestCase):
         self.assertEqual(memory.fit_carveout(_mark, 32, "cpu"), 0)
 
     def test_a_generic_kernel_fits_the_overload_it_launches(self):
-        # A generic kernel has no code of its own: the layer's launch fits the overload its arguments select.
+        # A generic kernel has no code of its own: the layer's launch fits the overload its arguments select. The
+        # plain grid runs whole blocks (on CUDA one block of 256 threads for the 8 items): the source and target are
+        # the heads of buffers as long as the grid, so a thread past the items would read and write inside them, and
+        # the words past the target keep their marks.
         for device in ("cpu", *wp.get_cuda_devices()):
             with self.subTest(device=str(device)):
-                source = wp.array(np.arange(16, dtype=np.float32).reshape(8, 2), dtype=wp.vec2, device=device)
-                target = wp.zeros(8, dtype=wp.vec2, device=device)
+                grid = shape(Work(8), memory.device(device))
+                threads = grid.grid * grid.block
+                words = np.arange(2 * threads, dtype=np.float32).reshape(threads, 2)
+                source_words = wp.array(words, dtype=wp.vec2, device=device)
+                target_words = wp.full(threads, wp.vec2(-1.0, -1.0), dtype=wp.vec2, device=device)
                 execution.launch(
                     _copy_any,
-                    shape(Work(8), memory.device(device)),
-                    inputs=(source,),
-                    outputs=(target,),
+                    grid,
+                    inputs=(source_words[:8],),
+                    outputs=(target_words[:8],),
                     device=device,
                     tiled=False,
                 )
-                np.testing.assert_array_equal(target.numpy(), source.numpy())
+                np.testing.assert_array_equal(target_words.numpy()[:8], words[:8])
+                np.testing.assert_array_equal(target_words.numpy()[8:], -1.0)
+                np.testing.assert_array_equal(source_words.numpy(), words)
 
 
 if __name__ == "__main__":
