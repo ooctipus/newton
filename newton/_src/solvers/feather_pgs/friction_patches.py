@@ -1806,50 +1806,86 @@ def _store_contact(
     previous_q: wp.array[wp.transform],
 ):
     """Carry contact history and input poses, independent of solver velocity passes. A ``carried`` build (a held
-    frame's) kept the frame's sorted index, which the store after the frame's earlier build already holds."""
-    # Pair searches need the complete sorted index, but only live anchors own
-    # geometric history. Retire stale validity and reset ownership before exit.
+    frame's) kept the frame's sorted index, which the store after the frame's earlier build already holds.
+
+    The slot's record is read whole before any of it is written: a read after a write to an array that may alias it
+    waits for its own load, so a copy that interleaves them pays a memory latency a field."""
+    valid = frame.valid[c]
+    pressured = frame.pressured[c]
+    key = wp.int64(0)
+    index = int(0)
     if carried == 0:
-        prev.keys[c] = frame.keys[c]
-        prev.indices[c] = frame.indices[c]
-    prev.valid[c] = frame.valid[c]
-    previous_world[c] = -1
-    # The centre of pressure of the last solve, in body a's frame, sliding or stuck: the next build's anchor.
-    prev.pressured[c] = frame.pressured[c]
-    if frame.pressured[c] != 0:
-        prev.pressure[c] = frame.pressure[c]
-    if frame.valid[c] == 0:
+        key = frame.keys[c]
+        index = frame.indices[c]
+    pressure = wp.vec3(0.0)
+    if pressured != 0:
+        pressure = frame.pressure[c]
+    if valid == 0:
+        # Pair searches need the complete sorted index, but only live anchors own
+        # geometric history. Retire stale validity and reset ownership before exit.
+        if carried == 0:
+            prev.keys[c] = key
+            prev.indices[c] = index
+        prev.valid[c] = valid
+        previous_world[c] = -1
+        # The centre of pressure of the last solve, in body a's frame, sliding or stuck: the next build's anchor.
+        prev.pressured[c] = pressured
+        if pressured != 0:
+            prev.pressure[c] = pressure
         return
+    a = frame.body_a[c]
+    b = frame.body_b[c]
     normal = frame.normal[c]
-    if frame.body_a[c] >= 0:
-        normal = wp.transform_vector(wp.transform_inverse(q[frame.body_a[c]]), normal)
-    prev.normal[c] = normal
-    prev.displacement[c] = frame.displacement[c]
-    prev.mu[c] = frame.mu[c]
-    prev.body_a[c] = frame.body_a[c]
-    prev.body_b[c] = frame.body_b[c]
-    prev.owner[c] = frame.owner[c]
-    prev.shape_a[c] = frame.shape_a[c]
-    prev.shape_b[c] = frame.shape_b[c]
-    prev.anchor_a[c] = frame.anchor_a[c]
-    prev.anchor_b[c] = frame.anchor_b[c]
-    prev.surface_a[c] = frame.surface_a[c]
-    prev.surface_b[c] = frame.surface_b[c]
-    prev.twist[c] = frame.twist[c]
+    displacement = frame.displacement[c]
+    mu = frame.mu[c]
+    owner = frame.owner[c]
+    shape_a = frame.shape_a[c]
+    shape_b = frame.shape_b[c]
+    anchor_a = frame.anchor_a[c]
+    anchor_b = frame.anchor_b[c]
+    surface_a = frame.surface_a[c]
+    surface_b = frame.surface_b[c]
+    twist = frame.twist[c]
+    pose_a = wp.transform_identity()
+    pose_b = wp.transform_identity()
     world = int(-1)
-    if frame.body_a[c] >= 0:
-        world = body_world[frame.body_a[c]]
-    if world < 0 and frame.body_b[c] >= 0:
-        world = body_world[frame.body_b[c]]
+    if a >= 0:
+        pose_a = q[a]
+        world = body_world[a]
+    if b >= 0:
+        pose_b = q[b]
+    if world < 0 and b >= 0:
+        world = body_world[b]
+    if carried == 0:
+        prev.keys[c] = key
+        prev.indices[c] = index
+    prev.valid[c] = valid
+    prev.pressured[c] = pressured
+    if pressured != 0:
+        prev.pressure[c] = pressure
+    if a >= 0:
+        normal = wp.transform_vector(wp.transform_inverse(pose_a), normal)
+    prev.normal[c] = normal
+    prev.displacement[c] = displacement
+    prev.mu[c] = mu
+    prev.body_a[c] = a
+    prev.body_b[c] = b
+    prev.owner[c] = owner
+    prev.shape_a[c] = shape_a
+    prev.shape_b[c] = shape_b
+    prev.anchor_a[c] = anchor_a
+    prev.anchor_b[c] = anchor_b
+    prev.surface_a[c] = surface_a
+    prev.surface_b[c] = surface_b
+    prev.twist[c] = twist
     # The solver maps the default, unpartitioned world (-1) to world zero.
-    world = wp.max(world, 0)
-    previous_world[c] = world
+    previous_world[c] = wp.max(world, 0)
     # _place reads pose increments only through valid stored anchors, so only
     # their bodies need the input pose.
-    if frame.body_a[c] >= 0:
-        previous_q[frame.body_a[c]] = q[frame.body_a[c]]
-    if frame.body_b[c] >= 0:
-        previous_q[frame.body_b[c]] = q[frame.body_b[c]]
+    if a >= 0:
+        previous_q[a] = pose_a
+    if b >= 0:
+        previous_q[b] = pose_b
 
 
 @wp.kernel(enable_backward=False)
