@@ -31,7 +31,7 @@ from .kernel_template import Dispatch
 from .law_source import law_preludes
 from .response_operator import Lanes, TransposedResponse, WalkedRows
 from .row_inputs import RowArgument
-from .row_laws import ROW_CONTACT, ROW_JOINT_LIMIT, ROW_JOINT_VELOCITY_LIMIT, ROW_LAW
+from .row_laws import ROW_CONTACT, ROW_JOINT_LIMIT, ROW_LAW
 from .solve_policy import block_argmax
 from .sweep import SPLIT, JacobiRows, SweepConfig, dense_tier_world, jacobi_limit_pass, jacobi_scale, jacobi_sweeps
 from .sweep_routes import MF_GS_ABI, worlds
@@ -212,7 +212,7 @@ def parallel_source(tier: TierSweep) -> tuple[str, Staging]:
         "parent": "world_row_parent.data[off_dense + i]",
         "mu": "world_row_mu.data[off_dense + i]",
     }
-    loads = store.loads(**metadata, unilateral=(ROW_CONTACT, ROW_JOINT_LIMIT, ROW_JOINT_VELOCITY_LIMIT))
+    loads = store.loads(**metadata, unilateral=(ROW_CONTACT, ROW_JOINT_LIMIT))
 
     # The velocity limits' last word closes the sweeps: none without a sweep, as the serial sweeps' at no iterations.
     last_word = jacobi_limit_pass(store, op) if velocity_limit_pass and sweeps else ""

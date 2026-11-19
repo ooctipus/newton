@@ -26,7 +26,6 @@ from .row_laws import (
     limit_rhs,
     row_rhs,
     separates,
-    velocity_limit_active,
 )
 from .row_records import UNIT_LINK, UNIT_SPEED, DenseRows, RowSupport, row_sides, unit_source
 
@@ -287,8 +286,8 @@ def allocate_rigid_velocity_limit_slots(
     a joint velocity limit's) and no gap; its unit source (:data:`.row_records.UNIT_SPEED`) seeds the axis it bounds at
     the body's root, which the writer walks (:func:`.walk_rows.speed_axis`).
 
-    ``velocity_limit_activation_fraction`` proximity-gates the allocation,
-    as the joint velocity limits (:func:`.prefix_rows.velocity_limits`): a positive fraction
+    ``velocity_limit_activation_fraction`` proximity-gates the allocation (the joint velocity limits take
+    their rows every step: :func:`.prefix_rows.velocity_limits`): a positive fraction
     reserves a row only when the speed read from ``joint_qd`` at the free
     root's DOFs satisfies ``|v| >= fraction * limit``. A fraction of ``0.0``
     reserves every finitely limited speed's row without reading ``joint_qd``. A reserved row whose residual
@@ -324,7 +323,7 @@ def allocate_rigid_velocity_limit_slots(
             continue
         root_dof = articulation_root_dof_start[art] + 3 * speed_axis
         speed = wp.length(wp.vec3(joint_qd[root_dof], joint_qd[root_dof + 1], joint_qd[root_dof + 2]))
-        if not velocity_limit_active(limit, speed, velocity_limit_activation_fraction):
+        if limit <= 0.0 or speed < velocity_limit_activation_fraction * limit:
             continue
 
         slot = reserve(slot_counter, world, 1, capacity, first_rejected_slot)

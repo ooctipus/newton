@@ -289,19 +289,12 @@ def joint_limit_side(
 
 
 @ROW_LAW.law
-def velocity_limit_active(limit: float, velocity: float, activation_fraction: float) -> bool:
-    """Return whether a coordinate's velocity limit takes its row pair (target ``-limit`` on each side).
-
-    A non-positive limit means unlimited. A positive ``activation_fraction`` admits
-    only coordinates whose speed reaches that fraction of the limit, PhysX's
-    proximity gate.
-    """
-    if limit <= 0.0:
-        return False
-    if activation_fraction > 0.0:
-        if wp.abs(velocity) < activation_fraction * limit:
-            return False
-    return True
+def velocity_limit_active(limit: float, unauthored: float) -> bool:
+    """Return whether a coordinate's velocity limit takes its row (both sides as one, target ``-limit``): every
+    authored limit does, whatever the speed, since the solve can bring any coordinate to its limit. A limit that is
+    not positive, or at or past ``unauthored`` (the builder's default joint velocity limit, which the importers write
+    where none is authored), is no limit."""
+    return limit > 0.0 and limit < unauthored
 
 
 @ROW_LAW.law

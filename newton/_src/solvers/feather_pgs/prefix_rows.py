@@ -46,9 +46,9 @@ PrefixLaw = field_group.struct("PrefixLaw", LAW, __name__)
 
 VELOCITY_LAW = (
     Field("velocity_limit", wp.float32, ("dof",), owner="model", attr="joint_velocity_limit"),
-    Field("activation", wp.float32, owner="options", attr="velocity_limit_activation_fraction"),
+    Field("unauthored", wp.float32, owner="laws", attr="unauthored_velocity_limit"),
 )
-"""The joint velocity-limit family's inputs."""
+"""The joint velocity-limit family's inputs: the limits, and the value of a limit nobody authored (no limit)."""
 
 PrefixVelocityLaw = field_group.struct("PrefixVelocityLaw", (*LAW, *VELOCITY_LAW), __name__)
 """The prefix law with the velocity-limit family's inputs (the joint velocity limits' warp producer)."""
@@ -73,22 +73,24 @@ PrefixMimicLaw = field_group.struct("PrefixMimicLaw", (*LAW, *MIMIC_LAW), __name
 """The prefix law with the mimic family's inputs (the mimic rows' warp producer)."""
 
 
-def _family(coordinates, name: str, evaluation: str) -> tuple:
-    """A coordinate family: both sides of each coordinate, ``coordinates`` a tuple or a native count from 0.
+def _family(coordinates, name: str, evaluation: str, sides: int = 2) -> tuple:
+    """A coordinate family: ``sides`` candidates a coordinate (both sides of a position limit; a velocity limit's one
+    row), ``coordinates`` a tuple or a native count from 0.
 
     A dynamically indexed local array survives CUDA compilation even when its values form an interval, so an
     interval becomes arithmetic.
     """
-    declaration, coordinate = "", "index / 2"
+    per = f"index / {sides}" if sides > 1 else "index"
+    declaration, coordinate = "", per
     if isinstance(coordinates, str):
-        count = f"2 * {coordinates}"
+        count = f"{sides} * {coordinates}" if sides > 1 else coordinates
     elif coordinates and coordinates == tuple(range(coordinates[0], coordinates[-1] + 1)):
-        count = 2 * len(coordinates)
+        count = sides * len(coordinates)
         coordinate += f" + {coordinates[0]}" if coordinates[0] else ""
     else:
-        count = 2 * len(coordinates)
+        count = sides * len(coordinates)
         declaration = f"    const int {name}[] = {{{', '.join(map(str, coordinates)) or '0'}}};\n"
-        coordinate = f"{name}[index / 2]"
+        coordinate = f"{name}[{per}]"
     return count, declaration, f"const int d = {coordinate};\n{evaluation}"
 
 
@@ -123,20 +125,23 @@ def limits(coordinates, dof: str, law: str) -> tuple:
 
 
 def velocity_limits(coordinates, dof: str, law: str) -> tuple:
-    """The joint velocity-limit family: a row pair with target ``-limit`` and no bias (:data:`VELOCITY_LAW`), on a
-    limit joint's coordinate (a prismatic, revolute or D6 axis: ``limit_q_index >= 0``) that is not prescribed."""
+    """The joint velocity-limit family: one row a coordinate for both sides of ``|v| <= limit`` (``J = +e``, target
+    ``-limit``, the limit itself in the row's ``mu``; no bias; :func:`.projection_laws.velocity_limit`), on every
+    authored limit (:func:`.row_laws.velocity_limit_active`) of a limit joint's coordinate (a prismatic, revolute or D6
+    axis: ``limit_q_index >= 0``) that is not prescribed."""
     return _family(
         coordinates,
         "velocity_coordinates",
         f"""            dof = {dof};
-            side = index & 1;
             const float limit = {law}velocity_limit.data[dof];
             active = {law}limit_q_index.data[dof] >= 0 && {law}prescribed.data[dof] == 0 &&
-                     RowLaw::velocity_limit_active(limit, {law}vhat.data[dof], {law}activation);
+                     RowLaw::velocity_limit_active(limit, {law}unauthored);
             type = 4;
             target = -limit;
+            mu = limit;
             d0 = d;
-            w0 = side == 0 ? 1.0f : -1.0f;""",
+            w0 = 1.0f;""",
+        sides=1,
     )
 
 
@@ -168,13 +173,13 @@ def mimics(count: int, law: str) -> tuple:
 _PHASE = """    for (int chunk = 0; chunk < $CANDIDATES; chunk += STRIDE) {
         const int candidate = chunk + LANE;
         int active = 0, type = 3, dof = 0, side = 0, d0 = -1, d1 = -1;
-        float phi = 0.0f, target = 0.0f, beta = 0.0f, w0 = 0.0f, w1 = 0.0f;
+        float phi = 0.0f, target = 0.0f, beta = 0.0f, mu = 0.0f, w0 = 0.0f, w1 = 0.0f;
 $LOCALS$EVALUATE        $SLOT
         if (active && slot < LAW::capacity) {
             const int at = prefix_line * LAW::row_type.shape[1] + slot;
             LAW::row_type.data[at] = type;
             LAW::row_parent.data[at] = -1;
-            LAW::row_mu.data[at] = 0.0f;
+            LAW::row_mu.data[at] = mu;
             LAW::row_beta.data[at] = beta;
             LAW::phi.data[at] = phi;
             LAW::target.data[at] = target;

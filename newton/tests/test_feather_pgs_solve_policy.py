@@ -105,8 +105,8 @@ def _factory_calls():
     )
 
 
-# A velocity-limit visit: its law call (projection_laws.velocity_limit_update or speed_row).
-_LAW_SITE = re.compile(r"ProjectionLaw::(?:velocity_limit_update|speed_row)\([^;]*\);")
+# A velocity-limit visit: its law call (projection_laws.velocity_limit, or a speed row's speed_row).
+_LAW_SITE = re.compile(r"ProjectionLaw::(?:velocity_limit|speed_row)\([^;]*\);")
 
 
 def _axis(name, values=(False, True)):

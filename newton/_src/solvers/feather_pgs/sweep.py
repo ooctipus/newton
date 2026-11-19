@@ -2602,8 +2602,8 @@ def impulse_seed(
 def velocity_limit_pass(rows: WorldRows, op, laws: RowLaws, *, end: str = "m_dense", pad: str = "            ") -> str:
     """Dense joint velocity-limit rows after every other row of the sweep, under the velocity-limit law.
 
-    Each row keeps a unilateral total (:func:`.projection_laws.velocity_limit_update`), owned by the row's first
-    lane. ``rows`` stages the rows' impulses, kinds, diagonals and right-hand sides (:class:`WorldRows`, or a route's
+    Each row is a coordinate's two-sided limit and keeps a signed total (:func:`.projection_laws.velocity_limit`),
+    owned by the row's first lane. ``rows`` stages the rows' impulses, kinds, diagonals and right-hand sides (:class:`WorldRows`, or a route's
     store of the same accessors); the operator reduces each row's velocity term outside the row loop
     (``dot``).
     """
@@ -2622,13 +2622,13 @@ def velocity_limit_pass(rows: WorldRows, op, laws: RowLaws, *, end: str = "m_den
         f"    float residual_vlim = jv_vlim + {rows.rhs_of('i')};",
         f"    const float old_vlim = {rows.load('i')};",
         f"    const float bound_vlim = {bound(rows.rhs_of('i'), op.terms('my_sum_vlim', '', whole=False), 'old_vlim', diagonal='denom')};",
-        "    const auto vlim = ProjectionLaw::velocity_limit_update(old_vlim, residual_vlim / denom);",
-        "    const float delta_impulse_vlim = vlim.v1;",
+        f"    const float new_vlim = ProjectionLaw::velocity_limit(old_vlim - residual_vlim / denom, {rows.mu('i')} / denom);",
+        "    const float delta_impulse_vlim = new_vlim - old_vlim;",
         f"    {lanes.sync()}",
     ]
     change = Change("delta_impulse_vlim", "bound_vlim", str(ROW_JOINT_VELOCITY_LIMIT), "denom", scaled=True)
     lines += [
-        f"    {rows.store('i', 'vlim.v0')}",
+        f"    {rows.store('i', 'new_vlim')}",
         "",
         "    if (delta_impulse_vlim != 0.0f) {",
         change_vote(laws, (change,), "        "),
@@ -2810,12 +2810,22 @@ def dense_tier_world(
 # The Jacobi law: every row of a world at once, from the extrapolated impulses, with momentum
 # ---------------------------------------------------------------------------------------------------------------------
 
-JACOBI_UNILATERAL, JACOBI_FRICTION, JACOBI_BILATERAL, JACOBI_IDLE, JACOBI_FROZEN = 0, 1, 2, 3, -1
+JACOBI_UNILATERAL, JACOBI_FRICTION, JACOBI_BILATERAL, JACOBI_IDLE, JACOBI_LIMIT, JACOBI_IDLE_LIMIT, JACOBI_FROZEN = (
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    -1,
+)
 """The kinds of a Jacobi row (``s_kind``): its projection, decoded from its type once at staging. A unilateral row
-(contact normals, position limits, velocity limits) clamps at zero, a friction row's pair projects on its
-disk and a bilateral row takes its step; a frozen row keeps its warm start. An idle row is a unilateral row at zero
-impulse whose residual keeps it there: it cannot move, so it is out of the steps' bound until its residual turns
-negative and it becomes unilateral again (:meth:`JacobiRows.idle`, :func:`jacobi_sweeps`)."""
+(contact normals, position limits) clamps at zero, a velocity limit takes its two-sided law
+(:func:`.projection_laws.velocity_limit`, its limit in ``s_mu``), a friction row's pair projects on its disk and a
+bilateral row takes its step; a frozen row keeps its warm start. An idle row is a unilateral row at zero impulse whose
+residual keeps it there, or a velocity limit at zero impulse within its limit: it cannot move, so it is out of the
+steps' bound until its residual leaves that set and it takes its law again (:meth:`JacobiRows.idle`,
+:func:`jacobi_sweeps`)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2943,6 +2953,7 @@ class JacobiRows:
         decode = [
             f"if ({' || '.join(f'row_type == {kind}' for kind in unilateral)}) kind = {JACOBI_UNILATERAL};",
             f"else if ({friction}) kind = {JACOBI_FRICTION};",
+            f"else if (row_type == {ROW_JOINT_VELOCITY_LIMIT}) kind = {JACOBI_LIMIT};",
         ]
         lines = [
             f"for (int i = lane; i < {self.rows}; i += {self.threads}) {{",
@@ -2974,12 +2985,18 @@ class JacobiRows:
         return self.group.phase(f"{pad}if (frozen) s_kind[lane] = {JACOBI_FROZEN};") + "\n" + self.group.barrier(pad)
 
     def idle(self, pad: str = "") -> str:
-        """Mark each unilateral row at zero impulse with a non-negative residual at zero impulse idle, once the staging
-        has formed ``s_rhs`` (each lane its own rows: no barrier). Its update clamps it at zero, so it moves nothing
-        until its residual turns negative (:func:`jacobi_sweeps`)."""
-        test = f"s_kind[i] == {JACOBI_UNILATERAL} && {self.load('i')} == 0.0f && {self.rhs_of('i')} >= 0.0f"
+        """Mark each unilateral row at zero impulse with a non-negative residual at zero impulse idle, and each velocity
+        limit at zero impulse whose coordinate is within its limit there (``0 <= r <= 2 L``), once the staging has
+        formed ``s_rhs`` (each lane its own rows: no barrier). Its update keeps it at zero, so it moves nothing until
+        its residual leaves that set (:func:`jacobi_sweeps`)."""
+        unloaded = f"{self.load('i')} == 0.0f && {self.rhs_of('i')} >= 0.0f"
+        test = f"s_kind[i] == {JACOBI_UNILATERAL} && {unloaded}"
+        limit = f"s_kind[i] == {JACOBI_LIMIT} && {unloaded} && {self.rhs_of('i')} <= 2.0f * {self.mu('i')}"
         return indent(
-            f"for (int i = lane; i < {self.rows}; i += {self.threads})\n    if ({test}) s_kind[i] = {JACOBI_IDLE};\n"
+            f"for (int i = lane; i < {self.rows}; i += {self.threads}) {{\n"
+            f"    if ({test}) s_kind[i] = {JACOBI_IDLE};\n"
+            f"    else if ({limit}) s_kind[i] = {JACOBI_IDLE_LIMIT};\n"
+            "}\n"
             "if (lane == 0) s_joined[0] = 0;",
             pad,
         )
@@ -2987,7 +3004,7 @@ class JacobiRows:
     @staticmethod
     def counted(row: str) -> str:
         """Whether row ``row`` counts in the steps' bound: admitted and not idle."""
-        return f"(s_kind[{row}] >= 0 && s_kind[{row}] != {JACOBI_IDLE})"
+        return f"(s_kind[{row}] >= 0 && s_kind[{row}] != {JACOBI_IDLE} && s_kind[{row}] != {JACOBI_IDLE_LIMIT})"
 
     @staticmethod
     def clamps(row: str) -> str:
@@ -3140,10 +3157,16 @@ def _jacobi_step(rows: JacobiRows, op, laws: RowLaws, pad: str) -> str:
     update = [
         step,
         f"if {rows.clamps('i')} value = ProjectionLaw::unilateral(value);",
+        # A velocity limit's two sides as one row: its step's measure of the limit L (s_mu) is s_i L.
+        f"if (s_kind[i] == {JACOBI_LIMIT} || s_kind[i] == {JACOBI_IDLE_LIMIT})",
+        f"    value = ProjectionLaw::velocity_limit(value, s_step[i] * {rows.mu('i')});",
         # An idle row whose residual turned negative joins the bound after the sweep (_jacobi_join) and moves from the
         # next: it keeps its zero impulse now, its lane loud so that the world cannot stop before it has moved.
         f"if (s_kind[i] == {JACOBI_IDLE} && r < 0.0f) {{",
         f"    value = xi; row_joins = 1; s_kind[i] = {JACOBI_UNILATERAL}; s_joined[0] = 1;",
+        "}",
+        f"if (s_kind[i] == {JACOBI_IDLE_LIMIT} && (r < 0.0f || r > 2.0f * {rows.mu('i')})) {{",
+        f"    value = xi; row_joins = 1; s_kind[i] = {JACOBI_LIMIT}; s_joined[0] = 1;",
         "}",
     ]
     group = rows.group
@@ -3403,11 +3426,11 @@ def jacobi_sweeps(rows: JacobiRows, op, laws: RowLaws, *, sweeps: int, pooled: b
 def jacobi_limit_pass(rows: JacobiRows, op, *, pad: str = "    ") -> str:
     """The last word of the joint velocity-limit rows after the final Jacobi sweep, on the first warp, in row order.
 
-    With ``r_i = b'_i + (A x)_i``, the residual the sweeps use, a violated admitted row (``r_i < 0``) is pushed onto
-    its limit, ``x_i += -r_i / A_ii`` (the row law's update from a zero impulse,
-    :func:`.projection_laws.velocity_limit_update`, added to the row's total). The pass only pushes: it changes
-    nothing at the sweeps' fixed point, where no row is violated, and gives the limits the last word of a world
-    stopped early, as the Gauss-Seidel sweeps' end pass does. The staged rows' walked support class forms
+    With ``r_i = b'_i + (A x)_i``, the residual the sweeps use, each admitted row takes the two-sided limit's
+    Gauss-Seidel update from its total (:func:`.projection_laws.velocity_limit`), pass after pass over the limits
+    alone until a pass is quiet under the exit law (at most one pass a row): a limit's push moves the coupled
+    coordinates of its tree, so one pass leaves its neighbours past theirs. It changes nothing at the sweeps' fixed
+    point, where no limit is violated, and gives the limits the last word of a world stopped early. The staged rows' walked support class forms
     ``(A x)_i = Z_i . w`` on ``w = Y^T x`` (:meth:`~.TransposedResponse.push_prologue`) with ``A_ii = |Z_i|^2 + cfm``
     in one ladder, and each push adds its change to ``w`` (the staged entries' actions on ``w``).
     """
@@ -3423,19 +3446,28 @@ def jacobi_limit_pass(rows: JacobiRows, op, *, pad: str = "    ") -> str:
         group.barrier("    "),
         op.push_prologue("    "),
         f"    if (lane < {warp}) {{",
+        # Gauss-Seidel passes over the limits alone until one is quiet under the exit law (a coupled limit's push
+        # moves its neighbours'), at most one a row.
+        f"      for (int pass = 0; pass < {rows.rows}; ++pass) {{",
+        "        int loud_vlim = 0;",
         f"        for (int i = 0; i < {rows.rows}; ++i) {{",
-        f"            if (!{rows.clamps('i')} || s_vlim[i] == 0) continue;",
+        f"            if ((s_kind[i] != {JACOBI_LIMIT} && s_kind[i] != {JACOBI_IDLE_LIMIT}) || s_vlim[i] == 0) continue;",
         pushed.dot((("part", "row", None), ("zz", "row", "row")), {"row": "i"}, body),
         f"            const float r_vlim = {rows.rhs_of('i')} + part;",
         "            const float diag_vlim = zz + cfm;",
+        f"            const float old_vlim = {rows.load('i')};",
         "            const float delta_vlim = diag_vlim > 0.0f",
-        "                ? ProjectionLaw::velocity_limit_update(0.0f, r_vlim / diag_vlim).v1 : 0.0f;",
+        f"                ? ProjectionLaw::velocity_limit(old_vlim - r_vlim / diag_vlim, {rows.mu('i')} / diag_vlim) - old_vlim",
+        "                : 0.0f;",
         "            if (delta_vlim != 0.0f) {",
+        f"                if (fabsf(delta_vlim) * diag_vlim > {bound(rows.rhs_of('i'), 'fabsf(part)', 'old_vlim', diagonal='diag_vlim')}) loud_vlim = 1;",
         f"                if (lane == 0) {rows.load('i')} += delta_vlim;",
         pushed.axpy((("row", "delta_vlim"),), body + "    ", row="i"),
         "            }",
         "            WARP_SYNC();",
         "        }",
+        "        if (loud_vlim == 0) break;",
+        "      }",
         "    }",
         group.barrier("    "),
         "}",

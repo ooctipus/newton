@@ -374,22 +374,22 @@ class SolverFeatherPGS(SolverBase):
                 bilateral box ``[-qdot_max_i, +qdot_max_i]`` through the articulated-body
                 response ``J M^-1 J^T + cfm``, so momentum redistributes correctly across
                 the articulation (rather than a naive joint-space clip which breaks
-                multi-body Newton's third law). No Baumgarte bias. Each row keeps a
+                multi-body Newton's third law). Every authored limit takes its rows each step,
+                whatever the speed (the solve can bring any coordinate to its limit); a limit at the
+                builder's default (``ModelBuilder.JointDofConfig.velocity_limit``, what the importers
+                write where none is authored) is no limit. No Baumgarte bias. Each row keeps a
                 non-negative impulse total, like a contact normal, so the sweeps converge
                 to the complementarity solution, independent of the row order.
 
                 Only supported on CUDA; CPU construction with
                 ``enable_joint_velocity_limits=True`` raises :class:`NotImplementedError`.
                 Defaults to False.
-            velocity_limit_activation_fraction (float, optional): Proximity gate for velocity-limit
-                row allocation. ``0.0`` allocates the lower/upper row pair of every finitely
-                limited joint DOF, and the speed row of every finitely limited free-rigid-body
-                linear or angular speed, each step. A positive fraction allocates them only when
-                the current speed satisfies ``|qd| >= fraction * limit`` (the magnitude of the
-                linear or angular velocity for a free body's speed row), skipping rows that would
-                be exact no-op clamps. Because the gate samples the pre-solve velocity, a DOF
-                crossing the threshold between steps is clamped one step late. Must be non-negative
-                and not NaN. Defaults to ``0.0``.
+            velocity_limit_activation_fraction (float, optional): Proximity gate of a free rigid
+                body's speed rows (``rigid_body_max_linear_velocity`` and
+                ``rigid_body_max_angular_velocity``). ``0.0`` allocates the speed row of every finitely
+                limited linear or angular speed each step. A positive fraction allocates one only when
+                the magnitude of the predicted linear or angular velocity reaches ``fraction * limit``.
+                Must be in ``[0, 1]`` or ``inf`` (never). Defaults to ``0.0``.
             pgs_iterations (int, optional): Number of Gauss-Seidel iterations to apply per frame. Defaults to 12.
             pgs_beta (float, optional): ERP style position correction factor for contact, joint-limit,
                 mimic and loop-closing rows. Defaults to 0.2.

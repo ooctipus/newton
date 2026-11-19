@@ -32,7 +32,7 @@ import warp as wp
 from ...core import memory
 from ...core.execution import Shape, Work, launch, shape
 from ...geometry.flags import ShapeFlags
-from ...sim import Contacts, Model, State
+from ...sim import Contacts, Model, ModelBuilder, State
 from ...sim.enums import JointType
 from . import field_group, host_index, prefix_rows, walk_rows
 from .contact_input import ContactInput
@@ -338,6 +338,8 @@ class RowLaws:
         laws.has_rigid_body_velocity_limits = (
             laws.rigid_body_max_linear_velocity is not None and laws.rigid_body_max_angular_velocity is not None
         )
+        # A joint velocity limit nobody authored holds the builder's default (the importers' too): no limit.
+        laws.unauthored_velocity_limit = float(ModelBuilder.JointDofConfig().velocity_limit)
 
         laws._joint_limit_tables(model)
         # Mimic and link plans must exist before capacity selection so the row census
@@ -1233,6 +1235,7 @@ class RowLaws:
                 "reason": reason,
                 # Lanes per articulation of the pre-solve PhysX velocity prescale; 0 when it launches no kernel.
                 "prescale_lanes": int(self.velocity_prescale_lanes) if prescale else 0,
+                "unauthored_limit": json_value(self.unauthored_velocity_limit),
                 "activation_fraction": json_value(self.options.velocity_limit_activation_fraction),
                 "rigid_body_limits": limits,
                 # Mirrors Placement.allocate_free_body_rows and the row allocation of write_contacts (both modes). At an

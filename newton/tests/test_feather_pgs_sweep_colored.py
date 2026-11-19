@@ -402,7 +402,7 @@ class TestColoredSweep(unittest.TestCase):
             return model
 
         physics = conf._physics(dataclasses.replace(tray(), build=limited), "patch", 32)
-        options = {**physics.options(32), "velocity_limit_activation_fraction": 0.0}
+        options = physics.options(32)
         runs, solvers = [], []
         for stage in (original, streamed):
             with mock.patch.object(sweep_plan.Sweep, "_staged", stage), colored(1, solvers):

@@ -540,8 +540,9 @@ class TestPrescribedCoordinateRows(unittest.TestCase):
 
         A chain of three hinges whose root link is kinematic starts every joint past its upper limit: the default
         activation gap makes both sides of each finite limit a row, so the two dynamic coordinates take four
-        position-limit rows (and, with velocity limits, four velocity-limit rows) and the prescribed one none. Writing
-        an unlimited position and velocity limit to the last coordinate leaves two of each.
+        position-limit rows (and, with velocity limits, one velocity-limit row each: a two-sided limit is one row) and the
+        prescribed one none. Writing an unlimited position and velocity limit to the last coordinate leaves two position-limit
+        rows and one velocity-limit row.
         """
         for device in ("cpu", *(("cuda:0",) if wp.is_cuda_available() else ())):
             with self.subTest(device=device):
@@ -567,13 +568,13 @@ class TestPrescribedCoordinateRows(unittest.TestCase):
                 model.joint_velocity_limit.assign(np.full(3, 2.0, np.float32))
                 self.assertEqual(_rows_of_kind(solver, model, states, ROW_JOINT_LIMIT), 4)
                 if velocity_limits:
-                    self.assertEqual(_rows_of_kind(solver, model, states, ROW_JOINT_VELOCITY_LIMIT), 4)
+                    self.assertEqual(_rows_of_kind(solver, model, states, ROW_JOINT_VELOCITY_LIMIT), 2)
                 model.joint_limit_lower.assign(np.asarray([-0.5, -0.5, -np.inf], np.float32))
                 model.joint_limit_upper.assign(np.asarray([0.5, 0.5, np.inf], np.float32))
                 model.joint_velocity_limit.assign(np.asarray([1.0, 1.0, 0.0], np.float32))
                 self.assertEqual(_rows_of_kind(solver, model, states, ROW_JOINT_LIMIT), 2)
                 if velocity_limits:
-                    self.assertEqual(_rows_of_kind(solver, model, states, ROW_JOINT_VELOCITY_LIMIT), 2)
+                    self.assertEqual(_rows_of_kind(solver, model, states, ROW_JOINT_VELOCITY_LIMIT), 1)
 
 
 class TestTreePlanKinematicBodies(unittest.TestCase):

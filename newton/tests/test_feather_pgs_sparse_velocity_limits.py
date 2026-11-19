@@ -3,6 +3,7 @@
 
 """Preserve articulated velocity clamps in factor-coordinate response."""
 
+import math
 import os
 import unittest
 from unittest import mock
@@ -76,7 +77,8 @@ class TestSparseVelocityLimitAdmission(unittest.TestCase):
 
 
 def _physical_sweep(jacobian, response, initial, bias, diagonal, kinds, parents, mu, impulses, *, iterations, omega):
-    """Apply ordinary physical rows, then unrelaxed velocity-limit rows, which keep a non-negative total."""
+    """Apply ordinary physical rows, then unrelaxed velocity-limit rows: each a coordinate's two-sided limit as one row
+    (lower side's residual ``J v + bias``, the limit in ``mu``), its total soft-thresholded."""
     velocity, impulses = initial.copy(), impulses.copy()
     ordinary = np.flatnonzero(kinds != VELOCITY_LIMIT)
     mapping = {int(row): i for i, row in enumerate(ordinary)}
@@ -98,7 +100,10 @@ def _physical_sweep(jacobian, response, initial, bias, diagonal, kinds, parents,
         impulses[ordinary] = ordinary_impulses
         for row in np.flatnonzero(kinds == VELOCITY_LIMIT):
             residual = jacobian[row] @ velocity + bias[row]
-            total = max(impulses[row] - residual / diagonal[row], 0.0) if diagonal[row] > 0.0 else impulses[row]
+            total = impulses[row]
+            if diagonal[row] > 0.0:
+                centre = impulses[row] - residual / diagonal[row] + mu[row] / diagonal[row]
+                total = math.copysign(max(abs(centre) - mu[row] / diagonal[row], 0.0), centre)
             correction = total - impulses[row]
             impulses[row] = total
             velocity += response[row] * correction
@@ -109,21 +114,22 @@ def _solve_data(sign, *, contact, iterations, omega):
     """Put velocity slots before a coupled contact that must be visited first."""
     mass = np.array([[2.0, 0.3, 0.1], [0.3, 1.5, 0.2], [0.1, 0.2, 0.8]])
     factor = np.linalg.cholesky(mass)
-    jacobian = np.array([[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]])
-    kinds = np.array([VELOCITY_LIMIT, VELOCITY_LIMIT], np.int32)
-    parents = np.array([-1, -1], np.int32)
-    bias = np.array([0.25, 0.25])
-    mu = np.zeros(2)
+    # |qd_0| <= 0.25 as one row (J = +e_0, the lower side's rhs 0.25, the limit in mu).
+    jacobian = np.array([[1.0, 0.0, 0.0]])
+    kinds = np.array([VELOCITY_LIMIT], np.int32)
+    parents = np.array([-1], np.int32)
+    bias = np.array([0.25])
+    mu = np.array([0.25])
     initial = np.array([sign * 2.0, 0.4, -0.2])
-    seeds = np.array([3.0, 3.0])
+    seeds = np.array([3.0])
     if contact:
         jacobian = np.vstack((jacobian, [[sign, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]))
         kinds = np.concatenate((kinds, [CONTACT, FRICTION, FRICTION])).astype(np.int32)
-        parents = np.array([-1, -1, -1, 2, 2], np.int32)
+        parents = np.array([-1, -1, 1, 1], np.int32)
         bias = np.concatenate((bias, [-1.0, 0.0, 0.0]))
-        mu = np.array([0.0, 0.0, 0.0, 0.3, 0.3])
+        mu = np.array([0.25, 0.0, 0.3, 0.3])
         initial[0] = sign * 0.1
-        seeds = np.zeros(5)
+        seeds = np.zeros(4)
     response = np.linalg.solve(mass, jacobian.T).T
     z = np.linalg.solve(factor, jacobian.T).T
     diagonal = np.einsum("ij,ij->i", jacobian, response)
@@ -167,7 +173,6 @@ def _case(
     floating=True,
     branches=3,
     depth=1,
-    activation_fraction=0.0,
 ):
     model = sparse_scene.branched_model(floating=floating, branches=branches, depth=depth)
     limits = np.full(model.joint_dof_count, 0.25, np.float32)
@@ -179,7 +184,6 @@ def _case(
         pins=SolverFeatherPGS.Pins(**pins),
         enable_joint_limits=True,
         enable_joint_velocity_limits=True,
-        velocity_limit_activation_fraction=activation_fraction,
         pgs_iterations=8,
         pgs_warmstart=False,
         dense_max_constraints=32,
@@ -297,7 +301,7 @@ class TestSparseVelocityLimitPhysics(unittest.TestCase):
                         self.assertLessEqual(abs(velocity[0]), 0.25 + 3e-5)
                         if not contact:
                             # The violated side keeps its total: 1.75 speed units over the response.
-                            self.assertGreater(max(impulses[world, :2]), 0.1)
+                            self.assertGreater(abs(impulses[world, 0]), 0.1)
                     np.testing.assert_array_equal(delta[1], 0.0)
 
     def test_serial_and_branched_dense_reference(self):
@@ -355,29 +359,11 @@ class TestSparseVelocityLimitPhysics(unittest.TestCase):
             for case in (reference, candidate):
                 for world, count in enumerate(case[1].placement.constraint_count.numpy()):
                     kinds = case[1].placement.row_type.numpy()[world, :count]
-                    if limit <= 0:
+                    # An infinite limit is no limit (row_laws.velocity_limit_active): no row, as a disabled one.
+                    if not 0.0 < limit < np.inf:
                         self.assertFalse(np.any(kinds == VELOCITY_LIMIT))
                     else:
                         self.assertTrue(np.any(kinds == VELOCITY_LIMIT))
-
-    def test_activation_fraction_preserves_existing_allocation(self):
-        """Keep threshold gating and the infinite-fraction disable behavior unchanged."""
-        for fraction in (0.9, np.inf):
-            with self.subTest(fraction=fraction):
-                reference, candidate = (
-                    _case(False, activation_fraction=fraction),
-                    _case(True, activation_fraction=fraction),
-                )
-                self.assertTrue(candidate[1].sweep.sparse_velocity_limits)
-                for _ in range(2):
-                    sparse_scene.step(reference)
-                    sparse_scene.step(candidate)
-                    self._assert_state(reference, candidate)
-                    np.testing.assert_array_equal(
-                        candidate[1].laws.velocity_limit_slot.numpy(), reference[1].laws.velocity_limit_slot.numpy()
-                    )
-                if np.isinf(fraction):
-                    np.testing.assert_array_equal(candidate[1].laws.velocity_limit_slot.numpy(), -1)
 
 
 if __name__ == "__main__":

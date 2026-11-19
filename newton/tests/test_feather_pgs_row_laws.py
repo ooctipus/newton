@@ -666,23 +666,24 @@ def test_joint_limit_side_matches_limit_rows(test, device):
 
 
 @wp.kernel
-def _law_velocity_limit_active(
-    joint_velocity_limit: wp.array[float], joint_qd: wp.array[float], fraction: float, active: wp.array[int]
-):
+def _law_velocity_limit_active(joint_velocity_limit: wp.array[float], unauthored: float, active: wp.array[int]):
     dof = wp.tid()
-    active[dof] = wp.where(row_laws.velocity_limit_active(joint_velocity_limit[dof], joint_qd[dof], fraction), 1, 0)
+    active[dof] = wp.where(row_laws.velocity_limit_active(joint_velocity_limit[dof], unauthored), 1, 0)
 
 
 def test_velocity_limit_active_matches_velocity_limit_rows(test, device):
     """Give rows to the coordinates the joint velocity-limit warp (``rows.velocity_limit_warp_kernel``) gives rows
-    to: a pair each, lower (``J = +1``) then upper, in coordinate order."""
+    to: one row each for both sides (``J = +1``), in coordinate order; every authored limit, none at the unauthored
+    value or past it."""
     rng = np.random.default_rng(21)
     arts, dofs = 8, 6
     count = arts * dofs
     limit = scalars(rng, count, 2.0)
+    limit[4::9] = 1.0e6
+    limit[7::11] = np.inf
     qd = scalars(rng, count, 2.0)
-    for fraction in (0.0, 0.8):
-        with test.subTest(fraction=fraction):
+    for unauthored in (1.0e6, np.inf):
+        with test.subTest(unauthored=unauthored):
             out = prefix_warp_rows(
                 device,
                 arts,
@@ -691,7 +692,7 @@ def test_velocity_limit_active_matches_velocity_limit_rows(test, device):
                 family="velocity",
                 velocity_limit=limit,
                 vhat=qd,
-                activation=fraction,
+                unauthored=unauthored,
                 cfm=0.0,
             )
             law = (
@@ -700,21 +701,19 @@ def test_velocity_limit_active_matches_velocity_limit_rows(test, device):
                     count,
                     device,
                     joint_velocity_limit=limit,
-                    joint_qd=qd,
-                    fraction=fraction,
+                    unauthored=unauthored,
                     active=np.zeros(count, dtype=np.int32),
                 )
                 .get("active")
                 .numpy()
                 .reshape(arts, dofs)
             )
-            np.testing.assert_array_equal(out["count"], 2 * law.sum(axis=1))
+            np.testing.assert_array_equal(out["count"], law.sum(axis=1))
             for art in range(arts):
                 coordinates = np.flatnonzero(law[art])
                 J = out["J"][art, : out["count"][art]]
                 expected = np.zeros_like(J)
-                expected[0::2][np.arange(coordinates.size), coordinates] = 1.0
-                expected[1::2][np.arange(coordinates.size), coordinates] = -1.0
+                expected[np.arange(coordinates.size), coordinates] = 1.0
                 np.testing.assert_array_equal(J, expected)
 
 

@@ -413,11 +413,7 @@ class Placement:
             return 0
 
         has_position_limit_rows = self.options.enable_joint_limits and model.joint_dof_count > 0
-        has_velocity_limit_rows = (
-            self.options.enable_joint_velocity_limits
-            and model.joint_dof_count > 0
-            and not np.isinf(self.options.velocity_limit_activation_fraction)
-        )
+        has_velocity_limit_rows = self.options.enable_joint_velocity_limits and model.joint_dof_count > 0
         has_mimic_rows = self.laws.mimic_count > 0
         if not (has_position_limit_rows or has_velocity_limit_rows or has_mimic_rows or self.laws.link_count):
             return 0
@@ -479,7 +475,9 @@ class Placement:
                 gap = 2.0 * self.options.joint_limit_activation_gap
                 rows -= both & (np.where(both, upper - lower, 0.0) > gap)
         if has_velocity_limit_rows:
-            rows += 2 * (joint_velocity_limit[dof] > 0.0)
+            # One row a coordinate for both sides of an authored limit (row_laws.velocity_limit_active).
+            limit = joint_velocity_limit[dof]
+            rows += (limit > 0.0) & (limit < self.laws.unauthored_velocity_limit)
         world = art_to_world[art]
         in_range = (world >= 0) & (world < per_world.size)
         np.add.at(per_world, world[in_range], rows[in_range])

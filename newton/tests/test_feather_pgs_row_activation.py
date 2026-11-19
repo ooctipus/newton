@@ -4,7 +4,7 @@
 """The row-activation gates: which rows a step builds, read from the step's data.
 
 A joint-limit row exists where its coordinate is within joint_limit_activation_gap of a finite bound, a velocity-limit
-row where its speed is past velocity_limit_activation_fraction of its limit; a row that may act at the predictor marks
+row pair for every authored velocity limit (one at the builder's default is no limit); a row that may act at the predictor marks
 its world's acts word. The rows the general route's warp builds are checked against the row law on both devices.
 """
 
@@ -104,7 +104,6 @@ def _limit_scene(
         model,
         enable_joint_limits=True,
         enable_joint_velocity_limits=enable_joint_velocity_limits,
-        velocity_limit_activation_fraction=0.5,
         dense_max_constraints=64,
         mf_max_constraints=64,
         pgs_iterations=pgs_iterations,
@@ -225,15 +224,16 @@ class TestFeatherPGSJointLimitWarp(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# velocity_limit_activation_fraction
+# authored speed limits
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-def _joint_velocity_rows(qd: float, *, fraction: float, qdot_max: float = 1.0):
-    """One revolute coordinate's joint velocity-limit rows (the general route's warp, on the CPU): their J signs,
-    targets and count."""
+def _joint_velocity_rows(qd: float, *, qdot_max: float = 1.0):
+    """One revolute coordinate's joint velocity-limit rows (the general route's warp, on the CPU), the builder's
+    default the unauthored limit: their J signs, targets and count."""
+    unauthored = newton.ModelBuilder.JointDofConfig().velocity_limit
     rows = prefix_warp_rows(
-        "cpu", 1, 1, 8, family="velocity", velocity_limit=[qdot_max], vhat=[qd], activation=fraction, cfm=0.0
+        "cpu", 1, 1, 8, family="velocity", velocity_limit=[qdot_max], vhat=[qd], unauthored=unauthored, cfm=0.0
     )
     count = int(rows["count"][0])
     return rows["J"][0, :count, 0].tolist(), rows["target"][0, :count].tolist(), count
@@ -289,7 +289,25 @@ def _allocated_rigid_velocity_slots(qd6, *, fraction: float, lin_limit: float = 
     return rigid_velocity_limit_slot.numpy().tolist(), int(mf_slot_counter.numpy()[0])
 
 
-class TestFeatherPGSVelocityLimitActivationFraction(unittest.TestCase):
+class TestFeatherPGSAuthoredSpeedLimits(unittest.TestCase):
+    def test_every_authored_joint_limit_takes_its_rows_whatever_the_speed(self):
+        """An authored joint velocity limit takes its row (both sides as one, ``J = +1``) at rest and past the limit:
+        the solve can bring any coordinate to its limit, so no speed leaves one out."""
+        for qd in (0.0, 0.5, 0.95, -2.0):
+            with self.subTest(qd=qd):
+                signs, targets, count = _joint_velocity_rows(qd)
+                self.assertEqual(signs, [1.0])
+                self.assertEqual(targets, [-1.0])
+                self.assertEqual(count, 1)
+
+    def test_an_unauthored_joint_limit_takes_no_rows(self):
+        """A limit at the builder's default (what the importers write where none is authored), or past it, is no
+        limit."""
+        unauthored = newton.ModelBuilder.JointDofConfig().velocity_limit
+        for limit in (unauthored, float("inf"), 0.0):
+            with self.subTest(limit=limit):
+                self.assertEqual(_joint_velocity_rows(5.0, qdot_max=limit), ([], [], 0))
+
     def test_solver_rejects_invalid_velocity_limit_activation_fraction(self):
         model = newton.ModelBuilder().finalize()
 
@@ -306,30 +324,6 @@ class TestFeatherPGSVelocityLimitActivationFraction(unittest.TestCase):
             SolverFeatherPGS(model, velocity_limit_activation_fraction=0.7).options.velocity_limit_activation_fraction,
             0.7,
         )
-
-    def test_fraction_zero_preserves_always_allocate_joint_rows(self):
-        # fraction == 0.0 must match the historical behavior exactly: both
-        # sides of every finitely limited DOF allocate, in the same order,
-        # regardless of the current joint velocity.
-        for qd in (0.0, 0.5, -2.0):
-            with self.subTest(qd=qd):
-                signs, targets, count = _joint_velocity_rows(qd, fraction=0.0)
-                self.assertEqual(signs, [1.0, -1.0])
-                self.assertEqual(targets, [-1.0, -1.0])
-                self.assertEqual(count, 2)
-
-    def test_fraction_gates_static_joint_dof_to_zero_rows(self):
-        self.assertEqual(_joint_velocity_rows(0.0, fraction=0.9), ([], [], 0))
-        self.assertEqual(_joint_velocity_rows(0.85, fraction=0.9), ([], [], 0))
-
-    def test_joint_dof_past_threshold_allocates_rows_same_step(self):
-        # The gate reads the same-step joint_qd input, so a DOF driven past
-        # the threshold gets its row pair allocated in that very step.
-        for qd in (0.95, -0.95, 1.5):
-            with self.subTest(qd=qd):
-                signs, _targets, count = _joint_velocity_rows(qd, fraction=0.9)
-                self.assertEqual(signs, [1.0, -1.0])
-                self.assertEqual(count, 2)
 
     def test_fraction_zero_allocates_every_limited_speed_row(self):
         """Allocate the linear and the angular speed row of a limited free body whatever its velocity."""

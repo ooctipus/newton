@@ -49,6 +49,7 @@ from .response_operator import Lanes, SparseFactor, Velocity, WalkedRows
 from .row_laws import (
     ROW_CONTACT,
     ROW_FRICTION,
+    ROW_JOINT_VELOCITY_LIMIT,
     ROW_LAW,
     ROW_LINK,
     ROW_MIMIC,
@@ -496,6 +497,16 @@ def audit_store(
                 eps = rows.row_eps[line, r]
             term += contact_compliance(weight, eps, diagonal) * impulse
         residual = term + bias
+        if kind == ROW_JOINT_VELOCITY_LIMIT:
+            # Both sides of |v| <= L as one row (projection_laws.velocity_limit): the row is its lower side, its upper
+            # side's residual and bias are 2 L less the row's; a positive impulse acts on the lower side, a negative
+            # one on the upper.
+            limit = rows.row_mu[line, r]
+            upper = 2.0 * limit - residual
+            gap += wp.abs(impulse * wp.where(impulse < 0.0, upper, residual))
+            violation = wp.max(violation, wp.max(-residual, -upper))
+            work -= wp.abs(impulse) * wp.where(impulse < 0.0, 2.0 * limit - bias, bias)
+            continue
         work -= impulse * bias
         if kind == ROW_FRICTION or kind == ROW_TORSION:
             if kind == ROW_FRICTION and rows.row_parent[line, r] == r - 1:

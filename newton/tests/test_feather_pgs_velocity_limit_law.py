@@ -1,12 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Project velocity-limit rows with their law: a non-negative total.
+"""Project velocity-limit rows with their law: both sides of ``|v| <= L`` as one row.
 
-A velocity-limit row is unilateral, ``r = J v + b >= 0``. It keeps a
-non-negative total, ``max(old - r / d, 0)``, like a contact normal or a
-position limit, and converges to the complementarity solution, which is
-independent of the row order and is the fixed point of the parallel tiers.
+A velocity-limit row is a coordinate's two-sided limit, ``J = +e``, its lower
+side's residual ``r = J v + L >= 0`` and its upper side's ``2 L - r >= 0``. It
+keeps a signed total, the soft threshold of its update by ``L / d``
+(:func:`.projection_laws.velocity_limit`), and converges to the complementarity
+solution of both sides, which is independent of the row order and is the fixed
+point of the parallel tiers.
 
 The CPU tests check that the law reaches every visit of a velocity-limit row in
 every serial sweep generator. The CUDA tests run the kernels against a float64
@@ -38,9 +40,9 @@ from newton.tests.feather_pgs_law_harness import (
 )
 
 # Every serial sweep generator with velocity-limit rows: (factory, arguments, options, law sites).
-# Each site is the law call one visit of a velocity-limit row compiles (projection_laws.velocity_limit_update and
-# its free-body form speed_row), from the row's total.
-_DENSE_PASS = "ProjectionLaw::velocity_limit_update(old_vlim, residual_vlim / denom)"
+# Each site is the law call one visit of a velocity-limit row compiles (projection_laws.velocity_limit, and the
+# free-body speed row's speed_row), from the row's total.
+_DENSE_PASS = "ProjectionLaw::velocity_limit(old_vlim - residual_vlim / denom, "
 _SPEED_PASS = "ProjectionLaw::speed_row(speed_mf_vlim, __int_as_float(rec_a.z), mf_diag, old_mf_vlim)"
 _GENERATORS = {
     "mf_gs": (
@@ -123,14 +125,17 @@ class TestVelocityLimitLawSources(unittest.TestCase):
 
 
 def serial_velocity_limit_reference(mass, velocity, jacobian, bias, *, iterations):
-    """Sweep velocity-limit rows in row order with their law in float64; return the velocity and the impulses."""
+    """Sweep velocity-limit rows (``J = +e``, ``bias`` the limit ``L``) in row order with their two-sided law in
+    float64; return the velocity and the impulses."""
     response = np.linalg.solve(mass, jacobian.T).T
     diagonal = np.einsum("ij,ij->i", jacobian, response)
     velocity, impulses = np.array(velocity, np.float64), np.zeros(len(jacobian))
     for _ in range(iterations):
         for row in range(len(jacobian)):
             residual = jacobian[row] @ velocity + bias[row]
-            new = max(impulses[row] - residual / diagonal[row], 0.0)
+            reach = bias[row] / diagonal[row]
+            centre = impulses[row] - residual / diagonal[row] + reach
+            new = np.sign(centre) * max(abs(centre) - reach, 0.0)
             change = new - impulses[row]
             impulses[row] = new
             velocity += response[row] * change
@@ -142,7 +147,7 @@ def serial_velocity_limit_reference(mass, velocity, jacobian, bias, *, iteration
 # its first visit brakes the shoulder, and the row releases that impulse once the elbow row brakes.
 _CHAIN_MASS = np.array([[3.0, -1.4], [-1.4, 1.0]])
 _CHAIN_VELOCITY = np.array([1.2, 3.0])
-_CHAIN_JACOBIAN = np.array([[-1.0, 0.0], [0.0, -1.0]])  # upper limits: limit - qd >= 0
+_CHAIN_JACOBIAN = np.array([[1.0, 0.0], [0.0, 1.0]])  # one row a coordinate: |qd| <= limit
 _CHAIN_BIAS = np.array([1.0, 1.0])
 _CHAIN_SOLUTION = np.array([1.2 - 1.4 * 2.0 / 3.0, 1.0])  # elbow at its limit, shoulder 0.2667 inside its own
 
@@ -158,6 +163,13 @@ class TestVelocityLimitLawReference(unittest.TestCase):
                 )
                 np.testing.assert_allclose(velocity, _CHAIN_SOLUTION, atol=1.0e-12)
                 np.testing.assert_allclose(impulses[rows.index(0)], 0.0, atol=1.0e-12)
+
+
+def _row_limits(capacity, chain, rows):
+    """The chain's rows' limits at their rows (the rows' mu), zero elsewhere."""
+    limits = np.zeros((1, capacity), np.float32)
+    limits[0, chain] = _CHAIN_BIAS[rows]
+    return limits
 
 
 def _dense_row_values(device, *, order, iterations, first_row=0, mass=_CHAIN_MASS):
@@ -211,7 +223,8 @@ def _dense_row_values(device, *, order, iterations, first_row=0, mass=_CHAIN_MAS
         "row_sides": wp.array(np.tile(np.array([0, -1], np.int32), (1, capacity, 1)), dtype=wp.vec2i, device=device),
         "world_row_type": array(row_type, wp.int32),
         "world_row_parent": array(np.full((1, capacity), -1, np.int32), wp.int32),
-        "world_row_mu": array(np.zeros((1, capacity), np.float32)),
+        # A velocity limit's row holds its limit in its mu.
+        "world_row_mu": array(_row_limits(capacity, chain, rows)),
         "mf_constraint_count": zero_int,
         "mf_contact_rows_end": zero_int,
         "row_record": array([[0] * 8], wp.int32),

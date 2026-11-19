@@ -541,7 +541,9 @@ def twin_inputs(name: str, rng, n: int, device) -> dict:
         }
     if name == "velocity_limit_active":
         limit = scalars(rng, n)
-        return {"limit": limit, "velocity": scalars(rng, n), "activation_fraction": np.abs(scalars(rng, n, 0.5))}
+        limit[5::13] = 1.0e6
+        limit[6::17] = np.inf
+        return {"limit": limit, "unauthored": np.full(n, 1.0e6, dtype=np.float32)}
     # Generic: scalars by name, kinds and counts as small integers.
     sig = law_source.law_signature(LAWS[name])
     values = {}

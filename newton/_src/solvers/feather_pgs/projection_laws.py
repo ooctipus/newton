@@ -18,8 +18,9 @@ One law each, written once for Warp kernels and native CUDA (:mod:`.law_source`)
   iterations; and :func:`friction_ball`, the joint solve of the pair and the
   spin row on their elliptic cone (the pair law's scheme in three dimensions,
   :func:`friction_ball_metric` and :func:`friction_ball_from_metric`);
-* velocity limits: :func:`velocity_limit_update`, the unrelaxed unilateral law
-  of a velocity-limit row, and its free-body speed form :func:`speed_row`.
+* velocity limits: :func:`velocity_limit`, a coordinate's two-sided limit as one
+  row; :func:`velocity_limit_update`, the unrelaxed unilateral law of a free
+  body's speed row (:func:`speed_row`).
 """
 
 import warp as wp
@@ -135,7 +136,7 @@ def regularized_diagonal(diagonal: float, w: float) -> float:
 
 @PROJECTION_LAW.law
 def unilateral(impulse: float) -> float:
-    """Project an impulse onto ``impulse >= 0`` (contact normals, position and velocity limits).
+    """Project an impulse onto ``impulse >= 0`` (contact normals and position limits).
 
     Selected, not branched, as the sweeps' own clamps compiled.
     """
@@ -584,11 +585,26 @@ def friction_triple_from_metric(
 
 
 @PROJECTION_LAW.law
-def velocity_limit_update(old: float, step: float) -> tuple[float, float]:
-    """Return a velocity-limit row's new impulse and the impulse change to apply: ``(new, delta)``.
+def velocity_limit(lower: float, reach: float) -> float:
+    """Return a coordinate's velocity-limit impulse, both sides of ``|v| <= L`` as one row.
 
-    The row is unilateral, ``r = J v + b >= 0`` with ``J`` signed by the side of the
-    limit it bounds, and ``step = r / d`` its unrelaxed step. The row keeps a total,
+    The row is ``J v + L`` with ``J = +e_dof``: its lower side's residual, ``v + L >= 0``; its upper side's is
+    ``L - v >= 0``, and both cannot act at once. ``lower`` is the lower side's unprojected update (the impulse that
+    would close ``v + L``: ``old - r / d`` in a Gauss-Seidel step, ``y - s r`` in a Jacobi one) and ``reach`` the same
+    step's measure of ``2 L``'s half, ``L / d`` (or ``s L``). The update that zeroes ``v`` is ``lower + reach``; the
+    limit soft-thresholds it by ``reach``: positive (pushing up, ``v = -L``) past ``reach``, negative (``v = L``)
+    below ``-reach``, zero between, where ``|v| <= L`` holds unloaded. Its fixed point is the two-sided limit's
+    complementarity, whatever the step.
+    """
+    centre = lower + reach
+    return wp.sign(centre) * wp.max(wp.abs(centre) - reach, 0.0)
+
+
+@PROJECTION_LAW.law
+def velocity_limit_update(old: float, step: float) -> tuple[float, float]:
+    """Return a free body's speed row's new impulse and the impulse change to apply: ``(new, delta)``.
+
+    The row is unilateral, ``r = limit - |v| >= 0``, and ``step = r / d`` its unrelaxed step. The row keeps a total,
     ``max(old - step, 0)``, like a contact normal or a position limit, so sweeps
     converge to the complementarity solution, which is independent of the row order
     and is the fixed point of the parallel tiers. From a zero impulse the update is
