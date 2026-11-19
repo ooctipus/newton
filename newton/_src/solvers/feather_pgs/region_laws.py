@@ -532,14 +532,17 @@ def friction_unit(C: wp.mat33, G: wp.mat33, friction: int) -> tuple[wp.mat33, wp
 
 @REGION_LAW.law
 def stick_terms(
-    Wnn: wp.mat33, C: wp.mat33, G: wp.mat33, cfm: float, friction: int
+    Wnn: wp.mat33, C: wp.mat33, G: wp.mat33, friction: int
 ) -> tuple[wp.mat33, wp.mat33, wp.mat33, wp.mat33]:
-    """A region's terms that stand for a step (its response does): the regularized friction block's inverse ``Ginv``,
-    the stick metric ``K = Wnn - C Ginv C^T`` (the unit held), and the factors of ``K`` and of ``Wnn``
-    (:func:`metric_factor`), ``(Ginv, K, Lk, Lw)``; a region without friction rows holds ``Wnn``'s alone."""
+    """A region's terms that stand for a step (its response does): the friction block's inverse ``Ginv``, the stick
+    metric ``K = Wnn - C Ginv C^T`` (the unit held), and the factors of ``K`` and of ``Wnn`` (:func:`metric_factor`),
+    ``(Ginv, K, Lk, Lw)``; a region without friction rows holds ``Wnn``'s alone.
+
+    A sticking unit is held at zero residual, so ``Ginv`` inverts ``G`` itself: the rows' ``cfm`` regularizes the
+    steps of the rows and of the cone law (their fixed points do not hold it), never a held unit, whose residual it
+    would leave at ``-cfm phi``, a creep no other route solves (exact Coulomb)."""
     Cu, Gu = friction_unit(C, G, friction)
-    Gs = Gu + wp.mat33(cfm, 0.0, 0.0, 0.0, cfm, 0.0, 0.0, 0.0, cfm)
-    Ginv = wp.inverse(Gs)
+    Ginv = wp.inverse(Gu)
     CG = Cu * Ginv
     K = Wnn - CG * wp.transpose(Cu)
     Lw = metric_factor(Wnn)
@@ -586,7 +589,7 @@ def region_visit(
         Wnn: The pair's response over ``N``.
         C: The response of ``N`` to a wrench over ``F`` (``Wnf``).
         G: The response over ``F``.
-        cfm: The friction unit's regularization, added to ``G``'s diagonal in its solves.
+        cfm: The friction unit's regularization, added to ``G``'s diagonal in its slide's cone law (a step metric).
         bf: The friction rows' right-hand sides.
         mu: The friction coefficient.
         mu_t: The torsional coefficient [m], 0 for a unit without a spin row.
@@ -594,7 +597,7 @@ def region_visit(
         ball_values: The cone law's metric of the regularized friction block (:func:`.projection_laws.friction_ball_metric`
             of ``G`` plus ``cfm``), its eigenvalues; read where ``mu_t`` is positive.
         ball_vectors: Its eigenvectors.
-        Ginv: The regularized friction block's inverse (:func:`stick_terms`).
+        Ginv: The friction block's inverse (:func:`stick_terms`).
         K: The stick metric.
         Lk: Its factor.
         Lw: ``Wnn``'s factor.

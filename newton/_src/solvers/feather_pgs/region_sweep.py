@@ -824,7 +824,7 @@ def region_terms(
     vectors = wp.mat33(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
     if mu_t > 0.0:
         values, vectors = friction_ball_metric(G + wp.mat33(cfm, 0.0, 0.0, 0.0, cfm, 0.0, 0.0, 0.0, cfm), mu, mu_t)
-    Ginv, K, Lk, Lw = stick_terms(Wnn, C, G, cfm, friction)
+    Ginv, K, Lk, Lw = stick_terms(Wnn, C, G, friction)
     return Wnn, C, G, values, vectors, Ginv, K, Lk, Lw
 
 
