@@ -75,7 +75,6 @@ def _launch_contact_allocator(
                 slots_needed=outputs["slots_needed"],
                 first=row_lines(device),
             ),
-            1,
             wp.array([0], dtype=wp.int32, device=device),
             wp.array([0], dtype=wp.int32, device=device),
             wp.zeros((1,), dtype=wp.int32, device=device),
@@ -101,7 +100,6 @@ def _launch_contact_allocator(
             counters["mf_first_rejected"],
             wp.zeros((0, 0), dtype=wp.int32, device=device),
         ],
-        1,
         device,
     )
     wp.synchronize_device(device)
@@ -152,7 +150,6 @@ def _launch_articulation_pair_contact_allocator(
                 slots_needed=contact_slots_needed,
                 first=row_lines(device),
             ),
-            1,
             wp.array(body_to_articulation, dtype=wp.int32, device=device),
             wp.array([0] * articulation_count, dtype=wp.int32, device=device),
             wp.zeros((2,), dtype=wp.int32, device=device),
@@ -178,7 +175,6 @@ def _launch_articulation_pair_contact_allocator(
             wp.full((1,), 2**31 - 1, dtype=wp.int32, device=device),
             wp.zeros((0, 0), dtype=wp.int32, device=device),
         ],
-        1,
         device,
     )
     wp.synchronize_device(device)

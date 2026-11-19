@@ -101,6 +101,8 @@ def _patch_fixture(
         ),
         rigid_contact_margin0=wp.zeros(n, dtype=float, device=device),
         rigid_contact_margin1=wp.zeros(n, dtype=float, device=device),
+        # Each contact's identity in its pass, which orders a pair's contacts in the frame.
+        rigid_contact_key=wp.array(np.arange(n), dtype=wp.int64, device=device),
     )
     patches = _FrictionPatchState(model, max(n, 8), wp.zeros(max(n, 8), dtype=wp.vec2, device=device))
     patches.build(model, state, contacts)
@@ -970,7 +972,9 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         patches = solver.laws.friction_patches
         active = patches.view.weight.numpy() > 0
         self.assertEqual(np.count_nonzero(active), 1)
-        np.testing.assert_allclose(patches.current.anchor_a.numpy()[active, 0], -0.1, atol=1.0e-5)
+        # The anchor lies on the supported edge: within 1e-8 m at a converged solve; the default sweeps of the first
+        # step, in its contacts' row order, leave it up to 1.6e-5 m away.
+        np.testing.assert_allclose(patches.current.anchor_a.numpy()[active, 0], -0.1, atol=2.0e-5)
 
     def test_contact_churn_reports_linear_force_but_not_a_wrench(self):
         """Compare the linear export with solved rows under an off-centre load after churn."""

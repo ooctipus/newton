@@ -184,6 +184,8 @@ class _Scene:
             rigid_contact_normal=wp.zeros(contacts, dtype=wp.vec3, device=device),
             rigid_contact_margin0=wp.zeros(contacts, dtype=float, device=device),
             rigid_contact_margin1=wp.zeros(contacts, dtype=float, device=device),
+            # Each slot's identity in its pass, which orders a pair's contacts in the frame.
+            rigid_contact_key=wp.array(np.arange(contacts), dtype=wp.int64, device=device),
         )
 
     def _add_pair(self, shape0, shape1, normal):
@@ -1198,7 +1200,8 @@ def _patch_extent(end, live, size):
 
 
 def run_live_sort_cases(test, device, capacities, extra_counts=(), merges=None):
-    """Sort live prefixes of several sizes and compare with numpy's stable argsort and the radix sort.
+    """Sort live prefixes of several sizes by (pair key, contact key) and compare with numpy's lexsort, and their keys
+    with the radix sort's.
 
     ``merges`` launches that many merge rounds, fewer than the live slots may need, as a replay past its capture's rows.
     """
@@ -1218,27 +1221,29 @@ def run_live_sort_cases(test, device, capacities, extra_counts=(), merges=None):
         for live in sorted(count for count in counts if 0 <= count <= capacity):
             with test.subTest(capacity=capacity, live=live):
                 keys = _fill_sort_case(patches, live, rng, codes)
+                # Each contact's key, unique in its pass and in no relation to its slot.
+                ties = rng.permutation(capacity).astype(np.int64) * 7919 + 3
                 # CPU arrays expose their memory; copies keep what the slots held.
                 before = (patches.current.keys.numpy().copy(), patches.current.indices.numpy().copy())
-                patches._sort_live()
+                patches._sort_live(wp.array(ties, dtype=wp.int64, device=device))
                 if live == 0:
                     np.testing.assert_array_equal(patches.current.keys.numpy(), before[0], "no slot changes")
                     np.testing.assert_array_equal(patches.current.indices.numpy(), before[1], "no slot changes")
                 sorted_keys = patches.current.keys.numpy()[:capacity]
                 sorted_indices = patches.current.indices.numpy()[:capacity]
-                order = np.argsort(keys[:live], kind="stable")
+                order = np.lexsort((ties[:live], keys[:live]))
                 np.testing.assert_array_equal(sorted_indices[:live], order)
                 np.testing.assert_array_equal(sorted_keys[:live], keys[order])
+                np.testing.assert_array_equal(sorted_indices[live:], np.arange(live, capacity), "empty slots stay")
                 radix_keys = wp.array(np.tile(keys, 2), dtype=wp.int64, device=device)
                 radix_indices = wp.array(np.tile(np.arange(capacity, dtype=np.int32), 2), dtype=int, device=device)
                 wp.utils.radix_sort_pairs(radix_keys, radix_indices, capacity)
                 np.testing.assert_array_equal(sorted_keys, radix_keys.numpy()[:capacity])
-                np.testing.assert_array_equal(sorted_indices, radix_indices.numpy()[:capacity])
 
 
 class TestPatchLiveSort(unittest.TestCase):
     def test_live_sort_matches_stable_argsort_and_radix_sort(self):
-        """Sort the live prefix exactly as a stable sort, from no contacts, which no slot sees, through merges."""
+        """Sort the live prefix by (pair key, contact key), from no contacts, which no slot sees, through merges."""
         run_live_sort_cases(self, "cpu", (128, 2047, 3000, 4096, 10000, 16_384))
 
     def test_key_width_selects_the_live_sort(self):
@@ -1371,6 +1376,7 @@ class _TiledScene:
             rigid_contact_max=self.capacity,
             contact_generation=wp.zeros(1, dtype=wp.int32, device=device),
             rigid_contact_count=wp.zeros(1, dtype=int, device=device),
+            rigid_contact_key=wp.array(np.arange(self.capacity), dtype=wp.int64, device=device),
         )
         for name in self._FIELDS:
             array = getattr(base.contacts, f"rigid_contact_{name}")
@@ -1885,6 +1891,7 @@ _CONTACT_FIELDS = (
     "rigid_contact_normal",
     "rigid_contact_margin0",
     "rigid_contact_margin1",
+    "rigid_contact_key",
 )
 
 
@@ -2434,21 +2441,25 @@ class TestPatchFrameModes(unittest.TestCase):
 
 
 def _expected_pairs(model, contacts, capacity):
-    """Return the sorted pair keys and slot order of the live contacts, computed on the host."""
+    """Return the sorted pair keys and slot order (by pair key, then contact key) of the live contacts, computed on
+    the host."""
     bodies, shapes = model.body_count, model.shape_body.shape[0]
     stride = bodies + shapes + 2
     count = int(contacts.rigid_contact_count.numpy()[0])
     live = min(count, capacity) if 0 <= count <= contacts.rigid_contact_max else 0
     shape_body = model.shape_body.numpy()
+    # A body's code (friction_patches.body_codes); index -1 reads the padding of a missing body.
+    body_code = np.append(friction_patches.body_codes(model.body_world.numpy()), 0) if bodies else np.zeros(1, np.int64)
 
     def codes(shape):
         body = np.where(shape >= 0, shape_body[np.maximum(shape, 0)], -1)
-        return np.where(body >= 0, body + 1, bodies + np.where(shape >= 0, shape, shapes) + 1).astype(np.int64)
+        return np.where(body >= 0, body_code[body], bodies + np.where(shape >= 0, shape, shapes) + 1).astype(np.int64)
 
     a = codes(contacts.rigid_contact_shape0.numpy()[:live])
     b = codes(contacts.rigid_contact_shape1.numpy()[:live])
     keys = np.minimum(a, b) * stride + np.maximum(a, b)
-    order = np.argsort(keys, kind="stable")
+    # A pair's contacts follow their keys, the identities the collision gives them.
+    order = np.lexsort((contacts.rigid_contact_key.numpy()[:live], keys))
     return keys[order], order
 
 

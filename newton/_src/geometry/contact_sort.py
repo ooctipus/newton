@@ -195,6 +195,15 @@ def _gather_full_kernel(data: _FullContactArrays, perm: wp.array[wp.int32], coun
         data.match_index[i] = data.match_index_buf[p]
 
 
+@wp.kernel(enable_backward=False)
+def _store_sorted_keys(sorted_keys: wp.array[wp.int64], keys: wp.array[wp.int64], count: wp.array[int]):
+    """Write the live contacts' sorted keys back over their keys, which then follow the gathered contacts."""
+    i = wp.tid()
+    if i >= count[0]:
+        return
+    keys[i] = sorted_keys[i]
+
+
 class ContactSorter:
     """Sort contact arrays into a deterministic canonical order.
 
@@ -475,7 +484,7 @@ class ContactSorter:
         self._sort(_backup_full_kernel, _gather_full_kernel, data, sort_keys, contact_count)
 
     def _sort(self, backup, gather, data, sort_keys, contact_count):
-        """Back up the live contacts, sort their keys, and gather them in key order.
+        """Back up the live contacts, sort their keys, and gather them in key order, the keys with them.
 
         The live contacts are published first, at most the ready rows, and
         every launch follows them; in a capture whose launches bind, each replay
@@ -501,6 +510,7 @@ class ContactSorter:
             slot_keys=False,
         )
         pool.launch(gather, rows, inputs=[data, indices, live], extent=live)
+        pool.launch(_store_sorted_keys, rows, inputs=[keys, sort_keys, live], extent=live)
 
     @property
     def sorted_keys_view(self) -> wp.array:

@@ -15,7 +15,10 @@ left, until one run holds every live slot, ending in the first half.
 Order: by key; a merge keeps the slots of its earlier run first among equal
 keys. Chunks of *slot keys* (``slot_keys``, keys of at most 51 bits) sort by
 (key, slot), so the whole sort is a stable sort by key; other keys sort by key
-alone within a chunk.
+alone within a chunk. Slot keys with *ties* (``ties``: a unique int64 per slot
+index, read at the slot's index) sort by (key, tie) instead, in chunks and in
+merges: the order is then a function of the keys and ties alone, whatever
+order the slots arrived in.
 
 Every launch strides over its extent entry and goes through
 :meth:`~newton._src.core.contact_pool.ContactPool.launch`: in a CUDA graph
@@ -114,6 +117,23 @@ def _key(order: wp.int64):
     return order
 
 
+@wp.func
+def _tie_order(tie: wp.int64, local: int, start: int, live: int):
+    """Order a chunk's live slots by tie; slots past the live count sort last."""
+    if start + local < live:
+        return tie
+    return _KEY_SENTINEL
+
+
+@wp.func
+def _ranked_order(key: wp.int64, rank: int, local: int, start: int, live: int):
+    """Order a chunk's slots by (key, the rank of their tie in the chunk); slots past the live count sort last, in
+    slot order."""
+    if start + local < live:
+        return (key << wp.int64(SLOT_BITS)) | wp.int64(rank)
+    return _PAD + wp.int64(local)
+
+
 # Below SORT_CHUNK // 2 slots per half, a chunk's tile reaches past the 2 * capacity
 # keys and indices of ordinary arrays: those capacities rely on wp.tile_store's
 # bounds check, which drops the stores past the arrays' end. Such slots only hold
@@ -154,6 +174,47 @@ def _chunk_sort(order_key, stored_key):
     return sort_chunks
 
 
+@wp.kernel(enable_backward=False)
+def _sort_tied_chunks(
+    slot_keys: wp.array[wp.int64],
+    slot_indices: wp.array[int],
+    ties: wp.array[wp.int64],
+    keys: wp.array[wp.int64],
+    indices: wp.array[int],
+    extent: wp.array[int],
+    capacity: int,
+    blocks: int,
+    merges: int,
+):
+    """Sort each chunk of the live slots by (slot key, tie), into the half where ``merges`` rounds end in the first.
+
+    The chunk's slots are first ordered by tie (``ties`` at each slot's index, which the chunk's slots hold as
+    loaded: a new frame's slots are their indices), then by (slot key, tie rank): the rank takes the slot's bits of
+    :func:`_slot_order`, so the chunk sort stays one key of at most 62 bits.
+    """
+    block = wp.tid()
+    live = extent[0]
+    output = capacity * (wp.min(merge_rounds(live), merges) % 2)
+    for start in range(block * SORT_CHUNK, live, blocks * SORT_CHUNK):
+        local = wp.tile_arange(SORT_CHUNK, dtype=int)
+        first = wp.tile_full(SORT_CHUNK, start, dtype=int)
+        count = wp.tile_full(SORT_CHUNK, live, dtype=int)
+        tied = wp.tile_load(ties, shape=SORT_CHUNK, offset=start)
+        by_tie = wp.tile_zeros(shape=SORT_CHUNK, dtype=wp.int64, storage="shared")
+        wp.tile_assign(by_tie, wp.tile_map(_tie_order, tied, local, first, count))
+        perm = wp.tile_arange(SORT_CHUNK, dtype=int, storage="shared")
+        wp.tile_sort(by_tie, perm)
+        loaded = wp.tile_load_indexed(slot_keys, perm, shape=(SORT_CHUNK,), offset=(start,), axis=0)
+        values = wp.tile_load_indexed(
+            slot_indices, perm, shape=(SORT_CHUNK,), offset=(start,), axis=0, storage="shared"
+        )
+        order = wp.tile_zeros(shape=SORT_CHUNK, dtype=wp.int64, storage="shared")
+        wp.tile_assign(order, wp.tile_map(_ranked_order, loaded, local, perm, first, count))
+        wp.tile_sort(order, values)
+        wp.tile_store(keys, wp.tile_map(_slot_key, order), offset=output + start)
+        wp.tile_store(indices, values, offset=output + start)
+
+
 # Two chunk sorts that differ in their key maps, each a kernel of this module.
 _sort_slot_chunks = wp.Kernel(
     _chunk_sort(_slot_order, _slot_key), key="live_sort_slot_chunks", options={"enable_backward": False}
@@ -164,13 +225,31 @@ _sort_key_chunks = wp.Kernel(
 
 
 @wp.func
-def _placed_before(keys: wp.array[wp.int64], source: int, lo: int, hi: int, key: wp.int64, earlier: bool):
-    """Count the slots of the sorted run [lo, hi) placed before ``key``: smaller keys, and an ``earlier`` run's equal ones."""
+def _placed_before(
+    keys: wp.array[wp.int64],
+    indices: wp.array[int],
+    ties: wp.array[wp.int64],
+    source: int,
+    lo: int,
+    hi: int,
+    key: wp.int64,
+    tie: wp.int64,
+    earlier: bool,
+):
+    """Count the slots of the sorted run [lo, hi) placed before ``key``: smaller keys, and among equal ones those of
+    a smaller tie (with ``ties``) and, at an equal tie or without ties, an ``earlier`` run's."""
     first = lo
+    tied = ties.shape[0] > 0
     while lo < hi:
         mid = (lo + hi) // 2
         value = keys[source + mid]
-        if value < key or (earlier and value == key):
+        before = value < key
+        if value == key:
+            before = earlier
+            if tied:
+                other = ties[indices[source + mid]]
+                before = other < tie or (other == tie and earlier)
+        if before:
             lo = mid + 1
         else:
             hi = mid
@@ -181,6 +260,7 @@ def _placed_before(keys: wp.array[wp.int64], source: int, lo: int, hi: int, key:
 def _merge_runs(
     keys: wp.array[wp.int64],
     indices: wp.array[int],
+    ties: wp.array[wp.int64],
     extent: wp.array[int],
     capacity: int,
     merge: int,
@@ -189,7 +269,8 @@ def _merge_runs(
 ):
     """Merge sorted runs pairwise, in the last of the ``merges`` rounds every run left; slots move past smaller keys.
 
-    An earlier run's slots go first among equal keys; launches past the needed merges return.
+    Among equal keys the smaller tie goes first (with ``ties``), else an earlier run's slots; launches past the
+    needed merges return.
     """
     thread = wp.tid()
     live = extent[0]
@@ -204,6 +285,9 @@ def _merge_runs(
     for i in range(thread, live, threads):
         key = keys[source + i]
         index = indices[source + i]
+        tie = wp.int64(0)
+        if ties.shape[0] > 0:
+            tie = ties[index]
         run = i // width
         group = int(0)
         end = runs
@@ -213,9 +297,13 @@ def _merge_runs(
         position = i - (run - group) * width
         # The runs before this slot's are full; the last run may hold fewer slots.
         for other in range(group, run):
-            position += _placed_before(keys, source, other * width, other * width + width, key, True)
+            position += _placed_before(
+                keys, indices, ties, source, other * width, other * width + width, key, tie, True
+            )
         for other in range(run + 1, end):
-            position += _placed_before(keys, source, other * width, wp.min(other * width + width, live), key, False)
+            position += _placed_before(
+                keys, indices, ties, source, other * width, wp.min(other * width + width, live), key, tie, False
+            )
         keys[target + position] = key
         indices[target + position] = index
 
@@ -239,7 +327,17 @@ def sort_grid(device, rows: int) -> tuple[int, int, int]:
 
 
 def launch_live_sort(
-    pool, keys, indices, extent, capacity: int, *, blocks: int, merges: int, merge_threads: int, slot_keys: bool
+    pool,
+    keys,
+    indices,
+    extent,
+    capacity: int,
+    *,
+    blocks: int,
+    merges: int,
+    merge_threads: int,
+    slot_keys: bool,
+    ties: wp.array | None = None,
 ) -> None:
     """Sort the live slots of ``keys`` and ``indices`` (first halves) by key, through ``pool``'s launches.
 
@@ -258,27 +356,44 @@ def launch_live_sort(
         merges: Merge rounds to launch; a capture notes the slots they pair (:meth:`ContactPool.note_cover`).
         merge_threads: Threads of each merge.
         slot_keys: Keys of at most 51 bits, which sort stably (:func:`slot_keys_fit`).
+        ties: With slot keys, an int64 per slot index (the slots' indices name them): equal keys sort by tie, so
+            with unique ties the order is the keys' and ties' alone. The live slots' indices must be the slots
+            themselves.
     """
-    kernel = _sort_slot_chunks if slot_keys else _sort_key_chunks
+    if ties is not None and not slot_keys:
+        raise ValueError("ties order slot keys only")
     pool.note_cover(int(SORT_CHUNK) << merges)
-    pool.launch(
-        kernel,
-        blocks,
-        inputs=[keys, indices, keys, indices, extent, capacity, blocks, merges],
-        extent=extent[1:2],
-        clamp=True,
-        row_args=(6,),
-        tiled=True,
-        block_dim=_BLOCK_THREADS,
-    )
+    if ties is not None:
+        pool.launch(
+            _sort_tied_chunks,
+            blocks,
+            inputs=[keys, indices, ties, keys, indices, extent, capacity, blocks, merges],
+            extent=extent[1:2],
+            clamp=True,
+            row_args=(7,),
+            tiled=True,
+            block_dim=_BLOCK_THREADS,
+        )
+    else:
+        pool.launch(
+            _sort_slot_chunks if slot_keys else _sort_key_chunks,
+            blocks,
+            inputs=[keys, indices, keys, indices, extent, capacity, blocks, merges],
+            extent=extent[1:2],
+            clamp=True,
+            row_args=(6,),
+            tiled=True,
+            block_dim=_BLOCK_THREADS,
+        )
+    no_ties = ties if ties is not None else wp.empty(0, dtype=wp.int64, device=keys.device)
     for merge in range(merges):
         pool.launch(
             _merge_runs,
             merge_threads,
-            inputs=[keys, indices, extent, capacity, merge, merges, merge_threads],
+            inputs=[keys, indices, no_ties, extent, capacity, merge, merges, merge_threads],
             extent=extent[2 + merge : 3 + merge],
             clamp=True,
-            row_args=(4,),
+            row_args=(5,),
         )
 
 

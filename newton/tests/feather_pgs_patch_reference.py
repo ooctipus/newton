@@ -38,6 +38,7 @@ from newton._src.solvers.feather_pgs.friction_patches import (
     _region_location,
     _settle_region,
     _starts_pair,
+    body_codes,
     patch_routes,
 )
 
@@ -77,15 +78,17 @@ _RECORDS = ("shape0", "shape1", "point0", "point1", "normal", "margin0", "margin
 
 def frame_order(model, contacts):
     """The frame's order of the live ``contacts``, computed on the host: the stable order of their body pairs, a side's
-    code its body plus one, or a static or missing shape's code above every body's (``friction_patches._pair_code``)."""
+    code its body's (``friction_patches.body_codes``), or a static or missing shape's code above every body's
+    (``friction_patches._pair_code``)."""
     live = max(int(contacts.rigid_contact_count.numpy()[0]), 0)
     shape_body = model.shape_body.numpy()
     bodies, shapes = model.body_count, len(shape_body)
+    body_code = np.append(body_codes(model.body_world.numpy()), 0) if bodies else np.zeros(1, np.int64)
     codes = []
     for name in ("rigid_contact_shape0", "rigid_contact_shape1"):
         shape = getattr(contacts, name).numpy()[:live].astype(np.int64)
         body = np.where(shape >= 0, shape_body[np.maximum(shape, 0)], -1)
-        codes.append(np.where(body >= 0, body + 1, bodies + np.where(shape >= 0, shape, shapes) + 1))
+        codes.append(np.where(body >= 0, body_code[body], bodies + np.where(shape >= 0, shape, shapes) + 1))
     low, high = np.minimum(*codes), np.maximum(*codes)
     return np.lexsort((high, low))
 

@@ -1337,7 +1337,7 @@ def support_units_kernel(max_rows: int, lanes: int, device_arch) -> wp.Kernel:
     """The support placement's units (case K1, the writer's first launch): ``dim = (worlds, lanes)``, a world's lane
     group of ``lanes`` striding over its rows, a lane a row: each contact row's records by the contact law
     (:func:`.row_build.write_contact_row`, its unit source written where its slot is reserved,
-    :func:`.row_slots.allocate_world_contact_slots`), and each unit's first row appended to the step's
+    :func:`.row_slots.reserve_world_contact_rows`), and each unit's first row appended to the step's
     :class:`UnitList`: a contact's ``min(slots_needed, max_rows)`` rows as one unit, a joint row (a limit, a velocity
     limit, a mimic) alone. The walkers (:func:`support_rows_kernel`) read the records after this launch."""
 

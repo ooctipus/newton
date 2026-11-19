@@ -1,30 +1,32 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for FeatherPGS contact row allocation under capacity overflow and in any reservation order.
+"""Tests for FeatherPGS contact row allocation under capacity overflow and in the frame's order.
 
-Slot counters are shared per world and reserved with atomics. When a reservation does
-not fit, the row count must still bound every accepted contact: a row that is built but
-lies at or past the count is never solved, yet friction patch links can chain into it,
-and the patch-chain walk in the solve kernels then never terminates.
-
-On CUDA the warps of the allocator reach a world's counter in a run-varying order. Under
-a deterministic collision pipeline the solver places each world's contact rows in the
-sorted contacts' order instead, so two solvers stepping the same contacts sweep the same
-rows; the default pipeline keeps the allocator's order and launches nothing more.
+Each world's contact rows are reserved in the frame's order (its pair and contact keys), so
+the rows, and the Gauss-Seidel solve that visits them, do not depend on the order in which
+the collision's threads wrote the contacts. When a reservation does not fit, the row count
+must still bound every accepted contact: a row that is built but lies at or past the count
+is never solved, yet friction patch links can chain into it, and the patch-chain walk in
+the solve kernels then never terminates.
 """
 
 import unittest
-from unittest import mock
 
 import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import field_group, row_slots, rows
+from newton._src.solvers.feather_pgs import field_group
 from newton._src.solvers.feather_pgs.contact_input import ContactInput
 from newton.solvers import SolverFeatherPGS
-from newton.tests.feather_pgs_law_harness import allocate_contacts, anchored_patches, finalize_counts, row_lines
+from newton.tests.feather_pgs_law_harness import (
+    allocate_contacts,
+    anchored_patches,
+    finalize_counts,
+    row_lines,
+    row_order,
+)
 from newton.tests.test_feather_pgs_sparse_solver import _build_model
 
 _UNBOUNDED = 2**31 - 1
@@ -90,7 +92,6 @@ def _allocate_overflowing_contacts(device, contact_count, row_capacity):
                 slots_needed=slots_needed,
                 first=row_lines(device),
             ),
-            contact_count,
             wp.zeros((1,), dtype=wp.int32, device=device),
             wp.zeros((1,), dtype=wp.int32, device=device),
             wp.zeros((1,), dtype=wp.int32, device=device),
@@ -116,7 +117,6 @@ def _allocate_overflowing_contacts(device, contact_count, row_capacity):
             wp.full((1,), _UNBOUNDED, dtype=wp.int32, device=device),
             wp.zeros((0, 0), dtype=wp.int32, device=device),
         ],
-        contact_count,
         device,
     )
     # The dense family's finalizer, as the solver launches it for these rows.
@@ -136,13 +136,12 @@ def _allocate_overflowing_contacts(device, contact_count, row_capacity):
     )
 
 
-def _step_tripods(device, *, threads=None, steps=4, deterministic=True, launched=None, **options):
-    """Step the tripod worlds with the contact allocator on ``threads`` threads (``None``: the default).
+def _step_tripods(device, *, steps=4, deterministic=True, **options):
+    """Step the tripod worlds, the collision pipeline sorting its contacts (``deterministic``) or not.
 
-    ``deterministic`` selects the collision pipeline's mode, ``options`` override the route's
-    solver options, and ``launched``, a set, receives every kernel the steps launch. Returns,
-    per step, the live contacts' world, path and slot, the worlds' dense and matrix-free row
-    counts, contact rows' start and dense overflow, and the output joint state.
+    ``options`` override the route's solver options. Returns, per step, the live contacts' world,
+    path and slot at their frame positions, the worlds' dense and matrix-free row counts, contact
+    rows' start and dense overflow, and the output joint state.
     """
     model = _build_model(free_count=2, robot_count=2, device=device)
     solver = SolverFeatherPGS(model, pins=SolverFeatherPGS.Pins(storage="dense"), **{**_ROUTE_OPTIONS, **options})
@@ -153,150 +152,113 @@ def _step_tripods(device, *, threads=None, steps=4, deterministic=True, launched
     )
     contacts = pipeline.contacts()
     control = model.control()
-    cap = rows._CONTACT_BUILD_THREAD_CAP if threads is None else threads
-    launch = wp.launch
-
-    def record_launch(kernel, *args, **kwargs):
-        if launched is not None:
-            launched.add(kernel)
-        return launch(kernel, *args, **kwargs)
-
     records = []
-    with (
-        mock.patch.object(rows, "_CONTACT_BUILD_THREAD_CAP", cap),
-        mock.patch.object(wp, "launch", record_launch),
-    ):
-        for _ in range(steps):
-            pipeline.collide(state_in, contacts)
-            state_in.clear_forces()
-            solver.step(state_in, state_out, control, contacts, 1.0 / 240.0)
-            live = int(contacts.rigid_contact_count.numpy()[0])
-            # On CPU numpy() views the solver's buffers, which the next step overwrites. The allocation records lie at
-            # each contact's frame position; the record takes them in the collision's order.
-            position = solver.laws.friction_patches.position.numpy()[:live]
-            record = {
-                name: getattr(solver.placement, f"contact_{name}").numpy()[position].copy()
-                for name in ("world", "path", "slot")
-            }
-            # Each family's contact rows in the world's line: the free bodies' from the store's body base.
-            base = solver.placement.body_base
-            record.update(
-                counts=(
-                    solver.placement.constraint_count.numpy().copy(),
-                    base + solver.placement.mf_constraint_count.numpy(),
-                ),
-                dense_overflow=solver.placement.dense_first_rejected_slot.numpy()
-                < solver.placement.slot_counter.numpy(),
-                starts=(
-                    solver.placement.dense_phase_bounds.numpy()[:, 1].copy(),
-                    np.full(model.world_count, base, dtype=np.int32),
-                ),
-                joint_q=state_out.joint_q.numpy().copy(),
-                joint_qd=state_out.joint_qd.numpy().copy(),
-            )
-            records.append(record)
-            state_in, state_out = state_out, state_in
+    for _ in range(steps):
+        pipeline.collide(state_in, contacts)
+        state_in.clear_forces()
+        solver.step(state_in, state_out, control, contacts, 1.0 / 240.0)
+        live = int(contacts.rigid_contact_count.numpy()[0])
+        # On CPU numpy() views the solver's buffers, which the next step overwrites.
+        record = {
+            name: getattr(solver.placement, f"contact_{name}").numpy()[:live].copy()
+            for name in ("world", "path", "slot")
+        }
+        # Whether each contact was admitted: the admitted contacts counted before each position, and in all.
+        before = solver.placement.contact_admitted_before.numpy()[:live]
+        total = int(solver.placement.reserve_totals.numpy()[4, 0])
+        record["admitted"] = np.diff(np.append(before, total)) > 0
+        record["pair_keys"] = solver.laws.friction_patches.current.keys.numpy()[:live].copy()
+        # Whether each contact has an immovable side (a shape without a body): those take a world's rows first.
+        shape_body = model.shape_body.numpy()
+        sides = [getattr(solver.laws.friction_patches.records, name).numpy()[:live] for name in ("shape0", "shape1")]
+        record["immovable"] = np.logical_or.reduce(
+            [(side < 0) | (shape_body[np.maximum(side, 0)] < 0) for side in sides]
+        )
+        # Each family's contact rows in the world's line: the free bodies' from the store's body base.
+        base = solver.placement.body_base
+        record.update(
+            counts=(
+                solver.placement.constraint_count.numpy().copy(),
+                base + solver.placement.mf_constraint_count.numpy(),
+            ),
+            dense_overflow=solver.placement.dense_first_rejected_slot.numpy() < solver.placement.slot_counter.numpy(),
+            starts=(
+                solver.placement.dense_phase_bounds.numpy()[:, 1].copy(),
+                np.full(model.world_count, base, dtype=np.int32),
+            ),
+            joint_q=state_out.joint_q.numpy().copy(),
+            joint_qd=state_out.joint_qd.numpy().copy(),
+        )
+        records.append(record)
+        state_in, state_out = state_out, state_in
     return records
 
 
 def _family_contacts(record, path, world):
-    """Indices of the contacts that hold rows of ``path`` in ``world``, ascending."""
-    return np.flatnonzero((record["path"] == path) & (record["world"] == world) & (record["slot"] >= 0))
-
-
-def _thread_order_differs(contacts, threads):
-    """Whether ``threads`` threads reserving the ascending ``contacts`` thread by thread take them out of order."""
-    return not np.array_equal(sorted(contacts, key=lambda c: (c % threads, c)), contacts)
+    """Frame positions of the contacts that hold rows of ``path`` in ``world`` in their rows' order: those with an
+    immovable side first, then the others, each in the world's row order over its admitted contacts' body pairs
+    (:func:`.feather_pgs_law_harness.row_order`)."""
+    admitted = np.flatnonzero((record["world"] == world) & record["admitted"])
+    order = row_order(admitted, record["pair_keys"][admitted])
+    rank = np.empty(len(record["world"]), dtype=np.int64)
+    rank[order] = np.arange(len(order))
+    contacts = np.flatnonzero((record["path"] == path) & (record["world"] == world) & (record["slot"] >= 0))
+    contacts = contacts[np.argsort(rank[contacts], kind="stable")]
+    return contacts[np.argsort(~record["immovable"][contacts], kind="stable")]
 
 
 class TestFeatherPGSContactRowOrder(unittest.TestCase):
-    """Sorted contacts' rows follow the contacts' order, whatever order the allocator reserves them in."""
+    """Contact rows follow the frame's order, whatever order the collision wrote the contacts in."""
 
-    def _check_reservation_order_changes_nothing(self, device):
-        """Step the tripods with the default allocator grid and with four threads; require the same rows and states.
+    def _check_collision_order_changes_nothing(self, device):
+        """Step the tripods with a sorting and a non-sorting collision pipeline; require the same rows and states.
 
-        Four threads reserve a world's contacts thread by thread (on CPU contacts 0, 4, 8, ...
-        before 1, 5, 9, ...), out of contact order, as CUDA warps that reach a world's counter
-        late do. Both runs must place every world's dense and matrix-free contact rows in
-        contact order and step bitwise alike.
+        The two pipelines write the same contacts in different orders. Both runs must place every world's dense and
+        matrix-free contact rows in the frame's order and step bitwise alike.
         """
-        threads = 4
-        reference = _step_tripods(device)
-        reordered = _step_tripods(device, threads=threads)
-        interleaved = False
-        for step, (expected, actual) in enumerate(zip(reference, reordered, strict=True)):
-            for name in ("world", "path"):
+        sorted_runs = _step_tripods(device, deterministic=True)
+        written_runs = _step_tripods(device, deterministic=False)
+        for step, (expected, actual) in enumerate(zip(sorted_runs, written_runs, strict=True)):
+            for name in ("world", "path", "slot"):
                 np.testing.assert_array_equal(actual[name], expected[name], err_msg=f"contact {name} at step {step}")
             for path in _ROW_PATHS:
                 for world in np.unique(expected["world"][expected["path"] == path]):
-                    contacts = _family_contacts(expected, path, world)
-                    # The premise: four threads reserve some world's rows out of contact order.
-                    interleaved |= _thread_order_differs(contacts, threads)
-                    for record in (expected, actual):
-                        slots = record["slot"][contacts]
-                        self.assertTrue(
-                            np.all(np.diff(slots) > 0),
-                            f"step {step}: rows of path {path} in world {world} leave contact order: {slots}",
-                        )
-            np.testing.assert_array_equal(actual["slot"], expected["slot"], err_msg=f"contact slots at step {step}")
+                    slots = expected["slot"][_family_contacts(expected, path, world)]
+                    self.assertTrue(
+                        np.all(np.diff(slots) > 0),
+                        f"step {step}: rows of path {path} in world {world} leave the reservation order: {slots}",
+                    )
             for name in ("joint_q", "joint_qd"):
                 np.testing.assert_array_equal(actual[name], expected[name], err_msg=f"{name} at step {step}")
-        self.assertTrue(interleaved, "no world holds contacts that four threads reserve out of order")
 
-    def test_reservation_order_changes_nothing_cpu(self):
-        """Order the contact rows of a serial launch that reserves them thread by thread."""
-        self._check_reservation_order_changes_nothing(wp.get_device("cpu"))
+    def test_collision_order_changes_nothing_cpu(self):
+        """Order the contact rows by the frame on CPU, where the two pipelines write their contacts differently."""
+        self._check_collision_order_changes_nothing(wp.get_device("cpu"))
 
-    @unittest.skipUnless(wp.is_cuda_available(), "CUDA reservations")
-    def test_reservation_order_changes_nothing_cuda(self):
-        """Order the contact rows whatever order the CUDA allocator's warps reserve them in."""
-        self._check_reservation_order_changes_nothing(wp.get_device("cuda:0"))
+    @unittest.skipUnless(wp.is_cuda_available(), "CUDA collision order")
+    def test_collision_order_changes_nothing_cuda(self):
+        """Order the contact rows by the frame whatever order the CUDA collision's threads write the contacts in."""
+        self._check_collision_order_changes_nothing(wp.get_device("cuda:0"))
 
-    def test_default_pipeline_keeps_the_allocator_order_cpu(self):
-        """Keep the allocator's rows and launch no run kernel for contacts of the default pipeline.
-
-        Newton promises a reproducible contact order only under ``deterministic=True``; for the
-        default pipeline the solver reserves rows as before, so four threads leave some world's
-        rows in thread order, out of contact order. The sorted pipeline's steps launch both run
-        kernels.
-        """
-        threads = 4
-        launched = set()
-        records = _step_tripods(wp.get_device("cpu"), threads=threads, deterministic=False, launched=launched)
-        self.assertFalse({row_slots.record_world_contact_runs, row_slots.place_world_contact_runs} & launched)
-        out_of_order = False
-        for record in records:
-            for path in _ROW_PATHS:
-                for world in np.unique(record["world"][record["path"] == path]):
-                    contacts = _family_contacts(record, path, world)
-                    if _thread_order_differs(contacts, threads):
-                        out_of_order |= not np.all(np.diff(record["slot"][contacts]) > 0)
-        self.assertTrue(out_of_order, "four threads left every world's rows in contact order")
-        launched.clear()
-        _step_tripods(wp.get_device("cpu"), steps=1, launched=launched)
-        self.assertLessEqual({row_slots.record_world_contact_runs, row_slots.place_world_contact_runs}, launched)
-
-    def test_overflowing_family_keeps_the_allocator_layout_cpu(self):
-        """Keep the allocator's slots for an overflowing row family and place the other one in contact order.
+    def test_overflowing_family_keeps_the_frame_order_cpu(self):
+        """Keep both row families in the frame's order when the dense family overflows.
 
         With 40 dense rows the tripods' worlds overflow their dense rows while their matrix-free
-        rows fit. The dense family keeps the allocator's accepted rows, which tile the world's
-        rows up to the finalized count; the matrix-free family follows the contacts' order.
+        rows fit. Each family's accepted rows tile the world's rows up to the finalized count, in
+        the frame's order.
         """
-        records = _step_tripods(wp.get_device("cpu"), threads=4, steps=2, dense_max_constraints=40)
+        records = _step_tripods(wp.get_device("cpu"), steps=2, dense_max_constraints=40)
         for step, record in enumerate(records):
             for path in _ROW_PATHS:
                 counts, starts = record["counts"][path], record["starts"][path]
                 for world in np.unique(record["world"][record["path"] == path]):
-                    contacts = _family_contacts(record, path, world)
-                    slots = record["slot"][contacts]
+                    slots = record["slot"][_family_contacts(record, path, world)]
                     needed = 3  # Every routed contact of the scene takes a normal and two friction rows.
                     rows = np.sort(np.concatenate([np.arange(slot, slot + needed) for slot in slots]))
                     np.testing.assert_array_equal(
                         rows, np.arange(starts[world], counts[world]), err_msg=f"step {step} path {path}"
                     )
-                    if path == 1:
-                        self.assertTrue(np.all(np.diff(slots) > 0), f"step {step}: {slots}")
+                    self.assertTrue(np.all(np.diff(slots) > 0), f"step {step}: {slots}")
             self.assertTrue(np.all(record["dense_overflow"]), f"step {step}: dense rows did not overflow")
             self.assertTrue(np.isfinite(record["joint_qd"]).all())
 
@@ -305,8 +267,7 @@ class TestFeatherPGSRowAllocationCPU(unittest.TestCase):
     def test_overflowing_allocation_launches_and_bounds_rows_cpu(self):
         """Launch the overflowing allocation on CPU, so its operand list is checked without a GPU.
 
-        CPU reservations run one at a time, so the race the CUDA test provokes cannot occur;
-        the same invariants hold.
+        The CPU's one lane reserves the world's contacts one at a time; the same invariants hold.
         """
         slot, needed, count, counter, dropped = _allocate_overflowing_contacts(wp.get_device("cpu"), 300, 48)
         accepted = slot >= 0
@@ -318,16 +279,15 @@ class TestFeatherPGSRowAllocationCPU(unittest.TestCase):
         self.assertLessEqual(int(np.max(slot[accepted] + needed[accepted])), count)
 
 
-@unittest.skipUnless(wp.is_cuda_available(), "the allocation race needs concurrent GPU reservations")
+@unittest.skipUnless(wp.is_cuda_available(), "a warp's lanes reserve together on CUDA")
 class TestFeatherPGSRowAllocation(unittest.TestCase):
     def test_overflow_keeps_every_accepted_contact_below_the_count(self):
         """No accepted contact may hold rows at or past the finalized count.
 
-        Rolling the shared counter back for a rejected reservation raced with concurrent
-        reservations: a contact accepted at slot s could see the counter end below s, so
-        its rows were built but never solved while patch links still chained into them.
-        With 3000 mixed one- and three-row contacts into 48 rows nearly every reservation
-        is rejected, which makes the race easy to hit.
+        A counter rolled back for a rejected reservation once left a contact accepted at slot
+        s past the final count, its rows built but never solved while patch links still chained
+        into them. With 3000 mixed one- and three-row contacts into 48 rows nearly every
+        reservation is rejected.
         """
         device = wp.get_device()
         worst_excess = 0

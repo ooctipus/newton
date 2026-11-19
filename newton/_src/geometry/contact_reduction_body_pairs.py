@@ -1974,7 +1974,6 @@ class BodyPairContactReducer:
         hashtable_size_factor: float = 1.0,
         group_pair_bound: int | None = None,
         borrowed_scratch: dict | None = None,
-        preserve_sort_keys: bool = False,
         verify: bool = False,
         hysteresis: float = 0.001,
         shape_world=None,
@@ -2109,10 +2108,7 @@ class BodyPairContactReducer:
             self.prev_generation = wp.zeros(0, dtype=wp.int32, device=device)
             self.entry_generation = wp.zeros(0, dtype=wp.int32, device=device)
             self.shape_world = wp.zeros(len(shape_group), dtype=wp.int32, device=device)
-        if preserve_sort_keys:
-            contact_fields.append(ContactField("_sort_key_scratch", wp.int64))
-        else:
-            self._sort_key_scratch = None
+        contact_fields.append(ContactField("_sort_key_scratch", wp.int64))
         borrowed = self._borrow()
         self._owned_scratch = tuple(
             name for name in _GATHER_SCRATCH if name not in borrowed or borrowed[name].shape[0] < pool.ready
@@ -2176,16 +2172,14 @@ class BodyPairContactReducer:
         rows.publish(self)
         self._scratch = None
 
-    def reduce(self, model, state, contacts, *, sort_keys=None):
-        """Compact ``contacts`` in place, dropping patch-redundant candidates.
+    def reduce(self, model, state, contacts):
+        """Compact ``contacts`` in place, dropping patch-redundant candidates, their keys
+        (``rigid_contact_key``) with them.
 
         Args:
             model: The simulation model.
             state: Current state (body transforms for witness-point math).
             contacts: The contacts buffer to compact.
-            sort_keys: Optional keys aligned with the input contact records.
-                Compact them with the same stable selection; requires
-                ``preserve_sort_keys=True`` at construction.
         """
         has_material = contacts.rigid_contact_stiffness is not None
         self._ensure_scratch(has_material)
@@ -2498,36 +2492,33 @@ class BodyPairContactReducer:
             clamp=True,
         )
 
-        if sort_keys is not None:
-            if self._sort_key_scratch is None:
-                raise ValueError("sort-key compaction requires preserve_sort_keys at construction")
-            pool.launch(
-                _gather_reduced_sort_keys,
+        pool.launch(
+            _gather_reduced_sort_keys,
+            stride,
+            inputs=[
+                self._frame_state,
+                self.keep_flags,
+                self.keep_scan,
+                contacts.rigid_contact_key,
+                self._sort_key_scratch,
                 stride,
-                inputs=[
-                    self._frame_state,
-                    self.keep_flags,
-                    self.keep_scan,
-                    sort_keys,
-                    self._sort_key_scratch,
-                    stride,
-                ],
-                extent=count,
-                clamp=True,
-            )
-            pool.launch(
-                _scatter_reduced_sort_keys,
+            ],
+            extent=count,
+            clamp=True,
+        )
+        pool.launch(
+            _scatter_reduced_sort_keys,
+            stride,
+            inputs=[
+                self._frame_state,
+                contacts.rigid_contact_count,
+                self._sort_key_scratch,
+                contacts.rigid_contact_key,
                 stride,
-                inputs=[
-                    self._frame_state,
-                    contacts.rigid_contact_count,
-                    self._sort_key_scratch,
-                    sort_keys,
-                    stride,
-                ],
-                extent=count,
-                clamp=True,
-            )
+            ],
+            extent=count,
+            clamp=True,
+        )
 
     def reset_history(self, world_mask=None):
         """Erase hysteresis history globally or for selected worlds.
@@ -2769,5 +2760,5 @@ class BodyPairContactReducer:
             ),
             "gather_scratch_owned_bytes": owned,
             "gather_scratch_borrowed_bytes": borrowed,
-            "sort_key_scratch_bytes": 0 if self._sort_key_scratch is None else self._sort_key_scratch.size * 8,
+            "sort_key_scratch_bytes": self._sort_key_scratch.size * 8,
         }

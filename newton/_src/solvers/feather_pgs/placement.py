@@ -9,11 +9,11 @@
 - the dense rows and their records, the free-body rows, the sparse placements' rows and the packed rows (Z by
   support);
 - the per-contact buffers of the contact pool (each contact's world, slot and path) and the carry's row tables;
-- the capacities, the slot counters, the row-family bounds and the sorted placement of contact rows;
+- the capacities, the slot counters, the row-family bounds and each world's span of contacts;
 - the status: the per-world overflow latch, the sticky flags, dropped rows, warnings and watermarks.
 
 A step calls :meth:`Placement.begin` (clear the allocation state), then the row pass writes into its slots
-(:meth:`Placement.place_sorted_contact_rows`, :meth:`Placement.close_rows`),
+(:meth:`Placement.close_rows`),
 :meth:`Placement.diagonals` and :meth:`Placement.prepare_impulses`; the rows' writers store their records.
 
 It also holds which placement the class takes: the native sparse size, the sparse-diagonal pair and the row producers.
@@ -26,6 +26,7 @@ import numpy as np
 import warp as wp
 
 from ...core.contact_pool import ContactField, model_contact_pool
+from ...core.ordered_reserve import ORDERED_STATES
 from ...sim import Contacts
 from ...sim.contacts import CAPACITY_BLOCKS_PER_SM, contact_capacity_blocks
 from ...sim.enums import JointType
@@ -39,7 +40,7 @@ from .row_kernels import RIGID_SPEED_ROWS
 from .row_laws import LINK_ROWS
 from .row_metadata import record_layout
 from .row_records import DENSE_ROWS, ROW_RECORDS, RowSupport
-from .row_slots import place_world_contact_runs, record_world_contact_runs
+from .row_slots import RESERVE_TILE, RowOrder
 from .warm_start import PREPARE_LANES, ContactCarry, prepare_world_impulses
 
 # FeatherPGS takes no gradients: its kernels compile no adjoints.
@@ -102,12 +103,12 @@ WORLD_ACTS = FieldGroup(Field("world_acts", wp.int32, ("world",), owner="placeme
 row is separable (:meth:`Placement.hold_acts`); the claims, the one writer and the patch finish leave a world without it
 at its exact solution, zero impulse (P4)."""
 
-CONTACT_RUNS = FieldGroup(
-    Field("contact_run_first", wp.int32, ("world", "run_block"), fill=2**31 - 1, owner="placement"),
-    Field("contact_run_last", wp.int32, ("world", "run_block"), fill=-1, owner="placement"),
-    Field("contact_run_rows", wp.vec2i, ("world", "run_block"), owner="placement"),
+WORLD_CONTACTS = FieldGroup(
+    Field("world_contact_first", wp.int32, ("world",), fill=2**31 - 1, owner="placement"),
+    Field("world_contact_last", wp.int32, ("world",), fill=-1, owner="placement"),
 )
-"""Contact runs of each world and shape block under sorted contacts (``record_world_contact_runs``)."""
+"""The frame positions each world's admitted contacts span (``admit_world_contacts``), from which their rows are
+reserved in the frame's order (``reserve_world_contact_rows``), which resets them."""
 
 ROW_WATERMARKS = FieldGroup(
     *(
@@ -502,12 +503,26 @@ class Placement:
                 "contact_path",
             )
         ]
+        # The row order's records (row_slots.RowOrder).
+        contact_fields += [ContactField(name, wp.vec4i) for name in ("contact_rows_frame", "contact_rows_before")]
+        contact_fields += [
+            ContactField(name, wp.int32)
+            for name in ("contact_admitted_before", "contact_admitted", "contact_pairs_before", "contact_pairs")
+        ]
         # Row builders always receive a zero phi view when patch friction is off.
         contact_fields.append(ContactField("friction_patch_phi", wp.vec2))
         # The warm start's carry by contact identity (:data:`.warm_start.ContactCarry`).
         if self.options.pgs_warmstart:
             contact_fields += [ContactField(field.attr, field.dtype) for field in fields_of(ContactCarry)]
         self.contact_rows = self.contact_pool.rows(contact_fields, on_rows=self._on_contact_rows)
+        # The reservation's ordered scans (row_slots.scan_frame_rows, rank_pairs, scan_pair_rows): a site per list, for
+        # tiles of every row the pool may hold, each list's total, and the grid that strides over the live tiles.
+        tiles = -(-max(self.contact_rows.reserve, 1) // int(RESERVE_TILE))
+        sites = np.zeros((10, ORDERED_STATES + tiles), dtype=np.uint64)
+        sites[:, 1] = 1  # zeroed states carry epoch 0, which no launch uses
+        self.reserve_sites = wp.array(sites, dtype=wp.uint64, device=device)
+        self.reserve_totals = wp.zeros((10, 1), dtype=int, device=device)
+        self.reserve_blocks = 2 * device.sm_count if device.is_cuda else 1
         # The friction patch state and the velocity-limit slots.
         # A contact has a region normal only where neither side is a non-free articulation's link: some body must be
         # free (a free rigid body's, or no articulation's) for any contact to hold one.
@@ -520,17 +535,7 @@ class Placement:
         self.laws.allocate(model, self.contact_pool, self.friction_patch_phi, region_normals=region_normals)
         # Allocated once here: per-step allocation is forbidden under CUDA graph capture.
         arrays.allocate(WORLD_ROW_STATE, world=self.forest.world_count)
-        # Contact runs of each world and block under sorted contacts (record_world_contact_runs):
-        # blocks are the global shapes before every world's, the worlds' own shapes, and the global
-        # shapes after them; 16 bytes per world and block.
-        shape_world_start = model.shape_world_start.numpy() if model.shape_world_start is not None else None
-        if shape_world_start is None or model.shape_count == 0:
-            self.contact_run_lead, self.contact_run_trail_start = 0, int(model.shape_count)
-        else:
-            self.contact_run_lead = int(shape_world_start[0])
-            self.contact_run_trail_start = int(shape_world_start[-2])
-        run_blocks = self.contact_run_lead + 1 + int(model.shape_count) - self.contact_run_trail_start
-        arrays.allocate(CONTACT_RUNS, world=self.forest.world_count, run_block=run_blocks)
+        arrays.allocate(WORLD_CONTACTS, world=self.forest.world_count)
 
     def allocate_size_groups(self) -> None:
         """Each size group's Jacobian: the sparse diagonal's dense part (case K2); a placeholder elsewhere."""
@@ -551,6 +556,16 @@ class Placement:
                 "response_size": response or size,
             }
             self.J_by_size[size] = arrays.allocate(SIZE_JACOBIAN, owner={}, **sizes)["J"]
+
+    def row_order(self, pair_keys) -> RowOrder:
+        """The row order's records (:class:`.row_slots.RowOrder`) over the contact rows, with the frame's pair keys."""
+        order = RowOrder()
+        order.pair_keys = pair_keys
+        order.world_contact_first = self.world_contact_first
+        order.world_contact_last = self.world_contact_last
+        for name in ("rows_frame", "admitted_before", "admitted", "pairs_before", "pairs", "rows_before"):
+            setattr(order, name, getattr(self, f"contact_{name}"))
+        return order
 
     def _on_contact_rows(self, rows) -> None:
         """Assign the per-contact buffers at the contact pool's ready rows, on creation and after each growth."""
@@ -837,81 +852,6 @@ class Placement:
             inputs=[self.row_slot_counter, self.row_first_rejected, self.row_count, self.row_dropped_all],
             outputs=[self.world_acts],
             device=self.model.device,
-        )
-
-    def place_sorted_contact_rows(
-        self, contacts, contact_build_threads, mf_slot_counter, mf_first_rejected_slot, units: wp.array
-    ):
-        """Give each world's contact rows the order of sorted contacts, whatever order the allocator reserved them in.
-
-        Runs only when the contacts come from a deterministic collision pipeline
-        (``Contacts.rigid_contacts_pair_sorted``), whose determinism Newton promises when the
-        solver is deterministic as well; the default pipeline keeps the allocator's atomic
-        reservation, whose order on CUDA follows the warps. A captured step keeps the order of
-        its capture. Dense rows are placed; matrix-free rows are placed with free rigid bodies. ``units``: the one writer's unit sources, which follow the placed slots (empty where the writer
-        does not take the contact rows).
-        """
-        order_dense = 1
-        order_mf = int(self.forest.has_free_rigid_bodies)
-        device = self.model.device
-        runs = (self.contact_run_first, self.contact_run_last, self.contact_run_rows)
-        blocks = (self.contact_run_lead, self.contact_run_trail_start)
-        # Each contact's family: the free bodies' contacts follow the line's other contact rows, in their own run or,
-        # where they are rows of the line (free_contact_rows false), after its others from the one counter.
-        is_free_rigid = self.forest.is_free_rigid if self.forest.is_free_rigid is not None else self.dummy_is_free_rigid
-        free_line = int(self.forest.has_free_rigid_bodies and not self.free_contact_rows)
-        families = (
-            self.contact_art_a,
-            self.contact_art_b,
-            is_free_rigid,
-            self.forest.articulation_response_dof_count,
-            free_line,
-        )
-        # Complete warps on CUDA, whose lanes merge each run's contacts before recording it.
-        lanes = 32 if device.is_cuda else 1
-        record_threads = -(-contact_build_threads // lanes) * lanes
-        # Its warps merge runs, so the grid stays whole: no extent follows the count.
-        self.contact_pool.launch(
-            record_world_contact_runs,
-            record_threads,
-            inputs=[
-                contacts.rigid_contact_count,
-                record_threads,
-                lanes,
-                contacts.rigid_contact_shape0,
-                self.laws.friction_patches.position,
-                self.contact_world,
-                self.contact_path,
-                self.contact_slots_needed,
-                *families,
-                order_dense,
-                order_mf,
-                *blocks,
-            ],
-            outputs=list(runs),
-        )
-        # One complete warp per world on CUDA, whose lanes sum each other's rows.
-        wp.launch(
-            place_world_contact_runs,
-            dim=(self.forest.world_count, lanes),
-            inputs=[
-                contacts.rigid_contact_shape0,
-                self.laws.friction_patches.position,
-                self.contact_world,
-                self.contact_path,
-                self.contact_slots_needed,
-                *families,
-                self.slot_counter,
-                self.dense_first_rejected_slot,
-                mf_slot_counter,
-                mf_first_rejected_slot,
-                self.body_base,
-                *blocks,
-                lanes,
-                self.dense_first,
-            ],
-            outputs=[*runs, self.contact_slot, units],
-            device=device,
         )
 
     def close_rows(self, contacts: Contacts | None, families: int, warn: bool) -> None:

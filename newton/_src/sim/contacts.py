@@ -380,6 +380,7 @@ class Contacts:
                 ContactField("rigid_contact_margin0", wp.float32),
                 ContactField("rigid_contact_margin1", wp.float32),
                 ContactField("rigid_contact_tids", wp.int32, -1),
+                ContactField("rigid_contact_key", wp.int64),
                 ContactField("rigid_contact_force", wp.vec3),
             ]
             if per_contact_shape_properties:
@@ -435,6 +436,11 @@ class Contacts:
             self.rigid_contact_margin1: wp.array[wp.float32]
             """Surface thickness for shape 1: effective radius + margin [m], shape (rigid_contact_max,), dtype float."""
             self.rigid_contact_tids: wp.array[wp.int32]
+            self.rigid_contact_key: wp.array[wp.int64]
+            """Each contact's identity in its pass: its shapes and the feature of its pair that made it (the
+            collision's sort sub key), packed in 63 bits (:func:`make_contact_sort_key_with_bits`), unique among a pass's
+            contacts, shape (rigid_contact_max,), dtype int64. Solvers order contacts by it, never by their written
+            order, which follows the GPU's threads."""
             # to be filled by the solver (currently unused)
             self.rigid_contact_force: wp.array[wp.vec3]
             """Contact force [N], shape (rigid_contact_max,), dtype :class:`vec3`."""
@@ -649,12 +655,6 @@ class Contacts:
 
         self.soft_contact_max = soft_contact_max
         self._rigid_contact_body_pair_reduced = False
-
-        self.rigid_contacts_pair_sorted = False
-        """Provenance: whether the pipeline that last wrote this buffer sorts
-        contacts into contiguous same-shape-pair runs (deterministic sort or
-        any contact-matching mode). Consumers whose kernels assume pair-run
-        contiguity (e.g. FeatherPGS friction anchors) must check this."""
 
     def _on_rigid_rows(self, rows: ContactRows) -> None:
         """Assign the rigid arrays at the pool's ready rows, on creation and after each growth."""

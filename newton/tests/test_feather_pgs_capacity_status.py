@@ -12,7 +12,13 @@ import warp as wp
 
 import newton
 from newton.solvers import SolverFeatherPGS
-from newton.tests.feather_pgs_law_harness import allocate_contacts, anchored_patches, contact_input, finalize_counts
+from newton.tests.feather_pgs_law_harness import (
+    allocate_contacts,
+    anchored_patches,
+    contact_input,
+    finalize_counts,
+    row_order,
+)
 
 
 def _allocator_arrays(capacity, *, route=0, count=205, device="cpu"):
@@ -79,7 +85,7 @@ def _allocate(arrays):
     """
     device = arrays["contact_count"].device
     data, _arrays = contact_input(arrays, device)
-    allocate_contacts({**arrays, "data": data}, 1, device)
+    allocate_contacts({**arrays, "data": data}, device)
     for family, counter, capacity, first_rejected in (
         (0, "world_slot_counter", "max_constraints", "dense_first_rejected_slot"),
         (1, "mf_slot_counter", "mf_max_constraints", "mf_first_rejected_slot"),
@@ -229,9 +235,11 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
                 slots = arrays["contact_slot"].numpy()
                 paths = arrays["contact_path"].numpy()
                 self.assertEqual(int(np.sum(slots >= 0)), accepted)
-                np.testing.assert_array_equal(slots[:accepted], np.arange(accepted) * 3)
-                np.testing.assert_array_equal(slots[accepted:], -np.ones(205 - accepted, dtype=np.int32))
-                np.testing.assert_array_equal(paths[:accepted], np.zeros(accepted, dtype=np.int32))
+                # The world's rows follow its row order: the first ``accepted`` contacts in it hold the rows.
+                order = row_order(np.arange(205))
+                np.testing.assert_array_equal(slots[order[:accepted]], np.arange(accepted) * 3)
+                np.testing.assert_array_equal(slots[order[accepted:]], -np.ones(205 - accepted, dtype=np.int32))
+                np.testing.assert_array_equal(paths[order[:accepted]], np.zeros(accepted, dtype=np.int32))
                 np.testing.assert_array_equal(arrays["contact_slots_needed"].numpy(), np.full(205, 3))
                 self.assertEqual(int(arrays["world_slot_counter"].numpy()[0]), 205 * 3)
                 expected_first_rejected = accepted * 3 if overflow else 2**31 - 1

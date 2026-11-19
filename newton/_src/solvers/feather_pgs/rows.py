@@ -63,8 +63,14 @@ from .row_laws import LINK_ROWS, ROW_LAW
 from .row_records import UNIT_LIMIT, UNIT_MIMIC, UNIT_SHIFT, UNIT_VELOCITY, RowSupport
 from .row_records import bind as bind_dense_rows
 from .row_slots import (
+    RESERVE_BLOCK,
     admit_world_contacts,
-    allocate_world_contact_slots,
+    advance_world_contact_rows,
+    list_pairs,
+    rank_pairs,
+    reserve_world_contact_rows,
+    scan_frame_rows,
+    scan_pair_rows,
     snapshot_dense_phase_bound,
 )
 from .sweep_plan import FREE_ROUTE
@@ -800,13 +806,12 @@ class RowLaws:
             # Sized for the bound in a capture whose launches bind: every replay runs them at the live
             # count and strides with the captured threads (ContactPool.launch); otherwise for the ready rows.
             rows = pool.launch_rows()
-            contact_build_threads = min(rows, _CONTACT_BUILD_THREAD_CAP)
 
             self._build_friction_patches(solver, state_in, contacts)
 
             # The allocation reads the contacts, the bodies and the row law, and writes the contacts' allocation
             # records, through one struct (contact_input.ContactInput) bound to the frame's records: each contact is
-            # admitted and sized in the frame's order, then its rows reserved in the collision's written order.
+            # admitted and sized in the frame's order, then its rows reserved in that order.
             contact_input = bind_contact_input(solver, state_in, state_aug, contacts, dt, 1.0)
             # A contact whose rows may act at the predictor marks its world (Placement.world_acts).
             pool.launch(
@@ -828,7 +833,12 @@ class RowLaws:
                     self.friction_patches.view,
                     solver.placement.acts_twists,
                 ],
-                outputs=[solver.placement.world_acts],
+                outputs=[
+                    solver.placement.world_acts,
+                    solver.placement.world_contact_first,
+                    solver.placement.world_contact_last,
+                    solver.placement.reserve_totals,
+                ],
                 extent=count,
                 max_blocks=solver.placement.contact_capacity_blocks,
             )
@@ -836,32 +846,67 @@ class RowLaws:
             # The one writer's contact rows are its own to fill: their unit sources are written where their slots are
             # reserved.
             units = solver.placement.unit_source if producer == "walk" else solver.placement.no_units
+            # The row order (row_slots._row_pair: each world's body pairs at a golden-ratio stride, a pair's contacts
+            # together): the rows counted in the frame's order, the pairs ranked and listed, their rows counted in
+            # the row order, parallel inside a world; then each contact's rows, a thread a contact; then each world's
+            # counters.
+            placement = solver.placement
+            order = placement.row_order(self.friction_patches.current.keys)
+            scans = [contact_input, placement.reserve_blocks, placement.reserve_sites, order]
+            for scan in (scan_frame_rows, rank_pairs):
+                wp.launch_tiled(
+                    scan,
+                    dim=[placement.reserve_blocks],
+                    inputs=scans,
+                    outputs=[placement.reserve_totals],
+                    block_dim=RESERVE_BLOCK,
+                    device=model.device,
+                )
             pool.launch(
-                allocate_world_contact_slots,
-                contact_build_threads,
+                list_pairs,
+                rows,
+                inputs=[contact_input, order],
+                extent=count,
+                max_blocks=placement.contact_capacity_blocks,
+            )
+            wp.launch_tiled(
+                scan_pair_rows,
+                dim=[placement.reserve_blocks],
+                inputs=scans,
+                outputs=[placement.reserve_totals],
+                block_dim=RESERVE_BLOCK,
+                device=model.device,
+            )
+            pool.launch(
+                reserve_world_contact_rows,
+                rows,
                 inputs=[
                     contact_input,
-                    contact_build_threads,
                     max_constraints,
-                    solver.placement.mf_max_constraints,
+                    placement.mf_max_constraints,
                     1,
+                    order,
+                    placement.slot_counter,
+                    mf_slot_counter,
+                    placement.reserve_totals,
                 ],
                 outputs=[
-                    solver.placement.slot_counter,
-                    mf_slot_counter,
                     dense_dropped_rows,
                     mf_dropped_rows,
-                    solver.placement.dense_first_rejected_slot,
+                    placement.dense_first_rejected_slot,
                     mf_first_rejected_slot,
                     units,
                 ],
                 extent=count,
-                clamp=True,
+                max_blocks=placement.contact_capacity_blocks,
             )
-            if contacts.rigid_contacts_pair_sorted:
-                solver.placement.place_sorted_contact_rows(
-                    contacts, contact_build_threads, mf_slot_counter, mf_first_rejected_slot, units
-                )
+            wp.launch(
+                advance_world_contact_rows,
+                dim=solver.forest.world_count,
+                inputs=[count, placement.reserve_totals, order],
+                outputs=[placement.slot_counter, mf_slot_counter],
+                device=model.device,
+            )
 
     def bound_free_body_contacts(self, solver) -> None:
         """Record where the free bodies' contact rows end in their run: every contact and friction row precedes the

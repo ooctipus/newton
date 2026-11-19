@@ -2389,6 +2389,29 @@ class TestBodyPairReductionHysteresis(unittest.TestCase):
         self.assertEqual(rows_h, rows_f)
 
 
+def _pile_energy(model, state) -> float:
+    """The bodies' kinetic energy plus their potential energy in gravity along z [J] (``body_qd`` is linear, then
+    angular velocity, of the body origin; these bodies' centres of mass sit at their origins)."""
+    q, qd = state.body_q.numpy().astype(np.float64), state.body_qd.numpy().astype(np.float64)
+    mass, inertia = model.body_mass.numpy().astype(np.float64), model.body_inertia.numpy().astype(np.float64)
+    x, y, z, w = q[:, 3], q[:, 4], q[:, 5], q[:, 6]
+    rotation = np.stack(
+        [
+            np.stack([1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)], -1),
+            np.stack([2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)], -1),
+            np.stack([2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)], -1),
+        ],
+        1,
+    )
+    world_inertia = rotation @ inertia @ np.transpose(rotation, (0, 2, 1))
+    linear, angular = qd[:, :3], qd[:, 3:]
+    kinetic = 0.5 * (mass * (linear * linear).sum(1)).sum() + 0.5 * np.einsum(
+        "bi,bij,bj->", angular, world_inertia, angular
+    )
+    com_height = q[:, 2] + (rotation @ model.body_com.numpy().astype(np.float64)[:, :, None])[:, 2, 0]
+    return float(kinetic + 9.81 * (mass * com_height).sum())
+
+
 class TestBodyPairReductionVerifier(unittest.TestCase):
     """The verify mode re-derives every keep/discard decision and finds zero disagreements."""
 
@@ -2475,7 +2498,14 @@ class TestBodyPairReductionVerifier(unittest.TestCase):
         body has seven offset colliders, so the test cannot pass solely through
         the reducer's one-collider identity path. At least one frame must
         strictly reduce; the invariant verifier must stay clean; and the
-        supported FeatherPGS consumer must remain finite and above the ground.
+        supported FeatherPGS consumer must remain finite and above the ground and
+        gain no energy: the pile's kinetic plus potential energy never rises past
+        its running minimum by 1% of its start (:func:`_pile_energy`).
+
+        Measured on the GB300 over 20 such piles: largest rises 0.01% of the start
+        on 18fdff153 and 0.02% after the row-order change, while single light
+        colliders spin at 100-240 rad/s on the energy an impact hands them; a peak
+        speed against one unreduced (equally chaotic) run is no measure of a gain.
         """
         rng = np.random.default_rng(1234)
         for trial in range(3):
@@ -2516,7 +2546,9 @@ class TestBodyPairReductionVerifier(unittest.TestCase):
             # Three matrix-free rows per contact for 4,096 contacts, more than the pile makes.
             mf_capacity = 3 * 4096
             solver = newton.solvers.SolverFeatherPGS(model, angular_damping=0.0, mf_max_constraints=mf_capacity)
-            raw_not_less, strict_reduction_frames, peak_red = 0, 0, 0.0
+            raw_not_less, strict_reduction_frames = 0, 0
+            start = lowest = _pile_energy(model, state_0)
+            gain = 0.0
             for _ in range(150):
                 pipe_raw.collide(state_0, c_raw)
                 pipe_red.collide(state_0, c_red)
@@ -2527,27 +2559,11 @@ class TestBodyPairReductionVerifier(unittest.TestCase):
                 state_0.clear_forces()
                 solver.step(state_0, state_1, control, c_red, DT)
                 state_0, state_1 = state_1, state_0
-                peak_red = max(peak_red, float(np.abs(state_0.body_qd.numpy()).max()))
-
-            # Reference peak from the SAME pile and same solver family, driven
-            # by unreduced contacts. An absolute bound flakes on a random pile,
-            # whose peak speed can legitimately be large in either pipeline.
-            raw_state_0, raw_state_1 = model.state(), model.state()
-            newton.eval_fk(model, raw_state_0.joint_q, raw_state_0.joint_qd, raw_state_0)
-            raw_control = model.control()
-            raw_dynamics_pipeline = newton.CollisionPipeline(model, broad_phase="nxn", growable_contacts=True)
-            raw_dynamics_contacts = raw_dynamics_pipeline.contacts()
-            raw_solver = newton.solvers.SolverFeatherPGS(model, angular_damping=0.0, mf_max_constraints=mf_capacity)
-            peak_raw = 0.0
-            for _ in range(150):
-                raw_dynamics_pipeline.collide(raw_state_0, raw_dynamics_contacts)
-                raw_state_0.clear_forces()
-                raw_solver.step(raw_state_0, raw_state_1, raw_control, raw_dynamics_contacts, DT)
-                raw_state_0, raw_state_1 = raw_state_1, raw_state_0
-                peak_raw = max(peak_raw, float(np.abs(raw_state_0.body_qd.numpy()).max()))
+                energy = _pile_energy(model, state_0)
+                gain = max(gain, energy - lowest)
+                lowest = min(lowest, energy)
 
             solver.check_constraint_capacity()
-            raw_solver.check_constraint_capacity()
             stats = pipe_red._body_pair_reducer.stats()
             self.assertEqual(stats["invariant_violations"], 0, f"trial {trial}")
             self.assertEqual(raw_not_less, 150, f"trial {trial}: reduction increased a count")
@@ -2555,7 +2571,7 @@ class TestBodyPairReductionVerifier(unittest.TestCase):
             body_q = state_0.body_q.numpy()
             qd = state_0.body_qd.numpy()
             self.assertTrue(np.isfinite(body_q).all() and np.isfinite(qd).all())
-            self.assertLess(peak_red, max(3.0 * peak_raw, 10.0), f"trial {trial}: pile blew up")
+            self.assertLess(gain, 0.01 * start, f"trial {trial}: the pile gained energy")
             self.assertGreater(float(body_q[bodies, 2].min()), -0.06, f"trial {trial}: body tunneled")
 
 

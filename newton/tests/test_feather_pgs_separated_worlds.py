@@ -85,9 +85,9 @@ def _contact_acts(
     acts, counter = ints([0]), ints([0])
     flags = [0, int(BodyFlags.KINEMATIC) if kinematic_b else 0]
     published = wp.array(twist if twists else [], dtype=wp.spatial_vector, device=device)
-    # The allocator's arguments in order: one thread; the bodies' trees and world, flags, coordinates and free flags;
-    # no free bodies' run, no gap gates, capacities of eight rows, friction, its gap, no telemetry, the patches, twists.
-    inputs = [data, 1, ints([0, 1]), ints([0, 0]), ints(flags), ints([1, 1]), ints([0, 0]), 0, 0.0, 0.0, 0.0, 8, 8, 1]
+    # The allocator's arguments in order: the bodies' trees and world, flags, coordinates and free flags; no free
+    # bodies' run, no gap gates, capacities of eight rows, friction, its gap, no telemetry, the patches, twists.
+    inputs = [data, ints([0, 1]), ints([0, 0]), ints(flags), ints([1, 1]), ints([0, 0]), 0, 0.0, 0.0, 0.0, 8, 8, 1]
     outputs = [acts, counter, ints([0]), ints([0]), ints([0]), ints([2**31 - 1]), ints([2**31 - 1])]
     allocate_contacts(
         [
@@ -99,7 +99,6 @@ def _contact_acts(
             *outputs,
             wp.zeros((0, 0), dtype=wp.int32, device=device),
         ],
-        1,
         device,
     )
     return int(acts.numpy()[0]), int(data.slot.numpy()[0])

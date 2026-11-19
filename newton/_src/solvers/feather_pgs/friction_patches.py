@@ -389,6 +389,7 @@ class _PatchContacts:
     shape_mu: wp.array[float]
     shape_gap: wp.array[float]
     body_radius: wp.array[float]
+    body_code: wp.array[int]
     q: wp.array[wp.transform]
     body_to_articulation: wp.array[int]
     is_free_rigid: wp.array[int]
@@ -401,12 +402,24 @@ class _PatchContacts:
 
 @wp.func
 def _pair_code(body: int, shape: int, inputs: _PatchContacts):
-    """A contact side's code in its pair key: its body plus one, or for a static or missing shape a code above every
-    body's."""
-    code = body + 1
+    """A contact side's code in its pair key: its body's (:func:`body_codes`), or for a static or missing shape a code
+    above every body's."""
     if body < 0:
-        code = inputs.q.shape[0] + (shape if shape >= 0 else inputs.shape_body.shape[0]) + 1
-    return code
+        return inputs.q.shape[0] + (shape if shape >= 0 else inputs.shape_body.shape[0]) + 1
+    return inputs.body_code[body]
+
+
+def body_codes(body_world: np.ndarray) -> np.ndarray:
+    """Each body's code in a pair key, 1 to the body count: the bodies of the worlds first, in index order, then the
+    global ones (world -1).
+
+    A pair's lower code is then its world body's wherever one side is a world's (static shapes code above every
+    body), and the model numbers each world's bodies after the last world's, so the frame's pair order lays each
+    world's contacts out in one run of positions (:func:`.row_slots.reserve_world_contact_rows`)."""
+    order = np.argsort(np.asarray(body_world) < 0, kind="stable")
+    codes = np.empty(len(order), dtype=np.int32)
+    codes[order] = np.arange(1, len(order) + 1, dtype=np.int32)
+    return codes
 
 
 @wp.func
@@ -2040,6 +2053,9 @@ class _FrictionPatchState:
         # The pair sort skips the key bits no pair key can set.
         self.key_stride, self.key_bits = _pair_key_layout(model.body_count, model.shape_body.shape[0])
         self.body_world = model.body_world
+        # Each body's code in a pair key: the worlds' bodies first (body_codes).
+        world = model.body_world.numpy() if model.body_count else np.zeros(0, dtype=np.int32)
+        self.body_code = wp.array(body_codes(world), dtype=int, device=device)
         self.body_radius = wp.zeros(model.body_count, dtype=float, device=device)
         # The contact frame whose pairs the current slots hold sorted, as
         # (generation, live count, contact stream); the sentinel generation makes
@@ -2344,7 +2360,7 @@ class _FrictionPatchState:
         # The token identifies the contact stream, also across graphs captured with other Contacts instances.
         stream = self.stream_token(generation)
         self._launch_prepare([*prepare_inputs, generation, stream, self.sorted_frame])
-        self._order_pairs()
+        self._order_pairs(contacts.rigid_contact_key)
         self._launch_prepare_contacts(collision, prepare_inputs[1])
         self._launch_build(model, state, generation, stream)
 
@@ -2458,7 +2474,7 @@ class _FrictionPatchState:
             model.shape_material_mu,
             model.shape_gap,
         )
-        inputs.body_radius, inputs.q = self.body_radius, state.body_q
+        inputs.body_radius, inputs.body_code, inputs.q = self.body_radius, self.body_code, state.body_q
         inputs.body_to_articulation, inputs.is_free_rigid = body_to_articulation, is_free_rigid
         inputs.contact_gap_gate = contact_gap_gate
         inputs.same_articulation_gap_gate = same_articulation_gap_gate
@@ -2474,15 +2490,16 @@ class _FrictionPatchState:
             self.current,
         ]
 
-    def _order_pairs(self):
-        """Sort the prepared slots by pair key, the work that only a new contact frame needs.
+    def _order_pairs(self, ties):
+        """Sort the prepared slots by pair key, then by each contact's key (``ties``, the collision's
+        ``rigid_contact_key``), the work that only a new contact frame needs.
 
         The live sort follows the work the prepare published, none for a kept
         frame, so work added here must leave outputs that stay valid while later
         builds keep the frame.
         """
         if self.live_sort:
-            self._sort_live()
+            self._sort_live(ties)
         else:
             # Empty slots hold INT64_MAX, whose low key_bits are all ones: no pair
             # key exceeds them, and the stable sort keeps live slots ahead of a tie,
@@ -2491,12 +2508,11 @@ class _FrictionPatchState:
             self.pool.note_unbound()
             wp.utils.radix_sort_pairs(self.current.keys, self.current.indices, self.capacity, end_bit=self.key_bits)
 
-    def _sort_live(self):
-        """Stably sort the live slots by pair key and leave every other slot untouched.
+    def _sort_live(self, ties):
+        """Sort the live slots by (pair key, contact key) and leave every other slot untouched.
 
-        A stable sort of slots [0, live) from indices c is the unique order by
-        (key, c), which the full radix sort produces; slots past live already
-        hold the empty record that sort leaves there. The launches follow the
+        The contact keys are unique in a pass, so the order is the geometry's alone, whatever order the
+        collision wrote its contacts in; slots past live already hold the empty record. The launches follow the
         sort's work that the prepare published: a capture launches the chunk
         sort over the live chunks and only the merges the live slots need. The
         scratch half starts at the ready rows, which a capture's updater
@@ -2514,6 +2530,7 @@ class _FrictionPatchState:
             merges=self.merges,
             merge_threads=self.merge_threads,
             slot_keys=True,
+            ties=ties,
         )
 
     def link(self, world, slot, path, slots_needed, routes):
