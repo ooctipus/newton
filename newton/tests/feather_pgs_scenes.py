@@ -13,7 +13,10 @@ also exercise impact and settling.
 Scenes by topology:
 
 - free rigid bodies: :func:`box_drop`, :func:`box_stack`, :func:`incline`,
-  :func:`ball_drop`, :func:`heightfield`, :func:`box_push`;
+  :func:`ball_drop`, :func:`heightfield`, :func:`box_push`; two free bodies a
+  world, so their contacts take the free bodies' run (the region route on the
+  CPU): :func:`incline_pair` and :func:`curved_patch` (a box on one region whose
+  contacts' normals differ, a cone of shallow facets);
 - fixed-base articulations without contact: :func:`chain`, :func:`four_bar`,
   :func:`mimic_pair`, :func:`spring_hinge`, :func:`pushed_arm`;
 - articulations in contact: :func:`legged` (a free-floating base on legs),
@@ -97,12 +100,21 @@ class Scene:
 
 
 def _cfg(
-    *, mu: float = 0.5, density: float = 1000.0, restitution: float = 0.0, gap: float | None = None, group: int = 1
+    *,
+    mu: float = 0.5,
+    density: float = 1000.0,
+    restitution: float = 0.0,
+    gap: float | None = None,
+    group: int = 1,
+    material: tuple[float, float] | None = None,
 ):
-    """A shape configuration; ``gap`` ``None`` keeps the builder's :data:`RIGID_GAP`."""
+    """A shape configuration; ``gap`` ``None`` keeps the builder's :data:`RIGID_GAP`; ``material`` authors the shape's
+    contact stiffness and damping ``(ke, kd)`` (:attr:`~newton.ShapeFlags.CONTACT_MATERIAL`)."""
     cfg = newton.ModelBuilder.ShapeConfig(mu=mu, density=density, restitution=restitution, collision_group=group)
     if gap is not None:
         cfg.gap = gap
+    if material is not None:
+        cfg.ke, cfg.kd = material
     return cfg
 
 
@@ -154,14 +166,16 @@ def _sphere_inertia(mass: float, radius: float) -> wp.mat33:
     return wp.mat33(np.eye(3, dtype=np.float32) * np.float32(0.4 * mass * radius * radius))
 
 
-def _free_box(builder, position, rotation=None, *, half=0.1, mass=1.0, mu=0.5, restitution=0.0):
-    """Add a free cube of half extent ``half`` and explicit mass; returns its body."""
+def _free_box(builder, position, rotation=None, *, half=0.1, mass=1.0, mu=0.5, restitution=0.0, material=None):
+    """Add a free cube of half extent ``half`` and explicit mass (``material``: its authored ``(ke, kd)``); returns its
+    body."""
     body = builder.add_body(
         xform=wp.transform(wp.vec3(*position), rotation or wp.quat_identity()),
         mass=mass,
         inertia=_box_inertia(mass, half, half, half),
     )
-    builder.add_shape_box(body, hx=half, hy=half, hz=half, cfg=_cfg(mu=mu, density=0.0, restitution=restitution))
+    cfg = _cfg(mu=mu, density=0.0, restitution=restitution, material=material)
+    builder.add_shape_box(body, hx=half, hy=half, hz=half, cfg=cfg)
     return body
 
 
@@ -241,6 +255,67 @@ def incline(*, angle: float = 0.35, mus: tuple[float, ...] = (0.6, 0.15)) -> Sce
         params={"mu": list(mus), "angle": angle, "normal": tuple(normal), "downhill": downhill},
         passive=True,
     )
+
+
+def incline_pair(*, angle: float = 0.35, mus: tuple[float, ...] = (0.6, 0.15)) -> Scene:
+    """:func:`incline` with a second box per world 2 m up the plane: one world sticks, the other slides, and each
+    world holds two free bodies (the free bodies' run)."""
+    rotation = wp.quat_from_axis_angle(wp.vec3(0.0, 1.0, 0.0), angle)
+    normal = np.array([math.sin(angle), 0.0, math.cos(angle)])
+    downhill = np.array([math.cos(angle), 0.0, -math.sin(angle)])
+
+    def build(device):
+        builder = _builder()
+        for mu in mus:
+            builder.begin_world()
+            builder.add_shape_plane(xform=wp.transform(wp.vec3(0.0), rotation), width=0.0, length=0.0, cfg=_cfg(mu=mu))
+            _free_box(builder, tuple(normal * 0.102), rotation, mu=mu)
+            _free_box(builder, tuple(normal * 0.102 - 2.0 * downhill), rotation, mu=mu)
+            builder.end_world()
+        return _finalize(builder, device)
+
+    return Scene(
+        "incline_pair", build, dt=1.0 / 240.0, steps=40, params={"mu": list(mus), "angle": angle}, passive=True
+    )
+
+
+def curved_patch(
+    *,
+    mu: float = 0.02,
+    slope: float = 3.0,
+    offset: tuple[float, float] = (0.05, 0.02),
+    material: tuple[float, float] | None = None,
+) -> Scene:
+    """A 0.2 m, 1 kg box resting off-centre in a static cone of 16 facets inclined ``slope`` degrees (a bowl of
+    radius 0.5 m), beside a second box far off (the free bodies' run). The box's contacts on the facets form one
+    region whose contacts' normals differ by up to about ``slope`` degrees: under friction ``mu`` below the slope the
+    box slides toward the axis, and how it slides depends on which normal its contacts act along (the region law's one
+    normal or each contact's own): the truth case of a curved patch. ``material`` authors every shape's contact
+    stiffness and damping ``(ke, kd)``."""
+
+    def build(device):
+        builder = _builder()
+        facets, radius = 16, 0.5
+        rise = radius * math.tan(math.radians(slope))
+        rim = [
+            (radius * math.cos(2.0 * math.pi * k / facets), radius * math.sin(2.0 * math.pi * k / facets), rise)
+            for k in range(facets)
+        ]
+        vertices = np.array([(0.0, 0.0, 0.0), *rim, (0.0, 0.0, -0.2)], dtype=np.float32)
+        indices = []
+        for k in range(facets):
+            a, b = 1 + k, 1 + (k + 1) % facets
+            indices += [0, a, b, facets + 1, b, a]
+        mesh = newton.Mesh(vertices, np.array(indices, dtype=np.int32))
+        builder.add_shape_mesh(-1, mesh=mesh, cfg=_cfg(mu=mu, material=material))
+        rotation = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), 0.3)
+        height = 0.1 + 0.1 * math.sqrt(2.0) * math.tan(math.radians(slope)) + 0.001
+        _free_box(builder, (offset[0], offset[1], height), rotation, mu=mu, material=material)
+        _free_box(builder, (3.0, 0.0, 0.5), mu=mu, material=material)
+        return _finalize(builder, device)
+
+    name = "curved_patch" if material is None else "curved_patch_authored"
+    return Scene(name, build, dt=1.0 / 240.0, steps=60, params={"mu": [mu], "slope": slope}, passive=True)
 
 
 def ball_drop(*, restitutions: tuple[float, ...] = (0.5, 0.0), height: float = 0.5) -> Scene:

@@ -54,6 +54,9 @@ class Pins:
     """The Jacobi tiers' row bound, on any class whose response they form (0: no tiers)."""
     tier_sweeps: int | None = None
     """Every Jacobi tier's sweep budget, in place of the equal-accuracy rule."""
+    regions: bool = True
+    """``False``: the free bodies' contacts stay rows (the colored and the general sweep's row mappings) where the rule
+    would make them regions, so a test solves one state on both mappings."""
 
     def record(self) -> dict:
         """The pins in force (those off their defaults) as a JSON-compliant record."""

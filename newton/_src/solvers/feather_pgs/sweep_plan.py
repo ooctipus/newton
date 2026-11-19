@@ -509,6 +509,7 @@ class Sweep:
             if (
                 self.placement.free_contact_rows
                 and not colored
+                and self.pins.regions
                 and not self.options.pgs_warmstart
                 and self.factor.walk_arts is not None
                 and self.forest.free_rigid_body_count > 0
