@@ -252,6 +252,8 @@ def _admit_world_contact(
         articulation_pair_contact_gap_gate,
         twists,
     )
+    if data.acts.shape[0] > 0:
+        data.acts[c] = wp.where(admitted and not separating, 1, 0)
     if not admitted:
         # Its world still names the run of frame positions it lies in (_heads_pair).
         data.world[c] = world
@@ -318,8 +320,9 @@ def admit_world_contacts(
     without rows has ``slot`` and ``path`` -1. A positive contact gap gate excludes wider speculative contacts before
     any route reserves rows; zero disables the gate.
 
-    An admitted contact whose rows may act at the predictor marks its world's ``acts`` word
-    (:data:`.placement.WORLD_ACTS`; empty: no word).
+    Each contact's verdict (``data.acts``) is 1 where it is admitted and its rows may act at the predictor (its normal
+    does not separate, :func:`.row_laws.separates`, or the predictor publishes no twist), else 0 (empty: no verdict);
+    such a contact marks its world's ``acts`` word (:data:`.placement.WORLD_ACTS`; empty: no word).
     """
     c = wp.tid()
     if c == 0:

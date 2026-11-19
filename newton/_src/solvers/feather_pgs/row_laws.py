@@ -62,11 +62,14 @@ SEPARATION_MARGIN = wp.constant(1.0e-5)
 SEPARATION_SCALE = wp.constant(2.0**-20)
 
 
-@wp.func
+@ROW_LAW.law
 def separates(residual: float, magnitude: float) -> bool:
-    """Whether a row keeps its zero impulse (P4): its residual at the predictor ``J v_hat + b`` stays above
-    ``SEPARATION_MARGIN`` [m/s] plus ``SEPARATION_SCALE`` of its terms' ``magnitude``, so the complete path's own
-    rounding of it is positive too (the joint limits' native form: :func:`.prefix_rows.limits`)."""
+    """Whether a unilateral row keeps its zero impulse at a motion: its residual there (at the predictor,
+    ``J v_hat + b``) stays above ``SEPARATION_MARGIN`` [m/s] plus ``SEPARATION_SCALE`` of its terms' ``magnitude``, so
+    the complete path's own rounding of it is positive too. The one verdict of every unilateral row: a contact normal
+    (:func:`.row_slots._admit_contact`), a joint position-limit side (:func:`.prefix_rows.limits`), a joint
+    velocity-limit side and a free body's speed row; a row that does not separate is marked (it may act), and a world
+    none of whose rows is marked keeps zero impulse (P4)."""
     margin = SEPARATION_MARGIN + SEPARATION_SCALE * magnitude
     return wp.isfinite(residual) and wp.isfinite(margin) and residual >= margin
 

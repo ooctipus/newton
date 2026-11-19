@@ -17,7 +17,6 @@ from . import field_group
 from .device_preludes import substitute
 from .field_group import Field, FieldGroup
 from .joint_table import JOINTS
-from .row_laws import SEPARATION_MARGIN, SEPARATION_SCALE
 from .row_records import RECORDS
 
 LAW = (
@@ -98,7 +97,6 @@ def limits(coordinates, dof: str, law: str) -> tuple:
     """The joint-limit family; ``dof`` is coordinate ``d``'s joint DOF, ``law`` the accessor of :data:`LAW`. An active
     side whose residual at the predictor ``w0 v_hat + rhs`` may not separate (:func:`.row_laws.separates`) marks its
     world's acts word."""
-    margin = f"{float(SEPARATION_MARGIN)!r}f + {float(SEPARATION_SCALE)!r}f * (fabsf(speed) + fabsf(bias))"
     return _family(
         coordinates,
         "limit_coordinates",
@@ -116,8 +114,7 @@ def limits(coordinates, dof: str, law: str) -> tuple:
                 if (active && {law}acts.shape[0] > 0) {{
                     const float speed = w0 * {law}vhat.data[dof];
                     const float bias = RowLaw::limit_rhs(phi, beta, 0.0f, 1.0f / {law}dt, 1.0f, 1.0f);
-                    const float margin = {margin};
-                    if (!(isfinite(speed + bias) && isfinite(margin) && speed + bias >= margin))
+                    if (!RowLaw::separates(speed + bias, fabsf(speed) + fabsf(bias)))
                         {law}acts.data[world] = 1;
                 }}
             }}""",

@@ -37,6 +37,9 @@ CONTACT_INPUT = (
     Field("art1", wp.int32, ("contact",), attr="contact_art_b", owner="placement"),
     Field("path", wp.int32, ("contact",), attr="contact_path", owner="placement"),
     Field("slots_needed", wp.int32, ("contact",), attr="contact_slots_needed", owner="placement"),
+    # Whether the contact's rows may act at the predictor (1) or keep zero impulse there (0, or no rows): its normal's
+    # verdict by the one unilateral law (row_laws.separates).
+    Field("acts", wp.int32, ("contact",), attr="contact_acts", owner="placement"),
     # Shapes, bodies and articulations.
     Field("shape_body", wp.int32, ("shape",), owner="model"),
     Field("body_q", wp.transform, ("body",), owner="state_in"),

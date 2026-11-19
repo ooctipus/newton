@@ -78,6 +78,7 @@ def _contact_acts(
         art1=ints([-9]),
         path=ints([-9]),
         slots_needed=ints([-9]),
+        acts=ints([-9]),
         first=row_lines(device),
     )
     acts, counter = ints([0]), ints([0])
@@ -99,14 +100,15 @@ def _contact_acts(
         ],
         device,
     )
-    return int(acts.numpy()[0]), int(data.slot.numpy()[0])
+    return int(acts.numpy()[0]), int(data.slot.numpy()[0]), int(data.acts.numpy()[0])
 
 
 class TestSeparatedWorlds(unittest.TestCase):
     def test_contact_marks_its_world_where_its_residual_may_not_separate(self):
         """The contact allocator's residual at the predictor, ``n . (v_a - v_b)`` plus the speculative gap's rate:
         above the margin the contact leaves the world's acts word, at it or below (or without twists, or with an
-        endpoint whose velocity the publication does not hold) it marks the word; its rows are reserved either way."""
+        endpoint whose velocity the publication does not hold) it marks the word, and its own verdict word is the
+        same; its rows are reserved either way."""
         for case, expected in (
             ({"speed_a": 1.0}, 0),
             ({"speed_a": -2.0}, 1),
@@ -120,8 +122,9 @@ class TestSeparatedWorlds(unittest.TestCase):
             ({"speed_a": -2.0, "gap": -0.001, "restitution": 0.5}, 1),
         ):
             with self.subTest(**case):
-                acts, slot = _contact_acts(**case)
+                acts, slot, verdict = _contact_acts(**case)
                 self.assertEqual(acts, expected)
+                self.assertEqual(verdict, expected)
                 self.assertGreaterEqual(slot, 0)
 
     def test_patch_finish_releases_the_contacts_of_a_world_that_does_not_act(self):

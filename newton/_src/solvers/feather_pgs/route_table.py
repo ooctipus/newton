@@ -96,20 +96,20 @@ class Laws:
     """The model has mimic rows."""
 
     @property
+    def verdicts(self) -> bool:
+        """A contact's rows start at zero and its verdict at the predictor (:func:`.row_laws.separates`) is its law's:
+        no warm start (a carried load would mark the row) and no per-contact compliance (the admission forms the hard
+        law's or an authored material's residual)."""
+        return not (self.warm_start or self.compliance)
+
+    @property
     def separable(self) -> bool:
         """Every row starts at zero and keeps it at a positive predictor residual, the residual the contacts'
         admission forms: the hard contact law, an authored material's, their friction and spin rows, position limits;
         no warm start, relatively regularized or per-contact compliant contact, joint velocity limit, mimic or
         eliminated row. (A weighted step from zero at a positive residual stays at zero; the admission forms an
         authored row's residual by its law, :func:`.row_slots.contact_separates`.)"""
-        return not (
-            self.warm_start
-            or self.regularized
-            or self.compliance
-            or self.velocity_limits
-            or self.mimic
-            or self.preelimination
-        )
+        return self.verdicts and not (self.regularized or self.velocity_limits or self.mimic or self.preelimination)
 
     @property
     def material(self) -> bool:

@@ -501,6 +501,7 @@ class Placement:
                 "contact_art_a",
                 "contact_art_b",
                 "contact_path",
+                "contact_acts",
             )
         ]
         # The row order's records (row_slots.RowOrder).
@@ -806,8 +807,10 @@ class Placement:
 
     def hold_acts(self, solver) -> None:
         """Hold each world's acts word (:data:`WORLD_ACTS`) where every row is separable (:attr:`.route_table.Laws.separable`,
-        no link) and the claims take the worlds. A contact's residual reads the body twists the predictor publishes
-        (``acts_twists``) where a contact can occur and it publishes every responding tree's; elsewhere a contact acts."""
+        no link) and the claims take the worlds. A contact's verdict (``contact_acts``) reads the body twists the
+        predictor publishes (``acts_twists``) where a world can be held, a contact can occur and the predictor
+        publishes every responding tree's; elsewhere a contact acts (the twists are published only where a consumer
+        reads the verdict)."""
         laws, forest = solver.laws, self.forest
         self.acts_reason = first_failed(
             (
