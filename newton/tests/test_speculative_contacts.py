@@ -628,7 +628,6 @@ def _export_reducer_contacts(reducer: GlobalContactReducer, device):
     writer_data.shape_angular_velocity = wp.empty(0, dtype=wp.vec3, device=device)
     writer_data.collision_update_dt = 0.0
     writer_data.max_speculative_extension = 0.0
-    reducer.exported_flags.zero_()
     total_blocks = 128
     wp.launch_tiled(
         _export_reduced_contacts,
@@ -641,7 +640,7 @@ def _export_reducer_contacts(reducer: GlobalContactReducer, device):
             reducer.normal,
             reducer.shape_pairs,
             reducer.contact_fingerprints,
-            reducer.exported_flags,
+            reducer.contact_slots,
             wp.zeros(2, dtype=wp.int32, device=device),
             wp.zeros(2, dtype=wp.vec4, device=device),
             shape_gap,

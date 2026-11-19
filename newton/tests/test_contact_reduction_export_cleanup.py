@@ -114,6 +114,24 @@ def _overflow_buffer(data: GlobalContactReducerData):
         export_contact_to_buffer(0, 1, wp.vec3(float(index), 0.0, 0.0), wp.vec3(0.0, 1.0, 0.0), -0.01, index, data)
 
 
+@wp.kernel
+def _seed_roundoff_twin(data: GlobalContactReducerData, twin_home_first: int):
+    """Contact 1 (fingerprint 10) and its roundoff twin 2 (fingerprint 30) share entry A; the twin alone also holds a
+    slot of entry B. ``twin_home_first`` names A the twin's first entry (its normal bin), else B."""
+    export_contact_to_buffer(0, 1, wp.vec3(0.01, 0.02, 0.03), wp.vec3(0.0, 1.0, 0.0), -0.01, 10, data)
+    export_contact_to_buffer(0, 1, wp.vec3(0.010000000707805157, 0.02, 0.03), wp.vec3(0.0, 1.0, 0.0), -0.01, 30, data)
+    entry_a = hashtable_find_or_insert(make_contact_key(0, 1, 0), data.ht_keys, data.ht_active_slots)
+    entry_b = hashtable_find_or_insert(make_contact_key(0, 1, 1), data.ht_keys, data.ht_active_slots)
+    reduction_update_slot(entry_a, 0, contact_key(1.0, 10), data.ht_values)
+    reduction_update_slot(entry_a, 1, contact_key(1.0, 30), data.ht_values)
+    reduction_update_slot(entry_b, 0, contact_key(1.0, 30), data.ht_values)
+    data.contact_slots[1] = wp.vec2i(entry_a, -1)
+    if twin_home_first != 0:
+        data.contact_slots[2] = wp.vec2i(entry_a, entry_b)
+    else:
+        data.contact_slots[2] = wp.vec2i(entry_b, entry_a)
+
+
 class _Fixture:
     def __init__(self, device, *, capacity=16):
         self.device = wp.get_device(device)
@@ -149,7 +167,7 @@ class _Fixture:
                 reducer.normal,
                 reducer.shape_pairs,
                 reducer.contact_fingerprints,
-                reducer.exported_flags,
+                reducer.contact_slots,
                 self.shape_types,
                 self.shape_data,
                 self.shape_gap,
@@ -194,6 +212,10 @@ class TestContactReductionExportCleanup(unittest.TestCase):
         # Every winner slot holds contact 1, resolved: its contact ID (score field zero).
         slots[winners] = 1
         reducer.ht_values.assign(slots)
+        # Contact 1's home is that entry (the resolve's record).
+        homes = reducer.contact_slots.numpy()
+        homes[1] = (entry, -1)
+        reducer.contact_slots.assign(homes)
         reducer.contact_count.fill_(1)
         reducer.ht_insert_failures.fill_(3)
         reducer.buffer_overflows.fill_(5)
@@ -210,7 +232,7 @@ class TestContactReductionExportCleanup(unittest.TestCase):
                 reducer.normal,
                 reducer.shape_pairs,
                 reducer.contact_fingerprints,
-                reducer.exported_flags,
+                reducer.contact_slots,
                 wp.zeros(2, dtype=int, device=device),
                 wp.zeros(2, dtype=wp.vec4, device=device),
                 wp.zeros(2, dtype=float, device=device),
@@ -260,7 +282,10 @@ class TestContactReductionExportCleanup(unittest.TestCase):
                         self.assertEqual(int(reducer.contact_count.numpy()[0]), 5)
                         self.assertEqual(int(reducer.ht_insert_failures.numpy()[0]), 3)
                         self.assertEqual(int(reducer.buffer_overflows.numpy()[0]), 5)
-                        self.assertTrue(np.all(reducer.exported_flags.numpy()[[2, 3, 4, 5]] > 0))
+                        # Every exported winner has its home: the first entry it holds a slot in.
+                        homes = reducer.contact_slots.numpy()[1:6, 0]
+                        self.assertTrue(np.all(homes >= 0))
+                        self.assertTrue(np.all(homes[:4] == homes[0]) and homes[4] != homes[0])
                         if cleanup:
                             self.assertTrue(np.all(reducer.ht_values.numpy() == 0))
                             self.assertTrue(np.all(reducer.hashtable.keys.numpy() == np.uint64((1 << 64) - 1)))
@@ -272,6 +297,18 @@ class TestContactReductionExportCleanup(unittest.TestCase):
     def test_export_modes_cpu(self):
         """Retire serial entries without changing exported geometry."""
         self.check_export_modes("cpu")
+
+    def test_winner_written_from_home_cpu(self):
+        """Write a winner held in two entries only from its home: a roundoff twin suppressed there stays represented
+        by its lower-fingerprint twin; a twin whose home it survives in is written once."""
+        for twin_home_first, expected in ((1, [10]), (0, [10, 30])):
+            with self.subTest(twin_home_first=twin_home_first):
+                fixture = _Fixture("cpu")
+                data = fixture.reducer.get_data_struct()
+                wp.launch(_seed_roundoff_twin, dim=1, inputs=[data, twin_home_first], device="cpu")
+                wp.launch(resolve_reduced_contacts_kernel, dim=4, inputs=[data, 0, 4], device="cpu")
+                fixture.export(create_export_reduced_contacts_kernel(_record_contact))
+                np.testing.assert_array_equal(fixture.contacts()[0], expected)
 
     def check_lifecycle(self, device, *, graph=False):
         """Reset only between collisions and reuse IDs after empty and regrown exports."""

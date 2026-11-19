@@ -631,9 +631,9 @@ def test_clear_active_coalesced(test, device):
 
 
 def test_export_reduced_contacts_kernel(test, device):
-    """Reset reused export flags while storing reduced contacts."""
+    """Reset reused home entries while storing reduced contacts."""
     reducer = GlobalContactReducer(capacity=100, device=device)
-    reducer.exported_flags.fill_(1)
+    reducer.contact_slots.fill_(wp.vec2i(5, 5))
 
     # Create dummy arrays for the required parameters
     num_shapes = 200
@@ -808,7 +808,7 @@ def test_export_reduced_contacts_kernel(test, device):
                 reducer.normal,
                 reducer.shape_pairs,
                 reducer.contact_fingerprints,
-                reducer.exported_flags,
+                reducer.contact_slots,
                 shape_types,
                 shape_data,
                 shape_gap,
@@ -837,7 +837,6 @@ def test_export_reduced_contacts_kernel(test, device):
 
     launch_and_verify()
     for _ in range(10):
-        reducer.exported_flags.zero_()
         contact_count_out.zero_()
         launch_and_verify()
 

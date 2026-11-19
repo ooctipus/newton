@@ -5485,7 +5485,7 @@ class NarrowPhase:
                     self.global_contact_reducer.normal,
                     self.global_contact_reducer.shape_pairs,
                     self.global_contact_reducer.contact_fingerprints,
-                    self.global_contact_reducer.exported_flags,
+                    self.global_contact_reducer.contact_slots,
                     shape_types,
                     shape_data,
                     shape_gap,

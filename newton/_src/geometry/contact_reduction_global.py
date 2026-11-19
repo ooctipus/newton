@@ -395,14 +395,19 @@ def reduction_slot_holds(value_idx: int, key: wp.uint64, values: wp.array[wp.uin
 
 
 @wp.func
-def reduction_resolve_slot(value_idx: int, fingerprint: int, contact_id: int, values: wp.array[wp.uint64]):
+def reduction_resolve_slot(value_idx: int, fingerprint: int, contact_id: int, values: wp.array[wp.uint64]) -> bool:
     """Give slot ``value_idx`` the contact ID of the buffered candidate ``contact_id`` if the slot's key is its
-    (its fingerprint, which no other candidate of its pair has); a resolved or empty slot is left alone."""
+    (its fingerprint, which no other candidate of its pair has); a resolved or empty slot is left alone. Returns
+    whether the slot is the candidate's, so a repeated resolve names the same slots."""
     value = values[value_idx]
+    if value == wp.uint64(contact_id):
+        return True
     if (value >> wp.uint64(31)) != wp.uint64(0) and (value & SLOT_FINGERPRINT_MASK) == (
         wp.uint64(fingerprint) & SLOT_FINGERPRINT_MASK
     ):
         values[value_idx] = wp.uint64(contact_id)
+        return True
+    return False
 
 
 @wp.func
@@ -535,7 +540,6 @@ class GlobalContactReducerData:
     normal: wp.array[wp.vec2]  # Octahedral-encoded unit normal (see encode_oct/decode_oct)
     shape_pairs: wp.array[wp.vec2i]
     contact_count: wp.array[wp.int32]
-    exported_flags: wp.array[wp.int32]
     reclaimed_contact_bits: wp.array[wp.uint32]
     reclaimed_contact_count: wp.array[wp.int32]
     capacity: int
@@ -545,7 +549,9 @@ class GlobalContactReducerData:
     contact_fingerprints: wp.array[wp.int32]
     # The entries in which each buffered candidate raised a slot, which the resolve pass reads: its normal bin's (-1:
     # none) and a voxel word, its voxel group's entry (-1: none) marked when it also raised its pair's predictive
-    # slots (competed_voxel_word); the predictive entry itself is found by its key.
+    # slots (competed_voxel_word); the predictive entry itself is found by its key. The resolve then writes the
+    # candidate's home entry into the first word (-1: it holds no slot): the first entry, in the order normal bin,
+    # voxel, predictive, in which it holds a slot. The export writes a winner only from its home entry.
     contact_slots: wp.array[wp.vec2i]
 
     # Optional hydroelastic data
@@ -845,10 +851,6 @@ class GlobalContactReducer:
             self.contact_pressure = wp.zeros(0, dtype=wp.float32, device=device)
             self.contact_nbin_entry = wp.zeros(0, dtype=wp.int32, device=device)
 
-        # Generic reduction deduplicates cross-entry winners during export.
-        # Hydroelastic reduction intentionally preserves and source-tags them.
-        self.exported_flags = wp.zeros(0 if store_hydroelastic_data else buffer_size, dtype=wp.int32, device=device)
-
         # Atomic counter for contact allocation
         self.contact_count = wp.zeros(1, dtype=wp.int32, device=device)
         # Atomic bits avoid publishing a linked-list pointer separately from its head.
@@ -987,8 +989,8 @@ class GlobalContactReducer:
         Every active key and winner slot must already have been retired by
         ``create_export_reduced_contacts_kernel(clear_after_export=True)``.
         Call at the next collision boundary, after consumers have inspected the
-        previous active count and overflow evidence. Raw payload and exported
-        flags remain untouched; the next contact allocations initialize flags.
+        previous active count and overflow evidence. Raw payload and home
+        entries remain untouched; the next contact allocations reset them.
         """
         if self.store_hydroelastic_data or self.enable_contact_reclamation:
             raise ValueError("Counter-only reset requires a non-hydroelastic reducer without contact reclamation")
@@ -1017,7 +1019,6 @@ class GlobalContactReducer:
         data.normal = self.normal
         data.shape_pairs = self.shape_pairs
         data.contact_count = self.contact_count
-        data.exported_flags = self.exported_flags
         data.reclaimed_contact_bits = self.reclaimed_contact_bits
         data.reclaimed_contact_count = self.reclaimed_contact_count
         data.capacity = self.capacity
@@ -1125,9 +1126,6 @@ def export_contact_to_buffer(
             return -1
         # A successful reuse is not a dropped contact.
         wp.atomic_add(reducer_data.contact_count, 0, -1)
-    if reducer_data.exported_flags.shape[0] > 0:
-        reducer_data.exported_flags[contact_id] = 0
-
     # Store contact data (packed into vec4, normal octahedral-encoded into vec2)
     reducer_data.position_depth[contact_id] = wp.vec4(position[0], position[1], position[2], depth)
     reducer_data.normal[contact_id] = encode_oct(normal)
@@ -1877,9 +1875,13 @@ def reduce_buffered_contacts_speculative_kernel(
 
 
 @wp.func
-def _resolve_entry(entry_idx: int, fingerprint: int, contact_id: int, values: wp.array[wp.uint64]):
+def _resolve_entry(entry_idx: int, fingerprint: int, contact_id: int, values: wp.array[wp.uint64]) -> bool:
+    """Resolve the candidate's slots of one entry; returns whether it holds any of them."""
+    holds = False
     for slot in range(wp.static(VALUES_PER_KEY)):
-        reduction_resolve_slot(reduction_value_index(entry_idx, slot), fingerprint, contact_id, values)
+        if reduction_resolve_slot(reduction_value_index(entry_idx, slot), fingerprint, contact_id, values):
+            holds = True
+    return holds
 
 
 # A module of its own: it launches at the narrow phase's block, the module's other kernels at the default.
@@ -1890,7 +1892,8 @@ def resolve_reduced_contacts_kernel(reducer_data: GlobalContactReducerData, spec
     (:attr:`GlobalContactReducerData.contact_slots`; its pair's predictive entry, found by its key, where its voxel
     word marks a raise there). Every slot's winner raised it, so it is buffered and names it; a slot no buffered
     candidate resolves (its winner found no buffer row) exports nothing. A candidate that raised nothing reads two
-    words and stops."""
+    words and stops. Each candidate's home entry (the first, in that order, in which it holds a slot; -1: none)
+    replaces its normal-bin word, so the export writes every winner once, from its home, with no claim."""
     tid = wp.tid()
     num_contacts = wp.min(reducer_data.contact_count[0], reducer_data.capacity)
     for i in range(tid, num_contacts, total_num_threads):
@@ -1899,18 +1902,24 @@ def resolve_reduced_contacts_kernel(reducer_data: GlobalContactReducerData, spec
         if entries[0] < 0 and entries[1] == -1:
             continue
         fingerprint = reducer_data.contact_fingerprints[contact_id]
+        home = int(-1)
         if entries[0] >= 0:
-            _resolve_entry(entries[0], fingerprint, contact_id, reducer_data.ht_values)
+            if _resolve_entry(entries[0], fingerprint, contact_id, reducer_data.ht_values):
+                home = entries[0]
         voxel_entry_idx = competed_voxel_entry(entries[1])
         if voxel_entry_idx >= 0:
-            _resolve_entry(voxel_entry_idx, fingerprint, contact_id, reducer_data.ht_values)
+            if _resolve_entry(voxel_entry_idx, fingerprint, contact_id, reducer_data.ht_values) and home < 0:
+                home = voxel_entry_idx
         if speculative != 0 and entries[1] < -1:
             pair = reducer_data.shape_pairs[contact_id]
             predictive = hashtable_find(
                 make_contact_key(pair[0], pair[1], wp.static(PREDICTIVE_BIN_ID)), reducer_data.ht_keys
             )
             if predictive >= 0:
-                _resolve_entry(predictive, fingerprint, contact_id, reducer_data.ht_values)
+                if _resolve_entry(predictive, fingerprint, contact_id, reducer_data.ht_values) and home < 0:
+                    home = predictive
+        if home != entries[0]:
+            reducer_data.contact_slots[contact_id] = wp.vec2i(home, entries[1])
 
 
 # =============================================================================
@@ -2063,7 +2072,10 @@ def create_export_reduced_contacts_kernel(writer_func: Any, *, clear_after_expor
     compare the seven possible winner pairs in parallel, preserving the
     lower-fingerprint representative for roundoff-equivalent geometry. CUDA
     lanes export the seven surviving slots concurrently; the CPU streams them
-    serially from lane zero.
+    serially from lane zero. A winner is written only from its home entry (the
+    resolve's, in :attr:`GlobalContactReducerData.contact_slots`), so each is
+    written once without a claim; one suppressed in its home as a roundoff copy
+    of a lower-fingerprint winner is represented by that winner.
 
     Args:
         writer_func: Writer for contacts selected by the reducer.
@@ -2080,18 +2092,18 @@ def create_export_reduced_contacts_kernel(writer_func: Any, *, clear_after_expor
     @wp.func(module="unique")
     def export_contact_id(
         contact_id: int,
+        entry_idx: int,
         position_depth: wp.array[wp.vec4],
         normal: wp.array[wp.vec2],
         shape_pairs: wp.array[wp.vec2i],
         contact_fingerprints: wp.array[wp.int32],
-        exported_flags: wp.array[wp.int32],
+        contact_slots: wp.array[wp.vec2i],
         shape_types: wp.array[int],
         shape_data: wp.array[wp.vec4],
         shape_gap: wp.array[float],
         writer_data: Any,
     ):
-        old_flag = wp.atomic_add(exported_flags, contact_id, 1)
-        if old_flag > 0:
+        if contact_slots[contact_id][0] != entry_idx:
             return
 
         position, contact_normal, depth = unpack_contact(contact_id, position_depth, normal)
@@ -2130,7 +2142,7 @@ def create_export_reduced_contacts_kernel(writer_func: Any, *, clear_after_expor
             normal: wp.array[wp.vec2],
             shape_pairs: wp.array[wp.vec2i],
             contact_fingerprints: wp.array[wp.int32],
-            exported_flags: wp.array[wp.int32],
+            contact_slots: wp.array[wp.vec2i],
             shape_types: wp.array[int],
             shape_data: wp.array[wp.vec4],
             shape_gap: wp.array[float],
@@ -2168,11 +2180,12 @@ def create_export_reduced_contacts_kernel(writer_func: Any, *, clear_after_expor
                     if contact_id != 0 and duplicate_mask & (1 << slot) == 0:
                         export_contact_id(
                             contact_id,
+                            entry_idx,
                             position_depth,
                             normal,
                             shape_pairs,
                             contact_fingerprints,
-                            exported_flags,
+                            contact_slots,
                             shape_types,
                             shape_data,
                             shape_gap,
@@ -2181,7 +2194,7 @@ def create_export_reduced_contacts_kernel(writer_func: Any, *, clear_after_expor
 
                 if wp.static(clear_after_export):
                     # Active keys are unique; this thread has finished all
-                    # winner reads. Cross-key claims retain their raw payload.
+                    # winner reads. Other keys' winners retain their raw payload.
                     for slot in range(wp.static(VALUES_PER_KEY)):
                         ht_values[reduction_value_index(entry_idx, slot)] = wp.uint64(0)
                     ht_keys[entry_idx] = HASHTABLE_EMPTY_KEY
@@ -2197,7 +2210,7 @@ def create_export_reduced_contacts_kernel(writer_func: Any, *, clear_after_expor
         normal: wp.array[wp.vec2],
         shape_pairs: wp.array[wp.vec2i],
         contact_fingerprints: wp.array[wp.int32],
-        exported_flags: wp.array[wp.int32],
+        contact_slots: wp.array[wp.vec2i],
         shape_types: wp.array[int],
         shape_data: wp.array[wp.vec4],
         shape_gap: wp.array[float],
@@ -2244,11 +2257,12 @@ def create_export_reduced_contacts_kernel(writer_func: Any, *, clear_after_expor
                     if contact_id != 0:
                         export_contact_id(
                             contact_id,
+                            entry_idx,
                             position_depth,
                             normal,
                             shape_pairs,
                             contact_fingerprints,
-                            exported_flags,
+                            contact_slots,
                             shape_types,
                             shape_data,
                             shape_gap,
@@ -2261,15 +2275,16 @@ def create_export_reduced_contacts_kernel(writer_func: Any, *, clear_after_expor
                     contact_id = slot_contact_id(ht_values[reduction_value_index(entry_idx, slot)])
                     if contact_id == 0:
                         continue
-                    # The global flag also suppresses repeated winners within
-                    # this entry, so no per-entry ID list is needed.
+                    # A repeated winner within this entry is suppressed above;
+                    # one held in several entries is written from its home.
                     export_contact_id(
                         contact_id,
+                        entry_idx,
                         position_depth,
                         normal,
                         shape_pairs,
                         contact_fingerprints,
-                        exported_flags,
+                        contact_slots,
                         shape_types,
                         shape_data,
                         shape_gap,
@@ -2282,7 +2297,7 @@ def create_export_reduced_contacts_kernel(writer_func: Any, *, clear_after_expor
 
             if wp.static(clear_after_export):
                 # The tile barrier above finishes all reads of this entry.
-                # Other entries deduplicate through raw payload/flags, which
+                # Other entries read the raw payload and home entries, which
                 # remain live. Keep counts and failures for later inspection.
                 if parallel_pairs != 0:
                     if lane < wp.static(VALUES_PER_KEY):

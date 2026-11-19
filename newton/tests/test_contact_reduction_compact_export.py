@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Check local suppression before the reducer's global export claim."""
+"""Check local suppression before the reducer's export from each winner's home entry."""
 
 import os
 import unittest
@@ -115,8 +115,8 @@ class TestCompactContactExport(unittest.TestCase):
                     ordinary.narrow_phase.check_buffer_capacity()
                     compact.narrow_phase.check_buffer_capacity()
 
-    def test_repeated_ids_claim_once_cpu(self):
-        """Suppress every later copy of a winner before touching payload or global flags."""
+    def test_repeated_ids_write_once_cpu(self):
+        """Suppress every later copy of a winner before touching payload or home entries."""
         # Every winner slot of entry 0 holds contact 1, resolved: its contact ID (score field zero).
         values = wp.array(np.ones(VALUES_STRIDE, dtype=np.uint64), device="cpu")
         masks = wp.zeros(21, dtype=int, device="cpu")
@@ -150,7 +150,7 @@ class TestCompactContactExport(unittest.TestCase):
                 r.normal,
                 r.shape_pairs,
                 r.contact_fingerprints,
-                r.exported_flags,
+                r.contact_slots,
                 fixture.shape_types,
                 fixture.shape_data,
                 fixture.shape_gap,
@@ -181,8 +181,6 @@ class TestCompactContactExport(unittest.TestCase):
                     actual = fixture.contacts()
                     np.testing.assert_array_equal(actual[0], expected[0])
                     np.testing.assert_array_equal(actual[1], expected[1])
-                    # One contact wins every slot of its key: claim it once.
-                    self.assertEqual(int(fixture.reducer.exported_flags.numpy()[5]), 1)
                     np.testing.assert_array_equal(fixture.reducer.ht_values.numpy(), 0 if cleanup else before)
 
     def test_contacts_cpu(self):
@@ -209,7 +207,7 @@ class TestCompactContactExport(unittest.TestCase):
 
     @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
     def test_graph_lifecycle_cuda(self):
-        """Replay empty and regrown collisions without stale claims or winner slots."""
+        """Replay empty and regrown collisions without stale home entries or winner slots."""
         fixture = _Fixture("cuda:0")
         kernel = create_export_reduced_contacts_kernel(_record_contact, clear_after_export=True, compact=True)
 

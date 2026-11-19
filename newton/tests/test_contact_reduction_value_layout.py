@@ -246,11 +246,11 @@ class TestContactReductionValueLayout(unittest.TestCase):
                         )
                     }
                 )
-                # Isaac Lab's suite check: retained export claims fit the active keys' slots.
+                # Isaac Lab's suite check: the buffered rows with a home entry fit the active keys' slots.
                 raw = int(reducer.contact_count.numpy()[0])
                 active = int(reducer.hashtable.active_slots.numpy()[-1])
-                claims = int(np.sum(reducer.exported_flags.numpy()[1 : raw + 1], dtype=np.int64))
-                self.assertLessEqual(claims, reducer.values_per_key * active)
+                homed = int(np.count_nonzero(reducer.contact_slots.numpy()[1 : raw + 1, 0] >= 0))
+                self.assertLessEqual(homed, reducer.values_per_key * active)
             self.assertGreater(len(passes[0]["rigid_contact_shape0"]), 0)
             self.assertEqual(len(passes[1]["rigid_contact_shape0"]), 0)
             for name, array in passes[0].items():
