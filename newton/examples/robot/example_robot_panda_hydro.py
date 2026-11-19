@@ -75,7 +75,6 @@ class Example:
     def __init__(self, viewer, args):
         self.scene = SceneType(args.scene)
         self.test_mode = args.test
-        self.deterministic = args.deterministic
         self.deterministic_solver = args.deterministic_solver
         self.show_isosurface = False  # Disabled by default for performance
         self.fps = 60
@@ -320,7 +319,6 @@ class Example:
             reduce_contacts=True,
             broad_phase="explicit",
             sdf_hydroelastic_config=sdf_hydroelastic_config,
-            deterministic=self.deterministic,
         )
         self.contacts = self.collision_pipeline.contacts()
 
@@ -597,22 +595,12 @@ class Example:
         parser.set_defaults(num_frames=720)
         parser.set_defaults(world_count=1)
         parser.add_argument(
-            "--deterministic",
-            action=argparse.BooleanOptionalAction,
-            default=True,
-            help=(
-                "Make contact generation and ordering reproducible across runs on the same GPU. "
-                "Enabled by default to keep the pick-and-place sequence stable; costs a few percent of step time."
-            ),
-        )
-        parser.add_argument(
             "--deterministic-solver",
             action=argparse.BooleanOptionalAction,
             default=False,
             help=(
-                "Additionally make the solver bit-exact. Separate from --deterministic because "
-                "it instruments every atomic scatter in the solver and costs ~7x step time, "
-                "while contact ordering is what varies between runs."
+                "Make the solver bit-exact too (contacts always are). It instruments every "
+                "atomic scatter in the solver and costs ~7x step time."
             ),
         )
         parser.add_argument(

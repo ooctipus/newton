@@ -2224,7 +2224,7 @@ class TestSteelJointFrictionLoad(unittest.TestCase):
             solver = _friction_solver(model, deterministic=wp.DeterministicMode.RUN_TO_RUN)
             self.assertFalse(solver._joint_friction_load_active)
             observables = solver.observables({SolverBase.ObservableKind.BODY_PARENT_F})
-            pipeline = newton.CollisionPipeline(model, deterministic=True, rigid_contact_max=64)
+            pipeline = newton.CollisionPipeline(model, rigid_contact_max=64)
             runs.append(
                 (*_advance_hinge(solver, model, 0.2, 30, observables, pipeline), observables.body_parent_f.numpy())
             )
@@ -2232,14 +2232,14 @@ class TestSteelJointFrictionLoad(unittest.TestCase):
             np.testing.assert_array_equal(unregistered, registered)
 
     def test_deterministic_runs_are_bitwise_identical(self):
-        """Reproduce a contact-loaded hinge bit for bit under deterministic=True."""
+        """Reproduce a contact-loaded hinge bit for bit under RUN_TO_RUN."""
         runs = []
         for _ in range(2):
             model = _payload_hinge_model(2.0, ground=True, boxes=6)
             solver = _friction_solver(
                 model, deterministic=wp.DeterministicMode.RUN_TO_RUN, articulation_constraint_max=64
             )
-            pipeline = newton.CollisionPipeline(model, deterministic=True, rigid_contact_max=256)
+            pipeline = newton.CollisionPipeline(model, rigid_contact_max=256)
             q, qd = _advance_hinge(solver, model, 0.5, 40, None, pipeline)
             runs.append((q, qd, solver._joint_friction_total.numpy()))
         self.assertGreater(float(runs[0][2][0]), 0.0)

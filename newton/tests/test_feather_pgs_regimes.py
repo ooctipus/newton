@@ -1086,9 +1086,7 @@ def patch_units(solver, count):
         while m >= 0 and m != c:
             members.append(int(contact[m]))
             m = ring[m]
-        units.append(
-            FrictionUnit(int(contact[c]), tuple(members), float(weight[c]), tuple(location[c]), float(arm[c]))
-        )
+        units.append(FrictionUnit(int(contact[c]), tuple(members), float(weight[c]), tuple(location[c]), float(arm[c])))
     return units
 
 
@@ -1336,7 +1334,11 @@ class Manufactured:
         rows = solver.placement
         # Each contact's allocation lies at its frame position.
         at = solver.laws.friction_patches.position.numpy()[: self.count]
-        paths, slots, worlds = rows.contact_path.numpy()[at], rows.contact_slot.numpy()[at], rows.contact_world.numpy()[at]
+        paths, slots, worlds = (
+            rows.contact_path.numpy()[at],
+            rows.contact_slot.numpy()[at],
+            rows.contact_world.numpy()[at],
+        )
         needed = rows.contact_slots_needed.numpy()[at]
         held = ~walked_worlds(solver)
         stores = [
@@ -1511,7 +1513,7 @@ class ManufacturedScene:
             }
         )
         self.options = options
-        pipeline_options = {"deterministic": True}
+        pipeline_options = {}
         if scene.rigid_contact_max is not None:
             pipeline_options["rigid_contact_max"] = scene.rigid_contact_max
         self.pipeline = newton.CollisionPipeline(self.model, **pipeline_options, growable_contacts=True)

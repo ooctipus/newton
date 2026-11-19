@@ -51,8 +51,7 @@ def _standing_cases(count, *, twin=False, iterations=8, **shape):
     """Build dense split standing cases on CPU; with ``twin`` the last one's torsos start one float32 ulp higher."""
     options = {**_DENSE_SPLIT, "pgs_iterations": iterations}
     cases = [
-        sparse_scene.make_case(False, options=dict(options), deterministic=True, standing=True, device="cpu", **shape)
-        for _ in range(count)
+        sparse_scene.make_case(False, options=dict(options), standing=True, device="cpu", **shape) for _ in range(count)
     ]
     if twin:
         model, _solver, state, *_ = cases[-1]
@@ -357,7 +356,6 @@ class TestFeatherPGSPatchParity(unittest.TestCase):
             False,
             options={**_DENSE_SPLIT, "pgs_warmstart": True},
             contact_matching="latest",
-            deterministic=True,
             standing=True,
             device="cpu",
         )

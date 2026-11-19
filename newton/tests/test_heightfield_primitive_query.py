@@ -73,7 +73,6 @@ class TestHeightfieldPrimitiveQuery(unittest.TestCase):
                 {"has_heightfields": False},
                 {"reduce_contacts": False},
                 {"speculative": True},
-                {"deterministic": True},
                 {"contact_writer_warp_func": write_contact_simple},
             ):
                 with self.subTest(options=options):

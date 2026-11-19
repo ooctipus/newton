@@ -82,10 +82,12 @@ def publish_sort_extent(extent: wp.array[int], base: int, live: int):
 
 
 @wp.kernel(enable_backward=False)
-def _publish_count(count: wp.array[int], rows: wp.array[wp.int32], extent: wp.array[int]):
+def _publish_count(count: wp.array[int], rows: wp.array[wp.int32], limit: int, extent: wp.array[int]):
     live = count[0]
     if rows.shape[0] > 0:
         live = wp.min(live, int(rows[0]))
+    if limit >= 0:
+        live = wp.min(live, limit)
     publish_sort_extent(extent, 0, wp.max(live, 0))
 
 
@@ -397,8 +399,9 @@ def launch_live_sort(
         )
 
 
-def publish_live(pool, count: wp.array, extent: wp.array) -> None:
-    """Write the sort extent of ``count[0]`` live slots, at most ``pool``'s ready rows, then record an updater.
+def publish_live(pool, count: wp.array, extent: wp.array, limit: int = -1) -> None:
+    """Write the sort extent of ``count[0]`` live slots, at most ``pool``'s ready rows and ``limit`` (when not
+    negative: the slots the sorted arrays hold), then record an updater.
 
     ``extent[0:1]`` then holds the live slots, a count the launches that sort
     and move them can follow. The updater
@@ -406,5 +409,5 @@ def publish_live(pool, count: wp.array, extent: wp.array) -> None:
     the launches that follow in a capture read this extent.
     """
     rows = pool.ready_rows if pool.ready_rows is not None else wp.empty(0, dtype=wp.int32, device=extent.device)
-    wp.launch(_publish_count, dim=1, inputs=[count, rows, extent], device=extent.device, record_tape=False)
+    wp.launch(_publish_count, dim=1, inputs=[count, rows, limit, extent], device=extent.device, record_tape=False)
     pool.begin_updates()

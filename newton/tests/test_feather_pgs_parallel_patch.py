@@ -1346,7 +1346,7 @@ def _rollout(model, solver, steps, *, dt=1.0 / 240.0, after_step=None):
     """Step through the collision pipeline; return the final state and the contacts of the last step."""
     state, out, control = model.state(), model.state(), model.control()
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
-    pipeline = newton.CollisionPipeline(model, rigid_contact_max=64, deterministic=True, growable_contacts=True)
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=64, growable_contacts=True)
     contacts = pipeline.contacts()
     for step in range(steps):
         state.clear_forces()
@@ -1576,7 +1576,7 @@ class TestPatchParallelRoutes(unittest.TestCase):
                 _sort_every_build(patches)
             states, control = [model.state(), model.state()], model.control()
             newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
-            pipeline = newton.CollisionPipeline(model, rigid_contact_max=64, deterministic=True, growable_contacts=True)
+            pipeline = newton.CollisionPipeline(model, rigid_contact_max=64, growable_contacts=True)
             contacts = pipeline.contacts()
             probe = _DecisionProbe(patches, 2)
 

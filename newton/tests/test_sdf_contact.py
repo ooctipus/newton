@@ -286,7 +286,7 @@ def test_mesh_sdf_staged_waves_keep_the_contacts(test, device):
         for world in range(worlds):
             poses += [wp.transform(wp.vec3(0.0, 0.0, 0.0)), wp.transform(wp.vec3(0.01 * world, 0.0, 0.58))]
         state.body_q.assign(poses)
-        pipeline = newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts=True, deterministic=True)
+        pipeline = newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts=True)
         narrow = pipeline.narrow_phase
         test.assertIsNotNone(narrow._mesh_sdf_staged)
         contacts = pipeline.contacts()

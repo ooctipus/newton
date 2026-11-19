@@ -129,7 +129,6 @@ def _stack_scene(device, g):
         reduce_contacts=True,
         rigid_contact_max=128,
         broad_phase="nxn",
-        deterministic=True,
         contact_matching="latest",
         growable_contacts=True,
     )
@@ -170,7 +169,6 @@ def _resting_box(device, g, rate, frames, **solver_kwargs):
         reduce_contacts=True,
         rigid_contact_max=32,
         broad_phase="nxn",
-        deterministic=True,
         contact_matching="latest",
         growable_contacts=True,
     )
@@ -230,7 +228,6 @@ def test_regularization_indeterminate_split(test: unittest.TestCase, device):
             reduce_contacts=True,
             rigid_contact_max=256,
             broad_phase="nxn",
-            deterministic=True,
             contact_matching="latest",
             growable_contacts=True,
         )
@@ -337,7 +334,6 @@ def test_restitution_rows_stay_rigid(test: unittest.TestCase, device):
             reduce_contacts=True,
             rigid_contact_max=32,
             broad_phase="nxn",
-            deterministic=True,
             contact_matching="latest",
             growable_contacts=True,
         )

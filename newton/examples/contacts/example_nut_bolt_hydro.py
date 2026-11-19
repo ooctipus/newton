@@ -168,7 +168,6 @@ class Example:
         self.viewer = viewer
         self.solver_type = args.solver
         self.test_mode = args.test
-        self.deterministic = args.deterministic
         self.deterministic_solver = args.deterministic_solver
 
         # XPBD contact correction (0.0 = no correction, 1.0 = full correction)
@@ -229,7 +228,6 @@ class Example:
             reduce_contacts=True,
             broad_phase=self.broad_phase_mode,
             sdf_hydroelastic_config=sdf_hydroelastic_config,
-            deterministic=self.deterministic,
         )
 
         # Create solver based on user choice
@@ -484,23 +482,12 @@ class Example:
         newton.examples.add_world_count_arg(parser)
         parser.set_defaults(world_count=None)
         parser.add_argument(
-            "--deterministic",
-            action=argparse.BooleanOptionalAction,
-            default=False,
-            help=(
-                "Make contact generation and ordering reproducible across runs on the same GPU. "
-                "Costs a few percent of step time. Needs a world count small enough to keep the "
-                "hydroelastic face-contact buffer under the 2^20 deterministic contact-id limit."
-            ),
-        )
-        parser.add_argument(
             "--deterministic-solver",
             action=argparse.BooleanOptionalAction,
             default=False,
             help=(
-                "Additionally make the solver bit-exact. Separate from --deterministic because "
-                "it instruments every atomic scatter in the solver and costs ~7x step time, "
-                "while contact ordering is what varies between runs."
+                "Make the solver bit-exact too (contacts always are). It instruments every "
+                "atomic scatter in the solver and costs ~7x step time."
             ),
         )
         parser.add_argument(

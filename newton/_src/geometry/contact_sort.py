@@ -381,7 +381,9 @@ class ContactSorter:
         data.has_tangent = 1 if has_tangent else 0
         data.has_match_index = 1 if has_match else 0
 
-        self._sort(_backup_simple_kernel, _gather_simple_kernel, data, sort_keys, contact_count)
+        # A standalone launch's output arrays may hold fewer slots than the sorter: sort the contacts they hold.
+        limit = min(contact_pair.shape[0], sort_keys.shape[0])
+        self._sort(_backup_simple_kernel, _gather_simple_kernel, data, sort_keys, contact_count, limit)
 
     def sort_full(
         self,
@@ -403,6 +405,7 @@ class ContactSorter:
         friction: wp.array | None = None,
         match_index: wp.array | None = None,
         device: Devicelike = None,
+        limit: int = -1,
     ) -> None:
         """Sort contacts written through the full collide.py writer.
 
@@ -428,6 +431,8 @@ class ContactSorter:
                 from :class:`ContactMatcher`.  When provided, the array is
                 permuted alongside the other contact fields during sorting.
             device: Device to launch on.
+            limit: The contact slots the arrays hold when fewer than the sorter's rows (an external buffer); -1:
+                the sorter's rows bound the sort.
         """
         # Scratch provisioning and the current buffer schema are separate.
         # A reducer-enabled deterministic pipeline provisions material scratch
@@ -481,9 +486,9 @@ class ContactSorter:
         data.has_shape_props = 1 if has_props else 0
         data.has_match_index = 1 if has_match else 0
 
-        self._sort(_backup_full_kernel, _gather_full_kernel, data, sort_keys, contact_count)
+        self._sort(_backup_full_kernel, _gather_full_kernel, data, sort_keys, contact_count, limit)
 
-    def _sort(self, backup, gather, data, sort_keys, contact_count):
+    def _sort(self, backup, gather, data, sort_keys, contact_count, limit=-1):
         """Back up the live contacts, sort their keys, and gather them in key order, the keys with them.
 
         The live contacts are published first, at most the ready rows, and
@@ -491,7 +496,7 @@ class ContactSorter:
         sorts the contacts of that replay.
         """
         pool = self._pool
-        publish_live(pool, contact_count, self._extent)
+        publish_live(pool, contact_count, self._extent, limit)
         live = self._extent[0:1]
         rows = pool.launch_rows()
         keys = self._rows.reserved["_sort_keys_copy"]

@@ -29,7 +29,6 @@ def _stack(device, restitution=0.0, drop=False):
         reduce_contacts=True,
         rigid_contact_max=128,
         broad_phase="nxn",
-        deterministic=True,
         contact_matching="latest",
         growable_contacts=True,
     )
@@ -168,7 +167,6 @@ def test_warm_carry_no_kick_after_dt_change_on_impact(test: unittest.TestCase, d
                 reduce_contacts=True,
                 rigid_contact_max=32,
                 broad_phase="nxn",
-                deterministic=True,
                 contact_matching="latest",
                 growable_contacts=True,
             )

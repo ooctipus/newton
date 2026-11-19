@@ -580,9 +580,7 @@ class TestFrictionPatchHistory(unittest.TestCase):
         self.assertEqual(float(patches.view.weight.numpy().max()), 0.0)
 
 
-def _run_rolling(
-    geometry, device, *, friction_anchor_beta=None, segments=64, hz=240, direction=1, deterministic=False, launch_ulp=0
-):
+def _run_rolling(geometry, device, *, friction_anchor_beta=None, segments=64, hz=240, direction=1, launch_ulp=0):
     """Roll a generated wheel for one second and average speed over its final quarter; ``launch_ulp`` (+-1) moves the
     launch velocity's components by one float32 ulp, a draw of the run's one-ulp family."""
     builder = newton.ModelBuilder()
@@ -599,7 +597,7 @@ def _run_rolling(
         add_shape(body, radius=0.05, half_height=0.025, xform=wp.transform(wp.vec3(0), rotation))
     model = builder.finalize(device=device)
     solver = newton.solvers.SolverFeatherPGS(model, friction_anchor_beta=friction_anchor_beta)
-    pipeline = newton.CollisionPipeline(model, deterministic=deterministic, growable_contacts=True)
+    pipeline = newton.CollisionPipeline(model, growable_contacts=True)
     contacts = pipeline.contacts()
     s0, s1 = model.state(), model.state()
     launch = np.array([direction, 0, 0, 0, 20 * direction, 0], dtype=np.float32)
@@ -647,10 +645,9 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
             # friction force moves every default draw below every reference draw.
             draws = (0, 1, -1) if faceted else (0,)
             references = [
-                _run_rolling(geometry, device, deterministic=True, friction_anchor_beta=reference_beta, launch_ulp=u)
-                for u in draws
+                _run_rolling(geometry, device, friction_anchor_beta=reference_beta, launch_ulp=u) for u in draws
             ]
-            actuals = [_run_rolling(geometry, device, deterministic=True, launch_ulp=u) for u in draws]
+            actuals = [_run_rolling(geometry, device, launch_ulp=u) for u in draws]
             for result in (*references, *actuals):
                 self.assertTrue(all(np.isfinite(value).all() for value in result))
             reference, actual = references[0], actuals[0]
@@ -672,10 +669,10 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
     def test_faceted_rolling_across_tessellation_direction_and_timestep(self):
         """Bound a faceted wheel's roll across tessellation, direction and timestep.
 
-        The runs take the collision pipeline's deterministic contact order. Its default order is not reproducible on
-        a GPU, and a faceted wheel's travel follows that order through its facet impacts: two runs of one mesh
-        wheel differ by 0.01 to 0.03 m of 0.9 m of travel, which is the bound below. Under one order they agree,
-        so a difference between the two runs is the solve's own.
+        The collision pipeline sorts its contacts, and a faceted wheel's travel follows that order through its facet
+        impacts: under one order two runs agree, so a difference between the two runs is the solve's own. The bound
+        below is the 0.01 to 0.03 m of 0.9 m of travel by which two runs of one mesh wheel differed in an unsorted
+        order.
         """
         device = "cuda:0" if wp.is_cuda_available() else "cpu"
         for geometry in ("mesh", "convex_hull"):
@@ -683,8 +680,8 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
                 for hz in (120, 240):
                     for direction in (-1, 1):
                         case = {"segments": segments, "hz": hz, "direction": direction}
-                        reference = _run_rolling(geometry, device, deterministic=True, **case)
-                        actual = _run_rolling(geometry, device, deterministic=True, **case)
+                        reference = _run_rolling(geometry, device, **case)
+                        actual = _run_rolling(geometry, device, **case)
                         with self.subTest(geometry=geometry, **case):
                             self.assertTrue(all(np.isfinite(value).all() for value in actual))
                             # The reference is the same law run again: nothing but the
@@ -703,7 +700,7 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
                             # launch's one-ulp family (0, +1, -1 ulp): its median.
                             lateral = [abs(float(actual[2][1]))]
                             for ulp in (1, -1):
-                                draw = _run_rolling(geometry, device, deterministic=True, launch_ulp=ulp, **case)
+                                draw = _run_rolling(geometry, device, launch_ulp=ulp, **case)
                                 lateral.append(abs(float(draw[2][1])))
                             self.assertLess(float(np.median(lateral)), 0.06, lateral)
                             # Same 6% margin on the 20 rad/s launch spin.
@@ -1214,7 +1211,7 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
         )
         self.assertEqual(solver.get_path_selection()["publication"], "cached")
         # Sorted contacts: the narrow phase's output order no longer depends on thread scheduling.
-        pipeline = newton.CollisionPipeline(model, deterministic=True, growable_contacts=True)
+        pipeline = newton.CollisionPipeline(model, growable_contacts=True)
         contacts, control = pipeline.contacts(), model.control()
         states, kinematics = [model.state(), model.state()], model.state()
         states[0].joint_q.assign(joint_q)

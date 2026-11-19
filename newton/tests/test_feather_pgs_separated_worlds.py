@@ -169,7 +169,7 @@ def _rollout(model, *, separated=True, steps=90, history=None, solver_kwargs=Non
         update_mass_matrix_interval=2,
         **(solver_kwargs or {}),
     )
-    pipeline = newton.CollisionPipeline(model, deterministic=True, growable_contacts=True)
+    pipeline = newton.CollisionPipeline(model, growable_contacts=True)
     contacts = pipeline.contacts()
     states = [model.state() for _ in range(2)]
     newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])

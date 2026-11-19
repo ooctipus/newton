@@ -2244,7 +2244,7 @@ class CollisionPipeline:
 
         Bodies built from many colliders produce one manifold per shape pair.
         After the narrow phase has written the ``Contacts`` buffer (and after
-        the deterministic sort), the pipeline compacts it per group of
+        the contact sort), the pipeline compacts it per group of
         ``(body or static shape, other body or static shape, normal bin,
         spatial cell)``: each group keeps one depth representative, up to six
         sampled footprint extremes over all its contacts and up to six more over
@@ -2350,7 +2350,6 @@ class CollisionPipeline:
         sdf_hydroelastic_config: HydroelasticSDF.Config | None = None,
         shape_pairs_max: int | None = None,
         broad_phase_output_max: int | None = None,
-        deterministic: bool = False,
         box_box_sat: bool = False,
         contact_matching: Literal["disabled", "latest", "sticky"] = "disabled",
         contact_matching_pos_threshold: float = 0.0005,
@@ -2439,10 +2438,7 @@ class CollisionPipeline:
                 count pairs per world from shape masks, which can overcount,
                 even when ``model.shape_contact_pairs`` has already been built.
                 The estimate never falls below 1,000,000 and warns when its
-                buffers require at least 256 MiB. With deterministic contact
-                reduction (``deterministic=True`` or contact matching) it is
-                limited to ``2**20 - 1`` and warns when that drops part of the
-                estimate. It is a heuristic that assumes small contact patches,
+                buffers require at least 256 MiB. It is a heuristic that assumes small contact patches,
                 so dense meshes under convex shapes may still need an explicit
                 value. Ignored when ``narrow_phase`` is provided.
             contact_reduction_hashtable_size_factor: Multiplier applied to
@@ -2506,7 +2502,7 @@ class CollisionPipeline:
             contact_export: Experimental reduced-contact export mapping. ``auto`` selects compact
                 workers for supported CUDA mesh/heightfield reducers. ``tiled`` forces the original
                 mapping; ``compact`` requires admission. Automatic compact export excludes
-                deterministic, speculative, hydroelastic and alternate heightfield export modes.
+                speculative, hydroelastic and alternate heightfield export modes.
                 Explicit choices override ``NEWTON_REDUCER_COMPACT_EXPORT``; ``None`` preserves it.
                 Cannot be combined with a prebuilt narrow phase; configure that instance directly.
                 This parameter may change without the normal deprecation period.
@@ -2584,15 +2580,9 @@ class CollisionPipeline:
                 every call when calibrating captured runs. Rebuild the pipeline
                 and recapture graphs to change this bound; an overflow invalidates
                 the affected collision results.
-            deterministic: Sort contacts after the narrow phase so that results
-                are independent of GPU thread scheduling. This also enables
-                deterministic hydroelastic accumulation and contact allocation.
-                Adds a radix sort + gather pass. Limits the shape count; see
-                :ref:`Deterministic Contacts`.
             contact_matching: Frame-to-frame contact matching mode.  One of
                 ``"disabled"``, ``"latest"``, or ``"sticky"``.  Any
-                non-disabled mode implies ``deterministic=True``, including
-                its shape-count limit, and populates
+                non-disabled mode populates
                 :attr:`Contacts.rigid_contact_match_index`.
                 Defaults to ``"disabled"``.
 
@@ -2712,10 +2702,6 @@ class CollisionPipeline:
                 "speculative_contact_gap_max must be a non-negative finite number or None, "
                 f"got {speculative_contact_gap_max!r}"
             )
-
-        # Any non-disabled matching mode implies deterministic sorting.
-        if matching_enabled:
-            deterministic = True
 
         mode_from_broad_phase: str | None = None
         broad_phase_instance: BroadPhaseAllPairs | BroadPhaseSAP | BroadPhaseExplicit | None = None
@@ -2943,12 +2929,6 @@ class CollisionPipeline:
                     self.shape_pairs_excluded.shape[0] if self.shape_pairs_excluded is not None else 0
                 )
 
-            if deterministic and not narrow_phase.deterministic:
-                raise ValueError(
-                    "CollisionPipeline(deterministic=True) requires a deterministic "
-                    "NarrowPhase. Either omit narrow_phase or construct it with "
-                    "deterministic=True."
-                )
             if bool(getattr(narrow_phase, "speculative", False)) != self._speculative_enabled:
                 raise ValueError(
                     "Provided narrow_phase speculative mode must match "
@@ -3019,7 +2999,6 @@ class CollisionPipeline:
                 model,
                 config=sdf_hydroelastic_config,
                 writer_func=contact_writer,
-                deterministic=deterministic,
                 shape_pairs_filtered=self.shape_pairs_filtered,
             )
 
@@ -3256,7 +3235,7 @@ class CollisionPipeline:
             # Pass write_contact as custom writer to write directly to final Contacts format
             #
             # contact_max is passed explicitly so NarrowPhase sizes its internal
-            # deterministic sort buffers to rigid_contact_max (the same capacity
+            # sort buffers to rigid_contact_max (the same capacity
             # the Contacts buffer uses) rather than falling back to the default
             # max_candidate_pairs.  On SAP/NXN scenes with thousands of shapes
             # the candidate-pair bound (N*(N-1)/2 per world) is orders of
@@ -3289,7 +3268,6 @@ class CollisionPipeline:
                 mesh_sdf_texture_only=mesh_sdf_texture_only,
                 mesh_sdf_any_texture=mesh_sdf_any_texture,
                 sdf_texture_paired_samples=model._sdf_texture_paired_samples,
-                deterministic=deterministic,
                 # The pipeline sorts with its own sorter; the narrow phase's standalone sort buffers stay empty.
                 contact_max=0,
                 verify_buffers=verify_buffers,
@@ -3322,12 +3300,12 @@ class CollisionPipeline:
         self._contact_sort_sub_key_bits = getattr(
             self.narrow_phase, "_contact_sort_sub_key_bits", CONTACT_SORT_SUB_KEY_BITS
         )
-        # Every contact's key (Contacts.rigid_contact_key), which solvers and the deterministic sort order by.
+        # Every contact's key (Contacts.rigid_contact_key), which solvers and contact matching order by.
         self._contact_sort_shape_index_bits = contact_sort_shape_index_bits(
             shape_count, self._contact_sort_sub_key_bits
         )
 
-        self._select_explicit_pair_kernel(model, pair_templates, using_expert_components, deterministic)
+        self._select_explicit_pair_kernel(model, pair_templates, using_expert_components)
 
         # A declared variable that an explicit argument superseded was present but not applied.
         superseded = []
@@ -3623,11 +3601,13 @@ class CollisionPipeline:
                 "Soft contacts with requires_grad=True or enable_rigid_soft_full_surface_contact=True "
                 "do not support body variants."
             )
-        self.deterministic = deterministic
+        # Every pass leaves its contacts in one order decided by their geometry: sorted by (shape pair, sub key), a
+        # key unique among a pass's contacts, so the writers' arrival order never reaches a solver.
         # Per-contact material rows exist only with hydroelastic contacts; a body-pair reducing
         # pipeline takes only the buffers its contacts() allocates, which carry none.
         per_contact_props = self.narrow_phase.hydroelastic_sdf is not None
-        if deterministic:
+        # Contact matching finds last pass's contacts by key: it sorts them.
+        if matching_enabled:
             self._contact_sorter = ContactSorter(
                 self._contact_pool.ready,
                 per_contact_shape_properties=per_contact_props,
@@ -3951,9 +3931,7 @@ class CollisionPipeline:
             "NEWTON_TERRAIN_LAW=none keeps the terrain route (a temporary opt-out)."
         )
 
-    def _select_explicit_pair_kernel(
-        self, model: Model, setting: str | None, using_expert_components: bool, deterministic: bool
-    ) -> None:
+    def _select_explicit_pair_kernel(self, model: Model, setting: str | None, using_expert_components: bool) -> None:
         """Choose the explicit broad-phase kernel once, at construction, and record why.
 
         The world-template kernel replaces the flat one only where it tests the same
@@ -3975,12 +3953,6 @@ class CollisionPipeline:
             reason = "Speculative contacts sweep AABBs, which only the flat pair kernel supports."
         elif templates is None or not templates.describes(self.shape_pairs_filtered):
             reason = "The explicit pairs are not the model-built replay of per-world templates."
-        elif not deterministic and BroadPhaseExplicitTemplates.flat_kernel_orders_writes():
-            # A deterministic pipeline sorts its contacts, so only then is the candidate order free.
-            reason = (
-                "Warp's deterministic mode orders the flat pair kernel's candidate writes; the world-template "
-                "kernel does not."
-            )
         else:
             layout = BroadPhaseExplicitTemplates(templates, device=self.device)
             if layout.unsupported_reason is not None:
@@ -4110,7 +4082,6 @@ class CollisionPipeline:
             "sparse_gjk_pairs": bool(narrow.sparse_gjk_pairs),
             "mesh_reduction": bool(self.mesh_contact_reduction_enabled),
             "body_pair_reduction": self._reduces_body_pairs,
-            "deterministic": bool(self.deterministic),
             "speculative": bool(self._speculative_enabled),
             "hydroelastic": self.hydroelastic_sdf is not None,
             "contact_matching": self.contact_matching,
@@ -4150,7 +4121,6 @@ class CollisionPipeline:
             midphase = "full"
         common = (
             (narrow.speculative, "speculative contacts"),
-            (narrow.deterministic, "deterministic contacts"),
             (narrow.hydroelastic_sdf is not None, "hydroelastic contacts"),
         )
         # The pipeline requests the table by argument only for convex hulls on heightfields under
@@ -5379,6 +5349,16 @@ class CollisionPipeline:
         writer_data.out_stiffness = contacts.rigid_contact_stiffness
         writer_data.out_damping = contacts.rigid_contact_damping
         writer_data.out_friction = contacts.rigid_contact_friction
+        if (
+            self._contact_sorter is not None
+            and contacts._rigid_contact_rows != self._contact_sorter.sorted_keys_view.shape[0]
+        ):
+            raise ValueError(
+                f"Contacts buffer capacity ({contacts._rigid_contact_rows}) does not match the contact matching "
+                f"sort buffer size ({self._contact_sorter.sorted_keys_view.shape[0]}). The sorter operates over "
+                f"fixed-capacity buffers for CUDA graph capture compatibility, so the sizes must match exactly. Use "
+                f"CollisionPipeline.contacts()."
+            )
         writer_data.out_sort_key = contacts.rigid_contact_key
         writer_data.shape_transform = self.geom_transform
         writer_data.shape_linear_velocity = self._shape_linear_velocity
@@ -5569,7 +5549,7 @@ class CollisionPipeline:
             )
 
         pool = contacts._rigid_contact_pool
-        if self.deterministic and self._contact_sorter is not None:
+        if self._contact_sorter is not None:
             self._contact_sorter.sort_full(
                 contacts.rigid_contact_key,
                 contacts.rigid_contact_count,

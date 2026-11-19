@@ -58,8 +58,8 @@ class TestCollisionOutputCapacity(unittest.TestCase):
     def test_generic_convex_output_matches_full_capacity(self):
         """Retain complete GJK/manifold results after bounding the broad-phase output."""
         model, pairs = _model_and_pairs(boxes=True)
-        baseline = _pipeline(model, pairs, deterministic=True)
-        bounded = _pipeline(model, pairs, broad_phase_output_max=2, deterministic=True)
+        baseline = _pipeline(model, pairs)
+        bounded = _pipeline(model, pairs, broad_phase_output_max=2)
         expected, actual = baseline.contacts(), bounded.contacts()
         baseline.collide(model.state(), expected)
         bounded.collide(model.state(), actual)
@@ -106,7 +106,7 @@ class TestCollisionOutputCapacity(unittest.TestCase):
     def test_raw_overflow_remains_visible_and_warns(self):
         """Retain unclamped demand and the existing warning after bounded writes."""
         model, pairs = _model_and_pairs(all_overlap=True)
-        pipeline = _pipeline(model, pairs, broad_phase_output_max=2, deterministic=True)
+        pipeline = _pipeline(model, pairs, broad_phase_output_max=2)
         contacts = pipeline.contacts()
         captured = StdOutCapture()
         captured.begin()
@@ -170,22 +170,22 @@ class TestCollisionOutputCapacity(unittest.TestCase):
         pipeline.collide(model.state(), contacts)
         self.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), 0)
 
-    def test_narrow_phase_derived_budgets_and_deterministic_contacts(self):
+    def test_narrow_phase_derived_budgets_and_sorted_contacts(self):
         """Pass the materialized budget downstream without shrinking contact sorting capacity."""
         model, pairs = _model_and_pairs()
         original_factory = collide_module.NarrowPhase
         with mock.patch.object(collide_module, "NarrowPhase", wraps=original_factory) as factory:
-            bounded = _pipeline(model, pairs, broad_phase_output_max=2, deterministic=True)
+            bounded = _pipeline(model, pairs, broad_phase_output_max=2)
         kwargs = factory.call_args.kwargs
         for key in ("max_candidate_pairs", "candidate_pair_work_estimate"):
             self.assertEqual(kwargs[key], 2)
         # Without mesh pairs the mesh stages get no budget at all.
         for key in ("max_mesh_mesh_pairs", "max_mesh_plane_pairs"):
             self.assertEqual(kwargs[key], 0)
-        # The pipeline sorts with its own buffers; the narrow phase allocates no standalone sort buffer.
+        # The pipeline writes every contact's key into its Contacts; the narrow phase allocates no standalone sort buffer.
         self.assertEqual(kwargs["contact_max"], 0)
-        self.assertEqual(len(bounded._sort_key_array), bounded.contacts().rigid_contact_max)
-        baseline = _pipeline(model, pairs, deterministic=True)
+        self.assertEqual(len(bounded.contacts().rigid_contact_key), bounded.contacts().rigid_contact_max)
+        baseline = _pipeline(model, pairs)
         contacts = bounded.contacts()
         expected = baseline.contacts()
         baseline.collide(model.state(), expected)

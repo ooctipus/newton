@@ -152,7 +152,7 @@ class TestNarrowPhaseBufferWarnings(unittest.TestCase):
 
 
 def _sort_key_bits(narrow_phase) -> int:
-    """Return the populated width of a narrow phase's deterministic sort keys.
+    """Return the populated width of a narrow phase's contact sort keys.
 
     The contact sorter merges whole 64-bit keys, so the keys' width is the narrow phase's: a sub-key and two
     shape indices.
@@ -570,14 +570,13 @@ class TestNarrowPhase(_NarrowPhaseSetupMixin, unittest.TestCase):
         self.assertIs(forwarded["support_vertex_offsets"], support_vertex_offsets)
         self.assertIs(forwarded["support_neighbors"], support_neighbors)
 
-    def test_deterministic_compact_contact_sort(self):
-        """Sort deterministic primitive contacts with compact keys."""
+    def test_compact_contact_sort(self):
+        """Sort primitive contacts with compact keys."""
         self.narrow_phase = NarrowPhase(
             max_candidate_pairs=2,
             max_triangle_pairs=8,
             reduce_contacts=False,
             has_meshes=False,
-            deterministic=True,
             contact_max=20,
             verify_buffers=False,
             shape_aabb_lower=wp.zeros(4, dtype=wp.vec3),
@@ -596,14 +595,13 @@ class TestNarrowPhase(_NarrowPhaseSetupMixin, unittest.TestCase):
         self.assertEqual(count, 2)
         self.assertTrue(np.array_equal(pairs, np.array(((0, 1), (2, 3)), dtype=np.int32)))
 
-    def test_deterministic_complex_contact_sort_keeps_full_sub_key(self):
-        """Retain full deterministic sub-keys for complex contacts."""
+    def test_complex_contact_sort_keeps_full_sub_key(self):
+        """Retain full sub-keys for complex contacts."""
         narrow_phase = NarrowPhase(
             max_candidate_pairs=2,
             max_triangle_pairs=8,
             reduce_contacts=False,
             has_meshes=True,
-            deterministic=True,
             contact_max=20,
             verify_buffers=False,
             shape_aabb_lower=wp.zeros(4, dtype=wp.vec3),
@@ -649,15 +647,14 @@ class TestNarrowPhase(_NarrowPhaseSetupMixin, unittest.TestCase):
         count = int(contact_count.numpy()[0])
         return contact_pair.numpy()[:count]
 
-    def test_deterministic_sort_keys_cover_more_than_2_20_shapes(self):
-        """Keep shape indices above 2**20 distinct in compact deterministic sort keys."""
+    def test_sort_keys_cover_more_than_2_20_shapes(self):
+        """Keep shape indices above 2**20 distinct in compact sort keys."""
         shape_count = (1 << 20) + 2
         self.narrow_phase = NarrowPhase(
             max_candidate_pairs=2,
             max_triangle_pairs=8,
             reduce_contacts=False,
             has_meshes=False,
-            deterministic=True,
             contact_max=20,
             verify_buffers=False,
             shape_aabb_lower=wp.zeros(shape_count, dtype=wp.vec3),
@@ -669,8 +666,8 @@ class TestNarrowPhase(_NarrowPhaseSetupMixin, unittest.TestCase):
         np.testing.assert_array_equal(pairs, [(2, 3), (1 << 20, (1 << 20) + 1)])
         self.assertEqual(_sort_key_bits(self.narrow_phase), 3 + 2 * 21)
 
-    def test_deterministic_sort_keys_reject_more_than_2_20_shapes(self):
-        """Reject shape counts the deterministic sort key can't hold instead of aliasing them."""
+    def test_sort_keys_reject_more_than_2_20_shapes(self):
+        """Reject shape counts the sort key can't hold instead of aliasing them."""
         shape_count = (1 << 20) + 1
         kwargs = {
             "max_candidate_pairs": 2,
@@ -685,16 +682,14 @@ class TestNarrowPhase(_NarrowPhaseSetupMixin, unittest.TestCase):
             "shape_aabb_upper": wp.ones(shape_count, dtype=wp.vec3),
         }
         with self.assertRaisesRegex(ValueError, "at most 1048576 shapes"):
-            NarrowPhase(deterministic=True, **kwargs, **aabbs)
-        NarrowPhase(deterministic=False, **kwargs, **aabbs)
+            NarrowPhase(**kwargs, **aabbs)
 
         # Without AABBs the shape count is known only at launch.
-        self.narrow_phase = NarrowPhase(deterministic=True, **kwargs)
+        self.narrow_phase = NarrowPhase(**kwargs)
         with self.assertRaisesRegex(ValueError, "20-bit shape indices.*pass shape_aabb_lower"):
             self._launch_spheres_past_2_20()
 
         self.narrow_phase = NarrowPhase(
-            deterministic=True,
             **kwargs,
             shape_aabb_lower=wp.zeros(2, dtype=wp.vec3),
             shape_aabb_upper=wp.ones(2, dtype=wp.vec3),

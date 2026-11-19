@@ -667,12 +667,10 @@ def _global_order_models(test, device):
 
 def test_pipeline_templates_match_flat_contacts(test, device):
     """Produce the flat kernel's candidates and contacts with the world templates, globals first or last."""
-    for (global_order, model, state), deterministic in itertools.product(
-        _global_order_models(test, device), (False, True)
-    ):
-        with test.subTest(global_order=global_order, deterministic=deterministic):
-            templated = _pipeline(model, "1", deterministic=deterministic)
-            flat = _pipeline(model, "0", deterministic=deterministic)
+    for global_order, model, state in _global_order_models(test, device):
+        with test.subTest(global_order=global_order):
+            templated = _pipeline(model, "1")
+            flat = _pipeline(model, "0")
             record = _kernel_record(templated)
             test.assertEqual(record["kernel"], "world_templates")
             test.assertEqual(record["source"], "environment")
@@ -694,12 +692,19 @@ def test_pipeline_templates_match_flat_contacts(test, device):
             np.testing.assert_array_equal(
                 _sorted_codes(templated_pairs, count, count), _sorted_codes(flat_pairs, count, count)
             )
-            if device.is_cpu or deterministic:
-                # Serial CPU runs keep list order, and deterministic pipelines sort contacts.
-                for name in _CONTACT_ARRAYS:
-                    np.testing.assert_array_equal(
-                        getattr(templated_contacts, name).numpy(), getattr(flat_contacts, name).numpy(), err_msg=name
-                    )
+            # Both kernels give the same contacts; a pass writes them in thread order, so they are compared in key
+            # order (each contact's identity), the order until the pipeline sorts every pass.
+            live = int(flat_contacts.rigid_contact_count.numpy()[0])
+            orders = [np.argsort(c.rigid_contact_key.numpy()[:live]) for c in (templated_contacts, flat_contacts)]
+            np.testing.assert_array_equal(
+                templated_contacts.rigid_contact_count.numpy(), flat_contacts.rigid_contact_count.numpy()
+            )
+            for name in (*(a for a in _CONTACT_ARRAYS if a != "rigid_contact_count"), "rigid_contact_key"):
+                np.testing.assert_array_equal(
+                    getattr(templated_contacts, name).numpy()[:live][orders[0]],
+                    getattr(flat_contacts, name).numpy()[:live][orders[1]],
+                    err_msg=name,
+                )
             np.testing.assert_array_equal(_contact_rows(templated_contacts), _contact_rows(flat_contacts))
 
 
@@ -832,14 +837,11 @@ class TestBroadPhaseTemplateSelection(unittest.TestCase):
         self.assertEqual(launches, {"templates": 0, "flat": 1})
         self.assertEqual(int(pipeline.broad_phase_pair_count.numpy()[0]), 1)
 
-    def test_deterministic_mode_keeps_the_flat_kernel(self):
-        """Keep the flat kernel when Warp orders its writes, unless the pipeline sorts contacts anyway."""
+    def test_deterministic_mode_keeps_the_world_templates(self):
+        """Use the world templates even when Warp orders the flat kernel's writes: the pipeline sorts contacts."""
         model = _finalize(_replicated_builder(), "cpu")
         with mock.patch.object(BroadPhaseExplicitTemplates, "flat_kernel_orders_writes", return_value=True):
-            record = _kernel_record(_pipeline(model, "1"))
-            self.assertEqual(record["kernel"], "flat_pairs")
-            self.assertIn("deterministic mode", record["reason"])
-            self.assertEqual(_kernel_record(_pipeline(model, "1", deterministic=True))["kernel"], "world_templates")
+            self.assertEqual(_kernel_record(_pipeline(model, "1"))["kernel"], "world_templates")
 
     def test_changed_list_keeps_the_flat_kernel(self):
         """Fall back when the model-built list was changed in place after finalization."""

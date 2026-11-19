@@ -106,7 +106,7 @@ def _settle(model, *, left_regions: bool, steps: int, capture: bool = False):
         pgs_iterations=8,
         dense_max_constraints=64,
     )
-    pipeline = newton.CollisionPipeline(model, deterministic=True)
+    pipeline = newton.CollisionPipeline(model)
     contacts = pipeline.contacts()
     states = [model.state() for _ in range(2)]
     newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])

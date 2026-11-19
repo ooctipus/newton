@@ -63,9 +63,7 @@ def tray(*, mu: float = 0.6, grid: int = 3, layers: int = 2) -> scenes.Scene:
                     scenes._free_box(builder, position, half=0.05, mass=0.2, mu=mu)
         return scenes._finalize(builder, device)
 
-    return scenes.Scene(
-        "tray", build, dt=1.0 / 240.0, steps=60, params={"mu": [mu]}, passive=True, deterministic_contacts=True
-    )
+    return scenes.Scene("tray", build, dt=1.0 / 240.0, steps=60, params={"mu": [mu]}, passive=True)
 
 
 @contextlib.contextmanager
@@ -436,9 +434,7 @@ def _conformance_tests():
     reference; and the compliant stack's material contacts, whose units step by the weights their slots stage."""
     variants = ({}, {"contact_torsion": True})
     problems = [
-        conf._physics(
-            dataclasses.replace(scene, deterministic_contacts=True), law, 32, "torsion" if variant else "", **variant
-        )
+        conf._physics(scene, law, 32, "torsion" if variant else "", **variant)
         for law, variant, scene in itertools.product(("point", "patch"), variants, (tray(), conf.scenes.box_stack()))
     ]
     problems.append(conf._physics(conf.scenes.compliant_stack(), "point", 32, "compliance", contact_compliance=True))

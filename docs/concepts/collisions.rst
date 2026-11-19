@@ -759,8 +759,8 @@ welded bodies no degrees of freedom; :class:`~newton.solvers.SolverFeatherPGS` d
 anyway. Dropping them in the broad phase removes their contact generation and solver bookkeeping.
 The remaining contacts may be renumbered, and on CUDA FeatherPGS can then reserve their rows in
 another order; with few PGS iterations, its results then differ as they do under any change of
-contact order. A deterministic pipeline (:ref:`Deterministic Contacts`) keeps the remaining
-contacts' order, and FeatherPGS gives sorted contacts' rows that order, so its rows stay the same.
+contact order. The pipeline sorts the remaining contacts (:ref:`Deterministic Contacts`), and
+FeatherPGS gives sorted contacts' rows that order, so its rows stay the same.
 Solvers that resolve such joints as constraints no longer see these contacts either, and contact
 sensors no longer report them. With ``include_static_kinematic_pairs=False``, a welded body also
 counts as static for that filter, so its pairs with kinematic shapes are dropped as well.
@@ -1346,7 +1346,7 @@ Bodies built from many colliders (a foot made of several spheres or capsules, a
 hand of boxes) produce one manifold per shape pair, so a single physical patch
 can reach the solver as dozens of near-redundant contacts. Optional body-pair
 reduction compacts the written contacts per body pair after the narrow phase
-(and after the deterministic sort), so ``rigid_contact_count`` itself drops.
+(and after the contact sort), so ``rigid_contact_count`` itself drops.
 Enable it with ``body_pair_reduction``:
 
 .. testcode:: body-pair-reduction
@@ -2391,9 +2391,8 @@ The default ``buffer_fraction`` is ``1.0``, which uses the default capacity
 estimates. Lowering it reduces GPU memory usage but may cause overflow in dense contact scenes.
 If runtime overflow warnings appear, increase ``buffer_fraction`` (or stage-specific
 ``buffer_mult_*`` values) until warnings disappear in your target scenes.
-In deterministic mode, the final iso-voxel buffer has a hard fingerprint-safe
-capacity limit that these settings cannot raise. If that limit overflows, reduce
-the SDF resolution or disable deterministic mode.
+The final iso-voxel buffer has a hard fingerprint-safe capacity limit that these
+settings cannot raise. If that limit overflows, reduce the SDF resolution.
 
 .. _Contact Material Properties:
 
@@ -2664,77 +2663,26 @@ See :doc:`custom_attributes` and :doc:`usd_parsing` for details.
 Deterministic Contact Ordering
 ------------------------------
 
-GPU thread scheduling is non-deterministic, so the order in which contacts are
-written to the output buffer can vary between runs.  Pass ``deterministic=True``
-to :class:`~newton.CollisionPipeline` (or :class:`~newton.geometry.NarrowPhase`) to guarantee
-a reproducible contact order:
+Every collision pass decides its contact set by geometry, independent of GPU thread scheduling.
+Contact reduction decides each slot by score, then by a geometry-derived fingerprint (triangle,
+edge or marching-cubes face index), so the winners do not depend on which thread arrives first;
+hydroelastic per-bin aggregates are summed in int64 fixed point, which is associative. Each
+contact carries its identity in ``Contacts.rigid_contact_key``, a 64-bit key
+``(shape_a, shape_b, sub_key)`` unique among the pass's contacts. The contacts' written order
+still follows the GPU's threads: the pipeline sorts them only for contact matching, and a solver
+that needs an order takes it from the keys. A standalone :class:`~newton.geometry.NarrowPhase`
+sorts its own output by key when it has a sort buffer (``contact_max`` > 0, the default).
 
-.. code-block:: python
-
-    pipeline = newton.CollisionPipeline(model, deterministic=True)
-
-This enables two mechanisms:
-
-1. **Fingerprint tiebreaking** — each contact carries a geometry-derived
-   fingerprint (triangle/edge index) that is used as a deterministic tiebreaker
-   in the ``atomic_max`` contact reduction, so the reduction winner is
-   independent of thread scheduling.
-2. **Radix sort** — after the narrow phase, all contact arrays are reordered by
-   a 64-bit key encoding ``(shape_a, shape_b, sub_key)`` via a radix sort +
-   gather pass.
-
-The overhead is small: fingerprint storage per contact, modified packing in
-the reduction, and one radix sort + gather pass per frame.  The sort is
-fully CUDA-graph-capturable.
-
-The key keeps bit 63 clear, so the two shape indices and the sub-key share 63
-bits.  Models with only primitive and convex shapes use a 3-bit sub-key, which
-leaves room for ``2**30`` shapes.  Models with meshes, heightfields,
-hydroelastic shapes or primitive shapes with an SDF use a 23-bit sub-key and
-fit at most ``2**20`` shapes;
-above that, deterministic mode and contact matching raise ``ValueError`` at
-construction.  A deterministic :class:`~newton.geometry.NarrowPhase` built
-without ``shape_aabb_lower``/``shape_aabb_upper`` doesn't know the shape count,
-so it uses 20-bit shape fields and raises at launch for more than ``2**20``
+The key keeps bit 63 clear. Models with only primitive and convex shapes use a 3-bit sub-key,
+which leaves room for ``2**30`` shapes; models with meshes, heightfields, hydroelastic shapes or
+primitive shapes with an SDF use a 23-bit sub-key and fit at most ``2**20`` shapes, above which
+construction raises ``ValueError``. A :class:`~newton.geometry.NarrowPhase` built without
+``shape_aabb_lower``/``shape_aabb_upper`` uses 20-bit shape fields and raises at launch for more
 shapes.
 
-Hydroelastic contacts are covered by the same two mechanisms, using the
-marching-cubes voxel and face index as the fingerprint.  They additionally need
-a third one, because hydroelastic reduction is the only contact path that sums
-contributions across threads:
-
-3. **Fixed-point aggregation** — the per-normal-bin aggregates (contact force,
-   center of pressure, depth volume, and friction moments) are accumulated as
-   int64 fixed point rather than with floating-point atomics.  Integer addition
-   is associative, so the sums are independent of the order in which threads
-   arrive and no ordering constraint is needed.  A first pass records the
-   largest contribution per bin as a binary exponent, which sizes that bin's
-   fixed-point grid; the mantissa width is derived from the contact buffer
-   capacity so the sum cannot overflow.
-
-Together these give bit-exact repeatability across runs on the same GPU
-architecture when the consuming solver is deterministic as well.
-For example, :class:`~newton.solvers.SolverSteel` reserves its constraint rows
-in contact-buffer order when constructed with
-``deterministic=wp.DeterministicMode.RUN_TO_RUN``:
-
-.. code-block:: python
-
-    pipeline = newton.CollisionPipeline(model, deterministic=True)
-    solver = newton.solvers.SolverSteel(model, deterministic=wp.DeterministicMode.RUN_TO_RUN)
-
-See :doc:`determinism` for which solvers support deterministic mode and
-what it costs.
-
-:class:`~newton.solvers.SolverFeatherPGS` is deterministic in this mode: it gives
-each world's contact rows the sorted contacts' order
-(``Contacts.rigid_contacts_pair_sorted`` marks such contacts). With the default
-pipeline it reserves rows with atomics, in an order that varies between CUDA runs.
-
-.. note::
-
-   Deterministic mode disables hydroelastic pre-pruning, so the generated
-   contact set differs from the non-deterministic default.
+Runs repeat bit for bit on the same GPU architecture when the solver is deterministic as well:
+:class:`~newton.solvers.SolverFeatherPGS` orders each world's contacts and contact rows by body pair
+and contact key. See :doc:`determinism` for the other solvers.
 
 .. _Contact Matching:
 
@@ -2767,8 +2715,6 @@ argument on :class:`~CollisionPipeline` selects one of three modes:
 
      The way sticky contacts are updated across frames may change without prior
      notice.
-
-Any non-disabled mode implies ``deterministic=True``.
 
 .. testsetup:: contact-matching
 
@@ -2859,7 +2805,7 @@ contact midpoints and normals in buffers owned by the pipeline: 40 bytes per
 ``rigid_contact_max`` slot.  ``"sticky"`` adds 48 bytes per slot and
 ``contact_report=True`` adds 4.  ``"disabled"`` allocates no matching history.
 
-The deterministic pipeline's sorter omits the unused simple-layout scratch,
+The pipeline's contact sorter omits the unused simple-layout scratch,
 saving 48 bytes per ``rigid_contact_max`` slot. This more than offsets the
 additional matcher-owned midpoint and normal history.
 
@@ -2909,7 +2855,7 @@ Performance
 - Experimental ``CollisionPipeline(contact_export="auto")`` chooses compact
   reduced-contact export on supported CUDA mesh/heightfield pipelines. Use
   ``"tiled"`` to force the original mapping or ``"compact"`` to require
-  compact admission. Automatic compact export excludes deterministic,
+  compact admission. Automatic compact export excludes
   speculative, hydroelastic and alternate heightfield export modes. Inspect
   :meth:`~CollisionPipeline.get_collision_selection` outside graph capture.
   Omitting this argument retains legacy environment selection.

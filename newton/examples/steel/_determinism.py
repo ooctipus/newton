@@ -174,7 +174,10 @@ class _SimulationCopy:
             deterministic=wp.DeterministicMode.RUN_TO_RUN if deterministic else wp.DeterministicMode.NOT_GUARANTEED,
             **solver_options,
         )
-        self.collision_pipeline = newton.CollisionPipeline(self.model, deterministic=deterministic)
+        # Every copy's pipeline sorts its contacts by key, which only contact matching does (the pipeline otherwise
+        # writes them in thread order and Steel reserves their rows in the order it reads them); only the solver's
+        # atomics differ between the modes.
+        self.collision_pipeline = newton.CollisionPipeline(self.model, contact_matching="latest")
         self.contacts = self.collision_pipeline.contacts()
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()

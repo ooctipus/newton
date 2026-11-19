@@ -18,9 +18,9 @@ bitwise identical results. Use it for regression tests, debugging,
 reproducible training and data generation, and replays that must match a
 recording.
 
-Determinism has to be requested from every stage that produces a step: the
-collision pipeline, which decides which contacts exist and in what order, and
-the solver, which consumes them.
+The collision pipeline, which decides which contacts exist and in what order,
+is deterministic on every pass; determinism has to be requested from the
+solver, which consumes the contacts.
 
 .. code-block:: python
 
@@ -28,7 +28,7 @@ the solver, which consumes them.
 
    import newton
 
-   pipeline = newton.CollisionPipeline(model, deterministic=True)
+   pipeline = newton.CollisionPipeline(model)
    solver = newton.solvers.SolverXPBD(model, deterministic=wp.DeterministicMode.RUN_TO_RUN)
 
    contacts = pipeline.contacts()
@@ -45,9 +45,8 @@ process-wide: the global setting is also Warp's default for every module that
 does not set its own option, so it additionally compiles the collision
 pipeline's kernels, other Newton utility kernels, and your own kernels with
 recorded atomics. That costs speed and memory and can overflow the record
-buffers of kernels with many atomics per thread. It does not enable the
-collision pipeline's contact sorting, which follows only the pipeline's own
-``deterministic`` flag.
+buffers of kernels with many atomics per thread; the collision pipeline does
+not need it.
 
 Sources of nondeterminism
 -------------------------
@@ -76,12 +75,11 @@ thread are already deterministic and cost nothing extra.
 Collision pipeline
 ------------------
 
-``CollisionPipeline(deterministic=True)`` sorts contacts into a canonical order
-after the narrow phase, breaks contact-reduction ties with geometry-derived
-fingerprints, and accumulates hydroelastic aggregates in fixed point; see
-:ref:`Deterministic Contacts`. Contact matching (``contact_matching`` other than
-``"disabled"``) implies ``deterministic=True``. Deterministic mode disables
-hydroelastic pre-pruning, so its contact set differs from the default.
+:class:`~newton.CollisionPipeline` sorts its contacts into one order of their
+geometry after every narrow phase, breaks contact-reduction ties with
+geometry-derived fingerprints, and accumulates hydroelastic aggregates in fixed
+point; see :ref:`Deterministic Contacts`. The cost is one sort per collision
+pass.
 
 Solver support
 --------------

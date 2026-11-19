@@ -835,7 +835,7 @@ def test_collide_outside_capture_grows_before_reading(test, device):
     demand = int(expected.rigid_contact_count.numpy()[0])
     test.assertGreater(demand, 64)
     with _small_pool_policy(64, 64):
-        pipeline = newton.CollisionPipeline(model, deterministic=True, growable_contacts=True)
+        pipeline = newton.CollisionPipeline(model, growable_contacts=True)
         contacts = pipeline.contacts()
         reallocates = _reallocates(pipeline._contact_pool)
         first = contacts.rigid_contact_max
@@ -845,7 +845,7 @@ def test_collide_outside_capture_grows_before_reading(test, device):
             pipeline.collide(model.state(), contacts)
         rows = sized_rows(demand, 64, pipeline._contact_pool.bound) if reallocates else first
     test.assertEqual(contacts.rigid_contact_max, rows)
-    test.assertEqual(pipeline._sort_key_array.shape, (rows,))
+    test.assertEqual(contacts.rigid_contact_key.shape, (rows,))
     test.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), demand)
     test.assertFalse(any(pipeline.narrow_phase.buffer_capacity_status().values()))
     np.testing.assert_array_equal(_records(contacts), _records(expected))
@@ -1706,13 +1706,13 @@ def test_bound_graph_follows_growth_without_recapture(test, device):
 def test_sorted_matched_graph_follows_growth(test, device):
     """Sort and match contacts in a graph captured once while the demand grows past the first rows.
 
-    A deterministic pipeline that matches contacts is captured with every box in the air, then replayed with the
+    A pipeline that matches contacts is captured with every box in the air, then replayed with the
     boxes resting: the first replay drops the contacts past the first rows and flags it, the service maps more
     rows, and every later replay sorts them as an eager pipeline does and matches each to the replay before.
     Without CUDA virtual memory, growth reallocates the rows and the service asks for the recapture instead.
     """
     worlds, boxes = 12288, 6
-    options = {"deterministic": True, "contact_matching": "latest"}
+    options = {"contact_matching": "latest"}
     with _small_pool_policy(8, 8):
         model = _build_resting_boxes(device, worlds, boxes)
         pipeline = newton.CollisionPipeline(model, **options, growable_contacts=True)

@@ -85,9 +85,6 @@ class Scene:
     """Contact capacity of the collision pipeline; ``None`` uses the pipeline's estimate."""
     contact_matching: str | None = None
     """Contact matching mode of the collision pipeline (``"latest"`` for warm start)."""
-    deterministic_contacts: bool = False
-    """Whether the collision pipeline sorts its contacts (``deterministic=True``), so repeats of a route agree
-    bitwise and the reference's run-to-run spread holds no contact or row order."""
     contact_stiffness: tuple[float, ...] = ()
     """Contact stiffness [N/m] of each world, written per contact after each collision pass; empty keeps hard
     contact."""
@@ -1107,7 +1104,6 @@ def gripper(
         control=control,
         # A squeezed box is a statically indeterminate support, so the grasp drifts with the row order between CUDA
         # repeats (the table's by more than its routes' bands allowed): sorted contacts fix the order.
-        deterministic_contacts=True,
         tags=frozenset({"articulated_contact", "grasp"}),
     )
 
@@ -1449,7 +1445,6 @@ def sprawl(*, mu: float = 0.8, fingers: int = 5, finger_links: int = 4, worlds: 
         rigid_contact_max=512,
         # The tree rests on one contact per link, a statically indeterminate support: sorted contacts fix the row
         # order (see long_chain).
-        deterministic_contacts=True,
         tags=frozenset({"articulated_contact", "large_articulation"}),
     )
 
@@ -1522,7 +1517,6 @@ def long_chain(*, links: int = 100, mu: float = 0.6, pull: float = 0.0, armature
         solver_options={"dense_max_constraints": 512},
         rigid_contact_max=512,
         control=control,
-        deterministic_contacts=True,
         tags=frozenset({"articulated_contact", "large_articulation"}),
     )
 
@@ -1664,7 +1658,6 @@ def pinch_twist(*, offsets: tuple[float, ...] = (0.004, 0.007, 0.011, 0.02), spi
         steps=72,
         params=params,
         control=_squeeze,
-        deterministic_contacts=True,
         tags=frozenset({"torsion", "grasp"}),
     )
 
@@ -1772,7 +1765,6 @@ def compliant_plate(*, stiffness: float = 2.0e4, damping: float = 200.0, contact
         contact_matching=contact_matching,
         contact_stiffness=(stiffness,),
         contact_damping=(damping,),
-        deterministic_contacts=True,
         tags=frozenset({"contact_compliance"}),
     )
 
@@ -1801,7 +1793,6 @@ def compliant_stack(
         contact_matching=contact_matching,
         contact_stiffness=(stiffness,),
         contact_damping=(damping,),
-        deterministic_contacts=True,
         tags=frozenset({"contact_compliance"}),
     )
 
@@ -1818,6 +1809,5 @@ def compliant_pinch(*, stiffness: float = 5.0e3, damping: float = 20.0) -> Scene
         control=_squeeze,
         contact_stiffness=(stiffness,),
         contact_damping=(damping,),
-        deterministic_contacts=True,
         tags=frozenset({"contact_compliance", "grasp"}),
     )

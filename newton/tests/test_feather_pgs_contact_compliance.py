@@ -129,7 +129,6 @@ def run_native_hydro_fixture(*, articulated=True):
         pipeline = newton.CollisionPipeline(
             model,
             rigid_contact_max=512,
-            deterministic=True,
             sdf_hydroelastic_config=HydroelasticSDF.Config(
                 reduce_contacts=True, moment_matching=True, anchor_contact=True, buffer_fraction=1.0
             ),

@@ -227,15 +227,14 @@ class TestHeightfieldPairCSR(unittest.TestCase):
         from newton._src.geometry.narrow_phase import NarrowPhase  # noqa: PLC0415
         from newton._src.sim.collide import write_contact  # noqa: PLC0415
 
-        for flag, writer, speculative, deterministic, expected in (
-            ("0", write_contact, False, False, False),
-            ("1", write_contact, False, False, True),
-            ("1", None, False, False, False),
-            ("1", fixtures.record_writer, False, False, False),
-            ("1", write_contact, True, False, False),
-            ("1", write_contact, False, True, False),
+        for flag, writer, speculative, expected in (
+            ("0", write_contact, False, False),
+            ("1", write_contact, False, True),
+            ("1", None, False, False),
+            ("1", fixtures.record_writer, False, False),
+            ("1", write_contact, True, False),
         ):
-            with self.subTest(flag=flag, writer=writer, speculative=speculative, deterministic=deterministic):
+            with self.subTest(flag=flag, writer=writer, speculative=speculative):
                 with patch.dict(
                     os.environ,
                     {
@@ -254,7 +253,6 @@ class TestHeightfieldPairCSR(unittest.TestCase):
                         contact_writer_warp_func=writer,
                         speculative=speculative,
                         contact_writer_supports_speculative=True,
-                        deterministic=deterministic,
                         device="cpu",
                     )
                 self.assertEqual(owner._heightfield_pair_csr_requested, expected)

@@ -966,7 +966,6 @@ def test_mesh_sdf_voxel_tolerance_preserves_inner_contact_coverage(test, device)
     pipeline = newton.CollisionPipeline(
         model,
         broad_phase="nxn",
-        deterministic=True,
         rigid_contact_max=128,
         max_triangle_pairs=128,
     )
@@ -3172,7 +3171,7 @@ class TestTrianglePairCapacityEstimator(unittest.TestCase):
         self.assertEqual(self._capacity(model), expected_pairs * _TRIANGLE_PAIRS_PER_MESH_PAIR)
 
     def test_explicit_capacity_and_floor(self):
-        """Keep explicit capacities and the legacy floor; deterministic reduction keeps the full estimate."""
+        """Keep explicit capacities and the legacy floor; the sorted reduction keeps the full estimate."""
         builder = newton.ModelBuilder()
         builder.add_shape_mesh(-1, mesh=_flat_mesh())
         self._boxes(builder, 3)
@@ -3181,15 +3180,12 @@ class TestTrianglePairCapacityEstimator(unittest.TestCase):
         self.assertEqual(CollisionPipeline(model, max_triangle_pairs=4096).narrow_phase.max_triangle_pairs, 4096)
         self.assertEqual(CollisionPipeline(model).narrow_phase.max_triangle_pairs, _TRIANGLE_PAIRS_MIN_CAPACITY)
         with mock.patch("newton._src.sim.collide._TRIANGLE_PAIRS_PER_MESH_PAIR", 1 << 20):
-            # A contact ID has a 32-bit word of its own: no packing limit clips a deterministic reducer.
-            with warnings.catch_warnings(record=True) as caught:
-                warnings.simplefilter("always", newton.NewtonWarning)
-                pipeline = CollisionPipeline(model, deterministic=True)
-            self.assertFalse([str(w.message) for w in caught if "deterministic" in str(w.message)])
+            # A contact ID has a 32-bit word of its own: no packing limit clips the reducer.
+            pipeline = CollisionPipeline(model)
             self.assertEqual(pipeline.narrow_phase.max_triangle_pairs, 3 << 20)
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", newton.NewtonWarning)
-                unreduced = CollisionPipeline(model, deterministic=True, reduce_contacts=False)
+                unreduced = CollisionPipeline(model, reduce_contacts=False)
             self.assertEqual(unreduced.narrow_phase.max_triangle_pairs, 3 << 20)
         with self.assertRaises(ValueError):
             CollisionPipeline(model, max_triangle_pairs=0)
@@ -4006,7 +4002,7 @@ for shape_type in particle_shape_tests:
 
 
 class TestDeterministicPipeline(unittest.TestCase):
-    """Test that deterministic=True yields bit-identical contacts across collide calls."""
+    """Test that the pipeline yields bit-identical contacts in identical order across collide calls."""
 
     pass
 
@@ -4802,14 +4798,12 @@ def test_deterministic_pipeline_500_steps(test, device):
         pipeline_a = newton.CollisionPipeline(
             model,
             broad_phase="nxn",
-            deterministic=True,
             reduce_contacts=True,
             rigid_contact_max=50000,
         )
         pipeline_b = newton.CollisionPipeline(
             model,
             broad_phase="nxn",
-            deterministic=True,
             reduce_contacts=True,
             rigid_contact_max=50000,
         )
@@ -4879,13 +4873,16 @@ def test_deterministic_pipeline_500_steps(test, device):
             )
             if count_a > 0:
                 # Also compare sort keys to distinguish ordering vs value issues
-                keys_a = pipeline_a._sort_key_array.numpy()[:count_a]
-                keys_b = pipeline_b._sort_key_array.numpy()[:count_a]
+                keys_a = contacts_a.rigid_contact_key.numpy()[:count_a]
+                keys_b = contacts_b.rigid_contact_key.numpy()[:count_a]
+                # Each pass's contacts in the order of their keys (their identity), whatever order its threads wrote.
+                order_a, order_b = np.argsort(keys_a), np.argsort(keys_b)
+                keys_a, keys_b = keys_a[order_a], keys_b[order_b]
                 keys_match = np.array_equal(keys_a, keys_b)
 
                 for name in checked_arrays:
-                    a = getattr(contacts_a, name).numpy()[:count_a]
-                    b = getattr(contacts_b, name).numpy()[:count_a]
+                    a = getattr(contacts_a, name).numpy()[:count_a][order_a]
+                    b = getattr(contacts_b, name).numpy()[:count_a][order_b]
                     if not np.array_equal(a, b):
                         diff_mask = a != b
                         diff_indices = np.argwhere(diff_mask)
@@ -4903,8 +4900,8 @@ def test_deterministic_pipeline_500_steps(test, device):
                             for ki in key_diff[:5].flatten():
                                 msg += f"    key[{ki}]: a=0x{keys_a[ki]:016x}  b=0x{keys_b[ki]:016x}\n"
                         # Show shape pairs for differing contacts
-                        s0_a = contacts_a.rigid_contact_shape0.numpy()[:count_a]
-                        s1_a = contacts_a.rigid_contact_shape1.numpy()[:count_a]
+                        s0_a = contacts_a.rigid_contact_shape0.numpy()[:count_a][order_a]
+                        s1_a = contacts_a.rigid_contact_shape1.numpy()[:count_a][order_a]
                         for idx in diff_indices[:5]:
                             ci = idx[0] if len(idx) > 1 else int(idx)
                             msg += f"  contact[{ci}]: shapes=({s0_a[ci]}, {s1_a[ci]}), key_a=0x{keys_a[ci]:016x}\n"
@@ -4925,13 +4922,11 @@ def test_static_empty_gjk_specialization_under_graph_capture(test, device, broad
     specialized = newton.CollisionPipeline(
         model,
         broad_phase=broad_phase,
-        deterministic=True,
         rigid_contact_max=64,
     )
     reference = newton.CollisionPipeline(
         model,
         broad_phase=broad_phase,
-        deterministic=True,
         rigid_contact_max=64,
     )
     test.assertFalse(specialized.narrow_phase.has_generic_convex_pairs)
@@ -5064,7 +5059,6 @@ def test_split_gjk_mpr_matches_fused_under_graph_capture(test, device):
         model,
         broad_phase="sap",
         shape_pairs_max=_SPLIT_GJK_MPR_LEAN_PAIR_COUNT_THRESHOLD,
-        deterministic=True,
         rigid_contact_max=16384,
         verify_buffers=False,
     )
@@ -5072,7 +5066,6 @@ def test_split_gjk_mpr_matches_fused_under_graph_capture(test, device):
         model,
         broad_phase="sap",
         shape_pairs_max=_SPLIT_GJK_MPR_LEAN_PAIR_COUNT_THRESHOLD,
-        deterministic=True,
         rigid_contact_max=16384,
         verify_buffers=False,
     )
@@ -5096,10 +5089,13 @@ def test_split_gjk_mpr_matches_fused_under_graph_capture(test, device):
     active = int(split_contacts.rigid_contact_count.numpy()[0])
     test.assertGreater(active, 0)
     test.assertEqual(active, int(fused_contacts.rigid_contact_count.numpy()[0]))
-    for name in ("rigid_contact_shape0", "rigid_contact_shape1"):
+    # A pass writes its contacts in thread order: compare them in key order, each contact's identity.
+    split_order = np.argsort(split_contacts.rigid_contact_key.numpy()[:active])
+    fused_order = np.argsort(fused_contacts.rigid_contact_key.numpy()[:active])
+    for name in ("rigid_contact_key", "rigid_contact_shape0", "rigid_contact_shape1"):
         np.testing.assert_array_equal(
-            getattr(split_contacts, name).numpy()[:active],
-            getattr(fused_contacts, name).numpy()[:active],
+            getattr(split_contacts, name).numpy()[:active][split_order],
+            getattr(fused_contacts, name).numpy()[:active][fused_order],
         )
     for name in (
         "rigid_contact_point0",
@@ -5111,8 +5107,8 @@ def test_split_gjk_mpr_matches_fused_under_graph_capture(test, device):
         "rigid_contact_margin1",
     ):
         np.testing.assert_allclose(
-            getattr(split_contacts, name).numpy()[:active],
-            getattr(fused_contacts, name).numpy()[:active],
+            getattr(split_contacts, name).numpy()[:active][split_order],
+            getattr(fused_contacts, name).numpy()[:active][fused_order],
             rtol=1.0e-5,
             atol=1.0e-5,
         )
@@ -5253,12 +5249,12 @@ def test_mesh_scale_update_matches_rebuild(test, device):
         for mesh_name, mesh in meshes.items():
             with test.subTest(terrain=terrain, mesh=mesh_name):
                 model = _build_meshes_on_terrain(device, terrain, mesh, _INITIAL_MESH_SCALES)
-                pipeline = newton.CollisionPipeline(model, deterministic=True, dynamic_shape_scale=True)
+                pipeline = newton.CollisionPipeline(model, dynamic_shape_scale=True)
                 rebuilt = _build_meshes_on_terrain(device, terrain, mesh, _UPDATED_MESH_SCALES)
                 _assign_rebuilt_shape_scale(model, rebuilt)
 
                 points = collide(model, pipeline)
-                expected = collide(rebuilt, newton.CollisionPipeline(rebuilt, deterministic=True))
+                expected = collide(rebuilt, newton.CollisionPipeline(rebuilt))
                 test.assertGreater(len(expected), 0)
                 test.assertEqual(len(points), len(expected))
                 np.testing.assert_allclose(points, expected, atol=1.0e-5)
@@ -5353,7 +5349,7 @@ def test_unit_scale_sdf_rescale_on_plane_matches_rebuild(test, device):
                 with test.subTest(broad_phase=broad_phase, with_terrain=with_terrain, use_graph=use_graph):
                     model = build((1.0, 1.0, 1.0), with_terrain)
                     rebuilt = build((2.0, 2.0, 2.0), with_terrain)
-                    pipeline = newton.CollisionPipeline(model, broad_phase=broad_phase, deterministic=True)
+                    pipeline = newton.CollisionPipeline(model, broad_phase=broad_phase)
                     contacts = pipeline.contacts()
                     state = model.state()
                     pipeline.collide(state, contacts)
@@ -5366,7 +5362,7 @@ def test_unit_scale_sdf_rescale_on_plane_matches_rebuild(test, device):
                     else:
                         pipeline.collide(state, contacts)
                     points = _sorted_contact_points(contacts)
-                    expected_pipeline = newton.CollisionPipeline(rebuilt, broad_phase=broad_phase, deterministic=True)
+                    expected_pipeline = newton.CollisionPipeline(rebuilt, broad_phase=broad_phase)
                     if with_terrain:
                         test.assertGreater(int(pipeline.narrow_phase.shape_pairs_mesh_mesh_count.numpy()[0]), 0)
                     expected = expected_pipeline.contacts()
@@ -5386,7 +5382,7 @@ def test_dynamic_shape_scale_graph_replay_matches_rebuild(test, device):
     cube = newton.Mesh.create_box(0.05, 0.05, 0.05, compute_inertia=False)
     cube.build_sdf(max_resolution=32, device=device)
     model = _build_meshes_on_terrain(device, "heightfield", cube, _INITIAL_MESH_SCALES)
-    pipeline = newton.CollisionPipeline(model, deterministic=True, dynamic_shape_scale=True)
+    pipeline = newton.CollisionPipeline(model, dynamic_shape_scale=True)
     contacts = pipeline.contacts()
     state = model.state()
     pipeline.collide(state, contacts)
@@ -5398,7 +5394,7 @@ def test_dynamic_shape_scale_graph_replay_matches_rebuild(test, device):
     rebuilt = _build_meshes_on_terrain(device, "heightfield", cube, _UPDATED_MESH_SCALES)
     _assign_rebuilt_shape_scale(model, rebuilt)
     wp.capture_launch(capture.graph)
-    rebuilt_pipeline = newton.CollisionPipeline(rebuilt, deterministic=True)
+    rebuilt_pipeline = newton.CollisionPipeline(rebuilt)
     expected = rebuilt_pipeline.contacts()
     rebuilt_pipeline.collide(rebuilt.state(), expected)
     points = _sorted_contact_points(contacts)
@@ -5449,7 +5445,7 @@ def test_packed_mesh_edges_use_mesh_coordinates(test, device):
             return super().launch_custom_write(**kwargs)
 
     def collide(edge_centers, edge_halves):
-        pipeline = newton.CollisionPipeline(model, deterministic=True)
+        pipeline = newton.CollisionPipeline(model)
         pipeline.narrow_phase = PackedEdgeNarrowPhase(pipeline.narrow_phase, edge_centers, edge_halves)
         contacts = pipeline.contacts()
         pipeline.collide(model.state(), contacts)
@@ -5548,7 +5544,6 @@ def test_deterministic_pipeline_sticky_500_steps(test, device):
             "broad_phase": "nxn",
             "reduce_contacts": True,
             "rigid_contact_max": 50000,
-            # contact_matching="sticky" implies deterministic=True.
             "contact_matching": "sticky",
         }
         pipeline_a = newton.CollisionPipeline(model, **common_kwargs)
@@ -5616,13 +5611,16 @@ def test_deterministic_pipeline_sticky_500_steps(test, device):
                 f"Sticky contact count mismatch at frame {_frame_idx}: {count_a} vs {count_b}",
             )
             if count_a > 0:
-                keys_a = pipeline_a._sort_key_array.numpy()[:count_a]
-                keys_b = pipeline_b._sort_key_array.numpy()[:count_a]
+                keys_a = contacts_a.rigid_contact_key.numpy()[:count_a]
+                keys_b = contacts_b.rigid_contact_key.numpy()[:count_a]
+                # Each pass's contacts in the order of their keys (their identity), whatever order its threads wrote.
+                order_a, order_b = np.argsort(keys_a), np.argsort(keys_b)
+                keys_a, keys_b = keys_a[order_a], keys_b[order_b]
                 keys_match = np.array_equal(keys_a, keys_b)
 
                 for name in checked_arrays:
-                    a = getattr(contacts_a, name).numpy()[:count_a]
-                    b = getattr(contacts_b, name).numpy()[:count_a]
+                    a = getattr(contacts_a, name).numpy()[:count_a][order_a]
+                    b = getattr(contacts_b, name).numpy()[:count_a][order_b]
                     if not np.array_equal(a, b):
                         diff_mask = a != b
                         diff_indices = np.argwhere(diff_mask)
@@ -8153,46 +8151,45 @@ def test_plane_convex_support(test, device):
     model = builder.finalize(device=device)
     test.assertGreater(model._convex_support_lut.shape[0], 1)
     state = model.state()
-    for deterministic in (False, True):
-        pipeline = newton.CollisionPipeline(model, deterministic=deterministic)
-        pipeline.narrow_phase.split_gjk_mpr = False
-        contacts = pipeline.contacts()
-        pipeline.collide(state, contacts)
-        if wp.get_device(device).is_cuda:
-            gc_was_enabled = _WARP_NEEDS_CAPTURE_GC_GUARD and gc.isenabled()
+    pipeline = newton.CollisionPipeline(model)
+    pipeline.narrow_phase.split_gjk_mpr = False
+    contacts = pipeline.contacts()
+    pipeline.collide(state, contacts)
+    if wp.get_device(device).is_cuda:
+        gc_was_enabled = _WARP_NEEDS_CAPTURE_GC_GUARD and gc.isenabled()
+        if gc_was_enabled:
+            gc.disable()
+        try:
+            with wp.ScopedCapture(device=device) as capture:
+                pipeline.collide(state, contacts)
+        finally:
             if gc_was_enabled:
-                gc.disable()
-            try:
-                with wp.ScopedCapture(device=device) as capture:
-                    pipeline.collide(state, contacts)
-            finally:
-                if gc_was_enabled:
-                    gc.enable()
-            wp.capture_launch(capture.graph)
-        distance = wp.empty(contacts.rigid_contact_max, dtype=float, device=device)
-        newton.eval_rigid_contact_kinematics(model, state, contacts, out_distance=distance)
-        count = int(contacts.rigid_contact_count.numpy()[0])
-        shapes = contacts.rigid_contact_shape1.numpy()[:count]
-        plane_shapes = contacts.rigid_contact_shape0.numpy()[:count]
-        shape_types = model.shape_type.numpy()
-        # Narrow-phase routing orders by type, regardless of shape creation order.
-        np.testing.assert_array_equal(shape_types[plane_shapes], GeoType.PLANE)
-        np.testing.assert_array_equal(shape_types[shapes], GeoType.CONVEX_MESH)
-        normals = contacts.rigid_contact_normal.numpy()[:count]
-        points_plane = contacts.rigid_contact_point0.numpy()[:count]
-        points_hull = contacts.rigid_contact_point1.numpy()[:count]
-        distances = distance.numpy()[:count]
-        worlds = model.shape_world.numpy()[shapes]
-        np.testing.assert_allclose(normals, np.broadcast_to(normal, normals.shape), atol=2.0e-6, rtol=0.0)
-        for world, (scale, separation, admitted, face_points, face_normals) in enumerate(expected):
-            values = distances[worlds == world]
-            with test.subTest(world=world, deterministic=deterministic):
-                test.assertEqual(len(values) > 0, admitted)
-                if admitted:
-                    test.assertAlmostEqual(float(values.min()), separation, delta=2.0e-5 * scale)
-                    np.testing.assert_allclose(points_plane[worlds == world] @ normal, 0.0, atol=2.0e-5 * scale)
-                    signed_faces = np.sum((points_hull[worlds == world, None] - face_points) * face_normals, axis=-1)
-                    np.testing.assert_allclose(signed_faces.max(axis=1), 0.0, atol=2.0e-5 * scale)
+                gc.enable()
+        wp.capture_launch(capture.graph)
+    distance = wp.empty(contacts.rigid_contact_max, dtype=float, device=device)
+    newton.eval_rigid_contact_kinematics(model, state, contacts, out_distance=distance)
+    count = int(contacts.rigid_contact_count.numpy()[0])
+    shapes = contacts.rigid_contact_shape1.numpy()[:count]
+    plane_shapes = contacts.rigid_contact_shape0.numpy()[:count]
+    shape_types = model.shape_type.numpy()
+    # Narrow-phase routing orders by type, regardless of shape creation order.
+    np.testing.assert_array_equal(shape_types[plane_shapes], GeoType.PLANE)
+    np.testing.assert_array_equal(shape_types[shapes], GeoType.CONVEX_MESH)
+    normals = contacts.rigid_contact_normal.numpy()[:count]
+    points_plane = contacts.rigid_contact_point0.numpy()[:count]
+    points_hull = contacts.rigid_contact_point1.numpy()[:count]
+    distances = distance.numpy()[:count]
+    worlds = model.shape_world.numpy()[shapes]
+    np.testing.assert_allclose(normals, np.broadcast_to(normal, normals.shape), atol=2.0e-6, rtol=0.0)
+    for world, (scale, separation, admitted, face_points, face_normals) in enumerate(expected):
+        values = distances[worlds == world]
+        with test.subTest(world=world):
+            test.assertEqual(len(values) > 0, admitted)
+            if admitted:
+                test.assertAlmostEqual(float(values.min()), separation, delta=2.0e-5 * scale)
+                np.testing.assert_allclose(points_plane[worlds == world] @ normal, 0.0, atol=2.0e-5 * scale)
+                signed_faces = np.sum((points_hull[worlds == world, None] - face_points) * face_normals, axis=-1)
+                np.testing.assert_allclose(signed_faces.max(axis=1), 0.0, atol=2.0e-5 * scale)
 
 
 add_function_test(

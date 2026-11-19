@@ -29,18 +29,15 @@ import warp as wp
 
 import newton
 from newton._src.geometry.contact_data import ContactData
-from newton._src.geometry.contact_reduction import get_slot
 from newton._src.geometry.contact_reduction_global import (
     PREDICTIVE_BIN_ID,
     GlobalContactReducerData,
-    make_contact_key,
 )
 from newton._src.geometry.contact_reduction_hydroelastic import (
     HydroelasticContactReduction,
     HydroelasticReductionConfig,
     export_hydroelastic_contact_to_buffer,
 )
-from newton._src.geometry.hashtable import hashtable_find_or_insert
 
 _GOLDEN_DIR = os.path.join(os.path.dirname(__file__), "golden_data", "test_contact_reduction_reference")
 _UPDATE = os.environ.get("NEWTON_UPDATE_CONTACT_REDUCTION_REFERENCE") == "1"
@@ -283,22 +280,12 @@ def _buffer_hydro_faces(
     separations: wp.array[float],
     areas: wp.array[float],
     pressures: wp.array[float],
-    deterministic: int,
 ):
-    """Buffer faces and their unreduced aggregates in order, as the SDF generator does."""
+    """Buffer faces in order, as the SDF generator does (the reducer accumulates their aggregates)."""
     for index in range(pairs.shape[0]):
         pair = pairs[index]
         normal = normals[index]
         separation = separations[index]
-        if separation < 0.0 and deterministic == 0:
-            key = make_contact_key(pair[0], pair[1], get_slot(normal))
-            entry = hashtable_find_or_insert(key, data.ht_keys, data.ht_active_slots)
-            if entry >= 0:
-                force = areas[index] * pressures[index]
-                wp.atomic_add(data.agg_force, entry, force * normal)
-                wp.atomic_add(data.weighted_pos_sum, entry, force * points[index])
-                wp.atomic_add(data.weight_sum, entry, force)
-                wp.atomic_add(data.agg_depth_volume, entry, (areas[index] * (-separation)) * normal)
         export_hydroelastic_contact_to_buffer(
             pair[0], pair[1], points[index], normal, separation, areas[index], pressures[index], index, data
         )
@@ -318,7 +305,7 @@ def _hydro_faces():
     return faces
 
 
-def _run_hydroelastic(out, name, faces, *, deterministic, moment_matching):
+def _run_hydroelastic(out, name, faces, *, moment_matching):
     """Reduce and export three passes of buffered faces through the hydroelastic reducer."""
     shapes = 4
     capacity = 4096
@@ -327,7 +314,6 @@ def _run_hydroelastic(out, name, faces, *, deterministic, moment_matching):
         device="cpu",
         writer_func=_write_hydro_contact,
         config=HydroelasticReductionConfig(moment_matching=moment_matching),
-        deterministic=deterministic,
     )
     writer = _HydroWriter()
     writer.count = wp.zeros(1, dtype=int, device="cpu")
@@ -359,7 +345,7 @@ def _run_hydroelastic(out, name, faces, *, deterministic, moment_matching):
         wp.launch(
             _buffer_hydro_faces,
             dim=1,
-            inputs=[reduction.get_data_struct(), *columns, int(deterministic)],
+            inputs=[reduction.get_data_struct(), *columns],
             device="cpu",
         )
         reduction.reduce_and_export(k_hydro, transforms, lower, upper, voxels, gaps, writer, 64)
@@ -406,7 +392,7 @@ class TestContactReductionReference(unittest.TestCase):
                     )
 
     def test_terrain_routes(self):
-        """Reproduce the terrain routes: typed rows, generic and finite queries, cleanup and determinism."""
+        """Reproduce the terrain routes: typed rows, generic and finite queries and cleanup."""
         model = _terrain_model()
         options = {"max_triangle_pairs": 8192}
         out = {}
@@ -421,17 +407,15 @@ class TestContactReductionReference(unittest.TestCase):
         _run_passes(self, out, "generic", model, generic, **options)
         pipeline = _run_passes(self, out, "cleanup", model, {**typed, "NEWTON_REDUCER_EXPORT_CLEANUP": "1"}, **options)
         self.assertTrue(pipeline.narrow_phase._reducer_export_cleanup)
-        _run_passes(self, out, "deterministic", model, typed, deterministic=True, **options)
         _run_passes(self, out, "finite", model, {**_TERRAIN_FLAGS, "NEWTON_HEIGHTFIELD_FINITE_QUERY": "1"}, **options)
         self._check("terrain", out)
 
     def test_mesh_pile(self):
-        """Reproduce the mesh-plane and mesh-mesh writers in both reduction modes."""
+        """Reproduce the mesh-plane and mesh-mesh writers."""
         model = _mesh_pile_model()
         options = {"max_triangle_pairs": 16384}
         out = {}
         _run_passes(self, out, "plain", model, _TERRAIN_FLAGS, **options)
-        _run_passes(self, out, "deterministic", model, _TERRAIN_FLAGS, deterministic=True, **options)
         self._check("mesh_pile", out)
 
     def test_speculative(self):
@@ -472,13 +456,11 @@ class TestContactReductionReference(unittest.TestCase):
         self._check("pair_csr", out)
 
     def test_hydroelastic(self):
-        """Reproduce the hydroelastic reducer with and without determinism and moment matching."""
+        """Reproduce the hydroelastic reducer with and without moment matching."""
         faces = _hydro_faces()
         out = {}
-        for deterministic in (False, True):
-            for moment_matching in (False, True):
-                name = f"deterministic{int(deterministic)}_moments{int(moment_matching)}"
-                _run_hydroelastic(out, name, faces, deterministic=deterministic, moment_matching=moment_matching)
+        for moment_matching in (False, True):
+            _run_hydroelastic(out, f"moments{int(moment_matching)}", faces, moment_matching=moment_matching)
         self._check("hydroelastic", out)
 
 

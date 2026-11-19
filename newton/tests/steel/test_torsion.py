@@ -1983,7 +1983,7 @@ def _pad_rollout(pairs_per_world, capacity, *, device, preparation="device", ste
         warn_constraint_overflow=warn,
         row_watermark=True,
     )
-    pipeline = newton.CollisionPipeline(model, broad_phase="nxn", rigid_contact_max=256, deterministic=True)
+    pipeline = newton.CollisionPipeline(model, broad_phase="nxn", rigid_contact_max=256)
     contacts = pipeline.contacts()
     z = model.state()
     control = model.control()
@@ -3480,7 +3480,7 @@ def test_colored_sleeping_islands_drop_their_torsion_rows(test, device):
         sleep_quiet_time=0.05,
         **_COLORED_TORSION,
     )
-    pipeline = newton.CollisionPipeline(model, rigid_contact_max=128, deterministic=True)
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=128)
     contacts = pipeline.contacts()
     state, output = model.state(), model.state()
     body_art = solver._body_to_articulation.numpy()

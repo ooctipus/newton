@@ -809,7 +809,7 @@ class TestHubPlacement(unittest.TestCase):
                 self.assertEqual(solver.placement.row_seeds.tiers, 0)
                 capture = Capture(solver)
                 pipeline = newton.CollisionPipeline(
-                    model, broad_phase="nxn", reduce_contacts=False, deterministic=True, growable_contacts=True
+                    model, broad_phase="nxn", reduce_contacts=False, growable_contacts=True
                 )
                 contacts = pipeline.contacts()
                 state, out = model.state(), model.state()
@@ -858,9 +858,7 @@ def _sink_rollout(device, sink, *, kinematic_at=None, steps=12):
             mf_max_constraints=32,
             pins=SolverFeatherPGS.Pins(tiers=None if kinematic_at is None else 32, sink=sink),
         )
-    pipeline = newton.CollisionPipeline(
-        model, broad_phase="nxn", reduce_contacts=False, deterministic=True, growable_contacts=True
-    )
+    pipeline = newton.CollisionPipeline(model, broad_phase="nxn", reduce_contacts=False, growable_contacts=True)
     contacts = pipeline.contacts()
     state, out = model.state(), model.state()
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)

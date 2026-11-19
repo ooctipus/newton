@@ -66,7 +66,6 @@ class TestCompactContactExport(unittest.TestCase):
                 narrow = NarrowPhase(**common, contact_export=choice)
                 self.assertEqual(narrow._reducer_compact_export, expected)
             for options in (
-                {"deterministic": True},
                 {"reduce_contacts": False},
                 {"has_meshes": False},
                 {"speculative": True},

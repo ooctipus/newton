@@ -98,16 +98,14 @@ def make_solver(model, enabled, pins=None, **overrides):
     return SolverFeatherPGS(model, pins=SolverFeatherPGS.Pins(**pins), **options)
 
 
-def make_case(enabled, *, options=None, pins=None, contact_matching=None, deterministic=False, standing=False, **shape):
+def make_case(enabled, *, options=None, pins=None, contact_matching=None, standing=False, **shape):
     model = standing_model(**shape) if standing else branched_model(**shape)
     solver = make_solver(model, enabled, pins=pins, **(options or {}))
     state, out, control = model.state(), model.state(), model.control()
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
     control.joint_f.assign(np.linspace(-0.08, 0.11, model.joint_dof_count, dtype=np.float32))
     matching = {} if contact_matching is None else {"contact_matching": contact_matching}
-    pipeline = newton.CollisionPipeline(
-        model, rigid_contact_max=32, deterministic=deterministic, **matching, growable_contacts=True
-    )
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=32, **matching, growable_contacts=True)
     return model, solver, state, out, control, pipeline, pipeline.contacts()
 
 

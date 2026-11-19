@@ -591,7 +591,7 @@ class TestStateBlockPlacement(unittest.TestCase):
             # The row order must not follow thread scheduling: sorted contacts order the rows, and the scene's row limit
             # keeps them all, since a thread race picks the rows that survive a limit.
             pipeline = newton.CollisionPipeline(
-                model, rigid_contact_max=scene.rigid_contact_max, deterministic=True, growable_contacts=True
+                model, rigid_contact_max=scene.rigid_contact_max, growable_contacts=True
             )
             contacts = pipeline.contacts()
             state, out, control = model.state(), model.state(), model.control()
@@ -767,8 +767,6 @@ def pipeline_options(scene) -> dict:
         options["rigid_contact_max"] = scene.rigid_contact_max
     if scene.contact_matching is not None:
         options["contact_matching"] = scene.contact_matching
-    if scene.deterministic_contacts:
-        options["deterministic"] = True
     return options
 
 

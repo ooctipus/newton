@@ -164,7 +164,7 @@ class TestSteelBodyPairReductionGate(unittest.TestCase):
 class TestSteelBodyPairReductionConformance(unittest.TestCase):
     """SolverSteel settles identically with and without body-pair reduction on every contact path."""
 
-    def _settle(self, build_fn, make_solver, reduce_on, steps=240, *, deterministic=True):
+    def _settle(self, build_fn, make_solver, reduce_on, steps=240):
         """Drop, settle, and return dynamics plus solver-path watermarks.
 
         The fell/contact guards make the comparison non-vacuous: a body that
@@ -181,7 +181,7 @@ class TestSteelBodyPairReductionConformance(unittest.TestCase):
         state_0, state_1 = model.state(), model.state()
         newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
         control = model.control()
-        pipeline = _make_pipeline(model, reduce_on, deterministic=deterministic)
+        pipeline = _make_pipeline(model, reduce_on)
         contacts = pipeline.contacts()
         solver = make_solver(model)
         z0 = float(state_0.body_q.numpy()[body][2])
@@ -207,21 +207,9 @@ class TestSteelBodyPairReductionConformance(unittest.TestCase):
         tol=5e-4,
         w_tol=0.05,
         expected_row_path=None,
-        *,
-        deterministic=True,
     ):
-        z_off, fell_off, contacts_off, w_off, rows_off = self._settle(
-            build_fn,
-            make_solver,
-            False,
-            deterministic=deterministic,
-        )
-        z_on, fell_on, contacts_on, w_on, rows_on = self._settle(
-            build_fn,
-            make_solver,
-            True,
-            deterministic=deterministic,
-        )
+        z_off, fell_off, contacts_off, w_off, rows_off = self._settle(build_fn, make_solver, False)
+        z_on, fell_on, contacts_on, w_on, rows_on = self._settle(build_fn, make_solver, True)
         self.assertTrue(fell_off and fell_on, "body did not fall: the solver is not simulating it")
         self.assertGreater(contacts_off, 0)
         self.assertGreater(contacts_on, 0)
@@ -238,17 +226,11 @@ class TestSteelBodyPairReductionConformance(unittest.TestCase):
         # bound instead of the calm default.
         self.assertLess(w_on, max(2.0 * w_off, w_tol), f"reduced settle is rocking: |w| {w_on} vs {w_off}")
 
-    def test_steel_nondeterministic_conformance(self):
-        """Conform on the default unsorted collision pipeline.
-
-        Sequential PGS observes row order, so the sorted conformance cases do
-        not establish support for ``CollisionPipeline(deterministic=False)``.
-        This exercises the serial solve with point friction and strict contact compaction.
-        """
+    def test_steel_conformance(self):
+        """Conform with the serial solve, point friction and strict contact compaction."""
         self._compare(
             lambda b: _free_jointed_foot(b, (0.0, 0.0, 0.05)),
             lambda m: _undamped(newton.solvers.SolverSteel(m, friction_anchor_beta=0.0)),
-            deterministic=False,
         )
 
     def test_steel_dynamic_dynamic_conformance(self):
@@ -572,7 +554,7 @@ class TestSteelBodyPairReductionSettling(unittest.TestCase):
             newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
             control = model.control()
             pipe_red = _make_pipeline(model, True, body_pair_verify=True)
-            pipe_raw = newton.CollisionPipeline(model, broad_phase="nxn", deterministic=True)
+            pipe_raw = newton.CollisionPipeline(model, broad_phase="nxn")
             c_red, c_raw = pipe_red.contacts(), pipe_raw.contacts()
             # Seven colliders per body generate thousands of speculative rows.
             # Both consumers must retain them for this to test reduction stability.
@@ -601,7 +583,7 @@ class TestSteelBodyPairReductionSettling(unittest.TestCase):
             raw_state_0, raw_state_1 = model.state(), model.state()
             newton.eval_fk(model, raw_state_0.joint_q, raw_state_0.joint_qd, raw_state_0)
             raw_control = model.control()
-            raw_dynamics_pipeline = newton.CollisionPipeline(model, broad_phase="nxn", deterministic=True)
+            raw_dynamics_pipeline = newton.CollisionPipeline(model, broad_phase="nxn")
             raw_dynamics_contacts = raw_dynamics_pipeline.contacts()
             raw_solver = newton.solvers.SolverSteel(
                 model, friction_anchor_beta=0.0, free_body_constraint_max=mf_capacity, deterministic=RUN_TO_RUN

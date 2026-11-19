@@ -2932,7 +2932,7 @@ class NarrowPhase:
     heightfield/sphere and heightfield/regular-cylinder queries into typed kernels
     with the original support, GJK/MPR and manifold math. Other current pair types
     retain the generic query, including barrel cylinders. Admission requires stock
-    buffered contact writing without finite queries, deterministic mode,
+    buffered contact writing without finite queries,
     speculative contacts or hydroelastic SDFs; no geometry is cached by this option.
     Each typed row scans the triangle stream only when a current heightfield
     pair reaches it: a small kernel reads the current pair list, shape types and
@@ -2948,7 +2948,7 @@ class NarrowPhase:
     Experimental, default-off ``NEWTON_REDUCER_EXPORT_CLEANUP=1`` retires consumed
     winner slots and keys during stock buffered export, then resets only counters
     at the next collision. Active counts and failure evidence remain available
-    through verification. Custom writers, deterministic, speculative, hydroelastic,
+    through verification. Custom writers, speculative, hydroelastic,
     finite-query and pair-CSR routes retain the original clear/export lifecycle.
 
     Experimental ``NEWTON_HEIGHTFIELD_PAIR_CSR=1`` groups stock-writer-admitted
@@ -2958,7 +2958,7 @@ class NarrowPhase:
     the contact manifold; it does not promise an equivalent pointwise Coulomb
     system. Unsupported pairs retain the original global reduction and export.
     Admission requires geometric culling, stock contact writing, no triangle
-    meshes, speculative contacts, deterministic mode or hydroelastic SDFs, and
+    meshes, speculative contacts or hydroelastic SDFs, and
     internal CollisionPipeline construction with unique explicit or generated
     NxN pairs. Raw-pool and membership failures remain sticky capacity errors.
 
@@ -2998,7 +2998,6 @@ class NarrowPhase:
         mesh_sdf_any_texture: bool = False,
         mesh_sdf_identity_scale_only: bool = False,
         sdf_texture_paired_samples: bool = True,
-        deterministic: bool = False,
         contact_max: int | None = None,
         verify_buffers: bool = True,
         contact_reduction_hashtable_size_factor: float = 0.25,
@@ -3066,11 +3065,8 @@ class NarrowPhase:
                 has no baked scale must then keep unit ``shape_scale``.
             sdf_texture_paired_samples: Whether texture SDFs store adjacent x samples together.
                 This is model-wide so mesh-SDF kernels require only two bounded static variants.
-            deterministic: Make contact generation and ordering independent of
-                GPU thread scheduling. Adds deterministic hydroelastic atomics
-                and a radix sort + gather pass. Limits the shape count; see
-                :ref:`Deterministic Contacts`.
-            contact_max: Maximum number of contacts for the deterministic sort buffer.
+            contact_max: Maximum number of contacts for the sort buffer that leaves a standalone launch's contacts in
+                one order of their geometry (by shape pair and sub key); 0: the caller sorts them (CollisionPipeline).
                 Must match the ``contact_pair`` array size passed to :meth:`launch`.
                 Defaults to ``max_candidate_pairs``.  Set this to a larger value when
                 a single candidate pair can emit multiple contacts (e.g. up to 4 for
@@ -3184,7 +3180,6 @@ class NarrowPhase:
             and self._heightfield_finite_query
             and not has_meshes
             and not speculative
-            and not deterministic
             and hydroelastic_sdf is None
             and pair_csr_writer_supported
         )
@@ -3214,7 +3209,6 @@ class NarrowPhase:
             and not self._heightfield_finite_query
             and not self._heightfield_pair_csr_requested
             and not speculative
-            and not deterministic
             and hydroelastic_sdf is None
             and primitive_writer_supported
         )
@@ -3263,7 +3257,6 @@ class NarrowPhase:
             and reduce_contacts
             and (has_meshes or has_heightfields)
             and cleanup_writer_supported
-            and not deterministic
             and not speculative
             and hydroelastic_sdf is None
             and not self._heightfield_finite_query
@@ -3276,7 +3269,6 @@ class NarrowPhase:
             wp.get_device(device).is_cuda
             and reduce_contacts
             and (has_meshes or has_heightfields)
-            and not deterministic
             and not self._heightfield_pair_csr_requested
         )
         if contact_export is None:
@@ -3295,7 +3287,7 @@ class NarrowPhase:
             if contact_export == "compact" and not compact_supported:
                 raise ValueError(
                     "contact_export='compact' requires a CUDA mesh/heightfield reducer with a stock writer, "
-                    "without deterministic, speculative, hydroelastic or alternate heightfield export"
+                    "without speculative, hydroelastic or alternate heightfield export"
                 )
             self._reducer_compact_export = contact_export != "tiled" and compact_supported
         # Requested terrain and reducer routes (environment or explicit argument), reported by
@@ -3338,7 +3330,6 @@ class NarrowPhase:
         self.has_generic_convex_pairs = has_generic_convex_pairs
         self.sdf_texture_paired_samples = sdf_texture_paired_samples
         self.mesh_sdf_identity_scale_only = mesh_sdf_identity_scale_only
-        self.deterministic = deterministic
         self.verify_buffers = verify_buffers
         self.contact_pool = None
         """The contact rows of the collision pipeline using this narrow phase, set by the pipeline; their captured
@@ -3375,10 +3366,8 @@ class NarrowPhase:
             if has_meshes or has_heightfields or hydroelastic_sdf is not None
             else CONTACT_SORT_CONVEX_SUB_KEY_BITS
         )
-        # Sort keys are written only in deterministic mode; external AABBs give the shape count.
-        if not deterministic:
-            self._contact_sort_shape_index_bits = 0
-        elif self.external_aabb:
+        # External AABBs give the shape count.
+        if self.external_aabb:
             self._contact_sort_shape_index_bits = contact_sort_shape_index_bits(
                 self.shape_aabb_lower.shape[0], self._contact_sort_sub_key_bits
             )
@@ -3674,8 +3663,6 @@ class NarrowPhase:
             self.global_contact_reducer = None
 
         self.hydroelastic_sdf = hydroelastic_sdf
-        if self.hydroelastic_sdf is not None:
-            self.hydroelastic_sdf._validate_deterministic(deterministic)
 
         # Pre-allocate all intermediate buffers.
         # Counters live in one consolidated array for efficient zeroing.
@@ -3826,7 +3813,7 @@ class NarrowPhase:
             # Per shape, nonzero for a partner whose heightfield pairs the terrain law writes (empty: none).
             self._terrain_law_partner = wp.zeros(0, dtype=wp.int32, device=device)
             det_capacity = contact_max if contact_max is not None else max_candidate_pairs
-            if deterministic and det_capacity > 0:
+            if det_capacity > 0:
                 self._sort_key_array = wp.zeros(det_capacity, dtype=wp.int64, device=device)
                 # The live sort compares whole keys; it has no radix passes for a key width to limit.
                 self._contact_sorter = ContactSorter(det_capacity, device=device)
@@ -5941,29 +5928,25 @@ class NarrowPhase:
         # Clear external contact count (internal counters are cleared in launch_custom_write)
         contact_count.zero_()
 
-        # Verify sort-key buffer and sorter match the contact output capacity.
-        # Raising instead of silently reallocating keeps this path
-        # CUDA-graph-capturable and consistent with CollisionPipeline.collide().
-        if self.deterministic and self._sort_key_array.shape[0] != contact_max:
-            raise ValueError(
-                f"Contact output capacity ({contact_max}) does not match the "
-                f"deterministic sort buffer size ({self._sort_key_array.shape[0]}). "
-                f"The sorter operates over fixed-capacity buffers for CUDA graph capture "
-                f"compatibility, so the sizes must match exactly."
-            )
-        if self.deterministic and shape_types.shape[0] > 1 << self._contact_sort_shape_index_bits:
+        # The sort covers the launched output: its keys and sorter hold at least the output's slots (an output larger
+        # than any before allocates them once, outside a capture), and it sorts the contacts the output holds.
+        sorts = self._contact_sorter is not None
+        if sorts and self._sort_key_array.shape[0] < contact_max:
+            self._sort_key_array = wp.zeros(contact_max, dtype=wp.int64, device=device)
+            self._contact_sorter = ContactSorter(contact_max, device=device)
+        if sorts and shape_types.shape[0] > 1 << self._contact_sort_shape_index_bits:
             hint = (
                 f"the shape AABBs passed at construction cover {self.shape_aabb_lower.shape[0]} shapes"
                 if self.external_aabb
                 else "pass shape_aabb_lower/upper at construction to size them"
             )
             raise ValueError(
-                f"Deterministic sort keys hold {self._contact_sort_shape_index_bits}-bit shape indices, got "
+                f"Contact sort keys hold {self._contact_sort_shape_index_bits}-bit shape indices, got "
                 f"{shape_types.shape[0]} shapes; {hint}."
             )
 
         # Create ContactWriterData struct
-        sort_key_arr = self._sort_key_array if self.deterministic else self._empty_sort_key
+        sort_key_arr = self._sort_key_array if sorts else self._empty_sort_key
 
         writer_data = ContactWriterData()
         writer_data.contact_max = contact_max
@@ -6025,7 +6008,7 @@ class NarrowPhase:
             device=device,
         )
 
-        if self.deterministic:
+        if sorts:
             self._contact_sorter.sort_simple(
                 sort_key_arr,
                 contact_count,

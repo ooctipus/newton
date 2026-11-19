@@ -8,7 +8,6 @@ each world's rows sit on another world's line: a read that takes its line from t
 differs from the identity's, on every route of the conformance catalogue.
 """
 
-import dataclasses
 import unittest
 from unittest import mock
 
@@ -29,9 +28,8 @@ def _reversed_lines(self, *args, **kwargs):
 
 def _states(group, route, device):
     physics = group.physics
-    # Contacts in a fixed order: otherwise two runs of one route differ, tables or not.
-    scene = dataclasses.replace(physics.scene, deterministic_contacts=True)
-    run = conformance.simulate(scene, route, device, options=physics.options(physics.iterations), steps=30)
+    # The pipeline sorts its contacts, so two runs of one route agree, tables or not.
+    run = conformance.simulate(physics.scene, route, device, options=physics.options(physics.iterations), steps=30)
     return {name: getattr(run, name) for name in conformance.STATE_FIELDS}
 
 

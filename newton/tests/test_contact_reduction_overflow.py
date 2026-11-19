@@ -306,28 +306,25 @@ def test_default_capacity_holds_large_batches(test, device):
             test.assertEqual(int(np.count_nonzero(per_world == 0)), 0)
 
 
-def test_deterministic_reduction_keeps_full_capacity(test, device):
-    """Size deterministic reduction and contact matching like any other reduction, above 2**20 contacts.
+def test_sorted_reduction_keeps_full_capacity(test, device):
+    """Size the sorted reduction, with or without contact matching, like an unreduced pipeline, above 2**20 contacts.
 
     The reducer keeps a contact ID in a 32-bit word of its own, so no contact-ID packing limit clips the automatic
-    capacity of a deterministic pipeline.
+    capacity.
     """
     world_count = 1400  # about 1.4M estimated slots, above the 2**20 - 1 limit a 20-bit contact ID imposed
     model = _tray_worlds_model(device, world_count)
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", newton.NewtonWarning)
-        unreduced = newton.CollisionPipeline(model, reduce_contacts=False, deterministic=True)
+        unreduced = newton.CollisionPipeline(model, reduce_contacts=False)
     test.assertIsNone(unreduced.narrow_phase.global_contact_reducer)
     capacity = unreduced.narrow_phase.max_triangle_pairs
     test.assertGreater(capacity, (1 << 20) - 1)
 
-    for kwargs in ({"deterministic": True}, {"contact_matching": "latest"}):
+    for kwargs in ({}, {"contact_matching": "latest"}):
         with test.subTest(**kwargs):
-            with warnings.catch_warnings(record=True) as caught:
-                warnings.simplefilter("always", newton.NewtonWarning)
-                pipeline = newton.CollisionPipeline(model, **kwargs)
-            test.assertFalse([str(w.message) for w in caught if "deterministic" in str(w.message)])
+            pipeline = newton.CollisionPipeline(model, **kwargs)
             test.assertIsNotNone(pipeline.narrow_phase.global_contact_reducer)
             test.assertEqual(pipeline.narrow_phase.max_triangle_pairs, capacity)
 
@@ -390,8 +387,8 @@ add_function_test(
 
 add_function_test(
     TestContactReductionOverflow,
-    "test_deterministic_reduction_keeps_full_capacity",
-    test_deterministic_reduction_keeps_full_capacity,
+    "test_sorted_reduction_keeps_full_capacity",
+    test_sorted_reduction_keeps_full_capacity,
     devices=["cpu"],
 )
 

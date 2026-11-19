@@ -780,6 +780,16 @@ def _per_contact_arrays(contacts):
     ]
 
 
+def _order_by_key(contacts):
+    """Put the live contacts in key order (each contact's identity): a pass writes them in thread order."""
+    count = int(contacts.rigid_contact_count.numpy()[0])
+    order = np.argsort(contacts.rigid_contact_key.numpy()[:count], kind="stable")
+    for array in _per_contact_arrays(contacts):
+        values = array.numpy().copy()
+        values[:count] = values[order]
+        array.assign(values)
+
+
 def _list_immobile_contacts_last(contacts, immobile):
     """Stably move the contacts between two ``immobile`` shapes behind the others; return how many others."""
     count = int(contacts.rigid_contact_count.numpy()[0])
@@ -813,8 +823,8 @@ def _check_arm_steps(test, model, law, friction_anchor_beta, device):
     immobile = roles <= 0
     control = model.control()
     solvers = [newton.solvers.SolverFeatherPGS(model, friction_anchor_beta=friction_anchor_beta) for _ in range(2)]
-    # Sorted contacts compare element by element: the reference keeps the base's ground pairs.
-    pipelines = (_pipeline(model, "0", deterministic=True), _pipeline(model, None, deterministic=True))
+    # Contacts in key order compare element by element: the reference keeps the base's ground pairs.
+    pipelines = (_pipeline(model, "0"), _pipeline(model, None))
     reference, contacts = (pipeline.contacts() for pipeline in pipelines)
     state = model.state()
     newton.eval_fk(model, model.joint_q, model.joint_qd, state)
@@ -825,6 +835,8 @@ def _check_arm_steps(test, model, law, friction_anchor_beta, device):
     for _ in range(60):
         pipelines[0].collide(state, reference)
         pipelines[1].collide(state, contacts)
+        _order_by_key(reference)
+        _order_by_key(contacts)
         listed = int(reference.rigid_contact_count.numpy()[0])
         kept = _list_immobile_contacts_last(reference, immobile)
         count = int(contacts.rigid_contact_count.numpy()[0])

@@ -136,8 +136,9 @@ def _allocate_overflowing_contacts(device, contact_count, row_capacity):
     )
 
 
-def _step_tripods(device, *, steps=4, deterministic=True, **options):
-    """Step the tripod worlds, the collision pipeline sorting its contacts (``deterministic``) or not.
+def _step_tripods(device, *, steps=4, sorted_contacts=False, **options):
+    """Step the tripod worlds, the collision pipeline sorting its contacts by key (``sorted_contacts``: contact
+    matching sorts them) or leaving them in its writers' order.
 
     ``options`` override the route's solver options. Returns, per step, the live contacts' world,
     path and slot at their frame positions, the worlds' dense and matrix-free row counts, contact
@@ -148,7 +149,11 @@ def _step_tripods(device, *, steps=4, deterministic=True, **options):
     state_in, state_out = model.state(), model.state()
     newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
     pipeline = newton.CollisionPipeline(
-        model, broad_phase="nxn", reduce_contacts=False, deterministic=deterministic, growable_contacts=True
+        model,
+        broad_phase="nxn",
+        reduce_contacts=False,
+        contact_matching="latest" if sorted_contacts else "disabled",
+        growable_contacts=True,
     )
     contacts = pipeline.contacts()
     control = model.control()
@@ -211,13 +216,13 @@ class TestFeatherPGSContactRowOrder(unittest.TestCase):
     """Contact rows follow the frame's order, whatever order the collision wrote the contacts in."""
 
     def _check_collision_order_changes_nothing(self, device):
-        """Step the tripods with a sorting and a non-sorting collision pipeline; require the same rows and states.
+        """Step the tripods with contacts sorted by key and in the writers' order; require the same rows and states.
 
         The two pipelines write the same contacts in different orders. Both runs must place every world's dense and
         matrix-free contact rows in the frame's order and step bitwise alike.
         """
-        sorted_runs = _step_tripods(device, deterministic=True)
-        written_runs = _step_tripods(device, deterministic=False)
+        sorted_runs = _step_tripods(device, sorted_contacts=True)
+        written_runs = _step_tripods(device)
         for step, (expected, actual) in enumerate(zip(sorted_runs, written_runs, strict=True)):
             for name in ("world", "path", "slot"):
                 np.testing.assert_array_equal(actual[name], expected[name], err_msg=f"contact {name} at step {step}")

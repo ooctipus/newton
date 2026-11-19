@@ -211,11 +211,9 @@ def _make_pipeline(model, reduce_body_pairs, *, reduce_mesh_contacts=True, **kwa
         "body_pair_hashtable_size_factor": "hashtable_size_factor",
     }
     config_kwargs = {config_fields[name]: kwargs.pop(name) for name in tuple(kwargs) if name in config_fields}
-    deterministic = kwargs.pop("deterministic", True)
     return newton.CollisionPipeline(
         model,
         broad_phase="nxn",
-        deterministic=deterministic,
         reduce_contacts=reduce_mesh_contacts,
         body_pair_reduction=(
             newton.CollisionPipeline.BodyPairReductionConfig(**config_kwargs) if reduce_body_pairs else None
@@ -243,12 +241,13 @@ def _contact_snapshot(contacts):
     )
 
 
-def _full_contact_rows(contacts, *, canonical=False):
+def _full_contact_rows(contacts, *, canonical=False, by_key=False):
     """Return rows over every solver-visible rigid-contact input field.
 
     The materialized length is clamped to capacity because Newton deliberately
     preserves an over-capacity raw counter for diagnostics.  Buffer order is
-    retained by default because sequential PGS can observe it.
+    retained by default; ``by_key`` orders the rows by their contact keys, the
+    order two passes share, since a pass writes its contacts in thread order.
     """
     raw_count = int(contacts.rigid_contact_count.numpy()[0])
     n = min(raw_count, contacts.rigid_contact_max)
@@ -268,8 +267,9 @@ def _full_contact_rows(contacts, *, canonical=False):
         arr = getattr(contacts, name, None)
         if arr is not None:
             cols.append(arr.numpy()[:n])
+    order = np.argsort(contacts.rigid_contact_key.numpy()[:n], kind="stable") if by_key else np.arange(n)
     rows = []
-    for k in range(n):
+    for k in order:
         row = []
         for col in cols:
             row.extend(round(float(x), 6) for x in np.atleast_1d(col[k]))
@@ -504,7 +504,6 @@ class TestBodyPairReductionGuarantees(unittest.TestCase):
             pipeline = newton.CollisionPipeline(
                 model,
                 broad_phase="nxn",
-                deterministic=True,
                 reduce_contacts=reduce_contacts,
                 body_pair_reduction=body_pair_reduction,
             )
@@ -535,7 +534,6 @@ class TestBodyPairReductionGuarantees(unittest.TestCase):
         pipeline = newton.CollisionPipeline(
             model,
             broad_phase="nxn",
-            deterministic=True,
             body_pair_reduction=newton.CollisionPipeline.BodyPairReductionConfig(),
             sdf_hydroelastic_config=HydroelasticSDF.Config(),
         )
@@ -566,42 +564,29 @@ class TestBodyPairReductionGuarantees(unittest.TestCase):
                 sdf_hydroelastic_config=HydroelasticSDF.Config(),
             )
 
-    def test_set_deterministic_without_sort(self):
-        """Produce the same kept set with the deterministic sorter disabled.
+    def test_kept_rows_repeat_in_order(self):
+        """Keep the same contacts in the same order across repeated collides of one state.
 
-        Winner selection packs score plus quantized pair-relative position,
-        and contacts self-identify as winners, so the kept SET is a pure
-        function of the physical state -- no sorting required. Compare kept sets as
-        order-independent multisets across repeated collides of one state.
+        Winner selection packs score plus quantized pair-relative position, and the pipeline sorts its contacts by
+        shape pair and sub key, so the kept rows and their order are a pure function of the physical state.
         """
         model = self._foot_model()
         state = model.state()
 
-        def kept_set(contacts):
+        def kept_rows(contacts):
             n = int(contacts.rigid_contact_count.numpy()[0])
-            s0 = contacts.rigid_contact_shape0.numpy()[:n]
-            s1 = contacts.rigid_contact_shape1.numpy()[:n]
-            p0 = np.round(contacts.rigid_contact_point0.numpy()[:n], 6)
-            rows = sorted(map(tuple, np.column_stack([s0, s1, p0[:, 0], p0[:, 1], p0[:, 2]]).tolist()))
-            return rows
+            names = ("rigid_contact_shape0", "rigid_contact_shape1", "rigid_contact_point0", "rigid_contact_normal")
+            return [getattr(contacts, name).numpy()[:n].copy() for name in names]
 
-        pipeline = newton.CollisionPipeline(
-            model,
-            broad_phase="nxn",
-            deterministic=False,
-            body_pair_reduction=newton.CollisionPipeline.BodyPairReductionConfig(),
-        )
+        pipeline = _make_pipeline(model, True)
         contacts = pipeline.contacts()
         pipeline.collide(state, contacts)
-        first = kept_set(contacts)
+        first = kept_rows(contacts)
+        self.assertGreater(len(first[0]), 0)
         for _ in range(3):
             pipeline.collide(state, contacts)
-            self.assertEqual(kept_set(contacts), first)
-        # and it matches the sorted pipeline's kept set
-        sorted_pipe = _make_pipeline(model, True)
-        sorted_contacts = sorted_pipe.contacts()
-        sorted_pipe.collide(state, sorted_contacts)
-        self.assertEqual(kept_set(sorted_contacts), first)
+            for expected, actual in zip(first, kept_rows(contacts), strict=True):
+                np.testing.assert_array_equal(actual, expected)
 
     def test_unvalidated_solver_rejected_at_step(self):
         """A solver without body-pair reduction support refuses a reduced buffer.
@@ -758,7 +743,7 @@ class TestBodyPairReductionMultiPatch(unittest.TestCase):
 class TestBodyPairReductionSolverConformance(unittest.TestCase):
     """Every solver declaring body-pair reduction support settles identically on/off."""
 
-    def _settle(self, build_fn, make_solver, reduce_on, steps=240, *, deterministic=True):
+    def _settle(self, build_fn, make_solver, reduce_on, steps=240):
         """Drop, settle, and return dynamics plus solver-path watermarks.
 
         The fell/contact guards make the comparison non-vacuous: a body that
@@ -775,7 +760,7 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
         state_0, state_1 = model.state(), model.state()
         newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
         control = model.control()
-        pipeline = _make_pipeline(model, reduce_on, deterministic=deterministic)
+        pipeline = _make_pipeline(model, reduce_on)
         contacts = pipeline.contacts()
         solver = make_solver(model)
         z0 = float(state_0.body_q.numpy()[body][2])
@@ -801,21 +786,9 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
         tol=5e-4,
         w_tol=0.05,
         expected_row_path=None,
-        *,
-        deterministic=True,
     ):
-        z_off, fell_off, contacts_off, w_off, rows_off = self._settle(
-            build_fn,
-            make_solver,
-            False,
-            deterministic=deterministic,
-        )
-        z_on, fell_on, contacts_on, w_on, rows_on = self._settle(
-            build_fn,
-            make_solver,
-            True,
-            deterministic=deterministic,
-        )
+        z_off, fell_off, contacts_off, w_off, rows_off = self._settle(build_fn, make_solver, False)
+        z_on, fell_on, contacts_on, w_on, rows_on = self._settle(build_fn, make_solver, True)
         self.assertTrue(fell_off and fell_on, "body did not fall: the solver is not simulating it")
         self.assertGreater(contacts_off, 0)
         self.assertGreater(contacts_on, 0)
@@ -976,19 +949,6 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
         self._compare(
             lambda b: _free_jointed_foot(b, (0.0, 0.0, 0.05)),
             lambda m: newton.solvers.SolverFeatherPGS(m, angular_damping=0.0),
-        )
-
-    def test_feather_pgs_nondeterministic_conformance(self):
-        """Conform on the production-default unsorted collision pipeline.
-
-        Sequential PGS observes row order, so the sorted conformance cases do
-        not establish support for ``CollisionPipeline(deterministic=False)``.
-        This exercises the default split solver with strict contact compaction.
-        """
-        self._compare(
-            lambda b: _free_jointed_foot(b, (0.0, 0.0, 0.05)),
-            lambda m: newton.solvers.SolverFeatherPGS(m, angular_damping=0.0),
-            deterministic=False,
         )
 
     def test_feather_pgs_dynamic_dynamic_conformance(self):
@@ -1403,11 +1363,10 @@ class TestBodyPairReductionSafety(unittest.TestCase):
         model = builder.finalize(device=wp.get_device())
         state = model.state()
 
-        plain = newton.CollisionPipeline(model, broad_phase="nxn", deterministic=True)
+        plain = newton.CollisionPipeline(model, broad_phase="nxn")
         reduced = newton.CollisionPipeline(
             model,
             broad_phase="nxn",
-            deterministic=True,
             body_pair_reduction=newton.CollisionPipeline.BodyPairReductionConfig(),
         )
         contacts = reduced.contacts()
@@ -1459,7 +1418,7 @@ class TestBodyPairReductionSafety(unittest.TestCase):
         model = builder.finalize(device=wp.get_device())
         state = model.state()
 
-        base = newton.CollisionPipeline(model, broad_phase="nxn", deterministic=True)
+        base = newton.CollisionPipeline(model, broad_phase="nxn")
         contacts_base = base.contacts()
         base.collide(state, contacts_base)
         n_base = int(contacts_base.rigid_contact_count.numpy()[0])
@@ -1473,9 +1432,10 @@ class TestBodyPairReductionSafety(unittest.TestCase):
         stats = pipeline._body_pair_reducer.stats()
         self.assertEqual(n_red, n_base, "saturated frame must keep the whole unreduced set")
         self.assertEqual(
-            _full_contact_rows(contacts),
-            _full_contact_rows(contacts_base),
-            "whole-frame fallback changed a solver-visible contact field or row order",
+            # Two passes write their contacts in thread order: compare them in key order (each contact's identity).
+            _full_contact_rows(contacts, by_key=True),
+            _full_contact_rows(contacts_base, by_key=True),
+            "whole-frame fallback changed a solver-visible contact field",
         )
         self.assertEqual(stats["fallback_frames"], 1)
         self.assertGreater(stats["probe_failures"], 0)
@@ -1545,7 +1505,7 @@ class TestBodyPairReductionSafety(unittest.TestCase):
         model = builder.finalize(device=wp.get_device())
         state = model.state()
 
-        base = newton.CollisionPipeline(model, broad_phase="nxn", deterministic=True)
+        base = newton.CollisionPipeline(model, broad_phase="nxn")
         contacts_base = base.contacts()
         base.collide(state, contacts_base)
         n_base = int(contacts_base.rigid_contact_count.numpy()[0])
@@ -1557,9 +1517,10 @@ class TestBodyPairReductionSafety(unittest.TestCase):
 
         self.assertEqual(n_red, n_base, "identity frame must keep every contact")
         self.assertEqual(
-            _full_contact_rows(contacts),
-            _full_contact_rows(contacts_base),
-            "identity fast path changed a solver-visible contact field or row order",
+            # Two passes write their contacts in thread order: compare them in key order (each contact's identity).
+            _full_contact_rows(contacts, by_key=True),
+            _full_contact_rows(contacts_base, by_key=True),
+            "identity fast path changed a solver-visible contact field",
         )
         stats = pipeline.body_pair_reduction_stats()
         self.assertEqual(stats["identity_frames"], 1)
@@ -1582,7 +1543,7 @@ class TestBodyPairReductionSafety(unittest.TestCase):
         model = builder.finalize(device=wp.get_device())
         state = model.state()
 
-        base = newton.CollisionPipeline(model, broad_phase="nxn", deterministic=True)
+        base = newton.CollisionPipeline(model, broad_phase="nxn")
         contacts_base = base.contacts()
         base.collide(state, contacts_base)
         n_base = int(contacts_base.rigid_contact_count.numpy()[0])
@@ -1617,7 +1578,7 @@ class TestBodyPairReductionSafety(unittest.TestCase):
         state = model.state()
         pipeline = _make_pipeline(model, True)
         contacts = pipeline.contacts()
-        raw = newton.CollisionPipeline(model, broad_phase="nxn", deterministic=True)
+        raw = newton.CollisionPipeline(model, broad_phase="nxn")
         raw_contacts = raw.contacts()
         observed_in = 0
         observed_kept = 0
@@ -1746,7 +1707,6 @@ class TestBodyPairReductionRobustness(unittest.TestCase):
             newton.CollisionPipeline(
                 model,
                 broad_phase="nxn",
-                deterministic=True,
                 contact_matching="sticky",
                 body_pair_reduction=newton.CollisionPipeline.BodyPairReductionConfig(),
             )
@@ -1887,7 +1847,6 @@ class TestBodyPairReductionRobustness(unittest.TestCase):
         pipeline = newton.CollisionPipeline(
             model,
             broad_phase="nxn",
-            deterministic=True,
             body_pair_reduction=newton.CollisionPipeline.BodyPairReductionConfig(),
             requires_grad=True,
         )

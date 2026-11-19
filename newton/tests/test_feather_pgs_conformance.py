@@ -298,8 +298,6 @@ def simulate(
         pipeline_options["rigid_contact_max"] = scene.rigid_contact_max
     if scene.contact_matching is not None:
         pipeline_options["contact_matching"] = scene.contact_matching
-    if scene.deterministic_contacts:
-        pipeline_options["deterministic"] = True
     pipeline = newton.CollisionPipeline(model, **pipeline_options, growable_contacts=True)
     contacts = pipeline.contacts()
     # The history holds the rows the scene's contacts can fill (its budget), not every row the
@@ -1316,15 +1314,11 @@ class Reference:
 def reference(physics: Physics, route: Route, device) -> Reference:
     """Run the reference route at the gate budget and converged, and derive the trajectory tolerance.
 
-    On CUDA the budget run repeats: the broad phase, the narrow phase and
-    FeatherPGS allocate pairs, contacts and rows with atomics, so the row
-    order, and with it a Gauss-Seidel iterate, follows the warps from run to
-    run. Where the contact problem is determinate the iterate stays within the
-    budget's convergence band, which the spread then includes. A statically
-    indeterminate support lets the order pick one of many rigid solutions,
-    which more iterations do not remove and one repeat cannot bound, so such
-    a scene sorts its contacts (``deterministic_contacts``) and repeats
-    bitwise, as FeatherPGS then gives the rows the contacts' order. Every
+    On CUDA the budget run repeats, and its run-to-run spread joins the
+    budget's convergence band. The collision pipeline sorts its contacts and
+    FeatherPGS gives the rows the contacts' order, so a statically
+    indeterminate support, whose order would pick one of many rigid
+    solutions, repeats bitwise. Every
     scene also takes its rounding sensitivity into the spread: another
     route's float order moves a rounding-sensitive trajectory as far as one
     ulp of the time step does (the legged scene under the relative

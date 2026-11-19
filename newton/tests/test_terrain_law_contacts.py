@@ -132,55 +132,52 @@ def test_law_writes_its_rows_as_contacts(test, device):
     """
     model, terrain = _mixed_scene(device)
     state = model.state()
-    for deterministic in (False, True):
-        with test.subTest(deterministic=deterministic):
-            today = _collide(_pipeline(model, TERRAIN_ROUTE, deterministic=deterministic, **PIPELINE), state)
-            shadow = _pipeline(model, {"NEWTON_TERRAIN_LAW_SHADOW": "all"}, deterministic=deterministic, **PIPELINE)
-            _collide(shadow, state)
-            law = _pipeline(model, {"NEWTON_TERRAIN_LAW": "all"}, deterministic=deterministic, **PIPELINE)
-            contacts = _collide(law, state)
-            rows = tu.shadow_rows(shadow)
-            got = tu.contact_rows(model, state, contacts, terrain)
-            test.assertGreater(sum(len(r) for r in rows.values()), 20)
-            test.assertEqual(sorted(p for p, r in rows.items() if r), sorted(got))
-            for partner, expected in rows.items():
-                written = got.get(partner, [])
-                test.assertEqual(len(written), len(expected), msg=f"partner {partner}")
-                missing = tu.missing_rows(expected, written, q_tol=2.0e-6, angle_tol=1.0e-5, d_tol=2.0e-6)
-                test.assertEqual(missing, [], msg=f"partner {partner}")
-            # Every contact without the heightfield is the narrow phase's, unchanged.
-            before, after = _pairs(today), _pairs(contacts)
-            other = sorted(p for p in before if terrain not in p)
-            test.assertEqual(other, sorted(p for p in after if terrain not in p))
-            for pair in other:
-                for name in ("rigid_contact_point0", "rigid_contact_point1", "rigid_contact_normal"):
-                    a = getattr(today, name).numpy()[before[pair]]
-                    b = getattr(contacts, name).numpy()[after[pair]]
-                    np.testing.assert_array_equal(np.sort(a, axis=0), np.sort(b, axis=0), err_msg=f"{pair} {name}")
-            # Shape A is the heightfield; the margins and the sort key are the writer's.
-            terrain_pairs = [p for p in after if terrain in p]
-            test.assertTrue(all(p[0] == terrain for p in terrain_pairs))
-            index = np.concatenate([after[p] for p in terrain_pairs])
-            margin0 = contacts.rigid_contact_margin0.numpy()[index]
-            np.testing.assert_allclose(margin0, model.shape_margin.numpy()[terrain], rtol=0, atol=1e-7)
-            if deterministic:
-                keys = law._sort_key_array.numpy()[: int(contacts.rigid_contact_count.numpy()[0])]
-                test.assertEqual(len(np.unique(keys)), len(keys))
+    today = _collide(_pipeline(model, TERRAIN_ROUTE, **PIPELINE), state)
+    shadow = _pipeline(model, {"NEWTON_TERRAIN_LAW_SHADOW": "all"}, **PIPELINE)
+    _collide(shadow, state)
+    law = _pipeline(model, {"NEWTON_TERRAIN_LAW": "all"}, **PIPELINE)
+    contacts = _collide(law, state)
+    rows = tu.shadow_rows(shadow)
+    got = tu.contact_rows(model, state, contacts, terrain)
+    test.assertGreater(sum(len(r) for r in rows.values()), 20)
+    test.assertEqual(sorted(p for p, r in rows.items() if r), sorted(got))
+    for partner, expected in rows.items():
+        written = got.get(partner, [])
+        test.assertEqual(len(written), len(expected), msg=f"partner {partner}")
+        missing = tu.missing_rows(expected, written, q_tol=2.0e-6, angle_tol=1.0e-5, d_tol=2.0e-6)
+        test.assertEqual(missing, [], msg=f"partner {partner}")
+    # Every contact without the heightfield is the narrow phase's, unchanged.
+    before, after = _pairs(today), _pairs(contacts)
+    other = sorted(p for p in before if terrain not in p)
+    test.assertEqual(other, sorted(p for p in after if terrain not in p))
+    for pair in other:
+        for name in ("rigid_contact_point0", "rigid_contact_point1", "rigid_contact_normal"):
+            a = getattr(today, name).numpy()[before[pair]]
+            b = getattr(contacts, name).numpy()[after[pair]]
+            np.testing.assert_array_equal(np.sort(a, axis=0), np.sort(b, axis=0), err_msg=f"{pair} {name}")
+    # Shape A is the heightfield; the margins and the sort key are the writer's.
+    terrain_pairs = [p for p in after if terrain in p]
+    test.assertTrue(all(p[0] == terrain for p in terrain_pairs))
+    index = np.concatenate([after[p] for p in terrain_pairs])
+    margin0 = contacts.rigid_contact_margin0.numpy()[index]
+    np.testing.assert_allclose(margin0, model.shape_margin.numpy()[terrain], rtol=0, atol=1e-7)
+    keys = contacts.rigid_contact_key.numpy()[: int(contacts.rigid_contact_count.numpy()[0])]
+    test.assertEqual(len(np.unique(keys)), len(keys))
 
 
 def test_default_writes_with_the_law(test, device):
     """Write every partner class's heightfield contacts with the law by default, as ``NEWTON_TERRAIN_LAW=all`` does.
 
     Without the variable the pipeline builds the law for every class it has a kernel for: its contacts are those of
-    an explicit ``all`` bit for bit (both deterministic), the narrow phase drops exactly the law's partners' pairs, and
+    an explicit ``all`` bit for bit, the narrow phase drops exactly the law's partners' pairs, and
     the route record says that the law writes by default. The terrain route's contacts of those pairs differ (118
     against the law's 81 rows on the CPU).
     """
     model, terrain = _mixed_scene(device)
     state = model.state()
-    default = _pipeline(model, {}, deterministic=True, **PIPELINE)
-    explicit = _pipeline(model, {"NEWTON_TERRAIN_LAW": "all"}, deterministic=True, **PIPELINE)
-    route = _pipeline(model, TERRAIN_ROUTE, deterministic=True, **PIPELINE)
+    default = _pipeline(model, {}, **PIPELINE)
+    explicit = _pipeline(model, {"NEWTON_TERRAIN_LAW": "all"}, **PIPELINE)
+    route = _pipeline(model, TERRAIN_ROUTE, **PIPELINE)
     record = _law_record(default)
     test.assertTrue(record["writes"])
     test.assertEqual(record["decision"], "default")
@@ -204,7 +201,7 @@ def test_default_writes_with_the_law(test, device):
 def test_law_contacts_replay_under_graph_capture(test, device):
     """Capture the collide with the law writing contacts and replay it to the contacts of an uncaptured collide."""
     model, _terrain = _mixed_scene(device)
-    pipeline = _pipeline(model, {}, deterministic=True, **PIPELINE)
+    pipeline = _pipeline(model, {}, **PIPELINE)
     test.assertTrue(_law_record(pipeline)["writes"])
     state = model.state()
     contacts = pipeline.contacts()
@@ -314,7 +311,7 @@ class TestTerrainLawContacts(unittest.TestCase):
         )
         for name, environ, kwargs, collide, reason in cases:
             with self.subTest(fallback=name):
-                pipeline = _pipeline(model, environ, deterministic=True, **kwargs)
+                pipeline = _pipeline(model, environ, **kwargs)
                 record = _law_record(pipeline)
                 self.assertEqual(
                     {k: record[k] for k in ("writes", "decision", "classes")},
@@ -326,7 +323,7 @@ class TestTerrainLawContacts(unittest.TestCase):
                 self.assertEqual(
                     pipeline.get_collision_selection()["heightfield"]["law_shadow"]["enabled"], name == "shadow"
                 )
-                route = _pipeline(model, {**environ, **TERRAIN_ROUTE}, deterministic=True, **kwargs)
+                route = _pipeline(model, {**environ, **TERRAIN_ROUTE}, **kwargs)
                 self.assertEqual(_law_record(route)["decision"], "opted_out")
                 _assert_same_contacts(
                     self, _arrays(_collide(route, state, **collide)), _arrays(_collide(pipeline, state, **collide))

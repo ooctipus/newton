@@ -92,7 +92,7 @@ def _scene(device):
 def _rollout(model, diagnostics, steps=STEPS):
     """Step ``model`` from rest; return the solver and the published states, one per step."""
     solver = SolverFeatherPGS(model, enable_joint_limits=True, pgs_iterations=16, diagnostics=diagnostics)
-    pipeline = newton.CollisionPipeline(model, deterministic=True, growable_contacts=True)
+    pipeline = newton.CollisionPipeline(model, growable_contacts=True)
     contacts = pipeline.contacts()
     state_0, state_1, control = model.state(), model.state(), model.control()
     newton.eval_fk(model, state_0.joint_q, state_0.joint_qd, state_0)
@@ -418,9 +418,7 @@ class _Run:
     def __init__(self, model, state, **options):
         self.model = model
         self.solver = SolverFeatherPGS(model, pgs_warmstart=True, pgs_iterations=16, **options)
-        self.pipeline = newton.CollisionPipeline(
-            model, contact_matching="latest", deterministic=True, growable_contacts=True
-        )
+        self.pipeline = newton.CollisionPipeline(model, contact_matching="latest", growable_contacts=True)
         self.contacts = self.pipeline.contacts()
         self.state, self.out = model.state(), model.state()
         self.state.assign(state)

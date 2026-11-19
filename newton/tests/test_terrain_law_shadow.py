@@ -112,14 +112,16 @@ def _contacts(pipeline, model, state=None):
 
 
 def _contact_arrays(contacts) -> dict:
-    """Every ``rigid_contact_*`` array of a :class:`newton.Contacts`, the per-contact ones cut to the contact count."""
+    """Every ``rigid_contact_*`` array of a :class:`newton.Contacts`, the per-contact ones cut to the contact count and
+    put in key order: a pass writes its contacts in thread order, and the key is each contact's identity."""
     count = int(contacts.rigid_contact_count.numpy()[0])
+    order = np.argsort(contacts.rigid_contact_key.numpy()[:count], kind="stable")
     out = {"count": count}
     for name in sorted(vars(contacts)):
         array = getattr(contacts, name)
         if name.startswith("rigid_contact_") and isinstance(array, wp.array):
             values = array.numpy()
-            out[name] = values[:count] if values.shape[0] == contacts.rigid_contact_max else values
+            out[name] = values[:count][order] if values.shape[0] == contacts.rigid_contact_max else values
     return out
 
 
@@ -132,25 +134,22 @@ def _unset():
 def test_shadow_keeps_contacts_bitwise(test, device):
     """Write today's contacts bit for bit with the shadow running beside the terrain route.
 
-    Every ``rigid_contact_*`` array is compared in place. On CUDA both pipelines are deterministic: by default the
-    global reducer breaks score ties by atomic order, so two pipelines without the shadow could already differ.
+    Every ``rigid_contact_*`` array is compared in key order (_contact_arrays).
     """
     model, _terrain = _mixed_scene(device)
     state = model.state()
-    for deterministic in (False, True) if device.is_cpu else (True,):
-        with test.subTest(deterministic=deterministic):
-            today = tu.terrain_route_pipeline(model, deterministic=deterministic, **PIPELINE)
-            shadow = tu.shadow_pipeline(model, deterministic=deterministic, **PIPELINE)
-            test.assertIsNone(today._terrain_law_shadow)
-            test.assertIsNotNone(shadow._terrain_law_shadow)
-            a = _contact_arrays(_contacts(today, model, state))
-            b = _contact_arrays(_contacts(shadow, model, state))
-            test.assertGreater(a["count"], 20)
-            test.assertEqual(sorted(a), sorted(b))
-            test.assertGreater(len(a), 12)
-            for name, values in a.items():
-                np.testing.assert_array_equal(values, b[name], err_msg=name)
-            test.assertGreater(int(shadow._terrain_law_shadow.rows()["count"].sum()), 0)
+    today = tu.terrain_route_pipeline(model, **PIPELINE)
+    shadow = tu.shadow_pipeline(model, **PIPELINE)
+    test.assertIsNone(today._terrain_law_shadow)
+    test.assertIsNotNone(shadow._terrain_law_shadow)
+    a = _contact_arrays(_contacts(today, model, state))
+    b = _contact_arrays(_contacts(shadow, model, state))
+    test.assertGreater(a["count"], 20)
+    test.assertEqual(sorted(a), sorted(b))
+    test.assertGreater(len(a), 12)
+    for name, values in a.items():
+        np.testing.assert_array_equal(values, b[name], err_msg=name)
+    test.assertGreater(int(shadow._terrain_law_shadow.rows()["count"].sum()), 0)
 
 
 def test_shadow_runs_under_graph_capture(test, device):

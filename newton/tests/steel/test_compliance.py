@@ -78,7 +78,6 @@ def run_native_hydro_fixture(*, device, articulated=True, response="immediate"):
         pipeline = newton.CollisionPipeline(
             model,
             rigid_contact_max=512,
-            deterministic=True,
             sdf_hydroelastic_config=HydroelasticSDF.Config(
                 reduce_contacts=True, moment_matching=True, anchor_contact=True, buffer_fraction=1.0
             ),
@@ -1396,7 +1395,6 @@ def _stack_scene(device, g, velocity_iterations=2):
         reduce_contacts=True,
         rigid_contact_max=128,
         broad_phase="nxn",
-        deterministic=True,
         contact_matching="latest",
     )
     solver = newton.solvers.SolverSteel(
@@ -1444,7 +1442,6 @@ def _resting_box(device, g, rate, frames, articulated=False, **solver_kwargs):
         reduce_contacts=True,
         rigid_contact_max=32,
         broad_phase="nxn",
-        deterministic=True,
         contact_matching="latest",
     )
     solver = newton.solvers.SolverSteel(model, iterations=12, contact_regularization=g, **solver_kwargs)
@@ -1563,7 +1560,6 @@ def test_regularization_indeterminate_split(test: unittest.TestCase, device):
         reduce_contacts=True,
         rigid_contact_max=256,
         broad_phase="nxn",
-        deterministic=True,
         contact_matching="latest",
     )
     solver = newton.solvers.SolverSteel(
@@ -1673,7 +1669,6 @@ def test_restitution_rows_stay_rigid(test: unittest.TestCase, device):
             reduce_contacts=True,
             rigid_contact_max=32,
             broad_phase="nxn",
-            deterministic=True,
             contact_matching="latest",
         )
         contacts = pipeline.contacts()

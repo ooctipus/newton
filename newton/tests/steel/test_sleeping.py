@@ -1438,7 +1438,7 @@ def _two_world_boxes(device):
     builder.add_ground_plane()
     builder.replicate(box, 2)
     model = builder.finalize(device=device)
-    pipeline = newton.CollisionPipeline(model, rigid_contact_max=256, deterministic=True)
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=256)
     solver = newton.solvers.SolverSteel(model, **PROFILE)
     return model, pipeline, solver, [model.state(), model.state()]
 
@@ -1460,7 +1460,7 @@ def test_stiffness_without_a_spring_lets_articulations_sleep(test, device):
             )
         builder.joint_stiffness = [stiffness] * builder.joint_dof_count
         model = builder.finalize(device=device)
-        pipeline = newton.CollisionPipeline(model, rigid_contact_max=512, deterministic=True)
+        pipeline = newton.CollisionPipeline(model, rigid_contact_max=512)
         solver = newton.solvers.SolverSteel(model, **PROFILE)
         states = [model.state(), model.state()]
         _advance(pipeline, solver, states, model.control(), 400)
@@ -1491,7 +1491,7 @@ def _add_fixed_support(builder):
 def _expect_support_move_wakes(builder, support, sleepers, world_mask, device):
     """Let ``sleepers`` sleep on ``support``, slide it, reset with ``world_mask``, and require them awake a step later."""
     model = builder.finalize(device=device)
-    pipeline = newton.CollisionPipeline(model, rigid_contact_max=256, deterministic=True)
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=256)
     solver = newton.solvers.SolverSteel(model, **PROFILE)
     states = [model.state(), model.state()]
     for state in states:
@@ -2806,9 +2806,7 @@ class _Heap:
         self.solver = SolverSteel(self.model, **args)
         # Tests that compare joint wrenches set this to the solver's observables.
         self.observables = None
-        self.pipeline = newton.CollisionPipeline(
-            self.model, rigid_contact_max=self.model.rigid_contact_max, deterministic=True
-        )
+        self.pipeline = newton.CollisionPipeline(self.model, rigid_contact_max=self.model.rigid_contact_max)
         self.contacts = self.pipeline.contacts()
         self.compliance_stiffness = compliance_stiffness
         if compliance_stiffness is not None:
