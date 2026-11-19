@@ -17,7 +17,7 @@ import warp as wp
 from . import field_group, row_records
 from .contact_laws import contact_geometry, contact_tangent_basis
 from .field_group import Field, FieldGroup
-from .friction_patches import PatchRowLaw, patch_friction_location
+from .friction_patches import PatchRowLaw, patch_friction_location, region_normal
 
 CONTACT_INPUT = (
     # The collision pipeline's contacts: their count, and their records in the frame's order (the member store,
@@ -159,8 +159,9 @@ def contact_front_end(
 @wp.func
 def contact_frame(data: ContactInput, law: PatchRowLaw, c: int) -> ContactFrame:
     """Return contact ``c``'s front end (:class:`ContactFrame`, :func:`contact_front_end`) from the collision
-    pipeline's arrays, with its region's friction location."""
-    return contact_front_end(
+    pipeline's arrays, with its region's friction location and normal (:func:`.friction_patches.region_normal`): its
+    gap and point are its own, its rows act along its region's normal."""
+    frame = contact_front_end(
         c,
         data.shape0,
         data.shape1,
@@ -173,6 +174,13 @@ def contact_frame(data: ContactInput, law: PatchRowLaw, c: int) -> ContactFrame:
         data.body_q,
         patch_friction_location(law.patches, c),
     )
+    if wp.length_sq(law.patches.normal[c]) > 0.0:
+        normal = region_normal(law.patches, c, frame.normal)
+        tangent0, tangent1 = contact_tangent_basis(normal)
+        frame.normal = normal
+        frame.tangent0 = tangent0
+        frame.tangent1 = tangent1
+    return frame
 
 
 def bind_routes(placement, contacts):

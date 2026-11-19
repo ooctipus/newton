@@ -462,6 +462,7 @@ class ReferencePatches:
         self.view.point = wp.zeros(capacity, dtype=wp.vec3, device=device)
         self.view.spin_arm = wp.zeros(capacity, dtype=float, device=device)
         self.view.spin_phi = wp.zeros(capacity, dtype=float, device=device)
+        self.view.normal = wp.zeros(capacity, dtype=wp.vec3, device=device)
         self.body_world = model.body_world
         self.body_radius = wp.zeros(model.body_count, dtype=float, device=device)
         self.update_geometry(model)

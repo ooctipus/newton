@@ -155,6 +155,11 @@ class FrictionPatches:
     phi: wp.array[wp.vec2]
     spin_arm: wp.array[float]
     spin_phi: wp.array[float]
+    normal: wp.array[wp.vec3]
+    """Each contact's region normal in the contact's own orientation (from body B to body A, as its rows see it):
+    the normal its region's carrier holds this build, along which every member's normal row acts (the region law's
+    one normal: :func:`region_normal`); zero where a side of the pair is articulated, whose rows keep their own
+    normals."""
 
 
 @wp.struct
@@ -206,6 +211,17 @@ def patch_row_law(solver) -> "PatchRowLaw":
 def patch_friction_location(patches: FrictionPatches, c: int):
     """Return contact ``c``'s friction location, in world coordinates."""
     return patches.point[c]
+
+
+@wp.func
+def region_normal(patches: FrictionPatches, c: int, normal: wp.vec3) -> wp.vec3:
+    """Contact ``c``'s normal row's direction: its region's normal (:attr:`FrictionPatches.normal`), or its own
+    ``normal`` where its region holds none. A region's members act along one normal on every route: its candidates in
+    the region law (:mod:`.region_laws`) and its rows, so a converged row sweep and the region visit solve one law."""
+    shared = patches.normal[c]
+    if wp.length_sq(shared) > 0.0:
+        return shared
+    return normal
 
 
 @wp.func
@@ -448,6 +464,11 @@ def _prepare_contact_fields(
         art_b = inputs.body_to_articulation[b]
     a_non_free = art_a >= 0 and inputs.is_free_rigid[art_a] == 0
     b_non_free = art_b >= 0 and inputs.is_free_rigid[art_b] == 0
+    # The region law's domain: a pair of free bodies or immovable sides; its region normal is placed with its carrier
+    # (_propose_region), one of its own until then.
+    patches.normal[c] = wp.vec3(0.0)
+    if not (a_non_free or b_non_free):
+        patches.normal[c] = n
     normal_gap_limit = contact_normal_gap_limit(
         a_non_free,
         b_non_free,
@@ -1626,6 +1647,15 @@ def _propose_region(
     else:
         history = frame.history[member_start]
     frame.carrier[member_start] = first
+    # The region's one normal, its carrier's, on every member in its own orientation (region_normal).
+    if wp.length_sq(patches.normal[first]) > 0.0:
+        shared = frame.normal[first]
+        for j in range(member_start, member_stop):
+            m = frame.members[j]
+            if frame.flipped[m] != 0:
+                patches.normal[m] = -shared
+            else:
+                patches.normal[m] = shared
     location, spin_arm = _region_location(
         frame.members[member_start], first, carry_only, member_start, member_stop, frame
     )
@@ -2023,6 +2053,7 @@ class _FrictionPatchState:
                 ContactField("point", wp.vec3),
                 ContactField("spin_arm", wp.float32),
                 ContactField("spin_phi", wp.float32),
+                ContactField("normal", wp.vec3),
             ),
             on_rows=self._on_view_rows,
         )

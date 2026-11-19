@@ -713,6 +713,7 @@ def anchored_patches(contacts: int, device) -> FrictionPatches:
     patches.point = wp.zeros(contacts, dtype=wp.vec3, device=device)
     patches.phi = wp.zeros(contacts, dtype=wp.vec2, device=device)
     patches.spin_arm = wp.zeros(contacts, dtype=float, device=device)
+    patches.normal = wp.zeros(contacts, dtype=wp.vec3, device=device)
     patches.spin_phi = wp.zeros(contacts, dtype=float, device=device)
     return patches
 

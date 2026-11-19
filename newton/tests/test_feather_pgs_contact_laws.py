@@ -75,6 +75,7 @@ def _patches(rng, contacts, device, enabled):
     patches.phi = wp.array(rng.normal(scale=0.01, size=(contacts, 2)).astype(np.float32), dtype=wp.vec2, device=device)
     patches.spin_phi = wp.zeros(contacts, dtype=float, device=device)
     patches.spin_arm = wp.zeros(contacts, dtype=float, device=device)
+    patches.normal = wp.zeros(contacts, dtype=wp.vec3, device=device)
     return patches
 
 
