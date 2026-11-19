@@ -547,8 +547,13 @@ def build_stacked_cubes_scene(
     reduce_contacts: bool = True,
     sdf_hydroelastic_config: HydroelasticSDF.Config | None = None,
     deterministic: bool = False,
+    growable_contacts: bool = False,
 ):
-    """Build the stacked cubes scene and return all components for simulation."""
+    """Build the stacked cubes scene and return all components for simulation.
+
+    ``growable_contacts`` makes the pipeline's rows follow the contacts a pass finds, as an unreduced hydroelastic
+    pair needs: it writes every face of its contact surface, more than a fixed buffer sized for reduced pairs holds.
+    """
     cube_mesh = None
     if shape_type == ShapeType.MESH:
         cube_mesh = newton.Mesh.create_box(
@@ -627,6 +632,7 @@ def build_stacked_cubes_scene(
         broad_phase="explicit",
         sdf_hydroelastic_config=sdf_hydroelastic_config,
         deterministic=deterministic,
+        growable_contacts=growable_contacts,
     )
 
     return model, solver, state_0, state_1, control, collision_pipeline, initial_positions, cube_half
@@ -904,6 +910,7 @@ def test_deterministic_hydroelastic_contacts_unreduced(test, device):
         deterministic=True,
         reduce_contacts=False,
         sdf_hydroelastic_config=HydroelasticSDF.Config(reduce_contacts=False),
+        growable_contacts=True,
     )
     newton.eval_fk(model, model.joint_q, model.joint_qd, state)
     contacts = pipeline.contacts()
@@ -913,6 +920,9 @@ def test_deterministic_hydroelastic_contacts_unreduced(test, device):
     for _ in range(4):
         pipeline.collide(state, contacts)
         count = int(contacts.rigid_contact_count.numpy()[0])
+        # Rows past the buffer would be dropped in the order the writers reach them, which no sort can repeat.
+        test.assertLessEqual(count, contacts.rigid_contact_max)
+        test.assertEqual(pipeline.contact_drops().contacts, 0)
         snapshots.append(
             (
                 count,
@@ -1010,6 +1020,10 @@ def _extract_contact_forces(contacts, model, state, shape_pair=None):
     or all-empty arrays when there are no active contacts.
     """
     n = int(contacts.rigid_contact_count.numpy()[0])
+    # A pass counts every contact it finds; past the buffer's rows the writers drop them (the pool's drop record),
+    # so forces summed over the rows would be those of an arbitrary subset.
+    if n > contacts.rigid_contact_max:
+        raise AssertionError(f"the pass found {n} contacts but the buffer holds {contacts.rigid_contact_max} rows")
     empty = np.empty((0, 3)), np.empty((0, 3)), np.empty((0, 3)), np.empty(0), np.empty(0)
     if n == 0 or contacts.rigid_contact_stiffness is None:
         return empty
@@ -1118,11 +1132,16 @@ def _build_cube_sphere_scene(device, cube_half=0.1, sphere_radius=0.1):
 def _make_pipelines(model, configs, deterministic=False):
     """Create collision pipelines and contacts for a list of HydroelasticSDF.Configs.
 
+    Their rows follow the contacts a pass finds (``growable_contacts``): an unreduced hydroelastic pair writes every
+    face of its contact surface, far more than a reduced pair's slots that a fixed buffer is sized for.
+
     Returns list of (pipeline, contacts) tuples.
     """
     result = []
     for cfg in configs:
-        pipe = newton.CollisionPipeline(model, sdf_hydroelastic_config=cfg, deterministic=deterministic)
+        pipe = newton.CollisionPipeline(
+            model, sdf_hydroelastic_config=cfg, deterministic=deterministic, growable_contacts=True
+        )
         result.append((pipe, pipe.contacts()))
     return result
 
