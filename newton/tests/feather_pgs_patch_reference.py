@@ -25,6 +25,7 @@ from types import SimpleNamespace
 import numpy as np
 import warp as wp
 
+from newton._src.geometry.contact_sort import body_pair_codes
 from newton._src.solvers.feather_pgs.contact_filters import contact_normal_gap_limit
 from newton._src.solvers.feather_pgs.contact_laws import contact_point, contact_points
 from newton._src.solvers.feather_pgs.friction_patches import (
@@ -38,7 +39,6 @@ from newton._src.solvers.feather_pgs.friction_patches import (
     _region_location,
     _settle_region,
     _starts_pair,
-    body_codes,
     patch_routes,
 )
 
@@ -83,7 +83,7 @@ def frame_order(model, contacts):
     live = max(int(contacts.rigid_contact_count.numpy()[0]), 0)
     shape_body = model.shape_body.numpy()
     bodies, shapes = model.body_count, len(shape_body)
-    body_code = np.append(body_codes(model.body_world.numpy()), 0) if bodies else np.zeros(1, np.int64)
+    body_code = np.append(body_pair_codes(model.body_world.numpy()), 0) if bodies else np.zeros(1, np.int64)
     codes = []
     for name in ("rigid_contact_shape0", "rigid_contact_shape1"):
         shape = getattr(contacts, name).numpy()[:live].astype(np.int64)

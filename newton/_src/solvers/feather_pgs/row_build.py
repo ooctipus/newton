@@ -137,7 +137,7 @@ def contact_row_writer(kinds: bool = True, laws: bool = True, stores: bool = Tru
         mu, restitution = contact_materials(data.shape0[c], data.shape1[c], data.material_mu, data.material_restitution)
         stiffness = float(0.0)
         if data.material != 0:
-            stiffness = data.stiffness[data.contact_of[c]]
+            stiffness = data.stiffness[c]
         authored = False
         if data.authored != 0 and stiffness <= 0.0:
             authored = contact_authored(data.shape0[c], data.shape1[c], data.shape_flags)
@@ -155,8 +155,8 @@ def contact_row_writer(kinds: bool = True, laws: bool = True, stores: bool = Tru
         r = slot + row
         normal_beta = float(0.0)
         friction_mu = mu
-        if stiffness > 0.0 and data.friction_weight[data.contact_of[c]] > 0.0:
-            friction_mu *= data.friction_weight[data.contact_of[c]]
+        if stiffness > 0.0 and data.friction_weight[c] > 0.0:
+            friction_mu *= data.friction_weight[c]
         if wp.static(not stores):
             word_phi = float(0.0)
             word_beta = float(0.0)
@@ -209,9 +209,7 @@ def contact_row_writer(kinds: bool = True, laws: bool = True, stores: bool = Tru
             if data.material != 0 or data.authored != 0:
                 eps = float(0.0)
                 if row == 0 and stiffness > 0.0:
-                    material_rhs, eps = contact_material_rhs(
-                        phi, target, stiffness, data.damping[data.contact_of[c]], data.dt
-                    )
+                    material_rhs, eps = contact_material_rhs(phi, target, stiffness, data.damping[c], data.dt)
                     data.rhs[line, r] = material_rhs
                 elif row == 0 and authored:
                     s0 = data.shape0[c]

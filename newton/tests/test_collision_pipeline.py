@@ -5089,9 +5089,8 @@ def test_split_gjk_mpr_matches_fused_under_graph_capture(test, device):
     active = int(split_contacts.rigid_contact_count.numpy()[0])
     test.assertGreater(active, 0)
     test.assertEqual(active, int(fused_contacts.rigid_contact_count.numpy()[0]))
-    # A pass writes its contacts in thread order: compare them in key order, each contact's identity.
-    split_order = np.argsort(split_contacts.rigid_contact_key.numpy()[:active])
-    fused_order = np.argsort(fused_contacts.rigid_contact_key.numpy()[:active])
+    # Every pass leaves its contacts in the pipeline's one order: the two compare element by element.
+    split_order = fused_order = np.arange(active)
     for name in ("rigid_contact_key", "rigid_contact_shape0", "rigid_contact_shape1"):
         np.testing.assert_array_equal(
             getattr(split_contacts, name).numpy()[:active][split_order],

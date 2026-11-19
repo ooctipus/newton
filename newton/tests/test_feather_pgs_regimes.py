@@ -1075,12 +1075,12 @@ def patch_units(solver, count):
     """The law's units on the step ``solver`` took (its patch view): each region's anchor at its friction
     location, on its region's pooled normal impulse, with its region's spin arm."""
     patches = solver.laws.friction_patches
-    view, contact = patches.view, patches.contact_of.numpy()[:count]
+    view, contact = patches.view, np.arange(count)
     weight, ring = view.weight.numpy()[:count], view.next_contact.numpy()[:count]
     location = view.point.numpy()[:count].astype(np.float64)
     arm = view.spin_arm.numpy()[:count].astype(np.float64)
     units = []
-    # The view lies in the frame's order; a unit names the collision's contacts (contact_of).
+    # The view lies in the contacts' order: a unit names its contacts.
     for c in np.flatnonzero(weight > 0.0):
         members, m = [int(contact[c])], ring[c]
         while m >= 0 and m != c:
@@ -1332,8 +1332,7 @@ class Manufactured:
         """Each contact's row store, world and first row where its world holds its rows (:func:`walked_worlds`), else
         ``None``; each contact must hold the rows the law states, a normal and its unit's."""
         rows = solver.placement
-        # Each contact's allocation lies at its frame position.
-        at = solver.laws.friction_patches.position.numpy()[: self.count]
+        at = slice(self.count)
         paths, slots, worlds = (
             rows.contact_path.numpy()[at],
             rows.contact_slot.numpy()[at],

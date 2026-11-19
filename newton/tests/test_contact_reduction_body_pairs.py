@@ -241,13 +241,12 @@ def _contact_snapshot(contacts):
     )
 
 
-def _full_contact_rows(contacts, *, canonical=False, by_key=False):
+def _full_contact_rows(contacts, *, canonical=False):
     """Return rows over every solver-visible rigid-contact input field.
 
     The materialized length is clamped to capacity because Newton deliberately
     preserves an over-capacity raw counter for diagnostics.  Buffer order is
-    retained by default; ``by_key`` orders the rows by their contact keys, the
-    order two passes share, since a pass writes its contacts in thread order.
+    retained, the pipeline's one order.
     """
     raw_count = int(contacts.rigid_contact_count.numpy()[0])
     n = min(raw_count, contacts.rigid_contact_max)
@@ -267,9 +266,8 @@ def _full_contact_rows(contacts, *, canonical=False, by_key=False):
         arr = getattr(contacts, name, None)
         if arr is not None:
             cols.append(arr.numpy()[:n])
-    order = np.argsort(contacts.rigid_contact_key.numpy()[:n], kind="stable") if by_key else np.arange(n)
     rows = []
-    for k in order:
+    for k in range(n):
         row = []
         for col in cols:
             row.extend(round(float(x), 6) for x in np.atleast_1d(col[k]))
@@ -1432,9 +1430,9 @@ class TestBodyPairReductionSafety(unittest.TestCase):
         stats = pipeline._body_pair_reducer.stats()
         self.assertEqual(n_red, n_base, "saturated frame must keep the whole unreduced set")
         self.assertEqual(
-            # Two passes write their contacts in thread order: compare them in key order (each contact's identity).
-            _full_contact_rows(contacts, by_key=True),
-            _full_contact_rows(contacts_base, by_key=True),
+            # Every pass leaves its contacts in the pipeline's one order: two passes compare element by element.
+            _full_contact_rows(contacts),
+            _full_contact_rows(contacts_base),
             "whole-frame fallback changed a solver-visible contact field",
         )
         self.assertEqual(stats["fallback_frames"], 1)
@@ -1517,9 +1515,9 @@ class TestBodyPairReductionSafety(unittest.TestCase):
 
         self.assertEqual(n_red, n_base, "identity frame must keep every contact")
         self.assertEqual(
-            # Two passes write their contacts in thread order: compare them in key order (each contact's identity).
-            _full_contact_rows(contacts, by_key=True),
-            _full_contact_rows(contacts_base, by_key=True),
+            # Every pass leaves its contacts in the pipeline's one order: two passes compare element by element.
+            _full_contact_rows(contacts),
+            _full_contact_rows(contacts_base),
             "identity fast path changed a solver-visible contact field",
         )
         stats = pipeline.body_pair_reduction_stats()

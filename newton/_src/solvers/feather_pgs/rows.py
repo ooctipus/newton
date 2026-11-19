@@ -1249,7 +1249,6 @@ class RowLaws:
                 "compliance": bool(self.set.material),
                 "authored_materials": bool(self.authored_materials),
                 "reason": _BETA_REASONS[self.friction_anchor_beta_source],
-                "pair_sort": self.friction_patches.record(),
             },
         }
 

@@ -16,7 +16,7 @@ step after step along the stance's indeterminate force modes until the feet reac
 import warp as wp
 
 from . import field_group
-from .contact_input import ContactRoutes, route_position
+from .contact_input import ContactRoutes
 from .factor.kernels import Clock, clock_dt_ratio
 from .field_group import Field
 from .row_laws import ROW_CONTACT
@@ -105,27 +105,22 @@ def carry_contacts(
     impulse = float(0.0)
     if c < routes.count[0]:
         carry.normal[c] = routes.normal[c]
-        j = route_position(routes, c)
-        slot = routes.slot[j]
+        slot = routes.slot[c]
         if slot >= 0:
-            line = first[routes.world[j]]
+            line = first[routes.world[c]]
             if row_type[line, slot] == ROW_CONTACT:
                 impulse = impulses[line, slot]
     carry.impulse[c] = impulse
 
 
 @wp.kernel
-def forget_carried_contacts(
-    position: wp.array[int], world: wp.array[int], world_mask: wp.array[wp.bool], carry: ContactCarry
-):
+def forget_carried_contacts(world: wp.array[int], world_mask: wp.array[wp.bool], carry: ContactCarry):
     """Forget the carried impulses of the selected worlds' contacts (every contact without a mask), each contact's
-    world the allocator's of the carried step (``contact_world``, at the contact's frame ``position``; a contact no
-    frame placed carries nothing)."""
+    world the allocator's of the carried step (``contact_world``; a contact the allocator placed in no world carries
+    nothing)."""
     c = wp.tid()
     if world_mask:
-        w = int(-1)
-        if position[c] >= 0:
-            w = world[position[c]]
+        w = world[c]
         if w < 0 or w >= world_mask.shape[0] or not world_mask[w]:
             return
     carry.impulse[c] = 0.0
@@ -180,12 +175,11 @@ def gather_carried_normals(
     c = wp.tid()
     if c >= routes.count[0]:
         return
-    j = route_position(routes, c)
-    slot = routes.slot[j]
+    slot = routes.slot[c]
     mi = match_index[c]
     if slot < 0 or mi < 0:
         return
-    line = first[routes.world[j]]
+    line = first[routes.world[c]]
     if row_type[line, slot] == ROW_CONTACT:
         impulse = decay * clock_dt_ratio(clock[0]) * carry.impulse[mi]
         impulses[line, slot] = carried_normal(impulse, routes.normal[c], carry.normal[mi])

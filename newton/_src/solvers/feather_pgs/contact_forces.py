@@ -6,7 +6,7 @@ spatial contact forces."""
 
 import warp as wp
 
-from .contact_input import ContactRoutes, route_position
+from .contact_input import ContactRoutes
 from .contact_laws import contact_tangent_basis
 from .row_laws import ROW_FRICTION
 
@@ -30,20 +30,18 @@ def contact_linear_force(
     # outputs
     rigid_contact_force: wp.array[wp.vec3],
 ):
-    """Convert solved FeatherPGS contact impulses into world-frame forces: the collision's contact ``c``'s rows sit at
-    its slot of its world's line (both at its frame position), a free body's contact's (``path`` 1) among the free
-    bodies' rows from ``body_base``."""
+    """Convert solved FeatherPGS contact impulses into world-frame forces: contact ``c``'s rows sit at its slot of its
+    world's line, a free body's contact's (``path`` 1) among the free bodies' rows from ``body_base``."""
     total_contacts = routes.count[0]
     if c >= total_contacts:
         return
 
     force = wp.vec3(0.0)
-    j = route_position(routes, c)
-    slot = routes.slot[j]
-    path = routes.path[j]
+    slot = routes.slot[c]
+    path = routes.path[c]
 
     if slot >= 0 and path >= 0 and inv_dt > 0.0:
-        world = routes.world[j]
+        world = routes.world[c]
         line = dense_first[world]
         # Contacts store normals from shape 0 toward shape 1 (A-to-B). FeatherPGS
         # solves along the opposite direction internally, which corresponds to the

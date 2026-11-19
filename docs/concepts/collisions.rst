@@ -760,7 +760,7 @@ anyway. Dropping them in the broad phase removes their contact generation and so
 The remaining contacts may be renumbered, and on CUDA FeatherPGS can then reserve their rows in
 another order; with few PGS iterations, its results then differ as they do under any change of
 contact order. The pipeline sorts the remaining contacts (:ref:`Deterministic Contacts`), and
-FeatherPGS gives sorted contacts' rows that order, so its rows stay the same.
+FeatherPGS gives their rows that order, so its rows stay the same.
 Solvers that resolve such joints as constraints no longer see these contacts either, and contact
 sensors no longer report them. With ``include_static_kinematic_pairs=False``, a welded body also
 counts as static for that filter, so its pairs with kinematic shapes are dropped as well.
@@ -2668,10 +2668,13 @@ Contact reduction decides each slot by score, then by a geometry-derived fingerp
 edge or marching-cubes face index), so the winners do not depend on which thread arrives first;
 hydroelastic per-bin aggregates are summed in int64 fixed point, which is associative. Each
 contact carries its identity in ``Contacts.rigid_contact_key``, a 64-bit key
-``(shape_a, shape_b, sub_key)`` unique among the pass's contacts. The contacts' written order
-still follows the GPU's threads: the pipeline sorts them only for contact matching, and a solver
-that needs an order takes it from the keys. A standalone :class:`~newton.geometry.NarrowPhase`
-sorts its own output by key when it has a sort buffer (``contact_max`` > 0, the default).
+``(shape_a, shape_b, sub_key)`` unique among the pass's contacts. The pipeline then sorts the
+pass's contacts, every field with them, by body pair and then by key, so every reader (solvers,
+sensors, exports, contact matching) sees one order that follows from the geometry alone. A body
+pair's code orders the worlds' bodies by index before the global bodies, and static shapes after
+every body, so each world's contacts form one run and a body pair's contacts lie together. A
+standalone :class:`~newton.geometry.NarrowPhase` sorts its own output by key when it has a sort
+buffer (``contact_max`` > 0, the default).
 
 The key keeps bit 63 clear. Models with only primitive and convex shapes use a 3-bit sub-key,
 which leaves room for ``2**30`` shapes; models with meshes, heightfields, hydroelastic shapes or
@@ -2681,8 +2684,8 @@ construction raises ``ValueError``. A :class:`~newton.geometry.NarrowPhase` buil
 shapes.
 
 Runs repeat bit for bit on the same GPU architecture when the solver is deterministic as well:
-:class:`~newton.solvers.SolverFeatherPGS` orders each world's contacts and contact rows by body pair
-and contact key. See :doc:`determinism` for the other solvers.
+:class:`~newton.solvers.SolverFeatherPGS` takes its contacts and contact rows in the pipeline's
+order. See :doc:`determinism` for the other solvers.
 
 .. _Contact Matching:
 

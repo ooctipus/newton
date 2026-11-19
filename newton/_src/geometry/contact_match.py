@@ -8,8 +8,10 @@ normals) and the current frame's sorted contacts, this module finds
 correspondences using the deterministic sort key from
 :func:`~newton._src.geometry.contact_data.make_contact_sort_key`.
 
-For each new contact the matcher binary-searches the previous frame's
-sorted keys for the ``(shape_a, shape_b)`` pair range — ignoring the
+The contacts lie in the pipeline's order, by body pair and then by key
+(:meth:`~newton._src.geometry.contact_sort.ContactSorter.sort_full`). For each
+new contact the matcher binary-searches the previous frame's (body-pair key,
+contact key) pairs for its ``(shape_a, shape_b)`` range — ignoring the
 ``sort_sub_key`` bits — then picks the closest previous contact in that
 range whose normal also passes the dot-product threshold.  "Closest" is
 measured in world space between the contact *midpoints*
@@ -144,13 +146,16 @@ def _accumulate_reset_world_mask_kernel(
 
 
 @wp.func
-def _lower_bound_int64(
+def _lower_bound_pair(
     lower: int,
     upper: int,
+    pair: wp.int64,
     target: wp.int64,
+    pairs: wp.array[wp.int64],
     keys: wp.array[wp.int64],
 ) -> int:
-    """First index in ``keys[lower:upper]`` whose value is >= *target*.
+    """First index in ``[lower, upper)`` whose (body-pair key, contact key) is >= ``(pair, target)``: the contacts'
+    order (:meth:`ContactSorter.sort_full`).
 
     Returns ``upper`` if no such index exists.
     """
@@ -158,7 +163,7 @@ def _lower_bound_int64(
     right = upper
     while left < right:
         mid = left + (right - left) // 2
-        if keys[mid] < target:
+        if pairs[mid] < pair or (pairs[mid] == pair and keys[mid] < target):
             left = mid + 1
         else:
             right = mid
@@ -232,6 +237,7 @@ class _MatchData:
     # ``prev_pos_world`` holds the world-space *midpoint* between shape 0's and
     # shape 1's contact points, saved by the previous frame's save kernel.
     prev_keys: wp.array[wp.int64]
+    prev_pair_keys: wp.array[wp.int64]
     prev_pos_world: wp.array[wp.vec3]
     prev_point0: wp.array[wp.vec3]
     prev_point1: wp.array[wp.vec3]
@@ -246,6 +252,7 @@ class _MatchData:
 
     # Current frame (sorted).
     new_keys: wp.array[wp.int64]
+    new_pair_keys: wp.array[wp.int64]
     new_point0: wp.array[wp.vec3]
     new_point1: wp.array[wp.vec3]
     new_shape0: wp.array[wp.int32]
@@ -338,8 +345,10 @@ def _match_contacts_kernel(data: _MatchData):
     # range is cheap.
     pair_prefix = target_key & ~data.pair_sub_key_mask
     pair_end = pair_prefix + data.pair_key_stride
-    range_lo = _lower_bound_int64(0, n_old, pair_prefix, data.prev_keys)
-    range_hi = _lower_bound_int64(range_lo, n_old, pair_end, data.prev_keys)
+    # A shape pair's contacts lie together within its body pair's (the contacts' order, by body pair then key).
+    body_pair = data.new_pair_keys[tid]
+    range_lo = _lower_bound_pair(0, n_old, body_pair, pair_prefix, data.prev_pair_keys, data.prev_keys)
+    range_hi = _lower_bound_pair(range_lo, n_old, body_pair, pair_end, data.prev_pair_keys, data.prev_keys)
 
     if range_lo >= range_hi:
         data.match_index[tid] = MATCH_NOT_FOUND
@@ -431,6 +440,7 @@ class _SaveStateData:
     """
 
     src_keys: wp.array[wp.int64]
+    src_pair_keys: wp.array[wp.int64]
     src_point0: wp.array[wp.vec3]
     src_point1: wp.array[wp.vec3]
     src_offset0: wp.array[wp.vec3]
@@ -446,6 +456,7 @@ class _SaveStateData:
     shape_body: wp.array[wp.int32]
 
     dst_keys: wp.array[wp.int64]
+    dst_pair_keys: wp.array[wp.int64]
     dst_pos_world: wp.array[wp.vec3]  # world-space midpoint of point0 and point1
     dst_normal: wp.array[wp.vec3]
     dst_point0_body: wp.array[wp.vec3]
@@ -472,6 +483,7 @@ def _save_sorted_state_kernel(data: _SaveStateData):
     i = wp.tid()
     if i < wp.min(data.src_count[0], data.dst_keys.shape[0]):
         data.dst_keys[i] = data.src_keys[i]
+        data.dst_pair_keys[i] = data.src_pair_keys[i]
         data.dst_claim[i] = _CLAIM_SENTINEL
         if data.has_report != 0:
             data.dst_prev_was_matched[i] = wp.int32(0)
@@ -741,6 +753,7 @@ class ContactMatcher:
             # History persists across frames: rows keep it when the pool grows.
             fields = [
                 ContactField("_prev_sorted_keys", wp.int64, 0x7FFFFFFFFFFFFFFF),
+                ContactField("_prev_pair_keys", wp.int64, 0x7FFFFFFFFFFFFFFF),
                 ContactField("_prev_pos_world", wp.vec3),
                 ContactField("_prev_normal", wp.vec3),
                 ContactField("_prev_claim", wp.int64, 0x7FFFFFFFFFFFFFFF),
@@ -847,6 +860,7 @@ class ContactMatcher:
     def match(
         self,
         sort_keys: wp.array[wp.int64],
+        pair_keys: wp.array[wp.int64],
         contact_count: wp.array[wp.int32],
         point0: wp.array[wp.vec3],
         point1: wp.array[wp.vec3],
@@ -872,8 +886,9 @@ class ContactMatcher:
         pose, to its fresh contact point. This excludes shared body motion.
 
         Args:
-            sort_keys: Current frame's sorted int64 keys (use
-                :attr:`ContactSorter.sorted_keys_view`).
+            sort_keys: Current frame's contact keys, in the contacts' order (by body pair, then key).
+            pair_keys: Current frame's body-pair keys in that order (:attr:`ContactSorter.sorted_keys_view` after
+                :meth:`ContactSorter.sort_full`).
             contact_count: Single-element int array with active contact count.
             point0: Sorted body-frame contact points on shape 0 (current frame).
             point1: Sorted body-frame contact points on shape 1 (current frame).
@@ -893,6 +908,7 @@ class ContactMatcher:
         """
         data = _MatchData()
         data.prev_keys = self._history("_prev_sorted_keys")
+        data.prev_pair_keys = self._history("_prev_pair_keys")
         # Owned history survives sorting and reduction of the current stream.
         data.prev_pos_world = self._history("_prev_pos_world")
         data.prev_point0 = self._history("_prev_point0") if self._sticky else data.prev_pos_world
@@ -905,6 +921,7 @@ class ContactMatcher:
         data.shape_world = self._shape_world
         data.world_count = self._world_count
         data.new_keys = sort_keys
+        data.new_pair_keys = pair_keys
         data.new_point0 = point0
         data.new_point1 = point1
         data.new_shape0 = shape0
@@ -943,6 +960,7 @@ class ContactMatcher:
     def save_sorted_state(
         self,
         sorted_keys: wp.array[wp.int64],
+        sorted_pair_keys: wp.array[wp.int64],
         contact_count: wp.array[wp.int32],
         sorted_point0: wp.array[wp.vec3],
         sorted_point1: wp.array[wp.vec3],
@@ -972,7 +990,8 @@ class ContactMatcher:
         required in that case and ignored otherwise.
 
         Args:
-            sorted_keys: Sorted int64 keys (use :attr:`ContactSorter.sorted_keys_view`).
+            sorted_keys: The contact keys, in the contacts' order.
+            sorted_pair_keys: The body-pair keys in that order (:attr:`ContactSorter.sorted_keys_view`).
             contact_count: Single-element int array with active contact count.
             sorted_point0: Sorted body-frame contact points on shape 0.
             sorted_point1: Sorted body-frame contact points on shape 1.
@@ -989,6 +1008,7 @@ class ContactMatcher:
         """
         data = _SaveStateData()
         data.src_keys = sorted_keys
+        data.src_pair_keys = sorted_pair_keys
         data.src_point0 = sorted_point0
         data.src_point1 = sorted_point1
         data.src_shape0 = sorted_shape0
@@ -1000,6 +1020,7 @@ class ContactMatcher:
         data.body_q = body_q
         data.shape_body = shape_body
         data.dst_keys = self._history("_prev_sorted_keys")
+        data.dst_pair_keys = self._history("_prev_pair_keys")
         # Save world-space geometry independently of transient sorter scratch.
         data.dst_pos_world = self._history("_prev_pos_world")
         data.dst_normal = self._history("_prev_normal")

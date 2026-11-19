@@ -655,7 +655,11 @@ def test_reservation_holds_the_device_bound(test, device):
         test.assertGreaterEqual(reserved, pool.bound * pool.row_bytes)
     else:
         test.assertEqual(reserved, mapped)
-        test.assertEqual(mapped, pool.ready * pool.row_bytes)
+        # The ready rows, and the fixed scratch rows past them (the contact sort's padded tiles).
+        extra = sum(
+            field.extra * wp.types.type_size_in_bytes(field.dtype) for member in members for field in member.fields
+        )
+        test.assertEqual(mapped, pool.ready * pool.row_bytes + extra)
     for member in members:
         test.assertGreaterEqual(member.reserve, pool.bound)
         for field in member.fields:
@@ -1021,7 +1025,7 @@ def test_forecast_holds_a_landing_from_the_floor(test, device):
 
     Every world's boxes reach the ground in the same pass, past any late start-up window, and the demand jumps from
     none to many times the floor at once. The pool's law alone reads that a replay late, so the forecast must hold it.
-    The service asks for a recapture past the slots the patch sort's merge rounds pair; the graph replays on without.
+    No recapture is asked: the contact sort's merge rounds are sized for the rows a capture binds.
     """
     worlds, boxes = 8192, 8
     model = _build_boxes(device, worlds=worlds, boxes=boxes)
@@ -1063,7 +1067,7 @@ def test_forecast_holds_a_landing_from_the_floor(test, device):
             asked += pipeline.service_capacity()
     wp.synchronize_device(device)
     test.assertEqual(len(pool._unbound_captures), 0, "bound graphs follow the rows")
-    test.assertGreater(asked, 0, "the landing passed the slots the patch sort's merge rounds pair")
+    test.assertEqual(asked, 0, "the sort's merge rounds cover the bound rows: no recapture")
     demand = 4 * worlds * boxes
     test.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), demand)
     test.assertEqual(pool.high_water, demand)
@@ -1630,9 +1634,9 @@ def test_bound_graph_follows_growth_without_recapture(test, device):
 
     The graph is captured with every box in the air, then replayed with the boxes resting: the first replay's
     contacts outnumber the rows the first pages hold, so it drops the excess and flags it; the service maps more
-    rows without synchronizing, and every later replay of the same graph holds every contact. The service asks for a
-    recapture past the slots the patch sort's merge rounds pair, which a replay's last round then joins all of.
-    Without CUDA virtual memory, rows are reallocated and the graph is recaptured on every growth.
+    rows without synchronizing, and every later replay of the same graph holds every contact. No recapture is asked:
+    the contact sort's merge rounds are sized for the rows a capture binds. Without CUDA virtual memory, rows are
+    reallocated and the graph is recaptured on every growth.
     """
     worlds, boxes = 12288, 6
     with _small_pool_policy(8, 8):
@@ -1692,7 +1696,7 @@ def test_bound_graph_follows_growth_without_recapture(test, device):
     test.assertEqual(overflowed, [0], "only the replay where the demand first passed the rows drops contacts")
     test.assertGreater(pool.growth_count, growths)
     test.assertEqual(recaptures, pool.growth_count - growths if reallocates else 0, "reallocated rows: every growth")
-    test.assertGreater(asked, 0, "the demand passed the slots the patch sort's merge rounds pair")
+    test.assertEqual(asked, recaptures, "a recapture only for reallocated rows")
     test.assertEqual(counts[-1], 4 * worlds * boxes, "every box rests on the ground, every contact held")
     test.assertTrue(all(count == 4 * worlds * boxes for count in counts[1:]), "no contact dropped after the first")
     test.assertGreater(pool.mapped_bytes(), first_mapping)

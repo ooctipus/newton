@@ -36,7 +36,7 @@ class TestFeatherPGSPersistentContacts(unittest.TestCase):
         solver.step(state, output, model.control(), contacts, 1.0 / 240.0)
         # The carry is keyed by the stepped contacts, each in its allocator's world.
         stepped = int(contacts.rigid_contact_count.numpy()[0])
-        carried_worlds = solver.placement.contact_world.numpy()[solver.laws.friction_patches.position.numpy()[:stepped]]
+        carried_worlds = solver.placement.contact_world.numpy()[:stepped]
         mask = wp.array([False, False, False], dtype=wp.bool, device=model.device)
         solver_mask = mask[:2]
         # Compile both reset paths before capture.

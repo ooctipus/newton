@@ -360,7 +360,8 @@ def launch_live_sort(
         slot_keys: Keys of at most 51 bits, which sort stably (:func:`slot_keys_fit`).
         ties: With slot keys, an int64 per slot index (the slots' indices name them): equal keys sort by tie, so
             with unique ties the order is the keys' and ties' alone. The live slots' indices must be the slots
-            themselves.
+            themselves. Like ``keys``, a view of the whole reservation: the chunk sort loads it in tiles, which stop
+            at the array's shape.
     """
     if ties is not None and not slot_keys:
         raise ValueError("ties order slot keys only")

@@ -883,17 +883,15 @@ def test_cached_shape_sdf_data_matches_fallback(test, device):
     )
     pipeline.collide(state, contacts)
     cached_count = int(contacts.rigid_contact_count.numpy()[0])
-    # A pass writes its contacts in thread order: compare them in key order, each contact's identity.
-    order = np.argsort(contacts.rigid_contact_key.numpy()[:cached_count])
-    cached = tuple(getattr(contacts, name).numpy()[:cached_count][order] for name in fields)
+    # Every pass leaves its contacts in the pipeline's one order: they compare element by element.
+    cached = tuple(getattr(contacts, name).numpy()[:cached_count] for name in fields)
 
     pipeline._hydro_shape_sdf_data_prepared = False
     pipeline.collide(state, contacts)
     fallback_count = int(contacts.rigid_contact_count.numpy()[0])
     test.assertEqual(fallback_count, cached_count)
-    order = np.argsort(contacts.rigid_contact_key.numpy()[:fallback_count])
     for name, expected in zip(fields, cached, strict=True):
-        np.testing.assert_array_equal(getattr(contacts, name).numpy()[:fallback_count][order], expected, err_msg=name)
+        np.testing.assert_array_equal(getattr(contacts, name).numpy()[:fallback_count], expected, err_msg=name)
 
 
 def test_deterministic_hydroelastic_contacts_unreduced(test, device):
@@ -1234,9 +1232,8 @@ def test_deterministic_hydroelastic_speculative_contacts(test, device):
         bin_ids = (active_keys >> np.uint64(55)) & np.uint64(0xFF)
         test.assertTrue(np.all(bin_ids >= SPECULATIVE_BIN_OFFSET))
 
-        # A pass writes its contacts in thread order: compare passes in key order, each contact's identity.
-        order = np.argsort(contacts.rigid_contact_key.numpy()[:count])
-        snapshots.append((count, tuple(getattr(contacts, name).numpy()[:count][order] for name in contact_fields)))
+        # Every pass leaves its contacts in the pipeline's one order: passes compare element by element.
+        snapshots.append((count, tuple(getattr(contacts, name).numpy()[:count] for name in contact_fields)))
 
     for count, fields in snapshots[1:]:
         test.assertEqual(count, snapshots[0][0])

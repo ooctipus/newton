@@ -374,8 +374,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
             getattr(solver.placement, name).numpy()
             for name in ("contact_world", "contact_slot", "contact_slots_needed")
         )
-        # The allocation records lie in the frame's order: each frame position's shapes are its collision contact's.
-        frame = solver.laws.friction_patches.contact_of.numpy()[: int(contacts.rigid_contact_count.numpy()[0])]
+        frame = slice(int(contacts.rigid_contact_count.numpy()[0]))
         shape_a, shape_b = contacts.rigid_contact_shape0.numpy()[frame], contacts.rigid_contact_shape1.numpy()[frame]
         identities = []
         for world, count in enumerate(solver.placement.constraint_count.numpy()):

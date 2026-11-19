@@ -49,7 +49,7 @@ from ..geometry.contact_reduction_body_pairs import (
     build_reduction_group_bound,
     build_reduction_groups,
 )
-from ..geometry.contact_sort import ContactSorter
+from ..geometry.contact_sort import ContactSorter, body_pair_codes, pair_key_stride
 from ..geometry.differentiable_contacts import launch_differentiable_contact_augment
 from ..geometry.flags import MeshProperties, ShapeFlags
 from ..geometry.kernels import create_soft_contacts
@@ -3606,17 +3606,20 @@ class CollisionPipeline:
         # Per-contact material rows exist only with hydroelastic contacts; a body-pair reducing
         # pipeline takes only the buffers its contacts() allocates, which carry none.
         per_contact_props = self.narrow_phase.hydroelastic_sdf is not None
-        # Contact matching finds last pass's contacts by key: it sorts them.
-        if matching_enabled:
-            self._contact_sorter = ContactSorter(
-                self._contact_pool.ready,
-                per_contact_shape_properties=per_contact_props,
-                allocate_simple_scratch=False,
-                device=device,
-                pool=self._contact_pool,
-            )
-        else:
-            self._contact_sorter = None
+        # Every pass's contacts leave in one order: by body pair (worlds' bodies first), then by contact key.
+        self._contact_sorter = ContactSorter(
+            self._contact_pool.ready,
+            per_contact_shape_properties=per_contact_props,
+            allocate_simple_scratch=False,
+            device=device,
+            pool=self._contact_pool,
+        )
+        self._body_code = wp.array(
+            body_pair_codes(model.body_world.numpy() if model.body_count else np.zeros(0, dtype=np.int32)),
+            dtype=wp.int32,
+            device=device,
+        )
+        pair_key_stride(model.body_count, model.shape_count)
 
         self.contact_matching = contact_matching
         self._matching_enabled = matching_enabled
@@ -3655,7 +3658,7 @@ class CollisionPipeline:
                 up_axis=int(getattr(model, "up_axis", 2)),
                 shape_world=model.shape_world.numpy(),
                 world_count=max(int(model.world_count), 1),
-                borrowed_scratch=(self._contact_sorter.borrow_full_scratch if self._contact_sorter else None),
+                borrowed_scratch=self._contact_sorter.borrow_full_scratch,
                 pool=self._contact_pool,
                 verify=body_pair_reduction.verify,
                 hysteresis=body_pair_reduction.hysteresis,
@@ -5349,15 +5352,11 @@ class CollisionPipeline:
         writer_data.out_stiffness = contacts.rigid_contact_stiffness
         writer_data.out_damping = contacts.rigid_contact_damping
         writer_data.out_friction = contacts.rigid_contact_friction
-        if (
-            self._contact_sorter is not None
-            and contacts._rigid_contact_rows != self._contact_sorter.sorted_keys_view.shape[0]
-        ):
+        if contacts._rigid_contact_rows > self._contact_sorter.sorted_keys_view.shape[0]:
             raise ValueError(
-                f"Contacts buffer capacity ({contacts._rigid_contact_rows}) does not match the contact matching "
-                f"sort buffer size ({self._contact_sorter.sorted_keys_view.shape[0]}). The sorter operates over "
-                f"fixed-capacity buffers for CUDA graph capture compatibility, so the sizes must match exactly. Use "
-                f"CollisionPipeline.contacts()."
+                f"Contacts buffer capacity ({contacts._rigid_contact_rows}) exceeds the contact sort's rows "
+                f"({self._contact_sorter.sorted_keys_view.shape[0]}). The sorter operates over fixed-capacity buffers "
+                f"for CUDA graph capture compatibility. Use CollisionPipeline.contacts()."
             )
         writer_data.out_sort_key = contacts.rigid_contact_key
         writer_data.shape_transform = self.geom_transform
@@ -5549,27 +5548,6 @@ class CollisionPipeline:
             )
 
         pool = contacts._rigid_contact_pool
-        if self._contact_sorter is not None:
-            self._contact_sorter.sort_full(
-                contacts.rigid_contact_key,
-                contacts.rigid_contact_count,
-                shape0=contacts.rigid_contact_shape0,
-                shape1=contacts.rigid_contact_shape1,
-                point0=contacts.rigid_contact_point0,
-                point1=contacts.rigid_contact_point1,
-                offset0=contacts.rigid_contact_offset0,
-                offset1=contacts.rigid_contact_offset1,
-                normal=contacts.rigid_contact_normal,
-                margin0=contacts.rigid_contact_margin0,
-                margin1=contacts.rigid_contact_margin1,
-                tids=contacts.rigid_contact_tids,
-                stiffness=contacts.rigid_contact_stiffness,
-                damping=contacts.rigid_contact_damping,
-                friction=contacts.rigid_contact_friction,
-                match_index=contacts.rigid_contact_match_index,
-                device=self.device,
-            )
-
         # Body-pair contact reduction: compact patch-redundant candidates so rigid_contact_count
         # reflects the contact structure, not the collider decomposition, before matching.
         if self._body_pair_reducer is not None:
@@ -5585,6 +5563,32 @@ class CollisionPipeline:
             # The reduction rewrote the count: later launches follow the reduced count.
             pool.begin_updates()
 
+        # The one order of the pass's contacts: by body pair, then by contact key, every field gathered
+        # (ContactSorter.sort_full). Every reader sees it: the matching, the solvers, sensors and exports.
+        limit = contacts._rigid_contact_rows
+        self._contact_sorter.sort_full(
+            contacts.rigid_contact_key,
+            contacts.rigid_contact_count,
+            shape_body=model.shape_body,
+            body_code=self._body_code,
+            shape0=contacts.rigid_contact_shape0,
+            shape1=contacts.rigid_contact_shape1,
+            point0=contacts.rigid_contact_point0,
+            point1=contacts.rigid_contact_point1,
+            offset0=contacts.rigid_contact_offset0,
+            offset1=contacts.rigid_contact_offset1,
+            normal=contacts.rigid_contact_normal,
+            margin0=contacts.rigid_contact_margin0,
+            margin1=contacts.rigid_contact_margin1,
+            tids=contacts.rigid_contact_tids,
+            stiffness=contacts.rigid_contact_stiffness,
+            damping=contacts.rigid_contact_damping,
+            friction=contacts.rigid_contact_friction,
+            match_index=contacts.rigid_contact_match_index,
+            device=self.device,
+            limit=limit if limit < self._contact_sorter.sorted_keys_view.shape[0] else -1,
+        )
+
         # Match and save the retained stream so all indices name solver contacts.
         # Matching now sees the final retained and sorted stream.
         if self._contact_matcher is not None:
@@ -5596,6 +5600,7 @@ class CollisionPipeline:
                 )
             self._contact_matcher.match(
                 sort_keys=contacts.rigid_contact_key,
+                pair_keys=self._contact_sorter.sorted_keys_view,
                 contact_count=contacts.rigid_contact_count,
                 point0=contacts.rigid_contact_point0,
                 point1=contacts.rigid_contact_point1,
@@ -5702,6 +5707,7 @@ class CollisionPipeline:
             )
             self._contact_matcher.save_sorted_state(
                 sorted_keys=contacts.rigid_contact_key,
+                sorted_pair_keys=self._contact_sorter.sorted_keys_view,
                 contact_count=contacts.rigid_contact_count,
                 sorted_point0=contacts.rigid_contact_point0,
                 sorted_point1=contacts.rigid_contact_point1,

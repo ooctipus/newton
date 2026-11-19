@@ -20,19 +20,16 @@ from .field_group import Field, FieldGroup
 from .friction_patches import PatchRowLaw, patch_friction_location, region_normal
 
 CONTACT_INPUT = (
-    # The collision pipeline's contacts: their count, and their records in the frame's order (the member store,
-    # friction_patches._prepare_contacts), with the maps between the frame's positions and the collision's contacts.
-    # Every per-contact field here is indexed by the frame's position.
+    # The collision pipeline's contacts: their count and records, in its order (by body pair, then contact key), the
+    # frame's. Every per-contact field here is indexed by the contact.
     Field("count", wp.int32, (1,), owner="contacts", attr="rigid_contact_count"),
-    Field("point0", wp.vec3, ("contact",), owner="records"),
-    Field("point1", wp.vec3, ("contact",), owner="records"),
-    Field("normal", wp.vec3, ("contact",), owner="records"),
-    Field("shape0", wp.int32, ("contact",), owner="records"),
-    Field("shape1", wp.int32, ("contact",), owner="records"),
-    Field("margin0", wp.float32, ("contact",), owner="records"),
-    Field("margin1", wp.float32, ("contact",), owner="records"),
-    Field("contact_of", wp.int32, ("contact",), owner="frame_order"),
-    Field("position", wp.int32, ("contact",), owner="frame_order"),
+    Field("point0", wp.vec3, ("contact",), owner="contacts", attr="rigid_contact_point0"),
+    Field("point1", wp.vec3, ("contact",), owner="contacts", attr="rigid_contact_point1"),
+    Field("normal", wp.vec3, ("contact",), owner="contacts", attr="rigid_contact_normal"),
+    Field("shape0", wp.int32, ("contact",), owner="contacts", attr="rigid_contact_shape0"),
+    Field("shape1", wp.int32, ("contact",), owner="contacts", attr="rigid_contact_shape1"),
+    Field("margin0", wp.float32, ("contact",), owner="contacts", attr="rigid_contact_margin0"),
+    Field("margin1", wp.float32, ("contact",), owner="contacts", attr="rigid_contact_margin1"),
     # The allocator's record of each contact.
     Field("world", wp.int32, ("contact",), attr="contact_world", owner="placement"),
     Field("slot", wp.int32, ("contact",), attr="contact_slot", owner="placement"),
@@ -66,7 +63,7 @@ CONTACT_INPUT = (
     Field("restitution_threshold", wp.float32, owner="laws", attr="effective_restitution_velocity_threshold"),
     Field("contact_w", wp.float32, owner="laws"),
     # The contacts' material (contact_compliance): stiffness [N/m], damping [N s/m] and friction scale per contact,
-    # the collision's (read at contact_of); a contact of zero stiffness keeps the rigid law.
+    # each contact's; a contact of zero stiffness keeps the rigid law.
     Field("material", wp.int32, owner="options", attr="contact_compliance"),
     Field("stiffness", wp.float32, ("contact",), attr="contact_stiffness"),
     Field("damping", wp.float32, ("contact",), attr="contact_damping"),
@@ -92,19 +89,12 @@ ContactRoutes = field_group.struct(
     "ContactRoutes",
     (
         Field("count", wp.int32, (1,), owner="contacts", attr="rigid_contact_count"),
-        Field("normal", wp.vec3, ("contact",), owner="contacts", attr="rigid_contact_normal"),
-        *FieldGroup(*CONTACT_INPUT).select("position", "world", "slot", "path"),
+        *FieldGroup(*CONTACT_INPUT).select("normal", "world", "slot", "path"),
     ),
     __name__,
 )
-"""The collision's contacts by their own index: their count and normals, each one's position in the frame
-(:func:`route_position`) and, at that position, its world, row slot and path (0 dense, 1 matrix-free, -1 none)."""
-
-
-@wp.func
-def route_position(routes: ContactRoutes, c: int) -> int:
-    """The frame's position of the collision's contact ``c``, at which its world, slot and path lie."""
-    return routes.position[c]
+"""The contacts: their count and normals, and each one's world, row slot and path (0 dense, 1 matrix-free, -1
+none)."""
 
 
 @wp.struct
@@ -186,14 +176,12 @@ def contact_frame(data: ContactInput, law: PatchRowLaw, c: int) -> ContactFrame:
 
 def bind_routes(placement, contacts):
     """Bind the contacts' :data:`ContactRoutes` (the allocator's records of the last step)."""
-    return field_group.bind(
-        ContactRoutes, placement=placement, contacts=contacts, frame_order=placement.laws.friction_patches
-    )
+    return field_group.bind(ContactRoutes, placement=placement, contacts=contacts)
 
 
 def bind(solver, state_in, state_aug, contacts, dt, bias_scale, data=None):
     """Bind the solver's live storage into a :data:`ContactInput`, without allocating device memory or reading back:
-    the contact records are the frame's copy, in the frame's order (:class:`.friction_patches.ContactRecords`).
+    the contact records are the collision pipeline's, in its order, the frame's.
 
     Args:
         data: An instance to refill, or ``None`` for a new one.
@@ -208,8 +196,6 @@ def bind(solver, state_in, state_aug, contacts, dt, bias_scale, data=None):
         laws=solver.laws,
         options=solver.options,
         contacts=contacts,
-        records=solver.laws.friction_patches.records,
-        frame_order=solver.laws.friction_patches,
         model=solver.model,
         state_in=state_in,
         state_aug=state_aug,

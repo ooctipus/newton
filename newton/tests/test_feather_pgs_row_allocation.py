@@ -73,7 +73,6 @@ def _allocate_overflowing_contacts(device, contact_count, row_capacity):
                 ContactInput,
                 device,
                 count=wp.array([contact_count], dtype=wp.int32, device=device),
-                position=wp.array(np.arange(contact_count, dtype=np.int32), device=device),
                 shape0=contact_shape0,
                 shape1=contact_shape1,
                 point0=contact_point0,
@@ -137,8 +136,8 @@ def _allocate_overflowing_contacts(device, contact_count, row_capacity):
 
 
 def _step_tripods(device, *, steps=4, sorted_contacts=False, **options):
-    """Step the tripod worlds, the collision pipeline sorting its contacts by key (``sorted_contacts``: contact
-    matching sorts them) or leaving them in its writers' order.
+    """Step the tripod worlds, the collision pipeline matching its contacts (``sorted_contacts``) or not: either
+    leaves them in its one order.
 
     ``options`` override the route's solver options. Returns, per step, the live contacts' world,
     path and slot at their frame positions, the worlds' dense and matrix-free row counts, contact
@@ -175,7 +174,7 @@ def _step_tripods(device, *, steps=4, sorted_contacts=False, **options):
         record["pair_keys"] = solver.laws.friction_patches.current.keys.numpy()[:live].copy()
         # Whether each contact has an immovable side (a shape without a body): those take a world's rows first.
         shape_body = model.shape_body.numpy()
-        sides = [getattr(solver.laws.friction_patches.records, name).numpy()[:live] for name in ("shape0", "shape1")]
+        sides = [getattr(contacts, f"rigid_contact_{name}").numpy()[:live] for name in ("shape0", "shape1")]
         record["immovable"] = np.logical_or.reduce(
             [(side < 0) | (shape_body[np.maximum(side, 0)] < 0) for side in sides]
         )

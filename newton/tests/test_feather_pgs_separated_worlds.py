@@ -46,8 +46,6 @@ def _contact_acts(
         ContactInput,
         device,
         count=ints([1]),
-        position=ints([0]),
-        contact_of=ints([0]),
         shape0=ints([0]),
         shape1=ints([1]),
         point0=wp.zeros(1, dtype=wp.vec3, device=device),

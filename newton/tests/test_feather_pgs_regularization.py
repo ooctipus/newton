@@ -62,9 +62,8 @@ def _build_scissor_model(device: str) -> newton.Model:
 
 
 def _contact_rows(solver, path_id: int, contact_count: int) -> dict[int, int]:
-    """contact index -> row slot for world-0 contacts routed to the given path (each contact's allocation at its frame
-    position)."""
-    at = solver.laws.friction_patches.position.numpy()[:contact_count]
+    """contact index -> row slot for world-0 contacts routed to the given path."""
+    at = slice(contact_count)
     contact_path = solver.placement.contact_path.numpy().astype(np.int32)[at]
     contact_slot = solver.placement.contact_slot.numpy().astype(np.int32)[at]
     contact_world = solver.placement.contact_world.numpy().astype(np.int32)[at]

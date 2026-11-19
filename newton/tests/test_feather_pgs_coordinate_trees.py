@@ -898,9 +898,8 @@ def _arm_within(test, reference, actual, bodies, tag, *, again=None):
 
 
 def _contact_rows(test, solver, count):
-    """The ``(world, slot)`` normal row of each of the first ``count`` contacts, in contact order (each contact's
-    allocation at its frame position)."""
-    at = solver.laws.friction_patches.position.numpy()[:count]
+    """The ``(world, slot)`` normal row of each of the first ``count`` contacts, in contact order."""
+    at = slice(count)
     world, slot = solver.placement.contact_world.numpy()[at], solver.placement.contact_slot.numpy()[at]
     test.assertTrue(np.all(slot >= 0), "every held contact owns a row")
     return world, slot
@@ -909,7 +908,7 @@ def _contact_rows(test, solver, count):
 def _normal_impulses(test, solver, count):
     """The solved normal impulse [N·s] of each of the first ``count`` contacts, in contact order: zero, as prepared,
     in a world none of whose rows can act."""
-    at = solver.laws.friction_patches.position.numpy()[:count]
+    at = slice(count)
     world, slot = solver.placement.contact_world.numpy()[at], solver.placement.contact_slot.numpy()[at]
     test.assertTrue(np.all(slot >= 0), "every contact owns a row")
     return solver.placement.impulses.numpy()[world, slot].astype(np.float64)

@@ -17,10 +17,11 @@ the contact pool's growth.
 
 from __future__ import annotations
 
+import numpy as np
 import warp as wp
 
 from ..core.contact_pool import ContactField, ContactPool
-from ..core.live_sort import EXTENT_SIZE, SORT_CHUNK, launch_live_sort, publish_live, sort_grid
+from ..core.live_sort import EXTENT_SIZE, SORT_CHUNK, launch_live_sort, publish_live, slot_keys_fit, sort_grid
 from ..core.types import Devicelike
 
 # Sentinel key for unused contact slots: the max positive int64 sorts last.
@@ -119,6 +120,7 @@ class _FullContactArrays:
     damping: wp.array[float]
     friction: wp.array[float]
     match_index: wp.array[wp.int32]
+    key: wp.array[wp.int64]
     shape0_buf: wp.array[wp.int32]
     shape1_buf: wp.array[wp.int32]
     point0_buf: wp.array[wp.vec3]
@@ -133,25 +135,87 @@ class _FullContactArrays:
     damping_buf: wp.array[float]
     friction_buf: wp.array[float]
     match_index_buf: wp.array[wp.int32]
+    key_buf: wp.array[wp.int64]
     has_shape_props: int
     has_match_index: int
+    # The body-pair key's layout (contact_pair_key).
+    shape_body: wp.array[wp.int32]
+    body_code: wp.array[wp.int32]
+    pair_stride: wp.int64
+
+
+@wp.func
+def contact_pair_key(
+    shape_a: int, shape_b: int, shape_body: wp.array[wp.int32], body_code: wp.array[wp.int32], stride: wp.int64
+) -> wp.int64:
+    """The body-pair key of a contact between ``shape_a`` and ``shape_b``: its sides' codes, the lower first, each a
+    body's code (:func:`body_pair_codes`) or, for a static or missing shape, a code above every body's.
+
+    Below ``stride`` squared (:func:`pair_key_stride`), so keys order pairs as their codes do."""
+    bodies = body_code.shape[0]
+    shapes = shape_body.shape[0]
+    a = int(-1)
+    b = int(-1)
+    if shape_a >= 0:
+        a = shape_body[shape_a]
+    if shape_b >= 0:
+        b = shape_body[shape_b]
+    ka = bodies + shapes + 1
+    if a >= 0:
+        ka = body_code[a]
+    elif shape_a >= 0:
+        ka = bodies + shape_a + 1
+    kb = bodies + shapes + 1
+    if b >= 0:
+        kb = body_code[b]
+    elif shape_b >= 0:
+        kb = bodies + shape_b + 1
+    return wp.int64(wp.min(ka, kb)) * stride + wp.int64(wp.max(ka, kb))
+
+
+def body_pair_codes(body_world: np.ndarray) -> np.ndarray:
+    """Each body's code in a body-pair key (:func:`contact_pair_key`), 1 to the body count: the worlds' bodies first,
+    in index order, then the global ones (world -1).
+
+    A pair's lower code is then its world body's wherever one side is a world's (static shapes code above every
+    body), and a model numbers each world's bodies after the last world's, so contacts in body-pair order lie world
+    after world, each world's in one run."""
+    order = np.argsort(np.asarray(body_world) < 0, kind="stable")
+    codes = np.empty(len(order), dtype=np.int32)
+    codes[order] = np.arange(1, len(order) + 1, dtype=np.int32)
+    return codes
+
+
+def pair_key_stride(bodies: int, shapes: int) -> int:
+    """The stride of body-pair keys (:func:`contact_pair_key`) over ``bodies`` bodies and ``shapes`` shapes: every
+    code is below it. Keys must sort with their slots (:func:`~newton._src.core.live_sort.slot_keys_fit`).
+
+    Raises:
+        ValueError: If the keys leave the live sort no room for its slot bits.
+    """
+    stride = int(bodies) + int(shapes) + 2
+    if not slot_keys_fit((stride * stride - 1).bit_length()):
+        raise ValueError(f"Body-pair keys of {bodies} bodies and {shapes} shapes exceed the contact sort's key bits")
+    return stride
 
 
 @wp.kernel(enable_backward=False)
 def _backup_full_kernel(
     data: _FullContactArrays,
     count: wp.array[int],
-    sort_keys_src: wp.array[wp.int64],
     sort_keys_dst: wp.array[wp.int64],
     sort_indices: wp.array[wp.int32],
 ):
-    """Prepare sort keys and copy active contacts into scratch buffers."""
+    """Write each active contact's body-pair key (:func:`contact_pair_key`) and copy it into the scratch buffers."""
     i = wp.tid()
     sort_indices[i] = wp.int32(i)
     if i >= count[0]:
         sort_keys_dst[i] = SORT_KEY_SENTINEL
         return
-    sort_keys_dst[i] = sort_keys_src[i]
+    sort_keys_dst[i] = contact_pair_key(
+        data.shape0[i], data.shape1[i], data.shape_body, data.body_code, data.pair_stride
+    )
+    data.key_buf[i] = data.key[i]
     data.shape0_buf[i] = data.shape0[i]
     data.shape1_buf[i] = data.shape1[i]
     data.point0_buf[i] = data.point0[i]
@@ -177,6 +241,7 @@ def _gather_full_kernel(data: _FullContactArrays, perm: wp.array[wp.int32], coun
     if i >= count[0]:
         return
     p = perm[i]
+    data.key[i] = data.key_buf[p]
     data.shape0[i] = data.shape0_buf[p]
     data.shape1[i] = data.shape1_buf[p]
     data.point0[i] = data.point0_buf[p]
@@ -274,6 +339,8 @@ class ContactSorter:
                 ContactField("_full_margin1_buf", wp.float32),
                 ContactField("_full_tids_buf", wp.int32),
                 ContactField("_full_match_index_buf", wp.int32),
+                # One chunk of slack past the rows: the tied chunk sort loads the keys in whole tiles.
+                ContactField("_full_key_buf", wp.int64, extra=int(SORT_CHUNK)),
             ]
             if per_contact_shape_properties:
                 fields += [
@@ -383,13 +450,18 @@ class ContactSorter:
 
         # A standalone launch's output arrays may hold fewer slots than the sorter: sort the contacts they hold.
         limit = min(contact_pair.shape[0], sort_keys.shape[0])
-        self._sort(_backup_simple_kernel, _gather_simple_kernel, data, sort_keys, contact_count, limit)
+        self._sort(_backup_simple_kernel, (sort_keys,), _gather_simple_kernel, data, contact_count, limit)
+        live = self._extent[0:1]
+        keys = self._rows.reserved["_sort_keys_copy"]
+        self._pool.launch(_store_sorted_keys, self._pool.launch_rows(), inputs=[keys, sort_keys, live], extent=live)
 
     def sort_full(
         self,
-        sort_keys: wp.array,
+        keys: wp.array,
         contact_count: wp.array,
         *,
+        shape_body: wp.array,
+        body_code: wp.array,
         shape0: wp.array,
         shape1: wp.array,
         point0: wp.array,
@@ -407,13 +479,19 @@ class ContactSorter:
         device: Devicelike = None,
         limit: int = -1,
     ) -> None:
-        """Sort contacts written through the full collide.py writer.
+        """Sort contacts written through the full collide.py writer by body pair, then by contact key: the
+        order every reader of a pipeline's contacts sees.
 
-        Fully graph-capturable — no host synchronization.
+        A body pair's contacts then lie together, world after world (:func:`body_pair_codes`), and the order is a
+        function of the contacts' geometry alone, the keys being unique in a pass. Fully graph-capturable: no host
+        synchronization.
 
         Args:
-            sort_keys: Per-contact int64 sort keys (filled by the writer).
+            keys: Per-contact int64 contact keys (filled by the writer, unique in a pass), gathered with the
+                contacts.
             contact_count: Single-element int array with the active contact count.
+            shape_body: Each shape's body, -1 for a static shape.
+            body_code: Each body's code (:func:`body_pair_codes`).
             shape0: int array of first shape indices.
             shape1: int array of second shape indices.
             point0: vec3 body-frame contact points on shape 0.
@@ -485,15 +563,23 @@ class ContactSorter:
         data.match_index_buf = self._full_match_index_buf
         data.has_shape_props = 1 if has_props else 0
         data.has_match_index = 1 if has_match else 0
+        data.key = keys
+        # The keys break ties from the sorter's own copy, over its whole reservation: the chunk sort's tile loads
+        # are bounded by the array's shape, and a capture's replay may sort more rows than it was captured with.
+        data.key_buf = self._rows.reserved["_full_key_buf"]
+        data.shape_body = shape_body
+        data.body_code = body_code
+        data.pair_stride = wp.int64(pair_key_stride(body_code.shape[0], shape_body.shape[0]))
 
-        self._sort(_backup_full_kernel, _gather_full_kernel, data, sort_keys, contact_count, limit)
+        self._sort(_backup_full_kernel, (), _gather_full_kernel, data, contact_count, limit, ties=data.key_buf)
 
-    def _sort(self, backup, gather, data, sort_keys, contact_count, limit=-1):
-        """Back up the live contacts, sort their keys, and gather them in key order, the keys with them.
+    def _sort(self, backup, backup_inputs, gather, data, contact_count, limit=-1, ties=None):
+        """Back up the live contacts with their sort keys (``backup``), sort them, and gather them in that order.
 
         The live contacts are published first, at most the ready rows, and
         every launch follows them; in a capture whose launches bind, each replay
-        sorts the contacts of that replay.
+        sorts the contacts of that replay. With ``ties`` (an int64 per contact, unique), equal sort keys order by
+        tie.
         """
         pool = self._pool
         publish_live(pool, contact_count, self._extent, limit)
@@ -501,7 +587,7 @@ class ContactSorter:
         rows = pool.launch_rows()
         keys = self._rows.reserved["_sort_keys_copy"]
         indices = self._rows.reserved["_sort_indices"]
-        pool.launch(backup, rows, inputs=[data, live, sort_keys, keys, indices], extent=live)
+        pool.launch(backup, rows, inputs=[data, live, *backup_inputs, keys, indices], extent=live)
         blocks, merges, merge_threads = sort_grid(pool.device, rows)
         launch_live_sort(
             pool,
@@ -512,14 +598,15 @@ class ContactSorter:
             blocks=blocks,
             merges=merges,
             merge_threads=merge_threads,
-            slot_keys=False,
+            slot_keys=ties is not None,
+            ties=ties,
         )
         pool.launch(gather, rows, inputs=[data, indices, live], extent=live)
-        pool.launch(_store_sorted_keys, rows, inputs=[keys, sort_keys, live], extent=live)
 
     @property
     def sorted_keys_view(self) -> wp.array:
-        """View of sorted keys (first half of internal buffer).
+        """View of sorted keys (first half of internal buffer): the contact keys after :meth:`sort_simple`, the
+        body-pair keys (:func:`contact_pair_key`) after :meth:`sort_full`.
 
         Valid only after :meth:`sort_simple` or :meth:`sort_full` returns.
         The array has ``capacity`` elements; active entries are

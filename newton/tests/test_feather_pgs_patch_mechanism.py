@@ -50,7 +50,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.core.live_sort import MAX_MERGES, SORT_CHUNK
+from newton._src.geometry.contact_sort import body_pair_codes
 from newton._src.solvers.feather_pgs import friction_patches
 from newton._src.solvers.feather_pgs.friction_patches import (
     _BUILD_FIELDS,
@@ -63,7 +63,7 @@ from newton._src.solvers.feather_pgs.friction_patches import (
 )
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 from newton.tests.feather_pgs_law_harness import row_lines
-from newton.tests.feather_pgs_patch_reference import SENTINEL, ReferencePatches, pair_codes, store_frame
+from newton.tests.feather_pgs_patch_reference import SENTINEL, ReferencePatches, frame_order, pair_codes, store_frame
 from newton.tests.feather_pgs_patch_reference import link_patch_rows as reference_link_patch_rows
 from newton.tests.test_feather_pgs_mixed_tree_free_body import _build as _arm_over_box
 
@@ -282,7 +282,21 @@ class _Scene:
             self.contacts.rigid_contact_margin0.assign(margin[:, 0])
             self.contacts.rigid_contact_margin1.assign(margin[:, 1])
         self.contacts.rigid_contact_count.assign([count])
+        _pipeline_order(self.model, self.contacts, count)
         return count
+
+
+def _pipeline_order(model, contacts, live):
+    """Put the ``live`` contacts in the collision pipeline's order, by body pair then key (``rigid_contact_key``, each
+    written row's index here), as every pass leaves them (:meth:`.ContactSorter.sort_full`)."""
+    order = frame_order(model, contacts)[:live]
+    for name in _CONTACT_FIELDS:
+        if name == "rigid_contact_key":
+            continue
+        array = getattr(contacts, name)
+        values = array.numpy()
+        values[:live] = values[order]
+        array.assign(values)
 
 
 def _pair(scene, capacity):
@@ -292,16 +306,15 @@ def _pair(scene, capacity):
 
 
 def _set_threads(patches, threads):
-    """Stride ``patches``' light launches and builds with ``threads``; the live sort's merges stride as builds."""
+    """Stride ``patches``' light launches and builds with ``threads``."""
     patches.threads, patches.build_threads = threads
-    patches.merge_threads = patches.build_threads
 
 
 def _twin(patches, scene):
     """Return a second patch state on another grid, which CUDA tests step alongside ``patches``, or None on the CPU.
 
     The twin runs the module under test on the same inputs, with
-    ``_TWIN_THREADS`` and one sort block, so it must match ``patches`` bitwise
+    ``_TWIN_THREADS``, so it must match ``patches`` bitwise
     (:func:`assert_same_state`): a race or any other grid-dependent result makes
     them differ, however small. The CPU compares with the reference bitwise.
     """
@@ -309,8 +322,6 @@ def _twin(patches, scene):
         return None
     twin = _FrictionPatchState(scene.model, patches.capacity, wp.zeros_like(patches.view.phi))
     _set_threads(twin, _TWIN_THREADS)
-    twin.sort_blocks = 1
-    twin.live_sort = patches.live_sort
     return twin
 
 
@@ -572,10 +583,10 @@ def assert_same_state(twin, patches, context="", records=True):
         )
     names = ["previous_world", "previous_q", "stored", "built"]
     if records:
-        names += ["extent", "sorted_frame"]
+        names += ["extent", "built_frame"]
     for name in names:
         np.testing.assert_array_equal(getattr(twin, name).numpy(), getattr(patches, name).numpy(), f"{context} {name}")
-    visits = friction_patches._SORT_EXTENT
+    visits = friction_patches._BUILD_EXTENT
     np.testing.assert_array_equal(twin.extent.numpy()[:visits], patches.extent.numpy()[:visits], f"{context} extent")
 
 
@@ -733,12 +744,11 @@ def _gates(scene, rng):
 
 
 def run_reference_differential(
-    device, seed, *, worlds=3, bodies=4, contacts=96, capacity=128, threads=None, live_sort=None, plan=_PLAN
+    device, seed, *, worlds=3, bodies=4, contacts=96, capacity=128, threads=None, plan=_PLAN
 ):
     """Step a patch state and the reference through ``plan``, comparing after every launch group.
 
-    ``live_sort`` overrides the capacity's choice of pair sort. On CUDA a twin
-    steps alongside (:func:`_twin`). Returns counts of carried anchors, of
+    On CUDA a twin steps alongside (:func:`_twin`). Returns counts of carried anchors, of
     anchors released by finishing and of stored anchors past an unstored
     build's live count, and the largest live count, so callers can require the
     sequence to exercise them.
@@ -748,8 +758,6 @@ def run_reference_differential(
     patches, reference = _pair(scene, capacity)
     if threads is not None:
         _set_threads(patches, threads)
-    if live_sort is not None:
-        patches.live_sort = live_sort
     twin = _twin(patches, scene)
     live_states = [state for state in (patches, twin) if state is not None]
     states = [*live_states, reference]
@@ -862,41 +870,6 @@ class TestPatchSortKeys(unittest.TestCase):
         np.testing.assert_array_equal(values.numpy()[:count], expected)
         np.testing.assert_array_equal(array.numpy()[:count], keys[expected])
 
-    def test_compressed_keys_keep_the_reference_order(self):
-        """Sort compressed pair keys into the shifted-key permutation and build identical frames."""
-        for seed, capacity in ((0, 96), (1, 128), (2, 160)):
-            with self.subTest(seed=seed, capacity=capacity):
-                scene = _Scene("cpu", seed)
-                patches, reference = _pair(scene, capacity)
-                patches.live_sort = False
-                self.assertLessEqual(patches.key_bits, 62)
-                self.assertLess(patches.key_bits, 64 - 8, "the sort must skip at least one byte")
-                carried = 0
-                for step, mode in enumerate(
-                    ("live", "live", "live", "sparse", "live", "empty", "live", "overflow", "live", "live")
-                ):
-                    scene.move()
-                    live = scene.frame(mode)
-                    for state in (patches, reference):
-                        state.build(scene.model, scene.state, scene.contacts)
-                    assert_same_patches(patches, reference, live, f"step {step} build")
-                    carried += int(np.count_nonzero(patches.current.source.numpy()[:live] >= 0))
-                    store_frame(patches, scene.state)
-                    reference.store(scene.state)
-                    assert_same_patches(patches, reference, live, f"step {step} store")
-                    assert_empty_tail(patches, f"step {step} store")
-                self.assertGreater(carried, 0, "the frames must carry anchor history")
-
-    def test_key_stride_fits_a_kernel_int(self):
-        """Admit pair-key strides up to the largest 32-bit int, the type _prepare receives them as."""
-        self.assertEqual(friction_patches._pair_key_layout(12, 18), (32, 10))
-        self.assertEqual(friction_patches._pair_key_layout(2**31 - 3, 0), (2**31 - 1, 62))
-        self.assertEqual(friction_patches._pair_key_layout(2**30, 2**30 - 3), (2**31 - 1, 62))
-        for bodies, shapes in ((2**31 - 2, 0), (0, 2**31 - 2), (2**31, 2**31)):
-            with self.subTest(bodies=bodies, shapes=shapes):
-                with self.assertRaisesRegex(ValueError, r"at most 2\*\*31 - 3 bodies and shapes"):
-                    friction_patches._pair_key_layout(bodies, shapes)
-
     def test_build_rejects_another_model(self):
         """Refuse body poses or shapes of another model than the one the pair keys were sized for."""
         scene = _Scene("cpu", 0)
@@ -912,16 +885,14 @@ class TestPatchSortKeys(unittest.TestCase):
         patches.build(scene.model, scene.state, scene.contacts)
 
     def test_shapeless_pair_ties_the_sentinel_bits(self):
-        """Keep a pair whose key equals the sentinel's sorted bits ahead of the empty slots, with either sort."""
+        """Keep a pair whose key has every bit of the stride's square below it ahead of the empty slots."""
         devices = ["cpu"] + (["cuda:0"] if wp.is_cuda_available() else [])
-        for device, live_sort in itertools.product(devices, (False, True)):
-            with self.subTest(device=device, live_sort=live_sort):
+        for device in devices:
+            with self.subTest(device=device):
                 scene = _Scene(device, 5, worlds=1, bodies=4, contacts=16)
                 stride = scene.body_count + len(scene.shape_body) + 2
                 self.assertEqual(stride & (stride - 1), 0, "the fixture needs a power-of-two key stride")
                 patches, reference = _pair(scene, 24)
-                patches.live_sort = live_sort
-                self.assertEqual(stride * stride - 1, (1 << patches.key_bits) - 1)
                 scene.active[:] = False
                 scene.active[-1] = True  # The (-1, -1) pair has the largest key, stride**2 - 1.
                 scene.active[0] = True
@@ -938,16 +909,15 @@ class TestPatchLiveExtent(unittest.TestCase):
     def test_live_extent_matches_the_full_capacity_reference(self):
         """Match the full-capacity mechanism bitwise through rising, dropping, overflowing and missing frames."""
         totals = {"carried": 0, "released": 0, "unstored": 0}
-        # Small capacities take the live sort; the radix sort runs where forced.
-        for seed, contacts, capacity, threads, live_sort in (
-            (0, 96, 96, None, None),
-            (1, 96, 128, (7, 5), False),
-            (2, 64, 160, (1, 3), None),
-            (3, 128, 128, (32, 64), False),
+        for seed, contacts, capacity, threads in (
+            (0, 96, 96, None),
+            (1, 96, 128, (7, 5)),
+            (2, 64, 160, (1, 3)),
+            (3, 128, 128, (32, 64)),
         ):
-            with self.subTest(seed=seed, capacity=capacity, threads=threads, live_sort=live_sort):
+            with self.subTest(seed=seed, capacity=capacity, threads=threads):
                 coverage = run_reference_differential(
-                    "cpu", seed, contacts=contacts, capacity=capacity, threads=threads, live_sort=live_sort
+                    "cpu", seed, contacts=contacts, capacity=capacity, threads=threads
                 )
                 for name in totals:
                     totals[name] += coverage[name]
@@ -977,7 +947,7 @@ class TestPatchLiveExtent(unittest.TestCase):
     @unittest.skipUnless(wp.is_cuda_available(), "graph capture needs CUDA")
     def test_graph_replay_follows_changing_counts(self):
         """Replay one captured patch step over rising, empty, overflowing and sharply dropping counts."""
-        run_graph_replay("cuda:0", live_sort=False)
+        run_graph_replay("cuda:0")
 
 
 def run_unstored_builds(device, seed, *, worlds=3, contacts=96, capacity=96, threads=None):
@@ -1002,7 +972,7 @@ def run_unstored_builds(device, seed, *, worlds=3, contacts=96, capacity=96, thr
         assert_empty_tail(patches, mode)
 
 
-def run_graph_replay(device, *, worlds=32, contacts=1536, capacity=2048, live_sort=None):
+def run_graph_replay(device, *, worlds=32, contacts=1536, capacity=2048):
     """Capture one patch step, replay it over changing counts, and compare each replay with the reference.
 
     On CUDA a twin steps eagerly alongside the replays (:func:`_twin`).
@@ -1010,8 +980,6 @@ def run_graph_replay(device, *, worlds=32, contacts=1536, capacity=2048, live_so
     rng = np.random.default_rng(7)
     scene = _Scene(device, 21, worlds=worlds, contacts=contacts)
     patches, reference = _pair(scene, capacity)
-    if live_sort is not None:
-        patches.live_sort = live_sort
     twin = _twin(patches, scene)
     rows = _Rows(scene, capacity, rng)
     dt = 1.0 / 240.0
@@ -1170,138 +1138,35 @@ class TestPatchSolverRoutes(unittest.TestCase):
                     self.assertNotIn(1, paths, "a single free body keeps no run of its own")
 
 
-def _fill_sort_case(patches, live, rng, codes):
-    """Write a frame as _prepare leaves it: ``live`` pair keys drawn from ``codes``, then empty slots.
-
-    The second halves hold unrelated values, as the radix sort's scratch would.
-    Returns the first half of the keys.
-    """
-    n = patches.capacity
-    keys = np.full(2 * n, SENTINEL, dtype=np.int64)
-    keys[:live] = rng.choice(codes, size=live)
-    keys[n:] = rng.integers(0, 1 << 40, size=n)
-    indices = np.concatenate((np.arange(n), rng.integers(0, n, size=n))).astype(np.int32)
-    patches.current.keys.assign(keys)
-    patches.current.indices.assign(indices)
-    patches.extent.assign(_patch_extent(live, live, patches.extent.shape[0]))
-    return keys[:n]
-
-
-def _patch_extent(end, live, size):
-    """Return the patch extent a prepare of a frame to sort publishes: the slots to visit, the live slots, then the
-    live sort's extent."""
-    extent = np.zeros(size, dtype=np.int32)
-    rounds = 0
-    while (int(SORT_CHUNK) << rounds) < live and rounds < int(MAX_MERGES):
-        rounds += 1
-    extent[:4] = end, live, live, -(-live // int(SORT_CHUNK))
-    extent[4 : 4 + rounds] = live
-    return extent
-
-
-def run_live_sort_cases(test, device, capacities, extra_counts=(), merges=None):
-    """Sort live prefixes of several sizes by (pair key, contact key) and compare with numpy's lexsort, and their keys
-    with the radix sort's.
-
-    ``merges`` launches that many merge rounds, fewer than the live slots may need, as a replay past its capture's rows.
-    """
-    rng = np.random.default_rng(17)
-    scene = _Scene(device, 0)
-    # Pair codes of several worlds, including the smallest and largest ones a
-    # model with 2**25 + 1 bodies and shapes can produce; few codes, many repeats.
-    stride = (1 << 25) + 3
-    first = np.concatenate(([1, 2, stride - 2, stride - 1], rng.integers(1, stride, size=40)))
-    second = np.concatenate(([stride - 1, 3, stride - 1, stride - 1], rng.integers(1, stride, size=40)))
-    codes = np.minimum(first, second).astype(np.int64) * stride + np.maximum(first, second)
-    test.assertLess(int(codes.max()), 1 << 51)
-    for capacity in capacities:
-        patches = _FrictionPatchState(scene.model, capacity, wp.zeros(capacity, dtype=wp.vec2, device=device))
-        patches.merges = patches.merges if merges is None else merges
-        counts = {0, 1, 2047, 2048, 2049, capacity // 2, capacity - 1, capacity, *extra_counts}
-        for live in sorted(count for count in counts if 0 <= count <= capacity):
-            with test.subTest(capacity=capacity, live=live):
-                keys = _fill_sort_case(patches, live, rng, codes)
-                # Each contact's key, unique in its pass and in no relation to its slot.
-                ties = rng.permutation(capacity).astype(np.int64) * 7919 + 3
-                # CPU arrays expose their memory; copies keep what the slots held.
-                before = (patches.current.keys.numpy().copy(), patches.current.indices.numpy().copy())
-                patches._sort_live(wp.array(ties, dtype=wp.int64, device=device))
-                if live == 0:
-                    np.testing.assert_array_equal(patches.current.keys.numpy(), before[0], "no slot changes")
-                    np.testing.assert_array_equal(patches.current.indices.numpy(), before[1], "no slot changes")
-                sorted_keys = patches.current.keys.numpy()[:capacity]
-                sorted_indices = patches.current.indices.numpy()[:capacity]
-                order = np.lexsort((ties[:live], keys[:live]))
-                np.testing.assert_array_equal(sorted_indices[:live], order)
-                np.testing.assert_array_equal(sorted_keys[:live], keys[order])
-                np.testing.assert_array_equal(sorted_indices[live:], np.arange(live, capacity), "empty slots stay")
-                radix_keys = wp.array(np.tile(keys, 2), dtype=wp.int64, device=device)
-                radix_indices = wp.array(np.tile(np.arange(capacity, dtype=np.int32), 2), dtype=int, device=device)
-                wp.utils.radix_sort_pairs(radix_keys, radix_indices, capacity)
-                np.testing.assert_array_equal(sorted_keys, radix_keys.numpy()[:capacity])
-
-
-class TestPatchLiveSort(unittest.TestCase):
-    def test_live_sort_matches_stable_argsort_and_radix_sort(self):
-        """Sort the live prefix by (pair key, contact key), from no contacts, which no slot sees, through merges."""
-        run_live_sort_cases(self, "cpu", (128, 2047, 3000, 4096, 10000, 16_384))
-
-    def test_key_width_selects_the_live_sort(self):
-        """Sort only the live prefix at every capacity while the pair keys leave room for the slot bits."""
-        scene = _Scene("cpu", 0)
-        phi = wp.zeros(96, dtype=wp.vec2, device="cpu")
-        self.assertTrue(_FrictionPatchState(scene.model, 96, phi).live_sort)
-        self.assertTrue(_FrictionPatchState(scene.model, 64, phi[:64]).live_sort)
-        self.assertTrue(friction_patches._uses_live_sort(51))
-        # Pair keys of 52 bits and more fall back to the radix sort: their 11-bit
-        # slot would reach the chunk keys' pad bit.
-        self.assertFalse(friction_patches._uses_live_sort(52))
-
-    def test_live_sort_builds_match_the_full_capacity_reference(self):
-        """Build, link, seed, finish and store bitwise as the reference with the live sort."""
+class TestPatchManyContacts(unittest.TestCase):
+    def test_builds_match_the_full_capacity_reference(self):
+        """Build, link, seed, finish and store bitwise as the reference, also past a thousand live contacts."""
         for seed, threads in ((4, None), (5, (7, 5))):
             with self.subTest(seed=seed, threads=threads):
-                run_reference_differential("cpu", seed, capacity=160, threads=threads, live_sort=True)
-        # More than one chunk of live contacts runs the merges.
+                run_reference_differential("cpu", seed, capacity=160, threads=threads)
         plan = ("grow", "grow", "grow", "live", "sparse", "grow", "overflow", "live", "rebuild", "masked", "live")
         coverage = run_reference_differential(
-            "cpu", 6, worlds=110, contacts=4096, capacity=4600, threads=(97, 61), live_sort=True, plan=plan
+            "cpu", 6, worlds=110, contacts=4096, capacity=4600, threads=(97, 61), plan=plan
         )
         self.assertGreater(coverage["live"], 2048)
 
-    def test_live_sort_past_its_merge_rounds_joins_every_run_left(self):
-        """Sort exactly with fewer merge rounds than the live slots need: the last round joins every run left."""
-        for merges in (1, 2):
-            run_live_sort_cases(self, "cpu", (16_384,), (6000, 9000), merges=merges)
-
-    @unittest.skipUnless(wp.is_cuda_available(), "the device sort needs CUDA")
-    def test_live_sort_matches_on_the_device(self):
-        """Sort live prefixes on the device, from capacities below one chunk to hundreds of chunks and nine merges."""
-        capacities = (128, 3000, 10000, 16_384, 1_000_000)
-        run_live_sort_cases(self, "cuda:0", capacities, (300_000,))
-        run_live_sort_cases(self, "cuda:0", (16_384,), (6000, 9000), merges=1)
-        run_live_sort_cases(self, "cuda:0", (1_000_000,), (300_000,), merges=3)
-
     @unittest.skipUnless(wp.is_cuda_available(), "multi-block grids need CUDA")
-    def test_live_sort_builds_match_on_many_blocks(self):
-        """Match the reference with the live sort on multi-block grids, through merges and graph replay."""
-        run_reference_differential("cuda:0", 12, worlds=160, contacts=8192, capacity=8192, live_sort=True)
-        run_graph_replay("cuda:0", worlds=160, contacts=8192, capacity=8192, live_sort=True)
+    def test_builds_match_on_many_blocks(self):
+        """Match the reference on multi-block grids, and through graph replay."""
+        run_reference_differential("cuda:0", 12, worlds=160, contacts=8192, capacity=8192)
+        run_graph_replay("cuda:0", worlds=160, contacts=8192, capacity=8192)
 
 
-def _shape(capacity, sms, *, light, build, block, merge=4, sort=2):
+def _shape(capacity, sms, *, light, build, block):
     """Return the launch attributes of a patch state with ``capacity`` slots on ``sms`` SMs.
 
-    ``light``, ``build`` and ``merge`` count 256-thread blocks per SM of the light
-    launches, ``_build`` and ``_merge_runs``, ``block`` is ``_build``'s block size,
-    and ``sort`` counts the live sort's chunk blocks per SM.
+    ``light`` and ``build`` count 256-thread blocks per SM of the light launches and ``_build``, and ``block`` is
+    ``_build``'s block size.
     """
     return {
         "threads": max(1, min(capacity, light * sms * 256)),
         "build_threads": max(1, min(capacity, build * sms * 256)),
         "build_block_dim": block,
-        "merge_threads": max(1, min(capacity, merge * sms * 256)),
-        "sort_blocks": max(1, min(-(-capacity // 2048), sort * sms)),
     }
 
 
@@ -1310,7 +1175,7 @@ def _shape(capacity, sms, *, light, build, block, merge=4, sort=2):
 _FORMER_SHAPE = {"light": 2, "build": 4, "block": 256}
 _SHAPE = {"light": 6, "build": 8, "block": 32}
 # An odd shape, far below the live counts, on any device.
-_ODD_SHAPE = {"threads": 7, "build_threads": 5, "build_block_dim": 32, "merge_threads": 3, "sort_blocks": 1}
+_ODD_SHAPE = {"threads": 7, "build_threads": 5, "build_block_dim": 32}
 
 # Collision frames of the launch-shape differential and the substeps that solve
 # each: "grow" activates more pairs, "sparse" keeps one pair, "empty" leaves no
@@ -1422,6 +1287,7 @@ class _TiledScene:
             tiled[:live] = values
             getattr(self.contacts, f"rigid_contact_{name}").assign(tiled)
         self.contacts.rigid_contact_count.assign([live])
+        _pipeline_order(self.model, self.contacts, live)
         return live
 
 
@@ -1488,14 +1354,12 @@ class _WideRows(_Rows):
         self.live = live
 
 
-def run_launch_shapes(
-    device, seed, shapes, *, worlds=3, contacts=96, capacity=128, live_sort=None, copies=1, stages=None
-):
+def run_launch_shapes(device, seed, shapes, *, worlds=3, contacts=96, capacity=128, copies=1, stages=None):
     """Step one patch state per launch shape on identical inputs; every array must match the first state's bitwise.
 
     ``shapes`` holds attribute overrides (:func:`_shape`), ``None`` for the
     constructor's own shape. Each frame is built, linked, seeded and finished
-    over its substeps, whose later builds keep its pairs. After each launch group every array of every state, sort halves and scratch
+    over its substeps, whose later builds keep its pairs. After each launch group every array of every state, scratch
     included, and every row array must equal the first state's (frames follow
     ``_SHAPE_PLAN``); ``stages`` limits the comparisons to the named launch
     groups ("build", "link", "finish", "store" and "reset"). With
@@ -1517,8 +1381,6 @@ def run_launch_shapes(
         state = _FrictionPatchState(scene.model, capacity, phi)
         for name, value in (shape or {}).items():
             setattr(state, name, value)
-        if live_sort is not None:
-            state.live_sort = live_sort
         states.append(state)
     first = states[0]
     coverage = {"live": 0, "carried": 0}
@@ -1627,7 +1489,6 @@ class TestPatchLaunchShapes(unittest.TestCase):
                 # The CPU counts as one SM.
                 expected = _shape(capacity, 1, **_SHAPE)
                 self.assertEqual({name: getattr(state, name) for name in expected}, expected)
-        state.live_sort = True
         launched = set()
         original = wp.launch
 
@@ -1638,14 +1499,13 @@ class TestPatchLaunchShapes(unittest.TestCase):
             launched.add((kernel.key, kwargs["dim"], stride, kwargs.get("block_dim")))
             return original(kernel, **kwargs)
 
-        self.assertGreater(scene.frame(), 2048, "more than one chunk of live contacts runs the merges")
+        self.assertGreater(scene.frame(), 2048, "many live contacts")
         with mock.patch.object(wp, "launch", record):
             state.build(scene.model, scene.state, scene.contacts)
         self.assertEqual(
             launched,
             {
                 ("_prepare", 1536, 1536, None),
-                ("_merge_runs", 1024, 1024, None),
                 ("_prepare_contacts", 1536, 1536, None),
                 ("_build", 2048, 2048, 32),
                 ("_place", 2048, 2048, 32),
@@ -1653,19 +1513,15 @@ class TestPatchLaunchShapes(unittest.TestCase):
         )
 
     def test_launch_shapes_match_bitwise(self):
-        """Build, link, seed, finish, store and reset bitwise on every grid, with each sort.
+        """Build, link, seed, finish, store and reset bitwise on every grid.
 
         CPU launches run one thread at a time, so they check how each grid
-        strides over the slots; the device tests run each sort as well.
+        strides over the slots.
         """
         shapes = (None, _shape(4600, 1, **_FORMER_SHAPE), _ODD_SHAPE)
-        for live_sort in (False, True):
-            with self.subTest(live_sort=live_sort):
-                coverage = run_launch_shapes(
-                    "cpu", 2, shapes, worlds=110, contacts=4096, capacity=4600, live_sort=live_sort
-                )
-                self.assertGreater(coverage["live"], 2048, "the live sort must merge chunks")
-                self.assertGreater(coverage["carried"], 0, "the frames must carry anchor history")
+        coverage = run_launch_shapes("cpu", 2, shapes, worlds=110, contacts=4096, capacity=4600)
+        self.assertGreater(coverage["live"], 2048, "many live contacts")
+        self.assertGreater(coverage["carried"], 0, "the frames must carry anchor history")
 
     @unittest.skipUnless(wp.is_cuda_available(), "launch shapes need CUDA")
     def test_launch_shapes_match_bitwise_on_the_device(self):
@@ -1687,13 +1543,9 @@ class TestPatchLaunchShapes(unittest.TestCase):
             _ODD_SHAPE,
         )
         with _patch_variants_compiled_here(device):
-            for live_sort in (False, True):
-                with self.subTest(live_sort=live_sort):
-                    coverage = run_launch_shapes(
-                        device, 3, shapes, worlds=110, contacts=4096, capacity=capacity, live_sort=live_sort
-                    )
-                    self.assertGreater(coverage["live"], 2048, "the live sort must merge chunks")
-                    self.assertGreater(coverage["carried"], 0, "the frames must carry anchor history")
+            coverage = run_launch_shapes(device, 3, shapes, worlds=110, contacts=4096, capacity=capacity)
+            self.assertGreater(coverage["live"], 2048, "many live contacts")
+            self.assertGreater(coverage["carried"], 0, "the frames must carry anchor history")
         state = _FrictionPatchState(_Scene(device, 0).model, capacity, wp.zeros(capacity, dtype=wp.vec2, device=device))
         self.assertEqual({name: getattr(state, name) for name in default}, default)
 
@@ -1895,8 +1747,8 @@ _CONTACT_FIELDS = (
 )
 
 
-def _swapped_stream(scene, live, rng, stream=None):
-    """Return another contact stream of equal generation and count, holding the live contacts reordered.
+def _copied_stream(scene, stream=None):
+    """Return another contact stream of equal generation, count and contacts, in the pipeline's order.
 
     ``stream`` receives the copy in place, for a graph captured over it.
     """
@@ -1905,9 +1757,8 @@ def _swapped_stream(scene, live, rng, stream=None):
         stream = SimpleNamespace(
             rigid_contact_max=scene.capacity, **{name: wp.empty_like(getattr(scene.contacts, name)) for name in names}
         )
-    order = np.concatenate((rng.permutation(live), np.arange(live, scene.capacity)))
     for name in _CONTACT_FIELDS:
-        getattr(stream, name).assign(getattr(scene.contacts, name).numpy()[order])
+        getattr(stream, name).assign(getattr(scene.contacts, name).numpy())
     stream.contact_generation.assign(scene.contacts.contact_generation)
     stream.rigid_contact_count.assign(scene.contacts.rigid_contact_count)
     return stream
@@ -1923,13 +1774,13 @@ def _frame_identity(patches, contacts):
     )
 
 
-def _assert_record(test, patches, sorted_frame, context):
-    """Require the device record to name ``sorted_frame``, or to hold the sentinel generation for ``None``."""
-    record = patches.sorted_frame.numpy()
-    if sorted_frame is None:
+def _assert_record(test, patches, built_frame, context):
+    """Require the device record to name ``built_frame``, or to hold the sentinel generation for ``None``."""
+    record = patches.built_frame.numpy()
+    if built_frame is None:
         test.assertEqual(int(record[0]), -1, f"{context} record")
     else:
-        np.testing.assert_array_equal(record, sorted_frame[1:] + sorted_frame[:1], f"{context} record")
+        np.testing.assert_array_equal(record, built_frame[1:] + built_frame[:1], f"{context} record")
 
 
 @wp.kernel(enable_backward=False)
@@ -1952,11 +1803,11 @@ def _advance_contact_generation(generation: wp.array[wp.int32]):
 
 
 def _decision(extent):
-    """Return how the build that published ``extent`` prepared its frame: "sort", "keep", or "empty" when no contact
-    is live, where keeping and sorting are one."""
+    """Return how the build that published ``extent`` prepared its frame: "sort" (a new frame, its keys written),
+    "keep", or "empty" when no contact is live, where keeping and a new frame are one."""
     if extent[1] == 0:
         return "empty"
-    return "sort" if extent[friction_patches._SORT_EXTENT] > 0 else "keep"
+    return "keep" if extent[friction_patches._KEPT_EXTENT] != 0 else "sort"
 
 
 def _decisions(patches):
@@ -1973,12 +1824,12 @@ def _decisions(patches):
 
 
 @wp.kernel(enable_backward=False)
-def _record_decision(extent: wp.array[int], sort: int, decisions: wp.array[wp.int32], slot: int):
-    """Write how the last build prepared its frame in ``decisions[slot]``: 1 sorted, 0 kept, -1 no live contact."""
+def _record_decision(extent: wp.array[int], kept: int, decisions: wp.array[wp.int32], slot: int):
+    """Write how the last build prepared its frame in ``decisions[slot]``: 1 new, 0 kept, -1 no live contact."""
     decision = wp.int32(-1)
     if extent[1] > 0:
         decision = wp.int32(0)
-        if extent[sort] > 0:
+        if extent[kept] == 0:
             decision = wp.int32(1)
     decisions[slot] = decision
 
@@ -1996,11 +1847,11 @@ class _DecisionProbe:
         self.decisions = wp.full(slots, -2, dtype=wp.int32, device=patches.device)
 
     def mark(self, slot):
-        sort = int(friction_patches._SORT_EXTENT)
+        kept = int(friction_patches._KEPT_EXTENT)
         wp.launch(
             _record_decision,
             dim=1,
-            inputs=[self.patches.extent, sort, self.decisions, slot],
+            inputs=[self.patches.extent, kept, self.decisions, slot],
             device=self.patches.device,
         )
 
@@ -2072,7 +1923,7 @@ class TestPatchFrameReuse(unittest.TestCase):
                 state.build(scene.model, scene.state, anonymous)
             assert_same_state(patches, plain, f"build {build}", records=False)
         self.assertEqual(decisions, ["sort"] * 3)
-        self.assertEqual(int(patches.sorted_frame.numpy()[0]), -1, "the record names no stream's generation")
+        self.assertEqual(int(patches.built_frame.numpy()[0]), -1, "the record names no stream's generation")
 
 
 # Build sequences: ("build", stream) builds a stream's frame, ("write", stream)
@@ -2148,13 +1999,12 @@ class TestHeldRegions(unittest.TestCase):
         self.assertGreater(live, 0)
         assert_same_state(held, plain, "second build without a store", records=False)
 
-    def test_rewritten_points_wait_for_a_new_frame(self):
-        """Keep a held frame's contacts and regions when a writer moves contact points under one generation, until it
-        forgets.
+    def test_rewritten_points_keep_the_held_regions(self):
+        """Keep a held frame's regions when a writer moves contact points under one generation, until it forgets.
 
-        The frame reads its contacts' records once, at its first build: their centres and regions stay the frame's
-        until the writer advances the generation or forgets the frame, and the next build then groups the contacts
-        as a build that sorts does.
+        The frame reads its contacts' points at every build, and makes its regions at its first: they stay the
+        frame's until the writer advances the generation or forgets the frame, and the next build then groups the
+        contacts as a new frame's build does.
         """
         scene, plain, held, decisions = self._states(63)
         rng = np.random.default_rng(63)
@@ -2172,8 +2022,10 @@ class TestHeldRegions(unittest.TestCase):
             state.build(scene.model, scene.state, scene.contacts)
         self.assertEqual(decisions[-1], "keep")
         np.testing.assert_array_equal(held.current.owner.numpy()[:live], owner, "the held frame's regions")
-        np.testing.assert_array_equal(held.current.center.numpy()[:live], center, "the frame's contacts")
-        self.assertTrue(np.any(plain.current.center.numpy()[:live] != center), "a build that sorts reads the points")
+        np.testing.assert_array_equal(
+            held.current.center.numpy()[:live], plain.current.center.numpy()[:live], "every build reads the points"
+        )
+        self.assertTrue(np.any(plain.current.center.numpy()[:live] != center), "the points moved")
         sorted_owner = plain.current.owner.numpy()[:live].copy()
         self.assertTrue(np.any(sorted_owner != owner), "the rewrite must regroup the contacts of a build that sorts")
         held.forget_frame()
@@ -2206,13 +2058,12 @@ class TestPatchFrameModes(unittest.TestCase):
         Both streams hold the same live contacts at the same generation and
         count, so only the stream identity tells them apart.
         """
-        rng = np.random.default_rng(45)
         for name, (events, expected) in _DECISION_PLANS.items():
             with self.subTest(name=name):
                 scene = _Scene("cpu", 45)
                 scene.active[:] = True
-                live = scene.frame()
-                streams = {"a": _swapped_stream(scene, live, rng), "b": _swapped_stream(scene, live, rng)}
+                scene.frame()
+                streams = {"a": _copied_stream(scene), "b": _copied_stream(scene)}
                 plain, patches = _recording_pair(scene, 128)
                 decisions = _decisions(patches)
                 for index, event in enumerate(events):
@@ -2249,12 +2100,11 @@ class TestPatchFrameModes(unittest.TestCase):
         build that kept its pairs after either would group contacts by stale
         pairs.
         """
-        rng = np.random.default_rng(46)
         scene = _Scene("cpu", 46)
         scene.active[:] = True
-        live = scene.frame()
-        stream = _swapped_stream(scene, live, rng)
-        other = _swapped_stream(scene, live, rng)
+        scene.frame()
+        stream = _copied_stream(scene)
+        other = _copied_stream(scene)
         anonymous = SimpleNamespace(**{k: v for k, v in vars(other).items() if k != "contact_generation"})
         sources = {
             "stream": lambda: stream,
@@ -2265,7 +2115,7 @@ class TestPatchFrameModes(unittest.TestCase):
         decisions = _decisions(patches)
         for event in ("stream", "wrapper", "write", "wrapper", "stream", "anonymous", "wrapper", "wrapper"):
             if event == "write":
-                _swapped_stream(scene, live, rng, stream=stream)
+                _copied_stream(scene, stream=stream)
                 wp.launch(_advance_contact_generation, dim=1, inputs=[stream.contact_generation], device="cpu")
                 continue
             contacts = sources[event]()
@@ -2347,11 +2197,12 @@ class TestPatchFrameModes(unittest.TestCase):
         patches.current.keys.assign(keys)
         patches.current.indices.assign(indices)
         generation = scene.contacts.contact_generation
-        _, inputs = patches._prepare_inputs(scene.model, scene.state, scene.contacts)
-        patches._launch_prepare([*inputs, generation, patches.stream_token(generation), patches.sorted_frame])
+        inputs = patches._prepare_inputs(scene.model, scene.state, scene.contacts)
+        patches._launch_prepare([*inputs, generation, patches.stream_token(generation), patches.built_frame])
         np.testing.assert_array_equal(patches.current.keys.numpy(), keys)
         np.testing.assert_array_equal(patches.current.indices.numpy(), indices)
-        np.testing.assert_array_equal(patches.extent.numpy()[:3], [live, live, 0])
+        np.testing.assert_array_equal(patches.extent.numpy()[:2], [live, live])
+        self.assertEqual(int(patches.extent.numpy()[friction_patches._KEPT_EXTENT]), 1)
 
     def test_a_frame_changed_since_its_record_sorts(self):
         """Sort a frame whose generation, count or stream differs from the record, or whose record is forgotten.
@@ -2360,7 +2211,6 @@ class TestPatchFrameModes(unittest.TestCase):
         the frame stored; an advanced generation with the same contacts sorts
         them into the order the slots held.
         """
-        rng = np.random.default_rng(43)
         for change in ("generation", "count", "stream", "record"):
             with self.subTest(change=change):
                 scene = _Scene("cpu", 43)
@@ -2379,7 +2229,7 @@ class TestPatchFrameModes(unittest.TestCase):
                 elif change == "count":
                     wp.launch(_lower_contact_count, dim=1, inputs=[contacts.rigid_contact_count], device="cpu")
                 elif change == "stream":
-                    contacts = _swapped_stream(scene, live, rng)
+                    contacts = _copied_stream(scene)
                 else:
                     patches.forget_frame()
                 for state in (plain, patches):
@@ -2392,53 +2242,6 @@ class TestPatchFrameModes(unittest.TestCase):
                 assert_same_state(patches, plain, f"{change} store", records=False)
                 self.assertTrue(np.any(patches.previous.valid.numpy()), "the sorted frame keeps its anchors")
 
-    def test_kept_builds_miss_rewrites_of_equal_generation_and_count(self):
-        """Keep the frame through in-place rewrites that keep the generation and count, as documented.
-
-        The device compares the generation and the live count only, and the
-        frame reads its contacts' records once. A rewrite of points, normals and
-        margins goes unseen: the kept build equals the frame's first build
-        bitwise, where a sorting build reads the rewrite. Reordering the
-        contacts in place goes unseen too: the kept frame holds the previous
-        order's contacts, each at its own sorted index.
-        """
-        rng = np.random.default_rng(48)
-        for rewrite in ("geometry", "order"):
-            with self.subTest(rewrite=rewrite):
-                scene = _Scene("cpu", 48)
-                scene.active[:] = True
-                plain, recording = _recording_pair(scene, 128)
-                decisions = _decisions(recording)
-                live = scene.frame()
-                self.assertGreater(live, 2)
-                for state in (plain, recording):
-                    state.build(scene.model, scene.state, scene.contacts)
-                kept = recording.contact_of.numpy()[:live].copy()
-                center = recording.current.center.numpy()[:live].copy()
-                contacts = scene.contacts
-                if rewrite == "geometry":
-                    for name in ("rigid_contact_point0", "rigid_contact_point1", "rigid_contact_normal"):
-                        values = getattr(contacts, name).numpy()
-                        values[:live] += rng.normal(scale=1.0e-3, size=(live, 3))
-                        getattr(contacts, name).assign(values)
-                    margins = contacts.rigid_contact_margin0.numpy()
-                    margins[:live] = rng.uniform(0.0, 2.0e-3, size=live)
-                    contacts.rigid_contact_margin0.assign(margins)
-                else:
-                    _swapped_stream(scene, live, rng, contacts)
-                for state in (plain, recording):
-                    state.build(scene.model, scene.state, contacts)
-                self.assertEqual(decisions, ["sort", "keep"], "the rewrite keeps the recorded frame")
-                self.assertEqual(int(recording.extent.numpy()[1]), live)
-                if rewrite == "geometry":
-                    np.testing.assert_array_equal(recording.current.center.numpy()[:live], center, rewrite)
-                    self.assertTrue(np.any(plain.current.center.numpy()[:live] != center), "a sort reads the rewrite")
-                    continue
-                order = recording.contact_of.numpy()[:live]
-                np.testing.assert_array_equal(order, kept, "the kept build holds the previous order")
-                self.assertFalse(np.array_equal(order, plain.contact_of.numpy()[:live]), "the order is stale")
-                np.testing.assert_array_equal(recording.current.indices.numpy()[:live], np.arange(live), "indices")
-
 
 def _expected_pairs(model, contacts, capacity):
     """Return the sorted pair keys and slot order (by pair key, then contact key) of the live contacts, computed on
@@ -2449,7 +2252,7 @@ def _expected_pairs(model, contacts, capacity):
     live = min(count, capacity) if 0 <= count <= contacts.rigid_contact_max else 0
     shape_body = model.shape_body.numpy()
     # A body's code (friction_patches.body_codes); index -1 reads the padding of a missing body.
-    body_code = np.append(friction_patches.body_codes(model.body_world.numpy()), 0) if bodies else np.zeros(1, np.int64)
+    body_code = np.append(body_pair_codes(model.body_world.numpy()), 0) if bodies else np.zeros(1, np.int64)
 
     def codes(shape):
         body = np.where(shape >= 0, shape_body[np.maximum(shape, 0)], -1)
@@ -2596,8 +2399,8 @@ class _SolverTwin:
         return True
 
     def assert_sorted(self, test, stream, context):
-        """Require the slots to hold the host-sorted pairs of a stream's live contacts: the frame's contacts are the
-        stream's in that order (``contact_of``), each at its own sorted index."""
+        """Require the slots to hold the pairs of a stream's live contacts, which lie in the pipeline's order, each at
+        its own index."""
         keys, order = _expected_pairs(self.model, self.streams[stream], self.patches.capacity)
         live = len(keys)
         np.testing.assert_array_equal(
@@ -2605,7 +2408,7 @@ class _SolverTwin:
             pair_codes(keys, self.patches.key_stride),
             f"{context} keys",
         )
-        np.testing.assert_array_equal(self.patches.contact_of.numpy()[:live], order, f"{context} frame order")
+        np.testing.assert_array_equal(order, np.arange(live), f"{context} the pipeline's order")
         np.testing.assert_array_equal(
             self.patches.current.indices.numpy()[:live], np.arange(live), f"{context} indices"
         )
@@ -2615,7 +2418,7 @@ class _SolverTwin:
         test.assertGreater(live, 0, f"{context}: the box must touch its support")
 
 
-def _change(twins, event, rng):
+def _change(twins, event):
     """Apply a frame change between substeps to every twin; returns the contact stream the next substeps use."""
     if event == "truncate":
         for twin in twins:
@@ -2630,9 +2433,7 @@ def _change(twins, event, rng):
         for twin in twins:
             twin.solver.notify_model_changed(flags)
     elif event == "swap":
-        source = twins[0].streams[0]
-        count = int(source.rigid_contact_count.numpy()[0])
-        order = np.concatenate((rng.permutation(count), np.arange(count, source.rigid_contact_max)))
+        order = np.arange(twins[0].streams[0].rigid_contact_max)
         for twin in twins:
             _permute_contacts(twin.streams[0], twin.streams[1], order)
         return 1
@@ -2643,8 +2444,8 @@ def _change(twins, event, rng):
 # decision; the second keeps. "collide" opens a collision frame, "step" shares
 # the last one, "truncate" lowers the count, "write" advances the generation
 # as Contacts.clear() does, "notify" reports a body change and "shape" a shape
-# change before sharing it, "swap" moves to a reordered stream of equal
-# generation and count, and "back" returns to the first stream.
+# change before sharing it, "swap" moves to another stream of equal
+# generation, count and contacts, and "back" returns to the first stream.
 _STEP_PLAN = (
     ("collide", "sort"),
     ("collide", "sort"),
@@ -2663,40 +2464,6 @@ _STEP_PLAN = (
 
 
 class TestPatchSolverFrameReuse(unittest.TestCase):
-    def test_solver_records_its_pair_sort(self):
-        """Record the live pair sort with its reason; frame reuse is the device's decision and has no record."""
-        devices = ["cpu"] + (["cuda:0"] if wp.is_cuda_available() else [])
-        for device in devices:
-            with self.subTest(device=device):
-                solver = SolverFeatherPGS(_arm_over_box(wp.get_device(device), worlds=2))
-                friction = solver.get_path_selection()["routes"]["friction"]
-                self.assertNotIn("frame_reuse", friction)
-                pair_sort = friction["pair_sort"]
-                self.assertTrue(pair_sort["live"])
-                self.assertEqual(pair_sort["live"], solver.laws.friction_patches.live_sort)
-                self.assertEqual(pair_sort["capacity"], solver.laws.friction_patches.capacity)
-                self.assertEqual(pair_sort["key_bits"], solver.laws.friction_patches.key_bits)
-                self.assertIn("only the live slots", pair_sort["reason"])
-
-    def test_route_records_the_pair_sort(self):
-        """Record the live sort, or the radix sort with the reason when the pair keys are too wide."""
-        cases = (
-            # (live_sort, capacity, key_bits, reason)
-            (True, 16_384, 51, "only the live slots"),
-            (True, 2_000_000, 51, "only the live slots"),
-            (False, 16_384, 52, "52-bit pair keys"),
-        )
-        for live, capacity, key_bits, reason in cases:
-            with self.subTest(capacity=capacity, key_bits=key_bits):
-                patches = SimpleNamespace(live_sort=live, capacity=capacity, key_bits=key_bits)
-                self.assertEqual(friction_patches._uses_live_sort(key_bits), live)
-                record = friction_patches._FrictionPatchState.record(patches)
-                self.assertEqual(
-                    {name: record[name] for name in ("live", "capacity", "key_bits")},
-                    {"live": live, "capacity": capacity, "key_bits": key_bits},
-                )
-                self.assertIn(reason, record["reason"])
-
     def test_solver_steps_keep_frames_bitwise_as_the_always_sort_chain(self):
         """Keep the sorted pairs on substeps that share a frame, bitwise as the always-sort chain.
 
@@ -2705,14 +2472,13 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
         to the first sorts, and every other substep keeps its pairs, a body
         change included.
         """
-        rng = np.random.default_rng(15)
         twin, plain = _SolverTwin("cpu"), _SolverTwin("cpu").sort_every_build()
         decisions = _decisions(twin.patches)
         for each in (twin, plain):
             each.pair(collide=True)
         for index, (event, first) in enumerate(_STEP_PLAN):
             context = f"pair {index} {event}"
-            stream = _change((twin, plain), event, rng)
+            stream = _change((twin, plain), event)
             for substep in range(2):
                 for each in (twin, plain):
                     each.substep(stream, collide=substep == 0 and event == "collide")
@@ -2748,17 +2514,14 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
         twin.solver.check_constraint_capacity()
 
     @unittest.skipUnless(wp.is_cuda_available(), "graph capture needs CUDA")
-    def test_solver_graphs_reuse_sorted_frames(self):
+    def test_solver_graphs_reuse_built_frames(self):
         """Replay collide and substep graphs bitwise as eager always-sort steps, sorting only new frames.
 
         A probe captured after each build shows on every replay how it prepared
         its frame (:class:`_DecisionProbe`): a graph's second build keeps its
-        pairs, and its first sorts only a frame the slots do not hold. The
-        graph twin takes the radix sort, which sorts a kept frame's slots into
-        the order they hold.
+        frame, and its first makes only a frame the slots do not hold new.
         """
-        rng = np.random.default_rng(6)
-        graph = _graph_twin(jaws=True, radix=True)
+        graph = _graph_twin(jaws=True)
         eager = _SolverTwin("cuda:0", jaws=True)
         for _ in range(3):
             for twin in (graph, eager):
@@ -2775,7 +2538,7 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
             captured[name] = capture.graph
         for index, (event, first) in enumerate(_STEP_PLAN):
             context = f"pair {index} {event}"
-            stream = _change((graph, eager), event, rng)
+            stream = _change((graph, eager), event)
             wp.capture_launch(captured[event if event in ("collide", "swap") else "step"])
             eager.pair(stream, collide=event == "collide")
             self.assertEqual(probe.read(), [first, "keep"], context)
@@ -2785,16 +2548,14 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
     @unittest.skipUnless(wp.is_cuda_available(), "graph capture needs CUDA")
     def test_graphs_sort_a_stream_allocated_at_a_freed_address(self):
         """Sort the first captured build over a new Contacts whose generation counter sits where a dropped one was."""
-        rng = np.random.default_rng(8)
         graph = _graph_twin(jaws=True)
         eager = _SolverTwin("cuda:0", jaws=True)
         # Eager steps leave the slots holding the first stream's frame, recorded as sorted.
         for twin in (graph, eager):
             twin.pair(collide=True)
         eager.sort_every_build()
-        count = int(graph.streams[0].rigid_contact_count.numpy()[0])
-        order = np.concatenate((rng.permutation(count), np.arange(count, graph.streams[0].rigid_contact_max)))
-        # The replacement holds the frame reordered, with the same generation and count.
+        order = np.arange(graph.streams[0].rigid_contact_max)
+        # The replacement holds the frame, with the same generation and count.
         reused = [_replace_first_stream(twin, order) for twin in (graph, eager)]
         self.assertTrue(reused[0], "the replacement's generation counter must sit at the freed address")
         probe = _DecisionProbe(graph.patches, 2)
@@ -2878,7 +2639,6 @@ class TestPatchSolverFrameReuse(unittest.TestCase):
         its pair.
         """
         graph = _graph_twin(boxes=True)
-        self.assertTrue(graph.patches.live_sort)
         eager, control = (_SolverTwin("cuda:0", boxes=True) for _ in range(2))
         twins = (graph, eager, control)
         for twin in twins:
@@ -2930,105 +2690,21 @@ def _assert_same_twins(graph, eager, context):
         )
 
 
-def _graph_twin(*, radix=False, **options):
-    """Return a CUDA twin to capture graphs of; ``radix`` makes its pairs take the radix sort."""
-    twin = _SolverTwin("cuda:0", **options)
-    if radix:
-        twin.patches.live_sort = False
-    return twin
-
-
-@wp.kernel(enable_backward=False)
-def _reverse_live_contacts(
-    count: wp.array[wp.int32],
-    shape0: wp.array[wp.int32],
-    shape1: wp.array[wp.int32],
-    point_id: wp.array[wp.int32],
-    tids: wp.array[wp.int32],
-    point0: wp.array[wp.vec3],
-    point1: wp.array[wp.vec3],
-    offset0: wp.array[wp.vec3],
-    offset1: wp.array[wp.vec3],
-    normal: wp.array[wp.vec3],
-    margin0: wp.array[float],
-    margin1: wp.array[float],
-):
-    """Reverse the order of the live contacts, so that slot order no longer follows pair order."""
-    i = wp.tid()
-    j = wp.min(count[0], shape0.shape[0]) - 1 - i
-    if i >= j:
-        return
-    s0 = shape0[i]
-    shape0[i] = shape0[j]
-    shape0[j] = s0
-    s1 = shape1[i]
-    shape1[i] = shape1[j]
-    shape1[j] = s1
-    p = point_id[i]
-    point_id[i] = point_id[j]
-    point_id[j] = p
-    t = tids[i]
-    tids[i] = tids[j]
-    tids[j] = t
-    a0 = point0[i]
-    point0[i] = point0[j]
-    point0[j] = a0
-    a1 = point1[i]
-    point1[i] = point1[j]
-    point1[j] = a1
-    o0 = offset0[i]
-    offset0[i] = offset0[j]
-    offset0[j] = o0
-    o1 = offset1[i]
-    offset1[i] = offset1[j]
-    offset1[j] = o1
-    n = normal[i]
-    normal[i] = normal[j]
-    normal[j] = n
-    m0 = margin0[i]
-    margin0[i] = margin0[j]
-    margin0[j] = m0
-    m1 = margin1[i]
-    margin1[i] = margin1[j]
-    margin1[j] = m1
-
-
-def _reverse_contacts(contacts):
-    """Reverse the order of a contact stream's live contacts in place."""
-    wp.launch(
-        _reverse_live_contacts,
-        dim=max(1, contacts.rigid_contact_max // 2),
-        inputs=[
-            contacts.rigid_contact_count,
-            contacts.rigid_contact_shape0,
-            contacts.rigid_contact_shape1,
-            contacts.rigid_contact_point_id,
-            contacts.rigid_contact_tids,
-            contacts.rigid_contact_point0,
-            contacts.rigid_contact_point1,
-            contacts.rigid_contact_offset0,
-            contacts.rigid_contact_offset1,
-            contacts.rigid_contact_normal,
-            contacts.rigid_contact_margin0,
-            contacts.rigid_contact_margin1,
-        ],
-        device=contacts.device,
-    )
+def _graph_twin(**options):
+    """Return a CUDA twin to capture graphs of."""
+    return _SolverTwin("cuda:0", **options)
 
 
 def _step_passes(twin, passes, probe=None):
     """Step ``twin`` through collision passes, each a substep count, colliding on each pass's first substep.
 
-    Each pass reverses its live contacts after colliding, so that the slots hold
-    pairs out of order and a kept build that lost its sorted pairs shows. A
-    :class:`_DecisionProbe` records each substep's decision in order.
+    A :class:`_DecisionProbe` records each substep's decision in order.
     """
     slot = 0
     for substeps in passes:
         for substep in range(substeps):
             if substep == 0:
                 twin.pipeline.collide(twin.states[0], twin.streams[0])
-                _reverse_contacts(twin.streams[0])
             twin.substep()
             if probe is not None:
                 probe.mark(slot)
@@ -3231,12 +2907,11 @@ def run_captured_entry_filter(test, device, replays):
         test.assertGreater(int(filtered.rigid_contact_count.numpy()[0]), 0, f"replay {replay}: the boxes must touch")
 
 
-def run_replay_past_the_sort_rounds(test, device, replays=3):
-    """Replay a build captured at 2,048 slots, whose one merge round pairs two chunks, after the pool grew past them.
+def run_replay_past_the_captured_rows(test, device, replays=3):
+    """Replay a build captured at 2,048 slots after the pool grew past them.
 
-    Each replay of more live slots than that round pairs joins every run in it, and sorts and builds the live slots
-    bitwise as an eager build at the grown rows, which merges pairwise over every round; so do the stale state's
-    eager builds. The pool asks for the recapture from the growth on.
+    Each replay of more live slots builds them bitwise as an eager build at the grown rows; so do the stale state's
+    eager builds. The pool asks for no recapture: every launch of the build follows the live rows.
     """
     rows = 16_384
     scene = _Scene(device, 31, worlds=200, contacts=rows)
@@ -3246,7 +2921,6 @@ def run_replay_past_the_sort_rounds(test, device, replays=3):
     stale, fresh = states
     if not stale.pool.bindable:
         test.skipTest("bound captures need CUDA virtual memory")
-    test.assertEqual((stale.merges, fresh.merges), (1, 3))
     scene.frame("sparse")
     for state in states:
         state.build(scene.model, scene.state, scene.contacts)
@@ -3254,12 +2928,12 @@ def run_replay_past_the_sort_rounds(test, device, replays=3):
         stale.build(scene.model, scene.state, scene.contacts)
     test.assertFalse(stale.pool.needs_recapture)
     stale.pool.grow(rows)
-    test.assertTrue(stale.pool.needs_recapture, "the pool grew past the slots the captured round pairs")
+    test.assertFalse(stale.pool.needs_recapture, "the captured build follows the grown rows")
     scene.active[:] = True
     for replay in range(replays + 1):
         scene.move()
         live = scene.frame("live", churn=False)
-        test.assertGreater(live, 4 * 2048, "the live slots must outgrow the captured round by several runs")
+        test.assertGreater(live, 4 * 2048, "the live slots must outgrow the captured rows several times")
         if replay < replays:
             wp.capture_launch(capture.graph)
         else:
@@ -3284,7 +2958,6 @@ def run_replay_past_the_sort_rounds(test, device, replays=3):
                 getattr(stale.view, name).numpy()[:live], getattr(fresh.view, name).numpy()[:live], f"{context} {name}"
             )
         np.testing.assert_array_equal(stale.built.numpy(), fresh.built.numpy(), f"{context} built")
-    test.assertGreater(stale.merges, 1, "an eager build sizes the rounds for the grown rows")
 
 
 class TestPatchCapturedFrameReuse(unittest.TestCase):
@@ -3327,9 +3000,9 @@ class TestPatchCapturedFrameReuse(unittest.TestCase):
         run_captured_entry_filter(self, "cuda:0", replays=100)
 
     @unittest.skipUnless(wp.is_cuda_available(), "graph capture needs CUDA")
-    def test_replays_past_the_captured_merge_rounds_sort_exactly(self):
-        """Sort and build bitwise as eager builds in replays whose live slots outgrew the captured merge rounds."""
-        run_replay_past_the_sort_rounds(self, "cuda:0")
+    def test_replays_past_the_captured_rows_build_exactly(self):
+        """Build bitwise as eager builds in replays whose live slots outgrew the captured rows."""
+        run_replay_past_the_captured_rows(self, "cuda:0")
 
 
 if __name__ == "__main__":

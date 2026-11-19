@@ -752,10 +752,6 @@ def bind_struct(struct_type, values, device):
     for name in ("first", "mf_first"):
         if name in fields and name not in bound:
             bound[name] = row_lines(device)
-    if "position" in fields and "position" not in bound and "shape0" in bound:
-        # A scene's contacts are in the frame's order: each contact's position is its own index.
-        order = wp.array(np.arange(bound["shape0"].shape[0], dtype=np.int32), device=device)
-        bound["position"], bound["contact_of"] = order, order
     instance = field_group.upload(struct_type, device, **bound)
     return instance, {
         arguments[name]: value for name, value in bound.items() if isinstance(value, wp.array) and name in arguments

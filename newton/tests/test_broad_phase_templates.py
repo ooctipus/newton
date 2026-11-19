@@ -692,10 +692,9 @@ def test_pipeline_templates_match_flat_contacts(test, device):
             np.testing.assert_array_equal(
                 _sorted_codes(templated_pairs, count, count), _sorted_codes(flat_pairs, count, count)
             )
-            # Both kernels give the same contacts; a pass writes them in thread order, so they are compared in key
-            # order (each contact's identity), the order until the pipeline sorts every pass.
+            # Both kernels give the same contacts in the same order: every pass leaves them in the pipeline's one order.
             live = int(flat_contacts.rigid_contact_count.numpy()[0])
-            orders = [np.argsort(c.rigid_contact_key.numpy()[:live]) for c in (templated_contacts, flat_contacts)]
+            orders = [np.arange(live)] * 2
             np.testing.assert_array_equal(
                 templated_contacts.rigid_contact_count.numpy(), flat_contacts.rigid_contact_count.numpy()
             )

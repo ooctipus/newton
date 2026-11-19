@@ -482,6 +482,7 @@ def test_save_empty_history_with_more_worlds_than_capacity(test, device):
             save = partial(
                 matcher.save_sorted_state,
                 keys,
+                keys,
                 count,
                 points,
                 points,
@@ -530,7 +531,8 @@ def test_save_resets_next_frame_report_flags(test, device):
         test.assertGreater(count, 0)
         matcher._prev_was_matched.fill_(wp.int32(1))
         matcher.save_sorted_state(
-            sorted_keys=pipeline._contact_sorter.sorted_keys_view,
+            sorted_keys=contacts.rigid_contact_key,
+            sorted_pair_keys=pipeline._contact_sorter.sorted_keys_view,
             contact_count=contacts.rigid_contact_count,
             sorted_point0=contacts.rigid_contact_point0,
             sorted_point1=contacts.rigid_contact_point1,
@@ -647,7 +649,7 @@ def test_contacts_exposes_matching_mode(test, device):
         incompatible_pipeline = newton.CollisionPipeline(
             model,
             broad_phase="nxn",
-            rigid_contact_max=contacts.rigid_contact_max + 1,
+            rigid_contact_max=contacts.rigid_contact_max - 1,
             contact_matching="sticky",
         )
         with test.assertRaisesRegex(ValueError, "capacity"):
@@ -922,13 +924,8 @@ def test_pipeline_sorter_omits_unused_simple_scratch(test, device):
         model, state = _build_simple_scene(device)
         for mode in ("disabled", "latest", "sticky"):
             pipeline = newton.CollisionPipeline(model, broad_phase="nxn", contact_matching=mode, rigid_contact_max=64)
+            # Every pipeline sorts its contacts into one order, with or without matching.
             sorter = pipeline._contact_sorter
-            # Only contact matching sorts the pipeline's contacts: without it the pipeline holds no sorter.
-            test.assertEqual(sorter is None, mode == "disabled")
-            if sorter is None:
-                contacts = pipeline.contacts()
-                test.assertGreater(_collide_once(pipeline, state, contacts), 0)
-                continue
             unused_scratch = (
                 sorter._simple_pair_buf,
                 sorter._simple_position_buf,
@@ -1055,6 +1052,7 @@ def test_sticky_drift_uses_body_witnesses(test, device):
             device=device,
         )
         matcher._prev_sorted_keys.assign(np.array([0], dtype=np.int64))
+        matcher._prev_pair_keys.assign(np.array([0], dtype=np.int64))
         matcher._prev_pos_world.assign(np.zeros((1, 3), dtype=np.float32))
         matcher._prev_point0.assign(np.zeros((1, 3), dtype=np.float32))
         matcher._prev_point1.assign(np.zeros((1, 3), dtype=np.float32))
@@ -1063,6 +1061,7 @@ def test_sticky_drift_uses_body_witnesses(test, device):
         match_index = wp.full(1, MATCH_NOT_FOUND, dtype=wp.int32, device=device)
         matcher.match(
             sort_keys=wp.zeros(1, dtype=wp.int64, device=device),
+            pair_keys=wp.zeros(1, dtype=wp.int64, device=device),
             contact_count=wp.array([1], dtype=wp.int32, device=device),
             point0=wp.zeros(1, dtype=wp.vec3, device=device),
             point1=wp.array([point1], dtype=wp.vec3, device=device),

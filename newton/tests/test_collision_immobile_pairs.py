@@ -594,8 +594,7 @@ def test_census_drops_exactly_the_contacts_without_response(test, device):
             test.assertGreaterEqual(int(np.count_nonzero(~silent)), _WORLDS)
             # The census is FeatherPGS's own: it reserves no row for exactly the silent contacts.
             solver.step(state, model.state(), model.control(), listed, 1.0 / 120.0)
-            # Each contact's allocation lies at its frame position.
-            path = solver.placement.contact_path.numpy()[solver.laws.friction_patches.position.numpy()[: len(silent)]]
+            path = solver.placement.contact_path.numpy()[: len(silent)]
             np.testing.assert_array_equal(path[silent], -1)
             test.assertTrue(np.all(path[~silent] >= 0), path)
             kept, record, _ = census[None]
@@ -780,27 +779,11 @@ def _per_contact_arrays(contacts):
     ]
 
 
-def _order_by_key(contacts):
-    """Put the live contacts in key order (each contact's identity): a pass writes them in thread order."""
-    count = int(contacts.rigid_contact_count.numpy()[0])
-    order = np.argsort(contacts.rigid_contact_key.numpy()[:count], kind="stable")
-    for array in _per_contact_arrays(contacts):
-        values = array.numpy().copy()
-        values[:count] = values[order]
-        array.assign(values)
-
-
-def _list_immobile_contacts_last(contacts, immobile):
-    """Stably move the contacts between two ``immobile`` shapes behind the others; return how many others."""
+def _immobile_contacts(contacts, immobile):
+    """Return which live contacts lie between two ``immobile`` shapes."""
     count = int(contacts.rigid_contact_count.numpy()[0])
     shapes = (contacts.rigid_contact_shape0.numpy()[:count], contacts.rigid_contact_shape1.numpy()[:count])
-    dropped = immobile[shapes[0]] & immobile[shapes[1]]
-    order = np.concatenate((np.flatnonzero(~dropped), np.flatnonzero(dropped)))
-    for array in _per_contact_arrays(contacts):
-        values = array.numpy().copy()
-        values[:count] = values[order]
-        array.assign(values)
-    return count - int(np.count_nonzero(dropped))
+    return immobile[shapes[0]] & immobile[shapes[1]]
 
 
 def _arm_shape_roles(model):
@@ -823,7 +806,7 @@ def _check_arm_steps(test, model, law, friction_anchor_beta, device):
     immobile = roles <= 0
     control = model.control()
     solvers = [newton.solvers.SolverFeatherPGS(model, friction_anchor_beta=friction_anchor_beta) for _ in range(2)]
-    # Contacts in key order compare element by element: the reference keeps the base's ground pairs.
+    # Contacts in the pipeline's order compare element by element: the reference keeps the base's ground pairs.
     pipelines = (_pipeline(model, "0"), _pipeline(model, None))
     reference, contacts = (pipeline.contacts() for pipeline in pipelines)
     state = model.state()
@@ -835,18 +818,18 @@ def _check_arm_steps(test, model, law, friction_anchor_beta, device):
     for _ in range(60):
         pipelines[0].collide(state, reference)
         pipelines[1].collide(state, contacts)
-        _order_by_key(reference)
-        _order_by_key(contacts)
         listed = int(reference.rigid_contact_count.numpy()[0])
-        kept = _list_immobile_contacts_last(reference, immobile)
+        # The pipeline's order is the same without the dropped contacts: the others keep it.
+        dropped = _immobile_contacts(reference, immobile)
+        others = np.flatnonzero(~dropped)
         count = int(contacts.rigid_contact_count.numpy()[0])
-        test.assertEqual(count, kept)
+        test.assertEqual(count, len(others))
         for name in _CONTACT_GEOMETRY:
             np.testing.assert_array_equal(
                 getattr(contacts, f"rigid_contact_{name}").numpy()[:count],
-                getattr(reference, f"rigid_contact_{name}").numpy()[:kept],
+                getattr(reference, f"rigid_contact_{name}").numpy()[others],
             )
-        dropped_contacts += listed - kept
+        dropped_contacts += listed - count
         ends = _contact_roles(contacts, roles)
         arm_contacts += int(np.count_nonzero((ends[0] == 1) & (ends[1] == 2)))
         outputs = []
@@ -858,11 +841,8 @@ def _check_arm_steps(test, model, law, friction_anchor_beta, device):
             states += [state_in, state_out]
             outputs.append(state_out)
         # FeatherPGS gives the base's ground contacts no row and every other contact the same rows:
-        # the same route, row count, world and first row (each contact's records at its frame position).
-        positions = [
-            solver.laws.friction_patches.position.numpy()[:live].copy()
-            for solver, live in zip(solvers, (listed, count), strict=True)
-        ]
+        # the same route, row count, world and first row.
+        positions = [slice(live) for live in (listed, count)]
         rows_of = {
             name: [
                 getattr(solver.placement, f"contact_{name}").numpy()[position]
@@ -871,11 +851,11 @@ def _check_arm_steps(test, model, law, friction_anchor_beta, device):
             for name in ("path", "slots_needed", "world", "slot")
         }
         paths = rows_of.pop("path")
-        np.testing.assert_array_equal(paths[0][kept:listed], -1)
-        np.testing.assert_array_equal(paths[1][:count], paths[0][:kept])
-        rows = paths[0][:kept] >= 0
+        np.testing.assert_array_equal(paths[0][dropped], -1)
+        np.testing.assert_array_equal(paths[1][:count], paths[0][others])
+        rows = paths[0][others] >= 0
         for name, values in rows_of.items():
-            np.testing.assert_array_equal(values[1][:count][rows], values[0][:kept][rows], err_msg=f"contact_{name}")
+            np.testing.assert_array_equal(values[1][:count][rows], values[0][others][rows], err_msg=f"contact_{name}")
         expected, actual = (np.concatenate((output.joint_q.numpy(), output.joint_qd.numpy())) for output in outputs)
         test.assertTrue(np.all(np.isfinite(actual)))
         if wp.get_device(device).is_cpu:
@@ -892,13 +872,10 @@ def test_fixed_base_arm_steps_match(test, device):
     """Step FeatherPGS alike without the base's ground contacts, from the same state every step.
 
     Under point and patch friction, with the base rooted by a fixed joint and by a D6 joint
-    without axes. FeatherPGS reserves a world's contact rows with atomics, which CUDA can serve in
-    warp order, so the dropped contacts must not move the others. Left in place, they push world
-    1's last arm-cube contacts into a second warp; on the GPU, states then ended up to 1.2e-2
-    rad/s apart after 12 PGS iterations, and a CPU run that reserves those contacts' rows first
-    reproduces that. The reference therefore lists the dropped contacts last, so that every other
-    contact keeps its index. Contact geometry and rows then agree exactly, and states bitwise on
-    CPU and within 1e-5 on CUDA, which allows float atomics to accumulate in another order.
+    without axes. The pipeline's order (body pair, then key) is the same with and without the dropped
+    contacts, which take no rows, so every other contact keeps its rows: contact geometry and rows
+    agree exactly, and states bitwise on CPU and within 1e-5 on CUDA, which allows float atomics to
+    accumulate in another order.
     """
     for root in ("fixed", "locked_d6"):
         model = _arm_scene(device, locked_d6=root == "locked_d6")
