@@ -1163,7 +1163,11 @@ def create_mesh_capsule_contacts(writer_func):
         sort_sub_key: int,
         writer_data: Any,
     ):
-        """Write a capsule's contacts with this triangle; ``start``/``end`` are its core's world ends."""
+        """Write a capsule's contacts with this triangle; ``start``/``end`` are its core's world ends.
+
+        Each contact's fingerprint is ``sort_sub_key << 4`` and its feature: the ends 0 and 1, the edges 2 to 4, the
+        vertices 5 to 7 and the core behind the face 8, so no two of a triangle's contacts share one.
+        """
         reach = threshold + radius
         for e in range(2):
             point = start
@@ -1183,7 +1187,7 @@ def create_mesh_capsule_contacts(writer_func):
                     shape_a,
                     shape_b,
                     gap_sum,
-                    (sort_sub_key << 3) | e,
+                    (sort_sub_key << 4) | e,
                     writer_data,
                 )
         # The core behind the face: the one-sided contact of its deepest point over the face (the core clipped to
@@ -1201,7 +1205,7 @@ def create_mesh_capsule_contacts(writer_func):
                 shape_a,
                 shape_b,
                 gap_sum,
-                (sort_sub_key << 3) | 1,
+                (sort_sub_key << 4) | 8,
                 writer_data,
             )
         t = context.triangle
@@ -1283,7 +1287,7 @@ def create_mesh_capsule_contacts(writer_func):
                                     shape_a,
                                     shape_b,
                                     gap_sum,
-                                    (sort_sub_key << 3) | (2 + k),
+                                    (sort_sub_key << 4) | (2 + k),
                                     writer_data,
                                 )
                             if minimum:
@@ -1298,7 +1302,7 @@ def create_mesh_capsule_contacts(writer_func):
                                     shape_a,
                                     shape_b,
                                     gap_sum,
-                                    (sort_sub_key << 3) | (2 + k),
+                                    (sort_sub_key << 4) | (2 + k),
                                     writer_data,
                                 )
         for j in range(3):
@@ -1340,7 +1344,7 @@ def create_mesh_capsule_contacts(writer_func):
                             shape_a,
                             shape_b,
                             gap_sum,
-                            (sort_sub_key << 3) | (5 + j),
+                            (sort_sub_key << 4) | (5 + j),
                             writer_data,
                         )
 

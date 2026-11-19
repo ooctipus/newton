@@ -120,7 +120,8 @@ def make_contact_sort_key(shape_a: int, shape_b: int, sort_sub_key: int, shape_i
 
     - Mesh-triangle contacts: ``(tri_idx << 1) | 1`` — 22 effective bits
       for ``tri_idx`` (~4M triangles).  When expanded by the multi-contact
-      path (``<< 3 | i``), this drops to 19 effective bits (~524K triangles).
+      path (``<< 3 | i``), this drops to 19 effective bits (~524K triangles);
+      a capsule's contacts with a triangle (``<< 4 | feature``) leave 18.
     - SDF contacts: ``(edge_idx << 2) | (mode << 1)`` — 21 effective bits
       for ``edge_idx`` (~2M edges).  After multi-contact expansion
       (``<< 3``), 18 effective bits (~262K edges).

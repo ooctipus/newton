@@ -422,7 +422,8 @@ def create_compute_gjk_mpr_contacts(
                         contact.shape_a = shape_a
                         contact.shape_b = shape_b
                         contact.gap_sum = rigid_gap
-                        contact.sort_sub_key = sort_sub_key
+                        # The triangle's only contact: index 0 of its contact family (as a single GJK contact).
+                        contact.sort_sub_key = sort_sub_key << 3
                         if wp.static(has_point_filter):
                             if point_filter(contact, query_context):
                                 writer_func(contact, writer_data, -1)
