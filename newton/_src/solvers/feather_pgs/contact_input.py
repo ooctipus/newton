@@ -174,8 +174,9 @@ def contact_frame(data: ContactInput, law: PatchRowLaw, c: int) -> ContactFrame:
         data.body_q,
         patch_friction_location(law.patches, c),
     )
-    if wp.length_sq(law.patches.normal[c]) > 0.0:
-        normal = region_normal(law.patches, c, frame.normal)
+    normal = region_normal(law.patches, c, frame.normal)
+    # A carrier's region normal is its own: only a member whose normal differs takes the region's frame.
+    if normal[0] != frame.normal[0] or normal[1] != frame.normal[1] or normal[2] != frame.normal[2]:
         tangent0, tangent1 = contact_tangent_basis(normal)
         frame.normal = normal
         frame.tangent0 = tangent0
