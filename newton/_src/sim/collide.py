@@ -3723,6 +3723,7 @@ class CollisionPipeline:
         pool = self._contact_pool
         self._forecast = None
         self._no_velocities = wp.empty(0, dtype=wp.spatial_vector, device=device)
+        self._no_displacement = wp.empty(0, dtype=wp.vec3, device=device)
         if pool.forecast_on is not None and pool.growable and model.shape_count:
             self._forecast = _shape_forecast(
                 model, pool, self.geom_transform, terrain_law=self._terrain_law_listed is not None, estimate=estimate
@@ -5372,6 +5373,7 @@ class CollisionPipeline:
                 self.broad_phase_pair_count,
                 self.narrow_phase.shape_aabb_lower,
                 self.narrow_phase.shape_aabb_upper,
+                self._shape_displacement if speculative_active else self._no_displacement,
                 state.body_qd,
             )
 

@@ -167,6 +167,51 @@ class TestFeatherPGSSleep(unittest.TestCase):
         self.assertTrue(asleep[40, :2].all(), "world 0's gravity is as it was: its boxes sleep on")
         self.assertFalse(asleep[40, 2:].any(), "world 1's gravity changed: its boxes wake")
 
+    def test_a_fast_striker_wakes_the_box_at_the_pass_that_predicts_the_impact(self):
+        # Speculative contacts over the 10 ms window: a box dropped 0.5 m reaches the resting box at 3 m/s, 30 mm a
+        # window against 10 mm of contact gaps, so only the swept boxes of the pass before the impact overlap. That
+        # pass must wake the box it makes contacts with: a held box takes the impact with its velocity zeroed after
+        # every sweep, and the striker sinks into it (2 mm before the island joined over the swept boxes).
+        builder = newton.ModelBuilder()
+        builder.default_shape_cfg.gap = 0.005
+        builder.add_ground_plane()
+        box = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, _H + 0.001), wp.quat_identity()))
+        builder.add_shape_box(box, hx=_H, hy=_H, hz=_H)
+        striker = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 3.0 * _H + 0.5), wp.quat_identity()))
+        builder.add_shape_box(striker, hx=_H, hy=_H, hz=_H)
+        model = builder.finalize(device="cpu")
+        pipeline = newton.CollisionPipeline(
+            model, broad_phase="sap", include_static_kinematic_pairs=False, speculative_contact_gap_max=0.05
+        )
+        solver = SolverFeatherPGS(model, pgs_iterations=8)
+        contacts = pipeline.contacts()
+        shape_sleep_index, tree_asleep = solver.collision_sleep_filter()
+        pipeline.configure_sleep_filter(shape_sleep_index, tree_asleep)
+        s0, s1, control = model.state(), model.state(), model.control()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, s0)
+        box_tree = shape_sleep_index.numpy()[int(np.flatnonzero(model.shape_body.numpy() == box)[0])]
+        slept, deepest = False, 0.0
+        for _ in range(40):
+            pipeline.collide(s0, contacts, dt=_DT)
+            asleep = tree_asleep.numpy()[box_tree[0], box_tree[1]] >= 0
+            slept = slept or asleep
+            n = int(contacts.rigid_contact_count.numpy()[0])
+            bodies = (
+                model.shape_body.numpy()[contacts.rigid_contact_shape0.numpy()[:n]],
+                model.shape_body.numpy()[contacts.rigid_contact_shape1.numpy()[:n]],
+            )
+            struck = bool(
+                np.any((bodies[0] == striker) & (bodies[1] == box) | (bodies[0] == box) & (bodies[1] == striker))
+            )
+            self.assertFalse(struck and asleep, "a pass makes contacts with the box only after waking it")
+            for _ in range(_SUBSTEPS):
+                solver.step(s0, s1, control, contacts, _DT / _SUBSTEPS)
+                s0, s1 = s1, s0
+                q = s0.body_q.numpy()
+                deepest = max(deepest, (q[box, 2] + _H) - (q[striker, 2] - _H))
+        self.assertTrue(slept, "the box rests and sleeps before the striker arrives")
+        self.assertLess(deepest, 1.0e-4)
+
     def test_no_tree_that_can_rest_builds_no_sleep_state(self):
         builder = newton.ModelBuilder()
         body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 1.0), wp.quat_identity()))

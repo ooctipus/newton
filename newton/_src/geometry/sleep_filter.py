@@ -20,7 +20,8 @@ names):
 At every pass, after the broad phase and before the narrow phase, :meth:`SleepFilter.apply`:
 
 1. joins two trees whose shapes are a candidate pair with overlapping boxes into one island. The boxes are grown by
-   the contact gap and the speculative margin, so they hold every contact that can arise before the next pass;
+   the contact gap and the speculative margin and swept by the pass's displacement (the broad phase's own test), so
+   they hold every contact that can arise before the next pass;
 2. marks an island *held back* when one of its trees is awake and not ready, or touches a moving body the solver
    never holds (a kinematic body with a velocity);
 3. puts every tree of a ready island to sleep, and wakes every asleep tree of a held-back island (its quiet count
@@ -36,6 +37,7 @@ from __future__ import annotations
 
 import warp as wp
 
+from .broad_phase_common import check_aabb_overlap_moving
 from .contact_data import SHAPE_PAIR_INDEX_MASK
 
 wp.set_module_options({"enable_backward": False})
@@ -84,15 +86,6 @@ def _unite(parent: wp.array[wp.int32], a: int, b: int):
 
 
 @wp.func
-def _overlap(sa: int, sb: int, lower: wp.array[wp.vec3], upper: wp.array[wp.vec3]) -> bool:
-    la = lower[sa]
-    ua = upper[sa]
-    lb = lower[sb]
-    ub = upper[sb]
-    return not (la[0] > ub[0] or lb[0] > ua[0] or la[1] > ub[1] or lb[1] > ua[1] or la[2] > ub[2] or lb[2] > ua[2])
-
-
-@wp.func
 def _moving(shape: int, shape_body: wp.array[wp.int32], body_qd: wp.array[wp.spatial_vector]) -> bool:
     body = shape_body[shape]
     if body < 0:
@@ -116,12 +109,14 @@ def _join(
     body_qd: wp.array[wp.spatial_vector],
     lower: wp.array[wp.vec3],
     upper: wp.array[wp.vec3],
+    displacement: wp.array[wp.vec3],
     trees: int,
     threads: int,
     parent: wp.array[wp.int32],
     held_back: wp.array[wp.int32],
 ):
-    """Join the trees of every candidate pair whose boxes overlap; hold back a tree a moving unheld body reaches."""
+    """Join the trees of every candidate pair whose boxes overlap over the pass (swept by ``displacement``, empty
+    without speculation); hold back a tree a moving unheld body reaches."""
     n = wp.min(pair_count[0], pairs.shape[0])
     for k in range(wp.tid(), n, threads):
         pair = pairs[k]
@@ -138,7 +133,7 @@ def _join(
         if a == b and ia[1] >= 0:
             # Two shapes of one tree join nothing.
             continue
-        if not _overlap(sa, sb, lower, upper):
+        if not check_aabb_overlap_moving(sa, sb, lower, upper, 0.0, 0.0, displacement):
             continue
         if ia[1] >= 0 and ib[1] >= 0:
             _unite(parent, a, b)
@@ -264,10 +259,18 @@ class SleepFilter:
         cuda = wp.get_device(device)
         self.pair_threads = cuda.sm_count * 2048 if cuda.is_cuda else 1 << 16
 
-    def apply(self, pairs: wp.array, pair_count: wp.array, lower: wp.array, upper: wp.array, body_qd: wp.array):
-        """Decide the pass's sleep and wake from the broad phase's candidate ``pairs`` and the grown boxes
-        (``lower``, ``upper``), then drop the pairs of held sides (:func:`_mask`); ``body_qd`` tells a moving unheld
-        body."""
+    def apply(
+        self,
+        pairs: wp.array,
+        pair_count: wp.array,
+        lower: wp.array,
+        upper: wp.array,
+        displacement: wp.array,
+        body_qd: wp.array,
+    ):
+        """Decide the pass's sleep and wake from the broad phase's candidate ``pairs``, the grown boxes (``lower``,
+        ``upper``) and the shapes' displacement over the pass the broad phase swept them by (empty without
+        speculation), then drop the pairs of held sides (:func:`_mask`); ``body_qd`` tells a moving unheld body."""
         islands = int(self.tree_asleep.shape[0]) * self.trees
         if islands == 0:
             return
@@ -284,6 +287,7 @@ class SleepFilter:
                 body_qd,
                 lower,
                 upper,
+                displacement,
                 self.trees,
                 threads,
             ],
