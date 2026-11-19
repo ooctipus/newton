@@ -12,6 +12,7 @@ import warp as wp
 
 import newton
 from newton._src.geometry.contact_reduction_global import (
+    VALUES_STRIDE,
     _roundoff_duplicate_bit_for_slot_pair,
     create_export_reduced_contacts_kernel,
 )
@@ -36,7 +37,6 @@ def _equal_id_pairs(
         positions,
         normals,
         fingerprints,
-        0,
     )
 
 
@@ -117,7 +117,8 @@ class TestCompactContactExport(unittest.TestCase):
 
     def test_repeated_ids_claim_once_cpu(self):
         """Suppress every later copy of a winner before touching payload or global flags."""
-        values = wp.full(7, 1, dtype=wp.uint64, device="cpu")
+        # Every winner slot of entry 0 holds contact 1, resolved: its contact ID (score field zero).
+        values = wp.array(np.ones(VALUES_STRIDE, dtype=np.uint64), device="cpu")
         masks = wp.zeros(21, dtype=int, device="cpu")
         wp.launch(
             _equal_id_pairs,
@@ -156,7 +157,6 @@ class TestCompactContactExport(unittest.TestCase):
                 fixture.output,
                 workers,
                 0,
-                int(r.deterministic),
             ],
             device=fixture.device,
             block_dim=64,

@@ -1476,7 +1476,6 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
     use_precomputed_edge_data: bool = False,
     use_texture_sdf_only: bool = False,
     use_identity_sdf_scale: bool = False,
-    deterministic_reduction: bool = False,
     sdf_source: str = "any",
     staged_passes: bool = False,
 ):
@@ -1497,8 +1496,6 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
             have a texture representation.
         use_identity_sdf_scale: Compile out SDF scale conversions; requires
             ``use_texture_sdf_only``.
-        deterministic_reduction: Use deterministic contact reduction. Only
-            applies when ``reduce_contacts`` is True.
         sdf_source: Which of a pair's two passes the global-reduction variant
             takes: ``"any"`` both, ``"texture"`` those whose SDF has a texture
             (the BVH fallback compiled out) or ``"mesh"`` those that fall back
@@ -1525,12 +1522,6 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
         raise ValueError("staged_passes needs the reducing kernel with precomputed edges")
     # The BVH fallback is compiled in where some pass may take it.
     bvh_fallback = not use_texture_sdf_only and sdf_source != "texture"
-    # The reducer mode is tested inside fully unrolled directional loops. Keep
-    # one bounded specialization for reduced mesh-SDF kernels so those checks
-    # and their inactive packing path fold away; non-reduced kernels share the
-    # default variant because they never call the reducer.
-    deterministic_reduction = bool(reduce_contacts and deterministic_reduction)
-    reducer_deterministic = 1 if deterministic_reduction else 0
     do_edge_sdf_collision = _create_sdf_contact_funcs(
         enable_heightfields, use_texture_sdf_only, bvh_fallback, texture_sample_sdf_hw, _texture_sample_sdf_hw_pair
     )
@@ -1548,8 +1539,7 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
     # different floating-point results, breaking bit-exact reproducibility.
     _module = (
         f"sdf_contact_{writer_func.__name__}_{enable_heightfields}_{reduce_contacts}_"
-        f"{speculative}_{use_precomputed_edge_data}_{use_texture_sdf_only}_{use_identity_sdf_scale}_"
-        f"{deterministic_reduction}"
+        f"{speculative}_{use_precomputed_edge_data}_{use_texture_sdf_only}_{use_identity_sdf_scale}"
         + ("" if sdf_source == "any" else f"_{sdf_source}")
         + ("_staged" if staged_passes else "")
     )
@@ -2637,7 +2627,6 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
                                         aabb_upper_tri,
                                         voxel_res_tri,
                                         reducer_data,
-                                        wp.static(reducer_deterministic),
                                         wp.static(speculative),
                                     )
                                     if wp.static(speculative):
@@ -2765,7 +2754,6 @@ def create_mesh_sdf_staged_kernels(
     speculative: bool,
     use_texture_sdf_only: bool,
     use_identity_sdf_scale: bool,
-    deterministic_reduction: bool,
 ):
     """Create the context, cull, search and export kernels of the staged texture passes.
 
@@ -2780,10 +2768,7 @@ def create_mesh_sdf_staged_kernels(
     sample_grad = texture_sample_sdf_grad_only_hw
     get_mesh_edge = _create_mesh_edge_accessor_func(True)
     get_mesh_edge_bounding_sphere = _create_get_mesh_edge_bounding_sphere_func(True)
-    reducer_deterministic = 1 if deterministic_reduction else 0
-    module = (
-        f"sdf_contact_staged_{speculative}_{use_texture_sdf_only}_{use_identity_sdf_scale}_{deterministic_reduction}"
-    )
+    module = f"sdf_contact_staged_{speculative}_{use_texture_sdf_only}_{use_identity_sdf_scale}"
     block = MESH_SDF_BLOCK_DIM
 
     @wp.kernel(enable_backward=False, module=module)
@@ -3034,7 +3019,6 @@ def create_mesh_sdf_staged_kernels(
             shape_collision_aabb_upper[tri_shape],
             shape_voxel_resolution[tri_shape],
             reducer_data,
-            wp.static(reducer_deterministic),
             wp.static(speculative),
         )
         if wp.static(speculative):

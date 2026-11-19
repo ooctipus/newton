@@ -16,11 +16,13 @@ from newton._src.geometry.contact_reduction_global import (
     VALUES_PER_KEY,
     GlobalContactReducer,
     GlobalContactReducerData,
+    contact_key,
     create_export_reduced_contacts_kernel,
     export_contact_to_buffer,
     make_contact_key,
-    reduction_value_index,
+    reduction_update_slot,
     reduction_value_index_np,
+    resolve_reduced_contacts_kernel,
 )
 from newton._src.geometry.hashtable import hashtable_find_or_insert
 from newton._src.geometry.narrow_phase import NarrowPhase, write_contact_simple
@@ -70,8 +72,10 @@ def _seed_entries(data: GlobalContactReducerData, enabled: wp.array[int]):
         elif index == 2:
             fingerprint = 20
         export_contact_to_buffer(0, 1, position, wp.vec3(0.0, 1.0, 0.0), -0.01, fingerprint, data)
+    entries = wp.vec4i()
     for bin_index in range(4):
         entry = hashtable_find_or_insert(make_contact_key(0, 1, bin_index), data.ht_keys, data.ht_active_slots)
+        entries[bin_index] = entry
         for slot in range(wp.static(VALUES_PER_KEY)):
             contact_id = int(0)
             if bin_index == 0:
@@ -88,11 +92,20 @@ def _seed_entries(data: GlobalContactReducerData, enabled: wp.array[int]):
                     contact_id = 3 + slot % 2
             elif bin_index == 2:
                 contact_id = 5
-            value = wp.uint64(contact_id)
-            if bin_index == 0 and slot == 6:
-                # Nonzero winner with reserved ID zero must never reach the writer.
-                value = wp.uint64(1) << wp.uint64(32)
-            data.ht_values[reduction_value_index(entry, slot)] = value
+            if contact_id != 0:
+                reduction_update_slot(
+                    entry, slot, contact_key(1.0, data.contact_fingerprints[contact_id]), data.ht_values
+                )
+            elif bin_index == 0 and slot == 6:
+                # A slot whose winner (fingerprint 1) was never buffered: no contact resolves it, so it must never
+                # reach the writer.
+                reduction_update_slot(entry, slot, contact_key(1.0, 1), data.ht_values)
+    # The entries each contact competed in, which the resolve pass visits.
+    data.contact_slots[1] = wp.vec2i(entries[0], -1)
+    data.contact_slots[2] = wp.vec2i(entries[0], -1)
+    data.contact_slots[3] = wp.vec2i(entries[0], entries[1])
+    data.contact_slots[4] = wp.vec2i(entries[0], entries[1])
+    data.contact_slots[5] = wp.vec2i(entries[2], -1)
 
 
 @wp.kernel
@@ -102,9 +115,9 @@ def _overflow_buffer(data: GlobalContactReducerData):
 
 
 class _Fixture:
-    def __init__(self, device, *, deterministic=False, capacity=16):
+    def __init__(self, device, *, capacity=16):
         self.device = wp.get_device(device)
-        self.reducer = GlobalContactReducer(capacity, device=device, deterministic=deterministic)
+        self.reducer = GlobalContactReducer(capacity, device=device)
         self.enabled = wp.ones(1, dtype=int, device=device)
         self.output = _ContactOutput()
         self.output.count = wp.zeros(1, dtype=int, device=device)
@@ -118,7 +131,10 @@ class _Fixture:
         self.shape_gap = wp.zeros(2, dtype=float, device=device)
 
     def seed(self):
-        wp.launch(_seed_entries, dim=1, inputs=[self.reducer.get_data_struct(), self.enabled], device=self.device)
+        """Reduce the fixture's contacts, then name every slot's winner as the narrow phase does before export."""
+        data = self.reducer.get_data_struct()
+        wp.launch(_seed_entries, dim=1, inputs=[data, self.enabled], device=self.device)
+        wp.launch(resolve_reduced_contacts_kernel, dim=8, inputs=[data, 0, 8], device=self.device)
 
     def export(self, kernel, *, parallel=False, blocks=1):
         reducer = self.reducer
@@ -140,7 +156,6 @@ class _Fixture:
                 self.output,
                 blocks,
                 int(parallel),
-                int(reducer.deterministic),
             ],
             block_dim=EXPORT_REDUCED_CONTACTS_BLOCK_DIM,
             device=self.device,
@@ -174,10 +189,11 @@ class TestContactReductionExportCleanup(unittest.TestCase):
         active = np.zeros(capacity + 1, dtype=np.int32)
         active[0], active[capacity] = entry, 1
         reducer.hashtable.active_slots.assign(active)
-        values = np.zeros(reducer.ht_values.shape[0], dtype=np.uint64)
+        slots = np.zeros(reducer.ht_values.shape[0], dtype=np.uint64)
         winners = reduction_value_index_np(entry, np.arange(VALUES_PER_KEY))
-        values[winners] = 1
-        reducer.ht_values.assign(values)
+        # Every winner slot holds contact 1, resolved: its contact ID (score field zero).
+        slots[winners] = 1
+        reducer.ht_values.assign(slots)
         reducer.contact_count.fill_(1)
         reducer.ht_insert_failures.fill_(3)
         reducer.buffer_overflows.fill_(5)
@@ -201,7 +217,6 @@ class TestContactReductionExportCleanup(unittest.TestCase):
                 output,
                 1,
                 0,
-                0,
             ],
             block_dim=EXPORT_REDUCED_CONTACTS_BLOCK_DIM,
             device=device,
@@ -216,49 +231,46 @@ class TestContactReductionExportCleanup(unittest.TestCase):
 
     def check_export_modes(self, device):
         """Preserve roundoff representatives and deduplicate winners across consumed entries."""
-        for deterministic in (False, True):
-            for parallel in (False, True) if wp.get_device(device).is_cuda else (False,):
-                for blocks in (1, 3):
-                    with self.subTest(deterministic=deterministic, parallel=parallel, blocks=blocks):
-                        observations = []
-                        for cleanup in (False, True):
-                            fixture = _Fixture(device, deterministic=deterministic)
-                            reducer = fixture.reducer
-                            fixture.seed()
-                            slots_before = reducer.hashtable.active_slots.numpy().copy()
-                            payload = reducer.position_depth.numpy().copy()
-                            keys_before = reducer.hashtable.keys.numpy().copy()
-                            values_before = reducer.ht_values.numpy().copy()
-                            reducer.ht_insert_failures.fill_(3)
-                            reducer.buffer_overflows.fill_(5)
-                            factory = create_export_reduced_contacts_kernel
-                            # The ordinary standalone API must remain nondestructive.
-                            kernel = (
-                                factory(_record_contact, clear_after_export=True)
-                                if cleanup
-                                else factory(_record_contact)
-                            )
-                            fixture.export(kernel, parallel=parallel, blocks=blocks)
-                            ids, geometry = fixture.contacts()
-                            np.testing.assert_array_equal(ids, [10, 20, 40, 50])
-                            self.assertTrue(np.isfinite(geometry).all())
-                            observations.append(geometry)
-                            np.testing.assert_array_equal(reducer.hashtable.active_slots.numpy(), slots_before)
-                            np.testing.assert_array_equal(reducer.position_depth.numpy(), payload)
-                            self.assertEqual(int(reducer.contact_count.numpy()[0]), 5)
-                            self.assertEqual(int(reducer.ht_insert_failures.numpy()[0]), 3)
-                            self.assertEqual(int(reducer.buffer_overflows.numpy()[0]), 5)
-                            self.assertTrue(np.all(reducer.exported_flags.numpy()[[2, 3, 4, 5]] > 0))
-                            if cleanup:
-                                self.assertTrue(np.all(reducer.ht_values.numpy() == 0))
-                                self.assertTrue(np.all(reducer.hashtable.keys.numpy() == np.uint64((1 << 64) - 1)))
-                            else:
-                                np.testing.assert_array_equal(reducer.hashtable.keys.numpy(), keys_before)
-                                np.testing.assert_array_equal(reducer.ht_values.numpy(), values_before)
-                        np.testing.assert_allclose(observations[0], observations[1], rtol=2e-6, atol=2e-7)
+        for parallel in (False, True) if wp.get_device(device).is_cuda else (False,):
+            for blocks in (1, 3):
+                with self.subTest(parallel=parallel, blocks=blocks):
+                    observations = []
+                    for cleanup in (False, True):
+                        fixture = _Fixture(device)
+                        reducer = fixture.reducer
+                        fixture.seed()
+                        slots_before = reducer.hashtable.active_slots.numpy().copy()
+                        payload = reducer.position_depth.numpy().copy()
+                        keys_before = reducer.hashtable.keys.numpy().copy()
+                        values_before = reducer.ht_values.numpy().copy()
+                        reducer.ht_insert_failures.fill_(3)
+                        reducer.buffer_overflows.fill_(5)
+                        factory = create_export_reduced_contacts_kernel
+                        # The ordinary standalone API must remain nondestructive.
+                        kernel = (
+                            factory(_record_contact, clear_after_export=True) if cleanup else factory(_record_contact)
+                        )
+                        fixture.export(kernel, parallel=parallel, blocks=blocks)
+                        ids, geometry = fixture.contacts()
+                        np.testing.assert_array_equal(ids, [10, 20, 40, 50])
+                        self.assertTrue(np.isfinite(geometry).all())
+                        observations.append(geometry)
+                        np.testing.assert_array_equal(reducer.hashtable.active_slots.numpy(), slots_before)
+                        np.testing.assert_array_equal(reducer.position_depth.numpy(), payload)
+                        self.assertEqual(int(reducer.contact_count.numpy()[0]), 5)
+                        self.assertEqual(int(reducer.ht_insert_failures.numpy()[0]), 3)
+                        self.assertEqual(int(reducer.buffer_overflows.numpy()[0]), 5)
+                        self.assertTrue(np.all(reducer.exported_flags.numpy()[[2, 3, 4, 5]] > 0))
+                        if cleanup:
+                            self.assertTrue(np.all(reducer.ht_values.numpy() == 0))
+                            self.assertTrue(np.all(reducer.hashtable.keys.numpy() == np.uint64((1 << 64) - 1)))
+                        else:
+                            np.testing.assert_array_equal(reducer.hashtable.keys.numpy(), keys_before)
+                            np.testing.assert_array_equal(reducer.ht_values.numpy(), values_before)
+                    np.testing.assert_allclose(observations[0], observations[1], rtol=2e-6, atol=2e-7)
 
     def test_export_modes_cpu(self):
-        """Retire serial fast and deterministic entries without changing exported geometry."""
+        """Retire serial entries without changing exported geometry."""
         self.check_export_modes("cpu")
 
     def check_lifecycle(self, device, *, graph=False):
@@ -414,7 +426,7 @@ class TestContactReductionExportCleanup(unittest.TestCase):
 
     @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
     def test_export_modes_cuda(self):
-        """Retire parallel and serial entries with deterministic and fast packing on CUDA."""
+        """Retire parallel and serial entries on CUDA."""
         self.check_export_modes("cuda:0")
 
     @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")

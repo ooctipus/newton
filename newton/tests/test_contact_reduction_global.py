@@ -18,14 +18,11 @@ from newton._src.geometry.contact_reduction import NUM_NORMAL_BINS, NUM_SPATIAL_
 from newton._src.geometry.contact_reduction_global import (
     CLEAR_ACTIVE_ENTRY_PARALLEL_THRESHOLD,
     EXPORT_REDUCED_CONTACTS_BLOCK_DIM,
-    SCORE_SHIFT,
+    SLOT_FINGERPRINT_BITS,
     VALUES_PER_KEY,
     GlobalContactReducer,
     GlobalContactReducerData,
-    _make_contact_value_det,
-    _make_contact_value_fast,
-    _make_preprune_probe_det,
-    _unpack_contact_id_det,
+    contact_key,
     create_export_reduced_contacts_kernel,
     decode_oct,
     encode_oct,
@@ -34,8 +31,14 @@ from newton._src.geometry.contact_reduction_global import (
     export_and_reduce_contact_centered_two_spatial_depths,
     export_contact_to_buffer,
     make_contact_key,
-    reduction_value_index,
+    reduction_resolve_slot,
+    reduction_slot_open,
+    reduction_try_update_slot,
+    reduction_update_slot,
     reduction_value_index_np,
+    resolve_reduced_contacts_kernel,
+    slot_contact_id,
+    spatial_contact_key,
 )
 from newton._src.geometry.hashtable import hashtable_find_or_insert
 from newton._src.geometry.narrow_phase import ContactWriterData
@@ -44,6 +47,9 @@ from newton.tests.unittest_utils import add_function_test, get_test_devices
 # =============================================================================
 # Test helper functions
 # =============================================================================
+
+_FINGERPRINT_MASK = (1 << SLOT_FINGERPRINT_BITS) - 1
+_RESOLVE_THREADS = 64
 
 
 def get_contact_count(reducer: GlobalContactReducer) -> int:
@@ -56,28 +62,60 @@ def get_active_slot_count(reducer: GlobalContactReducer) -> int:
     return int(reducer.hashtable.active_slots.numpy()[reducer.hashtable.capacity])
 
 
-def get_winning_contacts(reducer: GlobalContactReducer) -> list[int]:
-    """Extract the winning contact IDs from the hashtable (test helper)."""
-    values = reducer.ht_values.numpy()
+def resolve_slots(reducer: GlobalContactReducer, values: wp.array | None = None, speculative: bool = False):
+    """Name every slot's winner in ``values`` (default: the reducer's own slots) with the resolve pass (test helper)."""
+    data = reducer.get_data_struct()
+    if values is not None:
+        data.ht_values = values
+    wp.launch(
+        resolve_reduced_contacts_kernel,
+        dim=_RESOLVE_THREADS,
+        inputs=[data, int(speculative), _RESOLVE_THREADS],
+        device=reducer.device,
+    )
+
+
+def resolved_slots(reducer: GlobalContactReducer) -> np.ndarray:
+    """The reducer's slots after a resolve pass on a copy, so the reduction can continue (test helper).
+
+    Indexed by :func:`reduction_value_index_np`; a resolved slot holds its winner's contact ID, an empty slot zero, and
+    a slot whose winner was never buffered keeps its key.
+    """
+    values = wp.clone(reducer.ht_values)
+    resolve_slots(reducer, values)
+    return values.numpy()
+
+
+def slot_ids(values: np.ndarray) -> np.ndarray:
+    """Host counterpart of :func:`slot_contact_id`: the contact ID of each resolved slot, else zero."""
+    values = np.asarray(values, dtype=np.uint64)
+    return np.where(values >> np.uint64(SLOT_FINGERPRINT_BITS) == 0, values, 0).astype(np.int64)
+
+
+def active_winner_slots(reducer: GlobalContactReducer) -> dict[tuple[int, int], int]:
+    """Each active (entry, slot)'s resolved value: a contact ID, or a key no buffered candidate resolved (test helper)."""
+    values = resolved_slots(reducer)
     capacity = reducer.hashtable.capacity
-    values_per_key = reducer.values_per_key
-    contact_id_mask = (1 << 20) - 1 if reducer.deterministic else 0xFFFFFFFF
-
-    contact_ids = set()
-
-    # Iterate over active slots
     active_slots_np = reducer.hashtable.active_slots.numpy()
-    count = active_slots_np[capacity]
+    winners = {}
+    for entry_idx in active_slots_np[: active_slots_np[capacity]]:
+        for slot in range(reducer.values_per_key):
+            value = int(values[reduction_value_index_np(entry_idx, slot)])
+            if value != 0:
+                winners[(int(entry_idx), slot)] = value
+    return winners
 
-    for i in range(count):
-        entry_idx = active_slots_np[i]
-        for slot in range(values_per_key):
-            val = values[reduction_value_index_np(entry_idx, slot)]
-            if val != 0:
-                contact_id = int(val) & contact_id_mask
-                contact_ids.add(contact_id)
 
-    return sorted(contact_ids)
+def get_winning_contacts(reducer: GlobalContactReducer) -> list[int]:
+    """Extract the winning contact IDs from the hashtable after a resolve pass (test helper)."""
+    ids = slot_ids(np.array(list(active_winner_slots(reducer).values()), dtype=np.uint64))
+    return sorted({int(contact_id) for contact_id in ids if contact_id != 0})
+
+
+def get_unresolved_slot_count(reducer: GlobalContactReducer) -> int:
+    """Count active slots a resolve pass leaves holding a key: their winner was never buffered (test helper)."""
+    values = np.array(list(active_winner_slots(reducer).values()), dtype=np.uint64)
+    return int(np.count_nonzero(slot_ids(values) == 0))
 
 
 # =============================================================================
@@ -191,7 +229,7 @@ def test_multiple_contacts_same_pair(test, device):
             position=wp.vec3(x, 0.0, 0.0),
             normal=wp.vec3(0.0, 1.0, 0.0),
             depth=-0.01,
-            fingerprint=0,
+            fingerprint=tid,  # unique within the pair, as the resolve pass requires
             reducer_data=reducer_data,
             beta=0.001,
             shape_transform=xform,
@@ -383,7 +421,7 @@ def test_stress_many_contacts(test, device):
             position=wp.vec3(x, y, 0.0),
             normal=wp.vec3(nx / n_len, ny / n_len, nz / n_len),
             depth=-0.01,
-            fingerprint=0,
+            fingerprint=contact_in_pair,
             reducer_data=reducer_data,
             beta=0.001,
             shape_transform=xform,
@@ -689,15 +727,20 @@ def test_export_reduced_contacts_kernel(test, device):
         entry_idx = hashtable_find_or_insert(
             make_contact_key(10, 110, 0), reducer_data.ht_keys, reducer_data.ht_active_slots
         )
-        reducer_data.ht_values[reduction_value_index(entry_idx, 0)] = _make_contact_value_fast(1.0, 30, contact_a)
+        reduction_update_slot(entry_idx, 0, contact_key(1.0, 30), reducer_data.ht_values)
 
+        # A slot whose winner was never buffered: no candidate resolves it, so it exports nothing.
         sentinel_entry_idx = hashtable_find_or_insert(
             make_contact_key(11, 111, 0), reducer_data.ht_keys, reducer_data.ht_active_slots
         )
-        reducer_data.ht_values[reduction_value_index(sentinel_entry_idx, 0)] = _make_contact_value_fast(2.0, 0, 0)
-        reducer_data.ht_values[reduction_value_index(entry_idx, 1)] = _make_contact_value_fast(1.0, 20, contact_b)
-        reducer_data.ht_values[reduction_value_index(entry_idx, 2)] = _make_contact_value_fast(1.0, 10, contact_c)
-        reducer_data.ht_values[reduction_value_index(entry_idx, 3)] = _make_contact_value_fast(1.0, 30, contact_a)
+        reduction_update_slot(sentinel_entry_idx, 0, contact_key(2.0, 0), reducer_data.ht_values)
+        reduction_update_slot(entry_idx, 1, contact_key(1.0, 20), reducer_data.ht_values)
+        reduction_update_slot(entry_idx, 2, contact_key(1.0, 10), reducer_data.ht_values)
+        reduction_update_slot(entry_idx, 3, contact_key(1.0, 30), reducer_data.ht_values)
+        # The entries each candidate competed in, which the resolve pass visits.
+        reducer_data.contact_slots[contact_a] = wp.vec2i(entry_idx, -1)
+        reducer_data.contact_slots[contact_b] = wp.vec2i(entry_idx, -1)
+        reducer_data.contact_slots[contact_c] = wp.vec2i(entry_idx, -1)
 
         distinct_entry_idx = hashtable_find_or_insert(
             make_contact_key(12, 112, 0), reducer_data.ht_keys, reducer_data.ht_active_slots
@@ -712,11 +755,13 @@ def test_export_reduced_contacts_kernel(test, device):
                 fingerprint=100 + slot,
                 reducer_data=reducer_data,
             )
-            reducer_data.ht_values[reduction_value_index(distinct_entry_idx, slot)] = _make_contact_value_fast(
-                1.0, 100 + slot, contact_id
-            )
+            reduction_update_slot(distinct_entry_idx, slot, contact_key(1.0, 100 + slot), reducer_data.ht_values)
+            reducer_data.contact_slots[contact_id] = wp.vec2i(distinct_entry_idx, -1)
 
     wp.launch(store_roundoff_duplicate_winners_kernel, dim=1, inputs=[reducer_data], device=device)
+    # The export reads contact IDs: name every slot's winner first, as the narrow phase does.
+    resolve_slots(reducer)
+    test.assertEqual(get_unresolved_slot_count(reducer), 1, "only the sentinel's unbuffered winner stays a key")
 
     # Prepare output buffers
     max_output = 100
@@ -770,13 +815,12 @@ def test_export_reduced_contacts_kernel(test, device):
                 writer_data,
                 total_blocks,
                 int(not device.is_cpu),
-                0,  # deterministic=0 (fast packing)
             ],
             device=device,
             block_dim=EXPORT_REDUCED_CONTACTS_BLOCK_DIM,
         )
 
-        # ID zero is skipped, leaving five distinct pairs plus one representative
+        # The unresolved sentinel is skipped, leaving five distinct pairs plus one representative
         # from the numerically equivalent winner pair and all seven geometrically
         # distinct contacts from one hashtable entry.
         num_exported = int(contact_count_out.numpy()[0])
@@ -885,7 +929,7 @@ def test_centered_basic_storage_and_reduction(test, device):
             position=position,
             normal=normal,
             depth=depth,
-            fingerprint=0,
+            fingerprint=tid,
             centered_position=centered_position,
             X_ws_voxel_shape=X_ws_shape,
             aabb_lower_voxel=aabb_lower,
@@ -936,50 +980,48 @@ def test_centered_two_spatial_depths_prefers_inner_then_outer(test, device):
             reducer_data=reducer_data,
         )
 
-    for deterministic in (False, True):
-        mode = "deterministic" if deterministic else "fast"
-        reducer = GlobalContactReducer(capacity=200, device=device, deterministic=deterministic)
-        reducer_data = reducer.get_data_struct()
+    reducer = GlobalContactReducer(capacity=200, device=device)
+    reducer_data = reducer.get_data_struct()
 
-        wp.launch(
-            store_two_depth_contact_kernel,
-            dim=1,
-            inputs=[reducer_data, 0.0, -0.01, 1],
-            device=device,
-        )
-        test.assertEqual(get_contact_count(reducer), 1, mode)
+    wp.launch(
+        store_two_depth_contact_kernel,
+        dim=1,
+        inputs=[reducer_data, 0.0, -0.01, 1],
+        device=device,
+    )
+    test.assertEqual(get_contact_count(reducer), 1)
 
-        wp.launch(
-            store_two_depth_contact_kernel,
-            dim=1,
-            inputs=[reducer_data, 0.1, 0.05, 2],
-            device=device,
-        )
+    wp.launch(
+        store_two_depth_contact_kernel,
+        dim=1,
+        inputs=[reducer_data, 0.1, 0.05, 2],
+        device=device,
+    )
 
-        test.assertEqual(get_contact_count(reducer), 1, mode)
-        winners = get_winning_contacts(reducer)
-        fingerprints = {int(reducer.contact_fingerprints.numpy()[cid]) for cid in winners}
-        test.assertIn(1, fingerprints, f"Inner contact should win over an outer directional contact ({mode})")
-        test.assertNotIn(2, fingerprints, f"Outer directional contact should be a fallback only ({mode})")
-        test.assertEqual(get_active_slot_count(reducer), 2, f"Only normal and voxel entries should be active ({mode})")
+    test.assertEqual(get_contact_count(reducer), 1)
+    winners = get_winning_contacts(reducer)
+    fingerprints = {int(reducer.contact_fingerprints.numpy()[cid]) for cid in winners}
+    test.assertIn(1, fingerprints, "Inner contact should win over an outer directional contact")
+    test.assertNotIn(2, fingerprints, "Outer directional contact should be a fallback only")
+    test.assertEqual(get_active_slot_count(reducer), 2, "Only normal and voxel entries should be active")
 
-        outer_reducer = GlobalContactReducer(capacity=200, device=device, deterministic=deterministic)
-        outer_reducer_data = outer_reducer.get_data_struct()
-        wp.launch(
-            store_two_depth_contact_kernel,
-            dim=1,
-            inputs=[outer_reducer_data, 0.1, 0.05, 2],
-            device=device,
-        )
+    outer_reducer = GlobalContactReducer(capacity=200, device=device)
+    outer_reducer_data = outer_reducer.get_data_struct()
+    wp.launch(
+        store_two_depth_contact_kernel,
+        dim=1,
+        inputs=[outer_reducer_data, 0.1, 0.05, 2],
+        device=device,
+    )
 
-        test.assertEqual(get_contact_count(outer_reducer), 1, mode)
-        outer_winners = get_winning_contacts(outer_reducer)
-        outer_fingerprints = {int(outer_reducer.contact_fingerprints.numpy()[cid]) for cid in outer_winners}
-        test.assertIn(2, outer_fingerprints, f"Outer contact should win when no inner contact exists ({mode})")
+    test.assertEqual(get_contact_count(outer_reducer), 1)
+    outer_winners = get_winning_contacts(outer_reducer)
+    outer_fingerprints = {int(outer_reducer.contact_fingerprints.numpy()[cid]) for cid in outer_winners}
+    test.assertIn(2, outer_fingerprints, "Outer contact should win when no inner contact exists")
 
 
 def test_centered_two_spatial_depths_voxel_only_claim(test, device):
-    """A contact without a normal-slot win may claim an unpublished voxel entry; later ties allocate nothing."""
+    """A contact that raises only a new voxel entry's slot is buffered; a later tie raises nothing and is not."""
 
     @wp.kernel(module="unique")
     def reduce_kernel(
@@ -988,8 +1030,9 @@ def test_centered_two_spatial_depths_voxel_only_claim(test, device):
         fingerprint: int,
         result: wp.array[wp.int32],
     ):
-        # Identical normal-bin scores for every call: only the first caller wins the
-        # normal slots, later callers tie and lose them. ``position_local`` selects
+        # Identical normal-bin scores for every call, so the fingerprint decides the
+        # normal slots: callers are offered in descending fingerprint order, so the
+        # first wins them and later callers tie and lose them. ``position_local`` selects
         # the voxel group (resolution 8 along x: cells 0-6 share group 0, cell 7 is group 1).
         result[0] = export_and_reduce_contact_centered_two_spatial_depths(
             shape_a=0,
@@ -1023,28 +1066,32 @@ def test_centered_two_spatial_depths_voxel_only_claim(test, device):
         return int(result.numpy()[0])
 
     # First contact wins every normal slot and publishes voxel group 0.
-    test.assertEqual(run(wp.vec3(-0.99, 0.0, 0.0), 1), 1)
+    test.assertEqual(run(wp.vec3(-0.99, 0.0, 0.0), 3), 1)
     test.assertEqual(get_contact_count(reducer), 1)
     test.assertEqual(get_active_slot_count(reducer), 2)
 
-    # Same scores, so no normal-slot win, but voxel group 1 is unpublished:
-    # the contact allocates an ID and claims that voxel slot.
+    # Same scores and a lower fingerprint, so no normal-slot win, but voxel group 1
+    # is new: the contact raises that voxel slot, so it is buffered.
     test.assertEqual(run(wp.vec3(0.99, 0.0, 0.0), 2), 2)
     test.assertEqual(get_contact_count(reducer), 2)
     test.assertEqual(get_active_slot_count(reducer), 3)
     test.assertEqual(get_winning_contacts(reducer), [1, 2])
 
-    # Once the voxel entry exists, a tying contact loses everywhere and must
-    # not allocate an ID.
-    test.assertEqual(run(wp.vec3(0.99, 0.0, 0.0), 3), -1)
+    # Once the voxel entry exists, a tying contact of a lower fingerprint raises
+    # no slot and must not allocate an ID.
+    test.assertEqual(run(wp.vec3(0.99, 0.0, 0.0), 1), -1)
     test.assertEqual(get_contact_count(reducer), 2)
     test.assertEqual(get_active_slot_count(reducer), 3)
     test.assertEqual(get_winning_contacts(reducer), [1, 2])
     test.assertEqual(int(reducer.reclaimed_contact_bits.numpy().sum()), 0)
 
 
-def test_centered_two_spatial_depths_full_buffer_does_not_publish_voxel_key(test, device):
-    """Avoid publishing a voxel key when contact allocation is exhausted."""
+def test_centered_two_spatial_depths_full_buffer_exports_nothing(test, device):
+    """A candidate that raises its slots but finds no buffer row leaves them unresolved: they export nothing.
+
+    The candidate raises its slots before it is buffered (it is buffered only if it raised one), so its normal and
+    voxel entries are both inserted; with the buffer full no record names their winner, and no other contact may.
+    """
 
     @wp.kernel(module="unique")
     def exhaust_then_reduce_kernel(reducer_data: GlobalContactReducerData, result: wp.array[wp.int32]):
@@ -1081,9 +1128,12 @@ def test_centered_two_spatial_depths_full_buffer_does_not_publish_voxel_key(test
 
     test.assertEqual(int(result.numpy()[0]), -1)
     test.assertEqual(get_contact_count(reducer), 1)
-    test.assertEqual(get_active_slot_count(reducer), 1)
+    test.assertEqual(int(reducer.buffer_overflows.numpy()[0]), 1)
+    test.assertEqual(get_active_slot_count(reducer), 2)
     test.assertEqual(int(reducer.ht_insert_failures.numpy()[0]), 0)
     test.assertEqual(get_winning_contacts(reducer), [])
+    # Every slot it raised (its NUM_SPATIAL_DIRECTIONS + 1 normal-bin slots and its voxel slot) keeps its key.
+    test.assertEqual(get_unresolved_slot_count(reducer), NUM_SPATIAL_DIRECTIONS + 2)
 
 
 def test_centered_two_spatial_depths_closing_far_side_keeps_its_extremes(test, device):
@@ -1119,18 +1169,15 @@ def test_centered_two_spatial_depths_closing_far_side_keeps_its_extremes(test, d
     # A body touching at x = 0 and rocking onto its far side at x = 0.1, 1 mm away and closing faster than 1 mm a
     # step: the far side must keep a row, or it lands a substep's travel deep. Without closing it stays separated
     # and the touching side holds every extreme.
-    for deterministic in (False, True):
-        for closing, expected in ((True, {1, 2}), (False, {1})):
-            reducer = GlobalContactReducer(capacity=200, device=device, deterministic=deterministic)
-            reducer_data = reducer.get_data_struct()
-            wp.launch(store_step_end_contact_kernel, dim=1, inputs=[reducer_data, 0.0, -0.01, -0.01, 1], device=device)
-            step_end = -0.0005 if closing else 0.001
-            wp.launch(
-                store_step_end_contact_kernel, dim=1, inputs=[reducer_data, 0.1, 0.001, step_end, 2], device=device
-            )
-            winners = get_winning_contacts(reducer)
-            fingerprints = {int(reducer.contact_fingerprints.numpy()[cid]) for cid in winners}
-            test.assertEqual(fingerprints, expected, f"closing far side: {closing}, deterministic: {deterministic}")
+    for closing, expected in ((True, {1, 2}), (False, {1})):
+        reducer = GlobalContactReducer(capacity=200, device=device)
+        reducer_data = reducer.get_data_struct()
+        wp.launch(store_step_end_contact_kernel, dim=1, inputs=[reducer_data, 0.0, -0.01, -0.01, 1], device=device)
+        step_end = -0.0005 if closing else 0.001
+        wp.launch(store_step_end_contact_kernel, dim=1, inputs=[reducer_data, 0.1, 0.001, step_end, 2], device=device)
+        winners = get_winning_contacts(reducer)
+        fingerprints = {int(reducer.contact_fingerprints.numpy()[cid]) for cid in winners}
+        test.assertEqual(fingerprints, expected, f"closing far side: {closing}")
 
 
 def test_centered_different_pairs_independent(test, device):
@@ -1186,7 +1233,7 @@ def test_centered_deepest_wins_max_depth_slot(test, device):
             position=wp.vec3(0.0, 0.0, 0.0),
             normal=wp.vec3(0.0, 1.0, 0.0),
             depth=depth,
-            fingerprint=0,
+            fingerprint=tid,
             centered_position=wp.vec3(0.0, 0.0, 0.0),
             X_ws_voxel_shape=X_ws_shape,
             aabb_lower_voxel=aabb_lower,
@@ -1241,7 +1288,7 @@ def test_centered_pre_pruning_reduces_buffer_usage(test, device):
             position=positions,
             normal=wp.vec3(0.0, 1.0, 0.0),
             depth=-0.5,
-            fingerprint=0,
+            fingerprint=tid,
             centered_position=positions,
             X_ws_voxel_shape=X_ws,
             aabb_lower_voxel=wp.vec3(-15.0, -5.0, -15.0),
@@ -1258,6 +1305,7 @@ def test_centered_pre_pruning_reduces_buffer_usage(test, device):
     def store_one_dominated_contact_kernel(
         reducer_data: GlobalContactReducerData,
         x_offset: float,
+        fingerprint: int,
     ):
         X_ws = wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity())
         export_and_reduce_contact_centered(
@@ -1266,7 +1314,7 @@ def test_centered_pre_pruning_reduces_buffer_usage(test, device):
             position=wp.vec3(x_offset, 0.0, 0.0),
             normal=wp.vec3(0.0, 1.0, 0.0),
             depth=-0.001,
-            fingerprint=0,
+            fingerprint=fingerprint,
             centered_position=wp.vec3(x_offset, 0.0, 0.0),
             X_ws_voxel_shape=X_ws,
             aabb_lower_voxel=wp.vec3(-15.0, -5.0, -15.0),
@@ -1283,7 +1331,8 @@ def test_centered_pre_pruning_reduces_buffer_usage(test, device):
         wp.launch(
             store_one_dominated_contact_kernel,
             dim=1,
-            inputs=[reducer_data, x],
+            # Later arrivals carry lower fingerprints, so a tie with an earlier one in a voxel goes to the earlier.
+            inputs=[reducer_data, x, 100 - i],
             device=device,
         )
         wp.synchronize()
@@ -1345,10 +1394,11 @@ def _store_probed_contact_kernel(reducer_data: GlobalContactReducerData, two_tie
 def test_centered_pre_prune_probes_read_their_own_rows(test, device):
     """Admit a contact whose own slots are weak while every other value is a strong winner.
 
-    Each pre-prune probe of the single-tier and two-tier centered writers reads
-    the contact's own normal-bin or voxel row before allocating a buffer slot. A
-    probe that read any other value would see a strong winner and prune it.
+    The single-tier centered writer probes, and the two-tier writer raises, the
+    contact's own normal-bin or voxel row before allocating a buffer slot. One
+    that read any other value would see a strong winner and turn it away.
     """
+    # A strong winner holds every slot with the highest key.
     strong = np.iinfo(np.uint64).max
     # (two_tier, depth, probed slots): depth -0.01 is inside both writers' inner
     # tier, 0.05 only inside the two-tier writer's outer, directional tier.
@@ -1361,35 +1411,34 @@ def test_centered_pre_prune_probes_read_their_own_rows(test, device):
         (1, 0.05, "spatial"),
         (1, -0.01, "voxel"),
     )
-    for deterministic in (False, True):
-        for two_tier, depth, probe in cases:
-            with test.subTest(deterministic=deterministic, two_tier=two_tier, depth=depth, probe=probe):
-                reducer = GlobalContactReducer(capacity=64, device=device, deterministic=deterministic)
-                inputs = [reducer.get_data_struct(), two_tier, depth]
-                # An empty table admits the contact and inserts its keys.
+    for two_tier, depth, probe in cases:
+        with test.subTest(two_tier=two_tier, depth=depth, probe=probe):
+            reducer = GlobalContactReducer(capacity=64, device=device)
+            inputs = [reducer.get_data_struct(), two_tier, depth]
+            # An empty table admits the contact and inserts its keys.
+            wp.launch(_store_probed_contact_kernel, dim=1, inputs=inputs, device=device)
+            test.assertEqual(get_contact_count(reducer), 1)
+            active = reducer.hashtable.active_slots.numpy()
+            entries = active[: active[reducer.hashtable.capacity]]
+            bins = (reducer.hashtable.keys.numpy()[entries] >> np.uint64(55)) & np.uint64(0xFF)
+            normal_entries = entries[bins < NUM_NORMAL_BINS]
+            voxel_entries = entries[bins >= NUM_NORMAL_BINS]
+            test.assertEqual(len(normal_entries), 1)
+            if probe == "max_depth":
+                weak = reduction_value_index_np(normal_entries, NUM_SPATIAL_DIRECTIONS)
+            elif probe == "spatial":
+                weak = reduction_value_index_np(normal_entries[:, None], np.arange(NUM_SPATIAL_DIRECTIONS))
+            else:
+                test.assertEqual(len(voxel_entries), 1)
+                weak = reduction_value_index_np(voxel_entries[:, None], np.arange(VALUES_PER_KEY))
+            for admitted in (False, True):
+                slots = np.full(reducer.ht_values.shape[0], strong, dtype=np.uint64)
+                if admitted:
+                    slots[weak] = 0
+                reducer.ht_values.assign(slots)
+                reducer.contact_count.zero_()
                 wp.launch(_store_probed_contact_kernel, dim=1, inputs=inputs, device=device)
-                test.assertEqual(get_contact_count(reducer), 1)
-                active = reducer.hashtable.active_slots.numpy()
-                entries = active[: active[reducer.hashtable.capacity]]
-                bins = (reducer.hashtable.keys.numpy()[entries] >> np.uint64(55)) & np.uint64(0xFF)
-                normal_entries = entries[bins < NUM_NORMAL_BINS]
-                voxel_entries = entries[bins >= NUM_NORMAL_BINS]
-                test.assertEqual(len(normal_entries), 1)
-                if probe == "max_depth":
-                    weak = reduction_value_index_np(normal_entries, NUM_SPATIAL_DIRECTIONS)
-                elif probe == "spatial":
-                    weak = reduction_value_index_np(normal_entries[:, None], np.arange(NUM_SPATIAL_DIRECTIONS))
-                else:
-                    test.assertEqual(len(voxel_entries), 1)
-                    weak = reduction_value_index_np(voxel_entries[:, None], np.arange(VALUES_PER_KEY))
-                for admitted in (False, True):
-                    values = np.full(reducer.ht_values.shape[0], strong, dtype=np.uint64)
-                    if admitted:
-                        values[weak] = 0
-                    reducer.ht_values.assign(values)
-                    reducer.contact_count.zero_()
-                    wp.launch(_store_probed_contact_kernel, dim=1, inputs=inputs, device=device)
-                    test.assertEqual(get_contact_count(reducer), int(admitted))
+                test.assertEqual(get_contact_count(reducer), int(admitted))
 
 
 # =============================================================================
@@ -1409,129 +1458,92 @@ def ifloat_flip(u: wp.uint32) -> float: ...
 def float_flip_roundtrip_kernel(
     values_in: wp.array[float],
     values_out: wp.array[float],
-    truncated_out: wp.array[wp.uint32],
-    score_shift: int,
 ):
-    """Apply float_flip, clear low bits, then ifloat_flip to measure precision loss."""
+    """Apply float_flip, then ifloat_flip."""
     tid = wp.tid()
-    f = values_in[tid]
-    flipped = float_flip(f)
-    truncated = (flipped >> wp.uint32(score_shift)) << wp.uint32(score_shift)
-    reconstructed = ifloat_flip(truncated)
-    values_out[tid] = reconstructed
-    truncated_out[tid] = truncated
+    values_out[tid] = ifloat_flip(float_flip(values_in[tid]))
 
 
 class TestFloatFlipPrecision(unittest.TestCase):
-    """Test float_flip / ifloat_flip roundtrip precision with the SCORE_SHIFT used in contact reduction."""
+    """Test float_flip and the slot keys built on it."""
 
     pass
 
 
-def test_float_flip_roundtrip_precision(test, device):
-    """Validate that ifloat_flip((float_flip(f) >> SCORE_SHIFT) << SCORE_SHIFT) preserves
-    order and maintains relative precision ~2^-(23-SCORE_SHIFT)."""
-    score_shift = SCORE_SHIFT
-    mantissa_bits_kept = 23 - score_shift
-    max_relative_error = 2.0 ** (-mantissa_bits_kept)  # ~1.22e-4
+@wp.kernel(enable_backward=False)
+def _contact_key_kernel(
+    scores: wp.array[float],
+    fingerprint: int,
+    keys_out: wp.array[wp.uint64],
+    outer_out: wp.array[wp.uint64],
+    inner_out: wp.array[wp.uint64],
+    reconstructed_out: wp.array[float],
+):
+    tid = wp.tid()
+    key = contact_key(scores[tid], fingerprint)
+    keys_out[tid] = key
+    outer_out[tid] = spatial_contact_key(scores[tid], False, fingerprint)
+    inner_out[tid] = spatial_contact_key(scores[tid], True, fingerprint)
+    reconstructed_out[tid] = ifloat_flip(wp.uint32(key >> wp.uint64(31)))
 
-    # --- Build test values spanning actual score ranges ---
+
+def test_contact_key_keeps_full_precision(test, device):
+    """A slot ranks a candidate by its full float score, then its fingerprint: every distinct score has its own key.
+
+    The key keeps all 32 bits of ``float_flip(score)`` above the 31-bit fingerprint, so neighboring floats stay apart,
+    ``ifloat_flip`` recovers the score exactly, and no fingerprint lifts a lower score over a higher one; a prioritized
+    directional slot ranks every inner candidate above every outer one.
+    """
     # Depth scores: -depth in [0.0001, 0.1]
     depth_scores = np.linspace(0.0001, 0.1, 200, dtype=np.float32)
     # Spatial scores: dot(pos_2d, dir_2d) in [-10, +10]
     spatial_scores = np.linspace(-10.0, 10.0, 600, dtype=np.float32)
-    # Dense sweep around 1.0 to probe distinguishability
-    dense_sweep = np.linspace(0.999, 1.001, 100, dtype=np.float32)
-    # Edge cases
-    edge_cases = np.array(
-        [0.0, -0.0, 1e-6, -1e-6, 1e-4, -1e-4, 1.0, -1.0, 100.0, -100.0],
-        dtype=np.float32,
-    )
+    # Adjacent floats: the smallest score differences a key must keep apart
+    neighbors = np.concatenate(
+        [
+            [x, np.nextafter(x, np.float32(np.inf)), np.nextafter(x, np.float32(-np.inf))]
+            for x in np.array([1.0, -1.0, 1.0e-4, -1.0e-4, 10.0], dtype=np.float32)
+        ]
+    ).astype(np.float32)
+    edge_cases = np.array([0.0, 1e-6, -1e-6, 100.0, -100.0, 1e6, -1e6], dtype=np.float32)
 
-    all_values = np.concatenate([depth_scores, spatial_scores, dense_sweep, edge_cases])
-    n = len(all_values)
-
-    values_in = wp.array(all_values, dtype=float, device=device)
-    values_out = wp.zeros(n, dtype=float, device=device)
-    truncated_out = wp.zeros(n, dtype=wp.uint32, device=device)
-
-    wp.launch(
-        float_flip_roundtrip_kernel,
-        dim=n,
-        inputs=[values_in, values_out, truncated_out, score_shift],
-        device=device,
-    )
-
-    orig = all_values
-    recon = values_out.numpy()
-    trunc = truncated_out.numpy()
-
-    # --- 1. Roundtrip for +0.0 (positive zero roundtrips exactly;
-    #     -0.0 maps to a tiny negative via float_flip, which is fine) ---
-    pos_zero_mask = (orig == 0.0) & ~np.signbit(orig)
-    if np.any(pos_zero_mask):
-        test.assertTrue(
-            np.all(recon[pos_zero_mask] == 0.0),
-            "Positive zero must roundtrip exactly",
+    scores = np.unique(np.concatenate([depth_scores, spatial_scores, neighbors, edge_cases]))
+    n = len(scores)
+    by_fingerprint = {}
+    for fingerprint in (0, 5, _FINGERPRINT_MASK):
+        keys = wp.zeros(n, dtype=wp.uint64, device=device)
+        outer = wp.zeros(n, dtype=wp.uint64, device=device)
+        inner = wp.zeros(n, dtype=wp.uint64, device=device)
+        reconstructed = wp.zeros(n, dtype=float, device=device)
+        wp.launch(
+            _contact_key_kernel,
+            dim=n,
+            inputs=[wp.array(scores, dtype=float, device=device), fingerprint],
+            outputs=[keys, outer, inner, reconstructed],
+            device=device,
         )
+        keys_np = keys.numpy()
+        by_fingerprint[fingerprint] = keys_np
 
-    # --- 2. Relative error bound ---
-    nonzero_mask = np.abs(orig) > 1e-30
-    rel_err = np.abs(recon[nonzero_mask] - orig[nonzero_mask]) / np.abs(orig[nonzero_mask])
-    worst_rel = float(np.max(rel_err))
-    test.assertLessEqual(
-        worst_rel,
-        max_relative_error,
-        f"Worst relative error {worst_rel:.6e} exceeds 2^-{mantissa_bits_kept} = {max_relative_error:.6e}",
-    )
+        # Sorted distinct scores map to strictly increasing keys: no two scores share one.
+        test.assertTrue(np.all(keys_np[:-1] < keys_np[1:]), "contact_key must order every distinct score strictly")
+        test.assertTrue(np.all(keys_np >> np.uint64(63) == 0), "an unprioritized key has no priority bit")
+        np.testing.assert_array_equal(keys_np & np.uint64(_FINGERPRINT_MASK), fingerprint)
+        np.testing.assert_array_equal(reconstructed.numpy(), scores)
 
-    # --- 3. Order preservation (monotonicity) ---
-    sorted_idx = np.argsort(orig)
-    sorted_orig = orig[sorted_idx]
-    sorted_trunc = trunc[sorted_idx]
-    violations = 0
-    for i in range(len(sorted_orig) - 1):
-        if sorted_orig[i] < sorted_orig[i + 1] and sorted_trunc[i] > sorted_trunc[i + 1]:
-            violations += 1
-    test.assertEqual(violations, 0, f"Order violations: {violations}")
+        # The outer (unprioritized) spatial key is the plain key; every inner key beats every outer one.
+        np.testing.assert_array_equal(outer.numpy(), keys_np)
+        inner_np = inner.numpy()
+        test.assertTrue(np.all(inner_np[:-1] < inner_np[1:]))
+        test.assertLess(int(outer.numpy().max()), int(inner_np.min()))
 
-    # --- 4. Distinguishability at the precision floor ---
-    # Two values separated by more than 2^-(mantissa_bits_kept) relative
-    # to their magnitude must produce different truncated values.
-    base = np.float32(1.0)
-    eps_distinguishable = np.float32(2.0 ** (-mantissa_bits_kept + 1))  # 2x the LSB
-    pair = np.array([base, base + eps_distinguishable], dtype=np.float32)
-    pair_in = wp.array(pair, dtype=float, device=device)
-    pair_out = wp.zeros(2, dtype=float, device=device)
-    pair_trunc = wp.zeros(2, dtype=wp.uint32, device=device)
-    wp.launch(
-        float_flip_roundtrip_kernel,
-        dim=2,
-        inputs=[pair_in, pair_out, pair_trunc, score_shift],
-        device=device,
-    )
-    t = pair_trunc.numpy()
-    test.assertNotEqual(
-        int(t[0]),
-        int(t[1]),
-        f"Values {pair[0]} and {pair[1]} (eps={eps_distinguishable:.6e}) must produce different truncated values",
-    )
-
-    # --- 5. Sign correctness: all negatives map below all positives ---
-    neg_mask = orig < 0
-    pos_mask = orig > 0
-    if np.any(neg_mask) and np.any(pos_mask):
-        max_neg_trunc = int(np.max(trunc[neg_mask]))
-        min_pos_trunc = int(np.min(trunc[pos_mask]))
-        test.assertLess(
-            max_neg_trunc,
-            min_pos_trunc,
-            "All negative truncated values must be less than all positive truncated values",
-        )
+    # At one score the higher fingerprint wins; across scores the score decides, whatever the fingerprints.
+    test.assertTrue(np.all(by_fingerprint[0] < by_fingerprint[5]))
+    test.assertTrue(np.all(by_fingerprint[_FINGERPRINT_MASK][:-1] < by_fingerprint[0][1:]))
 
 
 def test_float_flip_exact_inverse(test, device):
-    """Verify ifloat_flip(float_flip(f)) == f exactly (no truncation)."""
+    """Verify ifloat_flip(float_flip(f)) == f exactly."""
     values = np.array(
         [0.0, -0.0, 1.0, -1.0, 0.5, -0.5, 3.14159, -2.71828, 1e-6, -1e-6, 1e6, -1e6, 42.0],
         dtype=np.float32,
@@ -1539,15 +1551,8 @@ def test_float_flip_exact_inverse(test, device):
     n = len(values)
     values_in = wp.array(values, dtype=float, device=device)
     values_out = wp.zeros(n, dtype=float, device=device)
-    truncated_out = wp.zeros(n, dtype=wp.uint32, device=device)
 
-    # Use score_shift=0 for exact roundtrip (no bits cleared)
-    wp.launch(
-        float_flip_roundtrip_kernel,
-        dim=n,
-        inputs=[values_in, values_out, truncated_out, 0],
-        device=device,
-    )
+    wp.launch(float_flip_roundtrip_kernel, dim=n, inputs=[values_in, values_out], device=device)
 
     orig = values
     recon = values_out.numpy()
@@ -1664,118 +1669,251 @@ def test_compact_sort_key_bit_layout(test, device):
 
 
 # =============================================================================
-# Deterministic packing function tests
+# Reduction slot rule tests
 # =============================================================================
 
 
-class TestDeterministicPacking(unittest.TestCase):
-    """Test deterministic contact value packing and unpacking."""
+class TestReductionSlots(unittest.TestCase):
+    """Test the rule that decides a reduction slot's holder: score, then fingerprint, never arrival order."""
 
     pass
 
 
 @wp.kernel(enable_backward=False)
-def _det_pack_unpack_kernel(
+def _offer_candidates_kernel(
     scores: wp.array[float],
     fingerprints: wp.array[int],
     contact_ids: wp.array[int],
-    packed_out: wp.array[wp.uint64],
-    unpacked_ids_out: wp.array[int],
+    order: wp.array[int],
+    values: wp.array[wp.uint64],
+    won_out: wp.array[wp.int32],
+    key_out: wp.array[wp.uint64],
 ):
-    tid = wp.tid()
-    packed = _make_contact_value_det(scores[tid], fingerprints[tid], contact_ids[tid])
-    packed_out[tid] = packed
-    unpacked_ids_out[tid] = _unpack_contact_id_det(packed)
+    """Offer candidates to slot 0 one after another, in ``order``, recording whether each raised it; then resolve.
+
+    Every candidate visits the slot in the resolve pass (in ``order`` too); the slot's key names its winner.
+    """
+    for k in range(order.shape[0]):
+        c = order[k]
+        raised = reduction_try_update_slot(0, 0, contact_key(scores[c], fingerprints[c]), values)
+        won_out[k] = wp.where(raised, 1, 0)
+    key_out[0] = values[0]
+    for k in range(order.shape[0]):
+        c = order[k]
+        reduction_resolve_slot(0, fingerprints[c], contact_ids[c], values)
 
 
-def test_det_pack_unpack_roundtrip(test, device):
-    """Verify contact_id survives pack/unpack roundtrip in deterministic mode."""
-    n = 5
-    scores = wp.array([0.1, 0.5, -0.01, 1.0, 0.0], dtype=float, device=device)
-    fps = wp.array([0, 100, 999999, 42, 0], dtype=int, device=device)
-    ids = wp.array([0, 1, 1048575, 500, 12345], dtype=int, device=device)
-    packed = wp.zeros(n, dtype=wp.uint64, device=device)
-    unpacked = wp.zeros(n, dtype=int, device=device)
-
-    wp.launch(_det_pack_unpack_kernel, dim=n, inputs=[scores, fps, ids, packed, unpacked], device=device)
-
-    ids_np = ids.numpy()
-    unpacked_np = unpacked.numpy()
-    for i in range(n):
-        expected = ids_np[i] & ((1 << 20) - 1)
-        test.assertEqual(
-            unpacked_np[i],
-            expected,
-            f"Roundtrip failed for contact_id={ids_np[i]}: got {unpacked_np[i]}, expected {expected}",
-        )
-
-
-def test_det_packing_score_dominates(test, device):
-    """Verify that higher score always produces a larger packed value."""
-    n = 2
-    # Same fingerprint and contact_id, different scores
-    scores = wp.array([0.1, 0.5], dtype=float, device=device)
-    fps = wp.array([42, 42], dtype=int, device=device)
-    ids = wp.array([10, 10], dtype=int, device=device)
-    packed = wp.zeros(n, dtype=wp.uint64, device=device)
-    unpacked = wp.zeros(n, dtype=int, device=device)
-
-    wp.launch(_det_pack_unpack_kernel, dim=n, inputs=[scores, fps, ids, packed, unpacked], device=device)
-
-    packed_np = packed.numpy()
-    test.assertLess(packed_np[0], packed_np[1], "Higher score should produce larger packed value")
+def _offer_candidates(device, scores, fingerprints, contact_ids, order):
+    """Offer candidates to an empty slot in ``order``; return the holder's (fingerprint, contact ID), key and raises."""
+    values = wp.zeros(1, dtype=wp.uint64, device=device)
+    won = wp.zeros(len(order), dtype=wp.int32, device=device)
+    key = wp.zeros(1, dtype=wp.uint64, device=device)
+    wp.launch(
+        _offer_candidates_kernel,
+        dim=1,
+        inputs=[
+            wp.array(scores, dtype=float, device=device),
+            wp.array(fingerprints, dtype=int, device=device),
+            wp.array(contact_ids, dtype=int, device=device),
+            wp.array(order, dtype=int, device=device),
+            values,
+        ],
+        outputs=[won, key],
+        device=device,
+    )
+    held_key = int(key.numpy()[0])
+    resolved = int(values.numpy()[0])
+    return (held_key & _FINGERPRINT_MASK, int(slot_ids(resolved))), held_key, won.numpy().tolist()
 
 
-def test_det_packing_fingerprint_breaks_tie(test, device):
-    """Verify that fingerprint breaks ties when scores are equal."""
-    n = 2
-    # Same score and contact_id, different fingerprints
-    scores = wp.array([0.5, 0.5], dtype=float, device=device)
-    fps = wp.array([10, 20], dtype=int, device=device)
-    ids = wp.array([5, 5], dtype=int, device=device)
-    packed = wp.zeros(n, dtype=wp.uint64, device=device)
-    unpacked = wp.zeros(n, dtype=int, device=device)
+def test_slot_higher_score_wins(test, device):
+    """The highest score holds the slot, whatever its fingerprint, contact ID or arrival."""
+    scores = [0.1, 0.5, 0.3]
+    fingerprints = [9, 1, 5]
+    contact_ids = [3, 1, 2]
+    for order in ([0, 1, 2], [2, 1, 0], [1, 0, 2]):
+        holder, _, _ = _offer_candidates(device, scores, fingerprints, contact_ids, order)
+        test.assertEqual(holder, (1, 1), f"order {order}")
 
-    wp.launch(_det_pack_unpack_kernel, dim=n, inputs=[scores, fps, ids, packed, unpacked], device=device)
 
-    packed_np = packed.numpy()
-    test.assertNotEqual(packed_np[0], packed_np[1], "Different fingerprints should produce different packed values")
-    test.assertLess(packed_np[0], packed_np[1], "Higher fingerprint should produce larger packed value")
+def test_slot_fingerprint_breaks_tie(test, device):
+    """At an equal score the highest fingerprint holds the slot, whatever its contact ID or arrival."""
+    scores = [0.5, 0.5, 0.5]
+    fingerprints = [10, 30, 20]
+    # The winner carries the lowest contact ID, so neither the ID nor the arrival can decide it.
+    contact_ids = [3, 1, 2]
+    for order in ([0, 1, 2], [2, 1, 0], [1, 0, 2], [0, 2, 1]):
+        holder, _, won = _offer_candidates(device, scores, fingerprints, contact_ids, order)
+        test.assertEqual(holder, (30, 1), f"order {order}")
+        # Once the highest fingerprint holds the slot, no later tie raises it.
+        test.assertEqual(won[order.index(1) + 1 :], [0] * (len(order) - order.index(1) - 1), f"order {order}")
+
+
+def test_slot_resolve_names_the_winner(test, device):
+    """The resolve gives a slot the contact ID of the candidate whose fingerprint its key holds, and only that.
+
+    A loser's resolve leaves the key, a resolved slot keeps its contact whoever visits it after, and a slot whose
+    winner is never buffered (never visits it) keeps its key, which names no contact.
+    """
+    scores = [0.5, 0.25, 0.75]
+    fingerprints = [4, 8, 2]
+    contact_ids = [7, 9, 5]
+    # Every candidate visits, the losers before and after the winner: the winner's ID only.
+    holder, key, won = _offer_candidates(device, scores, fingerprints, contact_ids, [0, 1, 2])
+    test.assertEqual(holder, (2, 5))
+    test.assertEqual(won, [1, 0, 1])
+    test.assertNotEqual(key >> SLOT_FINGERPRINT_BITS, 0, "a key's score field is never zero")
+    # The same candidate offering its key again raises nothing: it would be buffered twice.
+    _, _, won = _offer_candidates(device, [0.5, 0.5], [4, 4], [7, 7], [0, 1])
+    test.assertEqual(won, [1, 0])
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def resolve_unbuffered_winner(values: wp.array[wp.uint64], ids_out: wp.array[wp.int32]):
+        # The winner (fingerprint 3) raises the slot but finds no buffer row; the buffered loser cannot claim it.
+        reduction_update_slot(0, 0, contact_key(0.5, 3), values)
+        reduction_update_slot(0, 0, contact_key(0.25, 6), values)
+        reduction_resolve_slot(0, 6, 11, values)
+        ids_out[0] = slot_contact_id(values[0])
+        # An empty slot stays empty.
+        reduction_resolve_slot(1, 6, 11, values)
+        ids_out[1] = wp.int32(values[1])
+
+    values = wp.zeros(2, dtype=wp.uint64, device=device)
+    ids = wp.full(2, -1, dtype=wp.int32, device=device)
+    wp.launch(resolve_unbuffered_winner, dim=1, inputs=[values], outputs=[ids], device=device)
+    test.assertEqual(ids.numpy().tolist(), [0, 0])
+    test.assertEqual(int(values.numpy()[0]) & _FINGERPRINT_MASK, 3)
 
 
 @wp.kernel(enable_backward=False)
-def _det_preprune_probe_kernel(
-    scores: wp.array[float],
-    fingerprints: wp.array[int],
-    probes_out: wp.array[wp.uint64],
+def _slot_open_kernel(
+    held: int,
+    held_score: float,
+    held_fingerprint: int,
+    score: float,
+    fingerprint: int,
+    values: wp.array[wp.uint64],
+    open_out: wp.array[wp.int32],
 ):
+    held_key = wp.uint64(0)
+    if held != 0:
+        held_key = contact_key(held_score, held_fingerprint)
+        reduction_update_slot(0, 0, held_key, values)
+    is_open = reduction_slot_open(0, 0, contact_key(score, fingerprint), values)
+    open_out[0] = wp.where(is_open, 1, 0)
+    # The probe leaves the slot as it was.
+    open_out[1] = wp.where(values[0] == held_key, 1, 0)
+
+
+def test_slot_open_probe(test, device):
+    """reduction_slot_open admits a candidate exactly where its offer would raise the slot above the holder."""
+    # (holder score, fingerprint, or None for an empty slot), candidate (score, fingerprint), open
+    cases = (
+        (None, (0.5, 3), True),
+        ((0.4, 9), (0.5, 3), True),
+        ((0.6, 1), (0.5, 3), False),
+        ((0.5, 4), (0.5, 3), False),
+        ((0.5, 2), (0.5, 3), True),
+        # The same candidate already holding the slot: probing it again must not admit a second copy.
+        ((0.5, 3), (0.5, 3), False),
+    )
+    for holder, (score, fingerprint), expected in cases:
+        with test.subTest(held=holder, candidate=(score, fingerprint)):
+            held_score, held_fingerprint = holder if holder is not None else (0.0, 0)
+            values = wp.zeros(1, dtype=wp.uint64, device=device)
+            result = wp.zeros(2, dtype=wp.int32, device=device)
+            wp.launch(
+                _slot_open_kernel,
+                dim=1,
+                inputs=[int(holder is not None), held_score, held_fingerprint, score, fingerprint, values],
+                outputs=[result],
+                device=device,
+            )
+            test.assertEqual(result.numpy().tolist(), [int(expected), 1])
+
+
+@wp.kernel(enable_backward=False, module="unique")
+def _reduce_tied_candidates_kernel(
+    reducer_data: GlobalContactReducerData,
+    fingerprints: wp.array[int],
+    shape_transform: wp.array[wp.transform],
+    aabb_lower: wp.array[wp.vec3],
+    aabb_upper: wp.array[wp.vec3],
+    voxel_res: wp.array[wp.vec3i],
+):
+    """Reduce candidates that differ only by their fingerprint, so they tie in every slot they reach."""
     tid = wp.tid()
-    probes_out[tid] = _make_preprune_probe_det(scores[tid], fingerprints[tid])
+    export_and_reduce_contact(
+        shape_a=0,
+        shape_b=1,
+        position=wp.vec3(0.2, 0.0, -0.1),
+        normal=wp.vec3(0.0, 1.0, 0.0),
+        depth=-0.01,
+        fingerprint=fingerprints[tid],
+        reducer_data=reducer_data,
+        beta=0.001,
+        shape_transform=shape_transform,
+        shape_collision_aabb_lower=aabb_lower,
+        shape_collision_aabb_upper=aabb_upper,
+        shape_voxel_resolution=voxel_res,
+    )
 
 
-def test_det_preprune_probe_is_ceiling(test, device):
-    """Verify that the preprune probe is >= any packed value with the same score and fingerprint."""
-    n = 1
-    score = wp.array([0.5], dtype=float, device=device)
-    fp = wp.array([42], dtype=int, device=device)
-    probe = wp.zeros(n, dtype=wp.uint64, device=device)
-    wp.launch(_det_preprune_probe_kernel, dim=n, inputs=[score, fp, probe], device=device)
+def test_tied_candidates_order_independent(test, device):
+    """Tied candidates offered in two different orders leave the same winner, the highest fingerprint, in every slot.
 
-    # Pack with same score/fp but various contact_ids
-    ids_to_test = [0, 1, 100, 500000, (1 << 20) - 1]
-    for cid in ids_to_test:
-        ids_arr = wp.array([cid], dtype=int, device=device)
-        packed = wp.zeros(1, dtype=wp.uint64, device=device)
-        unpacked = wp.zeros(1, dtype=int, device=device)
-        wp.launch(_det_pack_unpack_kernel, dim=1, inputs=[score, fp, ids_arr, packed, unpacked], device=device)
+    Contact IDs follow the arrival order, so a slot decided by the ID (as a packed ``score | contact_id`` with an
+    atomic max did) would keep the last arrival, a different candidate in each order; the key holds the fingerprint
+    instead, and the resolve names the contact that carries it.
+    """
+    shape_transform = wp.array([wp.transform_identity()] * 2, dtype=wp.transform, device=device)
+    aabb_lower = wp.full(2, wp.vec3(-1.0), dtype=wp.vec3, device=device)
+    aabb_upper = wp.full(2, wp.vec3(1.0), dtype=wp.vec3, device=device)
+    voxel_res = wp.full(2, wp.vec3i(4, 4, 4), dtype=wp.vec3i, device=device)
+    orders = ([40, 10, 30, 20], [20, 30, 10, 40])
 
-        probe_val = int(probe.numpy()[0])
-        packed_val = int(packed.numpy()[0])
-        test.assertGreaterEqual(
-            probe_val,
-            packed_val,
-            f"Preprune probe should be >= packed value for contact_id={cid}",
+    winners_by_order = []
+    for fingerprints in orders:
+        reducer = GlobalContactReducer(capacity=16, device=device)
+        wp.launch(
+            _reduce_tied_candidates_kernel,
+            dim=len(fingerprints),
+            inputs=[
+                reducer.get_data_struct(),
+                wp.array(fingerprints, dtype=int, device=device),
+                shape_transform,
+                aabb_lower,
+                aabb_upper,
+                voxel_res,
+            ],
+            device=device,
         )
+        test.assertEqual(get_contact_count(reducer), len(fingerprints))
+        # Before the resolve every raised slot holds the highest fingerprint's key.
+        keys = reducer.ht_values.numpy()
+        active = reducer.hashtable.active_slots.numpy()
+        entries = active[: active[reducer.hashtable.capacity]]
+        held = {
+            (int(reducer.hashtable.keys.numpy()[entry]), slot): int(keys[reduction_value_index_np(entry, slot)])
+            for entry in entries
+            for slot in range(VALUES_PER_KEY)
+            if keys[reduction_value_index_np(entry, slot)] != 0
+        }
+        test.assertTrue(held)
+        test.assertEqual({key & _FINGERPRINT_MASK for key in held.values()}, {max(fingerprints)})
+        # The resolve names that candidate in every one of them.
+        fingerprint_of = reducer.contact_fingerprints.numpy()
+        winners = {}
+        for (entry, slot), value in active_winner_slots(reducer).items():
+            contact_id = int(slot_ids(value))
+            test.assertNotEqual(contact_id, 0, "every slot's winner is buffered and resolves it")
+            winners[(int(reducer.hashtable.keys.numpy()[entry]), slot)] = int(fingerprint_of[contact_id])
+        test.assertEqual(set(winners), set(held))
+        test.assertTrue(winners)
+        test.assertEqual(set(winners.values()), {max(fingerprints)}, f"arrival order {fingerprints}")
+        winners_by_order.append(winners)
+
+    test.assertEqual(winners_by_order[0], winners_by_order[1])
 
 
 # =============================================================================
@@ -1784,13 +1922,13 @@ def test_det_preprune_probe_is_ceiling(test, device):
 
 
 class TestDeterministicEndToEnd(unittest.TestCase):
-    """End-to-end test that deterministic mode produces identical contacts across runs."""
+    """End-to-end test that reduction produces identical contacts across runs."""
 
     pass
 
 
 def test_deterministic_identical_across_runs(test, device):
-    """Create a deterministic reducer, collide the same scene N times, assert identical winners.
+    """Reduce the same scene N times, assert identical winners.
 
     Compares winning contacts by their geometric content (position, depth,
     fingerprint) rather than buffer contact IDs, since IDs are assigned by
@@ -1798,7 +1936,7 @@ def test_deterministic_identical_across_runs(test, device):
     """
     num_runs = 5
     all_contact_sets = []
-    reducer = GlobalContactReducer(capacity=500, device=device, deterministic=True)
+    reducer = GlobalContactReducer(capacity=500, device=device)
     reducer_data = reducer.get_data_struct()
 
     for _ in range(num_runs):
@@ -1831,34 +1969,23 @@ def test_deterministic_identical_across_runs(test, device):
         wp.launch(store_contacts_det_kernel, dim=100, inputs=[reducer_data], device=device)
 
         # Extract winning contacts by geometric content (not by contact ID)
-        values = reducer.ht_values.numpy()
-        capacity = reducer.hashtable.capacity
-        active_slots_np = reducer.hashtable.active_slots.numpy()
-        count = active_slots_np[capacity]
+        test.assertEqual(get_unresolved_slot_count(reducer), 0, "every slot's winner is buffered")
         pd_np = reducer.position_depth.numpy()
         fp_np = reducer.contact_fingerprints.numpy()
 
-        seen_ids = set()
         contact_set = set()
-        for i in range(count):
-            entry_idx = active_slots_np[i]
-            for slot in range(reducer.values_per_key):
-                val = values[reduction_value_index_np(entry_idx, slot)]
-                if val != 0:
-                    contact_id = int(val) & ((1 << 20) - 1)
-                    if contact_id not in seen_ids:
-                        seen_ids.add(contact_id)
-                        pd = pd_np[contact_id]
-                        fp = int(fp_np[contact_id])
-                        # Round to avoid floating-point noise from storage
-                        key = (
-                            round(float(pd[0]), 5),
-                            round(float(pd[1]), 5),
-                            round(float(pd[2]), 5),
-                            round(float(pd[3]), 5),
-                            fp,
-                        )
-                        contact_set.add(key)
+        for contact_id in get_winning_contacts(reducer):
+            pd = pd_np[contact_id]
+            fp = int(fp_np[contact_id])
+            # Round to avoid floating-point noise from storage
+            key = (
+                round(float(pd[0]), 5),
+                round(float(pd[1]), 5),
+                round(float(pd[2]), 5),
+                round(float(pd[3]), 5),
+                fp,
+            )
+            contact_set.add(key)
 
         all_contact_sets.append(contact_set)
 
@@ -1907,8 +2034,8 @@ add_function_test(
 )
 add_function_test(
     TestGlobalContactReducer,
-    "test_centered_two_spatial_depths_full_buffer_does_not_publish_voxel_key",
-    test_centered_two_spatial_depths_full_buffer_does_not_publish_voxel_key,
+    "test_centered_two_spatial_depths_full_buffer_exports_nothing",
+    test_centered_two_spatial_depths_full_buffer_exports_nothing,
     devices=devices,
 )
 add_function_test(
@@ -1956,8 +2083,8 @@ add_function_test(
 )
 add_function_test(
     TestFloatFlipPrecision,
-    "test_float_flip_roundtrip_precision",
-    test_float_flip_roundtrip_precision,
+    "test_contact_key_keeps_full_precision",
+    test_contact_key_keeps_full_precision,
     devices=devices,
 )
 add_function_test(
@@ -1985,23 +2112,22 @@ add_function_test(
     TestMakeContactSortKey, "test_sort_key_overflow_masking", test_sort_key_overflow_masking, devices=devices
 )
 
-# Deterministic packing tests
+# Reduction slot rule tests
+add_function_test(TestReductionSlots, "test_slot_higher_score_wins", test_slot_higher_score_wins, devices=devices)
 add_function_test(
-    TestDeterministicPacking, "test_det_pack_unpack_roundtrip", test_det_pack_unpack_roundtrip, devices=devices
+    TestReductionSlots, "test_slot_fingerprint_breaks_tie", test_slot_fingerprint_breaks_tie, devices=devices
 )
 add_function_test(
-    TestDeterministicPacking, "test_det_packing_score_dominates", test_det_packing_score_dominates, devices=devices
-)
-add_function_test(
-    TestDeterministicPacking,
-    "test_det_packing_fingerprint_breaks_tie",
-    test_det_packing_fingerprint_breaks_tie,
+    TestReductionSlots,
+    "test_slot_resolve_names_the_winner",
+    test_slot_resolve_names_the_winner,
     devices=devices,
 )
+add_function_test(TestReductionSlots, "test_slot_open_probe", test_slot_open_probe, devices=devices)
 add_function_test(
-    TestDeterministicPacking,
-    "test_det_preprune_probe_is_ceiling",
-    test_det_preprune_probe_is_ceiling,
+    TestReductionSlots,
+    "test_tied_candidates_order_independent",
+    test_tied_candidates_order_independent,
     devices=devices,
 )
 
@@ -2010,7 +2136,7 @@ add_function_test(
     TestDeterministicEndToEnd,
     "test_deterministic_identical_across_runs",
     test_deterministic_identical_across_runs,
-    devices=[device for device in devices if device.is_cuda],  # deterministic mode targets CUDA
+    devices=devices,
 )
 
 

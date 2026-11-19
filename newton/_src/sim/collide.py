@@ -49,7 +49,6 @@ from ..geometry.contact_reduction_body_pairs import (
     build_reduction_group_bound,
     build_reduction_groups,
 )
-from ..geometry.contact_reduction_global import CONTACT_ID_BITS
 from ..geometry.contact_sort import ContactSorter
 from ..geometry.differentiable_contacts import launch_differentiable_contact_augment
 from ..geometry.flags import MeshProperties, ShapeFlags
@@ -1744,25 +1743,11 @@ def _resolve_auto_triangle_pairs(
     estimate: _TrianglePairCountEstimate,
     *,
     has_reducer: bool,
-    deterministic: bool,
     speculative: bool,
     hashtable_size_factor: float,
 ) -> int:
-    """Apply route limits to an automatic estimate and warn about clipping or large allocations."""
+    """Warn about large allocations of an automatic estimate."""
     capacity = estimate.capacity
-    # Deterministic reduction packs reducer buffer indices into CONTACT_ID_BITS.
-    packing_limit = (1 << int(CONTACT_ID_BITS)) - 1
-    if has_reducer and deterministic and capacity > packing_limit:
-        warnings.warn(
-            f"CollisionPipeline estimated max_triangle_pairs={capacity:,} but deterministic contact reduction "
-            f"(deterministic=True or contact matching) supports at most {packing_limit:,}, so mesh contacts may "
-            "be dropped. Split the worlds across pipelines, or disable determinism and contact matching if "
-            "acceptable.",
-            NewtonWarning,
-            stacklevel=3,
-        )
-        capacity = packing_limit
-
     allocation_bytes = _triangle_pair_allocation_bytes(capacity, hashtable_size_factor, has_reducer, speculative)
     if allocation_bytes >= _TRIANGLE_PAIRS_LARGE_BUFFER_BYTES:
         legacy_bytes = _triangle_pair_allocation_bytes(
@@ -1786,13 +1771,13 @@ def _triangle_pair_allocation_bytes(
     capacity: int, hashtable_size_factor: float, has_reducer: bool, speculative: bool
 ) -> int:
     """Return the bytes the narrow phase allocates for a triangle-pair capacity."""
-    # Triangle-pair slot (12 B). With reduction: reducer contact slot (40 B), and per hashtable
-    # entry a key, an active-slot index, and one value per reduction slot (68 B).
+    # Triangle-pair slot (12 B). With reduction: reducer contact slot (40 B) and the entries it competed in (8 B),
+    # and per hashtable entry a key, an active-slot index, and one value per reduction slot (68 B).
     if not has_reducer:
         return capacity * 12
     hashtable_entries = 1 << (max(int(capacity * hashtable_size_factor), 1024) - 1).bit_length()
     reclaim_bytes = (capacity // 32 + 1) * 4 if speculative else 0
-    return capacity * 52 + hashtable_entries * 68 + reclaim_bytes
+    return capacity * 60 + hashtable_entries * 68 + reclaim_bytes
 
 
 def _compute_per_world_shape_pairs_max(model: Model) -> int:
@@ -3238,7 +3223,6 @@ class CollisionPipeline:
                         triangle_pair_estimate,
                         # Mirrors NarrowPhase: the global reducer exists only for reduced mesh routes.
                         has_reducer=self.reduce_contacts and (has_meshes or has_heightfields),
-                        deterministic=deterministic,
                         speculative=self._speculative_enabled,
                         hashtable_size_factor=contact_reduction_hashtable_size_factor,
                     )

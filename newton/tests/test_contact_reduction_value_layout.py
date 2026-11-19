@@ -15,9 +15,9 @@ from newton._src.geometry.contact_reduction_global import (
     VALUES_PER_KEY,
     VALUES_STRIDE,
     GlobalContactReducer,
-    reduction_finalize_slot,
     reduction_insert_slot,
-    reduction_rollback_slot,
+    reduction_resolve_slot,
+    reduction_slot_open,
     reduction_try_update_slot,
     reduction_update_slot,
     reduction_value_index,
@@ -26,10 +26,14 @@ from newton._src.geometry.contact_reduction_global import (
 from newton._src.geometry.hashtable import HASHTABLE_EMPTY_KEY
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
-_UPDATE, _TRY_UPDATE, _FINALIZE, _ROLLBACK, _INSERT = range(5)
-_BACKGROUND = 1
-_PROVISIONAL = 3
-_WRITTEN = 5
+_UPDATE, _TRY, _OPEN, _INSERT, _RESOLVE = range(5)
+# Keys (score field << 31 | fingerprint): distinct fingerprints and scores, so a misplaced or merged key shows; the
+# written key outranks the background one.
+_BACKGROUND_FINGERPRINT = 7
+_BACKGROUND = (3 << 31) | _BACKGROUND_FINGERPRINT
+_WRITTEN = (5 << 31) | 6
+# The contact ID a resolve gives the background key's candidate (score field zero).
+_RESOLVED_ID = 42
 
 
 @wp.kernel(enable_backward=False)
@@ -48,29 +52,43 @@ def _apply_accessor(
     values: wp.array2d[wp.uint64],
     keys: wp.array2d[wp.uint64],
     active_slots: wp.array2d[wp.int32],
-    returned: wp.array[wp.uint64],
+    returned: wp.array2d[wp.int32],
 ):
     case = wp.tid()
     row = values[case]
     entry = entries[case]
     slot = slots[case]
     written = wp.uint64(_WRITTEN)
-    provisional = wp.uint64(_PROVISIONAL)
+    first = False
+    second = False
     if mode == _UPDATE:
         reduction_update_slot(entry, slot, written, row)
-    elif mode == _TRY_UPDATE:
-        returned[case] = reduction_try_update_slot(entry, slot, written, row)
-    elif mode == _FINALIZE:
-        if reduction_finalize_slot(entry, slot, provisional, written, row):
-            returned[case] = wp.uint64(1)
-    elif mode == _ROLLBACK:
-        reduction_rollback_slot(entry, slot, provisional, written, row)
+    elif mode == _TRY:
+        # The first offer raises the slot; the same key again raises nothing.
+        first = reduction_try_update_slot(entry, slot, written, row)
+        second = reduction_try_update_slot(entry, slot, written, row)
+    elif mode == _OPEN:
+        # A probe admits a higher key, turns away the key the slot holds, and writes nothing.
+        first = reduction_slot_open(entry, slot, written, row)
+        second = reduction_slot_open(entry, slot, wp.uint64(_BACKGROUND), row)
+    elif mode == _INSERT:
+        first = reduction_insert_slot(wp.uint64(entry + 1), slot, written, keys[case], row, active_slots[case])
     else:
-        reduction_insert_slot(wp.uint64(entry + 1), slot, written, keys[case], row, active_slots[case])
+        idx = reduction_value_index(entry, slot)
+        # Another fingerprint leaves the key; the key's own fingerprint names the slot's contact.
+        reduction_resolve_slot(idx, _BACKGROUND_FINGERPRINT + 1, _RESOLVED_ID + 1, row)
+        reduction_resolve_slot(idx, _BACKGROUND_FINGERPRINT, _RESOLVED_ID, row)
+        # A resolved slot is left alone.
+        reduction_resolve_slot(idx, _BACKGROUND_FINGERPRINT, _RESOLVED_ID + 2, row)
+    returned[case, 0] = wp.where(first, 1, 0)
+    returned[case, 1] = wp.where(second, 1, 0)
 
 
 def test_value_index_is_a_bijection(test, device):
-    """Map each (entry, slot) of the table to its own value, covering every value once."""
+    """Map each (entry, slot) of the table to its own slot, covering every slot once.
+
+    A row is ``VALUES_STRIDE`` one-word (uint64) slots: one 64-byte line per key.
+    """
     capacity = 64
     hits = wp.zeros(capacity * VALUES_STRIDE, dtype=int, device=device)
     indices = wp.zeros((capacity, VALUES_STRIDE), dtype=int, device=device)
@@ -79,17 +97,21 @@ def test_value_index_is_a_bijection(test, device):
     entries, slots = np.meshgrid(np.arange(capacity), np.arange(VALUES_STRIDE), indexing="ij")
     np.testing.assert_array_equal(indices.numpy(), reduction_value_index_np(entries, slots))
 
+    test.assertEqual(VALUES_STRIDE * np.dtype(np.uint64).itemsize, 64)
     reducer = GlobalContactReducer(capacity=4096, device=device)
     test.assertEqual(reducer.values_per_key, VALUES_PER_KEY)
     test.assertEqual(reducer.values_per_key, 7)
     test.assertEqual(reducer.values_stride, VALUES_STRIDE)
+    test.assertEqual(reducer.ht_values.dtype, wp.uint64)
     test.assertEqual(reducer.ht_values.shape[0], reducer.hashtable.capacity * VALUES_STRIDE)
+    # A slot is raised by a 64-bit atomic max: every slot must be 8-byte aligned.
+    test.assertEqual(reducer.ht_values.ptr % 8, 0)
 
 
 def test_slot_accessors_touch_only_their_cell(test, device):
-    """Write each accessor's value into the one cell its (entry, slot) names.
+    """Write each accessor's key into the one slot its (entry, slot) names.
 
-    Accessors name winner slots only, so every row's padding word keeps its value.
+    Accessors name winner slots only, so every row's padding slot keeps its word.
     """
     capacity = 4
     entries, slots = (
@@ -97,15 +119,15 @@ def test_slot_accessors_touch_only_their_cell(test, device):
     )
     cases = len(entries)
     cells = reduction_value_index_np(entries, slots)
-    for mode in (_UPDATE, _TRY_UPDATE, _FINALIZE, _ROLLBACK, _INSERT):
+    background = np.full((cases, capacity * VALUES_STRIDE), _BACKGROUND, dtype=np.uint64)
+    written = {_UPDATE: _WRITTEN, _TRY: _WRITTEN, _INSERT: _WRITTEN, _RESOLVE: _RESOLVED_ID}
+    returns = {_UPDATE: (0, 0), _TRY: (1, 0), _OPEN: (1, 0), _INSERT: (1, 0), _RESOLVE: (0, 0)}
+    for mode in (_UPDATE, _TRY, _OPEN, _INSERT, _RESOLVE):
         with test.subTest(mode=mode):
-            values = np.full((cases, capacity * VALUES_STRIDE), _BACKGROUND, dtype=np.uint64)
-            if mode in (_FINALIZE, _ROLLBACK):
-                values[np.arange(cases), cells] = _PROVISIONAL
-            values = wp.array(values, dtype=wp.uint64, device=device)
+            values = wp.array(background, dtype=wp.uint64, device=device)
             keys = wp.full((cases, capacity), HASHTABLE_EMPTY_KEY, dtype=wp.uint64, device=device)
             active_slots = wp.zeros((cases, capacity + 1), dtype=wp.int32, device=device)
-            returned = wp.zeros(cases, dtype=wp.uint64, device=device)
+            returned = wp.zeros((cases, 2), dtype=wp.int32, device=device)
             wp.launch(
                 _apply_accessor,
                 dim=cases,
@@ -126,13 +148,11 @@ def test_slot_accessors_touch_only_their_cell(test, device):
                 found = keys.numpy() == (entries + 1)[:, None].astype(np.uint64)
                 np.testing.assert_array_equal(found.sum(axis=1), 1)
                 expected_cells = reduction_value_index_np(np.argmax(found, axis=1), slots)
-            expected = np.full((cases, capacity * VALUES_STRIDE), _BACKGROUND, dtype=np.uint64)
-            expected[np.arange(cases), expected_cells] = _WRITTEN
+            expected = background.copy()
+            if mode in written:
+                expected[np.arange(cases), expected_cells] = written[mode]
             np.testing.assert_array_equal(values.numpy(), expected)
-            if mode == _TRY_UPDATE:
-                np.testing.assert_array_equal(returned.numpy(), _BACKGROUND)
-            elif mode == _FINALIZE:
-                np.testing.assert_array_equal(returned.numpy(), 1)
+            np.testing.assert_array_equal(returned.numpy(), np.tile(np.array(returns[mode]), (cases, 1)))
 
 
 _TERRAIN_FLAGS = {

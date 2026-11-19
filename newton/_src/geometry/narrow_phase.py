@@ -77,6 +77,7 @@ from ..geometry.contact_reduction_global import (
     mesh_triangle_contacts_to_reducer_kernel,
     reduce_buffered_contacts_kernel,
     reduce_buffered_contacts_speculative_kernel,
+    resolve_reduced_contacts_kernel,
     write_contact_to_reducer,
 )
 from ..geometry.contact_sort import ContactSorter
@@ -3598,7 +3599,6 @@ class NarrowPhase:
                             use_precomputed_edge_data=precomputed,
                             use_texture_sdf_only=self.mesh_sdf_texture_only,
                             use_identity_sdf_scale=self.mesh_sdf_identity_scale_only,
-                            deterministic_reduction=deterministic,
                             sdf_source=source,
                             staged_passes=staged and precomputed,
                         )
@@ -3636,7 +3636,7 @@ class NarrowPhase:
         self._mesh_sdf_staged = None
         if has_meshes and self.reduce_contacts and self.mesh_sdf_any_texture:
             self._mesh_sdf_staged = create_mesh_sdf_staged_kernels(
-                speculative, self.mesh_sdf_texture_only, self.mesh_sdf_identity_scale_only, deterministic
+                speculative, self.mesh_sdf_texture_only, self.mesh_sdf_identity_scale_only
             )
             self._mesh_sdf_staged_blocks = device_obj.sm_count * 4 if device_obj.is_cuda else 1
             self._mesh_sdf_staged_contexts = wp.zeros(
@@ -3666,7 +3666,6 @@ class NarrowPhase:
             self.global_contact_reducer = GlobalContactReducer(
                 max_triangle_pairs,
                 device=device,
-                deterministic=deterministic,
                 hashtable_size_factor=contact_reduction_hashtable_size_factor,
                 enable_contact_reclamation=speculative,
             )
@@ -5458,8 +5457,16 @@ class NarrowPhase:
                             record_tape=False,
                         )
 
-            # Export reduced contacts from hashtable
+            # Name each slot's winner, then export the reduced contacts from the hashtable.
             if self.reduce_contacts:
+                wp.launch(
+                    kernel=resolve_reduced_contacts_kernel,
+                    dim=self.total_num_threads,
+                    inputs=[reducer_data, int(self.speculative), self.total_num_threads],
+                    device=device,
+                    block_dim=self.block_dim,
+                    record_tape=False,
+                )
                 # Export has only one writer lane per block, so use a wider grid than
                 # the contact-generation kernels. On CPU, tiled kernels expose one lane.
                 effective_block_dim = min(self.block_dim, EXPORT_REDUCED_CONTACTS_BLOCK_DIM)
@@ -5485,7 +5492,6 @@ class NarrowPhase:
                     writer_data,
                     export_num_blocks,
                     int(self.block_dim > 1),
-                    int(self.global_contact_reducer.deterministic),
                 ]
                 if self._heightfield_pair_csr:
                     wp.launch_tiled(

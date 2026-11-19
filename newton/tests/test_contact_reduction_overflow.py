@@ -306,23 +306,30 @@ def test_default_capacity_holds_large_batches(test, device):
             test.assertEqual(int(np.count_nonzero(per_world == 0)), 0)
 
 
-def test_deterministic_limit_applies_only_with_reducer(test, device):
-    """Limit automatic capacity to the reducer's packing range only when a reducer exists, and say so."""
-    world_count = 1400  # about 1.4M estimated slots, above the 2**20 - 1 packing limit
+def test_deterministic_reduction_keeps_full_capacity(test, device):
+    """Size deterministic reduction and contact matching like any other reduction, above 2**20 contacts.
+
+    The reducer keeps a contact ID in a 32-bit word of its own, so no contact-ID packing limit clips the automatic
+    capacity of a deterministic pipeline.
+    """
+    world_count = 1400  # about 1.4M estimated slots, above the 2**20 - 1 limit a 20-bit contact ID imposed
     model = _tray_worlds_model(device, world_count)
-    packing_limit = (1 << 20) - 1
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", newton.NewtonWarning)
         unreduced = newton.CollisionPipeline(model, reduce_contacts=False, deterministic=True)
     test.assertIsNone(unreduced.narrow_phase.global_contact_reducer)
-    test.assertGreater(unreduced.narrow_phase.max_triangle_pairs, packing_limit)
+    capacity = unreduced.narrow_phase.max_triangle_pairs
+    test.assertGreater(capacity, (1 << 20) - 1)
 
     for kwargs in ({"deterministic": True}, {"contact_matching": "latest"}):
         with test.subTest(**kwargs):
-            with test.assertWarnsRegex(newton.NewtonWarning, r"deterministic contact reduction.*at most 1,048,575"):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", newton.NewtonWarning)
                 pipeline = newton.CollisionPipeline(model, **kwargs)
-            test.assertEqual(pipeline.narrow_phase.max_triangle_pairs, packing_limit)
+            test.assertFalse([str(w.message) for w in caught if "deterministic" in str(w.message)])
+            test.assertIsNotNone(pipeline.narrow_phase.global_contact_reducer)
+            test.assertEqual(pipeline.narrow_phase.max_triangle_pairs, capacity)
 
 
 class TestContactReductionOverflow(unittest.TestCase):
@@ -383,8 +390,8 @@ add_function_test(
 
 add_function_test(
     TestContactReductionOverflow,
-    "test_deterministic_limit_applies_only_with_reducer",
-    test_deterministic_limit_applies_only_with_reducer,
+    "test_deterministic_reduction_keeps_full_capacity",
+    test_deterministic_reduction_keeps_full_capacity,
     devices=["cpu"],
 )
 

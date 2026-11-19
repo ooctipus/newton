@@ -47,7 +47,6 @@ from .collision_core import sat_box_intersection
 from .contact_data import ContactData
 from .contact_reduction import get_slot
 from .contact_reduction_global import (
-    CONTACT_ID_BITS,
     GlobalContactReducerData,
     decode_oct,
     encode_oct,
@@ -673,12 +672,6 @@ class HydroelasticSDF:
             if config.reduce_contacts and config.pre_prune_contacts:
                 face_contact_budget = face_contact_budget * config.contact_buffer_fraction
             self.max_num_face_contacts = max(int(face_contact_budget), 64)
-            if deterministic:
-                max_det_contacts = (1 << int(CONTACT_ID_BITS)) - 1
-                # Contact IDs cannot represent a larger deterministic buffer.
-                # Bound the conservative estimate; runtime overflow reporting
-                # still catches a scene that genuinely reaches this limit.
-                self.max_num_face_contacts = min(self.max_num_face_contacts, max_det_contacts)
             self.grid_size = min(self.config.grid_size, self.max_num_face_contacts)
 
             if self.config.output_contact_surface:

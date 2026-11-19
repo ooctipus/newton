@@ -3172,7 +3172,7 @@ class TestTrianglePairCapacityEstimator(unittest.TestCase):
         self.assertEqual(self._capacity(model), expected_pairs * _TRIANGLE_PAIRS_PER_MESH_PAIR)
 
     def test_explicit_capacity_and_floor(self):
-        """Keep explicit capacities, the legacy floor, and the deterministic packing limit."""
+        """Keep explicit capacities and the legacy floor; deterministic reduction keeps the full estimate."""
         builder = newton.ModelBuilder()
         builder.add_shape_mesh(-1, mesh=_flat_mesh())
         self._boxes(builder, 3)
@@ -3181,9 +3181,12 @@ class TestTrianglePairCapacityEstimator(unittest.TestCase):
         self.assertEqual(CollisionPipeline(model, max_triangle_pairs=4096).narrow_phase.max_triangle_pairs, 4096)
         self.assertEqual(CollisionPipeline(model).narrow_phase.max_triangle_pairs, _TRIANGLE_PAIRS_MIN_CAPACITY)
         with mock.patch("newton._src.sim.collide._TRIANGLE_PAIRS_PER_MESH_PAIR", 1 << 20):
-            with self.assertWarnsRegex(newton.NewtonWarning, "deterministic contact reduction"):
+            # A contact ID has a 32-bit word of its own: no packing limit clips a deterministic reducer.
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", newton.NewtonWarning)
                 pipeline = CollisionPipeline(model, deterministic=True)
-            self.assertEqual(pipeline.narrow_phase.max_triangle_pairs, (1 << 20) - 1)
+            self.assertFalse([str(w.message) for w in caught if "deterministic" in str(w.message)])
+            self.assertEqual(pipeline.narrow_phase.max_triangle_pairs, 3 << 20)
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", newton.NewtonWarning)
                 unreduced = CollisionPipeline(model, deterministic=True, reduce_contacts=False)
