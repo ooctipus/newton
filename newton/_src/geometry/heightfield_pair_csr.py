@@ -270,7 +270,7 @@ def reduce_fallback_contacts(
     for index in range(wp.tid(), data.reducer.contact_count[0], total_threads):
         if data.raw_pair[index + 1] == -1:
             reduce_contact_in_hashtable(
-                index + 1, data.reducer, wp.static(BETA_THRESHOLD), shape_transform, lower, upper, voxels
+                index + 1, data.reducer, wp.static(BETA_THRESHOLD), shape_transform, lower, upper, voxels, 0.0, False
             )
 
 

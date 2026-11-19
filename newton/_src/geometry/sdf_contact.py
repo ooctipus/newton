@@ -2638,6 +2638,7 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
                                         voxel_res_tri,
                                         reducer_data,
                                         wp.static(reducer_deterministic),
+                                        wp.static(speculative),
                                     )
                                     if wp.static(speculative):
                                         if dist >= inner_spatial_depth:
@@ -3034,6 +3035,7 @@ def create_mesh_sdf_staged_kernels(
             shape_voxel_resolution[tri_shape],
             reducer_data,
             wp.static(reducer_deterministic),
+            wp.static(speculative),
         )
         if wp.static(speculative):
             if dist >= inner_spatial_depth:

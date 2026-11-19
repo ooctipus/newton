@@ -35,6 +35,19 @@ module (``NUM_NORMAL_BINS``, ``NUM_SPATIAL_DIRECTIONS``,
    - Ensures early detection of contacts at mesh centers
    - Prevents sudden contact jumps between frames
 
+**Under speculation** a pass predicts the window until the next one, and the slots keep what supports the pair over
+it. A candidate stands by its closest approach over the window: its gap moves linearly, so that is its depth now or its
+depth less its closing speed (rotation included) times the window, whichever is deeper. Within a normal bin the normal
+displacement of a rigid motion is affine in a point's tangent position, so the candidates whose (tangent position,
+standing) lie on the lower convex hull of the bin's candidates imply the others' non-penetration for any motion; a
+direction slot keeps the support of that hull in its direction, scoring a candidate by its projection less its
+standing (the hull's facets up to 45 degrees, steeper than any rotation a window makes), among the candidates that touch
+by the window's end. The max-depth and voxel slots keep the deepest by standing. In the buffered reduction the
+candidates touching now outrank the ones that only reach the window's end for the extremes: those rows bear the pair's
+load from the first substep, and under a soft contact a load on fewer rows sinks deeper, while a reaching row the slots
+miss costs at most what the window's reach brings. Without speculation the standing is the depth and the scores are
+the projections.
+
 **Implementation Details:**
 
 - Contacts stored in global buffer (struct of arrays: position_depth, normal, shape_pairs)
@@ -1371,6 +1384,21 @@ def export_contact_to_buffer(
 
 
 @wp.func
+def support_score(pos_2d: wp.vec2, dir_i: int, end_depth: float, speculative: bool) -> float:
+    """A candidate's score for its normal bin's direction slot ``dir_i``.
+
+    The projection of its tangent position on the slot's direction; under speculation less its standing (its closest
+    approach over the window, ``end_depth``), so the slot keeps the support of the lower hull of the bin's (tangent
+    position, standing) points: a point higher than it is further out cannot bear the pair within any rotation a window
+    makes, and loses the slot to a lower one. See the module's notes.
+    """
+    score = wp.dot(pos_2d, get_spatial_direction_2d(dir_i))
+    if speculative:
+        score -= end_depth
+    return score
+
+
+@wp.func
 def reduce_contact_in_hashtable(
     contact_id: int,
     reducer_data: GlobalContactReducerData,
@@ -1379,6 +1407,8 @@ def reduce_contact_in_hashtable(
     shape_collision_aabb_lower: wp.array[wp.vec3],
     shape_collision_aabb_upper: wp.array[wp.vec3],
     shape_voxel_resolution: wp.array[wp.vec3i],
+    closing: float,
+    speculative: bool,
 ):
     """Register a buffered contact in the reduction hashtable.
 
@@ -1401,6 +1431,13 @@ def reduce_contact_in_hashtable(
         shape_collision_aabb_lower: Per-shape local AABB lower bounds
         shape_collision_aabb_upper: Per-shape local AABB upper bounds
         shape_voxel_resolution: Per-shape voxel grid resolution
+        closing: The depth [m] the contact's points close over the pass's window (closing speed times the window,
+            rotation included; zero without speculation). The contact stands by its closest approach over the window
+            (its depth less the closing when it closes): it competes for the bin's extremes when it touches by the
+            window's end, and the depth slots rank it by that standing.
+        speculative: Whether the pass predicts its window: the extremes then keep the support of the lower hull in
+            (tangent position, standing) (:func:`support_score`), contacts touching now ahead of the ones that only
+            reach the window's end.
     """
     # Read contact data from buffer (normal is octahedral-encoded)
     pd = reducer_data.position_depth[contact_id]
@@ -1428,17 +1465,26 @@ def reduce_contact_in_hashtable(
 
     # Find or create the hashtable entry ONCE, then write directly to slots
     entry_idx = hashtable_find_or_insert(key, reducer_data.ht_keys, reducer_data.ht_active_slots)
+    # The candidate's deepest over the window: its gap moves linearly, so its closest approach is at one end.
+    end_depth = depth - wp.max(closing, 0.0)
     if entry_idx >= 0:
-        use_beta = depth < beta * wp.length(aabb_upper - aabb_lower)
+        touch = beta * wp.length(aabb_upper - aabb_lower)
+        use_beta = end_depth < touch
+        # Under speculation the rows that bear the pair now outrank the ones that only reach the window's end.
+        touching_now = depth < touch
         for dir_i in range(wp.static(NUM_SPATIAL_DIRECTIONS)):
             if use_beta:
-                dir_2d = get_spatial_direction_2d(dir_i)
-                score = wp.dot(pos_2d, dir_2d)
-                value = make_contact_value(score, fingerprint, contact_id, reducer_data.deterministic)
+                score = support_score(pos_2d, dir_i, end_depth, speculative)
+                if speculative:
+                    value = make_spatial_contact_value(
+                        score, touching_now, fingerprint, contact_id, reducer_data.deterministic
+                    )
+                else:
+                    value = make_contact_value(score, fingerprint, contact_id, reducer_data.deterministic)
                 slot_id = dir_i
                 reduction_update_slot(entry_idx, slot_id, value, reducer_data.ht_values)
 
-        max_depth_value = make_contact_value(-depth, fingerprint, contact_id, reducer_data.deterministic)
+        max_depth_value = make_contact_value(-end_depth, fingerprint, contact_id, reducer_data.deterministic)
         reduction_update_slot(entry_idx, wp.static(NUM_SPATIAL_DIRECTIONS), max_depth_value, reducer_data.ht_values)
     else:
         wp.atomic_add(reducer_data.ht_insert_failures, 0, 1)
@@ -1465,8 +1511,8 @@ def reduce_contact_in_hashtable(
 
     voxel_entry_idx = hashtable_find_or_insert(voxel_key, reducer_data.ht_keys, reducer_data.ht_active_slots)
     if voxel_entry_idx >= 0:
-        # Use -depth so atomic_max selects most penetrating (most negative depth)
-        voxel_value = make_contact_value(-depth, fingerprint, contact_id, reducer_data.deterministic)
+        # Use -depth so atomic_max selects most penetrating (most negative depth) at the window's end
+        voxel_value = make_contact_value(-end_depth, fingerprint, contact_id, reducer_data.deterministic)
         reduction_update_slot(voxel_entry_idx, voxel_local_slot, voxel_value, reducer_data.ht_values)
     else:
         wp.atomic_add(reducer_data.ht_insert_failures, 0, 1)
@@ -1499,6 +1545,8 @@ def export_and_reduce_contact(
             shape_collision_aabb_lower,
             shape_collision_aabb_upper,
             shape_voxel_resolution,
+            0.0,
+            False,
         )
 
     return contact_id
@@ -1658,20 +1706,26 @@ def _export_and_reduce_contact_centered_two_spatial_depths(
     voxel_res: wp.vec3i,
     reducer_data: GlobalContactReducerData,
     deterministic: int,
+    speculative: bool,
 ) -> int:
     """Export contact with touching-first spatial winners.
 
     Directional slots accept contacts out to ``outer_spatial_depth``, but
-    candidates that touch by the end of the step, ``step_end_depth`` inside
+    candidates that touch over the step, their closest approach inside
     ``inner_spatial_depth``, outrank the others. ``step_end_depth`` is the
     depth less the candidate's closing speed times the step (its current
-    ``depth`` when the motion is unknown), so the far side of a support that
-    a rocking body swings onto this step keeps rows. Within a tier the
-    furthest spatial projection wins; the max-depth and voxel slots take
-    contacts touching now (``depth`` inside ``inner_spatial_depth``) only.
+    ``depth`` when the motion is unknown); the closest approach is the deeper
+    of the two, so the far side of a support that a rocking body swings onto
+    this step keeps rows and a touching point that separates keeps its own.
+    Within a tier the furthest spatial projection wins, under speculation
+    less the closest approach (:func:`support_score`); the max-depth and
+    voxel slots take the contacts touching over the step and rank them by
+    their closest approach.
     """
-    use_inner = depth < inner_spatial_depth
-    step_end_inner = step_end_depth < inner_spatial_depth
+    # The candidate's deepest over the step: its gap moves linearly, so its closest approach is at one end.
+    step_end_depth = wp.min(step_end_depth, depth)
+    use_inner = step_end_depth < inner_spatial_depth
+    step_end_inner = use_inner
     use_outer = depth < outer_spatial_depth
 
     if not use_outer:
@@ -1713,9 +1767,9 @@ def _export_and_reduce_contact_centered_two_spatial_depths(
 
         if use_inner:
             if deterministic != 0:
-                max_depth_probe = _make_preprune_probe_det(-depth, fingerprint)
+                max_depth_probe = _make_preprune_probe_det(-step_end_depth, fingerprint)
             else:
-                max_depth_probe = _make_contact_value_fast(-depth, 0, 0)
+                max_depth_probe = _make_contact_value_fast(-step_end_depth, 0, 0)
             if slot_values[wp.static(NUM_SPATIAL_DIRECTIONS)] < max_depth_probe:
                 might_win = True
             if voxel_entry_idx >= 0 and voxel_slot_value < max_depth_probe:
@@ -1724,8 +1778,7 @@ def _export_and_reduce_contact_centered_two_spatial_depths(
                 might_win = True
 
         for dir_i in range(wp.static(NUM_SPATIAL_DIRECTIONS)):
-            dir_2d = get_spatial_direction_2d(dir_i)
-            score = wp.dot(pos_2d, dir_2d)
+            score = support_score(pos_2d, dir_i, step_end_depth, speculative)
             probe = make_spatial_preprune_probe(score, step_end_inner, fingerprint, deterministic)
             if slot_values[dir_i] < probe:
                 might_win = True
@@ -1733,9 +1786,9 @@ def _export_and_reduce_contact_centered_two_spatial_depths(
         wp.atomic_add(reducer_data.ht_insert_failures, 0, 1)
         if voxel_entry_idx >= 0:
             if deterministic != 0:
-                voxel_probe = _make_preprune_probe_det(-depth, fingerprint)
+                voxel_probe = _make_preprune_probe_det(-step_end_depth, fingerprint)
             else:
-                voxel_probe = _make_contact_value_fast(-depth, 0, 0)
+                voxel_probe = _make_contact_value_fast(-step_end_depth, 0, 0)
             if reducer_data.ht_values[reduction_value_index(voxel_entry_idx, voxel_local_slot)] < voxel_probe:
                 might_win = True
 
@@ -1746,8 +1799,7 @@ def _export_and_reduce_contact_centered_two_spatial_depths(
     replaced_values = replaced_values_vec_type()
     if entry_idx >= 0:
         for dir_i in range(wp.static(NUM_SPATIAL_DIRECTIONS)):
-            dir_2d = get_spatial_direction_2d(dir_i)
-            score = wp.dot(pos_2d, dir_2d)
+            score = support_score(pos_2d, dir_i, step_end_depth, speculative)
             provisional_value = make_spatial_contact_value(score, step_end_inner, fingerprint, 0, deterministic)
             previous_value = reduction_try_update_slot(entry_idx, dir_i, provisional_value, reducer_data.ht_values)
             if previous_value < provisional_value:
@@ -1755,7 +1807,7 @@ def _export_and_reduce_contact_centered_two_spatial_depths(
                 replaced_values[dir_i] = previous_value
 
         if use_inner:
-            provisional_value = make_contact_value(-depth, fingerprint, 0, deterministic)
+            provisional_value = make_contact_value(-step_end_depth, fingerprint, 0, deterministic)
             previous_value = reduction_try_update_slot(
                 entry_idx,
                 wp.static(NUM_SPATIAL_DIRECTIONS),
@@ -1767,7 +1819,7 @@ def _export_and_reduce_contact_centered_two_spatial_depths(
                 replaced_values[wp.static(NUM_SPATIAL_DIRECTIONS)] = previous_value
 
     if use_inner and voxel_entry_idx >= 0:
-        provisional_value = make_contact_value(-depth, fingerprint, 0, deterministic)
+        provisional_value = make_contact_value(-step_end_depth, fingerprint, 0, deterministic)
         previous_value = reduction_try_update_slot(
             voxel_entry_idx, voxel_local_slot, provisional_value, reducer_data.ht_values
         )
@@ -1784,14 +1836,13 @@ def _export_and_reduce_contact_centered_two_spatial_depths(
     if entry_idx >= 0:
         for dir_i in range(wp.static(NUM_SPATIAL_DIRECTIONS)):
             if not still_wins and (won_mask & (1 << dir_i)) != 0:
-                dir_2d = get_spatial_direction_2d(dir_i)
-                score = wp.dot(pos_2d, dir_2d)
+                score = support_score(pos_2d, dir_i, step_end_depth, speculative)
                 provisional_value = make_spatial_contact_value(score, step_end_inner, fingerprint, 0, deterministic)
                 if reducer_data.ht_values[reduction_value_index(entry_idx, dir_i)] == provisional_value:
                     still_wins = True
 
         if not still_wins and use_inner and (won_mask & (1 << wp.static(NUM_SPATIAL_DIRECTIONS))) != 0:
-            provisional_value = make_contact_value(-depth, fingerprint, 0, deterministic)
+            provisional_value = make_contact_value(-step_end_depth, fingerprint, 0, deterministic)
             if (
                 reducer_data.ht_values[reduction_value_index(entry_idx, wp.static(NUM_SPATIAL_DIRECTIONS))]
                 == provisional_value
@@ -1804,7 +1855,7 @@ def _export_and_reduce_contact_centered_two_spatial_depths(
         and voxel_entry_idx >= 0
         and (won_mask & (1 << wp.static(NUM_SPATIAL_DIRECTIONS + 1))) != 0
     ):
-        provisional_value = make_contact_value(-depth, fingerprint, 0, deterministic)
+        provisional_value = make_contact_value(-step_end_depth, fingerprint, 0, deterministic)
         if reducer_data.ht_values[reduction_value_index(voxel_entry_idx, voxel_local_slot)] == provisional_value:
             still_wins = True
 
@@ -1819,14 +1870,13 @@ def _export_and_reduce_contact_centered_two_spatial_depths(
         if entry_idx >= 0:
             for dir_i in range(wp.static(NUM_SPATIAL_DIRECTIONS)):
                 if (won_mask & (1 << dir_i)) != 0:
-                    dir_2d = get_spatial_direction_2d(dir_i)
-                    score = wp.dot(pos_2d, dir_2d)
+                    score = support_score(pos_2d, dir_i, step_end_depth, speculative)
                     provisional_value = make_spatial_contact_value(score, step_end_inner, fingerprint, 0, deterministic)
                     reduction_rollback_slot(
                         entry_idx, dir_i, provisional_value, replaced_values[dir_i], reducer_data.ht_values
                     )
             if use_inner and (won_mask & (1 << wp.static(NUM_SPATIAL_DIRECTIONS))) != 0:
-                provisional_value = make_contact_value(-depth, fingerprint, 0, deterministic)
+                provisional_value = make_contact_value(-step_end_depth, fingerprint, 0, deterministic)
                 reduction_rollback_slot(
                     entry_idx,
                     wp.static(NUM_SPATIAL_DIRECTIONS),
@@ -1835,7 +1885,7 @@ def _export_and_reduce_contact_centered_two_spatial_depths(
                     reducer_data.ht_values,
                 )
         if use_inner and voxel_entry_idx >= 0 and (won_mask & (1 << wp.static(NUM_SPATIAL_DIRECTIONS + 1))) != 0:
-            provisional_value = make_contact_value(-depth, fingerprint, 0, deterministic)
+            provisional_value = make_contact_value(-step_end_depth, fingerprint, 0, deterministic)
             reduction_rollback_slot(
                 voxel_entry_idx,
                 voxel_local_slot,
@@ -1847,20 +1897,19 @@ def _export_and_reduce_contact_centered_two_spatial_depths(
 
     if entry_idx >= 0:
         for dir_i in range(wp.static(NUM_SPATIAL_DIRECTIONS)):
-            dir_2d = get_spatial_direction_2d(dir_i)
-            score = wp.dot(pos_2d, dir_2d)
+            score = support_score(pos_2d, dir_i, step_end_depth, speculative)
             value = make_spatial_contact_value(score, step_end_inner, fingerprint, contact_id, deterministic)
             reduction_update_slot(entry_idx, dir_i, value, reducer_data.ht_values)
 
         if use_inner:
-            max_depth_value = make_contact_value(-depth, fingerprint, contact_id, deterministic)
+            max_depth_value = make_contact_value(-step_end_depth, fingerprint, contact_id, deterministic)
             reduction_update_slot(entry_idx, wp.static(NUM_SPATIAL_DIRECTIONS), max_depth_value, reducer_data.ht_values)
 
     if use_inner:
         if voxel_entry_idx < 0:
             voxel_entry_idx = hashtable_find_or_insert(voxel_key, reducer_data.ht_keys, reducer_data.ht_active_slots)
         if voxel_entry_idx >= 0:
-            voxel_value = make_contact_value(-depth, fingerprint, contact_id, deterministic)
+            voxel_value = make_contact_value(-step_end_depth, fingerprint, contact_id, deterministic)
             if voxel_only:
                 previous_value = reduction_try_update_slot(
                     voxel_entry_idx, voxel_local_slot, voxel_value, reducer_data.ht_values
@@ -1915,6 +1964,7 @@ def export_and_reduce_contact_centered_two_spatial_depths(
         voxel_res,
         reducer_data,
         reducer_data.deterministic,
+        False,
     )
 
 
@@ -2122,6 +2172,8 @@ def reduce_buffered_contacts_kernel(
             shape_collision_aabb_lower,
             shape_collision_aabb_upper,
             shape_voxel_resolution,
+            0.0,
+            False,
         )
 
 
@@ -2157,6 +2209,18 @@ def reduce_buffered_contacts_speculative_kernel(
         clearance = pd[3] - surface_offset_sum
         base_gap_sum = shape_gap[shape_a] + shape_gap[shape_b]
         if clearance <= base_gap_sum:
+            normal = wp.normalize(decode_oct(reducer_data.normal[contact_id]))
+            position = wp.vec3(pd[0], pd[1], pd[2])
+            closing_speed = compute_contact_approach_speed(
+                shape_a,
+                shape_b,
+                position - normal * (0.5 * pd[3] + radius_eff_a),
+                position + normal * (0.5 * pd[3] + radius_eff_b),
+                normal,
+                shape_transform,
+                shape_linear_velocity,
+                shape_angular_velocity,
+            )
             reduce_contact_in_hashtable(
                 contact_id,
                 reducer_data,
@@ -2165,6 +2229,8 @@ def reduce_buffered_contacts_speculative_kernel(
                 shape_collision_aabb_lower,
                 shape_collision_aabb_upper,
                 shape_voxel_resolution,
+                closing_speed * collision_update_dt,
+                True,
             )
         else:
             export_and_reduce_predictive_contact(
