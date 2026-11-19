@@ -592,19 +592,20 @@ class RowLaws:
         self._link_enabled.assign(self.forest.cut.enabled)
 
     # --- the slots and the friction patches, allocated with the rows ----------------------------------------------
-    def allocate(self, model, pool, phi) -> None:
+    def allocate(self, model, pool, phi, *, region_normals: bool) -> None:
         """Allocate the velocity-limit slots and the friction patch state.
 
         Args:
             model: The model.
             pool: The contact pool (its rows hold the patch state's per-contact fields).
             phi: The contact rows' patch phi view (a contact pool field).
+            region_normals: Whether any contact can hold a region normal (some body is free).
         """
         options = self.options
         arrays = self._arrays
         # Persistent state is owned by the body-pair patch builder, independently
         # of collision matching and the contact warm-start tables.
-        self.friction_patches = FrictionPatchState(model, pool.ready, phi, pool=pool)
+        self.friction_patches = FrictionPatchState(model, pool.ready, phi, pool=pool, region_normals=region_normals)
         # Joint velocity-limit buffers (per-DOF tracking). Independent from the
         # joint-position-limit buffers so the two flags can be used separately.
         # Both rows of a finite limit are allocated every step, so the velocity box

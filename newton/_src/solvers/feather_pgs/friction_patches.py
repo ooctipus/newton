@@ -159,7 +159,7 @@ class FrictionPatches:
     """Each contact's region normal in the contact's own orientation (from body B to body A, as its rows see it):
     the normal its region's carrier holds this build, along which every member's normal row acts (the region law's
     one normal: :func:`region_normal`); zero where a side of the pair is articulated, whose rows keep their own
-    normals."""
+    normals. Empty where no body of the model is free: no contact then holds one, and none is written or read."""
 
 
 @wp.struct
@@ -218,6 +218,8 @@ def region_normal(patches: FrictionPatches, c: int, normal: wp.vec3) -> wp.vec3:
     """Contact ``c``'s normal row's direction: its region's normal (:attr:`FrictionPatches.normal`), or its own
     ``normal`` where its region holds none. A region's members act along one normal on every route: its candidates in
     the region law (:mod:`.region_laws`) and its rows, so a converged row sweep and the region visit solve one law."""
+    if patches.normal.shape[0] == 0:
+        return normal
     shared = patches.normal[c]
     if wp.length_sq(shared) > 0.0:
         return shared
@@ -466,9 +468,10 @@ def _prepare_contact_fields(
     b_non_free = art_b >= 0 and inputs.is_free_rigid[art_b] == 0
     # The region law's domain: a pair of free bodies or immovable sides; its region normal is placed with its carrier
     # (_propose_region), one of its own until then.
-    patches.normal[c] = wp.vec3(0.0)
-    if not (a_non_free or b_non_free):
-        patches.normal[c] = n
+    if patches.normal.shape[0] > 0:
+        patches.normal[c] = wp.vec3(0.0)
+        if not (a_non_free or b_non_free):
+            patches.normal[c] = n
     normal_gap_limit = contact_normal_gap_limit(
         a_non_free,
         b_non_free,
@@ -1648,7 +1651,7 @@ def _propose_region(
         history = frame.history[member_start]
     frame.carrier[member_start] = first
     # The region's one normal, its carrier's, on every member in its own orientation (region_normal).
-    if wp.length_sq(patches.normal[first]) > 0.0:
+    if patches.normal.shape[0] > 0 and wp.length_sq(patches.normal[first]) > 0.0:
         shared = frame.normal[first]
         for j in range(member_start, member_stop):
             m = frame.members[j]
@@ -2021,9 +2024,12 @@ class _FrictionPatchState:
     the next build carries those regions and places their anchors anew.
     """
 
-    def __init__(self, model, capacity, phi, *, pool=None):
+    def __init__(self, model, capacity, phi, *, pool=None, region_normals=True):
         self.view = FrictionPatches()
         self.view.phi = phi
+        # Without a free body no contact holds a region normal: the view's normals stay empty, so no kernel writes or
+        # reads one (region_normal).
+        self.view.normal = wp.empty(0, dtype=wp.vec3, device=model.device)
         device = model.device
         if pool is None:
             pool = ContactPool(device=device, rows=capacity)
@@ -2053,7 +2059,7 @@ class _FrictionPatchState:
                 ContactField("point", wp.vec3),
                 ContactField("spin_arm", wp.float32),
                 ContactField("spin_phi", wp.float32),
-                ContactField("normal", wp.vec3),
+                *((ContactField("normal", wp.vec3),) if region_normals else ()),
             ),
             on_rows=self._on_view_rows,
         )

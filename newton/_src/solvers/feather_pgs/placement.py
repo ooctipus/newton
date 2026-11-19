@@ -509,7 +509,15 @@ class Placement:
             contact_fields += [ContactField(field.attr, field.dtype) for field in fields_of(ContactCarry)]
         self.contact_rows = self.contact_pool.rows(contact_fields, on_rows=self._on_contact_rows)
         # The friction patch state and the velocity-limit slots.
-        self.laws.allocate(model, self.contact_pool, self.friction_patch_phi)
+        # A contact has a region normal only where neither side is a non-free articulation's link: some body must be
+        # free (a free rigid body's, or no articulation's) for any contact to hold one.
+        body_to_articulation = self.forest.body_to_articulation
+        region_normals = (
+            body_to_articulation is None
+            or bool(self.forest.has_free_rigid_bodies)
+            or bool(np.any(body_to_articulation.numpy() < 0))
+        )
+        self.laws.allocate(model, self.contact_pool, self.friction_patch_phi, region_normals=region_normals)
         # Allocated once here: per-step allocation is forbidden under CUDA graph capture.
         arrays.allocate(WORLD_ROW_STATE, world=self.forest.world_count)
         # Contact runs of each world and block under sorted contacts (record_world_contact_runs):
