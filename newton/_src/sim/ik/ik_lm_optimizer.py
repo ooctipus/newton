@@ -811,7 +811,13 @@ class IKOptimizerLM:
 
         _template.__name__ = f"_lm_solve_tiled_{C}_{R}"
         _template.__qualname__ = f"_lm_solve_tiled_{C}_{R}"
-        _lm_solve_tiled = wp.kernel(enable_backward=False, module="unique")(_template)
+        # The normal equations are DOF x DOF (a robot's joints): Warp's own tile GEMM and Cholesky solve them, so
+        # the kernel skips libmathdx's link-time compile (37 s for a 9-DOF arm on a GB300).
+        _lm_solve_tiled = wp.kernel(
+            enable_backward=False,
+            module="unique",
+            module_options={"enable_mathdx_gemm": False, "enable_mathdx_solver": False},
+        )(_template)
 
         # late-import jcalc_* helpers to avoid circular import error
         from ...sim.articulation import (  # noqa: PLC0415
