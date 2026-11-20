@@ -1485,6 +1485,13 @@ def finalize_counts(
     )
 
 
+@wp.kernel
+def _own_pair_keys(pair_keys: wp.array[wp.int64]):
+    """Each contact its own body pair: its index."""
+    c = wp.tid()
+    pair_keys[c] = wp.int64(c)
+
+
 def row_order(admitted: np.ndarray, pair_keys: np.ndarray | None = None) -> np.ndarray:
     """A world's ``admitted`` contacts (their frame positions, ascending) in its rows' order
     (:func:`.row_slots._row_pair`): their body pairs (``pair_keys`` of the admitted contacts; each its own without)
@@ -1512,15 +1519,17 @@ def allocate_contacts(operands, device) -> None:
     worlds = values["world_slot_counter"].shape[0]
     # A thread a contact slot (past the count a thread returns): no read-back, so a graph capture holds it.
     slots = values["data"].slot.shape[0]
-    sites = np.zeros((10, ORDERED_STATES + -(-max(slots, 1) // int(RESERVE_TILE))), dtype=np.uint64)
-    sites[:, 1] = 1
+    # The scans' sites start at epoch 1 (zeroed states carry epoch 0); set on the device, not copied from the host: a
+    # capture would hold the host buffer's address, freed before any replay.
+    sites = wp.zeros((10, ORDERED_STATES + -(-max(slots, 1) // int(RESERVE_TILE))), dtype=wp.uint64, device=device)
+    sites[:, 1].fill_(1)
     blocks = 2 if device.is_cuda else 1
     values = {
         **values,
         "world_contact_first": wp.full(worlds, 2**31 - 1, dtype=wp.int32, device=device),
         "world_contact_last": wp.full(worlds, -1, dtype=wp.int32, device=device),
         "row_totals": wp.zeros((10, 1), dtype=int, device=device),
-        "sites": wp.array(sites, dtype=wp.uint64, device=device),
+        "sites": sites,
         "blocks": blocks,
         "contact_count": values["data"].count,
     }
@@ -1528,7 +1537,8 @@ def allocate_contacts(operands, device) -> None:
     # Each contact its own body pair: the scenes' contacts carry no frame.
     n = max(slots, 1)
     order = RowOrder()
-    order.pair_keys = wp.array(np.arange(n, dtype=np.int64), dtype=wp.int64, device=device)
+    order.pair_keys = wp.empty(n, dtype=wp.int64, device=device)
+    wp.launch(_own_pair_keys, dim=n, outputs=[order.pair_keys], device=device)
     order.world_contact_first, order.world_contact_last = values["world_contact_first"], values["world_contact_last"]
     for name, dtype in (("rows_frame", wp.vec4i), ("rows_before", wp.vec4i)):
         setattr(order, name, wp.zeros(n, dtype=dtype, device=device))
