@@ -33,7 +33,7 @@ from .response_operator import Lanes, TransposedResponse, WalkedRows
 from .row_inputs import RowArgument
 from .row_laws import ROW_CONTACT, ROW_JOINT_LIMIT, ROW_LAW
 from .solve_policy import block_argmax
-from .sweep import SPLIT, JacobiRows, SweepConfig, dense_tier_world, jacobi_limit_pass, jacobi_scale, jacobi_sweeps
+from .sweep import SPLIT, JacobiRows, SweepConfig, dense_tier_world, jacobi_scale, jacobi_sweeps
 from .sweep_routes import MF_GS_ABI, worlds
 from .tree_scan import WALK_BOTH, WalkClass, classes_half
 from .walk_rows import TOPOLOGY_BESIDE, RowSeeds, emit_rows
@@ -167,8 +167,8 @@ def parallel_source(tier: TierSweep) -> tuple[str, Staging]:
     ``F`` included (the leave ``F^T``). They form the matrix-free response (:class:`.TransposedResponse`: ``Z`` in
     registers and staged transposed, its step scale bounded by the column sums). It runs at most ``sweeps`` Jacobi
     sweeps (:func:`.sweep.jacobi_sweeps`: Nesterov momentum, pairs projected on their patch ring's pooled load with
-    ``linked_rows``, a world stopped under ``solve_policy``), with ``velocity_limit_pass`` the velocity limits' last
-    word, then publishes the velocity by the walk down and the impulses. With ``weighted`` contact rows step by their
+    ``linked_rows``, a velocity limit's soft threshold taken in every iterate like any row's law, a world stopped
+    under ``solve_policy``), then publishes the velocity by the walk down and the impulses. With ``weighted`` contact rows step by their
     weights (the relative regularization's; ``material``: a material contact's ``d / (d + eps)`` from the diagonal the
     tier forms). Seeded rows walk their trees by the walking ``classes``' path tables in constant memory
     (:func:`.factor.walk.walk_prelude`, the half their records share, :func:`.tree_scan.classes_half`).
@@ -181,11 +181,8 @@ def parallel_source(tier: TierSweep) -> tuple[str, Staging]:
     pitch, frame, classes, sweeps = tier.pitch, tier.frame, tier.classes, tier.levels.budget
     torsion, solve_policy, linked_rows = tier.torsion, tier.solve_policy, tier.linked_rows
     serial = device_lanes(tier.device_arch) == 1
-    velocity_limit_pass = tier.velocity_limit_pass
     laws = tier.laws
-    store = JacobiRows(
-        AM, limits=velocity_limit_pass, types=solve_policy.traces, weighted=tier.weighted, torsion=torsion
-    )
+    store = JacobiRows(AM, types=solve_policy.traces, weighted=tier.weighted, torsion=torsion)
     row_lanes = Lanes(NT)
     stored, frame = _stored_row(M_D if pitch is None else int(pitch), D), tuple(int(cap) for cap in frame)
     walked = WalkedRows(NA, NB, OA, OB, D, AM + 4, row_lanes, stored, emit, frame, len(classes))
@@ -214,8 +211,6 @@ def parallel_source(tier: TierSweep) -> tuple[str, Staging]:
     }
     loads = store.loads(**metadata, unilateral=(ROW_CONTACT, ROW_JOINT_LIMIT))
 
-    # The velocity limits' last word closes the sweeps: none without a sweep, as the serial sweeps' at no iterations.
-    last_word = jacobi_limit_pass(store, op) if velocity_limit_pass and sweeps else ""
     velocity = f"""    for (int d = lane; d < {D}; d += {NT}) {{
         const int global_dof = world_dof_indices.data[dof_map_base + d];
         s_v[d] = global_dof >= 0 ? v_out.data[global_dof] : 0.0f;
@@ -234,7 +229,6 @@ def parallel_source(tier: TierSweep) -> tuple[str, Staging]:
 
 {jacobi_sweeps(store, op, laws, sweeps=int(sweeps), pooled=bool(linked_rows))}
 
-{last_word}
 {group.phase(publish)}
     // The world queue's next world restages the shared rows: every lane has read this world's.
 {group.barrier("    ")}
@@ -271,11 +265,10 @@ class TierSweep(SweepConfig):
       prologue (:func:`_seeded_row`), else read as the one writer stored them (``pitch`` rows a world's line);
     - the rows' trees: ``inkernel_response`` ``(NA, NB, OA, OB)``, their slip capacities ``frame`` and walking
       ``classes``;
-    - ``linked_rows``: pairs project on their patch ring's pooled load; ``velocity_limit_pass``: the velocity limits'
-      last word.
+    - ``linked_rows``: pairs project on their patch ring's pooled load.
 
     A tier owns no world with free-body rows (its kernel's name carries the solver's free-body capacity
-    ``mf_max_constraints``) and admits its velocity-limit rows as unilateral rows. Its worlds' stored rows
+    ``mf_max_constraints``) and takes its velocity-limit rows in its Jacobi iteration (:data:`.sweep.JACOBI_LIMIT`). Its worlds' stored rows
     (:mod:`.walk_rows`) lie at their coordinates, ``max_world_dofs`` entries a row. A block a world, a thread a row
     (the CPU's one thread runs them as virtual lanes); its working set fits the stage budget of ``device_arch``. It
     walks its bucket of the claims' worlds (:func:`.sweep_routes.worlds`, :func:`.sweep_levels.claim_worlds`).
@@ -290,7 +283,6 @@ class TierSweep(SweepConfig):
     inkernel_response: tuple[int, int, int, int]
     emit: bool = False
     linked_rows: bool = False
-    velocity_limit_pass: bool = False
     frame: tuple[int, int] = (0, 0)
     classes: tuple[WalkClass, ...] = ()
     pitch: int | None = None
@@ -335,7 +327,6 @@ class TierSweep(SweepConfig):
             + ("" if walk_half == WALK_BOTH else f"_half{walk_half}")
             + ("" if pitch is None or pitch == self.max_constraints else f"_p{int(pitch)}")
             + ("_linked" if self.linked_rows else "")
-            + ("_lw" if self.velocity_limit_pass else "")
             + ("_weighted" if self.weighted else "")
             + ("_material" if self.material else "")
             + ("_torsion" if self.torsion else "")

@@ -53,7 +53,11 @@ CALLS = (
     # The conformance routes' configurations (32 rows, one warp), then the wider tiers and the other variants.
     ("whitened", (64, 32, 18, "120"), {"rows": 32, "levels": LevelLaw.split(112), **_INK}),
     ("whitened_linked", (64, 32, 18, "120"), {"rows": 32, "levels": LevelLaw.split(112), **_INK, "linked_rows": True}),
-    ("emit", (64, 32, 18, "120"), {"rows": 32, "levels": LevelLaw.split(112), **_INK, "emit": True, "classes": _CLASSES}),
+    (
+        "emit",
+        (64, 32, 18, "120"),
+        {"rows": 32, "levels": LevelLaw.split(112), **_INK, "emit": True, "classes": _CLASSES},
+    ),
     (
         "emit_linked",
         (64, 32, 18, "120"),
@@ -62,14 +66,14 @@ CALLS = (
     ("one_group", (64, 32, 18, "120"), {"rows": 32, "levels": LevelLaw.split(42), "inkernel_response": (18, 0, 0, 0)}),
     ("rows_64", (96, 32, 18, "120"), {"rows": 64, "levels": LevelLaw.split(60), **_INK}),
     (
-        "rows_96_last_word",
+        "rows_96_linked",
         (96, 32, 18, "120"),
-        {"rows": 96, "levels": LevelLaw.split(73), **_INK, "linked_rows": True, "velocity_limit_pass": True},
+        {"rows": 96, "levels": LevelLaw.split(73), **_INK, "linked_rows": True},
     ),
     (
         "rows_128",
         (128, 32, 18, "120"),
-        {"rows": 128, "levels": LevelLaw.split(84), **_INK, "linked_rows": True, "velocity_limit_pass": True},
+        {"rows": 128, "levels": LevelLaw.split(84), **_INK, "linked_rows": True},
     ),
 )
 """``(label, arguments, options)`` of the factory: the conformance routes' tiers and the other variants."""

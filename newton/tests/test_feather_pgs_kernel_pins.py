@@ -50,20 +50,14 @@ def _label(name, args, kwargs):
 
 
 def _linked_tier_calls():
-    """Linked parallel tiers, whose friction pairs pool their patch ring's normal impulses.
-
-    Each also with the last-word velocity-limit pass, which the solver builds for linked tiers with joint velocity
-    limits.
-    """
-    for rows, last_word in itertools.product((32, 48), (False, True)):
+    """Linked parallel tiers, whose friction pairs pool their patch ring's normal impulses."""
+    for rows in (32, 48):
         kwargs = {
             "rows": rows,
             "levels": LevelLaw.split(24),
             "inkernel_response": (18, 0, 0, 0),
             "linked_rows": True,
         }
-        if last_word:
-            kwargs["velocity_limit_pass"] = True
         yield "sweep_routes_tiers.TierSweep", (64, 32, 18, _ARCH), kwargs
 
 
@@ -122,13 +116,6 @@ def _suite_diagonal_sweeps():
     """Sparse-diagonal sweeps at the suite's shapes: ``(args, kwargs)``, over contact units."""
     for shape in ((1024, 114, 6, _ARCH), (256, 13, 9, _ARCH)):
         yield shape, {"speculative_contact_batches": True, "levels": LevelLaw(EXACT)}
-
-
-def _emit_last_word_calls():
-    """Linked seeded tiers with the last-word pass, which the solver builds for linked tiers with joint velocity
-    limits."""
-    for kwargs in _emit_tier_kwargs(linked=True):
-        yield (128, 32, 22, _ARCH), {**kwargs, "velocity_limit_pass": True}
 
 
 def _audit_calls():
@@ -403,14 +390,12 @@ def _suite_shape_calls():
 
 
 def _emit_tier_calls():
-    """The seeded parallel tiers of a 16+6 coordinate world, plain, linked and with the last-word pass."""
+    """The seeded parallel tiers of a 16+6 coordinate world, plain and linked."""
     for kwargs in _emit_tier_kwargs(linked=False):
         yield "sweep_routes_tiers.TierSweep[emit]", _emit_tier, (128, 32, 22, _ARCH), kwargs
     # The same rows linked into their patch rings.
     for kwargs in _emit_tier_kwargs(linked=True):
         yield "sweep_routes_tiers.TierSweep[emit]", _emit_tier, (128, 32, 22, _ARCH), kwargs
-    for args, kwargs in _emit_last_word_calls():
-        yield "sweep_routes_tiers.TierSweep[emit]", _emit_tier, args, kwargs
 
 
 def _factory_kernels():
@@ -583,9 +568,6 @@ class TestFeatherPGSKernelPins(unittest.TestCase):
         # The linked tiers are pinned.
         linked = [name for name in self.current if "linked_rows=True" in name]
         self.assertTrue(linked)
-        # Their last-word velocity-limit pass, in the plain and the seeded tiers.
-        last_word = {name.split("(", 1)[0] for name in linked if "velocity_limit_pass=True" in name}
-        self.assertEqual(last_word, {"sweep_routes_tiers.TierSweep", "sweep_routes_tiers.TierSweep[emit]"})
 
     def test_inventory_builds_the_suite_shapes(self):
         """Build every factory call at the suite's shapes; the suite's routes build them, so none may be rejected."""

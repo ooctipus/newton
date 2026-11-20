@@ -127,7 +127,6 @@ def parallel_sweep_reference(
     linked,
     omega=1.0,
     pair_step="isotropic",
-    velocity_limit_pass=False,
 ):
     """Repeat one world of the parallel tier's sweep in float64.
 
@@ -151,8 +150,7 @@ def parallel_sweep_reference(
     row where it has one, into their cone (the ring's pooled normal load when ``linked``;
     a spin row steps isotropically with its pair in the cone's scaled coordinates, its step
     the pair's times ``(mu_t / mu)^2``), restarts momentum against the last step
-    and stops once no row changes. ``velocity_limit_pass`` then pushes every violated
-    velocity-limit row onto its limit, in row order.
+    and stops once no row changes.
     """
     J, Y, Z = case["J"], case["Y"], case["Z"]
     kinds, parents, mu = case["kinds"], case["parents"], case["mu"]
@@ -168,9 +166,9 @@ def parallel_sweep_reference(
     admitted = kinds >= 0
     b = case["rhs"] + J @ v - A @ lam0
     # A joint velocity limit is one row for both sides of |v| <= mu (J = +e, rhs mu: its lower side's residual): the
-    # soft threshold of its step by its share of mu (projection_laws.velocity_limit); idle at zero within 0 <= r <= 2 mu.
+    # soft threshold of its step by its share of mu (projection_laws.velocity_limit); never idle (it counts in the bound).
     limit = (kinds == 0) & (case["types"] == ROW_JOINT_VELOCITY_LIMIT)
-    idle = (kinds == 0) & (lam0 == 0.0) & (b >= 0.0) & (~limit | (b <= 2.0 * mu))
+    idle = (kinds == 0) & (lam0 == 0.0) & (b >= 0.0) & ~limit
 
     def steps(counted):
         if matrix_free and not exact:
@@ -202,7 +200,7 @@ def parallel_sweep_reference(
     x, y, t = lam0.copy(), lam0.copy(), 1.0
     for _ in range(sweeps):
         residual = b + A @ y
-        joins = idle & ((residual < 0.0) | (limit & (residual > 2.0 * mu)))
+        joins = idle & (residual < 0.0)
         stepped = x.copy()
         for row in np.flatnonzero(admitted & ~joins):
             value = y[row] - step[row] * residual[row]
@@ -231,18 +229,6 @@ def parallel_sweep_reference(
             idle &= ~joins
             step = steps(admitted & ~idle)
             t, y = 1.0, x.copy()
-    if velocity_limit_pass:
-        # Gauss-Seidel passes over the limits alone until one changes nothing, at most a pass a row.
-        x = x.copy()
-        for _ in range(len(x)):
-            moved = False
-            for row in np.flatnonzero(limit & (diag > 0.0)):
-                residual = b[row] + A[row] @ x
-                value = _velocity_limit(x[row] - residual / diag[row], mu[row] / diag[row])
-                moved |= abs(value - x[row]) > 1.0e-14 * (abs(value) + 1.0e-14)
-                x[row] = value
-            if not moved:
-                break
     return x, v + Y.T @ (x - lam0)
 
 
@@ -763,66 +749,29 @@ class TestParallelPatchReference(unittest.TestCase):
                 self.assertAlmostEqual(-impulses[1], 0.5 * impulses[0], delta=1.0e-9)
                 self.assertEqual(impulses[2], 0.0)
 
-    def test_velocity_limit_pass_reaches_every_tier_variant(self):
-        """Stage the velocity-limit flag and append the last word to each tier variant only on request."""
-        plain_tiers = (sweep_routes_tiers.TierSweep, (_CAPACITY, 32, _DOFS, "120"))
-        seeded_tiers = (functools.partial(sweep_routes_tiers.TierSweep, emit=True), (128, 32, 22, "120"))
-        variants = {
-            "group rows": (plain_tiers, {"inkernel_response": (6, 0, 0, 0)}),
-            "seeded rows": (seeded_tiers, {"inkernel_response": (16, 6, 0, 16), "classes": tier_classes((16, 6))}),
-        }
-        for name, ((factory, args), options) in variants.items():
-            with self.subTest(variant=name):
-                settings = {"rows": 32, "levels": LevelLaw.split(24), "linked_rows": True, **options}
-                plain = factory(*args, **settings)
-                last_word = factory(*args, velocity_limit_pass=True, **settings)
-                self.assertEqual(sweep_kernel(last_word).key, sweep_kernel(plain).key + "_lw")
-                self.assertEqual((plain.velocity_limit_pass, last_word.velocity_limit_pass), (False, True))
-                text = _source(last_word)
-                self.assertNotIn("s_vlim", _source(plain))
-                self.assertEqual(text.count("s_vlim[i] = row_type == 4 ? 1 : 0;"), 1)
-                self.assertEqual(text.count("const float r_vlim = s_rhs[i] + part;"), 1)
-                # The pass runs between the final sweep and the velocity change's publish to the step's leave.
-                self.assertLess(text.index("const float r_vlim"), text.index("walk.du.data[global_dof] +="))
-                self.assertGreater(text.index("const float r_vlim"), text.index("for (; sweep <"))
+    def test_converged_tier_holds_a_pushed_limit(self):
+        """Hold the velocity limit a contact pushes past, in the Jacobi iteration alone, once it converges.
 
-    def test_solver_builds_the_pass_for_limited_linked_tiers(self):
-        """Build the last-word pass exactly for linked tiers with joint velocity limits."""
-        decide = Sweep._parallel_velocity_limit_pass
-        for limits in (False, True):
-            probe = SimpleNamespace(options=SimpleNamespace(enable_joint_velocity_limits=limits))
-            with self.subTest(limits=limits):
-                self.assertEqual(decide(probe), limits)
-
-    def test_last_word_holds_a_truncated_limit(self):
-        """Hold the limit after two sweeps with the last word, and leave a converged tier unchanged."""
+        Two sweeps leave the upper side violated by more than 0.5 (the truncated iterate); converged, the limit holds
+        to the regularized diagonal's share (cfm leaves 3e-6 of the limit)."""
         case = limited_contact_case()
         for inkernel in (False, True):
             options = {"matrix_free": True, "inkernel": inkernel, "exact": False, "nesterov": True, "tol": 0.0}
             with self.subTest(inkernel=inkernel):
                 _, truncated = parallel_sweep_reference(case, sweeps=2, linked=True, **options)
-                _, held = parallel_sweep_reference(case, sweeps=2, linked=True, velocity_limit_pass=True, **options)
+                _, converged = parallel_sweep_reference(case, sweeps=2000, linked=True, **options)
                 self.assertLess(case["rhs"][1] - case["J"][1] @ truncated, -0.5)
-                # The push divides by the regularized diagonal: cfm leaves 3e-6 of the limit.
-                self.assertGreaterEqual(case["rhs"][1] - case["J"][1] @ held, -1.0e-5 * case["rhs"][1])
-                converged, _ = parallel_sweep_reference(case, sweeps=2000, linked=True, **options)
-                unchanged, _ = parallel_sweep_reference(
-                    case, sweeps=2000, linked=True, velocity_limit_pass=True, **options
-                )
-                np.testing.assert_allclose(unchanged, converged, atol=1.0e-12)
+                self.assertGreaterEqual(case["rhs"][1] - case["J"][1] @ converged, -1.0e-5 * case["rhs"][1])
 
-    def test_last_word_holds_a_pushed_sphere_at_its_limit(self):
-        """Hold a sphere the step pushes past its limit: two sweeps hold it only with the last word, 2000 either way.
+    def test_converged_tier_holds_a_pushed_sphere_at_its_limit(self):
+        """Hold a sphere the step pushes past its limit once the tier converges; two sweeps leave it past.
 
         The rows are the first step of :func:`_pushed_sphere` as a CPU solver
         without velocity limits builds them, started from the prescaled velocity
-        the route with them predicts from, with every DOF's velocity-limit rows added
-        as the matrix-free builder writes them. Two sweeps of the matrix-free
-        linked tier (the float64 reference) leave the sphere 43 % past its limit;
-        the pass holds it to 1e-5 (1.7e-6 past: the regularized diagonal's share).
-        A sphere that starts past its limit cannot show this: the prescale puts it
-        on the limit before the solve, and two sweeps leave it 0.9 % under.
-        TestPatchParallelRoutes runs the solver's tiers on this sphere.
+        the route with them predicts from, with every DOF's velocity-limit row added
+        as the matrix-free builder writes it. Two sweeps of the matrix-free
+        linked tier (the float64 reference) leave the sphere past its limit (the truncated iterate); 2000 hold it to
+        1e-5 (the regularized diagonal's share). TestPatchParallelRoutes runs the solver's tiers on this sphere.
         """
         model = _pushed_sphere("cpu")
         limits = model.joint_velocity_limit.numpy().astype(np.float64)
@@ -833,13 +782,12 @@ class TestParallelPatchReference(unittest.TestCase):
         case = with_velocity_limit_rows(world_case(solver)[0], mass_matrix, limits, solver.options.pgs_cfm)
         options = {"matrix_free": True, "inkernel": False, "exact": False, "nesterov": True, "tol": 0.0, "linked": True}
         speeds = {}
-        for sweeps, last_word in itertools.product((2, 2000), (False, True)):
-            _, velocity = parallel_sweep_reference(case, sweeps=sweeps, velocity_limit_pass=last_word, **options)
-            speeds[sweeps, last_word] = float(np.max(np.abs(velocity[:2])))
+        for sweeps in (2, 2000):
+            _, velocity = parallel_sweep_reference(case, sweeps=sweeps, **options)
+            speeds[sweeps] = float(np.max(np.abs(velocity[:2])))
         limit = float(limits[0])
-        self.assertGreater(speeds[2, False], 1.05 * limit, f"two sweeps already hold the limit: {speeds}")
-        for key in ((2, True), (2000, False), (2000, True)):
-            self.assertLessEqual(speeds[key], limit * (1.0 + 1.0e-5), (key, speeds))
+        self.assertGreater(speeds[2], 1.05 * limit, f"two sweeps already hold the limit: {speeds}")
+        self.assertLessEqual(speeds[2000], limit * (1.0 + 1.0e-5), speeds)
 
 
 def _cpu_arm():
@@ -1300,12 +1248,11 @@ class TestParallelPatchKernel(unittest.TestCase):
                 else:
                     self.assertAlmostEqual(-impulses[1], 0.5 * impulses[0], delta=1.0e-5)
 
-    def test_last_word_holds_a_truncated_tier_at_the_limit(self):
-        """Exit a tier stopped after two sweeps within its velocity limit, and change a converged one by 1e-6 at most.
+    def test_tier_follows_the_reference_and_holds_a_converged_limit(self):
+        """Follow the float64 reference with a velocity-limit row at two sweeps and at 2000, and hold the limit there.
 
-        The last word pushes the limit row that the contact's impulse drove past its limit
-        back onto it (relative 1e-5); with 2000 sweeps the limit holds already, and the
-        pass leaves the impulses within 1e-6.
+        Two sweeps leave the limit the contact's impulse drove past violated (the truncated iterate, more than 1.5
+        times the limit); 2000 hold it to a relative 1e-5.
         """
         device = wp.get_device("cuda:0")
         arch = str(device.arch)
@@ -1314,32 +1261,27 @@ class TestParallelPatchKernel(unittest.TestCase):
         for sweeps in (2, 2000):
             options = {"matrix_free": True, "inkernel": True, "exact": False, "nesterov": True}
             with self.subTest(sweeps=sweeps):
-                results = {}
-                for last_word in (False, True):
-                    kernel = sweep_routes_tiers.TierSweep(
-                        _CAPACITY,
-                        32,
-                        _DOFS,
-                        arch,
-                        rows=32,
-                        levels=LevelLaw.split(sweeps),
-                        inkernel_response=(_DOFS, 0, 0, 0),
-                        linked_rows=True,
-                        velocity_limit_pass=last_word,
-                    )
-                    impulses, velocity = _launch_parallel(kernel, case, device=device)
-                    expected, expected_velocity = parallel_sweep_reference(
-                        case, sweeps=sweeps, tol=0.0, linked=True, velocity_limit_pass=last_word, **options
-                    )
-                    np.testing.assert_allclose(impulses, expected, rtol=1.0e-4, atol=1.0e-5)
-                    np.testing.assert_allclose(velocity, expected_velocity, rtol=1.0e-4, atol=1.0e-5)
-                    results[last_word] = impulses.astype(np.float64), velocity.astype(np.float64)
-                speed = case["J"][1] @ results[True][1]  # qd_3
-                self.assertLessEqual(speed, limit * (1.0 + 1.0e-5))
+                kernel = sweep_routes_tiers.TierSweep(
+                    _CAPACITY,
+                    32,
+                    _DOFS,
+                    arch,
+                    rows=32,
+                    levels=LevelLaw.split(sweeps),
+                    inkernel_response=(_DOFS, 0, 0, 0),
+                    linked_rows=True,
+                )
+                impulses, velocity = _launch_parallel(kernel, case, device=device)
+                expected, expected_velocity = parallel_sweep_reference(
+                    case, sweeps=sweeps, tol=0.0, linked=True, **options
+                )
+                np.testing.assert_allclose(impulses, expected, rtol=1.0e-4, atol=1.0e-5)
+                np.testing.assert_allclose(velocity, expected_velocity, rtol=1.0e-4, atol=1.0e-5)
+                speed = case["J"][1] @ velocity.astype(np.float64)  # qd_3
                 if sweeps == 2:
-                    self.assertGreater(case["J"][1] @ results[False][1], 1.5 * limit)
+                    self.assertGreater(speed, 1.5 * limit)
                 else:
-                    np.testing.assert_allclose(results[True][0], results[False][0], atol=1.0e-6)
+                    self.assertLessEqual(speed, limit * (1.0 + 1.0e-5))
 
 
 _STATE_FIELDS = ("joint_q", "joint_qd", "body_q", "body_qd")
@@ -1628,22 +1570,15 @@ class TestPatchParallelRoutes(unittest.TestCase):
             for name, value in kept.items():
                 np.testing.assert_array_equal(value, sorted_every_build[name], f"replay {replay}: {name}")
 
-    def test_limited_linked_tiers_take_the_last_word(self):
-        """Build the last-word pass into velocity-limited linked tiers, record it, and hold the limit.
+    def test_limited_linked_tiers_hold_the_limit(self):
+        """Hold a velocity limit in the linked tiers' Jacobi iteration, at the automatic budget and converged.
 
         A constant joint force pushes a resting sphere, whose joints are limited to
         0.5, by twice its limit within every step (:func:`_pushed_sphere`): without
-        limit rows two steps carry it past twice the limit. A sphere that starts past
-        its limit cannot show the pass, because the pre-solve prescale puts it on the
-        limit and its limit rows never bind. Only the pass promises the limit: a tier
-        without it stops where its budget leaves it, while the pass holds it to 1e-5.
-        Truncated to two sweeps, the tier without the
-        pass must leave the sphere at least 5 % past its limit, or the fixture cannot
-        show what the pass does, and the pass must hold it to 1e-5 (the reference on
-        the CPU rows of test_last_word_holds_a_pushed_sphere_at_its_limit: 43.5 % and
-        1.7e-6 past). Converged (2000 sweeps, tolerance 0), the tier's limit rows hold
-        the limit to 1e-5 without the pass, and the pass moves no velocity by more
-        than 1e-6.
+        limit rows two steps carry it past twice the limit. With them the tier's
+        Jacobi iteration takes each limit's soft threshold like any row's law and holds the limit to 1e-5 at its
+        automatic budget and at 2000 sweeps; truncated to two sweeps it leaves the sphere past (the reference:
+        test_converged_tier_holds_a_pushed_sphere_at_its_limit).
         """
         limit = 0.5
         model = _pushed_sphere("cuda:0", limit=limit)
@@ -1652,19 +1587,14 @@ class TestPatchParallelRoutes(unittest.TestCase):
                 limits: _matrix_free_solver(model, beta=0.2, parallel_rows=32, enable_joint_velocity_limits=limits)
                 for limits in (False, True)
             }
-            budgets = {
-                (sweeps, True): _matrix_free_solver(
-                    model, beta=0.2, parallel_rows=32, sweeps=sweeps, enable_joint_velocity_limits=True
-                )
-                for sweeps in (2, 2000)
-            }
+            converged = _matrix_free_solver(
+                model, beta=0.2, parallel_rows=32, sweeps=2000, enable_joint_velocity_limits=True
+            )
         for limits, solver in built.items():
             with self.subTest(limits=limits):
                 keys = [tier.kernel.key for tier in solver.sweep.tiers]
                 self.assertTrue(keys)
-                self.assertTrue(all(_law_key(key).endswith("_linked_lw" if limits else "_linked") for key in keys))
-                selected = solver.get_path_selection()
-                self.assertEqual(selected["routes"]["sweep"]["tiers"]["velocity_limit_pass"], limits)
+                self.assertTrue(all(_law_key(key).endswith("_linked") for key in keys))
                 state, _ = _rollout(model, solver, 2)
                 _assert_tier_owned(self, solver, 32)
                 for name in _STATE_FIELDS:
@@ -1674,19 +1604,11 @@ class TestPatchParallelRoutes(unittest.TestCase):
                     self.assertGreater(speed, 2.0 * limit, "the push must carry an unlimited sphere past its limit")
                 else:
                     self.assertLessEqual(speed, limit * (1.0 + 1.0e-5))
-        velocities = {}
-        for (sweeps, last_word), solver in budgets.items():
-            keys = [tier.kernel.key for tier in solver.sweep.tiers]
-            self.assertTrue(
-                keys and all(f"_sweeps{sweeps}_" in key and _law_key(key).endswith("_lw") == last_word for key in keys),
-                keys,
-            )
-            state, _ = _rollout(model, solver, 1)
-            _assert_tier_owned(self, solver, 32)
-            velocities[sweeps, last_word] = state.joint_qd.numpy().astype(np.float64)
-        speeds = {budget: float(np.max(np.abs(velocity[:2]))) for budget, velocity in velocities.items()}
-        for budget in ((2, True), (2000, True)):
-            self.assertLessEqual(speeds[budget], limit * (1.0 + 1.0e-5), (budget, speeds))
+        keys = [tier.kernel.key for tier in converged.sweep.tiers]
+        self.assertTrue(keys and all("_sweeps2000_" in key for key in keys), keys)
+        state, _ = _rollout(model, converged, 1)
+        _assert_tier_owned(self, converged, 32)
+        self.assertLessEqual(float(np.max(np.abs(state.joint_qd.numpy()[:2]))), limit * (1.0 + 1.0e-5))
 
     def test_every_tier_takes_the_automatic_budget(self):
         """Build linked tiers with the equal-accuracy budget, or a pinned one, and record it."""
@@ -1959,8 +1881,8 @@ class TestPatchParallelPhysics(unittest.TestCase):
             self.assertEqual(arms[name].spec.classes.tier_rows, rows, name)
             keys = [tier.kernel.key for tier in arms[name].sweep.tiers]
             self.assertEqual(bool(keys), bool(rows), name)
-            # Linked tiers with joint velocity limits take the last word.
-            self.assertTrue(all(_law_key(key).endswith("_linked_lw") for key in keys), keys)
+            # Linked tiers take joint velocity limits in their Jacobi iteration.
+            self.assertTrue(all(_law_key(key).endswith("_linked") for key in keys), keys)
         velocities = {}
         for name, solver in arms.items():
             state, out, control = model.state(), model.state(), model.control()

@@ -285,16 +285,6 @@ class Sweep:
             self.factor.slip_capacity(self.forest.group_to_art[size].numpy()) if size else 0 for size in (na, nb)
         )
 
-    def _parallel_velocity_limit_pass(self) -> bool:
-        """Whether the parallel tiers end with the last-word velocity-limit pass (``routes.sweep.tiers``).
-
-        The linked (patch) tiers give the joint velocity limits the last word, as the serial sweeps' end-of-iteration
-        pass gives it to them: after the final sweep one warp pushes every violated velocity-limit row back onto its
-        limit, in row order. It changes nothing once a tier converges and bounds the limit overshoot of a tier its
-        sweep budget stops early; it has rows to push only with joint velocity limits.
-        """
-        return bool(self.options.enable_joint_velocity_limits)
-
     def _parallel_tier_sweeps(self, tiers) -> tuple[list[int], str, str]:
         """Return each parallel tier's sweep budget, the rule that set it, and why (``routes.sweep.tiers``).
 
@@ -570,7 +560,6 @@ class Sweep:
                         levels=LevelLaw.split(sweeps_),
                         inkernel_response=self.classes.tiers.sizes,
                         linked_rows=True,
-                        velocity_limit_pass=self._parallel_velocity_limit_pass(),
                         frame=self._tier_frame(),
                         classes=self.factor.walk_classes,
                         pitch=self.placement.row_pitch,
@@ -1319,8 +1308,6 @@ class Sweep:
             "inkernel_response_reason": row.reasons["tiers"],
             # Every built tier projects each friction pair on its patch ring's pooled normal load (patch friction).
             "linked_rows": all(tier.config.linked_rows for tier in tiers),
-            # The last-word velocity-limit pass after the final sweep (linked tiers with joint velocity limits).
-            "velocity_limit_pass": all(tier.config.velocity_limit_pass for tier in tiers),
             # The largest tier budget; each tier records its own (the equal-accuracy rule "auto", or "pinned").
             "sweeps": max(tier.config.levels.budget for tier in tiers),
             "sweeps_rule": self.par_sweeps_rule,
