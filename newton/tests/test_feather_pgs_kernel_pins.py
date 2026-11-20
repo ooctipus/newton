@@ -547,7 +547,7 @@ class TestFeatherPGSKernelPins(unittest.TestCase):
             "sweep_levels._get_mark_independent_sparse_contact_candidates_kernel",
             "sweep_routes_tiers.TierSweep",
             "sweep_routes_tiers.TierSweep[emit]",
-            "row_slots.reserve_world_contact_rows",
+            "row_slots.reserve_world_rows",
             "walk_rows.slot_rows_kernel",
             "walk_rows.walked_rows_kernel",
         ):

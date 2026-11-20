@@ -6,7 +6,6 @@ world's rows under sorted contacts, and the counts with their capacity status.""
 
 import warp as wp
 
-from ...core.ordered_reserve import ordered_also, ordered_next, ordered_scan
 from ...sim import BodyFlags
 from .contact_filters import contact_normal_gap_limit
 from .contact_input import ContactInput
@@ -17,6 +16,16 @@ from .contact_laws import (
     contact_points,
     contact_responds,
     jacobian_entry,
+)
+from .device_preludes import (
+    lane_ballot,
+    lane_below,
+    lane_count,
+    lane_index,
+    lane_scan,
+    lane_stride,
+    lane_sum,
+    lane_sync,
 )
 from .friction_patches import FrictionPatches, patch_spin_rows
 from .row_laws import (
@@ -32,11 +41,6 @@ from .row_records import UNIT_CONTACT, unit_source
 
 # FeatherPGS takes no gradients: its kernels compile no adjoints.
 wp.set_module_options({"enable_backward": False})
-
-ROW_LISTS = wp.constant(9)
-"""The row order's lists, a scan site and a total each: the admitted contacts' rows of the four lists and the body
-pairs headed, in the frame's order (:func:`scan_frame_rows`, lists 0-4), then the pairs' rows of the four lists in the
-row order (:func:`scan_pair_rows`, lists 5-8)."""
 
 # =============================================================================
 # Multi-Articulation Contact Building Kernels
@@ -305,11 +309,10 @@ def admit_world_contacts(
     acts: wp.array[int],
     world_contact_first: wp.array[int],
     world_contact_last: wp.array[int],
-    row_totals: wp.array2d[int],
 ):
     """Classify every active contact and size its rows, a thread a contact in the frame's order (``data`` binds the
     frame's records), so its records and allocation are read and written where every later kernel reads them; its
-    rows are reserved after, in the same order (:func:`reserve_world_contact_rows`), from the range of positions each
+    rows are reserved after, in the same order (:func:`reserve_world_rows`), from the range of positions each
     world's contacts with a responding endpoint span, admitted or not (``world_contact_first``, ``world_contact_last``).
 
     A contact admitted by :func:`_admit_contact` needs 1 row for its normal and, when enabled below the friction gap
@@ -325,10 +328,6 @@ def admit_world_contacts(
     such a contact marks its world's ``acts`` word (:data:`.placement.WORLD_ACTS`; empty: no word).
     """
     c = wp.tid()
-    if c == 0:
-        # The row order's scans (scan_frame_rows, scan_pair_rows) start each of their lists from zero.
-        for k in range(ROW_LISTS):
-            row_totals[k, 0] = 0
     world = int(-1)
     if c < data.count[0]:
         world = _admit_world_contact(
@@ -349,7 +348,7 @@ def admit_world_contacts(
             twists,
             acts,
         )
-    # The world's range of frame positions, whose rows reserve_world_contact_rows reserves in order: one atomic pair
+    # The world's range of frame positions, whose rows reserve_world_rows reserves in order: one atomic pair
     # per world and warp.
     _record_world_span(world, c, world_contact_first, world_contact_last)
 
@@ -367,87 +366,38 @@ def _immovable_side(data: ContactInput, c: int) -> bool:
 # A world's first contact position before it held any.
 _NO_CONTACT = wp.constant(2**31 - 1)
 
-RESERVE_BLOCK = 512
-"""Threads of a block of the row order's scans (:func:`scan_frame_rows`, :func:`scan_pair_rows`) on CUDA. A tile is a
-block's threads, a frame position a thread: the scans' work on a position is a chain of dependent loads (a world's run,
-the pair the row order visits there, that pair's bounds), so a thread takes one. The scans compile in modules of their
-own: a module compiles once per block size it launches at, and this module's other kernels launch at Warp's default."""
+RESERVE_LANES = wp.constant(32)
+"""The lanes of a world's reservation (:func:`reserve_world_rows`): a warp on CUDA, one thread on the CPU."""
 
-
-def reserve_tiles(positions: int, device) -> int:
-    """The tile states a site of the row order's scans holds over ``positions`` frame positions: a block's threads a
-    tile on CUDA; on the CPU (a block of one thread, one position a tile) the tiles run in order and share one state
-    (:mod:`~newton._src.core.ordered_reserve`)."""
-    if not wp.get_device(device).is_cuda:
-        return 1
-    return -(-max(positions, 1) // RESERVE_BLOCK)
-
-
-def reserve_blocks(device) -> int:
-    """The blocks of the row order's scans' fixed grid: as many as the device holds at once, so every live tile has
-    its block; one on the CPU."""
-    device = wp.get_device(device)
-    return device.sm_count * (2048 // RESERVE_BLOCK) if device.is_cuda else 1
+RESERVE_BLOCK = 64
+"""Threads of a block of :func:`reserve_world_rows`: two worlds' lanes."""
 
 
 @wp.struct
 class RowOrder:
-    """The row order's records over the frame's positions (:func:`scan_frame_rows`, :func:`list_world_pairs`,
-    :func:`scan_pair_rows`): each position's body-pair key, the admitted contacts' rows of each list before it in the
-    frame's order and the body pairs headed before it (:func:`_heads_pair`), each pair's head and world by its rank
-    (``pairs``), and each pair's rows of each list before it in the row order, at its head (``rows_before``); each
-    world's first pair's rank, its pairs and the row order's stride over them (``world_pairs``)."""
+    """The row order's records over the frame's positions (:func:`reserve_world_rows`), each world's over its own run of
+    positions: each position's body-pair key; the world's span of positions (``world_contact_first``,
+    ``world_contact_last``, which the admission records); at each of its contacts the admitted contacts' rows of the
+    four lists before it in the world's frame order (``rows_frame``) and its body pair's index among the world's
+    (``pairs_before``); its ``j``-th pair's head at ``first + j`` (``pairs``); and at each pair's head the rows of each
+    list of the pairs before it in the row order (``rows_before``)."""
 
     pair_keys: wp.array[wp.int64]
     world_contact_first: wp.array[int]
     world_contact_last: wp.array[int]
-    world_pairs: wp.array[wp.vec3i]
     rows_frame: wp.array[wp.vec4i]
     pairs_before: wp.array[int]
-    pairs: wp.array[wp.vec2i]
+    pairs: wp.array[int]
     rows_before: wp.array[wp.vec4i]
 
 
 @wp.func
-def _in_run(data: ContactInput, order: RowOrder, c: int, live: int) -> bool:
-    """Whether frame position ``c`` lies in the run of positions the admission recorded for its world this step. A
-    contact the admission did not reach this step (a replay whose bound launches were skipped) has no run: its stale
-    records index nothing."""
-    if c >= live:
-        return False
-    world = data.world[c]
-    if world < 0 or world >= order.world_contact_first.shape[0]:
-        return False
-    return order.world_contact_first[world] <= c and c <= order.world_contact_last[world]
-
-
-@wp.func
-def _admitted(data: ContactInput, order: RowOrder, c: int, live: int) -> bool:
-    """Whether contact ``c`` holds rows this step: admitted (``path`` 0 or 1) inside its world's run (:func:`_in_run`)."""
-    if not _in_run(data, order, c, live):
-        return False
-    return data.path[c] >= 0
-
-
-@wp.func
-def _heads_pair(data: ContactInput, order: RowOrder, c: int, live: int) -> bool:
-    """Whether frame position ``c`` heads its body pair in its world's run (:func:`_in_run`): the run's first position
-    or a change of the frame's pair key (the keys ascend), whatever the contacts' admission. A pair's contacts share
-    their bodies, so they respond alike: a pair is in its world's run whole or not at all."""
-    if not _in_run(data, order, c, live):
-        return False
-    if c == order.world_contact_first[data.world[c]]:
-        return True
-    return order.pair_keys[c] != order.pair_keys[c - 1]
-
-
-@wp.func
-def _contact_rows(data: ContactInput, order: RowOrder, c: int, live: int) -> wp.vec4i:
-    """Contact ``c``'s rows in the reservation's four lists: (dense, free bodies') with an immovable side
-    (:func:`_immovable_side`), then (dense, free bodies') of the others; none where it holds no rows (:func:`_admitted`).
+def _contact_rows(data: ContactInput, c: int) -> wp.vec4i:
+    """World contact ``c``'s rows in the reservation's four lists: (dense, free bodies') with an immovable side
+    (:func:`_immovable_side`), then (dense, free bodies') of the others; none where it is not admitted (``path`` -1).
     """
     rows = wp.vec4i(0)
-    if _admitted(data, order, c, live):
+    if data.path[c] >= 0:
         k = int(0)
         if data.path[c] != 0:
             k = 1
@@ -457,46 +407,26 @@ def _contact_rows(data: ContactInput, order: RowOrder, c: int, live: int) -> wp.
     return rows
 
 
-@wp.kernel(enable_backward=False, module="unique")
-def scan_frame_rows(
-    data: ContactInput,
-    blocks: int,
-    sites: wp.array2d[wp.uint64],
-    order: RowOrder,
-    # outputs
-    row_totals: wp.array2d[int],
-):
-    """Count, before every frame position, the admitted contacts' rows of the four lists (:func:`_contact_rows`;
-    ``order.rows_frame``) and the body pairs headed (:func:`_heads_pair`; ``order.pairs_before``), and list each pair's
-    head and world by its rank (``order.pairs``), in the frame's order: five ordered reservations at once (lists 0-4 of ``sites``
-    and ``row_totals``, which the admission zeroed), a block scan and a decoupled look-back a tile
-    (:mod:`~newton._src.core.ordered_reserve`), parallel inside a world of any size."""
-    block, lane = wp.tid()
-    tile = wp.block_dim()
-    live = data.count[0]
-    live_tiles = (live + tile - 1) // tile
-    claim = ordered_next(sites[0], block, live_tiles, blocks, row_totals[0])
-    while claim[0] >= 0:
-        c = claim[0] * tile + lane
-        count = _contact_rows(data, order, c, live)
-        heads = int(0)
-        if _heads_pair(data, order, c, live):
-            heads = 1
-        last = int(0)
-        if claim[0] == live_tiles - 1:
-            last = 1
-        first = wp.vec4i(0)
-        first[0] = ordered_scan(sites[0], claim, count[0], last, row_totals[0])
-        also = ordered_also(claim)
-        for k in range(1, 4):
-            first[k] = ordered_scan(sites[k], also, count[k], last, row_totals[k])
-        ranked = ordered_scan(sites[4], also, heads, last, row_totals[4])
-        if c < live:
-            order.rows_frame[c] = first
-            order.pairs_before[c] = ranked
-            if heads != 0:
-                order.pairs[ranked] = wp.vec2i(c, data.world[c])
-        claim = ordered_next(sites[0], block, live_tiles, blocks, row_totals[0])
+@wp.func
+def _lane_scan4(value: wp.vec4i) -> wp.vec4i:
+    """Each list's sum of ``value`` over the group's lower lanes."""
+    return wp.vec4i(
+        lane_scan(value[0], RESERVE_LANES),
+        lane_scan(value[1], RESERVE_LANES),
+        lane_scan(value[2], RESERVE_LANES),
+        lane_scan(value[3], RESERVE_LANES),
+    )
+
+
+@wp.func
+def _lane_sum4(value: wp.vec4i) -> wp.vec4i:
+    """Each list's sum of ``value`` over the group."""
+    return wp.vec4i(
+        lane_sum(value[0], RESERVE_LANES),
+        lane_sum(value[1], RESERVE_LANES),
+        lane_sum(value[2], RESERVE_LANES),
+        lane_sum(value[3], RESERVE_LANES),
+    )
 
 
 @wp.func
@@ -518,125 +448,8 @@ def _row_stride(n: int) -> int:
     return stride
 
 
-@wp.kernel(enable_backward=False)
-def list_world_pairs(contact_count: wp.array[int], row_totals: wp.array2d[int], order: RowOrder):
-    """Record each world's body pairs (:func:`_heads_pair`): its first pair's rank, the pairs its run holds and the row
-    order's stride over them (``order.world_pairs``, :func:`_row_stride`): a thread a world."""
-    world = wp.tid()
-    first = order.world_contact_first[world]
-    last = order.world_contact_last[world]
-    if last < 0:
-        return
-    rank = order.pairs_before[first]
-    end = row_totals[4, 0]
-    if last + 1 < contact_count[0]:
-        end = order.pairs_before[last + 1]
-    m = end - rank
-    order.world_pairs[world] = wp.vec3i(rank, m, _row_stride(m))
-
-
-@wp.func
-def _frame_rows_at(order: RowOrder, position: int, live: int, row_totals: wp.array2d[int]) -> wp.vec4i:
-    """The admitted contacts' rows of each list before frame position ``position`` (all of them at ``live``)."""
-    if position >= live:
-        return wp.vec4i(row_totals[0, 0], row_totals[1, 0], row_totals[2, 0], row_totals[3, 0])
-    return order.rows_frame[position]
-
-
-@wp.func
-def _row_pair(order: RowOrder, g: int) -> int:
-    """The rank of the body pair the row order visits at pair rank ``g``: in the world of the pair ranked ``g``, its
-    ``m`` body pairs at a golden-ratio stride over their ranks (:func:`_row_stride`) from the first.
-
-    A world's pairs are those its contacts with a responding endpoint form, whether admitted or not
-    (:func:`_heads_pair`). Each pair's contacts stay together in the frame's order: a sorted frame lays a body's pairs
-    side by side, and their rows in that order chain through shared bodies into a deep trace for the colored sweeps,
-    while a pair's own contacts, which share both bodies, chain whatever their order and converge best together. It
-    reads only the frame's keys and the bodies' response, so a contact's admission moves no other's rows, and nor does
-    a contact that can never take rows."""
-    pairs = order.world_pairs[order.pairs[g][1]]
-    return pairs[0] + int((wp.int64(g - pairs[0]) * wp.int64(pairs[2])) % wp.int64(pairs[1]))
-
-
-@wp.func
-def _pair_end(order: RowOrder, rank: int, live: int, pairs: int) -> int:
-    """One past the last frame position of the pair ranked ``rank`` among ``pairs``: the next pair's head (the
-    positions between hold no rows), or ``live`` after the last."""
-    if rank + 1 >= pairs:
-        return live
-    return order.pairs[rank + 1][0]
-
-
 @wp.kernel(enable_backward=False, module="unique")
-def scan_pair_rows(
-    data: ContactInput,
-    blocks: int,
-    sites: wp.array2d[wp.uint64],
-    order: RowOrder,
-    # outputs
-    row_totals: wp.array2d[int],
-):
-    """Scan the body pairs' rows of each list in the row order (:func:`_row_pair`; lists 5-8), a pair rank a thread:
-    each pair's rows before it, at its head (``order.rows_before``). A pair's contacts lie from its head to its end
-    (:func:`_pair_end`). A contact's rows before it in the row order are its pair's and those of the pair's earlier
-    contacts (:func:`_rows_before`)."""
-    block, lane = wp.tid()
-    tile = wp.block_dim()
-    live = data.count[0]
-    pairs = row_totals[4, 0]
-    live_tiles = (pairs + tile - 1) // tile
-    claim = ordered_next(sites[5], block, live_tiles, blocks, row_totals[5])
-    while claim[0] >= 0:
-        g = claim[0] * tile + lane
-        head = int(-1)
-        count = wp.vec4i(0)
-        if g < pairs:
-            rank = _row_pair(order, g)
-            head = order.pairs[rank][0]
-            count = (
-                _frame_rows_at(order, _pair_end(order, rank, live, pairs), live, row_totals) - order.rows_frame[head]
-            )
-        last = int(0)
-        if claim[0] == live_tiles - 1:
-            last = 1
-        first = wp.vec4i(0)
-        first[0] = ordered_scan(sites[5], claim, count[0], last, row_totals[5])
-        also = ordered_also(claim)
-        for k in range(1, 4):
-            first[k] = ordered_scan(sites[5 + k], also, count[k], last, row_totals[5 + k])
-        if head >= 0:
-            order.rows_before[head] = first
-        claim = ordered_next(sites[5], block, live_tiles, blocks, row_totals[5])
-
-
-@wp.func
-def _rows_before(data: ContactInput, order: RowOrder, c: int, first: int) -> wp.vec4i:
-    """Admitted contact ``c``'s rows of each list before it in the row order: its body pair's (at the pair's head, the
-    last pair headed at or before it; ``first`` is its world's first position) and those of the pair's earlier
-    contacts, in the frame's order."""
-    head = c
-    if c > first:
-        if order.pair_keys[c] == order.pair_keys[c - 1]:
-            head = order.pairs[order.pairs_before[c] - 1][0]
-    return order.rows_before[head] + order.rows_frame[c] - order.rows_frame[head]
-
-
-@wp.func
-def _world_rows(world: int, order: RowOrder, row_totals: wp.array2d[int]):
-    """World ``world``'s rows of each list before its first pair in the row order, and its own rows of each list
-    (:func:`scan_pair_rows`): ``(base, rows)``. Its pairs take consecutive ranks (:func:`.contact_sort.body_pair_codes`
-    keeps a world's contacts in one run), the row order visits its first pair first, and the next world's first pair
-    after its last."""
-    pairs = order.world_pairs[world]
-    base = order.rows_before[order.pairs[pairs[0]][0]]
-    end = wp.vec4i(row_totals[5, 0], row_totals[6, 0], row_totals[7, 0], row_totals[8, 0])
-    if pairs[0] + pairs[1] < row_totals[4, 0]:
-        end = order.rows_before[order.pairs[pairs[0] + pairs[1]][0]]
-    return base, end - base
-
-
-@wp.kernel(enable_backward=False)
-def reserve_world_contact_rows(
+def reserve_world_rows(
     data: ContactInput,
     max_constraints: int,
     mf_max_constraints: int,
@@ -644,7 +457,6 @@ def reserve_world_contact_rows(
     order: RowOrder,
     world_slot_counter: wp.array[int],
     mf_slot_counter: wp.array[int],
-    row_totals: wp.array2d[int],
     # outputs
     dense_dropped_contact_rows: wp.array[int],
     mf_dropped_contact_rows: wp.array[int],
@@ -652,83 +464,133 @@ def reserve_world_contact_rows(
     mf_first_rejected_slot: wp.array[int],
     units: wp.array2d[int],
 ):
-    """Reserve the rows of every admitted contact (:func:`admit_world_contacts`) in the frame's order, so a world's
+    """Reserve the rows of every admitted contact (:func:`admit_world_contacts`) in its world's row order, so a world's
     rows follow its contacts' geometry (the frame's pair and contact keys), never the order the collision's threads
-    wrote them in: a thread a contact.
+    wrote them in: a world a lane group (:data:`RESERVE_LANES`), one launch for every world.
 
     A world's contacts lie in one run of the frame's positions (``order.world_contact_first`` to
-    ``order.world_contact_last``, which the admission recorded), whose rows of each list the scans counted before
-    every contact in the row order (:func:`_rows_before`).
-    A contact takes the next rows of its family in its world's line: the dense rows, or the free bodies' (``path``
-    1), which follow the dense class's (one row index for both classes); the contacts with an immovable side first
-    (:func:`_immovable_side`), then the others, each in the world's row order (:func:`_row_pair`). Supports first
-    is the order a sweep propagates a stack's load in from the ground up. A contact's slot is its first row.
+    ``order.world_contact_last``, which the admission recorded; a contact of no world may lie between them). The
+    lanes take it in three passes. In the frame's order, each contact's rows of the four lists before it and its body
+    pair (a pair heads at the run's first position or at a change of the frame's pair key, admitted or not: a pair's
+    contacts share their bodies, so they respond alike), each pair's head. In the row order, the world's ``m`` body
+    pairs at a golden-ratio stride over their indices (:func:`_row_stride`; each pair's contacts together in frame
+    order), each pair's rows before it: a sorted frame lays a body's pairs side by side, and their rows in that order
+    chain through shared bodies into a deep trace for the colored sweeps, while a pair's own contacts, which share both
+    bodies, chain whatever their order and converge best together. It reads only the frame's keys and the bodies'
+    response, so a contact's admission moves no other's rows, and nor does a contact that can never take rows. Then each
+    contact's slot.
 
-    Counters only grow (:func:`advance_world_contact_rows` adds every contact's rows): a contact whose rows do not
-    fit records its slot in the family's ``*_first_rejected_slot`` (per world, preset to a large value), and every
-    later contact's rows start past it, so the finalize kernels truncate the row count there; such a contact has no
-    rows (``slot`` and ``path`` -1). Where the one writer takes the rows (``units`` holds the placement's unit
-    sources; empty otherwise), each dense row's unit source is written with its slot.
+    A contact takes the next rows of its family in its world's line: the dense rows, or the free bodies' (``path`` 1),
+    which follow the dense class's (one row index for both classes); the contacts with an immovable side first
+    (:func:`_immovable_side`), then the others, each in the world's row order. Supports first is the order a sweep
+    propagates a stack's load in from the ground up. A contact's slot is its first row.
+
+    Counters only grow (each world's lane 0 adds every contact's rows once its slots are taken, and clears the world's
+    run for the next step): a contact whose rows do not fit records its slot in the family's ``*_first_rejected_slot``
+    (per world, preset to a large value), and every later contact's rows start past it, so the finalize kernels
+    truncate the row count there; such a contact has no rows (``slot`` and ``path`` -1). Where the one writer takes the
+    rows (``units`` holds the placement's unit sources; empty otherwise), each dense row's unit source is written with
+    its slot.
     """
-    c = wp.tid()
-    live = data.count[0]
-    if not _admitted(data, order, c, live):
+    lanes = lane_stride(RESERVE_LANES)
+    lane = lane_index(RESERVE_LANES)
+    world = wp.tid() // lanes
+    if world >= order.world_contact_first.shape[0]:
         return
-    path = data.path[c]
-    world = data.world[c]
-    base, rows = _world_rows(world, order, row_totals)
-    before = _rows_before(data, order, c, order.world_contact_first[world]) - base
-    k = int(0)
-    if path != 0:
-        k = 1
-    offset = before[k]
-    if not _immovable_side(data, c):
-        # Past the world's rows of the family with an immovable side.
-        offset = rows[k] + before[k + 2]
-    n = data.slots_needed[c]
-    if path != 0:
-        slot = mf_slot_counter[world] + offset
-        if slot + n > mf_max_constraints:
-            wp.atomic_min(mf_first_rejected_slot, world, slot)
-            if row_capacity_telemetry != 0:
-                wp.atomic_add(mf_dropped_contact_rows, world, n)
-            data.slot[c] = -1
-            data.path[c] = -1
-        else:
-            data.slot[c] = slot + max_constraints
-    else:
-        slot = world_slot_counter[world] + offset
-        if slot + n > max_constraints:
-            wp.atomic_min(dense_first_rejected_slot, world, slot)
-            if row_capacity_telemetry != 0:
-                wp.atomic_add(dense_dropped_contact_rows, world, n)
-            data.slot[c] = -1
-            data.path[c] = -1
-        else:
-            data.slot[c] = slot
-            if units.shape[0] > 0:
-                for r in range(n):
-                    units[data.first[world], slot + r] = unit_source(UNIT_CONTACT, 4 * c + r)
-
-
-@wp.kernel(enable_backward=False)
-def advance_world_contact_rows(
-    row_totals: wp.array2d[int],
-    order: RowOrder,
-    # outputs
-    world_slot_counter: wp.array[int],
-    mf_slot_counter: wp.array[int],
-):
-    """Add each world's contact rows (:func:`reserve_world_contact_rows`) to its counters, rejected rows included, and
-    reset its run of positions for the next step: a thread a world."""
-    world = wp.tid()
-    if order.world_contact_last[world] < 0:
+    first = order.world_contact_first[world]
+    end = wp.min(order.world_contact_last[world] + 1, data.count[0])
+    if end <= first:
         return
-    _base, rows = _world_rows(world, order, row_totals)
-    world_slot_counter[world] += rows[0] + rows[2]
-    mf_slot_counter[world] += rows[1] + rows[3]
-    order.world_contact_first[world] = _NO_CONTACT
-    order.world_contact_last[world] = -1
+    # The frame's order: each contact's rows before it and its pair, each pair's head.
+    rows = wp.vec4i(0)
+    pairs = int(0)
+    for base in range(first, end, lanes):
+        c = base + lane
+        mine = bool(False)
+        heads = bool(False)
+        own = wp.vec4i(0)
+        if c < end:
+            if data.world[c] == world:
+                mine = True
+                heads = c == first or order.pair_keys[c] != order.pair_keys[c - 1]
+                own = _contact_rows(data, c)
+        votes = lane_ballot(heads, RESERVE_LANES)
+        lower = _lane_scan4(own)
+        if mine:
+            pair = pairs + lane_below(votes, RESERVE_LANES) + wp.where(heads, 1, 0) - 1
+            order.pairs_before[c] = pair
+            order.rows_frame[c] = rows + lower
+            if heads:
+                order.pairs[first + pair] = c
+        rows = rows + _lane_sum4(own)
+        pairs += lane_count(votes, RESERVE_LANES)
+    lane_sync(RESERVE_LANES)
+    # The row order: each pair's rows before it.
+    stride = _row_stride(pairs)
+    seen = wp.vec4i(0)
+    for base in range(0, pairs, lanes):
+        q = base + lane
+        own = wp.vec4i(0)
+        head = int(-1)
+        if q < pairs:
+            j = int((wp.int64(q) * wp.int64(stride)) % wp.int64(pairs))
+            head = order.pairs[first + j]
+            after = rows
+            if j + 1 < pairs:
+                after = order.rows_frame[order.pairs[first + j + 1]]
+            own = after - order.rows_frame[head]
+        before = seen + _lane_scan4(own)
+        if head >= 0:
+            order.rows_before[head] = before
+        seen = seen + _lane_sum4(own)
+    lane_sync(RESERVE_LANES)
+    # Each admitted contact's slot.
+    for c in range(first + lane, end, lanes):
+        if data.world[c] != world:
+            continue
+        path = data.path[c]
+        if path < 0:
+            continue
+        head = order.pairs[first + order.pairs_before[c]]
+        before = order.rows_before[head] + order.rows_frame[c] - order.rows_frame[head]
+        k = int(0)
+        if path != 0:
+            k = 1
+        offset = before[k]
+        if not _immovable_side(data, c):
+            # Past the world's rows of the family with an immovable side.
+            offset = rows[k] + before[k + 2]
+        n = data.slots_needed[c]
+        if path != 0:
+            slot = mf_slot_counter[world] + offset
+            if slot + n > mf_max_constraints:
+                wp.atomic_min(mf_first_rejected_slot, world, slot)
+                if row_capacity_telemetry != 0:
+                    wp.atomic_add(mf_dropped_contact_rows, world, n)
+                data.slot[c] = -1
+                data.path[c] = -1
+            else:
+                data.slot[c] = slot + max_constraints
+        else:
+            slot = world_slot_counter[world] + offset
+            if slot + n > max_constraints:
+                wp.atomic_min(dense_first_rejected_slot, world, slot)
+                if row_capacity_telemetry != 0:
+                    wp.atomic_add(dense_dropped_contact_rows, world, n)
+                data.slot[c] = -1
+                data.path[c] = -1
+            else:
+                data.slot[c] = slot
+                if units.shape[0] > 0:
+                    for r in range(n):
+                        units[data.first[world], slot + r] = unit_source(UNIT_CONTACT, 4 * c + r)
+    lane_sync(RESERVE_LANES)
+    if lane == 0:
+        # The world's counters, rejected rows included, and its run cleared for the next step.
+        world_slot_counter[world] += rows[0] + rows[2]
+        mf_slot_counter[world] += rows[1] + rows[3]
+        order.world_contact_first[world] = _NO_CONTACT
+        order.world_contact_last[world] = -1
 
 
 @wp.kernel

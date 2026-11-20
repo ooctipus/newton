@@ -64,12 +64,9 @@ from .row_records import UNIT_LIMIT, UNIT_MIMIC, UNIT_SHIFT, UNIT_VELOCITY, RowS
 from .row_records import bind as bind_dense_rows
 from .row_slots import (
     RESERVE_BLOCK,
+    RESERVE_LANES,
     admit_world_contacts,
-    advance_world_contact_rows,
-    list_world_pairs,
-    reserve_world_contact_rows,
-    scan_frame_rows,
-    scan_pair_rows,
+    reserve_world_rows,
     snapshot_dense_phase_bound,
 )
 from .sweep_plan import FREE_ROUTE
@@ -838,7 +835,6 @@ class RowLaws:
                     solver.placement.world_acts,
                     solver.placement.world_contact_first,
                     solver.placement.world_contact_last,
-                    solver.placement.reserve_totals,
                 ],
                 extent=count,
                 max_blocks=solver.placement.contact_capacity_blocks,
@@ -847,47 +843,22 @@ class RowLaws:
             # The one writer's contact rows are its own to fill: their unit sources are written where their slots are
             # reserved.
             units = solver.placement.unit_source if producer == "walk" else solver.placement.no_units
-            # The row order (row_slots._row_pair: each world's body pairs at a golden-ratio stride, a pair's contacts
-            # together): the rows and pairs counted in the frame's order, each world's pairs, their rows counted in
-            # the row order, parallel inside a world; then each contact's rows, a thread a contact; then each world's
-            # counters.
+            # The row order (row_slots.reserve_world_rows: each world's body pairs at a golden-ratio stride, a pair's
+            # contacts together), each contact's rows reserved in it and each world's counters advanced: a world a lane
+            # group, one launch.
             placement = solver.placement
-            order = placement.row_order(self.friction_patches.current.keys)
-            scans = [contact_input, placement.reserve_blocks, placement.reserve_sites, order]
-            wp.launch_tiled(
-                scan_frame_rows,
-                dim=[placement.reserve_blocks],
-                inputs=scans,
-                outputs=[placement.reserve_totals],
-                block_dim=RESERVE_BLOCK,
-                device=model.device,
-            )
+            lanes = int(RESERVE_LANES) if model.device.is_cuda else 1
             wp.launch(
-                list_world_pairs,
-                dim=solver.forest.world_count,
-                inputs=[count, placement.reserve_totals, order],
-                device=model.device,
-            )
-            wp.launch_tiled(
-                scan_pair_rows,
-                dim=[placement.reserve_blocks],
-                inputs=scans,
-                outputs=[placement.reserve_totals],
-                block_dim=RESERVE_BLOCK,
-                device=model.device,
-            )
-            pool.launch(
-                reserve_world_contact_rows,
-                rows,
+                reserve_world_rows,
+                dim=solver.forest.world_count * lanes,
                 inputs=[
                     contact_input,
                     max_constraints,
                     placement.mf_max_constraints,
                     1,
-                    order,
+                    placement.row_order(self.friction_patches.current.keys),
                     placement.slot_counter,
                     mf_slot_counter,
-                    placement.reserve_totals,
                 ],
                 outputs=[
                     dense_dropped_rows,
@@ -896,15 +867,8 @@ class RowLaws:
                     mf_first_rejected_slot,
                     units,
                 ],
-                extent=count,
-                max_blocks=placement.contact_capacity_blocks,
-            )
-            wp.launch(
-                advance_world_contact_rows,
-                dim=solver.forest.world_count,
-                inputs=[placement.reserve_totals, order],
-                outputs=[placement.slot_counter, mf_slot_counter],
                 device=model.device,
+                block_dim=RESERVE_BLOCK,
             )
 
     def bound_free_body_contacts(self, solver) -> None:

@@ -171,7 +171,6 @@ def test_contact_endpoints_match_row_allocation(test, device):
         contact_count=np.array([contacts], dtype=np.int32),
         world_contact_first=np.full(3, 2**31 - 1, dtype=np.int32),
         world_contact_last=np.full(3, -1, dtype=np.int32),
-        row_totals=np.zeros((row_slots.ROW_LISTS, 1), dtype=np.int32),
         shape_transform=transforms(rng, 16),
         has_free_rigid=0,
         same_articulation_contact_gap_gate=0.0,

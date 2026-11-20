@@ -26,7 +26,6 @@ import numpy as np
 import warp as wp
 
 from ...core.contact_pool import ContactField, model_contact_pool
-from ...core.ordered_reserve import ORDERED_STATES
 from ...sim import Contacts
 from ...sim.contacts import CAPACITY_BLOCKS_PER_SM, contact_capacity_blocks
 from ...sim.enums import JointType
@@ -40,7 +39,7 @@ from .row_kernels import RIGID_SPEED_ROWS
 from .row_laws import LINK_ROWS
 from .row_metadata import record_layout
 from .row_records import DENSE_ROWS, ROW_RECORDS, RowSupport
-from .row_slots import ROW_LISTS, RowOrder, reserve_blocks, reserve_tiles
+from .row_slots import RowOrder
 from .warm_start import PREPARE_LANES, ContactCarry, prepare_world_impulses
 
 # FeatherPGS takes no gradients: its kernels compile no adjoints.
@@ -106,11 +105,9 @@ at its exact solution, zero impulse (P4)."""
 WORLD_CONTACTS = FieldGroup(
     Field("world_contact_first", wp.int32, ("world",), fill=2**31 - 1, owner="placement"),
     Field("world_contact_last", wp.int32, ("world",), fill=-1, owner="placement"),
-    Field("world_pairs", wp.vec3i, ("world",), owner="placement"),
 )
-"""The frame positions each world's contacts span (``admit_world_contacts``), its body pairs there
-(``list_world_pairs``), from which their rows are reserved in the row order (``reserve_world_contact_rows``), which
-resets the span."""
+"""The frame positions each world's contacts span (``admit_world_contacts``), from which their rows are reserved in
+the row order (``reserve_world_rows``), which resets the span."""
 
 ROW_WATERMARKS = FieldGroup(
     *(
@@ -506,21 +503,13 @@ class Placement:
         ]
         # The row order's records (row_slots.RowOrder).
         contact_fields += [ContactField(name, wp.vec4i) for name in ("contact_rows_frame", "contact_rows_before")]
-        contact_fields += [ContactField("contact_pairs_before", wp.int32), ContactField("contact_pairs", wp.vec2i)]
+        contact_fields += [ContactField(name, wp.int32) for name in ("contact_pairs_before", "contact_pairs")]
         # Row builders always receive a zero phi view when patch friction is off.
         contact_fields.append(ContactField("friction_patch_phi", wp.vec2))
         # The warm start's carry by contact identity (:data:`.warm_start.ContactCarry`).
         if self.options.pgs_warmstart:
             contact_fields += [ContactField(field.attr, field.dtype) for field in fields_of(ContactCarry)]
         self.contact_rows = self.contact_pool.rows(contact_fields, on_rows=self._on_contact_rows)
-        # The reservation's ordered scans (row_slots.scan_frame_rows, scan_pair_rows): a site per list, for
-        # tiles of every row the pool may hold, each list's total, and the grid that strides over the live tiles.
-        tiles = reserve_tiles(self.contact_rows.reserve, device)
-        sites = np.zeros((ROW_LISTS, ORDERED_STATES + tiles), dtype=np.uint64)
-        sites[:, 1] = 1  # zeroed states carry epoch 0, which no launch uses
-        self.reserve_sites = wp.array(sites, dtype=wp.uint64, device=device)
-        self.reserve_totals = wp.zeros((ROW_LISTS, 1), dtype=int, device=device)
-        self.reserve_blocks = reserve_blocks(device)
         # The friction patch state and the velocity-limit slots.
         # A contact has a region normal only where neither side is a non-free articulation's link: some body must be
         # free (a free rigid body's, or no articulation's) for any contact to hold one.
@@ -561,7 +550,6 @@ class Placement:
         order.pair_keys = pair_keys
         order.world_contact_first = self.world_contact_first
         order.world_contact_last = self.world_contact_last
-        order.world_pairs = self.world_pairs
         for name in ("rows_frame", "pairs_before", "pairs", "rows_before"):
             setattr(order, name, getattr(self, f"contact_{name}"))
         return order
