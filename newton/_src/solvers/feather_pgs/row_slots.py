@@ -356,30 +356,26 @@ def _immovable_side(data: ContactInput, c: int) -> bool:
 # A world's first contact position before any was admitted.
 _NO_CONTACT = wp.constant(2**31 - 1)
 
-RESERVE_BLOCK = 256
+RESERVE_BLOCK = 512
 """Threads of a block of the row order's scans (:func:`scan_frame_rows`, :func:`rank_pairs`, :func:`scan_pair_rows`)
-on CUDA."""
-RESERVE_TILE = wp.constant(1024)
-"""Frame positions a block of the row order's scans takes at a time (a whole number of each block's threads)."""
+on CUDA. A tile is a block's threads, a frame position a thread: the scans' work on a position is a chain of
+dependent loads (a world's run, its pair's bounds, the pair the row order visits there), so a thread takes one."""
 
 
-@wp.func
-def _row_stride(n: int) -> int:
-    """The stride of a world's row order over its ``n`` frame positions: the golden ratio's share of ``n`` (``n``
-    times ``2**32 / phi``, 2654435769, over ``2**32``, in integers), raised to the first value coprime with ``n``, so
-    ``j -> j * stride mod n`` visits every position once."""
-    stride = wp.max(int((wp.int64(n) * wp.int64(2654435769)) >> wp.int64(32)), 1)
-    while True:
-        a = stride
-        b = n
-        while b != 0:
-            t = a % b
-            a = b
-            b = t
-        if a == 1:
-            break
-        stride += 1
-    return stride
+def reserve_tiles(positions: int, device) -> int:
+    """The tile states a site of the row order's scans holds over ``positions`` frame positions: a block's threads a
+    tile on CUDA; on the CPU (a block of one thread, one position a tile) the tiles run in order and share one state
+    (:mod:`~newton._src.core.ordered_reserve`)."""
+    if not wp.get_device(device).is_cuda:
+        return 1
+    return -(-max(positions, 1) // RESERVE_BLOCK)
+
+
+def reserve_blocks(device) -> int:
+    """The blocks of the row order's scans' fixed grid: as many as the device holds at once, so every live tile has
+    its block; one on the CPU."""
+    device = wp.get_device(device)
+    return device.sm_count * (2048 // RESERVE_BLOCK) if device.is_cuda else 1
 
 
 @wp.struct
@@ -480,19 +476,16 @@ def scan_frame_rows(
     reservations at once (lists 0-4 of ``sites`` and ``row_totals``, which the admission zeroed), a block scan and a
     decoupled look-back a tile (:mod:`~newton._src.core.ordered_reserve`), parallel inside a world of any size."""
     block, lane = wp.tid()
-    per_lane = RESERVE_TILE // wp.block_dim()
+    tile = wp.block_dim()
     live = data.count[0]
-    live_tiles = (live + RESERVE_TILE - 1) // RESERVE_TILE
+    live_tiles = (live + tile - 1) // tile
     claim = ordered_next(sites[0], block, live_tiles, blocks, row_totals[0])
     while claim[0] >= 0:
-        begin = claim[0] * RESERVE_TILE + lane * per_lane
-        count = wp.vec4i(0)
+        c = claim[0] * tile + lane
+        count = _contact_rows(data, order, c, live)
         admitted = int(0)
-        for i in range(per_lane):
-            if begin + i < live:
-                count += _contact_rows(data, order, begin + i, live)
-                if _admitted(data, order, begin + i, live):
-                    admitted += 1
+        if _admitted(data, order, c, live):
+            admitted = 1
         last = int(0)
         if claim[0] == live_tiles - 1:
             last = 1
@@ -502,14 +495,9 @@ def scan_frame_rows(
         for k in range(1, 4):
             first[k] = ordered_scan(sites[k], also, count[k], last, row_totals[k])
         ranked = ordered_scan(sites[4], also, admitted, last, row_totals[4])
-        for i in range(per_lane):
-            c = begin + i
-            if c < live:
-                order.rows_frame[c] = first
-                order.admitted_before[c] = ranked
-                first += _contact_rows(data, order, c, live)
-                if _admitted(data, order, c, live):
-                    ranked += 1
+        if c < live:
+            order.rows_frame[c] = first
+            order.admitted_before[c] = ranked
         claim = ordered_next(sites[0], block, live_tiles, blocks, row_totals[0])
 
 
@@ -525,30 +513,24 @@ def rank_pairs(
     """Count, before every frame position, the body pairs that hold an admitted contact (``order.pairs_before``; list
     5), and list each world's admitted contacts from its first position (``order.admitted``)."""
     block, lane = wp.tid()
-    per_lane = RESERVE_TILE // wp.block_dim()
+    tile = wp.block_dim()
     live = data.count[0]
-    live_tiles = (live + RESERVE_TILE - 1) // RESERVE_TILE
+    live_tiles = (live + tile - 1) // tile
     claim = ordered_next(sites[5], block, live_tiles, blocks, row_totals[5])
     while claim[0] >= 0:
-        begin = claim[0] * RESERVE_TILE + lane * per_lane
-        count = int(0)
-        for i in range(per_lane):
-            c = begin + i
-            if _admitted(data, order, c, live):
-                first = order.world_contact_first[data.world[c]]
-                order.admitted[first + order.admitted_before[c] - order.admitted_before[first]] = c
-                if _heads_pair(data, order, c):
-                    count += 1
+        c = claim[0] * tile + lane
+        heads = int(0)
+        if _admitted(data, order, c, live):
+            first = order.world_contact_first[data.world[c]]
+            order.admitted[first + order.admitted_before[c] - order.admitted_before[first]] = c
+            if _heads_pair(data, order, c):
+                heads = 1
         last = int(0)
         if claim[0] == live_tiles - 1:
             last = 1
-        ranked = ordered_scan(sites[5], claim, count, last, row_totals[5])
-        for i in range(per_lane):
-            c = begin + i
-            if c < live:
-                order.pairs_before[c] = ranked
-                if _admitted(data, order, c, live) and _heads_pair(data, order, c):
-                    ranked += 1
+        ranked = ordered_scan(sites[5], claim, heads, last, row_totals[5])
+        if c < live:
+            order.pairs_before[c] = ranked
         claim = ordered_next(sites[5], block, live_tiles, blocks, row_totals[5])
 
 
@@ -631,20 +613,21 @@ def scan_pair_rows(
     it there. A contact's rows before it in the row order are its pair's and those of the pair's earlier contacts
     (:func:`_rows_before`)."""
     block, lane = wp.tid()
-    per_lane = RESERVE_TILE // wp.block_dim()
+    tile = wp.block_dim()
     live = data.count[0]
-    live_tiles = (live + RESERVE_TILE - 1) // RESERVE_TILE
+    live_tiles = (live + tile - 1) // tile
     claim = ordered_next(sites[6], block, live_tiles, blocks, row_totals[6])
     while claim[0] >= 0:
-        begin = claim[0] * RESERVE_TILE + lane * per_lane
+        c = claim[0] * tile + lane
+        head = int(-1)
         count = wp.vec4i(0)
-        for i in range(per_lane):
-            if begin + i < live:
-                head = _row_pair(data, order, begin + i)
-                if head >= 0:
-                    run_last = order.world_contact_last[data.world[head]]
-                    count += _frame_rows_at(order, _pair_end(order, head, run_last), live, row_totals)
-                    count -= order.rows_frame[head]
+        if c < live:
+            head = _row_pair(data, order, c)
+            if head >= 0:
+                run_last = order.world_contact_last[data.world[head]]
+                count = (
+                    _frame_rows_at(order, _pair_end(order, head, run_last), live, row_totals) - order.rows_frame[head]
+                )
         last = int(0)
         if claim[0] == live_tiles - 1:
             last = 1
@@ -653,16 +636,10 @@ def scan_pair_rows(
         also = ordered_also(claim)
         for k in range(1, 4):
             first[k] = ordered_scan(sites[6 + k], also, count[k], last, row_totals[6 + k])
-        for i in range(per_lane):
-            if begin + i < live:
-                head = _row_pair(data, order, begin + i)
-                if head >= 0:
-                    order.rows_before[head] = first
-                    end = order.world_contact_last[data.world[head]]
-                    first += _frame_rows_at(order, _pair_end(order, head, end), live, row_totals)
-                    first -= order.rows_frame[head]
-                elif head <= -2:
-                    order.rows_before[-2 - head] = first
+        if head >= 0:
+            order.rows_before[head] = first
+        elif head <= -2:
+            order.rows_before[-2 - head] = first
         claim = ordered_next(sites[6], block, live_tiles, blocks, row_totals[6])
 
 

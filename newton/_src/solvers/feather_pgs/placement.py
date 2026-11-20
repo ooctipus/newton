@@ -40,7 +40,7 @@ from .row_kernels import RIGID_SPEED_ROWS
 from .row_laws import LINK_ROWS
 from .row_metadata import record_layout
 from .row_records import DENSE_ROWS, ROW_RECORDS, RowSupport
-from .row_slots import RESERVE_TILE, RowOrder
+from .row_slots import RowOrder, reserve_blocks, reserve_tiles
 from .warm_start import PREPARE_LANES, ContactCarry, prepare_world_impulses
 
 # FeatherPGS takes no gradients: its kernels compile no adjoints.
@@ -517,12 +517,12 @@ class Placement:
         self.contact_rows = self.contact_pool.rows(contact_fields, on_rows=self._on_contact_rows)
         # The reservation's ordered scans (row_slots.scan_frame_rows, rank_pairs, scan_pair_rows): a site per list, for
         # tiles of every row the pool may hold, each list's total, and the grid that strides over the live tiles.
-        tiles = -(-max(self.contact_rows.reserve, 1) // int(RESERVE_TILE))
+        tiles = reserve_tiles(self.contact_rows.reserve, device)
         sites = np.zeros((10, ORDERED_STATES + tiles), dtype=np.uint64)
         sites[:, 1] = 1  # zeroed states carry epoch 0, which no launch uses
         self.reserve_sites = wp.array(sites, dtype=wp.uint64, device=device)
         self.reserve_totals = wp.zeros((10, 1), dtype=int, device=device)
-        self.reserve_blocks = 2 * device.sm_count if device.is_cuda else 1
+        self.reserve_blocks = reserve_blocks(device)
         # The friction patch state and the velocity-limit slots.
         # A contact has a region normal only where neither side is a non-free articulation's link: some body must be
         # free (a free rigid body's, or no articulation's) for any contact to hold one.

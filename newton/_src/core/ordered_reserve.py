@@ -59,7 +59,8 @@ misread when its tile is next used.
 
 On the CPU a launch runs its blocks one at a time in order, one thread per
 block (``block_dim`` 1), so a tile's exclusive prefix is the previous tile's
-inclusive prefix.
+inclusive prefix: one running state (tile 0's) serves every tile, and a site
+needs one tile state there.
 
 Kernels call :func:`ordered_tile` or :func:`ordered_next`, then
 :func:`ordered_scan` for every claimed tile, with every thread of the block
@@ -257,9 +258,10 @@ ORDERED_CPU = (
         const int tile = claim.tile;
         const bool alone = tile == 0 && last;
         const unsigned epoch = (unsigned)(claim.epoch == 0 && !alone ? ORDERED_EPOCH(site) : claim.epoch);
-        const unsigned prefix = tile > 0 ? (unsigned)states[tile - 1]
+        // Tiles run in order: tile 0's state holds the running inclusive prefix.
+        const unsigned prefix = tile > 0 ? (unsigned)states[0]
                                          : (unsigned)(claim.start < 0 ? *counter : claim.start);
-        if (!alone) states[tile] = ORDERED_PACK(epoch, 1u, prefix + (unsigned)count);
+        if (!alone) states[0] = ORDERED_PACK(epoch, 1u, prefix + (unsigned)count);
         if (last) {
             *counter = (int)(prefix + (unsigned)count);
             if (!alone) site[1] = ORDERED_NEXT_EPOCH(epoch);

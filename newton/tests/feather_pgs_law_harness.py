@@ -49,12 +49,12 @@ from newton._src.solvers.feather_pgs.route_table import Laws
 from newton._src.solvers.feather_pgs.row_records import UNIT_MIMIC, UNIT_SHIFT, DenseRows, MfRows, RowSupport
 from newton._src.solvers.feather_pgs.row_slots import (
     RESERVE_BLOCK,
-    RESERVE_TILE,
     RowOrder,
     admit_world_contacts,
     advance_world_contact_rows,
     list_pairs,
     rank_pairs,
+    reserve_tiles,
     reserve_world_contact_rows,
     scan_frame_rows,
     scan_pair_rows,
@@ -1521,7 +1521,7 @@ def allocate_contacts(operands, device) -> None:
     slots = values["data"].slot.shape[0]
     # The scans' sites start at epoch 1 (zeroed states carry epoch 0); set on the device, not copied from the host: a
     # capture would hold the host buffer's address, freed before any replay.
-    sites = wp.zeros((10, ORDERED_STATES + -(-max(slots, 1) // int(RESERVE_TILE))), dtype=wp.uint64, device=device)
+    sites = wp.zeros((10, ORDERED_STATES + reserve_tiles(slots, device)), dtype=wp.uint64, device=device)
     sites[:, 1].fill_(1)
     blocks = 2 if device.is_cuda else 1
     values = {
