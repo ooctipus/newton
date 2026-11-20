@@ -106,6 +106,7 @@ at its exact solution, zero impulse (P4)."""
 WORLD_CONTACTS = FieldGroup(
     Field("world_contact_first", wp.int32, ("world",), fill=2**31 - 1, owner="placement"),
     Field("world_contact_last", wp.int32, ("world",), fill=-1, owner="placement"),
+    Field("world_pairs", wp.vec2i, ("world",), owner="placement"),
 )
 """The frame positions each world's admitted contacts span (``admit_world_contacts``), from which their rows are
 reserved in the frame's order (``reserve_world_contact_rows``), which resets them."""
@@ -507,7 +508,13 @@ class Placement:
         contact_fields += [ContactField(name, wp.vec4i) for name in ("contact_rows_frame", "contact_rows_before")]
         contact_fields += [
             ContactField(name, wp.int32)
-            for name in ("contact_admitted_before", "contact_admitted", "contact_pairs_before", "contact_pairs")
+            for name in (
+                "contact_admitted_before",
+                "contact_admitted",
+                "contact_pairs_before",
+                "contact_pairs",
+                "contact_pair_ends",
+            )
         ]
         # Row builders always receive a zero phi view when patch friction is off.
         contact_fields.append(ContactField("friction_patch_phi", wp.vec2))
@@ -563,7 +570,8 @@ class Placement:
         order.pair_keys = pair_keys
         order.world_contact_first = self.world_contact_first
         order.world_contact_last = self.world_contact_last
-        for name in ("rows_frame", "admitted_before", "admitted", "pairs_before", "pairs", "rows_before"):
+        order.world_pairs = self.world_pairs
+        for name in ("rows_frame", "admitted_before", "admitted", "pairs_before", "pairs", "pair_ends", "rows_before"):
             setattr(order, name, getattr(self, f"contact_{name}"))
         return order
 

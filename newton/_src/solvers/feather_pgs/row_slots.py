@@ -383,11 +383,15 @@ class RowOrder:
     """The row order's records over the frame's positions (:func:`scan_frame_rows`, :func:`rank_pairs`,
     :func:`list_pairs`, :func:`scan_pair_rows`): each position's body-pair key, the admitted contacts' rows of each
     list before it in the frame's order, the admitted contacts and their body pairs counted before it and listed from
-    each world's first position, and each admitted contact's rows of each list before it in the row order."""
+    each world's first position, and each admitted contact's rows of each list before it in the row order; each
+    world's body pairs that hold an admitted contact and the row order's stride over them (``world_pairs``), and each
+    such pair's end in the frame at its first admitted contact (``pair_ends``)."""
 
     pair_keys: wp.array[wp.int64]
     world_contact_first: wp.array[int]
     world_contact_last: wp.array[int]
+    world_pairs: wp.array[wp.vec2i]
+    pair_ends: wp.array[int]
     rows_frame: wp.array[wp.vec4i]
     admitted_before: wp.array[int]
     admitted: wp.array[int]
@@ -537,12 +541,24 @@ def rank_pairs(
 @wp.kernel(enable_backward=False)
 def list_pairs(data: ContactInput, order: RowOrder):
     """List each world's body pairs that hold an admitted contact, by their first admitted contact, in the frame's
-    order from the world's first position (``order.pairs``; the list fits the world's run of positions)."""
+    order from the world's first position (``order.pairs``; the list fits the world's run of positions), with each
+    pair's end in the frame (``order.pair_ends``); the world's last admitted contact records the world's pairs and the
+    row order's stride over them (``order.world_pairs``, :func:`_row_stride`)."""
     c = wp.tid()
-    if not _admitted(data, order, c, data.count[0]) or not _heads_pair(data, order, c):
+    if not _admitted(data, order, c, data.count[0]):
         return
-    first = order.world_contact_first[data.world[c]]
-    order.pairs[first + order.pairs_before[c] - order.pairs_before[first]] = c
+    world = data.world[c]
+    first = order.world_contact_first[world]
+    last = order.world_contact_last[world]
+    heads = _heads_pair(data, order, c)
+    if c == last:
+        m = order.pairs_before[last] - order.pairs_before[first]
+        if heads:
+            m += 1
+        order.world_pairs[world] = wp.vec2i(m, _row_stride(m))
+    if heads:
+        order.pairs[first + order.pairs_before[c] - order.pairs_before[first]] = c
+        order.pair_ends[c] = _pair_end(order, c, last)
 
 
 @wp.func
@@ -590,13 +606,12 @@ def _row_pair(data: ContactInput, order: RowOrder, t: int) -> int:
     last = order.world_contact_last[world]
     if t < first or t > last:
         return -2 - t
-    m = order.pairs_before[last] - order.pairs_before[first]
-    if _heads_pair(data, order, last):
-        m += 1
+    pairs = order.world_pairs[world]
+    m = pairs[0]
     j = t - first
     if j >= m:
         return -1
-    return order.pairs[first + int((wp.int64(j) * wp.int64(_row_stride(m))) % wp.int64(m))]
+    return order.pairs[first + int((wp.int64(j) * wp.int64(pairs[1])) % wp.int64(m))]
 
 
 @wp.kernel(enable_backward=False)
@@ -624,10 +639,7 @@ def scan_pair_rows(
         if c < live:
             head = _row_pair(data, order, c)
             if head >= 0:
-                run_last = order.world_contact_last[data.world[head]]
-                count = (
-                    _frame_rows_at(order, _pair_end(order, head, run_last), live, row_totals) - order.rows_frame[head]
-                )
+                count = _frame_rows_at(order, order.pair_ends[head], live, row_totals) - order.rows_frame[head]
         last = int(0)
         if claim[0] == live_tiles - 1:
             last = 1

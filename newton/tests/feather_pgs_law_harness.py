@@ -1540,9 +1540,10 @@ def allocate_contacts(operands, device) -> None:
     order.pair_keys = wp.empty(n, dtype=wp.int64, device=device)
     wp.launch(_own_pair_keys, dim=n, outputs=[order.pair_keys], device=device)
     order.world_contact_first, order.world_contact_last = values["world_contact_first"], values["world_contact_last"]
+    order.world_pairs = wp.zeros(worlds, dtype=wp.vec2i, device=device)
     for name, dtype in (("rows_frame", wp.vec4i), ("rows_before", wp.vec4i)):
         setattr(order, name, wp.zeros(n, dtype=dtype, device=device))
-    for name in ("admitted_before", "admitted", "pairs_before", "pairs"):
+    for name in ("admitted_before", "admitted", "pairs_before", "pairs", "pair_ends"):
         setattr(order, name, wp.zeros(n, dtype=int, device=device))
     values["order"] = order
 
