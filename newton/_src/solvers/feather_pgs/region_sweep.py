@@ -21,6 +21,15 @@ The lanes of a warp take two kinds of step together:
 A lane leaves the sweeps when every region has been seen at the twist as it is: after a sweep in which no visit
 changed a bit and no region slid, or on reaching again the last region whose visit changed one (both give the bits of
 running every configured sweep: every later visit would be passed or idle).
+
+A region that cannot act is *left out* (:data:`REGION_LEFT`, :func:`region_left`): no candidate of it closes at the
+predictor, none of its contacts carried a load from the last substep, and it is no block's. Each is tested once a
+sweep, as a region that holds nothing is (its idle reach, then the closing test). A closed body's lane reaches each
+of its regions once a sweep, so its scan tests a left-out region in place, as any region that holds nothing. The
+general sweep's region phase passes it, and the world's lanes test it at the sweep's end at the twist the sweep leaves
+(:func:`.sweep_routes.region_verify`): one that closes joins the next sweep, at most one sweep after the sweep of every
+region would have opened it (a sweep more where the budget is spent). So every region still left out at the end holds
+nothing at a twist where none of its candidates closes.
 """
 
 import numpy as np
@@ -70,6 +79,10 @@ REGION_IDLE = wp.constant(-2)
 REGION_LOOSE = wp.constant(-1)
 """A region's state: it holds a wrench and its last visit did not settle it (it slid). A state of zero or more is the
 lane's version at the region's last settled visit."""
+REGION_LEFT = wp.constant(-3)
+"""A region's state: it holds nothing and cannot act at the predictor (:func:`region_left`); the general sweep's region
+phase passes it and tests it at each sweep's end (:func:`.sweep_routes.region_verify`), a closed body's scan as any
+region that holds nothing."""
 
 FRICTION_ROWS = wp.constant(3)
 """The bits of a region's kind that hold its friction unit's rows (0, 2 or 3)."""
@@ -152,6 +165,33 @@ def region_closes(sn: wp.vec3, cand: wp.array[wp.vec4], c0: int, c1: int, tol: f
                 closes = 1
         i += 4
     return closes == 1
+
+
+@wp.func
+def region_left(
+    kind: int,
+    c0: int,
+    c1: int,
+    cand: wp.array[wp.vec4],
+    cand_contact: wp.array[int],
+    anchored: wp.array[int],
+    anchor_source: wp.array[int],
+    tol: float,
+) -> bool:
+    """Whether a region whose candidates are ``cand[c0:c1]`` (their contacts ``cand_contact``) and kind ``kind`` is
+    left out of the sweeps until their end: no candidate closes faster than ``tol`` at the predictor (its right-hand
+    side, the residual there, is not below ``-tol``), none of its contacts carried a load from the last substep (an
+    anchor placed this build from a stored one, ``anchored`` and ``anchor_source`` of the patch frame: the finish keeps
+    only a loaded region's anchor), and it is no block's (:func:`form_blocks`' marks)."""
+    if (kind & (KIND_BLOCK | KIND_MEMBER)) != 0:
+        return False
+    if region_closes(wp.vec3(0.0, 0.0, 0.0), cand, c0, c1, tol):
+        return False
+    for k in range(c0, c1):
+        c = cand_contact[k]
+        if anchored[c] != 0 and anchor_source[c] >= 0:
+            return False
+    return True
 
 
 @wp.func
@@ -1075,6 +1115,10 @@ def fill_regions(
     threads: int,
     reg_head: wp.array[wp.vec2i],
     reg_cand: wp.array[wp.vec2i],
+    leave_out: int,
+    anchored: wp.array[int],
+    anchor_source: wp.array[int],
+    tol: float,
     reg_frame: wp.array[wp.mat33],
     reg_arm: wp.array[wp.vec3],
     reg_arm_b: wp.array[wp.vec3],
@@ -1111,7 +1155,9 @@ def fill_regions(
     slips and spin. Each member's rows take their laws where its front end is formed (:func:`member_laws`), the
     carrier's first, so the region reads them: the free bodies' writer leaves the regions' rows their kinds alone. It
     starts holding nothing, with the coefficients up to which its bodies' twists leave it open
-    (:func:`.region_laws.idle_reach`), formed once its candidates are.
+    (:func:`.region_laws.idle_reach`), formed once its candidates are, and left out of the sweeps until their end where
+    it cannot act (:func:`region_left`, under ``leave_out``: ``anchored`` and ``anchor_source`` the patch frame's,
+    ``tol`` the closing threshold).
 
     A region's candidates are the work a region has, 1 to tens of them, and a warp's 32 regions would hold its lanes
     to its largest: each lane forms its region's frame, terms and records (:func:`fill_region_head`), then the warp
@@ -1196,6 +1242,8 @@ def fill_regions(
         if holds:
             reg_kind[g] = kind
             reg_reach[g] = idle_reach(cand, c0, c0 + size, reg_arm[g], reg_arm_b[g], reg_body[g][1] >= 0)
+            if leave_out != 0 and region_left(kind, c0, c0 + size, cand, cand_contact, anchored, anchor_source, tol):
+                reg_state[g] = REGION_LEFT
         g += threads
 
 
@@ -1230,6 +1278,7 @@ def form_blocks(
     reg_stage: wp.array[wp.vec3i],
     reg_kind: wp.array[int],
     blk_pair: wp.array[wp.vec2i],
+    reg_state: wp.array[int],
 ):
     """A world's groups (a pair of movable bodies, or a body against immovable partners) with more than ``least``
     regions closing at the predictor (a candidate's gap term below ``-tol``; ``least`` the group's six relative
@@ -1341,6 +1390,8 @@ def form_blocks(
                     reg_kind[g] = reg_kind[g] | KIND_BLOCK | (k << BLOCK_SHIFT)
                 else:
                     reg_kind[g] = reg_kind[g] | KIND_MEMBER | (k << BLOCK_SHIFT)
+                # The fill read the marks of the frame's last listing: a block's region is never left out.
+                reg_state[g] = REGION_IDLE
             if best_g < 0 and votes != wp.uint32(0):
                 best_g = base + lane_first(votes, _WORLD_LANES)
             members += lane_count(votes, _WORLD_LANES)
@@ -1807,8 +1858,10 @@ class Regions:
         options: The checked options.
     """
 
-    def __init__(self, model, forest, placement, factor, options):
+    def __init__(self, model, forest, placement, factor, options, *, leave_out: bool = True):
         self.model, self.forest, self.placement, self.factor, self.options = model, forest, placement, factor, options
+        # Whether a region that cannot act waits for the sweeps' end (fill_regions; a test pin turns it off).
+        self.leave_out = leave_out
         device = model.device
         # The free bodies are the forest's: those that respond, in its order, which is the order of their speed rows'
         # slots (Placement.rigid_velocity_limit_slot). A prescribed free body is no row's side and holds no region.
@@ -2047,6 +2100,10 @@ class Regions:
                 threads,
                 self.reg_head,
                 self.reg_cand,
+                int(self.leave_out),
+                solver.laws.friction_patches.current.valid,
+                solver.laws.friction_patches.current.source,
+                REGION_TOLERANCE,
             ],
             outputs=[
                 self.reg_frame,
@@ -2105,6 +2162,7 @@ class Regions:
                     self.reg_stage,
                     self.reg_kind,
                     self.blk_pair,
+                    self.reg_state,
                 ],
                 device=device,
                 block_dim=_WORLD_BLOCK,

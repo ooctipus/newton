@@ -514,7 +514,9 @@ class Sweep:
                 and self.factor.walk_arts is not None
                 and self.forest.free_rigid_body_count > 0
             ):
-                self.regions = Regions(model, self.forest, self.placement, self.factor, self.options)
+                self.regions = Regions(
+                    model, self.forest, self.placement, self.factor, self.options, leave_out=self.pins.left_regions
+                )
                 # The region visit holds more values than the register line of two warps a block keeps in registers
                 # (sweep_routes.WARP_LINE): a sweep that visits regions takes one warp a block and no line.
                 self.general_sweep = self._staged(dataclasses.replace(declared, regions=True, block_warps=1), worlds)

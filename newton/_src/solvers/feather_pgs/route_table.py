@@ -57,6 +57,9 @@ class Pins:
     regions: bool = True
     """``False``: the free bodies' contacts stay rows (the colored and the general sweep's row mappings) where the rule
     would make them regions, so a test solves one state on both mappings."""
+    left_regions: bool = True
+    """``False``: no region is left out of the sweeps until their end (:func:`.region_sweep.region_left`), so a test
+    holds the published point to the sweep of every region from the start."""
 
     def record(self) -> dict:
         """The pins in force (those off their defaults) as a JSON-compliant record."""

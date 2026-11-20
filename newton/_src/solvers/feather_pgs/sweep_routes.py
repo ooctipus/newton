@@ -31,6 +31,7 @@ from .region_sweep import (
     KIND_SPRINGS,
     PAIR_BLOCKS,
     REGION_IDLE,
+    REGION_LEFT,
     REGION_LOOSE,
     REGION_TOLERANCE,
 )
@@ -902,7 +903,8 @@ def region_phase(pad: str = "        ") -> str:
     whose last visit settled it is stamped with its bodies' versions (``reg_state`` its first body's, ``reg_stamp``
     its second's) and passed while both stand; one that holds nothing is opened only if a candidate closes at its
     bodies' twists. A visit votes for another sweep by the exit law: a coordinate of the region whose own change is
-    past the floor (:data:`.solve_policy.QUIET`) of its terms."""
+    past the floor (:data:`.solve_policy.QUIET`) of its terms. A left-out region
+    (:data:`.region_sweep.REGION_LEFT`) is passed: the sweeps' end tests it (:func:`region_verify`)."""
     gather = """const wp::spatial_vector seen = body_seen.data[{f}];
 bool same = true;
 for (int k = 0; k < 6; ++k) {{
@@ -980,6 +982,9 @@ if (moved) {{
         if (!teamed && (place >= level_last || ((blocks >> lane) & 1u) != 0u)) continue;
         if (teamed) WARP_SYNC();
         const int g = alone ? reg_order.data[place] : level_region.data[place];
+        // A left-out region waits for the sweeps' end (region_verify).
+        const int state = reg_state.data[g];
+        if (state == {int(REGION_LEFT)}) continue;
         const wp::vec2i sides = reg_body.data[g];
         const int f = sides[0], f_b = sides[1];
         if (!alone || f != body) {{
@@ -1010,7 +1015,6 @@ if (moved) {{
             w_b = wp::vec3(wp::dot(basis_b[3], u_b), wp::dot(basis_b[4], u_b), wp::dot(basis_b[5], u_b));
             reach_b = RegionLaw::twist_reach(v_b, w_b);
         }}
-        const int state = reg_state.data[g];
         if (state == version && (f_b < 0 || reg_stamp.data[g] == version_b)) continue;
         const int kind = reg_kind.data[g];
 {pair_block}
@@ -1118,6 +1122,67 @@ SYNC();"""
     return indent(text, pad)
 
 
+def region_verify(iteration: str = ITERATION, budget: str = "sweep_budget", pad: str = "        ") -> str:
+    """Native statements of a sweep's end that test the world's left-out regions (:data:`.region_sweep.REGION_LEFT`:
+    none of their candidates closed at the predictor): the world's lanes take its regions, each left-out one at its
+    bodies' twists as the sweep leaves them (their walk coordinates ``s_v`` through their bases) by the phase's own
+    test of a region that holds nothing (within its idle reach none closes; past it, the closing test). One that
+    closes joins the next sweep as a region that holds nothing (:data:`.region_sweep.REGION_IDLE`) and the sweeps may
+    not stop; a sweep more where ``budget`` ends at ``iteration``. So every region still left out at the end holds
+    nothing at a motion where none of its candidates closes."""
+    twist = """const int first{s} = body_first.data[{f}];
+const wp::spatial_vector* const basis{s} = body_basis.data + (size_t){f} * 6;
+wp::spatial_vector u{s};
+for (int k = 0; k < 6; ++k) u{s}[k] = s_v[first{s} + k];
+const wp::vec3 v{s}(wp::dot(basis{s}[0], u{s}), wp::dot(basis{s}[1], u{s}), wp::dot(basis{s}[2], u{s}));
+const wp::vec3 w{s}(wp::dot(basis{s}[3], u{s}), wp::dot(basis{s}[4], u{s}), wp::dot(basis{s}[5], u{s}));"""
+    text = f"""{{
+    SYNC();
+    const wp::vec2i left_span = world_regions.data[world];
+    int joined = 0;
+    for (int g = left_span[0] + lane; g < left_span[1]; g += STRIDE) {{
+        if (reg_state.data[g] != {int(REGION_LEFT)}) continue;
+        const wp::vec2i sides = reg_body.data[g];
+{indent(twist.format(s="", f="sides[0]"), "        ")}
+        // Within its idle reach no candidate closes (region_laws.idle_reach), as in the phase.
+        const wp::vec2 idle = reg_reach.data[g];
+        float reach_b = 0.0f;
+        wp::vec3 v_b, w_b;
+        if (sides[1] >= 0) {{
+{indent(twist.format(s="_b_", f="sides[1]"), "            ")}
+            v_b = v_b_;
+            w_b = w_b_;
+            reach_b = RegionLaw::twist_reach(v_b, w_b);
+        }}
+        if (idle[0] * RegionLaw::twist_reach(v, w) + idle[1] * reach_b <= 1.0f) continue;
+        const float sign = (reg_kind.data[g] & {int(KIND_SECOND)}) != 0 ? -1.0f : 1.0f;
+        const wp::mat33 frame = reg_frame.data[g];
+        const wp::vec3 n(frame.data[0][0], frame.data[0][1], frame.data[0][2]);
+        const wp::vec3 t0(frame.data[1][0], frame.data[1][1], frame.data[1][2]);
+        const wp::vec3 t1(frame.data[2][0], frame.data[2][1], frame.data[2][2]);
+        wp::vec3 sn = wp::mul(RegionLaw::frame_twist(v, w, reg_arm.data[g], n, t0, t1).v0, sign);
+        if (sides[1] >= 0) {{
+            sn = wp::sub(sn, wp::mul(RegionLaw::frame_twist(v_b, w_b, reg_arm_b.data[g], n, t0, t1).v0, sign));
+        }}
+        const wp::vec2i span = reg_cand.data[g];
+        bool closes = false;
+        for (int i = span[0]; i < span[1]; ++i) {{
+            const wp::vec4 record = cand.data[i];
+            closes = closes || sn[0] + record[0] * sn[1] + record[1] * sn[2] + record[2] < -{REGION_TOLERANCE!r}f;
+        }}
+        if (closes) {{
+            reg_state.data[g] = {int(REGION_IDLE)};
+            joined = 1;
+        }}
+    }}
+    if (BALLOT(joined != 0) != 0u) {{
+        iteration_changed = 1;
+        if ({iteration} + 1 == {budget}) {budget} += 1;
+    }}
+}}"""
+    return indent(text, pad)
+
+
 def world_lanes(support: int, *, free_rows: bool) -> int:
     """A world's lanes (switch 2): the power of two over its rows' widest ``support``, 8 at least, 16 with the free
     bodies' run (6 + 6 entries a row), up to a warp's 32: a lane holds at most one entry of a row."""
@@ -1211,6 +1276,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     mf_store = free.stores("i")
 
     passes = []
+    budget, left_verify = "iterations", ""
     if sweep.has_dense_velocity_limit_rows:
         passes.append(velocity_limit_pass(dense, dense_op, laws, pad="        "))
     # The free bodies' speed rows leave and enter by the walk, as their rows were written (walk_rows): the run's, or
@@ -1310,16 +1376,20 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         # The world's own cycles (its cost class, sweep_levels.COST_CLASSES): read at each sweep's end inside the
         # loop, where the world's lanes have not yet waited for a warp-mate at the loop's exit.
         owns = lanes > 1
+        # Under regions a join where the budget ends takes a sweep more (region_verify).
+        budget = "sweep_budget" if sweep.regions else "iterations"
         sweep_end = (_OWN_CYCLES_END if owns else "") + end_sweep(
-            solve_policy, iteration=ITERATION, violation=violation
+            solve_policy, iteration=ITERATION, violation=violation, iterations=budget
         )
         head = "    const int lane = LANE;" + ("\n" + _OWN_CYCLES_START if owns else "")
         first_warp = end_first_warp = ""
         barrier = "SYNC();"
         free_phase = ""
         if sweep.regions:
-            # The free bodies' contacts are regions: the world's open ones, by the one visit.
+            # The free bodies' contacts are regions: the world's open ones, by the one visit; the sweeps' end tests
+            # the left-out ones.
             free_phase = region_phase("    ")
+            left_verify = region_verify(budget=budget) + "\n"
         elif free_rows:
             free_phase = rows_block(
                 free, free_op, laws, admission=_MF_ADMISSION, metric=metric, formed=free_record, pad="    "
@@ -1445,7 +1515,8 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
             indent(free_phase, "    "),
         ),
         (f"{first_warp}{chr(10).join(passes)}\n{end_first_warp}",),
-        exit=sweep_vote + sweep_end,
+        exit=sweep_vote + left_verify + sweep_end,
+        budget=budget,
     )
     # The streamed rows' records (row_record, row_metadata.record_layout).
     free_records, line_records = record_layout(sweep.record_rows, M_D, P)
@@ -1474,8 +1545,9 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         dense_count += "\n    const int speed_start = speed_first.data[world];"
     dense_view = dense.declaration() + "\n" if dense.stream else ""
     # The sweeps and the way back; the stage launch (``formed == "stage"``) forms the dense records and leaves.
+    budget_line = f"    int {budget} = iterations;\n" if budget != "iterations" else ""
     rest = f"""
-{sweeps}
+{budget_line}{sweeps}
 
     {barrier}
 {first_warp}    for (int d = lane; d < {D}; d += STRIDE) {{
