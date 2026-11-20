@@ -115,11 +115,9 @@ _CARRY_EXTENT = wp.constant(3)
 # Then whether the frame is kept (its keys written) and whether it is held.
 _KEPT_EXTENT = wp.constant(4)
 _HELD_EXTENT = wp.constant(5)
-# Then whether this prepare lists the held frame's regions anew in the frame's order (its first held build's).
-_RELIST_EXTENT = wp.constant(6)
 # Then the placement's work (_place's step 0): the regions a held frame carries, or the slots of a new frame's build.
-_PLACE_EXTENT = wp.constant(7)
-# The positions a warp lists together: _prepare counts a chunk's region starts, _prepare_contacts lists them in order
+_PLACE_EXTENT = wp.constant(6)
+# The positions a warp lists together: _count_regions counts a chunk's region starts, _list_regions lists them in order
 # after the chunks before it.
 _LIST_CHUNK = wp.constant(1024)
 
@@ -272,8 +270,9 @@ class _PatchFrame:
 
 @wp.func
 def _listed_region(regions: wp.array[int], live: int, region: int):
-    """The listed position of a held frame's ``region``-th region: those of several contacts first (listed from the
-    list's back below the live count), then those of one contact (from its front), each part in the frame's order.
+    """The listed position of a frame's ``region``-th region (:func:`_list_regions`): those of several contacts first
+    (listed from the list's back below the live count), then those of one contact (from its front), each part in the
+    frame's order.
 
     A region of several contacts holds its thread through member loops, a footprint's hull and a longer ring; one of
     a single contact does not. Visited first, the long ones start in the launch's first wave and the short ones fill
@@ -527,8 +526,6 @@ def _prepare(
     fresh: wp.array[int],
     extent: wp.array[int],
     regions: wp.array[int],
-    listing: wp.array[int],
-    chunks: wp.array[wp.vec2i],
 ):
     """Decide this frame and give a new frame's contacts their pair keys, in the frame's order: the collision
     pipeline's (``inputs``; by body pair, then contact key, :meth:`.ContactSorter.sort_full`), so a body pair's
@@ -543,14 +540,9 @@ def _prepare(
     build) is held: its contacts keep their regions, and its build carries
     them where any other build makes the regions anew and empties their list
     (:func:`_build`, :func:`_place`). Thread 0 publishes the extent, whether the frame is kept
-    and held, and the empty list, which this launch reads nowhere.
-
-    The build lists a frame's regions as its threads make them. The frame's
-    first held prepare lists them anew in the frame's order, which every
-    later build of the frame carries: ``listing[0]`` holds whether the list is
-    in that order (:func:`_prepare_contacts` writes it). Here each warp counts
-    the regions of one contact and of several that start in its chunks of
-    positions (``chunks``); ``threads`` is a whole number of warps.
+    and held, and the empty list, which this launch reads nowhere. A new
+    frame's build lists its regions in the frame's order (:func:`_list_regions`),
+    which every later build of the frame carries.
     """
     thread = wp.tid()
     live = count[0]
@@ -566,29 +558,13 @@ def _prepare(
     ):
         kept = 1
     held = kept * fresh[0]
-    relist = held * (1 - listing[0])
     if thread == 0:
         _publish_extent(extent, end, live, end * (1 - held), (regions[0] + regions[1]) * held)
         extent[_KEPT_EXTENT] = kept
         extent[_HELD_EXTENT] = held
-        extent[_RELIST_EXTENT] = relist
         if held == 0:
             regions[0] = 0
             regions[1] = 0
-    if relist != 0:
-        lane = lane_index(_PAIR_LANES)
-        warps = threads // lane_stride(_PAIR_LANES)
-        for chunk in range(thread // lane_stride(_PAIR_LANES), (live + _LIST_CHUNK - 1) // _LIST_CHUNK, warps):
-            singles = int(0)
-            others = int(0)
-            for base in range(
-                chunk * _LIST_CHUNK, wp.min(chunk * _LIST_CHUNK + _LIST_CHUNK, live), lane_stride(_PAIR_LANES)
-            ):
-                single, several = _region_starts(frame, base + lane, live)
-                singles += lane_count(lane_ballot(single, _PAIR_LANES), _PAIR_LANES)
-                others += lane_count(lane_ballot(several, _PAIR_LANES), _PAIR_LANES)
-            if lane == 0:
-                chunks[chunk] = wp.vec2i(singles, others)
     # A kept frame's live slots hold its keys.
     for c in range(live * kept + thread, end, threads):
         frame.indices[c] = c
@@ -602,53 +578,87 @@ def _prepare_contacts(
     threads: int,
     frame: _PatchFrame,
     patches: FrictionPatches,
-    listing: wp.array[int],
-    chunks: wp.array[wp.vec2i],
 ):
     """Prepare every slot this frame visits (:func:`_prepare_contact_fields`) in the frame's order, the collision
     pipeline's (``inputs``); a warp's lanes take consecutive slots (``threads`` is a whole number of warps). Every
     later kernel of the frame reads a contact at its index.
 
     A build that makes the regions marks each one where its members start (``region_stop``), so a prepare that does
-    not hold the frame clears the marks first. The frame's first held prepare lists the marked regions anew in the
-    frame's order (``extent[_RELIST_EXTENT]``), in the two parts the build lists them in (one contact from the list's
-    front, the others from its back below the live count), so the regions a warp of the carry takes lie together
-    (:func:`_build`): a warp a chunk of positions, after the regions :func:`_prepare` counted in the chunks before it.
+    not hold the frame clears the marks first.
     """
     thread = wp.tid()
     end = extent[0]
     live = extent[1]
     kept = extent[_KEPT_EXTENT]
     held = extent[_HELD_EXTENT]
-    relist = extent[_RELIST_EXTENT]
-    if thread == 0:
-        listing[0] = held
-    if relist != 0:
-        lane = lane_index(_PAIR_LANES)
-        warps = threads // lane_stride(_PAIR_LANES)
-        for chunk in range(thread // lane_stride(_PAIR_LANES), (live + _LIST_CHUNK - 1) // _LIST_CHUNK, warps):
-            before = wp.vec2i(0, 0)
-            for k in range(lane, chunk, lane_stride(_PAIR_LANES)):
-                before += chunks[k]
-            first = lane_sum(before[0], _PAIR_LANES)
-            last = lane_sum(before[1], _PAIR_LANES)
-            for base in range(
-                chunk * _LIST_CHUNK, wp.min(chunk * _LIST_CHUNK + _LIST_CHUNK, live), lane_stride(_PAIR_LANES)
-            ):
-                j = base + lane
-                single, several = _region_starts(frame, j, live)
-                singles = lane_ballot(single, _PAIR_LANES)
-                others = lane_ballot(several, _PAIR_LANES)
-                if single:
-                    frame.regions[first + lane_below(singles, _PAIR_LANES)] = j
-                if several:
-                    frame.regions[live - 1 - last - lane_below(others, _PAIR_LANES)] = j
-                first += lane_count(singles, _PAIR_LANES)
-                last += lane_count(others, _PAIR_LANES)
     for j in range(thread, end, threads):
         if held == 0:
             frame.region_stop[j] = 0
         _prepare_contact_fields(j, live, kept, held, inputs, frame, patches)
+
+
+@wp.kernel(enable_backward=False)
+def _count_regions(extent: wp.array[int], threads: int, frame: _PatchFrame, chunks: wp.array[wp.vec2i]):
+    """Count a new frame's regions, marked where their members start (``region_stop``, :func:`_build`), of one contact
+    and of several, a warp a chunk of positions (``chunks``; ``threads`` is a whole number of warps)."""
+    if extent[_BUILD_EXTENT] == 0:
+        return
+    thread = wp.tid()
+    live = extent[1]
+    lane = lane_index(_PAIR_LANES)
+    warps = threads // lane_stride(_PAIR_LANES)
+    for chunk in range(thread // lane_stride(_PAIR_LANES), (live + _LIST_CHUNK - 1) // _LIST_CHUNK, warps):
+        singles = int(0)
+        others = int(0)
+        for base in range(
+            chunk * _LIST_CHUNK, wp.min(chunk * _LIST_CHUNK + _LIST_CHUNK, live), lane_stride(_PAIR_LANES)
+        ):
+            single, several = _region_starts(frame, base + lane, live)
+            singles += lane_count(lane_ballot(single, _PAIR_LANES), _PAIR_LANES)
+            others += lane_count(lane_ballot(several, _PAIR_LANES), _PAIR_LANES)
+        if lane == 0:
+            chunks[chunk] = wp.vec2i(singles, others)
+
+
+@wp.kernel(enable_backward=False)
+def _list_regions(
+    extent: wp.array[int], threads: int, frame: _PatchFrame, chunks: wp.array[wp.vec2i], regions: wp.array[int]
+):
+    """List a new frame's regions in the frame's order, a warp a chunk of positions after the regions counted in the
+    chunks before it (:func:`_count_regions`): those of one contact from the list's front, those of several from its
+    back below the live count, each part in the frame's order; the warp of the last chunk records the two parts'
+    sizes (``regions``). Every later build of the frame carries the list (:func:`_listed_region`), so the regions a
+    warp of the placement or the carry takes lie together, and no result follows the order the build's threads made
+    the regions in."""
+    if extent[_BUILD_EXTENT] == 0:
+        return
+    thread = wp.tid()
+    live = extent[1]
+    chunks_live = (live + _LIST_CHUNK - 1) // _LIST_CHUNK
+    lane = lane_index(_PAIR_LANES)
+    warps = threads // lane_stride(_PAIR_LANES)
+    for chunk in range(thread // lane_stride(_PAIR_LANES), chunks_live, warps):
+        before = wp.vec2i(0, 0)
+        for k in range(lane, chunk, lane_stride(_PAIR_LANES)):
+            before += chunks[k]
+        first = lane_sum(before[0], _PAIR_LANES)
+        last = lane_sum(before[1], _PAIR_LANES)
+        for base in range(
+            chunk * _LIST_CHUNK, wp.min(chunk * _LIST_CHUNK + _LIST_CHUNK, live), lane_stride(_PAIR_LANES)
+        ):
+            j = base + lane
+            single, several = _region_starts(frame, j, live)
+            singles = lane_ballot(single, _PAIR_LANES)
+            others = lane_ballot(several, _PAIR_LANES)
+            if single:
+                frame.regions[first + lane_below(singles, _PAIR_LANES)] = j
+            if several:
+                frame.regions[live - 1 - last - lane_below(others, _PAIR_LANES)] = j
+            first += lane_count(singles, _PAIR_LANES)
+            last += lane_count(others, _PAIR_LANES)
+        if chunk == chunks_live - 1 and lane == 0:
+            regions[0] = first
+            regions[1] = last
 
 
 @wp.func
@@ -1110,23 +1120,16 @@ def _settle_region(
 def _list_region(
     member_start: int,
     member_stop: int,
-    end: int,
     anchor_start: int,
     anchor_stop: int,
     centre_stop: int,
     frame: _PatchFrame,
-    regions: wp.array[int],
 ):
-    """List a new frame's region, whose members lie in ``frame.members[member_start:member_stop]``, for its placement
-    (:func:`_place`) and the frame's later builds: where its members stop, its place in the list (one contact from the
-    list's front, several from its back below the live count ``end``: the threads of a warp that carries the list then
-    hold regions of one kind, and those of one contact wait for no footprint), and its pair's stored history, the
-    anchors ``prev.members[anchor_start:anchor_stop]`` and the centres ``prev.centres[anchor_start:centre_stop]``."""
+    """Mark a new frame's region, whose members lie in ``frame.members[member_start:member_stop]``, for its listing
+    (:func:`_list_regions`), its placement (:func:`_place`) and the frame's later builds: where its members stop, and
+    its pair's stored history, the anchors ``prev.members[anchor_start:anchor_stop]`` and the centres
+    ``prev.centres[anchor_start:centre_stop]``."""
     frame.region_stop[member_start] = member_stop
-    if member_stop - member_start == 1:
-        frame.regions[wp.atomic_add(regions, 0, 1)] = member_start
-    else:
-        frame.regions[end - 1 - wp.atomic_add(regions, 1, 1)] = member_start
     frame.history[member_start] = wp.vec3i(anchor_start, anchor_stop, centre_stop)
 
 
@@ -1141,10 +1144,9 @@ def _build_pair(
     frame: _PatchFrame,
     prev: _PatchFrame,
     patches: FrictionPatches,
-    regions: wp.array[int],
 ):
-    """Make the regions of the body pair whose sorted run is live positions ``[start, stop)`` on one thread and list
-    them, with the pair's stored history, for their placement (:func:`_list_region`)."""
+    """Make the regions of the body pair whose sorted run is live positions ``[start, stop)`` on one thread and mark
+    them, with the pair's stored history, for their listing and placement (:func:`_list_region`)."""
     key = frame.keys[start]
 
     # Binary search the previous pair, avoiding a scan over other worlds/pairs.
@@ -1233,7 +1235,7 @@ def _build_pair(
                     continue
                 frame.members[member_stop] = c
                 member_stop += 1
-        _list_region(member_start, member_stop, end, prev_start, prev_anchor_stop, prev_centre_stop, frame, regions)
+        _list_region(member_start, member_stop, prev_start, prev_anchor_stop, prev_centre_stop, frame)
 
 
 @wp.func(inline=False)
@@ -1289,10 +1291,9 @@ def _build_pair_lanes(
     frame: _PatchFrame,
     prev: _PatchFrame,
     patches: FrictionPatches,
-    regions: wp.array[int],
 ):
     """Make the regions of the body pair whose sorted run starts at live position ``start`` with the lanes of the warp
-    together and list them: every region, member, link and record :func:`_build_pair` makes on one thread, the same.
+    together and mark them: every region, member, link and record :func:`_build_pair` makes on one thread, the same.
 
     The lanes read the run, the stored run and its history a stride of positions at a time. The flood keeps its
     order: seed after seed in sorted order, and for each sweep of a seed the lanes test a stride of the later
@@ -1433,7 +1434,7 @@ def _build_pair_lanes(
                 member_stop += lane_count(mine_bits, _PAIR_LANES)
         lane_sync(_PAIR_LANES)
         if lane == 0:
-            _list_region(member_start, member_stop, end, prev_start, anchor_stop, centre_stop, frame, regions)
+            _list_region(member_start, member_stop, prev_start, anchor_stop, centre_stop, frame)
         index += 1
 
 
@@ -1453,10 +1454,9 @@ def _build(
     stream: wp.int64,
     built: wp.array[int],
     built_frame: wp.array[wp.int64],
-    regions: wp.array[int],
 ):
-    """Make a new frame's regions and list them, with their pairs' stored history, for their placement
-    (:func:`_place`); a held frame's build makes none (its extent is zero).
+    """Make a new frame's regions and mark them, with their pairs' stored history, for their listing
+    (:func:`_list_regions`) and placement (:func:`_place`); a held frame's build makes none (its extent is zero).
 
     The build strides over the live sorted positions and makes the regions of the body pair whose run starts at each;
     body pairs write disjoint current/previous records. A thread seeks its next pair before it builds it, so the
@@ -1532,7 +1532,6 @@ def _build(
                     frame,
                     prev,
                     patches,
-                    regions,
                 )
         # The longer pairs the lanes found, one after another, each with every lane of the warp.
         shared = lane_ballot(found and not whole, _PAIR_LANES)
@@ -1546,7 +1545,6 @@ def _build(
                 frame,
                 prev,
                 patches,
-                regions,
             )
             shared = shared & (shared - wp.uint32(1))
         position += threads
@@ -1999,8 +1997,6 @@ class _FrictionPatchState:
         # Whether a store followed the last build: the stored frame then holds that build, and a build of the same
         # contact frame is held. _store_frame sets it and a build clears it.
         self.fresh = wp.zeros(1, dtype=int, device=device)
-        # Whether the held frame's region list is in the frame's order (_prepare_contacts lists it anew).
-        self.listing = wp.zeros(1, dtype=int, device=device)
         self.extent = wp.zeros(_PLACE_EXTENT + 1, dtype=int, device=device)
 
     def _on_view_rows(self, rows):
@@ -2232,7 +2228,7 @@ class _FrictionPatchState:
             _prepare,
             self.warp_threads,
             inputs=[*inputs, self.fresh],
-            outputs=[self.extent, self.regions, self.listing, self.chunks],
+            outputs=[self.extent, self.regions],
             extent=used,
             clamp=True,
         )
@@ -2245,14 +2241,14 @@ class _FrictionPatchState:
             _prepare_contacts,
             self.warp_threads,
             inputs=[self.extent, inputs, self.warp_threads, self.current, self.view],
-            outputs=[self.listing, self.chunks],
             extent=self.extent[0:1],
             clamp=True,
         )
 
     def _launch_build(self, model, state, generation, stream):
         """Build the regions of the prepared, sorted slots and record their frame: ``generation``'s, of ``stream``.
-        A new frame's are made and listed (:func:`_build`), then every frame's placed (:func:`_place`)."""
+        A new frame's are made (:func:`_build`) and listed in the frame's order (:func:`_count_regions`,
+        :func:`_list_regions`), then every frame's placed (:func:`_place`)."""
         self.pool.launch(
             _build,
             self.build_threads,
@@ -2268,12 +2264,29 @@ class _FrictionPatchState:
                 generation,
                 stream,
             ],
-            outputs=[self.built, self.built_frame, self.regions],
+            outputs=[self.built, self.built_frame],
             # Any frame's slots to visit but a held one's, not the live ones: thread 0 publishes the live count, also
             # when it drops to zero.
             extent=self.extent[_BUILD_EXTENT : _BUILD_EXTENT + 1],
             clamp=True,
             block_dim=self.build_block_dim,
+        )
+        # A new frame's regions in the frame's order, a warp a chunk of positions (a held frame keeps its build's list).
+        self.pool.launch(
+            _count_regions,
+            self.warp_threads,
+            inputs=[self.extent, self.warp_threads, self.current],
+            outputs=[self.chunks],
+            extent=self.extent[0:1],
+            clamp=True,
+        )
+        self.pool.launch(
+            _list_regions,
+            self.warp_threads,
+            inputs=[self.extent, self.warp_threads, self.current, self.chunks],
+            outputs=[self.regions],
+            extent=self.extent[0:1],
+            clamp=True,
         )
         # The placement's steps: the first over every frame's regions, the others over a new frame's only.
         for step, work in ((0, _PLACE_EXTENT), (1, _BUILD_EXTENT), (2, _BUILD_EXTENT)):

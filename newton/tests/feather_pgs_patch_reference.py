@@ -237,7 +237,6 @@ def _build(
     frame: _PatchFrame,
     prev: _PatchFrame,
     patches: FrictionPatches,
-    regions: wp.array[int],
 ):
     """One thread per sorted body pair, over the whole capacity; the pair's build is the module's (the one-wrench law),
     its previous pairs searched over the whole history. Every build makes its regions anew: this reference holds
@@ -249,7 +248,7 @@ def _build(
     stop = start + 1
     while stop < end and frame.keys[stop] == frame.keys[start]:
         stop += 1
-    _build_pair(start, stop, end, prev.center.shape[0], shape_transform, shape_radius, frame, prev, patches, regions)
+    _build_pair(start, stop, end, prev.center.shape[0], shape_transform, shape_radius, frame, prev, patches)
     # The pair's regions placed one after another in the order the flood made them, each taking the nearest passing
     # stored anchor that no region before it took: the order the solver's placement reproduces a thread a region.
     member_start = start
@@ -621,7 +620,6 @@ class ReferencePatches:
                 self.current,
                 self.previous,
                 self.view,
-                wp.zeros(2, dtype=int, device=model.device),
             ],
             device=model.device,
         )

@@ -1150,6 +1150,29 @@ class TestPatchManyContacts(unittest.TestCase):
         )
         self.assertGreater(coverage["live"], 2048)
 
+    def test_regions_list_in_the_frame_order(self):
+        """List a new frame's regions in the frame's order, whatever order the build's threads made them in: those of
+        one contact from the list's front, those of several from its back below the live count, each part in the
+        frame's order and every marked region once, so the placement and the carry visit them in an order that
+        follows the frame, never the GPU's scheduling."""
+        devices = ["cpu"] + (["cuda:0"] if wp.is_cuda_available() else [])
+        for device in devices:
+            with self.subTest(device=device):
+                scene = _Scene(device, 7, worlds=110, contacts=4096)
+                scene.active[:] = True
+                live = scene.frame()
+                state = _FrictionPatchState(scene.model, 4600, wp.zeros(4600, dtype=wp.vec2, device=device))
+                state.build(scene.model, scene.state, scene.contacts)
+                stop = state.current.region_stop.numpy()[:live]
+                starts = np.flatnonzero(stop > np.arange(live))
+                singles = starts[stop[starts] == starts + 1]
+                several = starts[stop[starts] > starts + 1]
+                self.assertGreater(len(several), 32, "regions of several contacts across warps")
+                listed = state.current.regions.numpy()
+                np.testing.assert_array_equal(state.regions.numpy(), [len(singles), len(several)])
+                np.testing.assert_array_equal(listed[: len(singles)], singles)
+                np.testing.assert_array_equal(listed[live - len(several) : live][::-1], several)
+
     @unittest.skipUnless(wp.is_cuda_available(), "multi-block grids need CUDA")
     def test_builds_match_on_many_blocks(self):
         """Match the reference on multi-block grids, and through graph replay."""
@@ -1508,6 +1531,8 @@ class TestPatchLaunchShapes(unittest.TestCase):
                 ("_prepare", 1536, 1536, None),
                 ("_prepare_contacts", 1536, 1536, None),
                 ("_build", 2048, 2048, 32),
+                ("_count_regions", 1536, 1536, None),
+                ("_list_regions", 1536, 1536, None),
                 ("_place", 2048, 2048, 32),
             },
         )
