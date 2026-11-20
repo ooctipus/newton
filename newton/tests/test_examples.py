@@ -1071,6 +1071,16 @@ add_example_test(
     test_options={"requires": ("pxr.Usd", "trimesh", "collada", *MUJOCO_MODULES), "num-frames": 720},
     use_viewer=True,
 )
+# The hardware scene settles for 3 s, then the arm takes the bin's handle and shakes it until 9.6 s and holds it
+# until 10.6 s (636 frames at 60 Hz). Its parts have left the bench only while settling or shaking, so the test ends
+# with the hold instead of the default 720 frames, which stopped partway through the release.
+add_example_test(
+    TestRobotExamples,
+    name="robot.example_robot_clutter",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 636},
+    use_viewer=True,
+)
 
 
 class TestRobotPolicyExamples(unittest.TestCase):
