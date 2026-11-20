@@ -704,7 +704,7 @@ class ContactMatcher:
             launches are added.
         device: Device to allocate on.
         pool: Contact pool whose ready rows the history holds and grows with,
-            keeping its contents; by default a pool starting at ``capacity`` rows.
+            keeping its contents; by default a fixed pool of ``capacity`` rows.
     """
 
     def __init__(
@@ -725,7 +725,8 @@ class ContactMatcher:
     ):
         with wp.ScopedDevice(device):
             if pool is None:
-                pool = ContactPool(device=wp.get_device(), rows=capacity)
+                # A matcher of its own holds its rows, as Newton's buffers do: only a pool given grows.
+                pool = ContactPool(device=wp.get_device(), rows=capacity, fixed=True)
             self._pool = pool
             self._capacity = pool.ready
             self._pos_threshold_sq = pos_threshold * pos_threshold

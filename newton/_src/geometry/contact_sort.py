@@ -308,13 +308,14 @@ class ContactSorter:
             per_contact_shape_properties: Provision scratch for per-contact stiffness, damping and friction.
             allocate_simple_scratch: Provision the simple-layout scratch :meth:`sort_simple` needs.
             device: Device to allocate on.
-            pool: Contact pool whose ready rows the buffers hold and grow with; by default a pool
-                starting at ``capacity`` rows.
+            pool: Contact pool whose ready rows the buffers hold and grow with; by default a fixed pool of
+                ``capacity`` rows.
         """
         with wp.ScopedDevice(device):
             self._has_shape_props = per_contact_shape_properties
             if pool is None:
-                pool = ContactPool(device=wp.get_device(), rows=capacity)
+                # A sorter of its own holds its rows, as Newton's buffers do: only a pool given grows.
+                pool = ContactPool(device=wp.get_device(), rows=capacity, fixed=True)
             self._has_simple_scratch = allocate_simple_scratch
             fields = [
                 # The live sort merges through a second half and loads whole chunks past the first.

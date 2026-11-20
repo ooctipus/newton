@@ -814,7 +814,9 @@ def test_compatibility_budgets_are_silent_and_start_the_pool(test, device):
         test.assertEqual(model.rigid_contact_max, 5)
         contacts = pipeline.contacts()
         pool = contacts._rigid_contact_pool
-        test.assertEqual(contacts.rigid_contact_max, 5)
+        # The budget starts the rows; CUDA virtual memory publishes every row its first pages cover (ContactPool.settle).
+        test.assertEqual(contacts.rigid_contact_max, pool.ready)
+        test.assertGreaterEqual(contacts.rigid_contact_max, 5)
         test.assertEqual(pool.bound, reference_contacts._rigid_contact_pool.bound)
         model.rigid_contact_max = 7
         later = newton.CollisionPipeline(model, growable_contacts=True)
