@@ -171,6 +171,7 @@ FORCE_INPUT = (
     Field("predicted_twist", wp.spatial_vector, ("body",), owner="step"),
     Field("publish_twists", wp.int32, owner="step"),
     Field("drive", wp.vec4, ("dof",), owner="factor", attr="aug_drive"),
+    Field("line", wp.float32, ("dof",), owner="factor", attr="aug_line"),
     Field("drive_row", wp.int32, ("dof",), owner="factor", attr="drive_row_by_dof"),
     Field("row_K", wp.float32, ("drive_row",), owner="factor", attr="aug_row_K"),
     Field("row_Kd", wp.float32, ("drive_row",), owner="factor", attr="aug_row_Kd"),
@@ -715,11 +716,18 @@ class TrialWords:
 
 QUIET_DRIVE = r"""const wp::vec4 drive=f.drive.data[dof];
         if(drive[0]>0.0f&&drive[2]>0.0f) {
-            const float u0=drive[3],limited=Spatial::limited_drive_force(u0,drive[2]);
-            if(u0!=limited||wp::abs(Spatial::drive_step_force(u0,limited,drive[0],value,0.0f))>drive[2])MOVE(1);
+            const float u0=drive[3],limited=f.u0.data[dof];
+            if(u0!=limited)MOVE(1);
+            else {
+                const float force=limited-drive[0]*value,line=f.line.data[dof];
+                const float end=f.joint_qd.data[dof]+f.dt*value;
+                if(force>Spatial::motor_reach(drive[2],line,end,1.0f)||force<-Spatial::motor_reach(drive[2],line,end,-1.0f))
+                    MOVE(1);
+            }
         }
 """
-"""The test of a drive with nothing to do, where ``qdd`` is written: no excess, and the trial leaves it within its limit.
+"""The test of a drive with nothing to do, where ``qdd`` is written: no excess (``u0`` is the force the trial solved
+with), and the trial leaves it within its motor's reach at the step's end velocity (:func:`.spatial_laws.motor_reach`).
 A world every drive of which passes reads nothing else of the decision and takes no second stage."""
 
 SATURATE_DRIVES = r"""    for(int i=lane;i<$DOFS;i+=stride) {
@@ -732,18 +740,13 @@ SATURATE_DRIVES = r"""    for(int i=lane;i<$DOFS;i+=stride) {
             const float all=f.row_K.data[row];
             float decided=all;
             if(K>0.0f&&limit>0.0f) {
-                const float qdd=f.qdd.data[dof];
-                const float limited=Spatial::limited_drive_force(u0,limit);
-                const float inertia=u0!=limited?f.row_H.data[row]+passive:0.0f;
-                const float force=Spatial::drive_step_force(u0,limited,K,qdd,inertia);
-                float change=0.0f;
-                if(wp::abs(force)>limit) {
-                    decided=passive;
-                    change=wp::sign(force)*limit-limited;
-                } else if(u0!=limited) {
-                    const float rows=f.row_dv.data[row]/f.dt;
-                    change=Spatial::free_drive_force(u0,limited,K,qdd,rows,inertia,limit)-limited;
-                }
+                const float qdd=f.qdd.data[dof],limited=f.u0.data[dof];
+                const float inertia=f.row_H.data[row]+passive;
+                const float rows=u0!=limited?f.row_dv.data[row]/f.dt:0.0f;
+                const auto step=Spatial::motor_step(u0,limited,K,all,passive,qdd,inertia,limit,f.line.data[dof],
+                                                    f.joint_qd.data[dof],f.dt,rows);
+                const float change=step.v0-limited;
+                decided=step.v1;
                 if(change!=0.0f||decided!=all) {
                     f.u0.data[dof]+=change;
                     s[$SIX_BODIES+i]+=change;
@@ -759,14 +762,15 @@ SATURATE_DRIVES = r"""    for(int i=lane;i<$DOFS;i+=stride) {
     }
     SYNC();
 """
-"""The drives' saturation decision (:func:`.spatial_laws.drive_step_force`), read from the trial solve just made, the
-step's: a drive past its limit becomes the constant ``+-limit`` with no ``K``, and a drive within it takes back what its
-limit held off (:func:`.spatial_laws.free_drive_force`). Each changes the force by the same amount the trial solved
-with (``s[$SIX_BODIES + i]``); each drive's decided ``K`` goes to ``row_Kd``. For the border (:func:`border_solve`) each
-coordinate leaves in the dead response words its released stiffness (``K - Kd``, nonzero on a slip) and in the dead body
-wrench words its decided ``K``. ``moved``: bit 0, the trial found something to do (:data:`QUIET_DRIVE`); bit ``1 + r``,
-root ``r``'s decided step differs from its trial. A world with nothing to do pays its :data:`QUIET_DRIVE` tests and no
-launch, and a captured graph has nothing to skip."""
+"""The drives' decision (:func:`.spatial_laws.motor_step`), read from the trial solve just made, the step's: a drive
+past its motor's reach at its step's end velocity becomes its stall (``+-limit``, no ``K``), its torque-speed line
+(``K`` its back-EMF damper's) or its brake past twice its no-load speed (``-+limit``, no ``K``), and a drive within it takes back what its limit held off
+(:func:`.spatial_laws.free_drive_force`). Each changes the force by the same amount the trial solved with
+(``s[$SIX_BODIES + i]``); each drive's decided ``K`` goes to ``row_Kd``. For the border (:func:`border_solve`) each
+coordinate leaves in the dead response words its released stiffness (``K - Kd``, nonzero on a slip: negative where its
+line's damper is stiffer than its drive) and in the dead body wrench words its decided ``K``. ``moved``: bit 0, the
+trial found something to do (:data:`QUIET_DRIVE`); bit ``1 + r``, root ``r``'s decided step differs from its trial. A
+world with nothing to do pays its :data:`QUIET_DRIVE` tests and no launch, and a captured graph has nothing to skip."""
 
 
 def _root(layout: TreeLayout) -> str:
@@ -1670,7 +1674,8 @@ _HELD = """    // The border (SAT_PHYS section 1.2, W9): a tree's decided step o
 $passes
     };
     // HELD_BUILD(h, parent, first, a, n, nb, data, released, kept): the release of the tree's slips, coordinate-major. The slips are
-    // its coordinates whose released stiffness is positive, root-most first (ascending), slip j on lane j % WIDTH in
+    // its coordinates whose released stiffness is not zero (negative: a motor line's damper stiffer than its drive, a
+    // rank-1 update where a positive release is a downdate), root-most first (ascending), slip j on lane j % WIDTH in
     // slot j / WIDTH (at most HOLD_SLIPS, the class's slip capacity, and the release's; a slip past them keeps its K
     // and raises status bit 0). A pivot that is not positive raises bit 1 (SAT_PHYS falsifier 1: the split
     // capacitance not positive definite). One leaf-first sweep over the coordinates the slips' paths hold: at each,
@@ -1687,14 +1692,14 @@ $passes
         auto& release = walk.release;
         const int depth = release.step.shape[2];
         const int cap = a < release.dof.shape[0] ? release.dof.shape[1] : 0;
-        // Each slot's slip: the (lane + m WIDTH)-th coordinate, ascending, whose released stiffness is positive.
+        // Each slot's slip: the (lane + m WIDTH)-th coordinate, ascending, whose released stiffness is not zero.
         int is[HOLD_SLOTS], total = 0;
         #pragma unroll
         for (int m = 0; m < HOLD_SLOTS; ++m) is[m] = -1;
         #pragma unroll
         for (int k = 0; k < HOLD_WORDS; ++k) {
             const int x = lane + k * WIDTH;
-            const unsigned candidates = BALLOT(x < n && released[x] > 0.0f);
+            const unsigned candidates = BALLOT(x < n && released[x] != 0.0f);
             const int count = COUNT(candidates);
             #pragma unroll
             for (int m = 0; m < HOLD_SLOTS; ++m) {

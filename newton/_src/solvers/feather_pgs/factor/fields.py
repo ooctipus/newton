@@ -11,7 +11,7 @@ import warp as wp
 
 from .. import field_group
 from ..field_group import Field, FieldGroup
-from ..spatial_laws import FACTOR_REQUEST, drive_force, drive_stiffness, limited_drive_force
+from ..spatial_laws import FACTOR_REQUEST, drive_force, drive_stiffness, motor_limited
 
 ARTICULATION_WORK = FieldGroup(
     Field("mass_update_mask", wp.int32, ("articulation",), owner="factor"),
@@ -27,18 +27,22 @@ AUGMENTED_DRIVE_ROWS = FieldGroup(
     Field("aug_row_H", wp.float32, ("drive_row",), owner="factor"),
     Field("aug_row_dv", wp.float32, ("drive_row",), owner="factor"),
     Field("aug_drive", wp.vec4, ("dof",), owner="factor"),
+    Field("aug_line", wp.float32, ("dof",), owner="factor"),
 )
 """Augmented drive rows, ``max_dofs`` per articulation: each row's ``K``, which the factor holds; the ``K`` the saturation
-decision left it (``aug_row_Kd``, the passive damper's on a saturated drive, whose ``K - Kd`` the border releases,
+decision left it (``aug_row_Kd``: the passive damper's on a stalled or braking drive, with its motor line's on a drive
+on its line, whose ``K - Kd`` the border releases,
 :func:`.tree_kinetic_state.border_solve`); the ``H_ii`` (armature in, ``K`` out) last formed where the tree's
 representation forms its mass diagonal; what last step's rows did to its coordinate; per coordinate, what the step's
 saturation decision reads on every drive (:data:`.tree_kinetic_state.SATURATE_DRIVES`): ``aug_drive``, the drive's own ``K``, the passive damper's, the effort limit
-and the unlimited ``u0``, one read of one record."""
+and the unlimited ``u0``, one read of one record, and ``aug_line``, the slope of its motor's torque-speed line
+(:func:`.spatial_laws.motor_line`)."""
 
 DRIVE_ROWS = (
     Field("row_K", wp.float32, ("drive_row",), owner="factor", attr="aug_row_K"),
     Field("row_dv", wp.float32, ("drive_row",), owner="factor", attr="aug_row_dv"),
     Field("drive", wp.vec4, ("dof",), owner="factor", attr="aug_drive"),
+    Field("line", wp.float32, ("dof",), owner="factor", attr="aug_line"),
     Field("mass_update_requested", wp.int32, ("articulation",), owner="factor"),
     Field("v_out", wp.float32, ("dof",), owner="step"),
     Field("v_hat", wp.float32, ("dof",), owner="step"),
@@ -50,18 +54,29 @@ DriveRows = field_group.struct("DriveRows", DRIVE_ROWS, __name__)
 
 @wp.func
 def hold_drive_row(
-    rows: DriveRows, row: int, articulation: int, dof: int, u0: float, K: float, passive: float, limit: float
+    rows: DriveRows,
+    row: int,
+    articulation: int,
+    dof: int,
+    u0: float,
+    K: float,
+    passive: float,
+    limit: float,
+    line: float,
+    velocity: float,
 ) -> float:
-    """Hold a drive's ``u0`` and ``K``, its passive damper's within, and return the limited force the trial solves with.
-    A ``K`` the factor does not hold (new gains, the first step) requests the articulation's factor refresh; a
-    saturation never does, since the border releases its ``K`` from the factor's walk (``aug_row_Kd``). Only a drive
-    with an excess reads ``row_dv``, last step's ``v_out - v_hat``, what its rows did to the coordinate.
+    """Hold a drive's ``u0`` and ``K``, its passive damper's within, and its motor's line, and return the force the trial
+    solves with: ``u0`` within what the motor can push at the joint's ``velocity`` (:func:`.spatial_laws.motor_limited`).
+    A ``K`` the factor does not hold (new gains, the first step) requests the articulation's factor refresh; a decision
+    never does, since the border changes its ``K`` on the factor's walk (``aug_row_Kd``). Only a drive with an excess
+    reads ``row_dv``, last step's ``v_out - v_hat``, what its rows did to the coordinate.
     """
     if rows.row_K[row] != K:
         rows.row_K[row] = K
         rows.mass_update_requested[articulation] = rows.mass_update_requested[articulation] | FACTOR_REQUEST
     rows.drive[dof] = wp.vec4(K - passive, passive, limit, u0)
-    limited = limited_drive_force(u0, limit)
+    rows.line[dof] = line
+    limited = motor_limited(u0, limit, line, velocity)
     if limited != u0:
         rows.row_dv[row] = rows.v_out[dof] - rows.v_hat[dof]
     return limited

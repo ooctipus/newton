@@ -658,10 +658,38 @@ def drive_force(ke: float, kd: float, q: float, qd: float, q_target: float, qd_t
 
 
 @SPATIAL.law
-def limited_drive_force(u0: float, effort_limit: float) -> float:
-    """Return ``u0`` clamped to a positive effort limit (the actuator's force range), the force the trial solve holds."""
+def motor_line(effort_limit: float, velocity_limit: float, unauthored: float) -> float:
+    """Return the slope of a drive's torque-speed line, ``E / V``: its effort limit ``E`` (the stall torque) over its
+    velocity limit ``V`` (the no-load speed).
+
+    A real speed limit is the motor's: its back-EMF. Its torque in the direction it drives falls linearly from ``E`` at
+    rest to zero at ``V`` and past it turns into a brake (the motor generates), down to ``-E`` at ``2 V``, while braking
+    keeps ``E``: Isaac Lab's DC motor with its saturation torque at ``E``. An external force can drive the joint past
+    ``V`` against that brake, never a cap. A drive without
+    a finite positive effort limit or an authored velocity limit (positive and under ``unauthored``, the builder's
+    default, which the importers write where none is authored) has no line: zero, and its bound is ``E`` at any speed.
+    """
+    if effort_limit > 0.0 and wp.isfinite(effort_limit) and velocity_limit > 0.0 and velocity_limit < unauthored:
+        return effort_limit / velocity_limit
+    return 0.0
+
+
+@SPATIAL.law
+def motor_reach(effort_limit: float, line: float, velocity: float, side: float) -> float:
+    """Return the most a motor pushes along ``side`` (+1 or -1) with its joint at ``velocity``: ``E - line side v``
+    within ``[-E, E]``. Braking (``side v < 0``) keeps the stall torque ``E``; past its no-load speed the most is
+    negative, a brake it cannot help (the back-EMF past the supply), the full ``-E`` from twice that speed."""
+    return wp.clamp(effort_limit - line * side * velocity, -effort_limit, effort_limit)
+
+
+@SPATIAL.law
+def motor_limited(u0: float, effort_limit: float, line: float, velocity: float) -> float:
+    """Return ``u0`` within what the motor can push at ``velocity`` (:func:`motor_reach` on both sides), the force the
+    trial solve holds; a drive without a positive effort limit is not limited."""
     if effort_limit > 0.0:
-        return wp.clamp(u0, -effort_limit, effort_limit)
+        return wp.clamp(
+            u0, -motor_reach(effort_limit, line, velocity, -1.0), motor_reach(effort_limit, line, velocity, 1.0)
+        )
     return u0
 
 
@@ -689,19 +717,94 @@ def drive_step_force(u0: float, limited: float, K: float, qdd: float, inertia: f
 
 @SPATIAL.law
 def free_drive_force(
-    u0: float, limited: float, K: float, qdd: float, rows_qdd: float, inertia: float, effort_limit: float
+    u0: float,
+    limited: float,
+    K: float,
+    qdd: float,
+    rows_qdd: float,
+    inertia: float,
+    effort_limit: float,
+    line: float,
+    velocity: float,
+    dt: float,
 ) -> float:
-    """Return the force of a drive that :func:`drive_step_force` left below its limit, for the solve that follows.
+    """Return the force of a drive that :func:`drive_step_force` left within its motor's reach, for the solve that
+    follows.
 
     The excess ``u0 - limited`` is what the exact step asks of a free joint, but the trial solves no rows, and a joint
     blocked by a contact or a limit moves nowhere: its force is its whole ``u0``. So the excess comes back only as far as
-    it stays within the limit on the step as last step's rows left it, ``qdd + rows_qdd``. With no rows that is all of it,
-    the exact step. Blocked, none: the trial's limited force and ``K`` hold the joint at its limit. ``K`` stays in the
-    mass either way, because taking it out on a lagged reading gives a light joint ``limit / I`` beside a contact that
-    has left, while a force within ``limited`` and ``u0`` costs at most the limited step. A row that arrives this step
-    is read on the next: the drive pushes ``u0`` against it for that one step.
+    it stays within the motor's reach (:func:`motor_reach` at the step's end velocity) on the step as last step's rows
+    left it, ``qdd + rows_qdd``. With no rows that is all of it, the exact step. Blocked, none: the trial's limited force
+    and ``K`` hold the joint at its limit. ``K`` stays in the mass either way, because taking it out on a lagged reading
+    gives a light joint ``limit / I`` beside a contact that has left, while a force within ``limited`` and ``u0`` costs
+    at most the limited step. A row that arrives this step is read on the next: the drive pushes ``u0`` against it for
+    that one step.
     """
     excess = u0 - limited
     side = wp.sign(excess)
-    room = wp.max(effort_limit - side * (limited - K * (qdd + rows_qdd)), 0.0)
+    step = qdd + rows_qdd
+    reach = motor_reach(effort_limit, line, velocity + dt * step, side)
+    room = wp.max(reach - side * (limited - K * step), 0.0)
     return limited + side * wp.min(wp.abs(excess), room * (inertia + K) / inertia)
+
+
+@SPATIAL.law
+def motor_step(
+    u0: float,
+    limited: float,
+    K: float,
+    held: float,
+    passive: float,
+    qdd: float,
+    inertia: float,
+    effort_limit: float,
+    line: float,
+    velocity: float,
+    dt: float,
+    rows_qdd: float,
+) -> tuple[float, float]:
+    """Return a drive's force at zero acceleration and the stiffness its coordinate holds on the decided step, read from
+    the trial solve (every drive's ``K`` in the mass, ``held`` this one's with its passive damper's, every force
+    ``limited``).
+
+    The motor bounds the drive's force at the step's end velocity ``v+`` (:func:`motor_reach`): ``lo(v+) <= tau <=
+    hi(v+)``. The drive's force ``clamp(u0 - K qdd, lo, hi)`` is non-increasing in ``v+``, so it is the subgradient of a
+    convex potential and the step stays the minimum of a convex energy with one solution, as the effort limit's Huber
+    energy is. The bound depends on the joint's own velocity, not on another row's impulse (friction's on the normal
+    load is not a potential): no fixed point to chase. Its pieces, each linear in ``qdd``, so each held implicitly by the
+    factor as a drive's ``K`` is:
+
+    - the drive (:func:`drive_step_force` within ``[lo, hi]`` at its step's end velocity): ``u0`` and ``K``, an excess
+      coming back as :func:`free_drive_force` lets it;
+    - the stall, ``side E`` and no ``K``, where its end velocity brakes or rests (``side v+ <= 0``);
+    - the line, ``side E - line v - (dt line) qdd = side E - line v+``: the back-EMF a damper ``dt line`` in the mass,
+      where the end velocity lies between rest and twice the no-load speed along ``side`` (past ``V`` a brake);
+    - the brake, ``-side E`` and no ``K``, where even that brake leaves the joint past twice its no-load speed: an
+      external force drives it there.
+
+    ``side`` is the bound the drive's force passes: +1 past ``hi``, -1 past ``lo``.
+
+    The piece is the trial's one-coordinate reading, ``inertia`` the coordinate's ``K``-free mass with its passive
+    damper's (``(inertia + K) qdd = other + limited``): continuous across every kink, so a reading off by a little picks a
+    neighbouring piece of nearly the same force. With no line (``line = 0``) the line is the stall and this is the
+    effort limit's decision exactly.
+    """
+    force = drive_step_force(u0, limited, K, qdd, inertia)
+    step = qdd
+    if u0 != limited:
+        step = qdd + (u0 - limited) / (inertia + K)
+    end = velocity + dt * step
+    if force <= motor_reach(effort_limit, line, end, 1.0) and force >= -motor_reach(effort_limit, line, end, -1.0):
+        if u0 != limited:
+            return free_drive_force(u0, limited, K, qdd, rows_qdd, inertia, effort_limit, line, velocity, dt), held
+        return limited, held
+    side = float(-1.0)
+    if force > motor_reach(effort_limit, line, end, 1.0):
+        side = 1.0
+    # The joint's end velocity with no drive force, along the side whose bound the drive passes.
+    free = side * (velocity + dt * ((inertia + K) * qdd - limited) / inertia)
+    if free * inertia + dt * effort_limit <= 0.0:
+        return side * effort_limit, passive
+    if line * (free * inertia - dt * effort_limit) >= 2.0 * effort_limit * inertia:
+        return -side * effort_limit, passive
+    return side * effort_limit - line * velocity, passive + dt * line

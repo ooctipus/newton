@@ -57,13 +57,13 @@ from .publication_data import PublicationData
 from .spatial_laws import (
     axis_transform,
     coordinate_force,
-    drive_step_force,
-    free_drive_force,
     inertia_apply,
     inertia_at,
     joint_frame_pose,
-    limited_drive_force,
     motion_axis,
+    motor_limited,
+    motor_line,
+    motor_step,
     point_velocity,
     spring_damper_stiffness,
     transform_compose,
@@ -244,12 +244,14 @@ def class_kernels(turns: bool, welded: bool) -> tuple[wp.Kernel, wp.Kernel, wp.K
         joint_target_pos: wp.array[float],
         joint_target_vel: wp.array[float],
         joint_effort_limit: wp.array[float],
+        joint_velocity_limit: wp.array[float],
+        unauthored_velocity_limit: float,
         # in/out
         diagonal_inverse_mass: wp.array[float],
     ):
         """Predict each leaf: the force, the masked inverse-mass refresh, ``qdd`` and ``v_hat``.
 
-        A leaf is one coordinate, so it decides its drive's saturation here (:func:`.spatial_laws.drive_step_force`)
+        A leaf is one coordinate, so it decides its drive's piece of its motor's law here (:func:`.spatial_laws.motor_step`)
         with one more division: its ``K`` changing refreshes its own inverse mass.
         """
         element = wp.tid()
@@ -357,17 +359,19 @@ def class_kernels(turns: bool, welded: bool) -> tuple[wp.Kernel, wp.Kernel, wp.K
         drive = stiffness - passive
         limit = joint_effort_limit[dof]
         if drive > 0.0 and limit > 0.0:
-            limited = limited_drive_force(u0, limit)
+            line = motor_line(limit, joint_velocity_limit[dof], unauthored_velocity_limit)
+            limited = motor_limited(u0, limit, line, qd)
             trial = (value + limited) * inverse
-            step_force = drive_step_force(u0, limited, drive, trial, leaf_inertia + passive)
-            if wp.abs(step_force) > limit:
-                u0 = wp.sign(step_force) * limit
-                stiffness = passive
+            rows = float(0.0)
+            if u0 != limited:
+                rows = (data.v_out[dof] - f.vhat[dof]) / f.dt
+            u0, kept = motor_step(
+                u0, limited, drive, stiffness, passive, trial, leaf_inertia + passive, limit, line, qd, f.dt, rows
+            )
+            if kept != stiffness:
+                stiffness = kept
                 inverse = 1.0 / (leaf_inertia + stiffness)
                 refresh = True
-            elif u0 != limited:
-                rows = (data.v_out[dof] - f.vhat[dof]) / f.dt
-                u0 = free_drive_force(u0, limited, drive, trial, rows, leaf_inertia + passive, limit)
         if refresh:
             diagonal_inverse_mass[dof] = inverse
         if row >= 0:
@@ -804,6 +808,8 @@ class CoordinateTrees:
                 control.joint_target_q,
                 control.joint_target_qd,
                 model.joint_effort_limit,
+                model.joint_velocity_limit,
+                solver.factor.unauthored_velocity_limit,
                 solver.factor.diagonal_inverse_mass,
             ],
             device=model.device,

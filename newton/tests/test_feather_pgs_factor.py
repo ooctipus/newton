@@ -91,6 +91,10 @@ from newton.tests.feather_pgs_tree_scan_fixture import (
 )
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
+_UNAUTHORED_VELOCITY_LIMIT = float(newton.ModelBuilder.JointDofConfig().velocity_limit)
+"""The joint velocity limit the builder writes where none is authored: a drive without a motor line."""
+
+
 # =====================================================================================================================
 # The tree plan and its scans
 # =====================================================================================================================
@@ -2334,6 +2338,7 @@ def _drive_rows(row_K, articulations, dofs, device):
         row_K=row_K,
         row_dv=wp.zeros_like(row_K),
         drive=wp.zeros(dofs, dtype=wp.vec4, device=device),
+        line=wp.zeros(dofs, dtype=float, device=device),
         mass_update_requested=wp.zeros(articulations, dtype=int, device=device),
         v_out=wp.zeros(dofs, dtype=float, device=device),
         v_hat=wp.zeros(dofs, dtype=float, device=device),
@@ -2391,6 +2396,8 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
                 control.joint_target_q,
                 control.joint_target_qd,
                 model.joint_effort_limit,
+                model.joint_velocity_limit,
+                _UNAUTHORED_VELOCITY_LIMIT,
                 wp.zeros(model.joint_dof_count, dtype=float, device=device),
                 max_dofs,
                 dt,
@@ -2411,6 +2418,8 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
         target_q = wp.array([0.1, -0.1], dtype=wp.float32, device=device)
         target_qd = wp.array([0.0, 0.05], dtype=wp.float32, device=device)
         effort_limit = wp.array([1.25, 2.5], dtype=wp.float32, device=device)
+        # Unauthored velocity limits: no motor line, the effort limit alone bounds each drive.
+        velocity_limit = wp.full(2, _UNAUTHORED_VELOCITY_LIMIT, dtype=wp.float32, device=device)
         damping = wp.array([0.2, 0.3], dtype=wp.float32, device=device)
         rows = wp.array([0, 1], dtype=wp.int32, device=device)
 
@@ -2431,6 +2440,8 @@ class TestFeatherPGSAugmentedDrives(unittest.TestCase):
                     target_q,
                     target_qd,
                     effort_limit,
+                    velocity_limit,
+                    _UNAUTHORED_VELOCITY_LIMIT,
                     passive,
                     2,
                     0.1,

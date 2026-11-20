@@ -29,7 +29,7 @@ import warp as wp
 
 from ...core import execution, memory
 from ...core.host_unique import row_ids
-from ...sim import BodyFlags, JointType, ModelFlags
+from ...sim import BodyFlags, JointType, ModelBuilder, ModelFlags
 from . import field_group, host_index
 from .factor.closure import seed_blocks_kernel
 from .factor.fields import (
@@ -75,7 +75,7 @@ from .field_group import SolverArrays
 from .joint_table import JointTable
 from .path_selection import json_value
 from .row_laws import LINK_ROWS
-from .spatial_laws import spring_damper_stiffness
+from .spatial_laws import motor_line, spring_damper_stiffness
 from .tree_scan import (
     WALK_ANGULAR,
     WALK_BOTH,
@@ -105,6 +105,8 @@ def prepare_augmented_drives(
     joint_target_pos: wp.array[float],
     joint_target_vel: wp.array[float],
     joint_effort_limit: wp.array[float],
+    joint_velocity_limit: wp.array[float],
+    unauthored_velocity_limit: float,
     passive_damping: wp.array[float],
     max_dofs: int,
     dt: float,
@@ -113,8 +115,9 @@ def prepare_augmented_drives(
 ):
     """The augmented drive of each coordinate of ``dofs`` (those no one-coordinate tree's predict decides; without a
     list, the thread's own), from the immutable DOF-to-row topology: ``u0`` and ``K`` (:func:`.factor.fields.drive_terms`, its
-    passive damper's with it) held on its row (:func:`.factor.fields.hold_drive_row`), which requests the
-    articulation's factor refresh wherever ``K`` changed, a drive whose ``K`` fell to zero included."""
+    passive damper's with it) and its motor's line (:func:`.spatial_laws.motor_line`, from its effort and velocity
+    limits) held on its row (:func:`.factor.fields.hold_drive_row`), which requests the articulation's factor refresh
+    wherever ``K`` changed, a drive whose ``K`` fell to zero included."""
     dof = wp.tid()
     if dofs.shape[0] > 0:
         dof = dofs[dof]
@@ -137,7 +140,9 @@ def prepare_augmented_drives(
         passive_damping,
     )
     passive = spring_damper_stiffness(0.0, passive_damping[dof], 0.0, dt)
-    drive_tau[dof] = hold_drive_row(rows, row, row // max_dofs, dof, u0, K, passive, joint_effort_limit[dof])
+    limit = joint_effort_limit[dof]
+    line = motor_line(limit, joint_velocity_limit[dof], unauthored_velocity_limit)
+    drive_tau[dof] = hold_drive_row(rows, row, row // max_dofs, dof, u0, K, passive, limit, line, joint_qd[dof])
 
 
 class TreeFactor:
@@ -155,6 +160,8 @@ class TreeFactor:
     def __init__(self, model, options):
         self.model = model
         self.options = options
+        # The joint velocity limit the builder writes where none is authored: no motor line (spatial_laws.motor_line).
+        self.unauthored_velocity_limit = float(ModelBuilder.JointDofConfig().velocity_limit)
         self.forest = None
         self.laws = None
         self._arrays = SolverArrays(self, model.device)
@@ -692,6 +699,8 @@ class TreeFactor:
                 control.joint_target_q,
                 control.joint_target_qd,
                 model.joint_effort_limit,
+                model.joint_velocity_limit,
+                self.unauthored_velocity_limit,
                 self.passive_joint_damping,
                 self.forest.articulation_max_dofs,
                 dt,
