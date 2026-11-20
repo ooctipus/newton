@@ -105,9 +105,12 @@ at its exact solution, zero impulse (P4)."""
 WORLD_CONTACTS = FieldGroup(
     Field("world_contact_first", wp.int32, ("world",), fill=2**31 - 1, owner="placement"),
     Field("world_contact_last", wp.int32, ("world",), fill=-1, owner="placement"),
+    Field("contact_worlds", wp.int32, ("world",), owner="placement"),
+    Field("contact_worlds_listed", wp.int32, (2,), owner="placement"),
 )
-"""The frame positions each world's contacts span (``admit_world_contacts``), from which their rows are reserved in
-the row order (``reserve_world_rows``), which resets the span."""
+"""The frame positions each world's contacts span (``admit_world_contacts``), and the worlds whose span starts (listed
+in ``contact_worlds``, counted in ``contact_worlds_listed[0]``), from which their rows are reserved in the row order
+(``reserve_world_rows``), which resets the spans and the list."""
 
 ROW_WATERMARKS = FieldGroup(
     *(

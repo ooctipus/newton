@@ -1506,7 +1506,7 @@ def row_order(contacts: np.ndarray, pair_keys: np.ndarray | None = None) -> np.n
 def allocate_contacts(operands, device) -> None:
     """Allocate contact rows as the solver does: each contact admitted and sized
     (:func:`.row_slots.admit_world_contacts`, a thread a contact), then each world's rows reserved in its row order and
-    its counters advanced (:func:`.row_slots.reserve_world_rows`, a world a lane group), from ``operands``: a mapping of
+    its counters advanced (:func:`.row_slots.reserve_world_rows`, a listed world a lane group), from ``operands``: a mapping of
     :data:`ALLOCATION`'s names, or a sequence in its order. The worlds are the slot counters' entries."""
     values = operands if isinstance(operands, dict) else dict(zip(ALLOCATION, operands, strict=True))
     device = wp.get_device(device)
@@ -1517,6 +1517,8 @@ def allocate_contacts(operands, device) -> None:
         **values,
         "world_contact_first": wp.full(worlds, 2**31 - 1, dtype=wp.int32, device=device),
         "world_contact_last": wp.full(worlds, -1, dtype=wp.int32, device=device),
+        "contact_worlds": wp.zeros(worlds, dtype=wp.int32, device=device),
+        "contact_worlds_listed": wp.zeros(2, dtype=wp.int32, device=device),
     }
 
     # Each contact its own body pair: the scenes' contacts carry no frame.

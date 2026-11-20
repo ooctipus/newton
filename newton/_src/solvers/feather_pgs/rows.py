@@ -835,6 +835,8 @@ class RowLaws:
                     solver.placement.world_acts,
                     solver.placement.world_contact_first,
                     solver.placement.world_contact_last,
+                    solver.placement.contact_worlds,
+                    solver.placement.contact_worlds_listed,
                 ],
                 extent=count,
                 max_blocks=solver.placement.contact_capacity_blocks,
@@ -844,13 +846,16 @@ class RowLaws:
             # reserved.
             units = solver.placement.unit_source if producer == "walk" else solver.placement.no_units
             # The row order (row_slots.reserve_world_rows: each world's body pairs at a golden-ratio stride, a pair's
-            # contacts together), each contact's rows reserved in it and each world's counters advanced: a world a lane
-            # group, one launch.
+            # contacts together), each contact's rows reserved in it and each world's counters advanced: a world with
+            # contacts a lane group, one launch.
             placement = solver.placement
             lanes = int(RESERVE_LANES) if model.device.is_cuda else 1
-            wp.launch(
+            # A replay runs a lane group a contact, at most a world's (the contact count, known at the pass's
+            # updater, bounds the worlds the admission lists after it): none on a step without contacts. The listed
+            # worlds' count itself is written after the updater, so it cannot size the launch.
+            pool.launch(
                 reserve_world_rows,
-                dim=solver.forest.world_count * lanes,
+                solver.forest.world_count * lanes,
                 inputs=[
                     contact_input,
                     max_constraints,
@@ -859,15 +864,19 @@ class RowLaws:
                     placement.row_order(self.friction_patches.current.keys),
                     placement.slot_counter,
                     mf_slot_counter,
+                    placement.contact_worlds,
                 ],
                 outputs=[
+                    placement.contact_worlds_listed,
                     dense_dropped_rows,
                     mf_dropped_rows,
                     placement.dense_first_rejected_slot,
                     mf_first_rejected_slot,
                     units,
                 ],
-                device=model.device,
+                extent=count,
+                scale=lanes,
+                clamp=True,
                 block_dim=RESERVE_BLOCK,
             )
 

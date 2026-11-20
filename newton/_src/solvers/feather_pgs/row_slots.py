@@ -197,16 +197,20 @@ def _admit_contact(
     const int low = __shfl_sync(active, contact, leader);
     const int high = __shfl_sync(active, contact, top);
     if (world >= 0 && (int)(threadIdx.x & 31) == leader) {
-        atomicMin(&first.data[world], low);
+        if (atomicMin(&first.data[world], low) == 0x7fffffff)
+            worlds.data[atomicAdd(&listed.data[0], 1)] = world;
         atomicMax(&last.data[world], high);
     }
 #elif defined(__CUDA_ARCH__)
     if (world >= 0) {
-        atomicMin(&first.data[world], contact);
+        if (atomicMin(&first.data[world], contact) == 0x7fffffff)
+            worlds.data[atomicAdd(&listed.data[0], 1)] = world;
         atomicMax(&last.data[world], contact);
     }
 #else
     if (world >= 0) {
+        if (first.data[world] == 0x7fffffff)
+            worlds.data[listed.data[0]++] = world;
         if (contact < first.data[world])
             first.data[world] = contact;
         if (contact > last.data[world])
@@ -215,9 +219,12 @@ def _admit_contact(
 #endif
 """
 )
-def _record_world_span(world: int, contact: int, first: wp.array[int], last: wp.array[int]):
-    """Merge position ``contact`` into ``world``'s span (-1: none), once per world and warp on CUDA. Every lane of the
-    warp that reaches the launch calls it, with ascending positions."""
+def _record_world_span(
+    world: int, contact: int, first: wp.array[int], last: wp.array[int], worlds: wp.array[int], listed: wp.array[int]
+):
+    """Merge position ``contact`` into ``world``'s span (-1: none), once per world and warp on CUDA, and list the world
+    (``worlds``, counted in ``listed[0]``) where its span starts. Every lane of the warp that reaches the launch calls
+    it, with ascending positions."""
     ...
 
 
@@ -309,11 +316,14 @@ def admit_world_contacts(
     acts: wp.array[int],
     world_contact_first: wp.array[int],
     world_contact_last: wp.array[int],
+    contact_worlds: wp.array[int],
+    contact_worlds_listed: wp.array[int],
 ):
     """Classify every active contact and size its rows, a thread a contact in the frame's order (``data`` binds the
     frame's records), so its records and allocation are read and written where every later kernel reads them; its
     rows are reserved after, in the same order (:func:`reserve_world_rows`), from the range of positions each
-    world's contacts with a responding endpoint span, admitted or not (``world_contact_first``, ``world_contact_last``).
+    world's contacts with a responding endpoint span, admitted or not (``world_contact_first``, ``world_contact_last``),
+    for the worlds listed where their span starts (``contact_worlds``, counted in ``contact_worlds_listed[0]``).
 
     A contact admitted by :func:`_admit_contact` needs 1 row for its normal and, when enabled below the friction gap
     threshold (and, under persistent patches, for a loaded anchor), 2 adjacent rows for its friction, and a third for
@@ -350,7 +360,7 @@ def admit_world_contacts(
         )
     # The world's range of frame positions, whose rows reserve_world_rows reserves in order: one atomic pair
     # per world and warp.
-    _record_world_span(world, c, world_contact_first, world_contact_last)
+    _record_world_span(world, c, world_contact_first, world_contact_last, contact_worlds, contact_worlds_listed)
 
 
 @wp.func
@@ -457,7 +467,9 @@ def reserve_world_rows(
     order: RowOrder,
     world_slot_counter: wp.array[int],
     mf_slot_counter: wp.array[int],
+    contact_worlds: wp.array[int],
     # outputs
+    contact_worlds_listed: wp.array[int],
     dense_dropped_contact_rows: wp.array[int],
     mf_dropped_contact_rows: wp.array[int],
     dense_first_rejected_slot: wp.array[int],
@@ -466,7 +478,11 @@ def reserve_world_rows(
 ):
     """Reserve the rows of every admitted contact (:func:`admit_world_contacts`) in its world's row order, so a world's
     rows follow its contacts' geometry (the frame's pair and contact keys), never the order the collision's threads
-    wrote them in: a world a lane group (:data:`RESERVE_LANES`), one launch for every world.
+    wrote them in: a listed world (``contact_worlds``, the admission's, counted in ``contact_worlds_listed[0]``) a lane
+    group (:data:`RESERVE_LANES`), one launch, which a replay runs at the contact count's lane groups, at most a
+    world's (none on a step without contacts): every listed world holds a contact, and the list's own count is written
+    after the replay's updater, so it cannot size the launch. The groups past the list return; the last listed group to
+    finish clears the list for the next step (``contact_worlds_listed[1]`` counts them).
 
     A world's contacts lie in one run of the frame's positions (``order.world_contact_first`` to
     ``order.world_contact_last``, which the admission recorded; a contact of no world may lie between them). The
@@ -494,13 +510,13 @@ def reserve_world_rows(
     """
     lanes = lane_stride(RESERVE_LANES)
     lane = lane_index(RESERVE_LANES)
-    world = wp.tid() // lanes
-    if world >= order.world_contact_first.shape[0]:
+    listed = contact_worlds_listed[0]
+    item = wp.tid() // lanes
+    if item >= listed:
         return
+    world = contact_worlds[item]
     first = order.world_contact_first[world]
     end = wp.min(order.world_contact_last[world] + 1, data.count[0])
-    if end <= first:
-        return
     # The frame's order: each contact's rows before it and its pair, each pair's head.
     rows = wp.vec4i(0)
     pairs = int(0)
@@ -586,11 +602,15 @@ def reserve_world_rows(
                         units[data.first[world], slot + r] = unit_source(UNIT_CONTACT, 4 * c + r)
     lane_sync(RESERVE_LANES)
     if lane == 0:
-        # The world's counters, rejected rows included, and its run cleared for the next step.
+        # The world's counters, rejected rows included, and its run cleared for the next step; the last listed world
+        # to finish clears the list (every listed world read its count before).
         world_slot_counter[world] += rows[0] + rows[2]
         mf_slot_counter[world] += rows[1] + rows[3]
         order.world_contact_first[world] = _NO_CONTACT
         order.world_contact_last[world] = -1
+        if wp.atomic_add(contact_worlds_listed, 1, 1) == listed - 1:
+            contact_worlds_listed[0] = 0
+            contact_worlds_listed[1] = 0
 
 
 @wp.kernel
