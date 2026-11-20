@@ -167,10 +167,6 @@ def _step_tripods(device, *, steps=4, sorted_contacts=False, **options):
             name: getattr(solver.placement, f"contact_{name}").numpy()[:live].copy()
             for name in ("world", "path", "slot")
         }
-        # Whether each contact was admitted: the admitted contacts counted before each position, and in all.
-        before = solver.placement.contact_admitted_before.numpy()[:live]
-        total = int(solver.placement.reserve_totals.numpy()[4, 0])
-        record["admitted"] = np.diff(np.append(before, total)) > 0
         record["pair_keys"] = solver.laws.friction_patches.current.keys.numpy()[:live].copy()
         # Whether each contact has an immovable side (a shape without a body): those take a world's rows first.
         shape_body = model.shape_body.numpy()
@@ -200,10 +196,10 @@ def _step_tripods(device, *, steps=4, sorted_contacts=False, **options):
 
 def _family_contacts(record, path, world):
     """Frame positions of the contacts that hold rows of ``path`` in ``world`` in their rows' order: those with an
-    immovable side first, then the others, each in the world's row order over its admitted contacts' body pairs
-    (:func:`.feather_pgs_law_harness.row_order`)."""
-    admitted = np.flatnonzero((record["world"] == world) & record["admitted"])
-    order = row_order(admitted, record["pair_keys"][admitted])
+    immovable side first, then the others, each in the world's row order over the body pairs of its contacts, admitted
+    or not (:func:`.feather_pgs_law_harness.row_order`)."""
+    run = np.flatnonzero(record["world"] == world)
+    order = row_order(run, record["pair_keys"][run])
     rank = np.empty(len(record["world"]), dtype=np.int64)
     rank[order] = np.arange(len(order))
     contacts = np.flatnonzero((record["path"] == path) & (record["world"] == world) & (record["slot"] >= 0))

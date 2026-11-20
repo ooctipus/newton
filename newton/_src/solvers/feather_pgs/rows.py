@@ -66,8 +66,7 @@ from .row_slots import (
     RESERVE_BLOCK,
     admit_world_contacts,
     advance_world_contact_rows,
-    list_pairs,
-    rank_pairs,
+    list_world_pairs,
     reserve_world_contact_rows,
     scan_frame_rows,
     scan_pair_rows,
@@ -847,27 +846,25 @@ class RowLaws:
             # reserved.
             units = solver.placement.unit_source if producer == "walk" else solver.placement.no_units
             # The row order (row_slots._row_pair: each world's body pairs at a golden-ratio stride, a pair's contacts
-            # together): the rows counted in the frame's order, the pairs ranked and listed, their rows counted in
+            # together): the rows and pairs counted in the frame's order, each world's pairs, their rows counted in
             # the row order, parallel inside a world; then each contact's rows, a thread a contact; then each world's
             # counters.
             placement = solver.placement
             order = placement.row_order(self.friction_patches.current.keys)
             scans = [contact_input, placement.reserve_blocks, placement.reserve_sites, order]
-            for scan in (scan_frame_rows, rank_pairs):
-                wp.launch_tiled(
-                    scan,
-                    dim=[placement.reserve_blocks],
-                    inputs=scans,
-                    outputs=[placement.reserve_totals],
-                    block_dim=RESERVE_BLOCK,
-                    device=model.device,
-                )
-            pool.launch(
-                list_pairs,
-                rows,
-                inputs=[contact_input, order],
-                extent=count,
-                max_blocks=placement.contact_capacity_blocks,
+            wp.launch_tiled(
+                scan_frame_rows,
+                dim=[placement.reserve_blocks],
+                inputs=scans,
+                outputs=[placement.reserve_totals],
+                block_dim=RESERVE_BLOCK,
+                device=model.device,
+            )
+            wp.launch(
+                list_world_pairs,
+                dim=solver.forest.world_count,
+                inputs=[count, placement.reserve_totals, order],
+                device=model.device,
             )
             wp.launch_tiled(
                 scan_pair_rows,
@@ -903,7 +900,7 @@ class RowLaws:
             wp.launch(
                 advance_world_contact_rows,
                 dim=solver.forest.world_count,
-                inputs=[count, placement.reserve_totals, order],
+                inputs=[placement.reserve_totals, order],
                 outputs=[placement.slot_counter, mf_slot_counter],
                 device=model.device,
             )

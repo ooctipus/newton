@@ -49,11 +49,11 @@ from newton._src.solvers.feather_pgs.route_table import Laws
 from newton._src.solvers.feather_pgs.row_records import UNIT_MIMIC, UNIT_SHIFT, DenseRows, MfRows, RowSupport
 from newton._src.solvers.feather_pgs.row_slots import (
     RESERVE_BLOCK,
+    ROW_LISTS,
     RowOrder,
     admit_world_contacts,
     advance_world_contact_rows,
-    list_pairs,
-    rank_pairs,
+    list_world_pairs,
     reserve_tiles,
     reserve_world_contact_rows,
     scan_frame_rows,
@@ -1492,28 +1492,28 @@ def _own_pair_keys(pair_keys: wp.array[wp.int64]):
     pair_keys[c] = wp.int64(c)
 
 
-def row_order(admitted: np.ndarray, pair_keys: np.ndarray | None = None) -> np.ndarray:
-    """A world's ``admitted`` contacts (their frame positions, ascending) in its rows' order
-    (:func:`.row_slots._row_pair`): their body pairs (``pair_keys`` of the admitted contacts; each its own without)
-    at a golden-ratio stride over the pairs' ranks, coprime with their count, each pair's contacts together."""
-    admitted = np.asarray(admitted)
-    keys = np.arange(len(admitted)) if pair_keys is None else np.asarray(pair_keys)
+def row_order(contacts: np.ndarray, pair_keys: np.ndarray | None = None) -> np.ndarray:
+    """A world's ``contacts`` (their frame positions, ascending: every contact of its run, admitted or not) in its rows'
+    order (:func:`.row_slots._row_pair`): their body pairs (``pair_keys`` of those contacts; each its own without) at a
+    golden-ratio stride over the pairs' ranks, coprime with their count, each pair's contacts together."""
+    contacts = np.asarray(contacts)
+    keys = np.arange(len(contacts)) if pair_keys is None else np.asarray(pair_keys)
     starts = np.flatnonzero(np.r_[True, keys[1:] != keys[:-1]]) if len(keys) else np.zeros(0, dtype=int)
-    groups = np.split(admitted, starts[1:])
+    groups = np.split(contacts, starts[1:])
     n = len(groups)
     stride = max((n * 2654435769) >> 32, 1)
     while n and math.gcd(stride, n) != 1:
         stride += 1
-    return np.concatenate([groups[j] for j in (np.arange(n, dtype=np.int64) * stride) % n]) if n else admitted
+    return np.concatenate([groups[j] for j in (np.arange(n, dtype=np.int64) * stride) % n]) if n else contacts
 
 
 def allocate_contacts(operands, device) -> None:
     """Allocate contact rows as the solver does: each contact admitted and sized
-    (:func:`.row_slots.admit_world_contacts`, a thread a contact), the row order's scans
-    (:func:`.row_slots.scan_frame_rows`, :func:`.row_slots.rank_pairs`, :func:`.row_slots.list_pairs`,
-    :func:`.row_slots.scan_pair_rows`), its rows reserved in that order (:func:`.row_slots.reserve_world_contact_rows`)
-    and each world's counters advanced (:func:`.row_slots.advance_world_contact_rows`), from ``operands``: a mapping
-    of :data:`ALLOCATION`'s names, or a sequence in its order. The worlds are the slot counters' entries."""
+    (:func:`.row_slots.admit_world_contacts`, a thread a contact), the row order's scans and its worlds' pairs
+    (:func:`.row_slots.scan_frame_rows`, :func:`.row_slots.list_world_pairs`, :func:`.row_slots.scan_pair_rows`), its
+    rows reserved in that order (:func:`.row_slots.reserve_world_contact_rows`) and each world's counters advanced
+    (:func:`.row_slots.advance_world_contact_rows`), from ``operands``: a mapping of :data:`ALLOCATION`'s names, or a
+    sequence in its order. The worlds are the slot counters' entries."""
     values = operands if isinstance(operands, dict) else dict(zip(ALLOCATION, operands, strict=True))
     device = wp.get_device(device)
     worlds = values["world_slot_counter"].shape[0]
@@ -1521,14 +1521,14 @@ def allocate_contacts(operands, device) -> None:
     slots = values["data"].slot.shape[0]
     # The scans' sites start at epoch 1 (zeroed states carry epoch 0); set on the device, not copied from the host: a
     # capture would hold the host buffer's address, freed before any replay.
-    sites = wp.zeros((10, ORDERED_STATES + reserve_tiles(slots, device)), dtype=wp.uint64, device=device)
+    sites = wp.zeros((ROW_LISTS, ORDERED_STATES + reserve_tiles(slots, device)), dtype=wp.uint64, device=device)
     sites[:, 1].fill_(1)
     blocks = 2 if device.is_cuda else 1
     values = {
         **values,
         "world_contact_first": wp.full(worlds, 2**31 - 1, dtype=wp.int32, device=device),
         "world_contact_last": wp.full(worlds, -1, dtype=wp.int32, device=device),
-        "row_totals": wp.zeros((10, 1), dtype=int, device=device),
+        "row_totals": wp.zeros((ROW_LISTS, 1), dtype=int, device=device),
         "sites": sites,
         "blocks": blocks,
         "contact_count": values["data"].count,
@@ -1540,20 +1540,19 @@ def allocate_contacts(operands, device) -> None:
     order.pair_keys = wp.empty(n, dtype=wp.int64, device=device)
     wp.launch(_own_pair_keys, dim=n, outputs=[order.pair_keys], device=device)
     order.world_contact_first, order.world_contact_last = values["world_contact_first"], values["world_contact_last"]
-    order.world_pairs = wp.zeros(worlds, dtype=wp.vec2i, device=device)
+    order.world_pairs = wp.zeros(worlds, dtype=wp.vec3i, device=device)
     for name, dtype in (("rows_frame", wp.vec4i), ("rows_before", wp.vec4i)):
         setattr(order, name, wp.zeros(n, dtype=dtype, device=device))
-    for name in ("admitted_before", "admitted", "pairs_before", "pairs", "pair_ends"):
-        setattr(order, name, wp.zeros(n, dtype=int, device=device))
+    order.pairs_before = wp.zeros(n, dtype=int, device=device)
+    order.pairs = wp.zeros(n, dtype=wp.vec2i, device=device)
     values["order"] = order
 
     def args(kernel):
         return [values[name] for name in inspect.signature(kernel.func).parameters]
 
     wp.launch(admit_world_contacts, dim=n, inputs=args(admit_world_contacts), device=device)
-    for scan in (scan_frame_rows, rank_pairs):
-        wp.launch_tiled(scan, dim=[blocks], inputs=args(scan), block_dim=RESERVE_BLOCK, device=device)
-    wp.launch(list_pairs, dim=n, inputs=args(list_pairs), device=device)
+    wp.launch_tiled(scan_frame_rows, dim=[blocks], inputs=args(scan_frame_rows), block_dim=RESERVE_BLOCK, device=device)
+    wp.launch(list_world_pairs, dim=worlds, inputs=args(list_world_pairs), device=device)
     wp.launch_tiled(scan_pair_rows, dim=[blocks], inputs=args(scan_pair_rows), block_dim=RESERVE_BLOCK, device=device)
     wp.launch(reserve_world_contact_rows, dim=n, inputs=args(reserve_world_contact_rows), device=device)
     wp.launch(advance_world_contact_rows, dim=worlds, inputs=args(advance_world_contact_rows), device=device)
