@@ -21,7 +21,15 @@ import numpy as np
 import warp as wp
 
 from ..core.contact_pool import ContactField, ContactPool
-from ..core.live_sort import EXTENT_SIZE, SORT_CHUNK, launch_live_sort, publish_live, slot_keys_fit, sort_grid
+from ..core.live_sort import (
+    EXTENT_SIZE,
+    SORT_CHUNK,
+    _publish_count,
+    launch_live_sort,
+    publish_live,
+    slot_keys_fit,
+    sort_grid,
+)
 from ..core.types import Devicelike
 
 # Sentinel key for unused contact slots: the max positive int64 sorts last.
@@ -478,6 +486,7 @@ class ContactSorter:
         match_index: wp.array | None = None,
         device: Devicelike = None,
         limit: int = -1,
+        published: bool = False,
     ) -> None:
         """Sort contacts written through the full collide.py writer by body pair, then by contact key: the
         order every reader of a pipeline's contacts sees.
@@ -511,6 +520,8 @@ class ContactSorter:
             device: Device to launch on.
             limit: The contact slots the arrays hold when fewer than the sorter's rows (an external buffer); -1:
                 the sorter's rows bound the sort.
+            published: Whether the caller published the live contacts as the sort extent (:attr:`extent`) before its
+                last updater, so the sort publishes none and records no updater of its own.
         """
         # Scratch provisioning and the current buffer schema are separate.
         # A reducer-enabled deterministic pipeline provisions material scratch
@@ -571,18 +582,44 @@ class ContactSorter:
         data.body_code = body_code
         data.pair_stride = wp.int64(pair_key_stride(body_code.shape[0], shape_body.shape[0]))
 
-        self._sort(_backup_full_kernel, (), _gather_full_kernel, data, contact_count, limit, ties=data.key_buf)
+        self._sort(
+            _backup_full_kernel,
+            (),
+            _gather_full_kernel,
+            data,
+            contact_count,
+            limit,
+            ties=data.key_buf,
+            published=published,
+        )
 
-    def _sort(self, backup, backup_inputs, gather, data, contact_count, limit=-1, ties=None):
+    @property
+    def extent(self) -> wp.array:
+        """The sort extent (:data:`~newton._src.core.live_sort.EXTENT_SIZE` entries): a pass may publish its live
+        contacts here before its updater (:meth:`~newton._src.core.contact_pool.ContactPool.record_demand`) and sort
+        with ``published``."""
+        return self._extent
+
+    def publish(self, contact_count: wp.array, limit: int = -1) -> None:
+        """Publish ``contact_count[0]`` live contacts, at most the ready rows and ``limit`` (not negative), as the sort
+        extent, without an updater: the launches that follow the caller's next updater read it."""
+        rows = self._pool.ready_rows
+        if rows is None:
+            rows = wp.empty(0, dtype=wp.int32, device=self._extent.device)
+        wp.launch(_publish_count, dim=1, inputs=[contact_count, rows, limit, self._extent], device=self._extent.device)
+
+    def _sort(self, backup, backup_inputs, gather, data, contact_count, limit=-1, ties=None, published=False):
         """Back up the live contacts with their sort keys (``backup``), sort them, and gather them in that order.
 
         The live contacts are published first, at most the ready rows, and
         every launch follows them; in a capture whose launches bind, each replay
-        sorts the contacts of that replay. With ``ties`` (an int64 per contact, unique), equal sort keys order by
+        sorts the contacts of that replay. With ``published`` the caller published them (:meth:`publish`, or the
+        pass's record) before its last updater. With ``ties`` (an int64 per contact, unique), equal sort keys order by
         tie.
         """
         pool = self._pool
-        publish_live(pool, contact_count, self._extent, limit)
+        if not published:
+            publish_live(pool, contact_count, self._extent, limit)
         live = self._extent[0:1]
         rows = pool.launch_rows()
         keys = self._rows.reserved["_sort_keys_copy"]

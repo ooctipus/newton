@@ -133,6 +133,8 @@ from typing import Any
 
 import warp as wp
 
+from .live_sort import publish_sort_extent
+
 logger = logging.getLogger(__name__)
 
 MIN_READY_ROWS = 4096
@@ -367,6 +369,8 @@ def _record_demand(
     record_drops: int,
     beat: int,
     clamp: int,
+    extent: wp.array[int],
+    extent_limit: int,
 ):
     demand = count[0]
     rows = ready_rows[0]
@@ -423,6 +427,12 @@ def _record_demand(
     held = wp.min(demand, rows)
     if rows_used.shape[0] > 0:
         wp.atomic_max(rows_used, 0, held)
+    if extent.shape[0] > 0:
+        # The pass's live contacts as a sort extent (live_sort.publish_live), ahead of the pass's updater.
+        live = held
+        if extent_limit >= 0:
+            live = wp.min(live, extent_limit)
+        publish_sort_extent(extent, 0, wp.max(live, 0))
     if demand > rows:
         # Writers dropped the rows past the ready rows. A growable stream's consumers read every row below its
         # count, which holds the rows; a fixed stream keeps every contact counted, as Newton's buffers do, and its
@@ -1303,6 +1313,8 @@ class ContactPool:
         *,
         drops: bool = True,
         beat: bool = True,
+        extent: wp.array | None = None,
+        extent_limit: int = -1,
     ) -> None:
         """Record a pass's contact count as demand, then clamp a growable stream's count to the rows the writers held.
 
@@ -1326,6 +1338,10 @@ class ContactPool:
                 (:data:`FORECAST_PASSES`); outside one the next pass forecasts only when a host asks for it. A pass
                 that forecast (:attr:`forecast_on`) measures its share (:attr:`forecast_share`) from its count and the
                 sums the broad phase left in :attr:`forecast_slots`, and publishes the forecast.
+            extent: A sort extent (:data:`~newton._src.core.live_sort.EXTENT_SIZE` entries) to publish the pass's held
+                contacts in, at most ``extent_limit`` (when not negative), in the same launch: a sort that follows the
+                pass's updater (:meth:`begin_updates`) then needs no publication of its own.
+            extent_limit: The most contacts the sort holds; negative: no limit.
         """
         self._note_reader()
         owner = _capture_owner(self.device)
@@ -1351,6 +1367,8 @@ class ContactPool:
                 # A fixed buffer forecasts nothing: no demand grows it.
                 int(beat and not self.fixed),
                 int(not self.fixed),
+                empty if extent is None else extent,
+                int(extent_limit),
             ],
             device=self.device,
             record_tape=False,

@@ -5042,6 +5042,11 @@ class CollisionPipeline:
             "include_static_kinematic_pairs": False,
         }
 
+    def _sort_limit(self, contacts: Contacts) -> int:
+        """The contact slots ``contacts``' arrays hold when fewer than the sorter's rows, else -1."""
+        rows = contacts._rigid_contact_rows
+        return rows if rows < self._contact_sorter.sorted_keys_view.shape[0] else -1
+
     def _detect_rigid_contacts(self, state: State, contacts: Contacts, *, dt: float | None) -> None:
         """Write and count the rigid contacts of ``state`` in ``contacts``; outside capture, grow until they fit.
 
@@ -5078,12 +5083,17 @@ class CollisionPipeline:
             self._launch_rigid_detection(
                 state, contacts, limit, dt=dt, latch_drops=not grows, forecast_requested=requested
             )
+            # Without a body-pair reduction the count is final here: the record publishes the pass's sort extent,
+            # which the pass's updater then serves (ContactSorter.sort_full, published).
+            sorts = self._body_pair_reducer is None
             pool.record_demand(
                 contacts.rigid_contact_count,
                 limit,
                 self.narrow_phase._buffer_capacity_status,
                 drops=not grows,
                 beat=in_graph,
+                extent=self._contact_sorter.extent if sorts else None,
+                extent_limit=self._sort_limit(contacts) if sorts else -1,
             )
             if not (grows and pool.fit()):
                 break
@@ -5561,12 +5571,13 @@ class CollisionPipeline:
             if last is None or last() is not contacts:
                 self._last_contacts_ref = weakref.ref(contacts)
             self._body_pair_reducer.reduce(model, state, contacts)
-            # The reduction rewrote the count: later launches follow the reduced count.
+            # The reduction rewrote the count: later launches follow the reduced count, the sort's extent too.
+            self._contact_sorter.publish(contacts.rigid_contact_count, self._sort_limit(contacts))
             pool.begin_updates()
 
         # The one order of the pass's contacts: by body pair, then by contact key, every field gathered
-        # (ContactSorter.sort_full). Every reader sees it: the matching, the solvers, sensors and exports.
-        limit = contacts._rigid_contact_rows
+        # (ContactSorter.sort_full), its extent published before the pass's last updater. Every reader sees it: the
+        # matching, the solvers, sensors and exports.
         self._contact_sorter.sort_full(
             contacts.rigid_contact_key,
             contacts.rigid_contact_count,
@@ -5587,7 +5598,8 @@ class CollisionPipeline:
             friction=contacts.rigid_contact_friction,
             match_index=contacts.rigid_contact_match_index,
             device=self.device,
-            limit=limit if limit < self._contact_sorter.sorted_keys_view.shape[0] else -1,
+            limit=self._sort_limit(contacts),
+            published=True,
         )
 
         # Match and save the retained stream so all indices name solver contacts.
