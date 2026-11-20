@@ -367,7 +367,8 @@ _NO_CONTACT = wp.constant(2**31 - 1)
 RESERVE_BLOCK = 512
 """Threads of a block of the row order's scans (:func:`scan_frame_rows`, :func:`scan_pair_rows`) on CUDA. A tile is a
 block's threads, a frame position a thread: the scans' work on a position is a chain of dependent loads (a world's run,
-the pair the row order visits there, that pair's bounds), so a thread takes one."""
+the pair the row order visits there, that pair's bounds), so a thread takes one. The scans compile in modules of their
+own: a module compiles once per block size it launches at, and this module's other kernels launch at Warp's default."""
 
 
 def reserve_tiles(positions: int, device) -> int:
@@ -453,7 +454,7 @@ def _contact_rows(data: ContactInput, order: RowOrder, c: int, live: int) -> wp.
     return rows
 
 
-@wp.kernel(enable_backward=False)
+@wp.kernel(enable_backward=False, module="unique")
 def scan_frame_rows(
     data: ContactInput,
     blocks: int,
@@ -563,7 +564,7 @@ def _pair_end(order: RowOrder, rank: int, live: int, pairs: int) -> int:
     return order.pairs[rank + 1][0]
 
 
-@wp.kernel(enable_backward=False)
+@wp.kernel(enable_backward=False, module="unique")
 def scan_pair_rows(
     data: ContactInput,
     blocks: int,
