@@ -5449,7 +5449,7 @@ class NarrowPhase:
                 wp.launch(
                     kernel=resolve_reduced_contacts_kernel,
                     dim=self.total_num_threads,
-                    inputs=[reducer_data, int(self.speculative), self.total_num_threads],
+                    inputs=[reducer_data, self.total_num_threads],
                     device=device,
                     block_dim=self.block_dim,
                     record_tape=False,

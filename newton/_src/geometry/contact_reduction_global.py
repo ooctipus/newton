@@ -86,7 +86,7 @@ from .collision_core import (
     triangle_face_case,
     triangle_facet_case,
 )
-from .contact_data import ContactData, compute_contact_approach_speed
+from .contact_data import ContactData, compute_contact_approach_speed, contact_within_window
 from .contact_reduction import (
     MAX_CONTACTS_PER_PAIR,
     NUM_NORMAL_BINS,
@@ -147,12 +147,8 @@ VALUES_PER_KEY = NUM_SPATIAL_DIRECTIONS + 1
 # sector in each of seven slot planes ``capacity`` entries apart.
 VALUES_STRIDE = 8
 assert VALUES_STRIDE >= VALUES_PER_KEY
-# Normal bins occupy 0..19 and 15 voxel groups occupy 20..34. Reserve
-# bin 35 for a pair-level predictive manifold without changing the regular
-# seven-slot value layout: six fingerprint-sharded clearance contacts and one
-# earliest time-of-impact guard.
-PREDICTIVE_BIN_ID = NUM_NORMAL_BINS + (NUM_VOXEL_DEPTH_SLOTS + VALUES_PER_KEY - 1) // VALUES_PER_KEY
-_GLOBAL_TOTAL_SLOTS = NUM_NORMAL_BINS * VALUES_PER_KEY + NUM_VOXEL_DEPTH_SLOTS + VALUES_PER_KEY
+# Normal bins occupy 0..19 and 15 voxel groups occupy 20..34.
+_GLOBAL_TOTAL_SLOTS = NUM_NORMAL_BINS * VALUES_PER_KEY + NUM_VOXEL_DEPTH_SLOTS
 assert _GLOBAL_TOTAL_SLOTS <= MAX_CONTACTS_PER_PAIR
 PAIRS_PER_KEY = VALUES_PER_KEY * (VALUES_PER_KEY - 1) // 2
 EXPORT_REDUCED_CONTACTS_BLOCK_DIM = 32
@@ -322,23 +318,6 @@ def slot_contact_id(value: wp.uint64) -> int:
     if (value >> wp.uint64(31)) != wp.uint64(0):
         return 0
     return int(value)
-
-
-@wp.func
-def competed_voxel_word(voxel_entry_idx: int, predictive: bool) -> int:
-    """A buffered candidate's voxel word (:attr:`GlobalContactReducerData.contact_slots`): the voxel entry in which it
-    raised a slot (-1: none), or ``-3 - entry`` (``-2`` for none) when it also raised its pair's predictive slots."""
-    if predictive:
-        return -3 - voxel_entry_idx
-    return voxel_entry_idx
-
-
-@wp.func
-def competed_voxel_entry(word: int) -> int:
-    """The voxel entry a voxel word names (-1: none)."""
-    if word < -1:
-        return -3 - word
-    return word
 
 
 @wp.func
@@ -547,11 +526,10 @@ class GlobalContactReducerData:
     # Fingerprint per contact: its geometric feature (triangle/edge/vertex index), unique among its pair's
     # candidates. It breaks a slot's score ties (the key's low bits), so the winner never depends on thread order.
     contact_fingerprints: wp.array[wp.int32]
-    # The entries in which each buffered candidate raised a slot, which the resolve pass reads: its normal bin's (-1:
-    # none) and a voxel word, its voxel group's entry (-1: none) marked when it also raised its pair's predictive
-    # slots (competed_voxel_word); the predictive entry itself is found by its key. The resolve then writes the
-    # candidate's home entry into the first word (-1: it holds no slot): the first entry, in the order normal bin,
-    # voxel, predictive, in which it holds a slot. The export writes a winner only from its home entry.
+    # The entries in which each buffered candidate raised a slot, which the resolve pass reads: its normal bin's and
+    # its voxel group's (-1: none). The resolve then writes the candidate's home entry into the first word (-1: it
+    # holds no slot): the first entry, in the order normal bin, voxel, in which it holds a slot. The export writes a
+    # winner only from its home entry.
     contact_slots: wp.array[wp.vec2i]
 
     # Optional hydroelastic data
@@ -811,7 +789,7 @@ class GlobalContactReducer:
             hashtable_size_factor: Multiplier applied to ``capacity`` when sizing
                 the reduction hashtable. Must be positive.
             enable_contact_reclamation: Allocate the reservation-reuse stack used
-                by predictive contact reduction.
+                by speculative contact reduction.
             enable_reduction: Allocate hashtable values and aggregate arrays.
                 Disable when the contact buffer is decoded without reduction.
         """
@@ -1484,7 +1462,7 @@ def _export_and_reduce_contact_centered_two_spatial_depths(
     fingerprint: int,
     centered_position: wp.vec3,
     inner_spatial_depth: float,
-    outer_spatial_depth: float,
+    admitted: bool,
     position_local: wp.vec3,
     aabb_lower_voxel: wp.vec3,
     aabb_upper_voxel: wp.vec3,
@@ -1494,9 +1472,10 @@ def _export_and_reduce_contact_centered_two_spatial_depths(
 ) -> int:
     """Export contact with touching-first spatial winners.
 
-    Directional slots accept contacts out to ``outer_spatial_depth``, but
-    candidates that touch over the step, their closest approach inside
-    ``inner_spatial_depth``, outrank the others. ``step_end_depth`` is the
+    Directional slots accept every ``admitted`` contact (the caller's rule:
+    within the gap, or under speculation also predicted to touch within the
+    window), but candidates that touch over the step, their closest approach
+    inside ``inner_spatial_depth``, outrank the others. ``step_end_depth`` is the
     depth less the candidate's closing speed times the step (its current
     ``depth`` when the motion is unknown); the closest approach is the deeper
     of the two, so the far side of a support that a rocking body swings onto
@@ -1513,9 +1492,8 @@ def _export_and_reduce_contact_centered_two_spatial_depths(
     step_end_depth = wp.min(step_end_depth, depth)
     use_inner = step_end_depth < inner_spatial_depth
     step_end_inner = use_inner
-    use_outer = depth < outer_spatial_depth
 
-    if not use_outer:
+    if not admitted:
         return -1
 
     # === Normal bin: prioritized spatial slots and inner max-depth slot ===
@@ -1633,7 +1611,7 @@ def export_and_reduce_contact_centered_two_spatial_depths(
         fingerprint,
         centered_position,
         inner_spatial_depth,
-        outer_spatial_depth,
+        depth < outer_spatial_depth,
         position_local,
         aabb_lower_voxel,
         aabb_upper_voxel,
@@ -1641,119 +1619,6 @@ def export_and_reduce_contact_centered_two_spatial_depths(
         reducer_data,
         False,
     )
-
-
-@wp.func
-def export_and_reduce_predictive_contact(
-    shape_a: int,
-    shape_b: int,
-    position: wp.vec3,
-    normal: wp.vec3,
-    depth: float,
-    surface_offset_sum: float,
-    radius_eff_a: float,
-    radius_eff_b: float,
-    fingerprint: int,
-    shape_transform: wp.array[wp.transform],
-    shape_linear_velocity: wp.array[wp.vec3],
-    shape_angular_velocity: wp.array[wp.vec3],
-    collision_update_dt: float,
-    max_speculative_extension: float,
-    existing_contact_id: int,
-    reducer_data: GlobalContactReducerData,
-) -> int:
-    """Register an exact predictive candidate in a bounded shape-pair manifold.
-
-    Args:
-        shape_a: First shape index.
-        shape_b: Second shape index.
-        position: Contact midpoint in world space [m].
-        normal: Contact normal from the first shape to the second. A record this call buffers stores it as given,
-            the bits the regular export stores for the same candidate (:func:`export_contact_to_buffer`): which of
-            the two buffers a candidate depends on the slot races, so its data must not.
-        depth: Centerline contact distance [m].
-        surface_offset_sum: Combined collision margins [m].
-        radius_eff_a: Effective radius of the first shape [m].
-        radius_eff_b: Effective radius of the second shape [m].
-        fingerprint: Deterministic contact identifier.
-        shape_transform: World-space shape transforms.
-        shape_linear_velocity: Shape-origin linear velocities [m/s].
-        shape_angular_velocity: Shape angular velocities [rad/s].
-        collision_update_dt: Collision prediction horizon [s].
-        max_speculative_extension: Maximum speculative clearance [m].
-        existing_contact_id: The candidate's buffered contact (a positive one-based ID), or ``-1``: it is buffered
-            here if it raises a slot.
-        reducer_data: Global contact-reducer storage.
-    """
-    clearance = depth - surface_offset_sum
-    if clearance <= 0.0 or clearance > max_speculative_extension:
-        return -1
-
-    contact_normal = wp.normalize(normal)
-    point_a = position - contact_normal * (0.5 * depth + radius_eff_a)
-    point_b = position + contact_normal * (0.5 * depth + radius_eff_b)
-    closing_speed = compute_contact_approach_speed(
-        shape_a,
-        shape_b,
-        point_a,
-        point_b,
-        contact_normal,
-        shape_transform,
-        shape_linear_velocity,
-        shape_angular_velocity,
-    )
-    if closing_speed <= 0.0 or clearance > closing_speed * collision_update_dt:
-        return -1
-
-    key = make_contact_key(shape_a, shape_b, wp.static(PREDICTIVE_BIN_ID))
-    entry_idx = hashtable_find_or_insert(key, reducer_data.ht_keys, reducer_data.ht_active_slots)
-    if entry_idx < 0:
-        wp.atomic_add(reducer_data.ht_insert_failures, 0, 1)
-        return -1
-
-    clearance_score = -clearance
-    impact_time_score = collision_update_dt - clearance / closing_speed
-    shard_hash = wp.uint32(fingerprint)
-    shard_hash = shard_hash ^ (shard_hash >> wp.uint32(16))
-    shard_hash = shard_hash * wp.uint32(0x7FEB352D)
-    shard_hash = shard_hash ^ (shard_hash >> wp.uint32(15))
-    shard_hash = shard_hash * ((wp.uint32(0x846C) << wp.uint32(16)) | wp.uint32(0xA68B))
-    shard_hash = shard_hash ^ (shard_hash >> wp.uint32(16))
-    clearance_slot = int(shard_hash % wp.uint32(wp.static(NUM_SPATIAL_DIRECTIONS)))
-    values = reducer_data.ht_values
-    clearance_key = contact_key(clearance_score, fingerprint)
-    impact_time_key = contact_key(impact_time_score, fingerprint)
-    clearance_idx = reduction_value_index(entry_idx, clearance_slot)
-    impact_time_idx = reduction_value_index(entry_idx, wp.static(NUM_SPATIAL_DIRECTIONS))
-    raised_clearance = reduction_try_update_slot(entry_idx, clearance_slot, clearance_key, values)
-    raised_impact_time = reduction_try_update_slot(
-        entry_idx, wp.static(NUM_SPATIAL_DIRECTIONS), impact_time_key, values
-    )
-    # A candidate that raised no slot can never hold one (a slot only rises); one that holds none of its raised slots
-    # any more is beaten for good. Buffered here and found beaten, it returns its row (as the mesh-SDF export does).
-    if not raised_clearance and not raised_impact_time:
-        return -1
-    if existing_contact_id >= 0:
-        # The resolve pass visits its pair's predictive entry for it.
-        word = reducer_data.contact_slots[existing_contact_id][1]
-        reducer_data.contact_slots[existing_contact_id][1] = competed_voxel_word(competed_voxel_entry(word), True)
-        return existing_contact_id
-    holds = (raised_clearance and reduction_slot_holds(clearance_idx, clearance_key, values)) or (
-        raised_impact_time and reduction_slot_holds(impact_time_idx, impact_time_key, values)
-    )
-    if not holds:
-        return -1
-    contact_id = export_contact_to_buffer(shape_a, shape_b, position, normal, depth, fingerprint, reducer_data)
-    if contact_id < 0:
-        return -1
-    holds = (raised_clearance and reduction_slot_holds(clearance_idx, clearance_key, values)) or (
-        raised_impact_time and reduction_slot_holds(impact_time_idx, impact_time_key, values)
-    )
-    if not holds:
-        reclaim_contact_id(contact_id, reducer_data)
-        return -1
-    reducer_data.contact_slots[contact_id] = wp.vec2i(-1, competed_voxel_word(-1, True))
-    return contact_id
 
 
 # A module of its own: it launches at the narrow phase's block, the module's other kernels at the default.
@@ -1815,7 +1680,8 @@ def reduce_buffered_contacts_speculative_kernel(
     max_speculative_extension: float,
     total_num_threads: int,
 ):
-    """Reduce buffered contacts and retain an exact predictive manifold per pair."""
+    """Reduce buffered contacts under speculation: a contact present (within its base gap) or predicted (its points
+    close its clearance within the window) competes in its normal bin and voxel like any contact."""
     tid = wp.tid()
     num_contacts = wp.min(reducer_data.contact_count[0], reducer_data.capacity)
     for i in range(tid, num_contacts, total_num_threads):
@@ -1829,19 +1695,20 @@ def reduce_buffered_contacts_speculative_kernel(
         surface_offset_sum = shape_data[shape_a][3] + shape_data[shape_b][3]
         clearance = pd[3] - surface_offset_sum
         base_gap_sum = shape_gap[shape_a] + shape_gap[shape_b]
-        if clearance <= base_gap_sum:
-            normal = wp.normalize(decode_oct(reducer_data.normal[contact_id]))
-            position = wp.vec3(pd[0], pd[1], pd[2])
-            closing_speed = compute_contact_approach_speed(
-                shape_a,
-                shape_b,
-                position - normal * (0.5 * pd[3] + radius_eff_a),
-                position + normal * (0.5 * pd[3] + radius_eff_b),
-                normal,
-                shape_transform,
-                shape_linear_velocity,
-                shape_angular_velocity,
-            )
+        normal = wp.normalize(decode_oct(reducer_data.normal[contact_id]))
+        position = wp.vec3(pd[0], pd[1], pd[2])
+        closing_speed = compute_contact_approach_speed(
+            shape_a,
+            shape_b,
+            position - normal * (0.5 * pd[3] + radius_eff_a),
+            position + normal * (0.5 * pd[3] + radius_eff_b),
+            normal,
+            shape_transform,
+            shape_linear_velocity,
+            shape_angular_velocity,
+        )
+        reach = wp.min(closing_speed * collision_update_dt, max_speculative_extension)
+        if contact_within_window(clearance, base_gap_sum, reach):
             reduce_contact_in_hashtable(
                 contact_id,
                 reducer_data,
@@ -1852,25 +1719,6 @@ def reduce_buffered_contacts_speculative_kernel(
                 shape_voxel_resolution,
                 closing_speed * collision_update_dt,
                 True,
-            )
-        else:
-            export_and_reduce_predictive_contact(
-                shape_a,
-                shape_b,
-                wp.vec3(pd[0], pd[1], pd[2]),
-                decode_oct(reducer_data.normal[contact_id]),
-                pd[3],
-                surface_offset_sum,
-                radius_eff_a,
-                radius_eff_b,
-                reducer_data.contact_fingerprints[contact_id],
-                shape_transform,
-                shape_linear_velocity,
-                shape_angular_velocity,
-                collision_update_dt,
-                max_speculative_extension,
-                contact_id,
-                reducer_data,
             )
 
 
@@ -1886,38 +1734,28 @@ def _resolve_entry(entry_idx: int, fingerprint: int, contact_id: int, values: wp
 
 # A module of its own: it launches at the narrow phase's block, the module's other kernels at the default.
 @wp.kernel(enable_backward=False, module="unique")
-def resolve_reduced_contacts_kernel(reducer_data: GlobalContactReducerData, speculative: int, total_num_threads: int):
+def resolve_reduced_contacts_kernel(reducer_data: GlobalContactReducerData, total_num_threads: int):
     """Name every slot's winner once the pass's candidates have competed: each buffered candidate gives its contact ID
     to the slots whose keys hold its fingerprint (:func:`reduction_resolve_slot`) in the entries where it raised one
-    (:attr:`GlobalContactReducerData.contact_slots`; its pair's predictive entry, found by its key, where its voxel
-    word marks a raise there). Every slot's winner raised it, so it is buffered and names it; a slot no buffered
-    candidate resolves (its winner found no buffer row) exports nothing. A candidate that raised nothing reads two
-    words and stops. Each candidate's home entry (the first, in that order, in which it holds a slot; -1: none)
-    replaces its normal-bin word, so the export writes every winner once, from its home, with no claim."""
+    (:attr:`GlobalContactReducerData.contact_slots`). Every slot's winner raised it, so it is buffered and names it; a
+    slot no buffered candidate resolves (its winner found no buffer row) exports nothing. A candidate that raised
+    nothing reads two words and stops. Each candidate's home entry (the first, in that order, in which it holds a slot;
+    -1: none) replaces its normal-bin word, so the export writes every winner once, from its home, with no claim."""
     tid = wp.tid()
     num_contacts = wp.min(reducer_data.contact_count[0], reducer_data.capacity)
     for i in range(tid, num_contacts, total_num_threads):
         contact_id = i + 1
         entries = reducer_data.contact_slots[contact_id]
-        if entries[0] < 0 and entries[1] == -1:
+        if entries[0] < 0 and entries[1] < 0:
             continue
         fingerprint = reducer_data.contact_fingerprints[contact_id]
         home = int(-1)
         if entries[0] >= 0:
             if _resolve_entry(entries[0], fingerprint, contact_id, reducer_data.ht_values):
                 home = entries[0]
-        voxel_entry_idx = competed_voxel_entry(entries[1])
-        if voxel_entry_idx >= 0:
-            if _resolve_entry(voxel_entry_idx, fingerprint, contact_id, reducer_data.ht_values) and home < 0:
-                home = voxel_entry_idx
-        if speculative != 0 and entries[1] < -1:
-            pair = reducer_data.shape_pairs[contact_id]
-            predictive = hashtable_find(
-                make_contact_key(pair[0], pair[1], wp.static(PREDICTIVE_BIN_ID)), reducer_data.ht_keys
-            )
-            if predictive >= 0:
-                if _resolve_entry(predictive, fingerprint, contact_id, reducer_data.ht_values) and home < 0:
-                    home = predictive
+        if entries[1] >= 0:
+            if _resolve_entry(entries[1], fingerprint, contact_id, reducer_data.ht_values) and home < 0:
+                home = entries[1]
         if home != entries[0]:
             reducer_data.contact_slots[contact_id] = wp.vec2i(home, entries[1])
 

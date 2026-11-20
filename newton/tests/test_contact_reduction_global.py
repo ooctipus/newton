@@ -62,7 +62,7 @@ def get_active_slot_count(reducer: GlobalContactReducer) -> int:
     return int(reducer.hashtable.active_slots.numpy()[reducer.hashtable.capacity])
 
 
-def resolve_slots(reducer: GlobalContactReducer, values: wp.array | None = None, speculative: bool = False):
+def resolve_slots(reducer: GlobalContactReducer, values: wp.array | None = None):
     """Name every slot's winner in ``values`` (default: the reducer's own slots) with the resolve pass (test helper)."""
     data = reducer.get_data_struct()
     if values is not None:
@@ -70,7 +70,7 @@ def resolve_slots(reducer: GlobalContactReducer, values: wp.array | None = None,
     wp.launch(
         resolve_reduced_contacts_kernel,
         dim=_RESOLVE_THREADS,
-        inputs=[data, int(speculative), _RESOLVE_THREADS],
+        inputs=[data, _RESOLVE_THREADS],
         device=reducer.device,
     )
 

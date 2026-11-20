@@ -30,7 +30,6 @@ import warp as wp
 import newton
 from newton._src.geometry.contact_data import ContactData
 from newton._src.geometry.contact_reduction_global import (
-    PREDICTIVE_BIN_ID,
     GlobalContactReducerData,
 )
 from newton._src.geometry.contact_reduction_hydroelastic import (
@@ -135,8 +134,8 @@ def _approaching_model():
     """Bodies falling fast onto terrain and a plane, and one mesh onto another.
 
     Within the collision horizon they come closer than the speculative
-    extension but stay beyond their gaps, so the reducer keeps a predictive
-    manifold (the reserved bin) for each pair, besides its regular bins.
+    extension but stay beyond their gaps: their predicted contacts compete in
+    the normal bins and voxels like present ones.
     """
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     cfg = builder.ShapeConfig(margin=0.001, gap=0.01)
@@ -419,10 +418,10 @@ class TestContactReductionReference(unittest.TestCase):
         self._check("mesh_pile", out)
 
     def test_speculative(self):
-        """Reproduce the regular bins and predictive manifolds of fast-approaching pairs."""
+        """Reproduce the bins of fast-approaching pairs: their predicted contacts compete in the normal bins."""
         model = _approaching_model()
         out = {}
-        pipeline = _run_passes(
+        _run_passes(
             self,
             out,
             "speculative",
@@ -432,11 +431,6 @@ class TestContactReductionReference(unittest.TestCase):
             max_triangle_pairs=16384,
             speculative_contact_gap_max=0.25,
         )
-        # The last pass repeats the first; its keys include predictive manifolds.
-        reducer = pipeline.narrow_phase.global_contact_reducer
-        active = reducer.hashtable.active_slots.numpy()
-        keys = reducer.hashtable.keys.numpy()[active[: active[reducer.hashtable.capacity]]]
-        self.assertGreater(int(np.sum((keys >> np.uint64(55)) & np.uint64(0xFF) == PREDICTIVE_BIN_ID)), 0)
         self._check("speculative", out)
 
     def test_pair_csr(self):

@@ -159,6 +159,13 @@ def compute_contact_approach_speed(
 
 
 @wp.func
+def contact_within_window(separation: float, gap: float, reach: float) -> bool:
+    """Whether a contact belongs to a pass: present (its separation within its gap) or predicted (its points close the
+    separation within the window: ``reach`` is their closing speed times the window, capped at the pass's ceiling)."""
+    return separation <= gap or separation <= reach
+
+
+@wp.func
 def compute_contact_predictive_score(
     shape_a: int,
     shape_b: int,

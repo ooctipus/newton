@@ -12,6 +12,7 @@ from ..geometry.contact_data import (
     SHAPE_PAIR_INDEX_MASK,
     ContactData,
     compute_contact_approach_speed,
+    contact_within_window,
 )
 from ..geometry.sdf_texture import (
     TextureSDFData,
@@ -26,7 +27,6 @@ from ..utils.heightfield import HeightfieldData, sample_sdf_grad_heightfield, sa
 from .contact_reduction_global import (
     GlobalContactReducerData,
     _export_and_reduce_contact_centered_two_spatial_depths,
-    export_and_reduce_predictive_contact,
 )
 from .flags import MeshSignMethod
 from .kernels import mesh_query_point_sign, resolve_mesh_sign_method
@@ -2595,10 +2595,11 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
                                     # with speculation, so a candidate its points' closing speed (rotation included)
                                     # carries into contact this step competes as touching for the bin's extremes.
                                     step_end_depth = dist
+                                    admitted = dist < outer_spatial_depth
                                     if wp.static(speculative):
-                                        # Keep velocity-expanded search candidates out of the regular
-                                        # normal bins so the predictive pair manifold remains bounded.
-                                        outer_spatial_depth = margin_sum + base_gap_sum
+                                        # A candidate belongs to the pass when present (within the base gap) or
+                                        # predicted (its points close it within the window): it competes in its
+                                        # normal bin and voxel like any contact.
                                         unit_normal = wp.normalize(contact_normal)
                                         closing_speed = compute_contact_approach_speed(
                                             shape_a,
@@ -2611,7 +2612,12 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
                                             shape_angular_velocity,
                                         )
                                         step_end_depth = dist - closing_speed * collision_update_dt
-                                    contact_id = _export_and_reduce_contact_centered_two_spatial_depths(
+                                        admitted = contact_within_window(
+                                            dist - margin_sum,
+                                            base_gap_sum,
+                                            wp.min(closing_speed * collision_update_dt, max_speculative_extension),
+                                        )
+                                    _export_and_reduce_contact_centered_two_spatial_depths(
                                         shape_a,
                                         shape_b,
                                         contact_center,
@@ -2621,7 +2627,7 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
                                         (my_edge_idx << 2) | (mode << 1),
                                         contact_center - midpoint,
                                         inner_spatial_depth,
-                                        outer_spatial_depth,
+                                        admitted,
                                         position_local_tri,
                                         aabb_lower_tri,
                                         aabb_upper_tri,
@@ -2629,26 +2635,6 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
                                         reducer_data,
                                         wp.static(speculative),
                                     )
-                                    if wp.static(speculative):
-                                        if dist >= inner_spatial_depth:
-                                            export_and_reduce_predictive_contact(
-                                                shape_a,
-                                                shape_b,
-                                                contact_center,
-                                                contact_normal,
-                                                dist,
-                                                margin_sum,
-                                                0.0,
-                                                0.0,
-                                                (my_edge_idx << 2) | (mode << 1),
-                                                shape_transform,
-                                                shape_linear_velocity,
-                                                shape_angular_velocity,
-                                                collision_update_dt,
-                                                max_speculative_extension,
-                                                contact_id,
-                                                reducer_data,
-                                            )
 
                         # Defensive cooperative reset before the next outer
                         # iteration — see the matching ``tile_stack_clear``
@@ -2986,10 +2972,9 @@ def create_mesh_sdf_staged_kernels(
         midpoint = (wp.transform_get_translation(X_tri_ws) + wp.transform_get_translation(X_sdf_ws)) * 0.5
         inner_spatial_depth = margin_sum
         inner_spatial_depth += wp.min(ctx.texture_voxel_radius * ctx.min_sdf_scale, ctx.base_gap_sum)
-        outer_spatial_depth = margin_sum + ctx.gap_sum
         step_end_depth = dist
+        admitted = dist < margin_sum + ctx.gap_sum
         if wp.static(speculative):
-            outer_spatial_depth = margin_sum + ctx.base_gap_sum
             unit_normal = wp.normalize(contact_normal)
             closing_speed = compute_contact_approach_speed(
                 shape_a,
@@ -3002,7 +2987,12 @@ def create_mesh_sdf_staged_kernels(
                 shape_angular_velocity,
             )
             step_end_depth = dist - closing_speed * collision_update_dt
-        contact_id = _export_and_reduce_contact_centered_two_spatial_depths(
+            admitted = contact_within_window(
+                dist - margin_sum,
+                ctx.base_gap_sum,
+                wp.min(closing_speed * collision_update_dt, max_speculative_extension),
+            )
+        _export_and_reduce_contact_centered_two_spatial_depths(
             shape_a,
             shape_b,
             contact_center,
@@ -3012,7 +3002,7 @@ def create_mesh_sdf_staged_kernels(
             (hit.edge_idx << 2) | (mode << 1),
             contact_center - midpoint,
             inner_spatial_depth,
-            outer_spatial_depth,
+            admitted,
             position_local_tri,
             shape_collision_aabb_lower[tri_shape],
             shape_collision_aabb_upper[tri_shape],
@@ -3020,26 +3010,6 @@ def create_mesh_sdf_staged_kernels(
             reducer_data,
             wp.static(speculative),
         )
-        if wp.static(speculative):
-            if dist >= inner_spatial_depth:
-                export_and_reduce_predictive_contact(
-                    shape_a,
-                    shape_b,
-                    contact_center,
-                    contact_normal,
-                    dist,
-                    margin_sum,
-                    0.0,
-                    0.0,
-                    (hit.edge_idx << 2) | (mode << 1),
-                    shape_transform,
-                    shape_linear_velocity,
-                    shape_angular_velocity,
-                    collision_update_dt,
-                    max_speculative_extension,
-                    contact_id,
-                    reducer_data,
-                )
 
     @wp.kernel(enable_backward=False, launch_bounds=(MESH_SDF_BLOCK_DIM, 4), grid_stride=False, module="unique")
     def mesh_sdf_stage_cull_kernel(

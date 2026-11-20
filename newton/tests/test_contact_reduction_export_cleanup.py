@@ -152,7 +152,7 @@ class _Fixture:
         """Reduce the fixture's contacts, then name every slot's winner as the narrow phase does before export."""
         data = self.reducer.get_data_struct()
         wp.launch(_seed_entries, dim=1, inputs=[data, self.enabled], device=self.device)
-        wp.launch(resolve_reduced_contacts_kernel, dim=8, inputs=[data, 0, 8], device=self.device)
+        wp.launch(resolve_reduced_contacts_kernel, dim=8, inputs=[data, 8], device=self.device)
 
     def export(self, kernel, *, parallel=False, blocks=1):
         reducer = self.reducer
@@ -306,7 +306,7 @@ class TestContactReductionExportCleanup(unittest.TestCase):
                 fixture = _Fixture("cpu")
                 data = fixture.reducer.get_data_struct()
                 wp.launch(_seed_roundoff_twin, dim=1, inputs=[data, twin_home_first], device="cpu")
-                wp.launch(resolve_reduced_contacts_kernel, dim=4, inputs=[data, 0, 4], device="cpu")
+                wp.launch(resolve_reduced_contacts_kernel, dim=4, inputs=[data, 4], device="cpu")
                 fixture.export(create_export_reduced_contacts_kernel(_record_contact))
                 np.testing.assert_array_equal(fixture.contacts()[0], expected)
 

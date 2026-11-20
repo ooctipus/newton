@@ -1626,7 +1626,7 @@ class HydroelasticContactReduction:
         wp.launch(
             kernel=resolve_reduced_contacts_kernel,
             dim=[grid_size],
-            inputs=[reducer_data, 0, grid_size],
+            inputs=[reducer_data, grid_size],
             device=self.device,
             record_tape=False,
         )

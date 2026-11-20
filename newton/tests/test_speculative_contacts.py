@@ -9,14 +9,12 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.geometry.contact_reduction import get_slot
 from newton._src.geometry.contact_reduction_global import (
     EXPORT_REDUCED_CONTACTS_BLOCK_DIM,
-    PREDICTIVE_BIN_ID,
     GlobalContactReducer,
     GlobalContactReducerData,
     create_export_reduced_contacts_kernel,
-    export_and_reduce_contact_centered_two_spatial_depths,
-    export_and_reduce_predictive_contact,
     export_contact_to_buffer,
     reclaim_contact_id,
     reduce_buffered_contacts_speculative_kernel,
@@ -95,270 +93,6 @@ def _extract_speculative_plane_proxy_scale(
 
 
 @wp.kernel
-def _register_regular_and_predictive_contact(
-    reducer_data: GlobalContactReducerData,
-    shape_transform: wp.array[wp.transform],
-    shape_linear_velocity: wp.array[wp.vec3],
-    shape_angular_velocity: wp.array[wp.vec3],
-    contact_ids: wp.array[wp.int32],
-):
-    position = wp.vec3(0.0)
-    normal = wp.vec3(1.0, 0.0, 0.0)
-    contact_id = export_and_reduce_contact_centered_two_spatial_depths(
-        0,
-        1,
-        position,
-        normal,
-        0.05,
-        0.05,
-        17,
-        position,
-        0.0,
-        0.1,
-        position,
-        wp.vec3(-1.0),
-        wp.vec3(1.0),
-        wp.vec3i(1),
-        reducer_data,
-    )
-    contact_ids[0] = contact_id
-    contact_ids[1] = export_and_reduce_predictive_contact(
-        0,
-        1,
-        position,
-        normal,
-        0.05,
-        0.0,
-        0.0,
-        0.0,
-        17,
-        shape_transform,
-        shape_linear_velocity,
-        shape_angular_velocity,
-        0.1,
-        0.1,
-        contact_id,
-        reducer_data,
-    )
-    contact_ids[2] = export_and_reduce_predictive_contact(
-        0,
-        1,
-        position,
-        normal,
-        0.05,
-        0.0,
-        0.0,
-        0.0,
-        17,
-        shape_transform,
-        shape_linear_velocity,
-        shape_angular_velocity,
-        0.1,
-        0.1,
-        contact_id,
-        reducer_data,
-    )
-
-
-@wp.kernel
-def _register_inner_and_rotating_leading_contact(
-    reducer_data: GlobalContactReducerData,
-    shape_transform: wp.array[wp.transform],
-    shape_linear_velocity: wp.array[wp.vec3],
-    shape_angular_velocity: wp.array[wp.vec3],
-    contact_ids: wp.array[wp.int32],
-):
-    normal = wp.vec3(1.0, 0.0, 0.0)
-    inner_position = wp.vec3(0.0)
-    contact_ids[0] = export_and_reduce_contact_centered_two_spatial_depths(
-        0,
-        1,
-        inner_position,
-        normal,
-        -0.01,
-        -0.01,
-        11,
-        inner_position,
-        0.01,
-        0.1,
-        inner_position,
-        wp.vec3(-2.0),
-        wp.vec3(2.0),
-        wp.vec3i(1),
-        reducer_data,
-    )
-
-    leading_position = wp.vec3(0.0, 1.0, 0.0)
-    regular_contact_id = export_and_reduce_contact_centered_two_spatial_depths(
-        0,
-        1,
-        leading_position,
-        normal,
-        0.05,
-        0.05,
-        23,
-        leading_position,
-        0.01,
-        0.1,
-        leading_position,
-        wp.vec3(-2.0),
-        wp.vec3(2.0),
-        wp.vec3i(1),
-        reducer_data,
-    )
-    contact_ids[1] = regular_contact_id
-    contact_ids[2] = export_and_reduce_predictive_contact(
-        0,
-        1,
-        leading_position,
-        normal,
-        0.05,
-        0.0,
-        0.0,
-        0.0,
-        23,
-        shape_transform,
-        shape_linear_velocity,
-        shape_angular_velocity,
-        0.1,
-        0.1,
-        regular_contact_id,
-        reducer_data,
-    )
-
-
-@wp.kernel
-def _register_predictive_clearance_candidates(
-    reducer_data: GlobalContactReducerData,
-    shape_transform: wp.array[wp.transform],
-    shape_linear_velocity: wp.array[wp.vec3],
-    shape_angular_velocity: wp.array[wp.vec3],
-    contact_ids: wp.array[wp.int32],
-):
-    normal = wp.vec3(1.0, 0.0, 0.0)
-    for candidate_idx in range(8):
-        clearance = float(0.07)
-        fingerprint = int(7)
-        position_y = float(0.0)
-        if candidate_idx == 1:
-            clearance = 0.06
-            fingerprint = 3
-        elif candidate_idx == 2:
-            clearance = 0.05
-            fingerprint = 14
-        elif candidate_idx == 3:
-            clearance = 0.04
-            fingerprint = 2
-        elif candidate_idx == 4:
-            clearance = 0.03
-            fingerprint = 1
-        elif candidate_idx == 5:
-            clearance = 0.02
-            fingerprint = 16
-        elif candidate_idx == 6:
-            clearance = 0.01
-            fingerprint = 12
-        elif candidate_idx == 7:
-            clearance = 0.08
-            fingerprint = 18
-            position_y = 10.0
-        contact_ids[candidate_idx] = export_and_reduce_predictive_contact(
-            0,
-            1,
-            wp.vec3(0.0, position_y, clearance),
-            normal,
-            clearance,
-            0.0,
-            0.0,
-            0.0,
-            fingerprint,
-            shape_transform,
-            shape_linear_velocity,
-            shape_angular_velocity,
-            0.1,
-            0.1,
-            -1,
-            reducer_data,
-        )
-
-
-@wp.kernel
-def _register_predictive_clearance_candidates_contended(
-    reducer_data: GlobalContactReducerData,
-    shape_transform: wp.array[wp.transform],
-    shape_linear_velocity: wp.array[wp.vec3],
-    shape_angular_velocity: wp.array[wp.vec3],
-    clearance_order: int,
-):
-    candidate_idx = wp.tid()
-    clearance_rank = candidate_idx
-    if clearance_order == 1:
-        clearance_rank = 254 - wp.min(candidate_idx, 254)
-    elif clearance_order == 2:
-        clearance_rank = (candidate_idx * 73) % 255
-    clearance = 0.01 + float(clearance_rank) * 0.0001
-    fingerprint = (candidate_idx << 2) | ((candidate_idx & 1) << 1)
-    position_y = 0.0
-    if candidate_idx == 255:
-        clearance = 0.08
-        position_y = 10.0
-    export_and_reduce_predictive_contact(
-        0,
-        1,
-        wp.vec3(0.0, position_y, clearance),
-        wp.vec3(1.0, 0.0, 0.0),
-        clearance,
-        0.0,
-        0.0,
-        0.0,
-        fingerprint,
-        shape_transform,
-        shape_linear_velocity,
-        shape_angular_velocity,
-        0.1,
-        0.1,
-        -1,
-        reducer_data,
-    )
-
-
-@wp.kernel
-def _buffer_predictive_and_regular_records(
-    reducer_data: GlobalContactReducerData,
-    normals: wp.array[wp.vec3],
-    shape_transform: wp.array[wp.transform],
-    shape_linear_velocity: wp.array[wp.vec3],
-    shape_angular_velocity: wp.array[wp.vec3],
-    predictive_ids: wp.array[wp.int32],
-    regular_ids: wp.array[wp.int32],
-):
-    """Case ``i`` (shapes ``2i``, ``2i + 1``): a predictive candidate the regular export did not buffer, and the
-    regular export's record of the same candidate (same position, normal, depth and fingerprint)."""
-    i = wp.tid()
-    normal = normals[i]
-    position = wp.vec3(0.0, 10.0 * float(i), 0.0)
-    predictive_ids[i] = export_and_reduce_predictive_contact(
-        2 * i,
-        2 * i + 1,
-        position,
-        normal,
-        0.05,
-        0.0,
-        0.0,
-        0.0,
-        5,
-        shape_transform,
-        shape_linear_velocity,
-        shape_angular_velocity,
-        0.1,
-        0.1,
-        -1,
-        reducer_data,
-    )
-    regular_ids[i] = export_contact_to_buffer(2 * i, 2 * i + 1, position, normal, 0.05, 5, reducer_data)
-
-
-@wp.kernel
 def _buffer_one_contact(reducer_data: GlobalContactReducerData):
     export_contact_to_buffer(
         0,
@@ -386,66 +120,6 @@ def _buffer_separated_axial_contact(reducer_data: GlobalContactReducerData):
 
 
 @wp.kernel
-def _replace_full_buffer_predictive_winner(
-    reducer_data: GlobalContactReducerData,
-    shape_transform: wp.array[wp.transform],
-    shape_linear_velocity: wp.array[wp.vec3],
-    shape_angular_velocity: wp.array[wp.vec3],
-    contact_ids: wp.array[wp.int32],
-):
-    normal = wp.vec3(1.0, 0.0, 0.0)
-    fingerprint = int(7)
-    original_clearance = 0.08
-    original_contact_id = export_contact_to_buffer(
-        0,
-        1,
-        wp.vec3(0.0, 0.0, original_clearance),
-        normal,
-        original_clearance,
-        fingerprint,
-        reducer_data,
-    )
-    contact_ids[0] = export_and_reduce_predictive_contact(
-        0,
-        1,
-        wp.vec3(0.0, 0.0, original_clearance),
-        normal,
-        original_clearance,
-        0.0,
-        0.0,
-        0.0,
-        fingerprint,
-        shape_transform,
-        shape_linear_velocity,
-        shape_angular_velocity,
-        0.1,
-        0.1,
-        original_contact_id,
-        reducer_data,
-    )
-    # A different feature of the pair (fingerprints are unique among a pair's candidates) in the same clearance shard
-    # as fingerprint 7, so it displaces the first candidate from both of its slots.
-    contact_ids[1] = export_and_reduce_predictive_contact(
-        0,
-        1,
-        wp.vec3(0.0, 0.0, 0.05),
-        normal,
-        0.05,
-        0.0,
-        0.0,
-        0.0,
-        12,
-        shape_transform,
-        shape_linear_velocity,
-        shape_angular_velocity,
-        0.1,
-        0.1,
-        -1,
-        reducer_data,
-    )
-
-
-@wp.kernel
 def _reclaim_and_allocate_contact_ids(
     reducer_data: GlobalContactReducerData,
     stride: int,
@@ -464,43 +138,6 @@ def _reclaim_and_allocate_contact_ids(
         tid,
         reducer_data,
     )
-
-
-@wp.kernel
-def _register_predictive_clearance_candidates_sequential(
-    reducer_data: GlobalContactReducerData,
-    shape_transform: wp.array[wp.transform],
-    shape_linear_velocity: wp.array[wp.vec3],
-    shape_angular_velocity: wp.array[wp.vec3],
-):
-    candidate_idx = int(0)
-    while candidate_idx < 256:
-        clearance_rank = (candidate_idx * 73) % 255
-        clearance = 0.01 + float(clearance_rank) * 0.0001
-        fingerprint = (candidate_idx << 2) | ((candidate_idx & 1) << 1)
-        position_y = 0.0
-        if candidate_idx == 255:
-            clearance = 0.08
-            position_y = 10.0
-        export_and_reduce_predictive_contact(
-            0,
-            1,
-            wp.vec3(0.0, position_y, clearance),
-            wp.vec3(1.0, 0.0, 0.0),
-            clearance,
-            0.0,
-            0.0,
-            0.0,
-            fingerprint,
-            shape_transform,
-            shape_linear_velocity,
-            shape_angular_velocity,
-            0.1,
-            0.1,
-            -1,
-            reducer_data,
-        )
-        candidate_idx = candidate_idx + 1
 
 
 def _expected_contended_clearances(clearance_order: int) -> list[float]:
@@ -607,7 +244,7 @@ def _export_reducer_contacts(reducer: GlobalContactReducer, device):
     wp.launch(
         resolve_reduced_contacts_kernel,
         dim=resolve_threads,
-        inputs=[reducer.get_data_struct(), 1, resolve_threads],
+        inputs=[reducer.get_data_struct(), resolve_threads],
         device=device,
     )
     contact_count = wp.zeros(1, dtype=wp.int32, device=device)
@@ -1304,8 +941,9 @@ def test_speculative_axial_shapes_reach_triangle_mesh(test, device):
             test.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 0)
 
 
-def test_speculative_mesh_sdf_manifold_is_bounded(test, device):
-    """Limit a separated mesh-SDF shape pair to seven predictive contacts."""
+def test_speculative_mesh_sdf_predicted_manifold(test, device):
+    """A separated mesh-SDF pair predicted to touch keeps its manifold in the normal bins and voxels, as a touching
+    pair does, not a bounded handful of points."""
     projectile = newton.Mesh.create_sphere(
         0.2,
         num_latitudes=32,
@@ -1334,8 +972,7 @@ def test_speculative_mesh_sdf_manifold_is_bounded(test, device):
     pipeline.collide(model.state(), contacts, dt=0.03)
 
     count = int(contacts.rigid_contact_count.numpy()[0])
-    test.assertGreater(count, 0)
-    test.assertLessEqual(count, 7)
+    test.assertGreater(count, 7)
 
 
 def test_speculative_mesh_sdf_retains_rotating_leading_feature(test, device, scheduled=False):
@@ -1399,87 +1036,6 @@ def test_speculative_mesh_sdf_retains_rotating_leading_feature(test, device, sch
     test.assertGreater(float(rod_points[:, 0].max()), 0.3)
 
 
-def test_predictive_reducer_reuses_regular_contact(test, device):
-    """Verify one candidate winning regular and predictive keys exports once.
-
-    The predictive offer reuses the regular export's record; offering the same candidate again raises no slot (the
-    slots already hold its keys), so it returns -1 and buffers nothing.
-    """
-    reducer = GlobalContactReducer(capacity=8, device=device)
-    shape_transform = wp.array([wp.transform_identity(), wp.transform_identity()], dtype=wp.transform, device=device)
-    shape_linear_velocity = wp.array([wp.vec3(1.0, 0.0, 0.0), wp.vec3(0.0)], dtype=wp.vec3, device=device)
-    shape_angular_velocity = wp.zeros(2, dtype=wp.vec3, device=device)
-    contact_ids = wp.zeros(3, dtype=wp.int32, device=device)
-    wp.launch(
-        _register_regular_and_predictive_contact,
-        dim=1,
-        inputs=[
-            reducer.get_data_struct(),
-            shape_transform,
-            shape_linear_velocity,
-            shape_angular_velocity,
-            contact_ids,
-        ],
-        device=device,
-    )
-
-    ids = contact_ids.numpy()
-    test.assertGreater(int(ids[0]), 0)
-    test.assertEqual(int(ids[1]), int(ids[0]))
-    test.assertEqual(int(ids[2]), -1)
-    test.assertEqual(int(reducer.contact_count.numpy()[0]), 1)
-    exported_count, _ = _export_reducer_contacts(reducer, device)
-    test.assertEqual(exported_count, 1)
-
-
-def test_predictive_record_stores_the_regular_normal(test, device):
-    """A predictive candidate the regular export did not buffer stores the normal bits the regular export stores.
-
-    The mesh-SDF kernel offers each candidate to the regular export, then to the predictive manifold, which buffers
-    its own record only when the regular export did not; which happens depends on the slot races, so both records
-    of one fingerprint must hold the same data for the reduction's winner to be deterministic. The normals are mesh
-    SDF normals (unit to rounding), among them one a hardware run exported both ways.
-    """
-    normals_np = np.array(
-        [
-            [5.0695398e-06, 2.0673426e-02, 9.9978632e-01],
-            [-9.7364456e-05, 1.0825610e-01, 9.9412304e-01],
-            [0.6, 0.8, 1.0e-7],
-            [0.26726124, 0.5345225, 0.8017837],
-        ],
-        dtype=np.float32,
-    )
-    cases = len(normals_np)
-    reducer = GlobalContactReducer(capacity=4 * cases, device=device)
-    shape_transform = wp.array([wp.transform_identity()] * (2 * cases), dtype=wp.transform, device=device)
-    # Shape 2i approaches shape 2i + 1 along its normal at 1 m/s: 0.05 m of clearance closes within dt = 0.1 s.
-    velocity = np.zeros((2 * cases, 3), dtype=np.float32)
-    velocity[0::2] = normals_np
-    shape_linear_velocity = wp.array(velocity, dtype=wp.vec3, device=device)
-    shape_angular_velocity = wp.zeros(2 * cases, dtype=wp.vec3, device=device)
-    predictive_ids = wp.zeros(cases, dtype=wp.int32, device=device)
-    regular_ids = wp.zeros(cases, dtype=wp.int32, device=device)
-    wp.launch(
-        _buffer_predictive_and_regular_records,
-        dim=cases,
-        inputs=[
-            reducer.get_data_struct(),
-            wp.array(normals_np, dtype=wp.vec3, device=device),
-            shape_transform,
-            shape_linear_velocity,
-            shape_angular_velocity,
-            predictive_ids,
-            regular_ids,
-        ],
-        device=device,
-    )
-    predictive, regular = predictive_ids.numpy(), regular_ids.numpy()
-    test.assertTrue(np.all(predictive > 0), predictive)
-    test.assertTrue(np.all(regular > 0), regular)
-    stored = reducer.normal.numpy()
-    np.testing.assert_array_equal(stored[predictive], stored[regular])
-
-
 def test_speculative_buffered_reducer_uses_one_based_ids(test, device):
     """Verify buffered speculative reduction processes every real contact and skips reserved ID zero."""
     reducer = GlobalContactReducer(capacity=8, device=device)
@@ -1514,8 +1070,8 @@ def test_speculative_buffered_reducer_uses_one_based_ids(test, device):
         test.assertAlmostEqual(float(actual), expected, places=6)
 
 
-def test_speculative_buffered_axial_contacts_use_predictive_manifold(test, device):
-    """Route separated sphere and capsule mesh contacts by their physical clearance."""
+def test_speculative_buffered_axial_contacts_use_normal_bins(test, device):
+    """A separated sphere or capsule mesh contact predicted within the window competes in its normal bin."""
     for shape_type in (GeoType.SPHERE, GeoType.CAPSULE):
         with test.subTest(shape_type=shape_type):
             reducer = GlobalContactReducer(capacity=8, device=device)
@@ -1542,158 +1098,9 @@ def test_speculative_buffered_axial_contacts_use_predictive_manifold(test, devic
                 device=device,
             )
 
+            # Predicted to touch within the window, it competes in its normal bin like a present contact.
             bins = (reducer.hashtable.keys.numpy() >> np.uint64(55)) & np.uint64(0xFF)
-            test.assertIn(PREDICTIVE_BIN_ID, bins)
-
-
-def test_predictive_reducer_retains_rotating_leading_contact(test, device):
-    """Verify an inner winner cannot suppress an imminent angular-only feature."""
-    reducer = _make_predictive_reducer(8, device)
-    shape_transform = wp.array([wp.transform_identity(), wp.transform_identity()], dtype=wp.transform, device=device)
-    shape_linear_velocity = wp.zeros(2, dtype=wp.vec3, device=device)
-    shape_angular_velocity = wp.array([wp.vec3(0.0, 0.0, -1.0), wp.vec3(0.0)], dtype=wp.vec3, device=device)
-    contact_ids = wp.zeros(3, dtype=wp.int32, device=device)
-    wp.launch(
-        _register_inner_and_rotating_leading_contact,
-        dim=1,
-        inputs=[
-            reducer.get_data_struct(),
-            shape_transform,
-            shape_linear_velocity,
-            shape_angular_velocity,
-            contact_ids,
-        ],
-        device=device,
-    )
-
-    ids = contact_ids.numpy()
-    test.assertGreaterEqual(int(ids[0]), 0)
-    test.assertEqual(int(ids[1]), -1)
-    test.assertGreaterEqual(int(ids[2]), 0)
-    test.assertNotEqual(int(ids[2]), int(ids[0]))
-    test.assertEqual(int(reducer.contact_count.numpy()[0]), 2)
-    exported_count, positions = _export_reducer_contacts(reducer, device)
-    test.assertEqual(exported_count, 2)
-    test.assertAlmostEqual(float(max(positions[:exported_count, 1])), 1.0, places=6)
-
-
-def test_predictive_reducer_retains_clearance_manifold(test, device):
-    """Verify the nearest clearance in each deterministic shard and the impact guard survive."""
-    reducer = _make_predictive_reducer(16, device)
-    shape_transform = wp.array([wp.transform_identity(), wp.transform_identity()], dtype=wp.transform, device=device)
-    shape_linear_velocity = wp.array([wp.vec3(1.0, 0.0, 0.0), wp.vec3(0.0)], dtype=wp.vec3, device=device)
-    shape_angular_velocity = wp.array([wp.vec3(0.0, 0.0, -1.0), wp.vec3(0.0)], dtype=wp.vec3, device=device)
-    contact_ids = wp.full(8, -1, dtype=wp.int32, device=device)
-    wp.launch(
-        _register_predictive_clearance_candidates,
-        dim=1,
-        inputs=[
-            reducer.get_data_struct(),
-            shape_transform,
-            shape_linear_velocity,
-            shape_angular_velocity,
-            contact_ids,
-        ],
-        device=device,
-    )
-
-    test.assertEqual(int(reducer.contact_count.numpy()[0]), 8)
-    exported_count, positions = _export_reducer_contacts(reducer, device)
-    test.assertEqual(exported_count, 7)
-    clearances = sorted(float(position[2]) for position in positions[:exported_count])
-    for actual, expected in zip(clearances, (0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.08), strict=True):
-        test.assertAlmostEqual(actual, expected, places=6)
-
-
-def test_predictive_reducer_retains_clearance_manifold_under_contention(test, device):
-    """Verify concurrent blocks retain all winners within a bounded contact buffer."""
-    shape_transform = wp.array([wp.transform_identity(), wp.transform_identity()], dtype=wp.transform, device=device)
-    shape_linear_velocity = wp.array([wp.vec3(1.0, 0.0, 0.0), wp.vec3(0.0)], dtype=wp.vec3, device=device)
-    shape_angular_velocity = wp.array([wp.vec3(0.0, 0.0, -1.0), wp.vec3(0.0)], dtype=wp.vec3, device=device)
-    for clearance_order in (0, 1, 2):
-        with test.subTest(clearance_order=clearance_order):
-            reducer = _make_predictive_reducer(16, device)
-            wp.launch(
-                _register_predictive_clearance_candidates_contended,
-                dim=256,
-                inputs=[
-                    reducer.get_data_struct(),
-                    shape_transform,
-                    shape_linear_velocity,
-                    shape_angular_velocity,
-                    clearance_order,
-                ],
-                block_dim=32,
-                device=device,
-            )
-
-            test.assertLessEqual(int(reducer.contact_count.numpy()[0]), reducer.capacity)
-            exported_count, positions = _export_reducer_contacts(reducer, device)
-            test.assertEqual(exported_count, 7)
-            clearances = sorted(float(position[2]) for position in positions[:exported_count])
-            expected = _expected_contended_clearances(clearance_order)
-            for actual, expected_clearance in zip(clearances, expected, strict=True):
-                test.assertAlmostEqual(actual, expected_clearance, places=6)
-
-
-def test_predictive_reducer_preserves_winners_with_small_buffer(test, device):
-    """Verify 256 ordered contenders preserve shard winners within a 16-contact buffer."""
-    reducer = _make_predictive_reducer(16, device)
-    shape_transform = wp.array([wp.transform_identity(), wp.transform_identity()], dtype=wp.transform, device=device)
-    shape_linear_velocity = wp.array([wp.vec3(1.0, 0.0, 0.0), wp.vec3(0.0)], dtype=wp.vec3, device=device)
-    shape_angular_velocity = wp.array([wp.vec3(0.0, 0.0, -1.0), wp.vec3(0.0)], dtype=wp.vec3, device=device)
-    wp.launch(
-        _register_predictive_clearance_candidates_sequential,
-        dim=1,
-        inputs=[
-            reducer.get_data_struct(),
-            shape_transform,
-            shape_linear_velocity,
-            shape_angular_velocity,
-        ],
-        device=device,
-    )
-
-    allocated_count = int(reducer.contact_count.numpy()[0])
-    test.assertLessEqual(allocated_count, reducer.capacity)
-    exported_count, positions = _export_reducer_contacts(reducer, device)
-    test.assertEqual(exported_count, 7)
-    test.assertLessEqual(exported_count, allocated_count)
-    clearances = sorted(float(position[2]) for position in positions[:exported_count])
-    for actual, expected in zip(clearances, (0.01, 0.0101, 0.0102, 0.0104, 0.0107, 0.011, 0.08), strict=True):
-        test.assertAlmostEqual(actual, expected, places=6)
-
-
-def test_predictive_reducer_unbuffered_winner_exports_nothing(test, device):
-    """A stronger candidate that raises the predictive slots but finds no buffer row leaves them unresolved.
-
-    Slots only rise, so the displaced (buffered) winner no longer holds them and cannot be named; the pair exports
-    nothing rather than a contact the slots did not choose, and the lost row is counted as a buffer overflow.
-    """
-    reducer = _make_predictive_reducer(1, device)
-    shape_transform = wp.array([wp.transform_identity(), wp.transform_identity()], dtype=wp.transform, device=device)
-    shape_linear_velocity = wp.array([wp.vec3(1.0, 0.0, 0.0), wp.vec3(0.0)], dtype=wp.vec3, device=device)
-    shape_angular_velocity = wp.zeros(2, dtype=wp.vec3, device=device)
-    contact_ids = wp.full(2, -1, dtype=wp.int32, device=device)
-    wp.launch(
-        _replace_full_buffer_predictive_winner,
-        dim=1,
-        inputs=[
-            reducer.get_data_struct(),
-            shape_transform,
-            shape_linear_velocity,
-            shape_angular_velocity,
-            contact_ids,
-        ],
-        device=device,
-    )
-
-    ids = contact_ids.numpy()
-    test.assertEqual(int(ids[0]), 1)
-    test.assertEqual(int(ids[1]), -1)
-    test.assertEqual(int(reducer.buffer_overflows.numpy()[0]), 1)
-    exported_count, _ = _export_reducer_contacts(reducer, device)
-    test.assertEqual(exported_count, 0)
+            test.assertIn(get_slot(wp.vec3(1.0, 0.0, 0.0)), bins)
 
 
 def test_predictive_reducer_reclamation_storage_is_opt_in(test, device):
@@ -1802,38 +1209,16 @@ for _name, _test in (
         test_predictive_reducer_reclamation_storage_is_opt_in,
     ),
     (
-        "test_speculative_buffered_axial_contacts_use_predictive_manifold",
-        test_speculative_buffered_axial_contacts_use_predictive_manifold,
+        "test_speculative_buffered_axial_contacts_use_normal_bins",
+        test_speculative_buffered_axial_contacts_use_normal_bins,
     ),
     (
         "test_predictive_reducer_reclaims_ids_without_duplicates",
         test_predictive_reducer_reclaims_ids_without_duplicates,
     ),
-    ("test_predictive_reducer_reuses_regular_contact", test_predictive_reducer_reuses_regular_contact),
-    ("test_predictive_record_stores_the_regular_normal", test_predictive_record_stores_the_regular_normal),
     ("test_speculative_buffered_reducer_uses_one_based_ids", test_speculative_buffered_reducer_uses_one_based_ids),
-    (
-        "test_predictive_reducer_retains_rotating_leading_contact",
-        test_predictive_reducer_retains_rotating_leading_contact,
-    ),
-    ("test_predictive_reducer_retains_clearance_manifold", test_predictive_reducer_retains_clearance_manifold),
-    (
-        "test_predictive_reducer_preserves_winners_with_small_buffer",
-        test_predictive_reducer_preserves_winners_with_small_buffer,
-    ),
-    (
-        "test_predictive_reducer_unbuffered_winner_exports_nothing",
-        test_predictive_reducer_unbuffered_winner_exports_nothing,
-    ),
 ):
     add_function_test(TestSpeculativeContacts, _name, _test, devices=get_test_devices())
-
-add_function_test(
-    TestSpeculativeContacts,
-    "test_predictive_reducer_retains_clearance_manifold_under_contention",
-    test_predictive_reducer_retains_clearance_manifold_under_contention,
-    devices=get_cuda_test_devices(),
-)
 
 add_function_test(
     TestSpeculativeContacts,
@@ -1857,8 +1242,8 @@ add_function_test(
 )
 add_function_test(
     TestSpeculativeMeshContacts,
-    "test_speculative_mesh_sdf_manifold_is_bounded",
-    test_speculative_mesh_sdf_manifold_is_bounded,
+    "test_speculative_mesh_sdf_predicted_manifold",
+    test_speculative_mesh_sdf_predicted_manifold,
     devices=get_cuda_test_devices(),
 )
 add_function_test(
