@@ -134,6 +134,18 @@ def contact_rows(solver, contacts, route=0, *, incident=False, jacobian=False, e
     return records
 
 
+def left_out_contacts(solver, contacts) -> set[int]:
+    """The contacts of worlds the sweeps left out this step (their ``acts`` word is 0): the one writer did not write
+    their rows, so their records are those of the last step that did, not this step's."""
+    acts = solver.placement.world_acts
+    if acts.shape[0] == 0:
+        return set()
+    count = min(int(contacts.rigid_contact_count.numpy()[0]), solver.placement.contact_slot.shape[0])
+    world = solver.placement.contact_world.numpy()[:count]
+    words = acts.numpy()
+    return {c for c in range(count) if world[c] >= 0 and words[world[c]] == 0}
+
+
 def assert_rows_close(a, b, *, atol=3e-5, rtol=3e-4):
     """Require the same contacts, row types and ring links, and close row values.
 

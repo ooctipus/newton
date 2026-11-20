@@ -105,11 +105,11 @@ class Laws:
     @property
     def separable(self) -> bool:
         """Every row starts at zero and keeps it at a positive predictor residual, the residual the contacts'
-        admission forms: the hard contact law, an authored material's, their friction and spin rows, position limits;
-        no warm start, relatively regularized or per-contact compliant contact, joint velocity limit, mimic or
-        eliminated row. (A weighted step from zero at a positive residual stays at zero; the admission forms an
-        authored row's residual by its law, :func:`.row_slots.contact_separates`.)"""
-        return self.verdicts and not (self.regularized or self.velocity_limits or self.mimic or self.preelimination)
+        admission forms: the hard contact law, an authored material's, their friction and spin rows, position and
+        velocity limits, free bodies' speeds; no warm start, relatively regularized or per-contact compliant contact,
+        mimic or eliminated row. (A weighted step from zero at a positive residual stays at zero; the admission forms
+        an authored row's residual by its law, :func:`.row_slots.contact_separates`.)"""
+        return self.verdicts and not (self.regularized or self.mimic or self.preelimination)
 
     @property
     def material(self) -> bool:

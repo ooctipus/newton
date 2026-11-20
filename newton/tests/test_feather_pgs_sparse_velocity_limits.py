@@ -29,6 +29,7 @@ from newton.tests.feather_pgs_patch_parity import (
     assert_ring_coulomb,
     assert_rows_close,
     contact_rows,
+    left_out_contacts,
 )
 from newton.tests.feather_pgs_sparse_scene import (
     ForestProbe,
@@ -226,6 +227,11 @@ class TestSparseVelocityLimitPhysics(unittest.TestCase):
         # Keyed by contact: ring parents and patch rows are slots of per-world atomic reservations.
         rows = contact_rows(reference[1], reference[-1])
         candidate_rows = contact_rows(candidate[1], candidate[-1])
+        # A world the sweeps left out this step (its acts word 0) has no rows written this step: the one writer skips
+        # it, so its stored records are the last written step's, not this one's. Compare the written worlds' rows.
+        left_out = left_out_contacts(reference[1], reference[-1]) | left_out_contacts(candidate[1], candidate[-1])
+        rows = {c: r for c, r in rows.items() if c not in left_out}
+        candidate_rows = {c: r for c, r in candidate_rows.items() if c not in left_out}
         assert_rows_close(rows, candidate_rows)
         assert_contact_impulses_close(rows, candidate_rows)
         for case in (reference, candidate):

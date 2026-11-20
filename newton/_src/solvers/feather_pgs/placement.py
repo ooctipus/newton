@@ -816,8 +816,8 @@ class Placement:
             (
                 (
                     laws.set.separable and not laws.link_count,
-                    "A row can act at a separating residual or starts loaded (a warm start, a weighted contact, a joint "
-                    "velocity limit, a mimic, a link or a pre-eliminated row).",
+                    "A row can act at a separating residual or starts loaded (a warm start, a weighted contact, a "
+                    "mimic, a link or a pre-eliminated row).",
                 ),
                 (solver.sweep.claims is not None, "Only the claims' sweeps leave a world out."),
                 (solver.spec.pins.separated_worlds, "A test pin sweeps every world (separated_worlds=False)."),

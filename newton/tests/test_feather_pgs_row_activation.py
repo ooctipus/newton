@@ -300,6 +300,26 @@ class TestFeatherPGSAuthoredSpeedLimits(unittest.TestCase):
                 self.assertEqual(targets, [-1.0])
                 self.assertEqual(count, 1)
 
+    def test_acts_word_marks_worlds_whose_velocity_limits_may_act(self):
+        """A world's acts word is set where a coordinate's ``limit - |v_hat|`` is not above the separation margin
+        (:func:`.row_laws.separates`), and the rows stay those of no word, on every device."""
+        arts, size = 257, 6
+        rng = np.random.default_rng(7)
+        limit = rng.uniform(0.5, 4.0, arts * size)
+        vhat = limit * rng.uniform(-1.3, 1.3, arts * size) * (rng.random(arts * size) < 0.1)
+        unauthored = newton.ModelBuilder.JointDofConfig().velocity_limit
+        law = {"velocity_limit": limit, "unauthored": unauthored, "vhat": vhat, "cfm": 0.0}
+        margin = 1.0e-5 + 2.0**-20 * (limit + np.abs(vhat))
+        acting = (limit - np.abs(vhat) < margin).reshape(arts, size).any(axis=1)
+        self.assertTrue(acting.any() and not acting.all())
+        for device in ["cpu"] + (["cuda:0"] if wp.is_cuda_available() else []):
+            with self.subTest(device=device):
+                plain = prefix_warp_rows(device, arts, size, size, family="velocity", **law)
+                rows = prefix_warp_rows(device, arts, size, size, family="velocity", acts=np.zeros(arts), **law)
+                np.testing.assert_array_equal(rows["acts"], acting)
+                for name in ("count", "J", *PREFIX_RECORDS):
+                    np.testing.assert_array_equal(rows[name], plain[name], err_msg=name)
+
     def test_an_unauthored_joint_limit_takes_no_rows(self):
         """A limit at the builder's default (what the importers write where none is authored), or past it, is no
         limit."""

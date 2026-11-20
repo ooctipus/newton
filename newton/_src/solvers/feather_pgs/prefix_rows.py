@@ -125,7 +125,8 @@ def velocity_limits(coordinates, dof: str, law: str) -> tuple:
     """The joint velocity-limit family: one row a coordinate for both sides of ``|v| <= limit`` (``J = +e``, target
     ``-limit``, the limit itself in the row's ``mu``; no bias; :func:`.projection_laws.velocity_limit`), on every
     authored limit (:func:`.row_laws.velocity_limit_active`) of a limit joint's coordinate (a prismatic, revolute or D6
-    axis: ``limit_q_index >= 0``) that is not prescribed."""
+    axis: ``limit_q_index >= 0``) that is not prescribed. A row whose residual at the predictor, ``limit - |v_hat|``
+    (its nearer side's), may not separate (:func:`.row_laws.separates`) marks its world's acts word."""
     return _family(
         coordinates,
         "velocity_coordinates",
@@ -137,7 +138,12 @@ def velocity_limits(coordinates, dof: str, law: str) -> tuple:
             target = -limit;
             mu = limit;
             d0 = d;
-            w0 = 1.0f;""",
+            w0 = 1.0f;
+            if (active && {law}acts.shape[0] > 0) {{
+                const float speed = fabsf({law}vhat.data[dof]);
+                if (!RowLaw::separates(limit - speed, limit + speed))
+                    {law}acts.data[world] = 1;
+            }}""",
         sides=1,
     )
 
