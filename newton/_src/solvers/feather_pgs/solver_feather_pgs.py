@@ -223,7 +223,7 @@ class SolverFeatherPGS(SolverBase):
         self,
         model: Model,
         *,
-        angular_damping: float = 0.05,
+        angular_damping: float = 0.0,
         update_mass_matrix_interval: int = 1,
         enable_contact_friction: bool = True,
         contact_friction_gap_threshold: float = float("inf"),
@@ -281,7 +281,9 @@ class SolverFeatherPGS(SolverBase):
                 ``2 dt``, MuJoCo's default ``solimp``, a spring and dashpot per unit effective mass, so its compliance
                 is relative to the row's diagonal; it takes no restitution. A model without such a shape keeps the
                 rigid law.
-            angular_damping (float, optional): Angular damping factor. Defaults to 0.05.
+            angular_damping (float, optional): Angular damping rate [1/s] of free root bodies' spin, a numerical
+                damper, not a contact law: it slows a body's spin every substep, in flight and in contact alike.
+                Defaults to 0: none.
             update_mass_matrix_interval (int, optional): How often to update the mass matrix (every n-th time the
                 :meth:`step` function gets called). The cadence flag is evaluated on the host each step, so under
                 CUDA graph capture the 0/1 pattern is baked at capture time: with K steps captured per graph,
