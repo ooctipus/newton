@@ -109,6 +109,19 @@ class TestVelocityLimitLawSources(unittest.TestCase):
                 for site in sites:
                     self.assertEqual(text.count(site), 1, site)
 
+    def test_pass_runs_only_where_a_row_can_act(self):
+        """Test every velocity-limit row inside its box at a zero total before the pass, and run the pass only where
+        one is not: a pass of rows that cannot act applies nothing, so passing it is exact."""
+        for name, (factory, args, options, sites) in _GENERATORS.items():
+            if _DENSE_PASS not in sites:
+                continue
+            with self.subTest(generator=name):
+                _, sources = _native_sources(factory, *args, **options)
+                text = "\n".join(sources)
+                self.assertEqual(text.count("float vlim_live = 0.0f;"), 1)
+                self.assertLess(text.index("if (vlim_live > 0.0f) {"), text.index(_DENSE_PASS))
+                self.assertIn("vlim_r < 2.0f * vlim_limit - vlim_margin", text)
+
     def test_streamed_impulses_read_the_total_once(self):
         """Read a streamed free-body total through one lane-0 broadcast, never a broadcast inside a broadcast."""
         _, sources = _native_sources(

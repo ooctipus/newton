@@ -2606,35 +2606,72 @@ def velocity_limit_pass(rows: WorldRows, op, laws: RowLaws, *, end: str = "m_den
     owned by the row's first lane. ``rows`` stages the rows' impulses, kinds, diagonals and right-hand sides (:class:`WorldRows`, or a route's
     store of the same accessors); the operator reduces each row's velocity term outside the row loop
     (``dot``).
+
+    A row whose total is zero and whose velocity lies inside its box applies nothing: its residual
+    ``r = J v + b`` (``b`` the lower side's) is in ``[0, 2 L]``. The pass first tests every row so, each lane its own
+    rows on one thread's sum, and runs only where one is not provably inside: a row within the rounding apart from the
+    ladder's sum (``(2 n + 8) 2^-24`` of its terms' magnitude, the right-hand side and ``L``, ``n`` the row's entries)
+    of its box's ends counts as live. A pass none of whose rows is live leaves every impulse, the velocity and the
+    votes as the rows' visits would (each stores its unchanged zero and applies nothing), so passing it is exact.
     """
     lanes = rows.lanes
     visit = rows.visit("i")
-    lines = [
-        f"for (int i = 0; i < {end}; i++) {{",
+    # One thread's sum of a row: the operator on one lane.
+    serial = dataclasses.replace(op, lanes=Lanes(1))
+    floor = (2 * op.width + 8) * 2.0**-24
+    live = [
+        "float vlim_live = 0.0f;",
+        f"for (int i = {lanes.lane if lanes.parallel else '0'}; i < {end}; i += {lanes.width}) {{",
         *((indent(visit, "    "),) if visit else ()),
         f"    if (({rows.kind('i', scan=True)}) != {ROW_JOINT_VELOCITY_LIMIT}) continue;",
-        f"    float denom = {rows.diag('i')};",
-        "    if (denom <= 0.0f) continue;",
+        f"    if ({rows.diag('i')} <= 0.0f) continue;",
+        "    float vlim_jv = 0.0f, vlim_jv_terms = 0.0f;",
+        f"    for (int entry = 0; entry < {op.width}; ++entry) {{",
+        f"        const int index = {serial.guarded_coordinate('i')};",
+        "        if (index < 0) continue;",
+        f"        const float term = {op.element('i', 'entry')} * {op.velocity.at('index')};",
+        "        vlim_jv += term;",
+        "        vlim_jv_terms += fabsf(term);",
+        "    }",
+        f"    const float vlim_r = vlim_jv + {rows.rhs_of('i')};",
+        f"    const float vlim_limit = {rows.mu('i')};",
+        f"    const float vlim_margin = {floor!r}f * (vlim_jv_terms + fabsf({rows.rhs_of('i')}) + fabsf(vlim_limit));",
+        f"    if ({rows.load('i')} != 0.0f || !(vlim_r > vlim_margin && vlim_r < 2.0f * vlim_limit - vlim_margin))",
+        "        vlim_live = 1.0f;",
+        "}",
+        lanes.reduce("vlim_live"),
+    ]
+    lines = [
+        "{",
+        *("    " + line for line in "\n".join(live).split("\n") if line),
+        "    if (vlim_live > 0.0f) {",
+        f"    for (int i = 0; i < {end}; i++) {{",
+        *((indent(visit, "        "),) if visit else ()),
+        f"        if (({rows.kind('i', scan=True)}) != {ROW_JOINT_VELOCITY_LIMIT}) continue;",
+        f"        float denom = {rows.diag('i')};",
+        "        if (denom <= 0.0f) continue;",
         "",
-        op.dot((("my_sum_vlim", "row", None),), {"row": "i"}, "    "),
-        "    float jv_vlim = my_sum_vlim;",
+        op.dot((("my_sum_vlim", "row", None),), {"row": "i"}, "        "),
+        "        float jv_vlim = my_sum_vlim;",
         "",
-        f"    float residual_vlim = jv_vlim + {rows.rhs_of('i')};",
-        f"    const float old_vlim = {rows.load('i')};",
-        f"    const float bound_vlim = {bound(rows.rhs_of('i'), op.terms('my_sum_vlim', '', whole=False), 'old_vlim', diagonal='denom')};",
-        f"    const float new_vlim = ProjectionLaw::velocity_limit(old_vlim - residual_vlim / denom, {rows.mu('i')} / denom);",
-        "    const float delta_impulse_vlim = new_vlim - old_vlim;",
-        f"    {lanes.sync()}",
+        f"        float residual_vlim = jv_vlim + {rows.rhs_of('i')};",
+        f"        const float old_vlim = {rows.load('i')};",
+        f"        const float bound_vlim = {bound(rows.rhs_of('i'), op.terms('my_sum_vlim', '', whole=False), 'old_vlim', diagonal='denom')};",
+        f"        const float new_vlim = ProjectionLaw::velocity_limit(old_vlim - residual_vlim / denom, {rows.mu('i')} / denom);",
+        "        const float delta_impulse_vlim = new_vlim - old_vlim;",
+        f"        {lanes.sync()}",
     ]
     change = Change("delta_impulse_vlim", "bound_vlim", str(ROW_JOINT_VELOCITY_LIMIT), "denom", scaled=True)
     lines += [
-        f"    {rows.store('i', 'new_vlim')}",
+        f"        {rows.store('i', 'new_vlim')}",
         "",
-        "    if (delta_impulse_vlim != 0.0f) {",
-        change_vote(laws, (change,), "        "),
-        op.axpy((("row", "delta_impulse_vlim"),), "        "),
+        "        if (delta_impulse_vlim != 0.0f) {",
+        change_vote(laws, (change,), "            "),
+        op.axpy((("row", "delta_impulse_vlim"),), "            "),
+        "        }",
+        f"        {lanes.sync()}",
         "    }",
-        f"    {lanes.sync()}",
+        "    }",
         "}",
     ]
     return indent("\n".join(lines), pad)
