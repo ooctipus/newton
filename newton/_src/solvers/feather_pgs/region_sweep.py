@@ -32,12 +32,24 @@ region would have opened it (a sweep more where the budget is spent). So every r
 nothing at a twist where none of its candidates closes.
 """
 
+import warnings
+
 import numpy as np
 import warp as wp
 
 from ...core import memory
-from ...core.contact_pool import ContactField
+from ...core.contact_pool import (
+    ROW_QUANTUM,
+    ContactField,
+    ContactRows,
+    _grow_rows,
+    capturing,
+    device_row_limit,
+    grown_rows,
+    sized_rows,
+)
 from ...core.execution import Work, shape
+from ...core.ordered_reserve import OrderedTiles, ordered_scan, ordered_tile
 from ...geometry.flags import ShapeFlags
 from .contact_input import ContactFrame, ContactInput, contact_frame
 from .device_preludes import (
@@ -122,9 +134,6 @@ STAGE_UNIT = wp.constant(44)
 STAGE_CAND = wp.constant(12)
 """Words of a block candidate's staged record: its whitened row (6), right-hand side, compliance, impulse (state),
 three spare. A block's members' records come first (``STAGE_UNIT`` words each), then its candidates'."""
-STAGE_WORDS = 1 << 23
-"""The staged blocks' arena [words] (32 MB), allocated where a shape authors its material; a block that does not fit is
-not formed and ``blk_cursor[1]`` says so."""
 
 _BIG = wp.constant(1 << 30)
 
@@ -621,7 +630,7 @@ def check_bodies(
 def clear_layout(
     relist: wp.array[int],
     cursor: wp.array[int],
-    blk_cursor: wp.array[int],
+    blk_words: wp.array[int],
     body_count: wp.array2d[int],
     body_regions: wp.array[wp.vec2i],
     body_pair: wp.array[int],
@@ -632,8 +641,8 @@ def clear_layout(
     f = wp.tid()
     if f < 4:
         cursor[f] = 0
-    if f < 2:
-        blk_cursor[f] = 0
+    if f == 0:
+        blk_words[0] = 0
     if f < body_pair.shape[0]:
         for k in range(3):
             body_count[f, k] = 0
@@ -1282,6 +1291,30 @@ def _pair_cell(reg_body: wp.array[wp.vec2i], body_level: wp.array[int], g: int, 
     return wp.min(la, lb) * side + wp.max(la, lb)
 
 
+@wp.func
+def _cell_words(
+    reg_body: wp.array[wp.vec2i],
+    body_level: wp.array[int],
+    reg_cand: wp.array[wp.vec2i],
+    s: int,
+    e: int,
+    side: int,
+    cell: int,
+    lane: int,
+    lanes: int,
+) -> int:
+    """The arena words of the block of pair cell ``cell`` of a world's regions ``[s, e)``: its members' records and
+    its candidates' (:func:`stage_blocks`), summed over the world's lanes."""
+    regions = int(0)
+    candidates = int(0)
+    for g in range(s + lane, e, lanes):
+        if _pair_cell(reg_body, body_level, g, side) == cell:
+            span_c = reg_cand[g]
+            regions += 1
+            candidates += span_c[1] - span_c[0]
+    return STAGE_UNIT * lane_sum(regions, _WORLD_LANES) + STAGE_CAND * lane_sum(candidates, _WORLD_LANES)
+
+
 @wp.kernel(enable_backward=False, module="unique")
 def form_blocks(
     relist: wp.array[int],
@@ -1292,11 +1325,117 @@ def form_blocks(
     least: int,
     reg_cand: wp.array[wp.vec2i],
     cand: wp.array[wp.vec4],
+    reg_kind: wp.array[int],
     cand_floor: wp.array[float],
-    capacity: int,
+    tile_threads: int,
+    tiles: int,
+    site: wp.array[wp.uint64],
     body_level: wp.array[int],
     blk_count: wp.array2d[int],
-    blk_cursor: wp.array[int],
+    blk_words: wp.array[int],
+    blk_place: wp.array[wp.vec4i],
+    record: wp.array[int],
+):
+    """A world's groups (a pair of movable bodies, or a body against immovable partners) with more than ``least``
+    regions closing at the predictor (a candidate's gap term below minus its rounding, ``cand_floor``; ``least`` the
+    group's six relative coordinates: its rows then over-determine them), every candidate compliant, as blocks (the
+    largest first, :data:`PAIR_BLOCKS` at most), a world a lane group (:data:`_WORLD_LANES`), and the arena words of
+    their staged records (:func:`stage_blocks`), placed in the worlds' order. The blocks are the contact frame's: they
+    are formed where the step lists its regions anew, at that step's predictor. ``blk_count`` counts a world's pairs by
+    its bodies' places (``body_level`` holds them here), a side of the world's free bodies; a world of more than 16 free
+    bodies lists no block.
+
+    The lanes take the world's regions a stride at a time: their counts add up in any order (integers), and the largest
+    count is the lanes' greatest (its first cell on a tie, as a scan in cell order finds it). A world's words take
+    their place by an ordered reservation over the launch's tiles of ``tile_threads`` threads (``site``;
+    :mod:`~newton._src.core.ordered_reserve`), whatever order the worlds run in: ``blk_place`` holds the world's
+    blocks' pair cells (-1: none), its first word and its words, and ``blk_words[0]`` the listing's words, whose
+    high-water mark ``record[0]`` keeps (in pinned memory: the arena's service grows from it,
+    :meth:`Regions.serve_arena`). :func:`list_blocks` lists the blocks' regions."""
+    if relist[0] == 0:
+        return
+    lanes = lane_stride(_WORLD_LANES)
+    lane = lane_index(_WORLD_LANES)
+    world = wp.tid() // lanes
+    claim = ordered_tile(site, wp.tid() // tile_threads, tiles, blk_words)
+    cells = wp.vec2i(-1, -1)
+    held = int(0)
+    if world < world_regions.shape[0]:
+        span = world_regions[world]
+        s = span[0]
+        e = span[1]
+        f0 = world_free_start[world]
+        # The table's side is the world's free bodies (at most 16, the table's row of 256 cells): its cells in order
+        # are the pairs of places in order, whatever the side.
+        side = world_free_start[world + 1] - f0
+        if e - s > least and side <= 16:
+            for i in range(f0 + lane, world_free_start[world + 1], lanes):
+                body_level[world_free[i]] = i - f0
+            for c in range(lane, side * side, lanes):
+                blk_count[world, c] = 0
+            lane_sync(_WORLD_LANES)
+            rigid = int(1 << 20)
+            for g in range(s + lane, e, lanes):
+                # A region counts where a candidate of it closes at the predictor (its gap term).
+                add = int(0)
+                span_c = reg_cand[g]
+                for i in range(span_c[0], span_c[1]):
+                    if cand[i][2] < -cand_floor[i]:
+                        add = 1
+                if (reg_kind[g] & KIND_SPRINGS) == 0:
+                    add = rigid
+                wp.atomic_add(blk_count, world, _pair_cell(reg_body, body_level, g, side), add)
+            lane_sync(_WORLD_LANES)
+            for k in range(PAIR_BLOCKS):
+                best = int(least)
+                best_cell = int(-1)
+                for c in range(lane, side * side, lanes):
+                    count = blk_count[world, c]
+                    if count < rigid and count > best:
+                        best = count
+                        best_cell = c
+                for step in range(5):
+                    other = lane_read(best, lane ^ (1 << step), _WORLD_LANES)
+                    other_cell = lane_read(best_cell, lane ^ (1 << step), _WORLD_LANES)
+                    if other_cell >= 0 and (
+                        best_cell < 0 or other > best or (other == best and other_cell < best_cell)
+                    ):
+                        best = other
+                        best_cell = other_cell
+                if best_cell < 0:
+                    break
+                lane_sync(_WORLD_LANES)
+                if lane == 0:
+                    blk_count[world, best_cell] = 0
+                cells[k] = best_cell
+                held += _cell_words(reg_body, body_level, reg_cand, s, e, side, best_cell, lane, lanes)
+    # The worlds' words in their order: every thread of the tile scans, a world's lane 0 holding its words.
+    last = int(0)
+    if wp.tid() // tile_threads == tiles - 1:
+        last = 1
+    words = held
+    if lane != 0:
+        words = 0
+    first = ordered_scan(site, claim, words, last, blk_words)
+    if last != 0 and wp.tid() % tile_threads == tile_threads - 1:
+        # The launch's last thread ends the listing's words: the record's one writer.
+        record[0] = wp.max(record[0], first + words)
+    if lane == 0 and world < world_regions.shape[0]:
+        blk_place[world] = wp.vec4i(cells[0], cells[1], first, held)
+
+
+@wp.kernel(enable_backward=False, module="unique")
+def list_blocks(
+    relist: wp.array[int],
+    world_regions: wp.array[wp.vec2i],
+    world_free_start: wp.array[int],
+    reg_body: wp.array[wp.vec2i],
+    reg_cand: wp.array[wp.vec2i],
+    body_level: wp.array[int],
+    blk_place: wp.array[wp.vec4i],
+    blk_words: wp.array[int],
+    arena: wp.array[int],
+    record: wp.array[int],
     blk_blob: wp.array[wp.vec4i],
     blk_head: wp.array[int],
     reg_stage: wp.array[wp.vec3i],
@@ -1304,20 +1443,14 @@ def form_blocks(
     blk_pair: wp.array[wp.vec2i],
     reg_state: wp.array[int],
 ):
-    """A world's groups (a pair of movable bodies, or a body against immovable partners) with more than ``least``
-    regions closing at the predictor (a candidate's gap term below minus its rounding, ``cand_floor``; ``least`` the
-    group's six relative
-    coordinates: its rows then over-determine them), every candidate compliant, as blocks (the
-    largest first, :data:`PAIR_BLOCKS` at most), a world a lane group (:data:`_WORLD_LANES`): the pair's first region
-    in the stream stands for the block (:data:`KIND_BLOCK`), the others are its members (:data:`KIND_MEMBER`); its
-    pair ``(a, b)`` (:func:`factor_blocks` forms its response each step). The blocks are the contact frame's: they are
-    formed where the step lists its regions anew, at that step's predictor. ``blk_count`` counts a world's pairs by its
-    bodies' places (``body_level`` holds them here), a side of the world's free bodies; a world of more than 16 free
-    bodies lists no block.
+    """The blocks :func:`form_blocks` formed, where the arena's mapped words (``arena[0]``) hold their world's words,
+    a world a lane group: the pair's first region in the stream stands for the block (:data:`KIND_BLOCK`), the others
+    are its members (:data:`KIND_MEMBER`), its pair ``(a, b)`` (:func:`factor_blocks` forms its response each step);
+    each region's record takes its words in the stream's order (the lanes' votes rank them), from the world's place.
 
-    The lanes take the world's regions a stride at a time: their counts add up in any order (integers), the largest
-    count is the lanes' greatest (its first cell on a tie, as a scan in cell order finds it), and a block's regions
-    take their places in the stream's order (the lanes' votes rank them)."""
+    A listing whose words pass the arena's (the service grows it between replays from their high-water mark; a step
+    outside capture grows it before this, :meth:`Regions.list`) leaves its last worlds without their blocks, and
+    ``record[1]`` counts it."""
     if relist[0] == 0:
         return
     lanes = lane_stride(_WORLD_LANES)
@@ -1325,71 +1458,21 @@ def form_blocks(
     world = wp.tid() // lanes
     if world >= world_regions.shape[0]:
         return
+    if world == 0 and lane == 0 and blk_words[0] > arena[0]:
+        record[1] = record[1] + 1
     for k in range(lane, PAIR_BLOCKS, lanes):
         blk_pair[world * PAIR_BLOCKS + k] = wp.vec2i(-1, -1)
+    place = blk_place[world]
+    at = place[2]
+    if place[3] == 0 or at + place[3] > arena[0]:
+        return
     span = world_regions[world]
     s = span[0]
     e = span[1]
-    f0 = world_free_start[world]
-    # The table's side is the world's free bodies (at most 16, the table's row of 256 cells): its cells in order are
-    # the pairs of places in order, whatever the side.
-    side = world_free_start[world + 1] - f0
-    if e - s <= least or side > 16:
-        return
-    for i in range(f0 + lane, world_free_start[world + 1], lanes):
-        body_level[world_free[i]] = i - f0
-    for c in range(lane, side * side, lanes):
-        blk_count[world, c] = 0
-    lane_sync(_WORLD_LANES)
-    rigid = int(1 << 20)
-    for g in range(s + lane, e, lanes):
-        # A region counts where a candidate of it closes at the predictor (its gap term).
-        add = int(0)
-        span_c = reg_cand[g]
-        for i in range(span_c[0], span_c[1]):
-            if cand[i][2] < -cand_floor[i]:
-                add = 1
-        if (reg_kind[g] & KIND_SPRINGS) == 0:
-            add = rigid
-        wp.atomic_add(blk_count, world, _pair_cell(reg_body, body_level, g, side), add)
-    lane_sync(_WORLD_LANES)
+    side = world_free_start[world + 1] - world_free_start[world]
     for k in range(PAIR_BLOCKS):
-        best = int(least)
-        best_cell = int(-1)
-        for c in range(lane, side * side, lanes):
-            count = blk_count[world, c]
-            if count < rigid and count > best:
-                best = count
-                best_cell = c
-        for step in range(5):
-            other = lane_read(best, lane ^ (1 << step), _WORLD_LANES)
-            other_cell = lane_read(best_cell, lane ^ (1 << step), _WORLD_LANES)
-            if other_cell >= 0 and (best_cell < 0 or other > best or (other == best and other_cell < best_cell)):
-                best = other
-                best_cell = other_cell
+        best_cell = place[k]
         if best_cell < 0:
-            break
-        lane_sync(_WORLD_LANES)
-        if lane == 0:
-            blk_count[world, best_cell] = 0
-        # Its staged records' words, taken from the arena.
-        regions = int(0)
-        candidates = int(0)
-        for g in range(s + lane, e, lanes):
-            if _pair_cell(reg_body, body_level, g, side) == best_cell:
-                span_c = reg_cand[g]
-                regions += 1
-                candidates += span_c[1] - span_c[0]
-        regions = lane_sum(regions, _WORLD_LANES)
-        candidates = lane_sum(candidates, _WORLD_LANES)
-        words = STAGE_UNIT * regions + STAGE_CAND * candidates
-        at = int(0)
-        if lane == 0:
-            at = wp.atomic_add(blk_cursor, 0, words)
-        at = lane_read(at, 0, _WORLD_LANES)
-        if at + words > capacity:
-            if lane == 0:
-                blk_cursor[1] = 1
             break
         best_g = int(-1)
         members = int(0)
@@ -1432,6 +1515,7 @@ def form_blocks(
                 a = wp.min(sides[0], sides[1])
                 b = wp.max(sides[0], sides[1])
             blk_pair[world * PAIR_BLOCKS + k] = wp.vec2i(a, b)
+        at += STAGE_UNIT * members + STAGE_CAND * first_cand
         lane_sync(_WORLD_LANES)
 
 
@@ -1944,12 +2028,48 @@ class Regions:
         flags = model.shape_flags.numpy() if model.shape_count else np.zeros(0, dtype=np.int32)
         self.blocks = bool((flags & int(ShapeFlags.CONTACT_MATERIAL)).any())
         self.blk_count = wp.zeros((worlds if self.blocks else 1, 256), dtype=wp.int32, device=device)
-        self.blk_cursor = wp.zeros(2, dtype=wp.int32, device=device)
         self.blk_blob = wp.zeros(blocks, dtype=wp.vec4i, device=device)
         self.blk_head = wp.zeros(blocks, dtype=wp.int32, device=device)
-        words = STAGE_WORDS if self.blocks else 1
-        self.blk_stage = wp.zeros(words, dtype=wp.float32, device=device)
-        self.blk_istage = wp.zeros(words, dtype=wp.int32, device=device)
+        # The world kernels' lanes (a world a lane group: a warp on the GPU, one thread on the CPU), and form_blocks'
+        # tiles: a block of its launch on the GPU, a world on the CPU (whose blocks run in order, a thread each).
+        self.world_threads = worlds * (int(_WORLD_LANES) if device.is_cuda else 1)
+        self.tile_threads = _WORLD_BLOCK if device.is_cuda else 1
+        self.tiles = -(-self.world_threads // self.tile_threads)
+        # The blocks' staged records (stage_blocks) in an arena that follows the listings' demand (serve_arena): the
+        # listing's words (blk_words), the words mapped (arena_words, on the device) and the record form_blocks keeps
+        # (the demand's high-water mark and the listings the arena was short of), in pinned memory the device writes
+        # (one thread a listing) and the host reads without synchronizing.
+        self.blk_words = wp.zeros(1, dtype=wp.int32, device=device)
+        self.blk_place = wp.zeros(worlds, dtype=wp.vec4i, device=device)
+        self.arena_words = wp.zeros(1, dtype=wp.int32, device=device)
+        self.blk_site = OrderedTiles(self.tiles, device).site
+        self._record_host = wp.zeros(2, dtype=wp.int32, device="cpu", pinned=device.is_cuda)
+        self.arena_record = self._record_host
+        if device.is_cuda:
+            self.arena_record = wp.array(ptr=self._record_host.ptr, dtype=wp.int32, shape=(2,), device=device)
+        self._short_seen = 0
+        # Whether the arena's words were reallocated outside the service (_fit_arena): graphs that captured them are
+        # stale.
+        self._arena_stale = False
+        self.arena = None
+        if self.blocks:
+            fields = (ContactField("blk_stage", wp.float32), ContactField("blk_istage", wp.int32))
+            self.arena = ContactRows(
+                fields,
+                rows=ROW_QUANTUM,
+                reserve=min(
+                    device_row_limit(device, sum(f.row_bytes for f in fields)), *(f.row_limit() for f in fields)
+                ),
+                device=device,
+                on_rows=self._on_arena,
+                virtual=placement.contact_pool.growable,
+            )
+            # Virtual words hold every word their pages cover.
+            self._grow_arena(ROW_QUANTUM)
+            placement.contact_pool.serve(self.serve_arena)
+        else:
+            self.blk_stage = wp.zeros(1, dtype=wp.float32, device=device)
+            self.blk_istage = wp.zeros(1, dtype=wp.int32, device=device)
         self.capacity = 0
         # The stream's capacity on the device: the pool's ready rows, which follow its growth between captures.
         self.ready = placement.contact_pool.ready_rows
@@ -1967,6 +2087,56 @@ class Regions:
         self.capacity = int(rows.rows)
         if self.placement.contact_pool.ready_rows is None:
             self.ready.fill_(self.capacity)
+
+    def _on_arena(self, arena) -> None:
+        """Take the arena's whole reservation, which the kernels bound by the words mapped (``arena_words``)."""
+        self.blk_stage = arena.reserved["blk_stage"]
+        self.blk_istage = arena.reserved["blk_istage"]
+
+    def serve_arena(self) -> bool:
+        """Grow the blocks' arena to the listings' demand, outside capture (:meth:`.ContactPool.serve`): past
+        :data:`~newton._src.core.contact_pool.GROW_THRESHOLD` of its words, to
+        :data:`~newton._src.core.contact_pool.HEADROOM` words a word of the demand's high-water mark, which
+        :func:`form_blocks` records in pinned memory (read without synchronizing: it lags the replays in flight). The
+        words reach the device in stream order, after their pages are mapped. Warns of listings the arena was short
+        of (their last worlds formed no block). Returns whether graphs that captured the arena must be recaptured
+        (words that growth reallocates)."""
+        record = self._record_host.numpy()
+        demand, short = int(record[0]), int(record[1])
+        if short > self._short_seen:
+            warnings.warn(
+                f"The blocks' arena ({self.arena.rows} words) was short of {short - self._short_seen} listing(s), up to "
+                f"{demand} words: their last worlds formed no block; it grows for the next",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            self._short_seen = short
+        stale, self._arena_stale = self._arena_stale, False
+        target = grown_rows(demand, self.arena.rows, self.arena.reserve)
+        if target <= self.arena.rows:
+            return stale
+        self._grow_arena(target)
+        return stale or not self.arena.virtual
+
+    def _fit_arena(self) -> None:
+        """Outside capture, grow the arena to the listing :func:`form_blocks` just placed before its blocks are listed
+        (synchronizes): to :data:`~newton._src.core.contact_pool.HEADROOM` words a word of it, as a measured demand
+        sizes the contact pool. Words that growth reallocates make captured graphs stale (:meth:`serve_arena`)."""
+        demand = int(self.blk_words.numpy()[0])
+        if demand > self.arena.rows:
+            self._grow_arena(sized_rows(demand, self.arena.rows, self.arena.reserve))
+            self._arena_stale = self._arena_stale or not self.arena.virtual
+
+    def _grow_arena(self, words: int) -> None:
+        """Map (or allocate) ``words`` words of the arena and publish them to the device in stream order."""
+        self.arena_words.fill_(_grow_rows([self.arena], words))
+
+    def arena_status(self) -> dict[str, int]:
+        """The blocks' arena: its words, the demand's high-water mark and the listings it was short of. Synchronizes."""
+        wp.synchronize_device(self.model.device)
+        record = self._record_host.numpy()
+        words = 0 if self.arena is None else self.arena.rows
+        return {"words": words, "demand": int(record[0]), "short_listings": int(record[1])}
 
     def bases(self, v_hat: wp.array, contacts) -> None:
         """Each free body's basis (:func:`free_body_basis`), on a step with contacts: it reads the factor's walk and the
@@ -2055,7 +2225,7 @@ class Regions:
             clear_layout,
             dim=max(self.count, 4),
             inputs=[self.relist],
-            outputs=[self.cursor, self.blk_cursor, self.body_count, self.body_regions, self.body_pair],
+            outputs=[self.cursor, self.blk_words, self.body_count, self.body_regions, self.body_pair],
             device=device,
         )
         pool.launch(
@@ -2161,12 +2331,12 @@ class Regions:
             block_dim=_FILL_SHAPE.block,
             **live,
         )
-        # The world kernels: a world a lane group (a warp on the GPU, one thread on the CPU).
-        world_threads = forest.world_count * (int(_WORLD_LANES) if device.is_cuda else 1)
+        world_threads = self.world_threads
         if self.blocks:
             wp.launch(
                 form_blocks,
-                dim=world_threads,
+                # Whole tiles: every thread of a tile takes part in its scan.
+                dim=self.tiles * self.tile_threads,
                 inputs=[
                     self.relist,
                     self.world_regions,
@@ -2176,13 +2346,35 @@ class Regions:
                     BLOCK_CLOSING,
                     self.reg_cand,
                     self.cand,
+                    self.reg_kind,
                     self.cand_floor,
-                    int(self.blk_stage.shape[0]),
+                    self.tile_threads,
+                    self.tiles,
+                    self.blk_site,
+                ],
+                outputs=[self.body_level, self.blk_count, self.blk_words, self.blk_place, self.arena_record],
+                device=device,
+                block_dim=_WORLD_BLOCK,
+            )
+            if not capturing(device):
+                # Outside capture the arena holds the listing before its blocks are listed: none is left out.
+                self._fit_arena()
+            wp.launch(
+                list_blocks,
+                dim=world_threads,
+                inputs=[
+                    self.relist,
+                    self.world_regions,
+                    self.world_free_start,
+                    self.reg_body,
+                    self.reg_cand,
+                    self.body_level,
+                    self.blk_place,
+                    self.blk_words,
+                    self.arena_words,
                 ],
                 outputs=[
-                    self.body_level,
-                    self.blk_count,
-                    self.blk_cursor,
+                    self.arena_record,
                     self.blk_blob,
                     self.blk_head,
                     self.reg_stage,

@@ -4400,14 +4400,15 @@ class CollisionPipeline:
                 pool.forecast,
                 pool.ready,
             )
-        pool.service()
+        # The pool's services (ContactPool.serve) may reallocate a buffer that graphs captured.
+        served = pool.service()
         # The staged mesh-SDF work buffer follows its passes' demand; a reallocated buffer needs new graphs.
         staged_grew = self.narrow_phase.service_mesh_sdf_staged(measured=state is not None)
         # Each pipeline learns of a growth once, also of one another owner of the model's pool caused.
         generation = pool.generation
         grew = generation != self._service_generation
         self._service_generation = generation
-        return (grew and pool.needs_recapture) or staged_grew
+        return (grew and pool.needs_recapture) or staged_grew or served
 
     def contact_drops(self) -> ContactDrops:
         """Return the rigid contacts this pipeline's passes dropped for want of rows, and by which worlds.

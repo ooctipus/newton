@@ -918,6 +918,8 @@ class ContactPool:
         # The bound of the members so far. It never rises: graphs captured at it keep covering the rows.
         self._bound = INDEX_LIMIT
         self._followers: list[weakref.ReferenceType] = []
+        # The services of buffers whose own writers record their demand (serve), run by each service().
+        self._services: list = []
         self.ready_rows = None
         """The ready rows on the device: writers' row limit and the rows bound launches follow (int32, shape 1)."""
         # The demand record, allocated here, outside any graph capture that records demand. A pool
@@ -1156,6 +1158,27 @@ class ContactPool:
             if self.ready > other.ready:
                 other.grow(self.ready)
             self._followers.append(weakref.ref(other))
+
+    def serve(self, service) -> None:
+        """Run ``service()`` in each :meth:`service` of this pool, outside capture.
+
+        A buffer whose own writers record their demand on the device (a solver's staging arena) grows between replays
+        as the pool's rows do, from the one call an application makes a step
+        (:meth:`newton.CollisionPipeline.service_capacity`). ``service`` returns whether graphs that captured the
+        buffer must be recaptured; a bound method is held weakly.
+        """
+        self._services.append(weakref.WeakMethod(service) if hasattr(service, "__self__") else (lambda: service))
+
+    def _serve(self) -> bool:
+        """Run the buffers' services (:meth:`serve`); return whether a graph must be recaptured."""
+        recapture = False
+        for ref in list(self._services):
+            service = ref()
+            if service is None:
+                self._services.remove(ref)
+            elif service():
+                recapture = True
+        return recapture
 
     def grow(self, rows: int) -> bool:
         """Grow the ready rows of this pool and its followers to at least ``rows``, outside capture.
@@ -1520,6 +1543,7 @@ class ContactPool:
         """
         if capturing(self.device):
             return False
+        served = self._serve()
         while self._stale_status:
             offset, count = self._stale_status.pop()
             self._update_status[offset : offset + count].zero_()
@@ -1545,10 +1569,10 @@ class ContactPool:
                 if rising > self.ready:
                     target = max(target, reserved_rows(rising, self.bound))
             if target > self.ready:
-                return self._grow_logged(target, high_water)
+                return self._grow_logged(target, high_water) or served
         if not self.fixed:
             self._consider_trim()
-        return False
+        return served
 
     def _watch(self) -> None:
         """Follow the demand: the high-water mark holds still once it stayed within :data:`TRIM_BAND` for
