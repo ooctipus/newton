@@ -34,9 +34,11 @@ from .row_laws import (
     authored_contact_law,
     contact_capped_beta,
     contact_depenetration_cap,
+    contact_material_rate,
     contact_material_rhs,
     contact_restitution_rhs,
     contact_rhs,
+    contact_rhs_rate,
     row_rhs,
 )
 from .row_records import row_sides
@@ -92,6 +94,32 @@ def contact_normal_beta(data: ContactInput, c: int, body_a: int, body_b: int, ph
         body_b = -1
     cap = contact_depenetration_cap(body_a, body_b, data.max_depenetration_velocity)
     return contact_capped_beta(phi, data.beta, cap, data.dt)
+
+
+@wp.func
+def contact_gap_rate(data: ContactInput, c: int, phi: float, beta: float, bias_scale: float, rebounds: bool) -> float:
+    """``|d rhs / d phi|`` [1/s] of contact ``c``'s normal row at its gap ``phi`` and capped ``beta``, by the law
+    :func:`contact_row_writer` gives it: a material contact's (:func:`.row_laws.contact_material_rate`, its stiffness
+    an authored material's spring by :func:`.row_laws.authored_contact_law`), zero for a row whose rebound replaced
+    its bias (``rebounds``: restitution's target has no gap term), else the hard law's
+    (:func:`.row_laws.contact_rhs_rate` at ``bias_scale``). Times the gap's rounding it is the rounding of the row's
+    right-hand side."""
+    stiffness = float(0.0)
+    if data.material != 0:
+        stiffness = data.stiffness[c]
+    if stiffness > 0.0:
+        return contact_material_rate(phi, stiffness, data.damping[c], data.dt)
+    if data.authored != 0:
+        if contact_authored(data.shape0[c], data.shape1[c], data.shape_flags):
+            s0 = data.shape0[c]
+            s1 = data.shape1[c]
+            kappa, damping = authored_contact_law(
+                data.material_ke[s0], data.material_kd[s0], data.material_ke[s1], data.material_kd[s1], phi, data.dt
+            )
+            return contact_material_rate(phi, kappa, damping, data.dt)
+    if rebounds:
+        return 0.0
+    return contact_rhs_rate(phi, beta, 1.0 / data.dt, bias_scale, data.speculative_scale)
 
 
 @cache

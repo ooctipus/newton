@@ -59,6 +59,7 @@ from .friction_patches import PatchRowLaw, patch_friction_location
 from .projection_laws import friction_ball_metric
 from .region_laws import (
     REGION_SLIDE,
+    candidate_closes,
     candidate_row,
     frame_response,
     frame_twist,
@@ -68,9 +69,9 @@ from .region_laws import (
     stick_terms,
     twist_reach,
 )
-from .row_build import member_contact_row, member_row_law
+from .row_build import contact_gap_rate, member_contact_row, member_row_law
 from .row_kernels import RIGID_SPEED_ROWS, RowBias, row_bias_words
-from .row_laws import ROW_CONTACT, ROW_TORSION
+from .row_laws import ROW_CONTACT, ROW_TORSION, contact_restitution_rhs
 from .row_records import DenseRows, row_sides
 from .tree_scan import indent_text
 
@@ -125,9 +126,6 @@ STAGE_WORDS = 1 << 23
 """The staged blocks' arena [words] (32 MB), allocated where a shape authors its material; a block that does not fit is
 not formed and ``blk_cursor[1]`` says so."""
 
-REGION_TOLERANCE = 1.0e-7
-"""The closing threshold [m/s]: a candidate closes when its residual is below minus this."""
-
 _BIG = wp.constant(1 << 30)
 
 BLOCK_CLOSING = 6
@@ -153,15 +151,16 @@ def twist_differs(v: wp.vec3, w: wp.vec3, v_old: wp.vec3, w_old: wp.vec3) -> boo
 
 
 @wp.func
-def region_closes(sn: wp.vec3, cand: wp.array[wp.vec4], c0: int, c1: int, tol: float) -> bool:
-    """Whether a candidate of ``cand[c0:c1]`` closes faster than ``tol`` at the region's velocity ``sn``, four loads
-    a step."""
+def region_closes(sn: wp.vec3, cand: wp.array[wp.vec4], cand_floor: wp.array[float], c0: int, c1: int) -> bool:
+    """Whether a candidate of ``cand[c0:c1]`` closes at the region's velocity ``sn``: its residual below minus its
+    floor, the rounding of its right-hand side ``cand_floor`` included (:func:`.region_laws.candidate_closes`), four
+    loads a step."""
     closes = int(0)
     i = c0
     while i < c1:
         for k in range(4):
-            record = cand[wp.min(i + k, c1 - 1)]
-            if sn[0] + record[0] * sn[1] + record[1] * sn[2] + record[2] < -tol:
+            at = wp.min(i + k, c1 - 1)
+            if candidate_closes(cand[at], sn, cand_floor[at]):
                 closes = 1
         i += 4
     return closes == 1
@@ -173,19 +172,20 @@ def region_left(
     c0: int,
     c1: int,
     cand: wp.array[wp.vec4],
+    cand_floor: wp.array[float],
     cand_contact: wp.array[int],
     anchored: wp.array[int],
     anchor_source: wp.array[int],
-    tol: float,
 ) -> bool:
     """Whether a region whose candidates are ``cand[c0:c1]`` (their contacts ``cand_contact``) and kind ``kind`` is
-    left out of the sweeps until their end: no candidate closes faster than ``tol`` at the predictor (its right-hand
-    side, the residual there, is not below ``-tol``), none of its contacts carried a load from the last substep (an
+    left out of the sweeps until their end: no candidate closes at the predictor (its right-hand side, the residual
+    there, is not below minus its floor: :func:`region_closes`), none of its contacts carried a load from the last
+    substep (an
     anchor placed this build from a stored one, ``anchored`` and ``anchor_source`` of the patch frame: the finish keeps
     only a loaded region's anchor), and it is no block's (:func:`form_blocks`' marks)."""
     if (kind & (KIND_BLOCK | KIND_MEMBER)) != 0:
         return False
-    if region_closes(wp.vec3(0.0, 0.0, 0.0), cand, c0, c1, tol):
+    if region_closes(wp.vec3(0.0, 0.0, 0.0), cand, cand_floor, c0, c1):
         return False
     for k in range(c0, c1):
         c = cand_contact[k]
@@ -248,9 +248,9 @@ def sweep_closed_bodies(
     reg_lk: wp.array[wp.mat33],
     reg_lw: wp.array[wp.mat33],
     cand: wp.array[wp.vec4],
+    cand_floor: wp.array[float],
     cand_row: wp.array[int],
     sweeps: int,
-    tol: float,
     cfm: float,
     reg_wrench: wp.array[wp.vec3],
     reg_phi: wp.array[wp.vec3],
@@ -315,7 +315,7 @@ def sweep_closed_bodies(
                         if (reg_kind[g] & KIND_SECOND) != 0:
                             sn = -sn
                         span_c = reg_cand[g]
-                        if region_closes(sn, cand, span_c[0], span_c[1], tol):
+                        if region_closes(sn, cand, cand_floor, span_c[0], span_c[1]):
                             live = 1
                 if live == 1:
                     found = g
@@ -365,6 +365,7 @@ def sweep_closed_bodies(
                 reg_lk[found],
                 reg_lw[found],
                 cand,
+                cand_floor,
                 c0,
                 c1,
                 wrench_old,
@@ -373,7 +374,6 @@ def sweep_closed_bodies(
                 set_old[1],
                 set_old[2],
                 reg_spring[found],
-                tol,
             )
             push, turn = frame_wrench(wrench - wrench_old, phi - phi_old, arm, n, t0, t1)
             force += push * sign
@@ -934,9 +934,9 @@ def fill_region_head(
 ):
     """Region ``g`` formed from its world, its candidates' contacts and their places, all but its candidates
     (:func:`fill_region_member`) and its kind, which it returns with what its candidates read: ``(kind, c0, size, line,
-    source, c, sn, point, words)``, the first candidate, the candidates, the world's row line, the slot that holds its
-    frame's rows, the contact its frame is, the predictor's normal and friction slips at its friction location, its
-    frame's point, and its frame's normal row's law words (:func:`member_laws`)."""
+    source, c, sn, point, words, rounding)``, the first candidate, the candidates, the world's row line, the slot that
+    holds its frame's rows, the contact its frame is, the predictor's normal and friction slips at its friction
+    location, its frame's point, its frame's normal row's law words (:func:`member_laws`) and its gap's rounding."""
     world = reg_head[g][1]
     line = rows.first[world]
     span = reg_cand[g]
@@ -1031,7 +1031,7 @@ def fill_region_head(
     reg_set[g] = wp.vec3i(-1, -1, -1)
     reg_spring[g] = wp.vec3(0.0, 0.0, 0.0)
     reg_state[g] = REGION_IDLE
-    return kind, c0, size, line, source, c, sn, frame.point, words
+    return kind, c0, size, line, source, c, sn, frame.point, words, frame.rounding
 
 
 @wp.func
@@ -1045,6 +1045,7 @@ def fill_region_member(
     sn: wp.vec3,
     point: wp.vec3,
     words: wp.vec4,
+    rounding: float,
     rows: DenseRows,
     bias: RowBias,
     data: ContactInput,
@@ -1054,13 +1055,16 @@ def fill_region_member(
     reg_frame: wp.array[wp.mat33],
     reg_wnn: wp.array[wp.mat33],
     cand: wp.array[wp.vec4],
+    cand_floor: wp.array[float],
     cand_row: wp.array[int],
 ) -> bool:
     """Candidate ``k`` of region ``g`` (:func:`fill_region_head`'s returns): a point on the region's frame (its normal
     and tangents ``reg_frame[g]``, its friction location contact ``c``'s), its rows' laws where its front end is formed
-    unless its rows are the frame's own (``source``, whose normal row's law ``words`` the head formed), its rhs at the
-    predictor, and its compliance [1/kg], the row's (a material's) or its relative one's share of the candidate's own
-    response a . Wnn a (``reg_wnn[g]``). Returns whether it is compliant."""
+    unless its rows are the frame's own (``source``, whose normal row's law ``words`` and gap rounding ``rounding`` the
+    head formed), its rhs at the predictor with that rhs's rounding ``cand_floor`` (the gap's rounding,
+    :func:`.contact_laws.gap_rounding`, times the rate its law turns gap into speed, :func:`.row_build.contact_gap_rate`), and its compliance [1/kg], the row's (a
+    material's) or its relative one's share of the candidate's own response a . Wnn a (``reg_wnn[g]``). Returns
+    whether it is compliant."""
     basis = reg_frame[g]
     n = wp.vec3(basis[0, 0], basis[0, 1], basis[0, 2])
     t0 = wp.vec3(basis[1, 0], basis[1, 1], basis[1, 2])
@@ -1070,11 +1074,13 @@ def fill_region_member(
     j = data.slot[cj]
     member_point = point
     member_words = wp.vec4(words)
+    member_rounding = rounding
     if j != source:
         member = contact_frame(data, law, cj)
         word_phi, word_beta, word_target, word_restitution = member_laws(rows, bias, data, law, member, cj)
         member_words = wp.vec4(word_phi, word_beta, word_target, word_restitution)
         member_point = member.point
+        member_rounding = member.rounding
     lever = wp.cross(member_point - friction_point, n)
     a1 = wp.dot(lever, t0)
     a2 = wp.dot(lever, t1)
@@ -1091,6 +1097,20 @@ def fill_region_member(
         row = wp.vec3(1.0, a1, a2)
         eps = -eps * wp.dot(row, reg_wnn[g] * row)
     cand[c0 + k] = wp.vec4(a1, a2, rows.rhs[line, j] + incident, eps)
+    # The rhs's rounding: its law's rate at the bias row_bias_words formed it with (scale 1), zero where restitution's
+    # rebound replaced the bias.
+    rebounds = False
+    if member_words[3] > 0.0:
+        rebounds, _bounce = contact_restitution_rhs(
+            member_words[0],
+            incident - member_words[2],
+            member_words[2],
+            member_words[3],
+            bias.dt,
+            bias.restitution_threshold,
+        )
+    rate = contact_gap_rate(data, cj, member_words[0], member_words[1], 1.0, rebounds)
+    cand_floor[c0 + k] = rate * member_rounding
     cand_row[c0 + k] = line * pitch + j
     return eps != 0.0
 
@@ -1118,7 +1138,6 @@ def fill_regions(
     leave_out: int,
     anchored: wp.array[int],
     anchor_source: wp.array[int],
-    tol: float,
     reg_frame: wp.array[wp.mat33],
     reg_arm: wp.array[wp.vec3],
     reg_arm_b: wp.array[wp.vec3],
@@ -1137,6 +1156,7 @@ def fill_regions(
     reg_lk: wp.array[wp.mat33],
     reg_lw: wp.array[wp.mat33],
     cand: wp.array[wp.vec4],
+    cand_floor: wp.array[float],
     cand_row: wp.array[int],
     reg_wrench: wp.array[wp.vec3],
     reg_phi: wp.array[wp.vec3],
@@ -1156,8 +1176,7 @@ def fill_regions(
     carrier's first, so the region reads them: the free bodies' writer leaves the regions' rows their kinds alone. It
     starts holding nothing, with the coefficients up to which its bodies' twists leave it open
     (:func:`.region_laws.idle_reach`), formed once its candidates are, and left out of the sweeps until their end where
-    it cannot act (:func:`region_left`, under ``leave_out``: ``anchored`` and ``anchor_source`` the patch frame's,
-    ``tol`` the closing threshold).
+    it cannot act (:func:`region_left`, under ``leave_out``: ``anchored`` and ``anchor_source`` the patch frame's).
 
     A region's candidates are the work a region has, 1 to tens of them, and a warp's 32 regions would hold its lanes
     to its largest: each lane forms its region's frame, terms and records (:func:`fill_region_head`), then the warp
@@ -1180,8 +1199,9 @@ def fill_regions(
         sn = wp.vec3(0.0)
         point = wp.vec3(0.0)
         words = wp.vec4(0.0)
+        rounding = float(0.0)
         if holds:
-            kind, c0, size, line, source, c, sn, point, words = fill_region_head(
+            kind, c0, size, line, source, c, sn, point, words, rounding = fill_region_head(
                 g, rows, bias, data, law, mf_constraint_count, mf_contact_rows_end, dense_max, mf_max, pitch,
                 cand_contact, art_free, body_twist, body_inertia, cfm, reg_head, reg_cand, reg_frame, reg_arm,
                 reg_arm_b,
@@ -1224,11 +1244,13 @@ def fill_regions(
                 lane_read(words[2], owner, _FILL_LANES),
                 lane_read(words[3], owner, _FILL_LANES),
             )
+            owner_rounding = lane_read(rounding, owner, _FILL_LANES)
             springs = False
             if q < total:
                 springs = fill_region_member(
                     owner_g, q - owner_first, owner_c0, owner_line, owner_source, owner_c, owner_sn, owner_point,
-                    owner_words, rows, bias, data, law, pitch, cand_contact, reg_frame, reg_wnn, cand, cand_row,
+                    owner_words, owner_rounding, rows, bias, data, law, pitch, cand_contact, reg_frame, reg_wnn, cand,
+                    cand_floor, cand_row,
                 )  # fmt: skip
             spring_bits = wp.uint64(lane_ballot(springs, _FILL_LANES))
             # This lane's region's candidates in this round are lanes [lo, hi).
@@ -1242,7 +1264,9 @@ def fill_regions(
         if holds:
             reg_kind[g] = kind
             reg_reach[g] = idle_reach(cand, c0, c0 + size, reg_arm[g], reg_arm_b[g], reg_body[g][1] >= 0)
-            if leave_out != 0 and region_left(kind, c0, c0 + size, cand, cand_contact, anchored, anchor_source, tol):
+            if leave_out != 0 and region_left(
+                kind, c0, c0 + size, cand, cand_floor, cand_contact, anchored, anchor_source
+            ):
                 reg_state[g] = REGION_LEFT
         g += threads
 
@@ -1268,7 +1292,7 @@ def form_blocks(
     least: int,
     reg_cand: wp.array[wp.vec2i],
     cand: wp.array[wp.vec4],
-    tol: float,
+    cand_floor: wp.array[float],
     capacity: int,
     body_level: wp.array[int],
     blk_count: wp.array2d[int],
@@ -1281,7 +1305,8 @@ def form_blocks(
     reg_state: wp.array[int],
 ):
     """A world's groups (a pair of movable bodies, or a body against immovable partners) with more than ``least``
-    regions closing at the predictor (a candidate's gap term below ``-tol``; ``least`` the group's six relative
+    regions closing at the predictor (a candidate's gap term below minus its rounding, ``cand_floor``; ``least`` the
+    group's six relative
     coordinates: its rows then over-determine them), every candidate compliant, as blocks (the
     largest first, :data:`PAIR_BLOCKS` at most), a world a lane group (:data:`_WORLD_LANES`): the pair's first region
     in the stream stands for the block (:data:`KIND_BLOCK`), the others are its members (:data:`KIND_MEMBER`); its
@@ -1322,7 +1347,7 @@ def form_blocks(
         add = int(0)
         span_c = reg_cand[g]
         for i in range(span_c[0], span_c[1]):
-            if cand[i][2] < -tol:
+            if cand[i][2] < -cand_floor[i]:
                 add = 1
         if (reg_kind[g] & KIND_SPRINGS) == 0:
             add = rigid
@@ -1826,6 +1851,7 @@ _REGION_FIELDS = (
     ("reg_lk", wp.mat33, 1),
     ("reg_lw", wp.mat33, 1),
     ("cand", wp.vec4, 1),
+    ("cand_floor", wp.float32, 1),
     ("cand_row", wp.int32, 1),
     ("cand_contact", wp.int32, 1),
     ("reg_wrench", wp.vec3, 1),
@@ -2103,7 +2129,6 @@ class Regions:
                 int(self.leave_out),
                 solver.laws.friction_patches.current.valid,
                 solver.laws.friction_patches.current.source,
-                REGION_TOLERANCE,
             ],
             outputs=[
                 self.reg_frame,
@@ -2124,6 +2149,7 @@ class Regions:
                 self.reg_lk,
                 self.reg_lw,
                 self.cand,
+                self.cand_floor,
                 self.cand_row,
                 self.reg_wrench,
                 self.reg_phi,
@@ -2150,7 +2176,7 @@ class Regions:
                     BLOCK_CLOSING,
                     self.reg_cand,
                     self.cand,
-                    REGION_TOLERANCE,
+                    self.cand_floor,
                     int(self.blk_stage.shape[0]),
                 ],
                 outputs=[
@@ -2261,9 +2287,9 @@ class Regions:
                 self.reg_lk,
                 self.reg_lw,
                 self.cand,
+                self.cand_floor,
                 self.cand_row,
                 int(self.options.pgs_iterations),
-                REGION_TOLERANCE,
                 float(self.options.pgs_cfm),
             ],
             outputs=[
@@ -2329,7 +2355,7 @@ class Regions:
         names = "world_regions world_levels level_end level_region reg_order body_first body_basis"
         names += " reg_frame reg_arm reg_arm_b reg_body reg_cand reg_law reg_wnn reg_wnf reg_wff reg_ball_values"
         names += " reg_ball_vectors reg_ginv reg_k reg_lk reg_lw"
-        names += " reg_bf reg_kind reg_row cand cand_row reg_wrench reg_phi reg_set reg_spring reg_state reg_stamp"
+        names += " reg_bf reg_kind reg_row cand cand_floor cand_row reg_wrench reg_phi reg_set reg_spring reg_state reg_stamp"
         names += " reg_reach body_seen body_version blk_pair blk_blob blk_L blk_d blk_wrench blk_stage blk_istage"
         return {**{name: getattr(self, name) for name in names.split()}, "region_cfm": float(self.options.pgs_cfm)}
 

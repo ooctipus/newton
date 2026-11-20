@@ -18,6 +18,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs import region_sweep
+from newton._src.solvers.feather_pgs.solve_policy import QUIET
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 from newton.tests.test_feather_pgs_mixed_tree_free_body import DT
 
@@ -83,6 +84,7 @@ def _left_counts(solver) -> tuple[int, int]:
     kinds = regions.reg_kind.numpy()[:count]
     states = regions.reg_state.numpy()[:count]
     cand = regions.cand.numpy()
+    floor = regions.cand_floor.numpy()
     contact = regions.cand_contact.numpy()
     frame = solver.laws.friction_patches.current
     anchored, source = frame.valid.numpy(), frame.source.numpy()
@@ -92,7 +94,11 @@ def _left_counts(solver) -> tuple[int, int]:
         c0, c1 = spans[g]
         members = contact[c0:c1]
         carried = np.any((anchored[members] != 0) & (source[members] >= 0))
-        if (kinds[g] & blocks) == 0 and not carried and np.all(cand[c0:c1, 2] >= -region_sweep.REGION_TOLERANCE):
+        if (
+            (kinds[g] & blocks) == 0
+            and not carried
+            and np.all(cand[c0:c1, 2] >= -(QUIET * np.abs(cand[c0:c1, 2]) + floor[c0:c1]))
+        ):
             predicted += 1
     return predicted, int(np.count_nonzero(states == int(region_sweep.REGION_LEFT)))
 

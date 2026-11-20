@@ -34,7 +34,6 @@ from .region_sweep import (
     REGION_IDLE,
     REGION_LEFT,
     REGION_LOOSE,
-    REGION_TOLERANCE,
 )
 from .response_operator import Lanes, SparseFactor, Velocity
 from .row_inputs import RowArgument
@@ -888,6 +887,7 @@ REGION_OPERANDS = (
     ("reg_lk", wp.array[wp.mat33]),
     ("reg_lw", wp.array[wp.mat33]),
     ("cand", wp.array[wp.vec4]),
+    ("cand_floor", wp.array[float]),
     ("cand_row", wp.array[int]),
     ("reg_wrench", wp.array[wp.vec3]),
     ("reg_phi", wp.array[wp.vec3]),
@@ -1076,7 +1076,7 @@ if (moved) {{
             bool closes = false;
             for (int i = span[0]; i < span[1]; ++i) {{
                 const wp::vec4 record = cand.data[i];
-                closes = closes || sn[0] + record[0] * sn[1] + record[1] * sn[2] + record[2] < -{REGION_TOLERANCE!r}f;
+                closes = closes || RegionLaw::candidate_closes(record, sn, cand_floor.data[i]);
             }}
             if (!closes) continue;
         }}
@@ -1088,8 +1088,8 @@ if (moved) {{
         const auto out = RegionLaw::region_visit(
             sn, sf, response.v0, response.v1, response.v2, region_cfm, rhs_f, law[0], law[1],
             kind & {int(FRICTION_ROWS)}, reg_ball_values.data[g], reg_ball_vectors.data[g],
-            reg_ginv.data[g], reg_k.data[g], reg_lk.data[g], reg_lw.data[g], cand, span[0], span[1], wrench_old, phi_old, set_old[0], set_old[1], set_old[2],
-            reg_spring.data[g], {REGION_TOLERANCE!r}f);
+            reg_ginv.data[g], reg_k.data[g], reg_lk.data[g], reg_lw.data[g], cand, cand_floor, span[0], span[1], wrench_old, phi_old, set_old[0], set_old[1], set_old[2],
+            reg_spring.data[g]);
         // The change of the region's wrench through its bodies' bases.
         const wp::vec3 d_wrench = wp::sub(out.v0, wrench_old), d_phi = wp::sub(out.v1, phi_old);
         {{
@@ -1202,7 +1202,7 @@ const wp::vec3 w{s}(wp::dot(basis{s}[3], u{s}), wp::dot(basis{s}[4], u{s}), wp::
         bool closes = false;
         for (int i = span[0]; i < span[1]; ++i) {{
             const wp::vec4 record = cand.data[i];
-            closes = closes || sn[0] + record[0] * sn[1] + record[1] * sn[2] + record[2] < -{REGION_TOLERANCE!r}f;
+            closes = closes || RegionLaw::candidate_closes(record, sn, cand_floor.data[i]);
         }}
         if (closes) {{
             reg_state.data[g] = {int(REGION_IDLE)};

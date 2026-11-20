@@ -207,9 +207,9 @@ class Bodies:
                 array(candidates + 3 * np.arange(regions), int),
                 *terms,
                 cands,
+                wp.zeros(candidates, dtype=float, device=device),
                 array(np.arange(candidates), int),
                 sweeps,
-                region_sweep.REGION_TOLERANCE,
                 0.0,
             ],
             outputs=[

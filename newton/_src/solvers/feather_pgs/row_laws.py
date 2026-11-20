@@ -131,6 +131,17 @@ def contact_rhs(
 
 
 @ROW_LAW.law
+def contact_rhs_rate(phi: float, beta: float, inv_dt: float, bias_scale: float, speculative_scale: float) -> float:
+    """Return ``|d rhs / d phi|`` [1/s] of :func:`contact_rhs`: the rate at which the row's law turns an error of its gap
+    into one of its right-hand side, ``bias_scale beta / dt`` in penetration and ``speculative_scale / dt`` across an
+    open gap."""
+    rate = speculative_scale * inv_dt
+    if phi <= 0.0:
+        rate = bias_scale * beta * inv_dt
+    return wp.abs(rate)
+
+
+@ROW_LAW.law
 def contact_material_rhs(phi: float, target: float, stiffness: float, damping: float, dt: float) -> tuple[float, float]:
     """Return a material contact normal row's ``rhs`` and its compliance ``eps`` [1/kg].
 
@@ -141,6 +152,13 @@ def contact_material_rhs(phi: float, target: float, stiffness: float, damping: f
     """
     denominator = dt * stiffness + wp.where(phi <= 0.0, damping, 0.0)
     return stiffness * phi / denominator - target, 1.0 / (dt * denominator)
+
+
+@ROW_LAW.law
+def contact_material_rate(phi: float, stiffness: float, damping: float, dt: float) -> float:
+    """Return ``|d rhs / d phi|`` [1/s] of :func:`contact_material_rhs`: ``k / (dt k + c')``."""
+    denominator = dt * stiffness + wp.where(phi <= 0.0, damping, 0.0)
+    return wp.abs(stiffness / denominator)
 
 
 MATERIAL_TIMECONST = wp.constant(0.02)

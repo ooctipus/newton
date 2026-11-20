@@ -48,6 +48,7 @@ import warp as wp
 
 from .law_source import LawFamily
 from .projection_laws import BILATERAL_PIVOT, CONE_LAW, friction_triple, friction_triple_from_metric
+from .solve_policy import QUIET
 
 REGION_LAW = LawFamily("RegionLaw", requires=(CONE_LAW,))
 """The region law's family; native code calls ``RegionLaw::region_visit(...)``."""
@@ -63,6 +64,9 @@ REGION_STEPS = wp.constant(16)
 """Steps a block takes at most: its active-set steps and its Newton steps together."""
 
 _NONE = wp.constant(1.0e30)
+
+_QUIET = wp.constant(QUIET)
+"""The exit law's floor relative to a sum's terms (:data:`.solve_policy.QUIET`)."""
 
 
 @REGION_LAW.law
@@ -352,27 +356,46 @@ def candidate_row(record: wp.vec4) -> wp.vec3:
 
 
 @REGION_LAW.law
+def closing_floor(a: wp.vec3, s: wp.vec3, b: float, rounding: float) -> float:
+    """The floor [m/s] of a candidate's residual ``a . s + b`` at the velocity ``s``: the rounding of its terms (the exit
+    law's floor, :data:`.solve_policy.QUIET`) and the rounding ``b`` carries from its gap (``rounding``: the gap's
+    rounding, :func:`.contact_laws.gap_rounding`, times the rate its row law turns gap into speed,
+    :func:`.row_build.contact_gap_rate`). A residual within it is indistinguishable from zero; the rows solve the
+    modeled gap exactly, so the geometry's model error is not in it."""
+    return _QUIET * (wp.abs(a[0] * s[0]) + wp.abs(a[1] * s[1]) + wp.abs(a[2] * s[2]) + wp.abs(b)) + rounding
+
+
+@REGION_LAW.law
+def candidate_closes(record: wp.vec4, s: wp.vec3, rounding: float) -> bool:
+    """Whether the candidate of ``record`` (its right-hand side's rounding ``rounding``) closes at the region's normal
+    velocity ``s``: its residual lies below minus its floor (:func:`closing_floor`)."""
+    a = candidate_row(record)
+    return wp.dot(a, s) + record[2] < -closing_floor(a, s, record[2], rounding)
+
+
+@REGION_LAW.law
 def region_block(
     start: wp.vec3,
     K: wp.mat33,
     L: wp.mat33,
     without: wp.vec3,
     cand: wp.array[wp.vec4],
+    cand_floor: wp.array[float],
     g0: int,
     g1: int,
     i0_in: int,
     i1_in: int,
     i2_in: int,
     spring_in: wp.vec3,
-    tol: float,
 ) -> tuple[wp.vec3, int, int, int, wp.vec3, wp.vec3, wp.vec3, int, int, int]:
     """The candidates' block of the region whose candidates are ``cand[g0:g1]``, from the velocity ``start`` (the
     region's normal coordinates) in the metric ``K``: the impulses ``lambda >= 0`` with
     ``r = A (start + K A^T lambda) + b + eps lambda >= 0`` and ``lambda . r = 0``, solved exactly (the module's
     statement), from the set and the springs' wrench its last solve left.
 
-    ``without`` is the velocity without the region: the block is *open* when no candidate closes at ``without`` faster
-    than ``tol``.
+    ``without`` is the velocity without the region: the block is *open* when no candidate closes at ``without``
+    (:func:`candidate_closes`, ``cand_floor`` the roundings of the candidates' right-hand sides), and a rigid candidate
+    enters the set only where it closes at the block's velocity.
 
     Returns ``(wrench, i0, i1, i2, multipliers, springs, velocity, open, bounded, steps)``: the block's wrench
     ``A^T lambda`` (its first coordinate the load), the rigid set and its multipliers, the compliant candidates'
@@ -446,15 +469,16 @@ def region_block(
         index_sum = int(0)
         index_square = int(0)
         j = int(-1)
-        worst = -tol
+        worst = float(0.0)
         i = g0
         while i < g1:
             for k in range(4):
                 if i + k < g1:
                     ii = i + k
                     record = cand[ii]
+                    rounding = cand_floor[ii]
                     a = candidate_row(record)
-                    if wp.dot(a, without) + record[2] < -tol:
+                    if wp.dot(a, without) + record[2] < -closing_floor(a, without, record[2], rounding):
                         opened = 0
                     r = wp.dot(a, s) + record[2]
                     if record[3] != 0.0:
@@ -470,7 +494,13 @@ def region_block(
                             count += 1
                             index_sum += ii - g0
                             index_square += (ii - g0) * (ii - g0)
-                    elif ii != i0 and ii != i1 and ii != i2 and r < worst:
+                    elif (
+                        ii != i0
+                        and ii != i1
+                        and ii != i2
+                        and r < worst
+                        and r < -closing_floor(a, s, record[2], rounding)
+                    ):
                         worst = r
                         j = ii
             i += 4
@@ -571,6 +601,7 @@ def region_visit(
     Lk: wp.mat33,
     Lw: wp.mat33,
     cand: wp.array[wp.vec4],
+    cand_floor: wp.array[float],
     g0: int,
     g1: int,
     wrench_in: wp.vec3,
@@ -579,7 +610,6 @@ def region_visit(
     i1_in: int,
     i2_in: int,
     spring_in: wp.vec3,
-    tol: float,
 ) -> tuple[wp.vec3, wp.vec3, int, int, int, wp.vec3, wp.vec3, wp.vec3, int, int]:
     """One visit of a region (the module's statement), every other impulse held.
 
@@ -602,6 +632,7 @@ def region_visit(
         Lk: Its factor.
         Lw: ``Wnn``'s factor.
         cand: The candidates' records.
+        cand_floor: The roundings [m/s] of their right-hand sides (:func:`closing_floor`).
         g0: The region's first candidate.
         g1: One past its last.
         wrench_in: The normal wrench the region holds (over ``N``).
@@ -610,7 +641,6 @@ def region_visit(
         i1_in: Its second row.
         i2_in: Its third row.
         spring_in: The compliant candidates' part of ``wrench_in``.
-        tol: The closing threshold [m/s].
 
     Returns:
         ``(wrench, phi, i0, i1, i2, multipliers, springs, velocity, outcome, steps)``: the wrench and friction the
@@ -655,7 +685,7 @@ def region_visit(
     steps = int(0)
     while True:
         wrench, i0, i1, i2, multipliers, spring, velocity, opened, bounded, steps = region_block(
-            start, metric, factor, without, cand, g0, g1, j0, j1, j2, held, tol
+            start, metric, factor, without, cand, cand_floor, g0, g1, j0, j1, j2, held
         )
         if stuck >= 0:
             break

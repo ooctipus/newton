@@ -17,6 +17,10 @@ sum adds (``Z_ik u_k``, ``J_ik v_k`` or ``W_ij lambda_j``, as the sweep forms it
 within ``tau_i`` is indistinguishable from rounding: a sweep of quiet updates is a fixed point of the floating-point
 projected Gauss-Seidel map up to its floor, whatever the schedule. (The impulse after the update bounds the impulse
 term within ``phi_i`` of the one before, so the floor reads the one before, at hand where the residual is formed.)
+A region's closing test reads the same floor plus the rounding the candidate's right-hand side carries from its gap
+(:func:`.region_laws.closing_floor`: the gap's rounding at world magnitude, :func:`.contact_laws.gap_rounding`, times
+the rate its row law turns gap into speed): the rows solve the modeled gap exactly, so the geometry's model error (the
+collision path's declared precision) is not theirs but the position block's. The exit vote reads neither.
 A sweep that visits only the rows it selected at entry also requires every unvisited zero-impulse unilateral row's
 would-be change to be quiet.
 

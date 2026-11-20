@@ -11,6 +11,8 @@ One law each, written once for Warp kernels and native CUDA (:mod:`.law_source`)
   :func:`contact_points` gives the normal from body B to body A, each surface
   point as a translation and an offset, and the gap ``phi`` formed from
   translations and offsets apart, never from rounded world points;
+  :func:`gap_rounding` the rounding of that forming at the magnitudes it
+  reads;
 * materials: :func:`contact_materials`, the friction coefficient
   (:func:`contact_friction`, also the torsional one's combination) and the
   restitution (:func:`contact_restitution`) averaged over the present shapes;
@@ -36,10 +38,19 @@ import warp as wp
 from ...geometry.flags import ShapeFlags
 from ...sim import BodyFlags
 from .law_source import LawFamily
+from .solve_policy import UNIT_ROUNDOFF
 from .spatial_laws import SPATIAL, point_velocity
 
 CONTACT_LAW = LawFamily("ContactLaw", requires=(SPATIAL,))
 """The contact front end's family; native code calls ``ContactLaw::contact_points(...)``."""
+
+GAP_ROUNDING_UNITS = 4
+"""Roundings a gap carries per magnitude it is formed from: a coordinate's own representation, its rotation, its
+translation and the difference that forms the gap."""
+
+GAP_ROUNDING = wp.constant(GAP_ROUNDING_UNITS * UNIT_ROUNDOFF)
+"""A gap's rounding relative to the magnitude of what it is formed from, :data:`GAP_ROUNDING_UNITS` roundings of
+float32."""
 
 CONTACT_SPIN_ROW = wp.constant(3)
 """A contact's spin row under contact torsion: its fourth row, after the normal (0) and the friction pair (1, 2)."""
@@ -157,6 +168,21 @@ def contact_points(
 
 
 @CONTACT_LAW.law
+def gap_rounding(
+    normal: wp.vec3, translation_a: wp.vec3, offset_a: wp.vec3, translation_b: wp.vec3, offset_b: wp.vec3
+) -> float:
+    """Return the rounding [m] of the gap :func:`contact_points` forms, at the magnitudes it reads: each translation's
+    coordinates weighted by how much of them the normal reads (``sum_k |n_k| |t_k|``, a world position's spacing far
+    from the origin) and each offset's length. The rows solve the modeled gap exactly, so this is all of its error
+    they read; the geometry's own (the collision path's declared ``rigid_contact_distance_precision``) is the
+    position block's and the depth claims'."""
+    magnitude = wp.length(offset_a) + wp.length(offset_b)
+    for k in range(3):
+        magnitude += wp.abs(normal[k]) * (wp.abs(translation_a[k]) + wp.abs(translation_b[k]))
+    return GAP_ROUNDING * magnitude
+
+
+@CONTACT_LAW.law
 def contact_geometry(
     c: int,
     shape0: wp.array[int],
@@ -168,18 +194,19 @@ def contact_geometry(
     margin1: wp.array[float],
     shape_body: wp.array[int],
     body_q: wp.array[wp.transform],
-) -> tuple[int, int, wp.vec3, wp.vec3, float]:
-    """Return contact ``c``'s bodies, normal, the point its rows act at and its gap from the contact arrays:
-    ``(body_a, body_b, normal, point, phi)``.
+) -> tuple[int, int, wp.vec3, wp.vec3, float, float]:
+    """Return contact ``c``'s bodies, normal, the point its rows act at, its gap and the gap's rounding from the
+    contact arrays: ``(body_a, body_b, normal, point, phi, rounding)``.
 
-    :func:`contact_bodies`, :func:`contact_points` and :func:`contact_point`, for the producers that read a contact
-    straight from the collision pipeline's arrays.
+    :func:`contact_bodies`, :func:`contact_points`, :func:`contact_point` and :func:`gap_rounding`, for the producers
+    that read a contact straight from the collision pipeline's arrays.
     """
     body_a, body_b = contact_bodies(shape0[c], shape1[c], shape_body)
-    n, translation_a, offset_a, _translation_b, _offset_b, separation, phi = contact_points(
+    n, translation_a, offset_a, translation_b, offset_b, separation, phi = contact_points(
         normal[c], point0[c], point1[c], margin0[c], margin1[c], body_a, body_b, body_q
     )
-    return body_a, body_b, n, contact_point(translation_a, offset_a, separation), phi
+    rounding = gap_rounding(n, translation_a, offset_a, translation_b, offset_b)
+    return body_a, body_b, n, contact_point(translation_a, offset_a, separation), phi, rounding
 
 
 @CONTACT_LAW.law

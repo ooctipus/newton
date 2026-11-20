@@ -103,13 +103,15 @@ none)."""
 @wp.struct
 class ContactFrame:
     """A contact's front end (:func:`contact_frame`), formed once for all its rows: its bodies, normal, the one point
-    its rows act at and its gap, its tangent basis and its friction location."""
+    its rows act at, its gap and the gap's rounding (:func:`.contact_laws.gap_rounding`), its tangent basis and its
+    friction location."""
 
     body_a: int
     body_b: int
     normal: wp.vec3
     point: wp.vec3
     phi: float
+    rounding: float
     tangent0: wp.vec3
     tangent1: wp.vec3
     friction_point: wp.vec3
@@ -131,9 +133,9 @@ def contact_front_end(
 ) -> ContactFrame:
     """Return the front end (:class:`ContactFrame`) of the contact whose collision record is ``at`` in the given arrays
     (the collision pipeline's, or a copy in another order) with the friction location ``friction_point``: the
-    bodies, normal, the one point the contact's rows act at and the gap of :func:`.contact_laws.contact_geometry`,
-    and the tangent basis."""
-    body_a, body_b, n, point, phi = contact_geometry(
+    bodies, normal, the one point the contact's rows act at, the gap and its rounding of
+    :func:`.contact_laws.contact_geometry`, and the tangent basis."""
+    body_a, body_b, n, point, phi, rounding = contact_geometry(
         at, shape0, shape1, point0, point1, normal, margin0, margin1, shape_body, body_q
     )
     tangent0, tangent1 = contact_tangent_basis(n)
@@ -143,6 +145,7 @@ def contact_front_end(
     frame.normal = n
     frame.point = point
     frame.phi = phi
+    frame.rounding = rounding
     frame.tangent0 = tangent0
     frame.tangent1 = tangent1
     frame.friction_point = friction_point
