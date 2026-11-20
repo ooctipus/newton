@@ -39,7 +39,7 @@ from .tree_scan import WALK_BOTH, WalkClass, classes_half
 from .walk_rows import TOPOLOGY_BESIDE, RowSeeds, emit_rows
 
 PARALLEL_ABI = kernel_template.params(
-    *MF_GS_ABI[:-1],
+    *MF_GS_ABI,
     ("ink_meta", wp.array[int]),
     ("cfm", float),
     ("v_out", wp.array[float]),
@@ -109,7 +109,7 @@ def _seeded_row(weighted: bool, material: bool, stored: str, release: str) -> st
     its trees' ``release`` applied, a bouncing contact's rebound (:func:`.row_laws.contact_restitution_rhs`)."""
     eps = " && world_row_eps.data[at] <= 0.0f" if material else ""
     weight = " world_row_w.data[at] = 1.0f;" if weighted else ""
-    return f"""        const int topology = dense_phase_bounds.data[world * 2 + 1];
+    return f"""        const int topology = topology_rows.data[world];
         if (i < topology && topology <= {TOPOLOGY_BESIDE}) {{
 {stored}
         }} else {{
@@ -167,8 +167,7 @@ def parallel_source(tier: TierSweep) -> tuple[str, Staging]:
     ``F`` included (the leave ``F^T``). They form the matrix-free response (:class:`.TransposedResponse`: ``Z`` in
     registers and staged transposed, its step scale bounded by the column sums). It runs at most ``sweeps`` Jacobi
     sweeps (:func:`.sweep.jacobi_sweeps`: Nesterov momentum, pairs projected on their patch ring's pooled load with
-    ``linked_rows``, a velocity limit's soft threshold taken in every iterate like any row's law, a world stopped
-    under ``solve_policy``), then publishes the velocity by the walk down and the impulses. With ``weighted`` contact rows step by their
+    ``linked_rows``, a world stopped under ``solve_policy``), then publishes the velocity by the walk down and the impulses. With ``weighted`` contact rows step by their
     weights (the relative regularization's; ``material``: a material contact's ``d / (d + eps)`` from the diagonal the
     tier forms). Seeded rows walk their trees by the walking ``classes``' path tables in constant memory
     (:func:`.factor.walk.walk_prelude`, the half their records share, :func:`.tree_scan.classes_half`).
@@ -268,7 +267,7 @@ class TierSweep(SweepConfig):
     - ``linked_rows``: pairs project on their patch ring's pooled load.
 
     A tier owns no world with free-body rows (its kernel's name carries the solver's free-body capacity
-    ``mf_max_constraints``) and takes its velocity-limit rows in its Jacobi iteration (:data:`.sweep.JACOBI_LIMIT`). Its worlds' stored rows
+    ``mf_max_constraints``). Its worlds' stored rows
     (:mod:`.walk_rows`) lie at their coordinates, ``max_world_dofs`` entries a row. A block a world, a thread a row
     (the CPU's one thread runs them as virtual lanes); its working set fits the stage budget of ``device_arch``. It
     walks its bucket of the claims' worlds (:func:`.sweep_routes.worlds`, :func:`.sweep_levels.claim_worlds`).

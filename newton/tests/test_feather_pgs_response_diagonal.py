@@ -37,19 +37,14 @@ def _build_mixed_response_model(
     static_plane=False,
     static_support=False,
     free_body_first=False,
-    free_body_velocity_limit=None,
 ):
     """Build one serial articulation contacting one free rigid body.
 
     ``static_support`` rests the free body on a static ledge that clears the arm, so the free body also
     produces matrix-free contact rows. ``free_body_first`` builds the free body before the articulation,
-    which packs the world DOFs free-body first. ``free_body_velocity_limit`` caps the free body's linear
-    and angular velocity [m/s, rad/s], producing matrix-free velocity-limit rows once exceeded.
-    ``static_plane`` adds a ground plane under the free body.
+    which packs the world DOFs free-body first. ``static_plane`` adds a ground plane under the free body.
     """
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
-    if free_body_velocity_limit is not None:
-        SolverFeatherPGS.register_custom_attributes(builder)
     builder.default_shape_cfg.density = 1000.0
     builder.default_shape_cfg.ke = 1.0e5
     builder.default_shape_cfg.kd = 1.0e3
@@ -59,15 +54,7 @@ def _build_mixed_response_model(
     builder.default_shape_cfg.gap = 0.0
 
     def add_free_body():
-        custom_attributes = None
-        if free_body_velocity_limit is not None:
-            custom_attributes = {
-                "rigid_body_max_linear_velocity": free_body_velocity_limit,
-                "rigid_body_max_angular_velocity": free_body_velocity_limit,
-            }
-        box = builder.add_link(
-            xform=wp.transform(wp.vec3(0.7, 0.0, 0.5695), wp.quat_identity()), custom_attributes=custom_attributes
-        )
+        box = builder.add_link(xform=wp.transform(wp.vec3(0.7, 0.0, 0.5695), wp.quat_identity()))
         builder.add_shape_box(box, hx=0.1, hy=0.1, hz=0.05)
         builder.add_articulation([builder.add_joint_free(parent=-1, child=box)])
         if static_support:
@@ -182,7 +169,7 @@ def _patch_unit_rows(seed, *, worlds=3, capacity=40, prefix=2, contacts=10, diag
         "diagonal": diagonal,
         "cfm": 1.0e-6,
         "row_count": np.zeros(worlds, np.int32),
-        "bounds": np.zeros((worlds, 2), np.int32),
+        "topology": np.zeros(worlds, np.int32),
         # Rows past each world's count hold a type no row family uses.
         "row_type": np.full((worlds, capacity), 7, np.int32),
         "row_parent": np.full((worlds, capacity), -1, np.int32),
@@ -236,7 +223,7 @@ def _patch_unit_rows(seed, *, worlds=3, capacity=40, prefix=2, contacts=10, diag
         rows["row_type"][w, :prefix] = ROW_JOINT_LIMIT
         rows["dense_J"][w, :prefix] = rng.normal(0.0, 0.5, (prefix, dense))
         rows["rhs"][w, :prefix] = rng.uniform(-0.2, 0.1, prefix)
-        rows["bounds"][w] = prefix
+        rows["topology"][w] = prefix
         row = prefix
         if layout is None:
             rings = []
@@ -377,7 +364,7 @@ def _unit_schedule_oracle(rows, marked):
     level_units = np.zeros((rows["worlds"], capacity), np.int32)
     serial = []
     for w in range(rows["worlds"]):
-        start, end = int(rows["bounds"][w, 1]), int(rows["row_count"][w])
+        start, end = int(rows["topology"][w]), int(rows["row_count"][w])
         heads = [row for row in range(start, end) if rows["row_type"][w, row] != ROW_FRICTION]
         candidates = [row for row in heads if np.any(marked[w, row] < -1)]
         reserved = {int(c) for row in heads if row not in candidates for c in marked[w, row] if c >= 0}
@@ -420,7 +407,7 @@ def _unit_schedule_order(rows, schedule, world):
     order = []
     for head in schedule["level_units"][world, : schedule["level_offsets"][world, schedule["level_count"][world]]]:
         order += _unit_rows(rows, world, int(head))
-    order += list(range(int(rows["bounds"][world, 1])))
+    order += list(range(int(rows["topology"][world])))
     for head in schedule["serial"][world]:
         order += _unit_rows(rows, world, head)
     return order
@@ -601,7 +588,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                 wp.array(row_type, device=device),
                 wp.array(row_parent, device=device),
                 wp.array(row_mu, device=device),
-                wp.zeros((1, 2), dtype=wp.int32, device=device),
+                wp.zeros(1, dtype=wp.int32, device=device),
                 wp.zeros(1, dtype=wp.int32, device=device),
                 wp.zeros((1, max_constraints + 1), dtype=wp.int32, device=device),
                 wp.empty((1, max_constraints), dtype=wp.int32, device=device),
@@ -710,7 +697,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                 wp.array(row_type, device=device),
                 wp.array(row_parent, device=device),
                 wp.array(row_mu, device=device),
-                wp.zeros((1, 2), dtype=wp.int32, device=device),
+                wp.zeros(1, dtype=wp.int32, device=device),
                 wp.zeros(1, dtype=wp.int32, device=device),
                 wp.zeros((1, max_constraints + 1), dtype=wp.int32, device=device),
                 wp.empty((1, max_constraints), dtype=wp.int32, device=device),
@@ -805,7 +792,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
             inputs=[
                 wp.array((max_constraints,), dtype=wp.int32, device=device),
                 row_lines(device),
-                wp.zeros((1, 2), dtype=wp.int32, device=device),
+                wp.zeros(1, dtype=wp.int32, device=device),
                 wp.array(row_type, device=device),
             ],
             outputs=[sparse_row_dof, level_count, level_offsets, level_units, serial_count, serial_normals],
@@ -947,7 +934,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                         inputs=[
                             wp.array(rows["row_count"], device=device),
                             row_lines(device),
-                            wp.array(rows["bounds"], device=device),
+                            wp.array(rows["topology"], device=device),
                             wp.array(rows["row_type"], device=device),
                         ],
                         outputs=[sparse_row_dof, level_count, level_offsets, level_units, serial_count, serial_heads],
@@ -1022,7 +1009,7 @@ class TestFeatherPGSResponseDiagonal(unittest.TestCase):
                             wp.array(rows["row_type"], device=device),
                             wp.array(rows["row_parent"], device=device),
                             wp.array(rows["row_mu"], device=device),
-                            wp.array(rows["bounds"], device=device),
+                            wp.array(rows["topology"], device=device),
                             wp.array(schedule["level_count"], device=device),
                             wp.array(schedule["level_offsets"], device=device),
                             wp.array(schedule["level_units"], device=device),

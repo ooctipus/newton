@@ -35,7 +35,6 @@ from .factor.walk import walk_tables
 from .field_group import Field, FieldGroup, SolverArrays, fields_of
 from .forest_plan import RowLaw
 from .route_table import first_failed
-from .row_kernels import RIGID_SPEED_ROWS
 from .row_laws import LINK_ROWS
 from .row_metadata import record_layout
 from .row_records import DENSE_ROWS, ROW_RECORDS, RowSupport
@@ -84,18 +83,14 @@ rows' ``constraint_count``, ``slot_counter`` and ``dense_first_rejected_slot``, 
 (:meth:`.placement.Placement.allocate_world_rows`)."""
 
 WORLD_ROW_STATE = FieldGroup(
-    # Per-world dense row-family boundaries, snapshotted from slot_counter each step. The dense slot layout is
-    # [mimic][joint-limit][joint-vel-limit][contact/friction], so [world, 0] ends the mimic and position-limit
-    # prefix, [world, 1] the velocity-limit segment, and contacts/friction occupy [bounds[world, 1], m_dense).
-    Field("dense_phase_bounds", wp.int32, ("world", 2), owner="placement"),
-    # First matrix-free slot past the contact/friction rows (start of the velocity-limit tail).
+    # Per-world dense row-family boundary, snapshotted from slot_counter each step. The dense slot layout is
+    # [mimic][link][joint-limit][contact/friction], so a world's topology rows are [0, topology_rows) and its
+    # contacts and friction [topology_rows, m_dense).
+    Field("topology_rows", wp.int32, ("world",), owner="placement"),
+    # The free bodies' run's slot past its contact/friction rows.
     Field("mf_contact_rows_end", wp.int32, ("world",), owner="placement"),
-    # The line's first speed row, past every contact row: a free body's speed rows are the line's last rows where
-    # they are rows of the line (step_plan.Capacities.speed_rows), so the rows [speed_first, m_dense) are speed rows.
-    Field("speed_first", wp.int32, ("world",), owner="placement"),
 )
-"""Per-world row-family boundaries: the dense rows' phases, the free bodies' contact rows' end and the line's speed
-rows' start."""
+"""Per-world row-family boundaries: the dense rows' topology rows and the free bodies' contact rows' end."""
 
 WORLD_ACTS = FieldGroup(Field("world_acts", wp.int32, ("world",), owner="placement"))
 """Whether a row of the world can act at the predictor (:func:`.row_laws.separates`): set by its allocators where every
@@ -345,7 +340,7 @@ class Placement:
 
     Built in the solver's construction order: the capacities and placeholders here, then
     :meth:`allocate_size_groups`, :meth:`allocate_contact_rows`, :meth:`allocate_world_rows`,
-    :meth:`allocate_sparse_diagonal_rows`, :meth:`allocate_free_body_rows`, :meth:`allocate_packed_rows`,
+    :meth:`allocate_sparse_diagonal_rows`, :meth:`allocate_packed_rows`,
     :meth:`allocate_placeholders`, :meth:`allocate_status` and :meth:`place_dense_response`. The native sparse route
     allocates its rows on :attr:`arrays` as it admits them.
 
@@ -378,12 +373,12 @@ class Placement:
         # world's contacts.
         self.dense_max_constraints = spec.capacities.dense_rows
         self.mf_max_constraints = spec.capacities.free_body_rows
-        # A free body is a one-node tree: its contacts and speed rows keep a run of their own (the free bodies' rows
-        # from ``body_base``) only where a world can take the colored mapping; elsewhere they are rows of the line,
-        # the speed rows its last (``speed_rows`` a world), and the free bodies' rows hold none (the spec's
-        # capacities, step_plan.Capacities).
+        # A free body is a one-node tree: its contacts keep a run of their own (the free bodies' rows from
+        # ``body_base``) only where a world can take the colored mapping; elsewhere they are rows of the line, and the
+        # free bodies' rows hold none (the spec's capacities, step_plan.Capacities).
         self.free_contact_rows = spec.capacities.free_contact_rows
-        self.speed_rows = spec.capacities.speed_rows
+        # The streamed rows' records, once the sweep's plan places them (allocate_row_records).
+        self.row_record, self.writes_records = None, False
         # The row store's line: the dense class's rows, then (with free rigid bodies) the free bodies' from
         # ``body_base``.
         self.body_base = self.dense_max_constraints
@@ -413,9 +408,8 @@ class Placement:
             return 0
 
         has_position_limit_rows = self.options.enable_joint_limits and model.joint_dof_count > 0
-        has_velocity_limit_rows = self.options.enable_joint_velocity_limits and model.joint_dof_count > 0
         has_mimic_rows = self.laws.mimic_count > 0
-        if not (has_position_limit_rows or has_velocity_limit_rows or has_mimic_rows or self.laws.link_count):
+        if not (has_position_limit_rows or has_mimic_rows or self.laws.link_count):
             return 0
 
         art_to_world = self.forest.art_to_world.numpy().astype(np.int32, copy=False)
@@ -435,17 +429,13 @@ class Placement:
 
         joint_limit_lower_arr = getattr(model, "joint_limit_lower", None)
         joint_limit_upper_arr = getattr(model, "joint_limit_upper", None)
-        if has_position_limit_rows and (joint_limit_lower_arr is None or joint_limit_upper_arr is None):
+        if joint_limit_lower_arr is None or joint_limit_upper_arr is None:
             has_position_limit_rows = False
-        joint_velocity_limit_arr = getattr(model, "joint_velocity_limit", None)
-        if has_velocity_limit_rows and joint_velocity_limit_arr is None:
-            has_velocity_limit_rows = False
-        if not (has_position_limit_rows or has_velocity_limit_rows):
+        if not has_position_limit_rows:
             return int(np.max(per_world)) if per_world.size else 0
 
-        joint_limit_lower = joint_limit_lower_arr.numpy() if has_position_limit_rows else None
-        joint_limit_upper = joint_limit_upper_arr.numpy() if has_position_limit_rows else None
-        joint_velocity_limit = joint_velocity_limit_arr.numpy() if has_velocity_limit_rows else None
+        joint_limit_lower = joint_limit_lower_arr.numpy()
+        joint_limit_upper = joint_limit_upper_arr.numpy()
 
         dense_joint_types = (
             int(JointType.PRISMATIC),
@@ -465,19 +455,14 @@ class Placement:
         dof = joint_qd_start[joint][axis_joint] + axis
 
         rows = np.zeros(dof.size, dtype=np.int64)
-        if has_position_limit_rows:
-            fuse_position_limits = np.isin(self.forest.response_dof_count[art], list(self.classes.fused_sizes))
-            lower, upper = joint_limit_lower[dof], joint_limit_upper[dof]
-            rows += ~fuse_position_limits & np.isfinite(lower)
-            rows += ~fuse_position_limits & np.isfinite(upper)
-            if at_once:
-                both = ~fuse_position_limits & np.isfinite(lower) & np.isfinite(upper)
-                gap = 2.0 * self.options.joint_limit_activation_gap
-                rows -= both & (np.where(both, upper - lower, 0.0) > gap)
-        if has_velocity_limit_rows:
-            # One row a coordinate for both sides of an authored limit (row_laws.velocity_limit_active).
-            limit = joint_velocity_limit[dof]
-            rows += (limit > 0.0) & (limit < self.laws.unauthored_velocity_limit)
+        fuse_position_limits = np.isin(self.forest.response_dof_count[art], list(self.classes.fused_sizes))
+        lower, upper = joint_limit_lower[dof], joint_limit_upper[dof]
+        rows += ~fuse_position_limits & np.isfinite(lower)
+        rows += ~fuse_position_limits & np.isfinite(upper)
+        if at_once:
+            both = ~fuse_position_limits & np.isfinite(lower) & np.isfinite(upper)
+            gap = 2.0 * self.options.joint_limit_activation_gap
+            rows -= both & (np.where(both, upper - lower, 0.0) > gap)
         world = art_to_world[art]
         in_range = (world >= 0) & (world < per_world.size)
         np.add.at(per_world, world[in_range], rows[in_range])
@@ -513,7 +498,7 @@ class Placement:
         if self.options.pgs_warmstart:
             contact_fields += [ContactField(field.attr, field.dtype) for field in fields_of(ContactCarry)]
         self.contact_rows = self.contact_pool.rows(contact_fields, on_rows=self._on_contact_rows)
-        # The friction patch state and the velocity-limit slots.
+        # The friction patch state.
         # A contact has a region normal only where neither side is a non-free articulation's link: some body must be
         # free (a free rigid body's, or no articulation's) for any contact to hold one.
         body_to_articulation = self.forest.body_to_articulation
@@ -635,40 +620,6 @@ class Placement:
             )
         else:
             self.arrays.allocate(SPARSE_CONTACT_SERIAL, world=1, serial=1)
-
-    def allocate_free_body_rows(self, model):
-        """Allocate buffers for matrix-free PGS path for free rigid body contacts.
-
-        CUDA without free rigid bodies still passes the
-        ``mf_*`` arrays to kernels (the fused GS solve, the PGS diagnostics),
-        but ``mf_constraint_count`` stays zero (``_clear_dense_row_state`` and
-        the row pass's close (``_close_row_pass``) write it only when MF is
-        active), so every access sits inside a loop bounded by
-        ``m_mf == 0`` and no element is ever read or written. The rows' records
-        follow the sweep's plan (:meth:`allocate_row_records`).
-        """
-        self.row_record, self.writes_records = None, False
-
-        if not self.forest.has_free_rigid_bodies:
-            # Only the ``is not None`` checks observe this on the inactive
-            # path, where no free rigid body owns a speed row.
-            self.rigid_velocity_limit_slot = (
-                wp.full((1,), -1, dtype=wp.int32, device=model.device)
-                if self.laws.has_rigid_body_velocity_limits and model.body_count > 0
-                else None
-            )
-            return
-
-        if self.laws.has_rigid_body_velocity_limits and self.forest.free_rigid_body_count > 0:
-            # Two speed rows per free rigid body: its linear and its angular speed.
-            self.rigid_velocity_limit_slot = wp.full(
-                (RIGID_SPEED_ROWS * self.forest.free_rigid_body_count,),
-                -1,
-                dtype=wp.int32,
-                device=model.device,
-            )
-        else:
-            self.rigid_velocity_limit_slot = None
 
     def allocate_packed_rows(self) -> None:
         """The matrix-free sweeps' rows, packed (:mod:`.packed_rows`): every row of the world's line, by side or by

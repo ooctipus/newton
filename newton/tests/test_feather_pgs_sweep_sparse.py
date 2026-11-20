@@ -9,8 +9,7 @@ lane stores an impulse or a cached metric only after every lane has read it. The
 ``ptxas`` and ``cuobjdump`` are on ``PATH``. The sweep's physics is the sparse tests' and the conformance gate's.
 
 The configurations are the conformance routes' (``sparse``, ``sparse_triplets``,
-``sparse_warm_start``, ``sparse_readout``, ``sparse_velocity_limits``, ``sparse_velocity_mimic``), the native
-sparse tasks' under both friction laws, and the contact units, schedules and policies their options select.
+``sparse_warm_start``, ``sparse_readout``), the native sparse tasks' under both friction laws, and the contact units, schedules and policies their options select.
 """
 
 import itertools
@@ -32,14 +31,11 @@ _TABLE = {"use_support_table": True}
 _ACTIVE = {"active_rows": True, "use_support_table": True}
 _TRIPLETS = {**_ACTIVE, "contact_triplets": True}
 _PATCH = {**_TRIPLETS, "linked_rows": True}
-_LIMITS = {"velocity_limits": True}
 _SMALL = {"lanes_per_world": 8, "local_factors": True}
 
 # (label, max_constraints, max_world_dofs, max_row_dofs, options, policy)
 CONFIGURATIONS = (
     # The conformance routes.
-    ("sparse_velocity_limits", 32, 2, 2, {**_TABLE, **_LIMITS, **_SMALL}, None),
-    ("sparse_velocity_mimic", 32, 2, 2, {**_LIMITS, **_SMALL}, None),
     ("sparse_point", 64, 14, 10, _ACTIVE, None),
     ("sparse_triplets", 64, 14, 10, _TRIPLETS, None),
     ("sparse_readout", 64, 14, 10, _ACTIVE, {"readout": "sweeps"}),
@@ -49,11 +45,13 @@ CONFIGURATIONS = (
     ("patch_units_256", 256, 18, 12, _PATCH, None),
     ("patch_units_48", 48, 18, 18, _PATCH, None),
     ("point_units", 112, 18, 12, _TRIPLETS, None),
-    ("velocity_limits_16_lanes", 64, 9, 9, {**_LIMITS, "lanes_per_world": 16}, None),
+    ("lanes_16", 64, 9, 9, {"lanes_per_world": 16}, None),
     ("explicit_rows_patch", 128, 43, 18, {"active_rows": True, "linked_rows": True}, None),
     ("explicit_rows_point", 56, 43, 18, {"active_rows": True}, None),
     ("full_sweep_table", 128, 27, 21, _TABLE, None),
-    ("small_table_limits", 16, 6, 6, {**_TABLE, **_LIMITS, **_SMALL}, None),
+    ("small_table", 16, 6, 6, {**_TABLE, **_SMALL}, None),
+    ("small_world_table", 32, 2, 2, {**_TABLE, **_SMALL}, None),
+    ("small_world", 32, 2, 2, _SMALL, None),
     # Options the recipes select.
     ("point_units_256", 256, 18, 12, _TRIPLETS, None),
     ("patch_without_triplets", 256, 18, 12, {**_ACTIVE, "linked_rows": True}, None),
@@ -63,15 +61,8 @@ CONFIGURATIONS = (
     ("point_units_sweeps", 112, 18, 12, _TRIPLETS, {"readout": "sweeps"}),
     ("explicit_rows_trace", 128, 43, 18, {"active_rows": True}, {"readout": "trace"}),
     ("patch_trace", 112, 18, 12, _PATCH, {"readout": "trace"}),
-    (
-        "limits_sweeps",
-        64,
-        9,
-        9,
-        {**_LIMITS, "lanes_per_world": 16},
-        {"readout": "sweeps"},
-    ),
-    ("small_trace", 16, 6, 6, {**_TABLE, **_LIMITS, **_SMALL}, {"readout": "trace"}),
+    ("lanes_16_sweeps", 64, 9, 9, {"lanes_per_world": 16}, {"readout": "sweeps"}),
+    ("small_trace", 16, 6, 6, {**_TABLE, **_SMALL}, {"readout": "trace"}),
 )
 
 
@@ -120,18 +111,16 @@ class TestSparseSweepConfiguration(unittest.TestCase):
             (False, True),  # use_support_table
             (False, True),  # contact_triplets
             (False, True),  # linked_rows
-            (False, True),  # velocity_limits
             (8, 32),  # lanes_per_world
             (False, True),  # local_factors
         )
         checked = 0
-        for active, table, triplets, linked, limits, lanes, local in grid:
+        for active, table, triplets, linked, lanes, local in grid:
             options = {
                 "active_rows": active,
                 "use_support_table": table,
                 "contact_triplets": triplets,
                 "linked_rows": linked,
-                "velocity_limits": limits,
                 "lanes_per_world": lanes,
                 "local_factors": local,
                 "warm_start": active and local,
@@ -159,14 +148,11 @@ class TestSparseSweepConfiguration(unittest.TestCase):
                 EMITTER(*args, **options)
 
     def test_the_options_compose(self):
-        """Velocity limits after an active sweep or contact units, a group of fewer lanes than the world's coordinates
-        or with the active scan and units, and local factors of any size the working set fits: each a sweep."""
+        """An active sweep with or without contact units, a group of fewer lanes than the world's coordinates or with the
+        active scan and units, and local factors of any size the working set fits: each a sweep."""
         cases = (
-            ((16, 6, 4), {"velocity_limits": True, "active_rows": True}),
-            (
-                (16, 6, 4),
-                {"velocity_limits": True, "active_rows": True, "use_support_table": True, "contact_triplets": True},
-            ),
+            ((16, 6, 4), {"active_rows": True}),
+            ((16, 6, 4), {"active_rows": True, "use_support_table": True, "contact_triplets": True}),
             ((16, 18, 4), {"lanes_per_world": 16}),
             (
                 (64, 18, 4),
@@ -240,7 +226,7 @@ class TestSparseSweepConfiguration(unittest.TestCase):
             "sparse_point",
             "patch_units_256",
             "sparse_patch_small_world",
-            "sparse_velocity_limits",
+            "small_world_table",
         ):
             _, M, D, S, kwargs, policy = next(entry for entry in CONFIGURATIONS if entry[0] == label)
             with self.subTest(label):

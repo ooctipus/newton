@@ -27,7 +27,7 @@ from .factor.walk import WalkTrees
 from .kernel_template import Dispatch
 from .response_operator import Lanes, ResponseOperator, SparseFactor, Velocity
 from .row_inputs import RowArgument
-from .row_laws import ROW_CONTACT, ROW_FRICTION, ROW_JOINT_LIMIT, ROW_JOINT_VELOCITY_LIMIT
+from .row_laws import ROW_CONTACT, ROW_FRICTION, ROW_JOINT_LIMIT
 from .sweep import (
     EXACT,
     ITERATION,
@@ -50,7 +50,6 @@ from .sweep import (
     level_loop,
     row_step,
     row_update,
-    velocity_limit_pass,
 )
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -69,7 +68,7 @@ SPARSE_DIAGONAL_ABI = kernel_template.params(
     ("world_row_type", wp.array2d[int]),
     ("world_row_parent", wp.array2d[int]),
     ("world_row_mu", wp.array2d[float]),
-    ("dense_phase_bounds", wp.array2d[int]),
+    ("topology_rows", wp.array[int]),
     ("sparse_contact_level_count", wp.array[int]),
     ("sparse_contact_level_offsets", wp.array2d[int]),
     ("sparse_contact_level_units", wp.array2d[int]),
@@ -314,9 +313,7 @@ def sparse_diagonal_source(sweep: DiagonalSweep) -> tuple[str, Staging]:
     by the unit law (:func:`.sweep.contact_unit`) and visits an unloaded one, and a level's contacts a lane each. With
     ``speculative_contact_batches`` the coupled contacts come from the world's serial list, and a batch of them
     (one per segment of the warp) is tested first: a batch whose normals stay zero without load is skipped whole,
-    otherwise the sweep enters the batch at its first active contact. With ``velocity_limits`` the coupled visits
-    admit no velocity-limit row, which takes the last word of every sweep (:func:`.sweep.velocity_limit_pass`), as the
-    general sweep's; a key's limit row is one step to the world in a slot, as a contact's seed. Under contact ``torsion`` a friction contact's
+    otherwise the sweep enters the batch at its first active contact. Under contact ``torsion`` a friction contact's
     spin row follows its pair (four rows: a triple's stride is four); such a contact declines the unit, and its pair's
     visit solves the triple from its metric cached for the launch (:func:`.sweep.friction_metric_law`). The dense
     articulation's change goes to the step's one leave in the walk's coordinates
@@ -326,7 +323,7 @@ def sparse_diagonal_source(sweep: DiagonalSweep) -> tuple[str, Staging]:
     """
     M, D, P = int(sweep.max_constraints), int(sweep.max_world_dofs), int(sweep.dense_dofs)
     torsion, solve_policy = sweep.torsion, sweep.solve_policy
-    speculative_contact_batches, velocity_limits = sweep.speculative_contact_batches, sweep.velocity_limits
+    speculative_contact_batches = sweep.speculative_contact_batches
     L = sweep.lanes
     batch_lanes = min(8 if P + 2 <= 8 else 16, L)
     batch_shift = batch_lanes.bit_length() - 1
@@ -348,11 +345,7 @@ def sparse_diagonal_source(sweep: DiagonalSweep) -> tuple[str, Staging]:
         lanes = Lanes(1) if scalar else warp
         store = dataclasses.replace(rows, lanes=lanes)
         op = SCALAR_ROWS if scalar else slot_rows(P, M, lanes)
-        # Velocity-limit rows wait for the last word.
-        admission = f"if (row_type == {ROW_JOINT_VELOCITY_LIMIT}) continue;" if velocity_limits and kind is None else ""
-        return row_step(
-            store, op, laws, end="row_count", kind=kind, parent=parent, admission=admission, metric=cached, pad=pad
-        )
+        return row_step(store, op, laws, end="row_count", kind=kind, parent=parent, metric=cached, pad=pad)
 
     pair_op = slot_rows(P, M, warp)
     # A unit's three rows on their shared support: their velocity terms, the pair's couplings with the normal and with
@@ -579,10 +572,9 @@ const unsigned noop_lanes = BALLOT(candidate_noop);"""
     seed = ""
     if sweep.seeded:
         apply = pair_op.axpy((("row", "seed"),), "        ", row="i")
-        seed = impulse_seed("row_count", rows.peek("i"), f"({rows.kind('i', scan=True)})", apply, warp.sync()) + "\n"
-    last_word = velocity_limit_pass(rows, pair_op, laws, end="row_count", pad="        ") if velocity_limits else ""
-    # The phase bound is the raw slot watermark: consumers clamp it to the world's rows.
-    contact_start = "min(dense_phase_bounds.data[world * 2 + 1], row_count)" if scheduled else "row_count"
+        seed = impulse_seed("row_count", rows.peek("i"), apply, warp.sync()) + "\n"
+    # The topology bound is the raw slot watermark: consumers clamp it to the world's rows.
+    contact_start = "min(topology_rows.data[world], row_count)" if scheduled else "row_count"
     body = f"""    const int line = dense_first.data[world];
     __builtin_assume(line >= 0);
     const int row_base = line * {M};
@@ -606,7 +598,7 @@ const unsigned noop_lanes = BALLOT(candidate_noop);"""
 {limit_loads}
     SYNC();
 {seed}{metric}
-{level_loop((limit_rows, "        SYNC();", independent_phase, serial), (last_word,), exit=sweep_end)}
+{level_loop((limit_rows, "        SYNC();", independent_phase, serial), exit=sweep_end)}
 
     for (int i = lane; i < row_count; i += {L}) world_impulses.data[off_dense + i] = {rows.peek("i")};
     SYNC();
@@ -640,8 +632,7 @@ class DiagonalSweep(SweepConfig):
       at a time, a lane a contact (the diagonal choice's ``units``); with
       ``speculative_contact_batches`` its serial contacts tested a batch at a time (at most 16 response entries);
     - the fused limits: each diagonal coordinate's joint limits, a lane a coordinate, exact;
-    - ``seeded``: the first sweep starts from the response of the impulses the rows carry;
-    - ``velocity_limits``: the velocity-limit rows take the last word of every sweep.
+    - ``seeded``: the first sweep starts from the response of the impulses the rows carry.
 
     A world is a warp on CUDA and one thread on the CPU (:meth:`work`); weighted rows
     (:func:`.sweep.weight_arguments`) and material contacts (:func:`.sweep.material_arguments`) add their operands.
@@ -654,7 +645,6 @@ class DiagonalSweep(SweepConfig):
     _: dataclasses.KW_ONLY
     speculative_contact_batches: bool = False
     seeded: bool = False
-    velocity_limits: bool = False
 
     ABI: ClassVar[tuple] = SPARSE_DIAGONAL_ABI
     NATIVE: ClassVar[str] = "sweep_sparse_diagonal_native"
@@ -682,7 +672,6 @@ class DiagonalSweep(SweepConfig):
             + ("_material" if self.material else "")
             + ("_torsion" if self.torsion else "")
             + ("_seeded" if self.seeded else "")
-            + ("_velocity_limits" if self.velocity_limits else "")
             + ("" if self.lanes == 32 else f"_lanes{self.lanes}")
             + self.solve_policy.suffix
         )

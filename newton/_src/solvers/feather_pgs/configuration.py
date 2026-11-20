@@ -27,15 +27,6 @@ _NUMBER_RULES = (
     ("same_articulation_contact_gap_gate", float, _finite_nonnegative, "must be finite and non-negative", False),
     ("articulation_pair_contact_gap_gate", float, _finite_nonnegative, "must be finite and non-negative", False),
     ("joint_limit_activation_gap", float, lambda value: value >= 0.0, "must be non-negative or inf", False),
-    # A finite fraction above 1 would leave speeds in (limit, fraction * limit) unclamped: a row allocates only at
-    # |qd| >= fraction * limit. inf is the explicit never-activate switch.
-    (
-        "velocity_limit_activation_fraction",
-        float,
-        lambda v: 0.0 <= v <= 1.0 or math.isinf(v),
-        "must be in [0, 1] or inf",
-        False,
-    ),
     ("pgs_contact_regularization", float, _finite_nonnegative, "must be finite and non-negative", False),
     ("restitution_velocity_threshold", float, _finite_nonnegative, "must be finite and non-negative", False),
     ("pgs_warmstart_decay", float, _finite_nonnegative, "must be finite and non-negative", True),

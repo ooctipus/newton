@@ -27,21 +27,17 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import class_plan, field_group, forest_plan, sweep_routes_tiers
+from newton._src.solvers.feather_pgs import class_plan, forest_plan, sweep_routes_tiers
 from newton._src.solvers.feather_pgs import sweep as emitter
 from newton._src.solvers.feather_pgs.device_preludes import RING
-from newton._src.solvers.feather_pgs.factor.kernels import prescale_joint_velocity_limits
 from newton._src.solvers.feather_pgs.factor.walk import WALK_LINK, WalkTrees, pack_walk_records, release_view
 from newton._src.solvers.feather_pgs.forest_plan import ClassShape
-from newton._src.solvers.feather_pgs.joint_table import JointTable
 from newton._src.solvers.feather_pgs.row_laws import (
     ROW_CONTACT,
     ROW_FRICTION,
     ROW_JOINT_LIMIT,
-    ROW_JOINT_VELOCITY_LIMIT,
     ROW_TORSION,
 )
-from newton._src.solvers.feather_pgs.rows import velocity_prescale_launch
 from newton._src.solvers.feather_pgs.sweep import LevelLaw, sweep_kernel
 from newton._src.solvers.feather_pgs.sweep_plan import Sweep, SweepLaunch
 from newton.solvers import SolverFeatherPGS
@@ -50,7 +46,6 @@ from newton.tests.feather_pgs_law_harness import (
     tier_classes,
     unpacked_rows,
 )
-from newton.tests.feather_pgs_mass_reference import MassReference
 from newton.tests.feather_pgs_patch_parity import (
     SLIDING_FEET,
     assert_loaded_anchors,
@@ -62,7 +57,6 @@ from newton.tests.feather_pgs_row_builders import (
     launched_kernels,
 )
 from newton.tests.test_feather_pgs_native_prelude import _native_snippets
-from newton.tests.test_feather_pgs_velocity_limit_law import _HAND_LIMIT, _limited_hand
 
 
 def _source(tier):
@@ -165,10 +159,7 @@ def parallel_sweep_reference(
     kinds = np.where((kinds >= 0) & ((diag > 0.0) | (kinds == 1)), kinds, -1)
     admitted = kinds >= 0
     b = case["rhs"] + J @ v - A @ lam0
-    # A joint velocity limit is one row for both sides of |v| <= mu (J = +e, rhs mu: its lower side's residual): the
-    # soft threshold of its step by its share of mu (projection_laws.velocity_limit); never idle (it counts in the bound).
-    limit = (kinds == 0) & (case["types"] == ROW_JOINT_VELOCITY_LIMIT)
-    idle = (kinds == 0) & (lam0 == 0.0) & (b >= 0.0) & ~limit
+    idle = (kinds == 0) & (lam0 == 0.0) & (b >= 0.0)
 
     def steps(counted):
         if matrix_free and not exact:
@@ -204,9 +195,7 @@ def parallel_sweep_reference(
         stepped = x.copy()
         for row in np.flatnonzero(admitted & ~joins):
             value = y[row] - step[row] * residual[row]
-            if limit[row]:
-                value = _velocity_limit(value, step[row] * mu[row])
-            elif kinds[row] == 0:
+            if kinds[row] == 0:
                 value = max(value, 0.0)
             stepped[row] = value
         projected = stepped.copy()
@@ -230,12 +219,6 @@ def parallel_sweep_reference(
             step = steps(admitted & ~idle)
             t, y = 1.0, x.copy()
     return x, v + Y.T @ (x - lam0)
-
-
-def _velocity_limit(lower, reach):
-    """:func:`.projection_laws.velocity_limit` in float64: the soft threshold of ``lower + reach`` by ``reach``."""
-    centre = lower + reach
-    return math.copysign(max(abs(centre) - reach, 0.0), centre)
 
 
 def _box_contact_rows(rng, ring_base, *, linked):
@@ -395,39 +378,6 @@ def sliding_pair_case(*, masses=(4.0, 1.0), sliding=(1.0, 1.0), live_tangents=2)
     }
 
 
-def limited_contact_case(limit=0.5):
-    """A contact whose impulse pushes a velocity-limited coordinate past its limit.
-
-    The normal closes at 2 m/s along coordinate 2 with a lever onto coordinate 3,
-    which moves at 0.3 within ``|qd_3| <= limit`` (one row, ``J = +e_3``, its lower
-    side's residual ``qd_3 + limit``, the limit in its ``mu``). Two Jacobi sweeps
-    leave the upper side violated by about 0.76; converged, the limit holds with an
-    impulse."""
-    H = np.eye(_DOFS)
-    H[3, 3] = 0.2
-    L = np.linalg.cholesky(H[::-1, ::-1])  # leaf-first: P H P^T = L L^T
-    J = np.zeros((2, _DOFS))
-    J[0, 2], J[0, 3] = 1.0, 0.6
-    J[1, 3] = 1.0  # |qd_3| <= limit, one row
-    Y = np.linalg.solve(H, J.T).T
-    cfm = 1.0e-5
-    return {
-        "J": J,
-        "Y": Y,
-        "Z": np.linalg.solve(L, J[:, ::-1].T).T[:, ::-1],
-        "L": L,
-        "cfm": cfm,
-        "diag": np.einsum("ij,ij->i", J, Y) + cfm,
-        "kinds": np.array((0, 0), np.int32),
-        "types": np.array((ROW_CONTACT, ROW_JOINT_VELOCITY_LIMIT), np.int32),
-        "parents": np.array((-1, -1), np.int32),
-        "mu": np.array((0.0, limit)),
-        "rhs": np.array((0.0, limit)),
-        "impulses": np.zeros(2),
-        "velocity": np.array((0.0, 0.0, -2.0, 0.3, 0.0, 0.0)),
-    }
-
-
 def sliding_stance(device):
     """Two box feet sliding forward at 0.5 m/s on low friction (:data:`SLIDING_FEET`), one world.
 
@@ -446,8 +396,8 @@ def world_case(solver, world=0):
     ``Y = H^-1 J^T`` over the world's coordinates, from the packed rows
     (:func:`.feather_pgs_law_harness.unpacked_rows`), and the bias in the
     right-hand side; the case takes ``v_hat`` as its velocity and cold impulses.
-    Contact and position-limit rows clamp at zero, a velocity limit takes its two-sided law and friction rows pair; a world with any
-    other row, such as a drive, mimic or connect row, raises ``ValueError``.
+    Contact and position-limit rows clamp at zero and friction rows pair; a world with any other row, such as a
+    drive, mimic or connect row, raises ``ValueError``.
     Returns the case and ``v_hat + Y^T lambda`` of the impulses the sweep solved.
     """
     count = int(solver.placement.constraint_count.numpy()[world])
@@ -458,7 +408,6 @@ def world_case(solver, world=0):
             ROW_CONTACT,
             ROW_FRICTION,
             ROW_JOINT_LIMIT,
-            ROW_JOINT_VELOCITY_LIMIT,
             ROW_TORSION,
         }
     )
@@ -490,57 +439,6 @@ def world_case(solver, world=0):
         "velocity": velocity,
     }
     return case, velocity + Y.T @ solver.placement.impulses.numpy()[world, :count].astype(np.float64)
-
-
-def prescaled_joint_velocity(model):
-    """The model's joint velocity after the pre-solve prescale of a step with joint velocity limits.
-
-    With ``enable_joint_velocity_limits`` the solver scales each articulation's
-    velocity by one ratio, the smallest ``limit / |qd|`` over its DOFs (PhysX's
-    ``maxJointVelocity`` ratio), and predicts the step's velocity from the
-    result. A solver without them, which builds this module's CPU rows, predicts
-    from the unscaled velocity. The launch takes the
-    solver.s lanes and thread count (``rows.velocity_prescale_launch``).
-    """
-    lanes, threads = velocity_prescale_launch(
-        model.articulation_start.numpy(), joint_count=model.joint_count, cuda=model.device.is_cuda
-    )
-    qd = wp.clone(model.joint_qd)
-    wp.launch(
-        prescale_joint_velocity_limits,
-        dim=threads,
-        inputs=[
-            field_group.upload(JointTable, model.device, model),
-            model.articulation_count,
-            lanes,
-            model.joint_qd,
-        ],
-        outputs=[qd],
-        device=model.device,
-    )
-    return qd.numpy()
-
-
-def with_velocity_limit_rows(case, mass_matrix, limits, cfm):
-    """``case`` with every DOF's velocity-limit row appended, as the matrix-free builder writes them.
-
-    The row ``J = +e_d`` holds both sides of ``|v_d| <= limit`` without bias (its rhs the lower side's ``limit``,
-    the limit in its ``mu``); ``mass_matrix`` is the joint-space mass matrix of the case's columns.
-    """
-    J = np.eye(len(limits))
-    count = len(J)
-    limited = dict(case)
-    limited["J"] = np.vstack((case["J"], J))
-    limited["Y"] = np.vstack((case["Y"], np.linalg.solve(mass_matrix, J.T).T))
-    limited["cfm"] = np.concatenate((np.broadcast_to(case["cfm"], len(case["J"])), np.full(count, cfm)))
-    limited["diag"] = np.einsum("ij,ij->i", limited["J"], limited["Y"]) + limited["cfm"]
-    limited["kinds"] = np.concatenate((case["kinds"], np.zeros(count, np.int32)))
-    limited["types"] = np.concatenate((case["types"], np.full(count, ROW_JOINT_VELOCITY_LIMIT, np.int32)))
-    limited["parents"] = np.concatenate((case["parents"], np.full(count, -1, np.int32)))
-    limited["mu"] = np.concatenate((case["mu"], np.asarray(limits, np.float64)))
-    limited["rhs"] = np.concatenate((case["rhs"], np.asarray(limits, np.float64)))
-    limited["impulses"] = np.concatenate((case["impulses"], np.zeros(count)))
-    return limited
 
 
 def friction_alignment(impulses, velocity):
@@ -748,46 +646,6 @@ class TestParallelPatchReference(unittest.TestCase):
                 np.testing.assert_allclose(impulses, per_row, rtol=1.0e-12, atol=1.0e-15)
                 self.assertAlmostEqual(-impulses[1], 0.5 * impulses[0], delta=1.0e-9)
                 self.assertEqual(impulses[2], 0.0)
-
-    def test_converged_tier_holds_a_pushed_limit(self):
-        """Hold the velocity limit a contact pushes past, in the Jacobi iteration alone, once it converges.
-
-        Two sweeps leave the upper side violated by more than 0.5 (the truncated iterate); converged, the limit holds
-        to the regularized diagonal's share (cfm leaves 3e-6 of the limit)."""
-        case = limited_contact_case()
-        for inkernel in (False, True):
-            options = {"matrix_free": True, "inkernel": inkernel, "exact": False, "nesterov": True, "tol": 0.0}
-            with self.subTest(inkernel=inkernel):
-                _, truncated = parallel_sweep_reference(case, sweeps=2, linked=True, **options)
-                _, converged = parallel_sweep_reference(case, sweeps=2000, linked=True, **options)
-                self.assertLess(case["rhs"][1] - case["J"][1] @ truncated, -0.5)
-                self.assertGreaterEqual(case["rhs"][1] - case["J"][1] @ converged, -1.0e-5 * case["rhs"][1])
-
-    def test_converged_tier_holds_a_pushed_sphere_at_its_limit(self):
-        """Hold a sphere the step pushes past its limit once the tier converges; two sweeps leave it past.
-
-        The rows are the first step of :func:`_pushed_sphere` as a CPU solver
-        without velocity limits builds them, started from the prescaled velocity
-        the route with them predicts from, with every DOF's velocity-limit row added
-        as the matrix-free builder writes it. Two sweeps of the matrix-free
-        linked tier (the float64 reference) leave the sphere past its limit (the truncated iterate); 2000 hold it to
-        1e-5 (the regularized diagonal's share). TestPatchParallelRoutes runs the solver's tiers on this sphere.
-        """
-        model = _pushed_sphere("cpu")
-        limits = model.joint_velocity_limit.numpy().astype(np.float64)
-        model.joint_qd.assign(prescaled_joint_velocity(model))  # what the matrix-free route predicts from
-        solver = SolverFeatherPGS(model, friction_anchor_beta=0.2, pins=SolverFeatherPGS.Pins(**_DENSE))
-        _rollout(model, solver, 1)
-        mass_matrix = MassReference(model).mass_matrix(model.joint_q.numpy(), 0)
-        case = with_velocity_limit_rows(world_case(solver)[0], mass_matrix, limits, solver.options.pgs_cfm)
-        options = {"matrix_free": True, "inkernel": False, "exact": False, "nesterov": True, "tol": 0.0, "linked": True}
-        speeds = {}
-        for sweeps in (2, 2000):
-            _, velocity = parallel_sweep_reference(case, sweeps=sweeps, **options)
-            speeds[sweeps] = float(np.max(np.abs(velocity[:2])))
-        limit = float(limits[0])
-        self.assertGreater(speeds[2], 1.05 * limit, f"two sweeps already hold the limit: {speeds}")
-        self.assertLessEqual(speeds[2000], limit * (1.0 + 1.0e-5), speeds)
 
 
 def _cpu_arm():
@@ -1133,7 +991,7 @@ def _launch_parallel(tier, case, *, device):
         "general_world_grid_stride": 1,
         "world_constraint_count": wp.array([count], dtype=wp.int32, device=device),
         "mf_constraint_count": wp.zeros(1, dtype=wp.int32, device=device),
-        "dense_phase_bounds": wp.zeros((1, 2), dtype=wp.int32, device=device),
+        "topology_rows": wp.zeros(1, dtype=wp.int32, device=device),
         "world_dof_indices": wp.array(np.arange(_DOFS, dtype=np.int32)[None], dtype=wp.int32, device=device),
         "rhs_bias": rows(case["rhs"]),
         "row_incident": rows(case["J"] @ v_hat),
@@ -1247,41 +1105,6 @@ class TestParallelPatchKernel(unittest.TestCase):
                     self.assertGreaterEqual(friction_alignment(impulses, velocity), 1.0 - 1.0e-5)
                 else:
                     self.assertAlmostEqual(-impulses[1], 0.5 * impulses[0], delta=1.0e-5)
-
-    def test_tier_follows_the_reference_and_holds_a_converged_limit(self):
-        """Follow the float64 reference with a velocity-limit row at two sweeps and at 2000, and hold the limit there.
-
-        Two sweeps leave the limit the contact's impulse drove past violated (the truncated iterate, more than 1.5
-        times the limit); 2000 hold it to a relative 1e-5.
-        """
-        device = wp.get_device("cuda:0")
-        arch = str(device.arch)
-        case = limited_contact_case()
-        limit = case["rhs"][1]
-        for sweeps in (2, 2000):
-            options = {"matrix_free": True, "inkernel": True, "exact": False, "nesterov": True}
-            with self.subTest(sweeps=sweeps):
-                kernel = sweep_routes_tiers.TierSweep(
-                    _CAPACITY,
-                    32,
-                    _DOFS,
-                    arch,
-                    rows=32,
-                    levels=LevelLaw.split(sweeps),
-                    inkernel_response=(_DOFS, 0, 0, 0),
-                    linked_rows=True,
-                )
-                impulses, velocity = _launch_parallel(kernel, case, device=device)
-                expected, expected_velocity = parallel_sweep_reference(
-                    case, sweeps=sweeps, tol=0.0, linked=True, **options
-                )
-                np.testing.assert_allclose(impulses, expected, rtol=1.0e-4, atol=1.0e-5)
-                np.testing.assert_allclose(velocity, expected_velocity, rtol=1.0e-4, atol=1.0e-5)
-                speed = case["J"][1] @ velocity.astype(np.float64)  # qd_3
-                if sweeps == 2:
-                    self.assertGreater(speed, 1.5 * limit)
-                else:
-                    self.assertLessEqual(speed, limit * (1.0 + 1.0e-5))
 
 
 _STATE_FIELDS = ("joint_q", "joint_qd", "body_q", "body_qd")
@@ -1409,25 +1232,6 @@ def _spinning_sphere(device, *, speed, spin, mu=0.5):
     qd[0], qd[3] = speed, spin
     model.joint_q.assign(q)
     model.joint_qd.assign(qd)
-    return model
-
-
-def _pushed_sphere(device, *, limit=0.5, dt=1.0 / 240.0):
-    """A resting sphere on x, y and z joints limited to ``limit``; a constant force on x adds ``2 * limit`` each step.
-
-    A step with joint velocity limits first scales a starting velocity past the
-    limits back onto them (:func:`prescaled_joint_velocity`), so a sphere that
-    starts past its limit reaches the solve within it. From rest, or from the
-    limit, the ratio is 1: the force on the first joint, which carries the whole
-    chain, takes the x velocity past the limit within each step of ``dt``, and
-    only the solve's limit rows can take it out.
-    """
-    masses = (3.0, 0.01, 1.0)
-    model = _sliding_sphere(device, (newton.Axis.X, newton.Axis.Y, newton.Axis.Z), masses, (0.0, 0.0))
-    model.joint_velocity_limit.assign(np.full(model.joint_dof_count, limit, np.float32))
-    force = np.zeros(model.joint_dof_count, np.float32)
-    force[0] = sum(masses) * 2.0 * limit / dt
-    model.joint_f.assign(force)
     return model
 
 
@@ -1569,46 +1373,6 @@ class TestPatchParallelRoutes(unittest.TestCase):
         for replay, (kept, sorted_every_build) in enumerate(zip(replays[True], replays[False], strict=True)):
             for name, value in kept.items():
                 np.testing.assert_array_equal(value, sorted_every_build[name], f"replay {replay}: {name}")
-
-    def test_limited_linked_tiers_hold_the_limit(self):
-        """Hold a velocity limit in the linked tiers' Jacobi iteration, at the automatic budget and converged.
-
-        A constant joint force pushes a resting sphere, whose joints are limited to
-        0.5, by twice its limit within every step (:func:`_pushed_sphere`): without
-        limit rows two steps carry it past twice the limit. With them the tier's
-        Jacobi iteration takes each limit's soft threshold like any row's law and holds the limit to 1e-5 at its
-        automatic budget and at 2000 sweeps; truncated to two sweeps it leaves the sphere past (the reference:
-        test_converged_tier_holds_a_pushed_sphere_at_its_limit).
-        """
-        limit = 0.5
-        model = _pushed_sphere("cuda:0", limit=limit)
-        with patch.dict(os.environ):
-            built = {
-                limits: _matrix_free_solver(model, beta=0.2, parallel_rows=32, enable_joint_velocity_limits=limits)
-                for limits in (False, True)
-            }
-            converged = _matrix_free_solver(
-                model, beta=0.2, parallel_rows=32, sweeps=2000, enable_joint_velocity_limits=True
-            )
-        for limits, solver in built.items():
-            with self.subTest(limits=limits):
-                keys = [tier.kernel.key for tier in solver.sweep.tiers]
-                self.assertTrue(keys)
-                self.assertTrue(all(_law_key(key).endswith("_linked") for key in keys))
-                state, _ = _rollout(model, solver, 2)
-                _assert_tier_owned(self, solver, 32)
-                for name in _STATE_FIELDS:
-                    self.assertTrue(np.isfinite(getattr(state, name).numpy()).all(), name)
-                speed = float(np.max(np.abs(state.joint_qd.numpy()[:2])))
-                if not limits:
-                    self.assertGreater(speed, 2.0 * limit, "the push must carry an unlimited sphere past its limit")
-                else:
-                    self.assertLessEqual(speed, limit * (1.0 + 1.0e-5))
-        keys = [tier.kernel.key for tier in converged.sweep.tiers]
-        self.assertTrue(keys and all("_sweeps2000_" in key for key in keys), keys)
-        state, _ = _rollout(model, converged, 1)
-        _assert_tier_owned(self, converged, 32)
-        self.assertLessEqual(float(np.max(np.abs(state.joint_qd.numpy()[:2]))), limit * (1.0 + 1.0e-5))
 
     def test_every_tier_takes_the_automatic_budget(self):
         """Build linked tiers with the equal-accuracy budget, or a pinned one, and record it."""
@@ -1861,17 +1625,16 @@ class TestPatchParallelPhysics(unittest.TestCase):
         """Sweep a world the linked tiers decline serially, at the tiers' fixed point.
 
         Patch friction runs the linked tiers by default. A palm and three two-link
-        fingers, every joint velocity-limited (seven limit rows, one a coordinate, no contacts), is
+        fingers at their joints' lower position limits (fourteen limit rows, two a coordinate, no contacts), is
         too large for a 4-row tier, so its world keeps the serial sweep: it lands
         where the serial route (no tier requested) lands, to float order. Both sweeps
-        accumulate velocity-limit rows, so a 32-row tier that owns the world lands
+        clamp the limit rows, so a 32-row tier that owns the world lands
         there too. Converged settings (2000 iterations and sweeps) make the law, not
         the budget, decide.
         """
-        model = _limited_hand("cuda:0")
+        model = _hand_on_limits("cuda:0")
         torques = np.array([0.03, 0.006, -0.005, 0.0002, 0.008, -0.007, 0.001], np.float32)
-        # As test_serial_sweep_converges_to_the_parallel_tier builds its routes on this hand.
-        converged = {"enable_joint_velocity_limits": True, "pins": _DENSE, "pgs_iterations": 2000, "sweeps": 2000}
+        converged = {"enable_joint_limits": True, "pins": _DENSE, "pgs_iterations": 2000, "sweeps": 2000}
         arms = {
             "declined": _matrix_free_solver(model, beta=0.2, parallel_rows=4, **converged),
             "owned": _matrix_free_solver(model, beta=0.2, parallel_rows=32, **converged),
@@ -1881,7 +1644,6 @@ class TestPatchParallelPhysics(unittest.TestCase):
             self.assertEqual(arms[name].spec.classes.tier_rows, rows, name)
             keys = [tier.kernel.key for tier in arms[name].sweep.tiers]
             self.assertEqual(bool(keys), bool(rows), name)
-            # Linked tiers take joint velocity limits in their Jacobi iteration.
             self.assertTrue(all(_law_key(key).endswith("_linked") for key in keys), keys)
         velocities = {}
         for name, solver in arms.items():
@@ -1890,13 +1652,35 @@ class TestPatchParallelPhysics(unittest.TestCase):
             solver.step(state, out, control, None, 1.0 / 240.0)
             velocities[name] = out.joint_qd.numpy().astype(np.float64)
         # The serial sweep returns early only for worlds of at most 4 dense rows and no matrix-free rows.
-        self.assertGreater(int(arms["declined"].placement.constraint_count.numpy()[0]), 4)
+        count = int(arms["declined"].placement.constraint_count.numpy()[0])
+        self.assertGreater(count, 4)
         self.assertEqual(int(arms["declined"].placement.mf_constraint_count.numpy()[0]), 0)
         _assert_tier_owned(self, arms["owned"], 32)
-        limited = np.abs(velocities["serial"])
-        self.assertTrue(np.any(limited >= _HAND_LIMIT * (1.0 - 1.0e-4)), "no limit binds")
+        self.assertTrue(np.any(arms["serial"].placement.impulses.numpy()[0, :count] > 0.0), "no limit binds")
         np.testing.assert_allclose(velocities["declined"], velocities["serial"], rtol=0.0, atol=1.0e-6)
         np.testing.assert_allclose(velocities["owned"], velocities["serial"], rtol=0.0, atol=1.0e-5)
+
+
+def _hand_on_limits(device):
+    """A palm joint carrying three two-link fingers in one plane, without gravity, every joint at rest on the lower
+    end of its ``[0, 0.5]`` rad position limit."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    axis = wp.vec3(0.0, 0.0, 1.0)
+    limits = {"limit_lower": 0.0, "limit_upper": 0.5}
+    palm = builder.add_link(mass=0.4, inertia=wp.mat33(np.eye(3) * 2.0e-3))
+    joints = [builder.add_joint_revolute(-1, palm, axis=axis, **limits)]
+    for finger in range(3):
+        parent, offset = palm, wp.vec3(0.03 * (finger - 1), 0.08, 0.0)
+        for _ in range(2):
+            link = builder.add_link(mass=0.05, inertia=wp.mat33(np.eye(3) * 2.0e-5))
+            joints.append(
+                builder.add_joint_revolute(
+                    parent, link, axis=axis, parent_xform=wp.transform(offset, wp.quat_identity()), **limits
+                )
+            )
+            parent, offset = link, wp.vec3(0.0, 0.04, 0.0)
+    builder.add_articulation(joints)
+    return builder.finalize(device=device)
 
 
 if __name__ == "__main__":

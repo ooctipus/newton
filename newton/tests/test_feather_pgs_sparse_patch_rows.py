@@ -145,10 +145,7 @@ class TestFeatherPGSSparsePatchRowsCuda(unittest.TestCase):
             low, high = (middle, high) if staging(middle).fits(budget) else (low, middle)
         active = staging(low, active_rows=True)
         self.assertFalse(active.fits(budget))
-        options = {
-            "enable_joint_velocity_limits": False,
-            "dense_max_constraints": low,
-        }
+        options = {"dense_max_constraints": low}
         full = staging(low)
         for name, law in (("patch", {}),):
             with self.subTest(law=name):

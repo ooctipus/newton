@@ -29,7 +29,6 @@ from operator import attrgetter, itemgetter
 from types import MappingProxyType
 from typing import NamedTuple
 
-import numpy as np
 import warp as wp
 
 from ...core.execution import Beside
@@ -62,23 +61,19 @@ class Capacities:
     row_pitch: int
     """A world's rows in the row store: the dense rows, then the free-body rows where free bodies exist."""
     free_contact_rows: bool
-    """The free bodies' contacts and speed rows keep a run of their own (the free-body rows): only where a world can
-    take the colored mapping, whose units are that run's (:func:`.sweep_units.capable_worlds`)."""
-    speed_rows: int
-    """The free bodies' speed rows a world holds on the line (two a body under speed limits), where they are rows of
-    the line: the line's last rows, from its phase bound 2 (:meth:`.rows.RowLaws.bound_phase`); 0 elsewhere."""
+    """The free bodies' contacts keep a run of their own (the free-body rows): only where a world can take the colored
+    mapping, whose units are that run's (:func:`.sweep_units.capable_worlds`)."""
 
     @classmethod
-    def build(cls, options, forest: ForestPlan, link_rows: int, speed_limits: bool) -> Capacities:
+    def build(cls, options, forest: ForestPlan, link_rows: int) -> Capacities:
         """The capacities from the options and the forest: a link's rows are the closure's, on top of the rows the
         option gives the world's contacts (``link_rows`` a world).
 
-        A free body is a one-node tree: its contacts and speed rows are rows of the line like any other, written by
-        the one writer and swept by the class's sweep. They keep a run of their own only where a world can take the
-        colored mapping; elsewhere their capacity (``mf_max_constraints``) and the speed rows' join the line's dense
-        rows, and the free-body rows hold none."""
+        A free body is a one-node tree: its contacts are rows of the line like any other, written by the one writer
+        and swept by the class's sweep. They keep a run of their own only where a world can take the colored mapping;
+        elsewhere their capacity (``mf_max_constraints``) joins the line's dense rows, and the free-body rows hold
+        none."""
         from . import sweep_units  # noqa: PLC0415
-        from .row_kernels import RIGID_SPEED_ROWS  # noqa: PLC0415
 
         dense = int(options.dense_max_constraints) + int(link_rows)
         free = int(options.mf_max_constraints)
@@ -86,10 +81,8 @@ class Capacities:
         # The production rule decides the run (the rows' layout); a test that relaxes the rule changes only which of
         # the run's worlds the colored mapping takes.
         run = bool(free_bodies and sweep_units.capable_worlds(forest.free_rigid_per_world, free).size > 0)
-        speed_rows = 0
         if free_bodies and not run:
-            speed_rows = RIGID_SPEED_ROWS * int(np.max(forest.free_rigid_per_world, initial=0)) if speed_limits else 0
-            dense += free + speed_rows
+            dense += free
             # The line ends on a whole L1 line, so every world's line starts on one: the free bodies' (empty) rows
             # fill it, one at least.
             line = L1_LINE_BYTES // 4
@@ -99,7 +92,6 @@ class Capacities:
             free_body_rows=free,
             row_pitch=dense + (free if free_bodies else 0),
             free_contact_rows=run,
-            speed_rows=speed_rows,
         )
 
 
@@ -316,8 +308,6 @@ class Step:
         self.contacts, self.dt, self.index = contacts, dt, index
         # The collision pass's event, waited on once, before the first stage that reads what it produced.
         self.event = event
-        # The predictor's velocity (prescaled where velocities are limited), from stage 1.
-        self.qd = None
 
     def enter(self, cut, cache_valid) -> None:
         self.state_in, self.state_out, self.control = cut.enter(
@@ -345,13 +335,6 @@ class Step:
         if self.event is not None:
             wp.get_stream(device).wait_event(self.event)
             self.event = None
-
-    def prescale(self, factor, prescaled) -> None:
-        factor.prescale_velocity(self.state_in.joint_qd, prescaled)
-        self.qd = prescaled
-
-    def velocity(self) -> None:
-        self.qd = self.state_in.joint_qd
 
     def count(self, solver) -> None:
         solver._step += 1
@@ -386,7 +369,18 @@ class Read(NamedTuple):
 
 
 STEP, STATE_IN, STATE_OUT, CONTROL, CONTACTS, DT, QD, SOURCE_IN, SOURCE_OUT = (
-    Read(name) for name in (None, "state_in", "state_out", "control", "contacts", "dt", "qd", "source_in", "source_out")
+    Read(name)
+    for name in (
+        None,
+        "state_in",
+        "state_out",
+        "control",
+        "contacts",
+        "dt",
+        "state_in.joint_qd",
+        "source_in",
+        "source_out",
+    )
 )
 
 
@@ -433,7 +427,7 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
     model, options, forest, diagnostics = solver.model, solver.options, spec.forest, spec.diagnostics
     articulated, particles, pure, warm = spec.articulated, spec.particles, spec.pure_forest, spec.laws.warm_start
     v_hat, v_out, colored, rest = solver.v_hat, solver.v_out, sweep.colored_units, solver.sleep
-    device, limited, preelimination = model.device, options.enable_joint_velocity_limits, spec.laws.preelimination
+    device, preelimination = model.device, spec.laws.preelimination
 
     # The drives' stage takes the held plan's coordinates (a one-coordinate tree's predict decides its own drive) and
     # overlaps FK/ID beside the step's stream (Beside); the mask (refresh) joins them.
@@ -452,9 +446,6 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
     # holds none (no contact is admitted there either).
     holds, run = placement.walks, placement.free_contact_rows
     limit_sizes = laws.limit_sizes(solver) if options.enable_joint_limits and holds else ()
-    velocity_limits = laws.velocity_limit_warp_kernels and holds
-    speed_rows = placement.speed_rows or spec.classes.tiers is not None
-    free_limits = forest.has_free_rigid_bodies and placement.rigid_velocity_limit_slot is not None
     # The rows a world's topology fixes (links, mimics, limits) are known once their families are written, before the
     # contacts: where the one writer walks the general placement's rows, it walks them beside the contact pass (Beside)
     # and the rest after it, the two parts joined before the rest (where a tier walks a world's rows, only a few:
@@ -503,15 +494,13 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
         (s1, "check_call", True, (cached_state_binding, "check_call", device, STATE_IN, STATE_OUT, DT)),
         (s1, "drives_on_stream", forked, (STEP, "beside", overlap, *drive)),
         (s1, "drives", drives and overlap is None, drive),
-        (s1, "prescale", limited, (STEP, "prescale", factor, solver.qd_work)),
-        (s1, "velocity", not limited, (STEP, "velocity")),
-        (s1, "fk_id", True, (factor, "fk_id", STATE_IN, STATE_OUT, QD, DT)),
+        (s1, "fk_id", True, (factor, "fk_id", STATE_IN, STATE_OUT, DT)),
         (s1, "join_drives", forked, (overlap, "join")),
         (s1, "refresh", True, (factor, "refresh", DT)),
         (s1, "advance_clock", factor.walk_arts is None, (factor, "advance_clock", DT)),
         (s1, "walk_step", factor.walk_arts is not None, (factor, "walk_step", STATE_IN, DT)),
-        (s3, "predict", True, (factor, "predict", STATE_IN, CONTROL, QD, DT)),
-        (s3, "correct_free_roots", free_roots, (factor, "correct_free_roots", STATE_IN, QD, DT, v_hat)),
+        (s3, "predict", True, (factor, "predict", STATE_IN, CONTROL, DT)),
+        (s3, "correct_free_roots", free_roots, (factor, "correct_free_roots", STATE_IN, DT, v_hat)),
         (s3, "damp_spin", options.angular_damping != 0.0, (factor, "damp_spin", DT, v_hat)),
         (s3, "free_body_bases", regions, (STEP, "beside", bases, sweep.regions, "bases", v_hat, CONTACTS)),
         (dynamics, "snapshots", "snapshots" in diagnostics, *snapshots),
@@ -526,17 +515,12 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
         (s4, "write_links", laws.link_count > 0 and holds, (laws, "write_links", solver, STATE_IN)),
         (s4, "prepare_fused_limits", spec.classes.fused_sizes, (laws, "prepare_fused_limits", solver, STATE_IN, DT)),
         (s4, "write_limits", limit_sizes, (laws, "write_limits", solver, STATE_IN, DT, limit_sizes)),
-        (s4, "bound_limits", True, (laws, "bound_phase", solver, 0)),
-        (s4, "write_velocity_limits", velocity_limits, (laws, "write_velocity_limits", solver, STATE_IN, DT)),
-        (s4, "bound_velocity_limits", True, (laws, "bound_phase", solver, 1)),
+        (s4, "bound_topology", True, (laws, "bound_topology", solver)),
         (s4, "write_topology_rows", topology is not None, *clear, (STEP, "beside", topology, *walk, WRITE_TOPOLOGY)),
         (s4, "write_contacts", True, (laws, "write_contacts", solver, STATE_IN, factor, CONTACTS, DT, route.producer)),
-        # The free bodies' run (their contacts and speed rows) where a colored world holds one, else the line's speed
-        # rows, its last: the tiers and the sweeps read where they start.
+        # The free bodies' run (their contacts) where a colored world holds one.
         (s4, "bound_free_body_contacts", run, (laws, "bound_free_body_contacts", solver)),
-        (s4, "bound_speed_rows", speed_rows, (laws, "bound_speed_rows", solver)),
-        (s4, "allocate_free_body_limits", free_limits, (laws, "allocate_free_body_limits", solver)),
-        (s4, "write_free_bodies", run, (laws, "write_free_bodies", solver, STATE_IN, CONTACTS, DT)),
+        (s4, "write_free_bodies", run and not regions, (laws, "write_free_bodies", solver, STATE_IN, CONTACTS, DT)),
         # The pass's close: the row classes' counts with status (the free bodies' where their run is staged), the
         # overflow latch and the warning, one launch.
         (

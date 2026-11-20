@@ -53,7 +53,6 @@ from .factor.kernels import (
     invalidate_articulation_fk_id_cache,
     invalidate_fk_id_cache_for_articulations,
     invalidate_fk_id_cache_for_gravity,
-    prescale_joint_velocity_limits,
     take_gravity,
 )
 from .factor.walk import (
@@ -72,7 +71,6 @@ from .factor.walk import (
     walk_work,
 )
 from .field_group import SolverArrays
-from .joint_table import JointTable
 from .path_selection import json_value
 from .row_laws import LINK_ROWS
 from .spatial_laws import motor_line, spring_damper_stiffness
@@ -221,22 +219,18 @@ class TreeFactor:
     # Construction
     # ---------------------------------------------------------------------------------------------------------------
 
-    def kinematic_state(self, *, sparse_velocity_limits: bool = False) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def kinematic_state(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Derive the kinematic masks and effective joint armature from the body flags, changing nothing.
 
         The coordinate mask is the rows' prescribed coordinates (:data:`.joint_table.JOINTS`): none takes a row on
         it alone.
 
-        Args:
-            sparse_velocity_limits: Whether the native sparse factor carries velocity-limit rows.
-
         Returns:
             ``(armature, joint_mask, dof_mask)`` for :meth:`apply_kinematic_state`.
 
         Raises:
-            RuntimeError: If the flags make a DOF of a sparse split or
-                velocity-limit response kinematic, or a DOF of a
-                prescribed-response articulation dynamic. Both need a new solver.
+            RuntimeError: If the flags make a DOF of a prescribed-response articulation dynamic, which needs a new
+                solver.
         """
         model = self.model
         armature = model.joint_armature.numpy().copy()
@@ -253,11 +247,6 @@ class TreeFactor:
             joint, offset = host_index.expand(np.maximum(joint_qd_start[kinematic_joints + 1] - dof_start, 0))
             dof_mask[dof_start[joint] + offset] = 1
             armature[dof_start[joint] + offset] = 1.0e10
-
-        if sparse_velocity_limits and np.any(dof_mask):
-            raise RuntimeError(
-                "Sparse response gained prescribed DOFs; reconstruct the solver and recapture its CUDA graph."
-            )
 
         if self.forest is not None:
             selected = np.nonzero(self.forest.prescribed_articulation_host != 0)[0]
@@ -311,7 +300,6 @@ class TreeFactor:
         view.dof_body = view.body_joint = wp.zeros(1, dtype=wp.int32, device=device)
         view.du = wp.zeros(1, dtype=wp.float32, device=device)
         view.release = release_view(max(int(model.articulation_count), 1), 0, 1, device)
-        view.first_art = wp.full(1, -1, dtype=wp.int32, device=device)
         view.cls = wp.zeros(1, dtype=wp.int32, device=device)
         return view
 
@@ -652,30 +640,13 @@ class TreeFactor:
     # ---------------------------------------------------------------------------------------------------------------
 
     # Stages 1-3 (:func:`.step_plan._stages` chooses which run): the drives' K and u0 (on the dynamics stream where
-    # they overlap FK/ID), the prescaled velocity, FK/ID, the mass-update mask and the factor refresh, the walk's
+    # they overlap FK/ID), FK/ID, the mass-update mask and the factor refresh, the walk's
     # refresh, which advances the step's clock, then the predictor and the free roots' corrections. joint_tau holds
     # only u0: the predictor adds the current external, control and bias contributions.
 
-    def prescale_velocity(self, joint_qd: wp.array, prescaled_joint_qd: wp.array) -> None:
-        """Write every DOF's PhysX-prescaled joint velocity in one launch, without a separate copy."""
-        model = self.model
-        wp.launch(
-            prescale_joint_velocity_limits,
-            dim=self.laws.velocity_prescale_threads,
-            inputs=[
-                field_group.bind(JointTable, model=model, factor=self, forest=self.forest),
-                model.articulation_count,
-                self.laws.velocity_prescale_lanes,
-                joint_qd,
-            ],
-            outputs=[prescaled_joint_qd],
-            device=model.device,
-        )
-
-    def fk_id(self, state_in, state_out, qd: wp.array, dt: float) -> None:
-        """Forward kinematics and inverse-dynamics terms, at the predictor's velocity ``qd`` (prescaled when
-        limited)."""
-        self.held.begin(state_in, self, qd, dt, state_out=state_out)
+    def fk_id(self, state_in, state_out, dt: float) -> None:
+        """Forward kinematics and inverse-dynamics terms, at the input state's velocity."""
+        self.held.begin(state_in, self, dt, state_out=state_out)
 
     def prepare_drives(
         self, state_in, control, dt: float, v_hat: wp.array, v_out: wp.array, dofs: wp.array | None = None
@@ -727,14 +698,14 @@ class TreeFactor:
         )
         self.held.refresh(self)
 
-    def predict(self, state_in, control, qd: wp.array, dt: float) -> None:
-        """Stage 3: ``v_hat = qd + h H^-1 (tau - c)``. Each tree's launch holds the drives' saturation decision and,
+    def predict(self, state_in, control, dt: float) -> None:
+        """Stage 3: ``v_hat = qd + h H^-1 (tau - c)`` at the input state's ``qd``. Each tree's launch holds the drives' saturation decision and,
         where it moved a drive, the decided step by the border on the walk (:data:`.tree_kinetic_state.SATURATE_DRIVES`,
         :func:`.tree_kinetic_state.border_solve`); the factor keeps every ``K``, so no saturation ever asks the refresh
         for a factor."""
-        self.held.predict(state_in, self, control, qd, dt)
+        self.held.predict(state_in, self, control, dt)
 
-    def correct_free_roots(self, state_in, qd: wp.array, dt: float, v_hat: wp.array) -> None:
+    def correct_free_roots(self, state_in, dt: float, v_hat: wp.array) -> None:
         """Apply canonical gyro physics to the free roots after the held prediction, where a free root and a free
         rigid body exist."""
         model, forest = self.model, self.forest
@@ -753,7 +724,7 @@ class TreeFactor:
                 state_in.body_q,
                 model.body_inertia,
                 self.walk_data,
-                qd,
+                state_in.joint_qd,
                 dt,
             ],
             outputs=[v_hat],
@@ -915,13 +886,6 @@ class TreeFactor:
             depth if self.walk_slip_capacity else 1,
             device,
         )
-        # The responding articulation whose coordinates start at each global coordinate (-1 elsewhere), by which a
-        # matrix-free sweep finds a free body's tree.
-        first_art = np.full(dofs, -1, dtype=np.int32)
-        starts = forest.articulation_dof_start.numpy()
-        responding = np.flatnonzero(forest.articulation_response_dof_count.numpy() > 0)
-        first_art[starts[responding]] = responding
-        view.first_art = wp.array(first_art, dtype=wp.int32, device=device)
         view.cls = self.walk_class
         self.walk_trees = view
         self.plan_leave()

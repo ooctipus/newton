@@ -113,7 +113,6 @@ def _build(
     shoulder=False,
     quadruped=False,
     cabinet=False,
-    speed_limit=None,
     links=3,
     pads=None,
 ):
@@ -125,11 +124,9 @@ def _build(
     conveyor does in manipulation scenes. With ``quadruped`` a free-root
     18-coordinate walker stands beside them. With ``cabinet`` a fixed
     two-drawer cabinet (independent prismatic coordinates: the solver's
-    diagonal-mass response class) replaces the box. ``speed_limit`` bounds
-    every arm joint's velocity (the hand recipes' joint velocity limits).
-    ``links`` is the arm's joint count (17 with the free box is the Kuka
-    scenes' class, a hub on the tiers). ``pads`` replaces
-    the arm's capsule with a row of sphere pads that touch the box's side when
+    diagonal-mass response class) replaces the box. ``links`` is the arm's
+    joint count (17 with the free box is the Kuka scenes' class, a hub on the
+    tiers). ``pads`` replaces the arm's capsule with a row of sphere pads that touch the box's side when
     the first joint is at ``pads`` rad: one contact region, whose end pads own
     its two friction anchors and whose inner pads are normal-only units.
     """
@@ -182,7 +179,6 @@ def _build(
                     target_kd=2.0,
                     limit_lower=-1.5,
                     limit_upper=1.5,
-                    velocity_limit=speed_limit,
                 )
             )
         parent = body
@@ -494,24 +490,6 @@ class TestFeatherPGSMixedTreeFreeBody(unittest.TestCase):
         self.assertLessEqual(float(q[-1, :, 3:5].max()), 1.0e-3)
         self.assertEqual(int(owner.groups[0].status.numpy().sum()), 0)
         self._assert_patch_history(plain_solver, owner_solver, loaded=False)
-
-    def test_joint_velocity_limits_are_owned(self):
-        """Joint velocity limits (the hand recipes) are ordinary rows over the owner's motion velocities."""
-        model = _build(wp.get_device("cuda:0"), speed_limit=0.8)
-        recipe = {"enable_joint_velocity_limits": True}
-        plain_solver, _plain_owner, plain, plain_qd = _rollout(model, owner=False, attrs=recipe)
-        self.assertTrue(plain_solver.options.enable_joint_velocity_limits)
-        owner_solver, owner, cached, cached_qd = _rollout(model, owner=True, attrs=recipe)
-        self.assertIsInstance(owner, HeldTree)
-        self.assertFalse(any(group.bank_compare for group in owner.groups))
-        self.assertTrue(np.isfinite(cached).all() and np.isfinite(cached_qd).all())
-        np.testing.assert_allclose(cached[:, :, :3], plain[:, :, :3], atol=1.0e-4, rtol=0.0)
-        np.testing.assert_allclose(cached[:, :, 3:], plain[:, :, 3:], atol=1.0e-4, rtol=0.0)
-        np.testing.assert_allclose(cached_qd, plain_qd, atol=2.0e-3, rtol=0.0)
-        # The swung joint started at 1.5 rad/s and was held under its 0.8 rad/s limit.
-        q = owner_solver.joint_q_trajectory.reshape(len(cached), model.world_count, -1)
-        self.assertLess(float(np.abs(np.diff(q[:, :, 0], axis=0)).max()) / DT, 1.0)
-        self._assert_patch_history(plain_solver, owner_solver)
 
     def test_hub_scenes_are_owned(self):
         """A 17-joint arm with a free box per world (the Kuka scenes' class), a hub whose rows the tiers step at once,

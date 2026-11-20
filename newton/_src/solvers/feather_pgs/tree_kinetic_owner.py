@@ -87,13 +87,12 @@ class TreeKineticState:
 
         self.sparse = sparse_owner
         self.solver = solver = sparse_owner.solver
-        self.motion_velocity = bool(solver.options.enable_joint_velocity_limits)
         model, device = solver.model, solver.model.device
         self.complete = complete
         host = sparse_owner.host
         self.layout, parent, tables = make_plan(model, sparse_owner, complete=complete)
-        # Motion-velocity layouts validate by the stamps alone: their repair reads the prescaled velocity.
-        self.bank_compare = not self.motion_velocity
+        # A repair compares its input bank with the bank its cache was published into.
+        self.bank_compare = True
         self.group_count = sparse_owner.plan.group_to_art.size
         # A composite owner passes what it read for all of its groups; a direct construction reads it here.
         self.clocked = solver.options.diagnostics.stage_clocks if clocked is None else bool(clocked)
@@ -275,7 +274,6 @@ class TreeKineticState:
             # "content": a repair whose input bank is not the bank the cache was published into compares the two banks
             # word for word; "identity": the bank's pointers alone.
             "input_validation": "content" if self.bank_compare else "identity",
-            "motion_velocity": bool(self.motion_velocity),
             "publishes_twists": bool(self.publishes_twists),
             "kernels": {
                 "repair": kernel_key(self.repair_kernel),
@@ -296,7 +294,6 @@ class TreeKineticState:
             self.schedules,
             layout=layout,
             twist_roots=self._twist_roots,
-            motion_velocity=self.motion_velocity,
             bank_coordinates=self.bank_coordinates if self.bank_compare else 0,
             clocked=self.clocked,
             diagonal=self.diagonal_mass,
@@ -381,7 +378,7 @@ class TreeKineticState:
             classes.append(WalkClass(table.parent, table.first, half))
         return tuple(classes)
 
-    def _force_input(self, state_in, state_aug, control, predictor_qd, dt):
+    def _force_input(self, state_in, state_aug, control, dt):
         """Bind the predictor's inputs (tree_kinetic_state.FORCE_INPUT) for one step."""
         from .tree_kinetic_state import ForceInput  # noqa: PLC0415
 
@@ -397,7 +394,6 @@ class TreeKineticState:
             state_in=state_in,
             state_aug=state_aug,
             control=control,
-            predictor_qd=predictor_qd,
             dt=dt,
             stage_clocks=cached_state_binding.stage_clocks(solver),
             predicted_twist=self._no_twists if twists is None else twists,
@@ -494,13 +490,12 @@ class TreeKineticState:
         )
         return bank
 
-    def begin(self, state_in, state_aug, stage3_qd, dt, *, state_out=None):
+    def begin(self, state_in, state_aug, dt, *, state_out=None):
         """Repair current caches or late-request geometry before any factor read.
 
         Args:
             state_in: The step's input bank, which the repair publishes into.
             state_aug: The solver's augmented state.
-            stage3_qd: The predictor velocity (the prescaled velocity of a motion-velocity layout).
             dt: The step duration [s].
             state_out: The step's output bank. A group whose cache the last finish
                 published into it keeps that cache when ``state_in`` holds the same
@@ -508,9 +503,9 @@ class TreeKineticState:
                 validates by the input bank's stamps alone.
         """
         data = self._publication(state_in, state_aug, state_in, dt)
-        # The repair takes the launch ABI of the finish (get_state_kernel): only an alternate-motion repair reads
-        # stage3_qd, otherwise the state's own velocity; only a comparing repair reads a bank: the output bank, or the
-        # input bank itself where there is none to compare (every group stamped with it exits before comparing).
+        # The repair takes the launch ABI of the finish (get_state_kernel): a comparing repair reads a bank, the output
+        # bank, or the input bank itself where there is none to compare (every group stamped with it exits before
+        # comparing).
         bank = self._bank(state_out if self.bank_compare and state_out is not None else state_in)
         wp.launch_tiled(
             self.repair_kernel,
@@ -522,19 +517,18 @@ class TreeKineticState:
                 self.data,
                 self.solver.factor.mass_update_requested,
                 self.solver.factor.clock,
-                stage3_qd,
                 bank,
             ],
             block_dim=self.block_dim,
             device=self.solver.model.device,
         )
 
-    def predict(self, state_in, state_aug, control, stage3_qd, dt):
+    def predict(self, state_in, state_aug, control, dt):
         """Apply live force buckets through held W with original root transport (a rest tree has none)."""
         if self.predictor_kernel is None:
             return
         solver = self.solver
-        force = self._force_input(state_in, state_aug, control, stage3_qd, dt)
+        force = self._force_input(state_in, state_aug, control, dt)
         # A group of prescribed roots answers zero, and nothing reads that answer: its coordinates' v_hat and qdd, which
         # the finish overwrites (v_out = qd, qdd = 0) and the rows never read (a row takes a prescribed body's motion
         # from its published twist, contact_laws.prescribed_target). It launches only where the contacts read its
@@ -575,9 +569,7 @@ class TreeKineticState:
                 self.data,
                 self.solver.factor.mass_update_requested,
                 self.solver.factor.clock,
-                # The repair's motion input of the shared launch ABI, unread by a finish; the input bank, which a
-                # prescribed group's finish compares its output bank with.
-                state_in.joint_qd,
+                # The input bank, which a prescribed group's finish compares its output bank with.
                 self._bank(state_in) if self.prescribed else self._no_bank,
             ],
             block_dim=self.block_dim,

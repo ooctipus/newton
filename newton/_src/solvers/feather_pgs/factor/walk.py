@@ -1153,10 +1153,8 @@ def walk_down_prelude(
     walk's coordinates of known velocities (``u = L^T P qd``, :data:`.tree_scan.ENTER`), the same walk with another
     combine.
 
-    No shared memory and no scratch. The step's one leave takes the leave (:func:`walk_leave_kernel`), the audit the
-    enter (:func:`walk_enter_kernel`), and the general sweep's free bodies both, on their one-body class
-    (:data:`FREE_BODY_WALK`): a speed row reads its body's velocity by the leave and pushes its change back by the
-    enter.
+    No shared memory and no scratch. The step's one leave takes the leave (:func:`walk_leave_kernel`) and the audit the
+    enter (:func:`walk_enter_kernel`).
 
     Args:
         classes: The walking classes, indexed by ``cls``.
@@ -1477,9 +1475,6 @@ class WalkTrees:
     - ``release``: the release of each tree's slips (the block primitive's first phase, :class:`WalkRelease`), which the
       predictor's border writes (:func:`.tree_kinetic_state.border_solve`, FL3.9): the rows take ``R``, the leave
       ``R^T`` and the audit's coordinates ``R^-T``;
-    - ``first_art``: the responding articulation whose coordinates start at
-      each global coordinate (-1 elsewhere), by which a matrix-free sweep finds a free body's tree
-      (:class:`.sweep_routes.FreeBodyCoordinates`);
     - ``cls``: each walking articulation's class (:attr:`.tree_factor.TreeFactor.walk_classes`), by which a lane reads
       its tree's path from the classes' tables in constant memory (``WALK_TREE``, :func:`walk_prelude`).
     """
@@ -1499,7 +1494,6 @@ class WalkTrees:
     body_joint: wp.array[int]
     release: WalkRelease
     du: wp.array[float]
-    first_art: wp.array[int]
     cls: wp.array[int]
 
 

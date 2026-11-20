@@ -59,7 +59,6 @@ from newton._src.solvers.feather_pgs.factor.walk import (
 )
 from newton._src.solvers.feather_pgs.kernel_template import KernelTemplate, items, params
 from newton._src.solvers.feather_pgs.placement import Placement
-from newton._src.solvers.feather_pgs.row_laws import ROW_SPEED
 from newton._src.solvers.feather_pgs.tree_factor import prepare_augmented_drives
 from newton._src.solvers.feather_pgs.tree_kinetic_layout import TreeLayout
 from newton._src.solvers.feather_pgs.tree_plan import UP_FIRST, UP_SUMS, TreePlan, local_parents
@@ -523,7 +522,7 @@ class TestHeldTreeChains(unittest.TestCase):
                 state.joint_qd.assign(rng.uniform(-0.5, 0.5, model.joint_dof_count).astype(np.float32))
                 expected = model.state()
                 newton.eval_fk(model, state.joint_q, state.joint_qd, expected)
-                owner.begin(state, solver.factor, state.joint_qd, 1.0 / 240.0)
+                owner.begin(state, solver.factor, 1.0 / 240.0)
                 np.testing.assert_allclose(state.body_q.numpy(), expected.body_q.numpy(), atol=2e-6)
                 np.testing.assert_allclose(state.body_qd.numpy(), expected.body_qd.numpy(), atol=2e-5)
                 np.testing.assert_array_equal(owner.status.numpy(), 0)
@@ -755,7 +754,6 @@ class Capture:
                 sides[..., 1],
                 dofs[..., 0],
                 dofs[..., 1],
-                placement.row_type.numpy()[:, placement.body_base :].copy(),
             )
         self.v_hat = solver.v_hat.numpy().astype(np.float64)
         self.v_out = solver.v_out.numpy().astype(np.float64)
@@ -835,8 +833,6 @@ class RowCheck:
     """Worst ``|dv_walk - dv_step| / |dv_walk|`` of an articulation's leave."""
     leave_ratio: float = 0.0
     """The same over its rounding, ``n u kappa`` and the publication's (pass: at most ``BOUND``)."""
-    ball_worlds: int = 0
-    """Worlds whose speed ball acted: their ``du`` is a law's, not ``sum Z lambda``, so their leave is not compared."""
     operators: tuple = ()
 
 
@@ -904,11 +900,10 @@ def check_rows(solver, joint_q: np.ndarray, capture: Capture, rng) -> RowCheck:
     # The leave: the step's du is sum Z lambda over its final rows; each articulation leaves it once.
     D = int(forest.max_world_dofs)
     du = np.zeros((int(forest.world_count), max(D, 1)))
-    ball = np.zeros(du.shape[0], dtype=bool)
     # Every stored row's footprints, the one writer's (FL3.3, whose rows form no J), but a world whose tier walks its
     # rows: those above its family bound stay in its sweep, so its du is not theirs.
     if getattr(solver.placement, "walks", False):
-        kinds_line, walked = solver.placement.row_type.numpy(), walked_worlds(solver)
+        walked = walked_worlds(solver)
         # Each entry's world coordinate, whatever the rows' layout (by side, dense, or by support class).
         coordinates = packed_coordinates(solver)
         for world, count in enumerate(capture.counts):
@@ -917,29 +912,19 @@ def check_rows(solver, joint_q: np.ndarray, capture: Capture, rng) -> RowCheck:
             line = int(capture.dense_first[world])
             for row in range(int(count)):
                 lam = capture.impulses[line, row]
-                if kinds_line[line, row] == ROW_SPEED:
-                    # A speed row of the line: its speed ball's law, not a row (as the free bodies' run's below).
-                    ball[world] |= lam != 0.0
-                    continue
                 held = coordinates[line, row] >= 0
                 du[world, coordinates[line, row, held]] += capture.Z_final[line, row, held] * lam
     if capture.mf_final is not None:
-        Z_a, Z_b, lam, counts, _, _, dof_a, dof_b, kinds = capture.mf_final
+        Z_a, Z_b, lam, counts, _, _, dof_a, dof_b = capture.mf_final
         for world, count in enumerate(counts):
             line = int(capture.mf_first[world])
             for row in range(int(count)):
-                if kinds[line, row] == ROW_SPEED:
-                    # A free body's speed row is its speed ball's: a magnitude against the body's velocity as each
-                    # visit finds it, a law and not a row, so its world's du is not sum Z lambda.
-                    ball[world] |= lam[line, row] != 0.0
-                    continue
                 for dof, Z in ((dof_a, Z_a), (dof_b, Z_b)):
                     if dof[line, row] >= 0:
                         du[world, dof[line, row] : dof[line, row] + 6] += Z[line, row] * lam[line, row]
-    out.ball_worlds = int(np.count_nonzero(ball))
     for art in range(solver.model.articulation_count):
         n, world = int(sizes[art]), int(art_world[art])
-        if n <= 0 or world < 0 or ball[world] or not np.any(du[world, offsets[art] : offsets[art] + n]):
+        if n <= 0 or world < 0 or not np.any(du[world, offsets[art] : offsets[art] + n]):
             continue
         walk, _, kappa = walk_of(art)
         dv, _ = walk.down(du[world, offsets[art] : offsets[art] + n])
@@ -1356,7 +1341,7 @@ def report_walk() -> None:
             f"  {physics.name:44s} {route.name:16s} rows {r.rows:4d} sides {r.sides:4d} seeded {r.seeded:4d} "
             f"free {r.free_rows:3d} kappa {r.kappa:8.1e} | Z: step {r.forward_step:8.1e} walk32 {r.forward_walk32:8.1e} "
             f"ratio {r.ratio:6.2f} | writer {r.writer:7.1e} seed {r.seed:7.1e} meet {r.meet:7.1e} | leave {r.leave:8.1e} "
-            f"ratio {r.leave_ratio:6.2f} ball {r.ball_worlds} | {','.join(sorted(set(r.operators)))}",
+            f"ratio {r.leave_ratio:6.2f} | {','.join(sorted(set(r.operators)))}",
             flush=True,
         )
 
@@ -1366,7 +1351,7 @@ def report_walk() -> None:
 # =====================================================================================================================
 
 UNITS = (1, 2, 3, 4)
-"""Rows a lane walks: a limit, a velocity limit's pair, a point contact, a contact with spin."""
+"""Rows a lane walks: a limit, a pair of rows, a point contact, a contact with spin."""
 UNSTORED = ("sparse", "sparse_triplets", "emit_parallel")
 """The CUDA catalogue's routes whose rows no store holds as ``J``, packed ``Z`` or the walk's slots: native sparse
 factors (rows in factor coordinates, whitened from a ``J`` in shared scratch) and the tiers' seeded rows."""
@@ -1820,8 +1805,8 @@ def placement_frames(solver, joint_q: np.ndarray, capture) -> dict:
     - ``rows`` and ``leave``: the one writer's worlds, their rows against their physical ``J v_hat`` and their leave
       against the float64 walk's (:func:`.test_feather_pgs_walk_rows.walked_frames`, ``slot_frames``; Z0's F1).
 
-    The worlds a speed ball acted in are left out (their ``du`` is a law's, not ``sum Z lambda``), and so is every
-    world of the support placement, case K1 (``unstored``: its rows are :class:`TestSupportPlacement`'s)."""
+    Every world of the support placement, case K1, is left out (``unstored``: its rows are
+    :class:`TestSupportPlacement`'s)."""
     forest, placement = solver.forest, solver.placement
     out = {"rows": 0.0, "leave": 0.0, "general": 0, "unstored": 0}
     if not getattr(placement, "walks", False) or solver.spec.classes.support == "factor":
@@ -1960,7 +1945,7 @@ def refresh_error(device, bodies: int, rng) -> float:
     if factor.walk_arts is None:
         factor.plan_walk(np.arange(model.articulation_count, dtype=np.int32))
     # The held tree's repair publishes the state's poses and the walk's step geometry, as a step's would.
-    factor.fk_id(state, model.state(), state.joint_qd, 1.0 / 240.0)
+    factor.fk_id(state, model.state(), 1.0 / 240.0)
     factor.mass_update_mask.fill_(1)
     walk = factor.walk(q, 0)
     n = walk.s.shape[0]

@@ -29,7 +29,6 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs.factor.walk import TreeWalk, local_frames
-from newton._src.solvers.feather_pgs.row_laws import ROW_SPEED
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_scenes as scenes
 from newton.tests.feather_pgs_law_harness import packed_coordinates, walk_class_of, walked_worlds
@@ -189,11 +188,13 @@ class TestBlockPrimitive(unittest.TestCase):
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-def slipping_hinges(device="cpu"):
-    """Three hinges, each a stiff PD drive held past its effort limit, each with a joint limit its rows hold."""
+def slipping_hinges(device="cpu", *, branched=False):
+    """Three hinges, each a stiff PD drive held past its effort limit, each with a joint limit its rows hold: a chain,
+    or with ``branched`` the second and third hinges both on the first link."""
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     parent, joints = -1, []
-    for inertia, (lo, hi) in zip((0.05, 0.01, 0.02), ((-0.2, 0.0), (-0.1, 0.0), (-0.3, 0.05)), strict=True):
+    limits = ((-0.2, 0.0), (-0.1, 0.0), (-0.3, 0.05))
+    for index, (inertia, (lo, hi)) in enumerate(zip((0.05, 0.01, 0.02), limits, strict=True)):
         link = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * inertia))
         joints.append(
             builder.add_joint_revolute(
@@ -209,7 +210,8 @@ def slipping_hinges(device="cpu"):
                 parent_xform=wp.transform(wp.vec3(0.3, 0.0, 0.0), wp.quat_identity()),
             )
         )
-        parent = link
+        if index == 0 or not branched:
+            parent = link
     builder.add_articulation(joints)
     model = builder.finalize(device=device)
     control = model.control()
@@ -406,9 +408,9 @@ class TestTierSlipFrame(unittest.TestCase):
         """An emitting class's world of more rows than its tier holds goes to the general sweep through the one writer's
         STORE sink: its rows carry the release ``R`` as the tiers' do, so its step is the decided operator's (the all-K
         factor's rows missed it while the predictor took the decided step)."""
-        general, reference = _hinges_step({"tiers": 0}, enable_joint_velocity_limits=True)
+        general, reference = _hinges_step({"tiers": 0})
         scale = float(np.linalg.norm(reference))
-        solver, qd = _hinges_step({"tiers": 4, "sink": "emit"}, enable_joint_velocity_limits=True)
+        solver, qd = _hinges_step({"tiers": 4, "sink": "emit"})
         self.assertNotEqual(solver.placement.row_seeds.tiers, 0)
         self.assertGreater(int(solver.placement.constraint_count.numpy()[0]), solver.placement.row_seeds.bound)
         self.assertEqual(int(solver.factor.walk_view().release.count.numpy()[0]), 3)
@@ -426,8 +428,8 @@ def walked_frames(solver, joint_q: np.ndarray, capture) -> dict:
     (and ``u`` of the incident velocity), and ``n u kappa |dv|`` (FL3.1's leave bound) with the publication's rounding
     of ``v_hat`` and ``v_out``. A free rigid body is a one-body tree of six coordinates. A tree whose drives slip this
     step leaves ``R^T du`` (its rows carry the release and are checked by :class:`TestSlipRelease`); the closure's
-    corrected rows (``test_feather_pgs_preelim``), a world whose speed ball acted (its ``du`` is a law's, not
-    ``sum Z lambda``) and the leave of a world whose tier walks its rows are left to their own checks."""
+    corrected rows (``test_feather_pgs_preelim``) and the leave of a world whose tier walks its rows are left to their
+    own checks."""
     forest, placement, factor = solver.forest, solver.placement, solver.factor
     out = {"rows": 0.0, "free_rows": 0.0, "leave": 0.0, "worlds": 0, "free_bodies": 0, "slipping": 0}
     sizes = forest.articulation_response_dof_count.numpy()
@@ -442,11 +444,9 @@ def walked_frames(solver, joint_q: np.ndarray, capture) -> dict:
     sides_all = placement.row_sides.numpy()
     counts = placement.constraint_count.numpy()
     first = placement.dense_first.numpy()
-    kinds_all = placement.row_type.numpy()
     walks, hats = {}, {}
-    # A world whose speed ball acted: a speed row of the line (its last rows) or of the free bodies' run; and a world
-    # whose tier walks its rows (its rows above the family bound stay in its sweep).
-    ball, walked = np.zeros(int(forest.world_count), dtype=bool), walked_worlds(solver)
+    # A world whose tier walks its rows (its rows above the family bound stay in its sweep).
+    walked = walked_worlds(solver)
 
     def walk_of(art):
         if art not in walks:
@@ -466,10 +466,6 @@ def walked_frames(solver, joint_q: np.ndarray, capture) -> dict:
         if count == 0:
             continue
         for row in range(count):
-            if kinds_all[line, row] == ROW_SPEED:
-                # A speed row keeps its unwhitened axis: its law reads the body's velocity, not a row.
-                ball[world] |= capture.impulses[line, row] != 0.0
-                continue
             term, scale_z, scale_u, length = 0.0, 0.0, 0.0, 0
             skip = False
             for art in sides_all[line, row]:
@@ -495,14 +491,11 @@ def walked_frames(solver, joint_q: np.ndarray, capture) -> dict:
     # The free bodies' rows: each side a six-step walk, against the incident velocity the writer summed.
     free_du = {}
     if capture.mf_final is not None:
-        Z_a, Z_b, lam, mf_counts, side_a, side_b, _dof_a, _dof_b, kinds = capture.mf_final
+        Z_a, Z_b, lam, mf_counts, side_a, side_b, _dof_a, _dof_b = capture.mf_final
         mf_incident = placement.row_incident.numpy()[:, placement.body_base :].astype(np.float64)
         for world, count in enumerate(mf_counts):
             line = int(capture.mf_first[world])
             for row in range(int(count)):
-                if kinds[line, row] == ROW_SPEED:
-                    ball[world] |= lam[line, row] != 0.0
-                    continue
                 term, scale_z, scale_u = 0.0, 0.0, 0.0
                 for side, Z in ((side_a, Z_a), (side_b, Z_b)):
                     if side[line, row] < 0:
@@ -521,7 +514,7 @@ def walked_frames(solver, joint_q: np.ndarray, capture) -> dict:
     view = factor.walk_view()
     for art in range(sizes.size):
         world, n = int(art_world[art]), int(sizes[art])
-        if world < 0 or n == 0 or solver.factor.eliminates or ball[world] or walked[world]:
+        if world < 0 or n == 0 or solver.factor.eliminates or walked[world]:
             continue
         line, count = int(first[world]), int(counts[world])
         du = np.zeros(n) + free_du.get(art, 0.0)
@@ -1041,17 +1034,11 @@ class TestSupportPlacement(unittest.TestCase):
         self.assertLess(worst["leave"], BOUND, worst)
 
     def test_rows_take_the_decided_operator(self):
-        model, control = slipping_hinges("cuda:0")
+        # A branched tree admits native sparse factors (a chain's factor is full).
+        model, control = slipping_hinges("cuda:0", branched=True)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            # Velocity rows admit native sparse factors on a chain.
-            solver = SolverFeatherPGS(
-                model,
-                angular_damping=0.0,
-                pgs_iterations=30,
-                enable_joint_limits=True,
-                enable_joint_velocity_limits=True,
-            )
+            solver = SolverFeatherPGS(model, angular_damping=0.0, pgs_iterations=30, enable_joint_limits=True)
         self.assertEqual(solver.spec.classes.support, "factor")
         state, out = model.state(), model.state()
         joint_q = state.joint_q.numpy().astype(np.float64)

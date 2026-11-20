@@ -27,9 +27,8 @@ Routes
 
 Scenes and features
     Dropped and stacked boxes, a box sticking and one sliding on an incline, a
-    bouncing ball, a box and a sphere on a heightfield, boxes pushed against a
-    rigid-body speed limit, a revolute chain on limits and drives, a four-bar
-    loop, a mimic pair, a spring hinge, an arm under joint velocity limits, a
+    bouncing ball, a box and a sphere on a heightfield, a revolute chain on
+    limits and drives, a four-bar loop, a mimic pair, a spring hinge, a
     legged robot standing on a free base, a gripper lifting a box, a
     diagonal-mass keyboard pressed by an arm, a 17-coordinate hand pressing a
     free cube, two articulations of more than 64 coordinates (a 66-coordinate
@@ -40,7 +39,7 @@ Scenes and features
     split, a stack, a compliant pinch). Articulated contact
     scenes hold two worlds that differ, so a world mix-up shows. Variants: warm
     start, contact compliance, contact torsion, restitution, bilateral
-    pre-elimination, joint and rigid-body velocity limits.
+    pre-elimination.
 
 Metrics
     Computed on the host from the model, the states before and after each
@@ -64,8 +63,8 @@ Metrics
       which checks the force export on every route;
     - scene laws: sliding acceleration ``g (sin a - mu cos a)`` and no creep on
       the incline (on CPU also at every step and every budget from 32 to 2,000
-      sweeps, :func:`incline_steady_slide_laws`), rebound ``v+ = -e u``, speed
-      limits, the spring hinge's discrete oscillator, the lifted box following
+      sweeps, :func:`incline_steady_slide_laws`), rebound ``v+ = -e u``, the
+      spring hinge's discrete oscillator, the lifted box following
       the gripper, the exported force on a pressed key balancing its drive,
       and the CT benchmark's references (:mod:`newton.tests.feather_pgs_references`):
       torsional decay, stiction and spin-up, the soft-finger pinch's hold on the
@@ -935,23 +934,6 @@ def drop_laws(run: Run) -> list:
     return laws
 
 
-def speed_limit_laws(run: Run) -> list:
-    """A free body pushed past its speed limit moves at the limit and never faster (one body per world)."""
-    limit = run.scene.params["speed_limit"]
-    laws = []
-    for body in range(run.body_qd.shape[1]):
-        speed = np.linalg.norm(run.body_qd[:, body, :3], axis=-1)
-        laws.append((f"world {body} speed overshoot [1]", float(speed.max() / limit - 1.0), 1.0e-4))
-        laws.append((f"world {body} final speed deficit [1]", float(1.0 - speed[-1] / limit), 1.0e-3))
-    return laws
-
-
-def joint_speed_limit_laws(run: Run) -> list:
-    """Joints pushed past their velocity limits never exceed them."""
-    limit = run.scene.params["velocity_limit"]
-    return [("overshoot [1]", float(np.abs(run.joint_qd).max() / limit - 1.0), 1.0e-3)]
-
-
 def spring_laws(run: Run) -> list:
     """The hinge follows the discrete oscillator of semi-implicit Euler, the spring explicit, the damper implicit."""
     params, dt = run.scene.params, run.scene.dt
@@ -1186,8 +1168,6 @@ def keyboard_laws(run: Run) -> list:
 SCENE_LAWS = {
     "incline": incline_laws,
     "ball_drop": drop_laws,
-    "box_push": speed_limit_laws,
-    "pushed_arm": joint_speed_limit_laws,
     "spring_hinge": spring_laws,
     "spin_decay": spin_decay_laws,
     "spin_decay_free": spin_decay_laws,
@@ -1558,7 +1538,6 @@ def _torsion_scenes() -> tuple:
 def cuda_groups() -> list:
     """Problems of the CUDA matrix: every route each scene admits, against the CUDA reference."""
     ref = REFERENCE_CUDA
-    vlimits = {"enable_joint_velocity_limits": True}
     groups = []
     for law in _laws():
         # Patch friction keeps the packed full sweep of the legged scene's small worlds.
@@ -1642,27 +1621,6 @@ def cuda_groups() -> list:
                 SPARSE_DIAGONAL_TREE.but("sparse_diagonal_tree_warm_start", options=_WARM),
             ),
         ),
-        # The sparse diagonal gives its velocity-limit rows the last word, a key's in a slot as a contact's seed, and
-        # its fused position limits stay (case K2): a press whose drives pass the keys' and the arm's limits.
-        Group(
-            # The keys' and the arm's velocity rows beside the contacts: a row capacity past the default 32.
-            _physics(
-                scenes.keyboard(velocity_limit=0.01),
-                "patch",
-                16,
-                "velocity_limits",
-                dense_max_constraints=64,
-                **vlimits,
-            ),
-            ref,
-            (
-                # The one-coordinate class keeps velocity-limited stars on the held tree's ordinary dynamics.
-                SPARSE_DIAGONAL.but(
-                    "sparse_diagonal_velocity_limits", expect={"held_tree.coordinate_trees.enabled": False}
-                ),
-                SPARSE_DIAGONAL_TREE.but("sparse_diagonal_tree_velocity_limits"),
-            ),
-        ),
         # The hub's tiers start from the impulses the warm start carries.
         Group(
             _physics(scenes.hand(contact_matching="latest"), "patch", 16),
@@ -1670,40 +1628,24 @@ def cuda_groups() -> list:
             (HUB.but("hub_warm_start", options=_WARM),),
         ),
         Group(_physics(scenes.ball_drop(), "patch", 16), ref, (MF_HELD,)),
-        Group(_physics(scenes.box_push(), "patch", 16), ref, (MF_HELD,)),
         Group(_physics(scenes.chain(), None, 16), ref, (MF_HELD, MF_PARALLEL)),
         Group(_physics(scenes.four_bar(), None, 16), ref, (MF_DEFAULT,)),
         Group(_physics(scenes.four_bar(loop="revolute"), None, 16), ref, (MF_DEFAULT,)),
         Group(_physics(scenes.mimic_pair(), None, 16), ref, (MF_HELD,)),
-        Group(
-            _physics(scenes.mimic_pair(), None, 16, "velocity_limits", **vlimits),
-            ref,
-            (SPARSE.but("sparse_velocity_mimic", expect={"sparse_mass_matrix.velocity_limits": True}),),
-        ),
         # A one-coordinate arm is diagonal-mass.
         Group(_physics(scenes.spring_hinge(), None, 8), ref, (MF_DEFAULT,)),
+        # Native sparse factors select their rows at sweep entry and fuse their contact units (case K1; a row
+        # capacity past the small worlds' packed lanes).
         Group(
-            _physics(scenes.pushed_arm(), None, 16, "velocity_limits", **vlimits),
-            ref,
-            (
-                MF_HELD,
-                SPARSE.but("sparse_velocity_limits", expect={"sparse_mass_matrix.velocity_limits": True}),
-                MF_PARALLEL,
-            ),
-        ),
-        # Native sparse factors select their rows at sweep entry and fuse their contact units beside velocity-limit
-        # rows, which keep their last word (case K1; a row capacity past the small worlds' packed lanes).
-        Group(
-            _physics(scenes.legged(), "patch", 32, "velocity_limits", dense_max_constraints=96, **vlimits),
+            _physics(scenes.legged(), "patch", 32, "active_rows", dense_max_constraints=96),
             ref,
             (
                 Route(
-                    "sparse_velocity_limits_active",
+                    "sparse_active",
                     "cuda",
                     options=_MF,
                     expect={
                         "sweep.route": "sparse_pgs",
-                        "sparse_mass_matrix.velocity_limits": True,
                         "sparse_mass_matrix.active_rows": True,
                         "sparse_mass_matrix.contact_triplets": True,
                     },
@@ -1711,17 +1653,17 @@ def cuda_groups() -> list:
             ),
         ),
         # Native sparse factors take mimic rows in every composition (the support writer walks a mimic's two
-        # covectors as any joint row's), and velocity-limit rows beside a kinematic root, whose coordinates the
-        # row laws give no row (case K1).
+        # covectors as any joint row's), and rows beside a kinematic root, whose coordinates the row laws give no
+        # row (case K1).
         Group(
             _physics(scenes.legged(mimic=True), "patch", 32, "mimic"),
             ref,
             (SPARSE.but("sparse_mimic"),),
         ),
         Group(
-            _physics(scenes.legged(kinematic_base=True), "patch", 32, "velocity_limits", **vlimits),
+            _physics(scenes.legged(kinematic_base=True), "patch", 32),
             ref,
-            (SPARSE.but("sparse_kinematic_velocity_limits", expect={"sparse_mass_matrix.velocity_limits": True}),),
+            (SPARSE.but("sparse_kinematic"),),
         ),
         # Bilateral pre-elimination on the cases the one writer writes: the Jacobi tiers on its rows (case K4), the hub's
         # and the pinned gripper's, from the closed blocks' seed.
@@ -1743,12 +1685,6 @@ def cuda_groups() -> list:
             _physics(scenes.hand(mimic=True), "patch", 16, "mimic"),
             ref,
             (HUB.but("hub_mimic"),),
-        ),
-        # The hub's velocity-limit rows: a lift whose drive passes its velocity limit.
-        Group(
-            _physics(scenes.hand(lift_velocity_limit=0.02), "patch", 16, "velocity_limits", **vlimits),
-            ref,
-            (HUB.but("hub_velocity_limits"),),
         ),
     ]
     # The CT benchmark's torsion checks: T1 articulated and free, T3 at every offset (7 mm, where the elliptic cone
@@ -1906,13 +1842,11 @@ def run_checks(group: Group, route: Route, device) -> list:
                 LAW_FACTOR * _energy_gain(ref.budget, data) + ENERGY_FLOOR * weight,
             )
         )
-    # A rigid-body speed clamp removes momentum outside the contact rows, which the export does not report.
-    if "rigid_body_velocity_limits" not in physics.scene.tags:
-        balance = momentum_balance(run, data, torque=False)
-        for kind, value in balance.items():
-            if value is not None:
-                relative = LAW_FACTOR * (ref.momentum[kind] or 0.0) if kind == "articulated" else 0.0
-                rows.append((f"momentum balance ({kind}) [m g dt]", value, relative + MOMENTUM_BOUND[kind]))
+    balance = momentum_balance(run, data, torque=False)
+    for kind, value in balance.items():
+        if value is not None:
+            relative = LAW_FACTOR * (ref.momentum[kind] or 0.0) if kind == "articulated" else 0.0
+            rows.append((f"momentum balance ({kind}) [m g dt]", value, relative + MOMENTUM_BOUND[kind]))
     for name, value, bound in (
         ("joint limit violation", limit_violation(run, data), ref.limit),
         ("loop closure gap [m]", loop_gap(run, joints), ref.loop),
@@ -2039,15 +1973,6 @@ OWNERSHIP = (
     # The hub's tiers own its worlds; the matrix-free sweep solves none.
     (scenes.hand, "patch", 16, HUB, (), ("mf_gs",)),
     (scenes.keyboard, "patch", 16, SPARSE_DIAGONAL, ("sparse_diagonal",), ("mf_gs",)),
-    # Velocity-limit rows bind on the pushed arm: their last phase counts with the sweep's.
-    (
-        scenes.pushed_arm,
-        None,
-        16,
-        MF_HELD.but("mf_held_velocity_limits", options={"enable_joint_velocity_limits": True}),
-        ("mf_gs",),
-        (),
-    ),
 )
 """Routes whose owners claim worlds at run time, and the sweeps the solve readout must see serve them."""
 

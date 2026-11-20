@@ -276,7 +276,6 @@ class TestWorldClasses(unittest.TestCase):
         model = builder.finalize(device="cpu")
         model.joint_limit_lower.fill_(-np.inf)
         model.joint_limit_upper.fill_(np.inf)
-        model.joint_velocity_limit.fill_(0.0)
         lower, upper = model.joint_limit_lower.numpy(), model.joint_limit_upper.numpy()
         dof = 0
         for links, limited, _ in arms:
@@ -1172,7 +1171,7 @@ class TestEveryLiveArrayIsListed(unittest.TestCase):
 
         for scene, options in (
             (scenes.loaded_four_bar(), {"pgs_warmstart": True}),
-            (scenes.five_bar_leg(), {"enable_joint_velocity_limits": True}),
+            (scenes.five_bar_leg(), {}),
             (scenes.stewart_platform(), {"contact_torsion": True}),
         ):
             with self.subTest(scene=scene.name), wp.ScopedDevice("cpu"):

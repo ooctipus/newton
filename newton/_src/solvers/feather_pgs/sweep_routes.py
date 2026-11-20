@@ -20,7 +20,7 @@ from ...core.execution import Work, device_lanes
 from ...core.memory import REGISTERS_PER_THREAD, Buffer, Operand, Place, Staging
 from . import kernel_template, sweep_units
 from .device_preludes import memory_words
-from .factor.walk import FREE_BODY_WALK, WALK_COORDINATE, WALK_LINK, WalkTrees, walk_down_prelude
+from .factor.walk import WalkTrees
 from .kernel_template import Dispatch
 from .packed_rows import CLASS_SIDES, PACKED_SIDES_BY_SIDE, PACKED_SIDES_DENSE
 from .projection_laws import IDLE_LAW
@@ -37,7 +37,7 @@ from .region_sweep import (
 )
 from .response_operator import Lanes, SparseFactor, Velocity
 from .row_inputs import RowArgument
-from .row_laws import ROW_CONTACT, ROW_FRICTION, ROW_JOINT_LIMIT, ROW_JOINT_VELOCITY_LIMIT, ROW_SPEED, ROW_TORSION
+from .row_laws import ROW_CONTACT, ROW_FRICTION, ROW_JOINT_LIMIT, ROW_TORSION
 from .row_metadata import record_layout, unpack_mf_header, validate_record_coordinates
 from .solve_policy import QUIET_LITERAL, block_argmax, sweep_exit
 from .sweep import (
@@ -68,17 +68,10 @@ from .sweep import (
     level_loop,
     row_step,
     rows_block,
-    speed_rows_pass,
     triple_phase,
     unit_visit,
-    velocity_limit_pass,
 )
 from .sweep_levels import COST_MATES
-
-# The row loops leave the velocity-limit and speed rows to the passes at the end of every sweep (the last word).
-_DENSE_ADMISSION = f"if (row_type == {ROW_JOINT_VELOCITY_LIMIT}) continue;"
-_LINE_ADMISSION = f"if (row_type == {ROW_JOINT_VELOCITY_LIMIT} || row_type == {ROW_SPEED}) continue;"
-_MF_ADMISSION = f"if (mf_rt == {ROW_SPEED}) continue;"
 
 
 def worlds(groups: int | None = None, lanes: int | None = None, classes: bool = False) -> kernel_template.Dispatch:
@@ -112,8 +105,7 @@ MF_GS_ABI = kernel_template.params(
     ("world", int),
     ("world_constraint_count", wp.array[int]),
     ("dense_first", wp.array[int]),
-    ("dense_phase_bounds", wp.array2d[int]),
-    ("speed_first", wp.array[int]),
+    ("topology_rows", wp.array[int]),
     ("world_dof_indices", wp.array2d[int]),
     ("rhs_bias", wp.array2d[float]),
     ("row_incident", wp.array2d[float]),
@@ -134,12 +126,10 @@ MF_GS_ABI = kernel_template.params(
     ("walk", WalkTrees),
     ("iterations", int),
     ("omega", float),
-    ("v_out", wp.array[float]),
 )
 """The matrix-free sweep's native ABI: one world per call (the world queue's dispatch). The free bodies' run's rows are
 the row store's (the ``world_*`` records) and the packed rows' (``packed_Z``), from the dense capacity of the world's
-line; the streamed rows' records the line's (``row_record``, :func:`.row_metadata.pack_row_record`). ``speed_first``:
-where the line's speed rows start."""
+line; the streamed rows' records the line's (``row_record``, :func:`.row_metadata.pack_row_record`)."""
 
 
 _ROW_BUFFERS = {"metadata": "s_rec_dense", "impulses": "s_lam_mf", "dense_impulses": "s_lam_dense"}
@@ -199,52 +189,6 @@ ROW_PLACES = (
     RowPlaces(Place.STREAMED, Place.GLOBAL, Place.GLOBAL),
 )
 """Every placement of the sweep's row operands (the census's axis)."""
-
-
-class FreeBodyCoordinates:
-    """The way into and out of a free body's walk coordinates, which a matrix-free sweep's speed rows read (native).
-
-    A sweep runs on the velocity change from the predictor in walk coordinates, ``du`` (``s_v``, from zero): a row's
-    residual is its right-hand side, which holds its incident velocity ``J v_hat``, plus ``Z^T du``, and its update
-    ``du += Z delta``. The sweep adds its change to the walk's ``du`` and the step's one leave walks every tree down
-    (:func:`.factor.walk.walk_leave_kernel`). A free body's speed row reads the body's physical velocity mid-sweep: its
-    tree (found from its first global coordinate, :class:`.factor.walk.WalkTrees`' ``first_art``) is walked down and
-    back in place (:meth:`walk_leave`, :meth:`walk_enter`): the leave and the enter of its one-body class
-    (:data:`.factor.walk.FREE_BODY_WALK`, :func:`.factor.walk.walk_down_prelude`), compiled.
-    """
-
-    def _walked(self, first: str, call: str) -> str:
-        """``call`` (a walk of :func:`.factor.walk.walk_down_prelude` on ``data`` and ``link``) on the tree whose first
-        world coordinate is ``first``."""
-        return f"""{{
-    const int body_art = walk.first_art.data[world_dof_indices.data[dof_map_base + {first}]];
-    const int j0 = walk.joint_start.data[body_art], d0 = walk.dof_start.data[body_art];
-    const float* data = walk.data.data + (size_t)d0 * {WALK_COORDINATE};
-    const float* link = walk.link.data + (size_t)j0 * {WALK_LINK};
-    {call};
-}}"""
-
-    def walk_leave(self, first: str, values: str) -> str:
-        """The walk down of the free body (a one-body tree, :data:`.factor.walk.FREE_BODY_WALK`) whose first world
-        coordinate is ``first``, in place on its six ``values``: ``v = P^T L^-T u``."""
-        return self._walked(
-            first,
-            f"WALK_DOWN(0, data, link, [&](const int c) -> float {{ return {values}[c]; }}, "
-            "[](const int) -> float { return 0.0f; }, "
-            f"[&](const int c, const float q, const float) {{ {values}[c] = q; }}, [](const int, const float*) {{}})",
-        )
-
-    def walk_enter(self, first: str, velocity: str, out: str) -> str:
-        """The walk in of that free body: ``out = L^T P velocity``."""
-        return self._walked(first, f"WALK_ENTER(0, data, link, {velocity}, {out})")
-
-
-FREE_BODY_COORDINATES = FreeBodyCoordinates()
-"""The free bodies' way into and out of walk coordinates in a matrix-free sweep (:class:`FreeBodyCoordinates`)."""
-
-FREE_BODY_WALKS = walk_down_prelude((FREE_BODY_WALK,), ahead=0, enter=True)
-"""The leave and the enter of :data:`FREE_BODY_COORDINATES`, compiled into a sweep that visits speed rows, without
-prefetch: a one-body walk is no chain whose loads a lane could hold ahead."""
 
 
 def packed_operator(
@@ -341,7 +285,7 @@ COLOR_AFTER = "LOAD_slots(reinterpret_cast<const int2*>(&color_after.data[(off_u
 (:data:`.sweep_units.UNIT_FIELDS`)."""
 
 COLORED_ABI = kernel_template.params(
-    *MF_GS_ABI[:-1],
+    *MF_GS_ABI,
     ("world_slot", wp.array[int]),
     ("color_count", wp.array[int]),
     ("color_offset", wp.array2d[int]),
@@ -917,7 +861,7 @@ regularization."""
 
 def region_phase(pad: str = "        ") -> str:
     """Native statements of a sweep's region phase: the world's open regions (those of a free body that a dense row,
-    a speed row or a region between two movable bodies touches; :func:`.region_sweep.fill_regions`), body by body in
+    or a region between two movable bodies touches; :func:`.region_sweep.fill_regions`), body by body in
     their order, each by the one visit (:func:`.region_laws.region_visit`), on the world's velocity change in walk
     coordinates (``s_v``).
 
@@ -1289,7 +1233,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     configuration's (:class:`GeneralSweep`)."""
     places, solve_policy = sweep.places, sweep.solve_policy
     contact_torsion, seeded, wide_rows = sweep.torsion, sweep.seeded, sweep.wide_rows
-    free_rows, speed_rows, max_row_dofs = sweep.free_rows, sweep.speed_rows, sweep.max_row_dofs
+    free_rows, max_row_dofs = sweep.free_rows, sweep.max_row_dofs
     colored = sweep.colored
     lanes = sweep.lanes
     M_D, M_MF, D = sweep.max_constraints, sweep.mf_max_constraints, sweep.max_world_dofs
@@ -1310,35 +1254,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     mf_load = free.loads("i")
     mf_store = free.stores("i")
 
-    passes = []
     budget, left_verify = "iterations", ""
-    if sweep.has_dense_velocity_limit_rows:
-        passes.append(velocity_limit_pass(dense, dense_op, laws, pad="        "))
-    # The free bodies' speed rows leave and enter by the walk, as their rows were written (walk_rows): the run's, or
-    # the line's last rows, each naming its body by its side.
-    if free_rows:
-        passes.append(speed_rows_pass(free, free_op, laws, walk=FREE_BODY_COORDINATES, pad="        "))
-    if speed_rows:
-        body = (
-            (
-                "const wp::vec2i speed_sides = row_sides.data[off_dense + i];",
-                "const int speed_body = articulation_world_dof_offset.data[speed_sides[0]];",
-            ),
-            "speed_body",
-            dense_op.element("i", "PACKED_FIRST(speed_sides, speed_sides[0]) + 3"),
-        )
-        passes.append(
-            speed_rows_pass(
-                dense,
-                dense_op,
-                laws,
-                walk=FREE_BODY_COORDINATES,
-                start="speed_start",
-                end="m_dense",
-                body=body,
-                pad="        ",
-            )
-        )
 
     # Where spin rows may appear, every friction contact's record (its Gram couplings and metric) is formed once per
     # launch before the sweeps (sweep.friction_record_stage), the dense rows' and the free bodies', and its visits only
@@ -1430,9 +1346,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
             free_phase = region_phase("    ")
             left_verify = region_verify(budget=budget) + "\n"
         elif free_rows:
-            free_phase = rows_block(
-                free, free_op, laws, admission=_MF_ADMISSION, metric=metric, formed=free_record, pad="    "
-            )
+            free_phase = rows_block(free, free_op, laws, metric=metric, formed=free_record, pad="    ")
         offsets = trace_reduction = metric_build = ""
 
     thread, threads = ("tid", "(int)blockDim.x") if colored else ("lane", "STRIDE")
@@ -1442,7 +1356,6 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
             impulse_seed(
                 "m_dense",
                 dense.peek("i"),
-                f"({dense.kind('i', scan=True)})",
                 dense_op.axpy((("row", "seed"),), "        ", row="i"),
                 row_lanes.sync(),
                 declare=tuple(line for line in dense.visit("i").split("\n") if line),
@@ -1453,10 +1366,8 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
                 impulse_seed(
                     "m_mf",
                     free.load("i"),
-                    free.kind("i"),
                     free_op.axpy((("row", "seed"),), "        ", row="i"),
                     row_lanes.sync(),
-                    skip=ROW_SPEED,
                     declare=(
                         *free.visit("i").split("\n"),
                         "const int packed_dofs = rec_a.x;",
@@ -1488,13 +1399,13 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         }}
         if ({"!__syncthreads_or(velocity_moved != 0)" if colored else "BALLOT(velocity_moved != 0) == 0u"}) iteration_changed = 0;
 """
-    admission = _LINE_ADMISSION if speed_rows else _DENSE_ADMISSION
+    admission = ""
     triples = ""
     if contact_torsion and sweep.one_tree and not colored:
         # Every world holds one tree: K1's order. The row loop solves every contact's normal and every other row, then
         # the friction triples follow in the shared phase (sweep.triple_phase), each on its contact's record.
         spin = dense.spin_of(dense.parent("i", enclosed=True), "m_dense")
-        admission += f"\nif (row_type == {ROW_FRICTION} && {spin} >= 0) continue;"
+        admission = f"if (row_type == {ROW_FRICTION} && {spin} >= 0) continue;"
         record = ", ".join(f"{name} = friction_record[{k}]" for k, name in enumerate(FORMED_RECORD))
         triples = triple_phase(
             dense,
@@ -1520,8 +1431,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     # ones inside their loop.
     live = None
     if dense.owned and not (units or sweep.active_rows or colored):
-        never = (ROW_JOINT_VELOCITY_LIMIT, ROW_SPEED) if speed_rows else (ROW_JOINT_VELOCITY_LIMIT,)
-        live = (dense_op.velocity, str(D), never)
+        live = (dense_op.velocity, str(D))
     dense_phase = rows_block(
         dense,
         dense_op,
@@ -1553,7 +1463,6 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
             triples,
             indent(free_phase, "    "),
         ),
-        (f"{first_warp}{chr(10).join(passes)}\n{end_first_warp}",),
         exit=sweep_vote + left_verify + sweep_end,
         budget=budget,
     )
@@ -1570,7 +1479,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         mf_count = "int m_mf = mf_constraint_count.data[world];"
         free_view = free.declaration()
         # Under regions the run's contact rows are the regions' candidates, whose impulses their visits publish: the
-        # run's staged impulses are its speed rows'.
+        # run stages none.
         staged_first = "mf_contact_end + lane" if sweep.regions else "lane"
         free_loads = f"""
     for (int i = {staged_first}; i < m_mf; i += STRIDE) {{
@@ -1580,8 +1489,6 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     for (int i = {staged_first}; i < m_mf; i += STRIDE) {{
         {mf_store}
     }}"""
-    if speed_rows:
-        dense_count += "\n    const int speed_start = speed_first.data[world];"
     dense_view = dense.declaration() + "\n" if dense.stream else ""
     # The sweeps and the way back; the stage launch (``formed == "stage"``) forms the dense records and leaves.
     budget_line = f"    int {budget} = iterations;\n" if budget != "iterations" else ""
@@ -1633,9 +1540,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     sides = (packed, *((CLASS_SIDES,) if sweep.support_classes else ()), *((memory_words(_SLOTS),) if colored else ()))
     records = bool(contact_torsion or colored)
     families = ((REGION_LAW,) if sweep.regions else ()) + ((IDLE_LAW,) if live is not None else ())
-    return sweep.native(
-        body, lanes=lanes, rows=sides, walks=(FREE_BODY_WALKS,), records=records, laws=families
-    ), staging
+    return sweep.native(body, lanes=lanes, rows=sides, records=records, laws=families), staging
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1655,8 +1560,8 @@ class GeneralSweep(SweepConfig):
       the friction triples after the rows (:func:`.sweep.triple_phase`, K1's order) where each world holds ``one_tree``;
     - the support class: ``max_row_dofs`` (the placement's packed support), ``support_classes`` (the rows' sides by
       their classes, :func:`.packed_rows.row_classes`), ``wide_rows`` (the bilateral block's), and the free bodies' 6 +
-      6 class: ``free_rows`` their own run, else rows of the line, their ``speed_rows`` the line's last;
-    - ``has_dense_velocity_limit_rows``: the velocity limits' last word; ``seeded``: the seed; ``pitch``: the line.
+      6 class: ``free_rows`` their own run, else rows of the line;
+    - ``seeded``: the seed; ``pitch``: the line.
 
     The warp mapping: ``lanes_per_world`` lanes a world in blocks of ``block_warps`` warps (one thread on the CPU); the
     colored one a block of :data:`COLORED_THREADS`. Each walks its claim's bucket (:func:`worlds`).
@@ -1669,7 +1574,6 @@ class GeneralSweep(SweepConfig):
     _: dataclasses.KW_ONLY
     max_row_dofs: int | None = None
     places: RowPlaces = STAGED_ROWS
-    has_dense_velocity_limit_rows: bool = True
     seeded: bool = False
     wide_rows: bool = False
     support_classes: bool = False
@@ -1679,7 +1583,6 @@ class GeneralSweep(SweepConfig):
     block_warps: int = 1
     pitch: int | None = None
     free_rows: bool = True
-    speed_rows: bool = False
     one_tree: bool = False
     records: int | None = None
     regions: bool = False
@@ -1759,7 +1662,6 @@ class GeneralSweep(SweepConfig):
         return (
             f"sweep_mf_{'colored' if self.colored else 'gs'}_{M}_{MF}_{self.max_world_dofs}"
             f"_s{self.max_row_dofs}"
-            f"_densevlim{int(self.has_dense_velocity_limit_rows)}"
             + self.places.suffix
             + ("_torsion" if self.torsion else "")
             + ("_weighted" if self.weighted else "")
@@ -1776,7 +1678,6 @@ class GeneralSweep(SweepConfig):
             + ("" if self.free_rows else "_line")
             + ("_regions" if self.regions else "")
             + {"inline": "", "ahead": "_formed", "stage": "_records"}[self.formed]
-            + ("_speed" if self.speed_rows else "")
             + ("_tree" if self.one_tree else "")
             + "_walk"
             + self.solve_policy.suffix

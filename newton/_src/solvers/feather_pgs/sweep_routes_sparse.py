@@ -22,9 +22,8 @@ acts on is the factor-coordinate delta from ``v_hat``, staged per world and publ
   block (:func:`contact_units`): one load group with the contact's record, one reduction of the three residuals,
   the normal step, the pair's residuals moved by the normal change through the record's couplings, the pair law from
   the record's metric, and one apply;
-- the **laws**: the shared row visit and law (:func:`.sweep.row_visit`) for every other row, the last-word
-  velocity-limit pass under either law (``velocity_limits``), the warm-start seed (``warm_start``), and the exit under
-  the solve policy.
+- the **laws**: the shared row visit and law (:func:`.sweep.row_visit`) for every other row, the warm-start seed
+  (``warm_start``), and the exit under the solve policy.
 
 :class:`SparseSweep` is the configuration the one factory builds (:func:`.sweep.sweep_kernel`: :data:`SPARSE_ABI`,
 tiles of 64 threads); its working set (:attr:`SparseSweep.staging`) is what the solver's admission and the factory
@@ -45,7 +44,7 @@ from .kernel_template import Dispatch
 from .projection_laws import IDLE_LAW
 from .response_operator import Lanes, SparseFactor
 from .row_inputs import RowArgument
-from .row_laws import ROW_CONTACT, ROW_JOINT_VELOCITY_LIMIT, ROW_TORSION
+from .row_laws import ROW_CONTACT, ROW_TORSION
 from .sparse_mass_matrix import _SparseRowSupport
 from .sweep import (
     FORMED_RECORD,
@@ -73,7 +72,6 @@ from .sweep import (
     row_step,
     triple_phase,
     unit_visit,
-    velocity_limit_pass,
 )
 
 _SPARSE_LOCAL_WORKSPACE_BYTES = 8 * 1024
@@ -135,7 +133,7 @@ class SparseSweep(SweepConfig):
     - the contact unit: ``contact_triplets``, a contact normal and its friction pair on their Gram block, with the
       support table and the active scan or linked rows, three rows (four with torsion) at least; ``linked_rows``
       (patch rings) take part only in an active scan or a contact unit;
-    - ``velocity_limits``: the velocity-limit rows' last word; ``warm_start``: the seed.
+    - ``warm_start``: the seed.
 
     The configuration resolves its request: a contact unit or linked rows it cannot hold are off.
     """
@@ -146,7 +144,6 @@ class SparseSweep(SweepConfig):
     _: dataclasses.KW_ONLY
     use_support_table: bool = False
     contact_triplets: bool = False
-    velocity_limits: bool = False
     lanes_per_world: int = 32
     local_factors: bool = False
     warm_start: bool = False
@@ -181,7 +178,6 @@ class SparseSweep(SweepConfig):
             "use_support_table": bool(self.use_support_table),
             "contact_triplets": triplets,
             "linked_rows": bool(self.linked_rows) and (active or triplets),
-            "velocity_limits": bool(self.velocity_limits),
             "local_factors": bool(self.local_factors),
             "warm_start": bool(self.warm_start),
             "torsion": bool(self.torsion),
@@ -212,7 +208,6 @@ class SparseSweep(SweepConfig):
         suffix += "_support_table" if self.use_support_table else ""
         suffix += "_contact_triplets" if self.contact_triplets else ""
         suffix += "_linked" if self.linked_rows else ""
-        suffix += "_velocity_limits" if self.velocity_limits else ""
         suffix += f"_lanes{self.lanes}" if self.lanes != 32 else ""
         suffix += "_local_factors" if self.local_factors else ""
         suffix += "_warm_start" if self.warm_start else ""
@@ -297,7 +292,7 @@ def warm_start_seed(op: SparseFactor, pad: str) -> str:
     """Give the delta the response of the impulses the row buffer carries, before the first sweep
     (:func:`.sweep.impulse_seed`)."""
     return impulse_seed(
-        "count", "s_impulse[i]", "s_type[i]", op.axpy((("row", "seed"),), "        ", row="i"), op.lanes.sync(), pad=pad
+        "count", "s_impulse[i]", op.axpy((("row", "seed"),), "        ", row="i"), op.lanes.sync(), pad=pad
     )
 
 
@@ -381,7 +376,7 @@ def _staging(sweep: SparseSweep, rows: StagedRows, op: SparseFactor) -> Staging:
 
 def _source(sweep: SparseSweep) -> tuple[str, Staging]:
     """The sweep's native body: staging and setup, then per sweep the active scan, the row loop (contact unit, then
-    the row step), the friction triples (contact torsion), the last-word velocity-limit pass and the exit;
+    the row step), the friction triples (contact torsion) and the exit;
     then the publication."""
     M, D, S, L = sweep.max_constraints, sweep.max_world_dofs, sweep.max_row_dofs, sweep.lanes
     lanes = Lanes(L)
@@ -407,8 +402,7 @@ def _source(sweep: SparseSweep) -> tuple[str, Staging]:
     if sweep.active_rows:
         order = SelectedRows("count")
     elif live:
-        never = (ROW_JOINT_VELOCITY_LIMIT,) if sweep.velocity_limits else ()
-        order = LiveOrder("count", rows, "idle_reach", laws.torsion, never)
+        order = LiveOrder("count", rows, "idle_reach", laws.torsion)
     else:
         order = SlotOrder("count")
     body_pad = order.inner("        ")
@@ -430,14 +424,12 @@ def _source(sweep: SparseSweep) -> tuple[str, Staging]:
         )
     if sweep.contact_triplets:
         scan.append("        int consumed_tangent = -1;")
-    # Velocity-limit rows wait for the last-word pass; under contact torsion the triples are the triple phase's.
-    admission = f"if (row_type == {ROW_JOINT_VELOCITY_LIMIT}) continue;" if sweep.velocity_limits else ""
+    # Under contact torsion the triples are the triple phase's.
     update = row_step(
         rows,
         op,
         laws,
         end="count",
-        admission=admission,
         held=True,
         triple_phase=sweep.torsion,
         reach="idle_reach" if live else None,
@@ -468,15 +460,12 @@ def _source(sweep: SparseSweep) -> tuple[str, Staging]:
             guard="world_triples",
             pad="        ",
         )
-    passes = ""
-    if sweep.velocity_limits:
-        passes = velocity_limit_pass(rows, op, laws, end="count", pad="        ")
     exit_ = end_sweep(
         sweep.solve_policy,
         iteration=ITERATION,
         violation=active_violation(rows, op, count="count", parallel=False) if sweep.active_rows else None,
     )
-    sweeps = level_loop((*scan, row_loop, triples), (passes,), exit=exit_)
+    sweeps = level_loop((*scan, row_loop, triples), exit=exit_)
     body = f"""    const int lane = LANE;
     const int line = dense_first.data[world];
     __builtin_assume(line >= 0);

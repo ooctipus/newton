@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Check packed independent worlds against the physical velocity/contact law."""
+"""Check packed independent worlds against the physical contact law."""
 
 import unittest
 from itertools import product
@@ -10,21 +10,65 @@ from unittest import mock
 import numpy as np
 import warp as wp
 
+from newton._src.solvers.feather_pgs.row_laws import ROW_CONTACT, ROW_FRICTION
 from newton._src.solvers.feather_pgs.sweep import sweep_kernel
 from newton._src.solvers.feather_pgs.sweep_routes_sparse import SparseSweep
 from newton.tests import test_feather_pgs_sparse_contact_triplets as fixtures
-from newton.tests import test_feather_pgs_sparse_velocity_limits as velocity
+from newton.tests.test_feather_pgs_sparse_pgs import _sweep
+
+
+def _contact_problem(*, iterations, omega):
+    """A coupled contact and its friction pair on a three-coordinate articulation, in three worlds (the middle one
+    empty): the sweep's inputs and the physical sweep's answer (velocity and impulses)."""
+    mass = np.array([[2.0, 0.3, 0.1], [0.3, 1.5, 0.2], [0.1, 0.2, 0.8]])
+    factor = np.linalg.cholesky(mass)
+    jacobian = np.array([[-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+    kinds = np.array([ROW_CONTACT, ROW_FRICTION, ROW_FRICTION], np.int32)
+    parents = np.array([-1, 0, 0], np.int32)
+    bias = np.array([-1.0, 0.0, 0.0])
+    mu = np.array([0.0, 0.3, 0.3])
+    initial = np.array([-0.1, 0.4, -0.2])
+    seeds = np.zeros(3)
+    response = np.linalg.solve(mass, jacobian.T).T
+    z = np.linalg.solve(factor, jacobian.T).T
+    diagonal = np.einsum("ij,ij->i", jacobian, response)
+    count, worlds, capacity = len(kinds), 3, 8
+
+    def padded(value, dtype=np.float32):
+        result = np.zeros((worlds, capacity, *value.shape[1:]), dtype=dtype)
+        result[:, : len(value)] = value
+        return result
+
+    data = {
+        "world_constraint_count": np.array([count, 0, count], np.int32),
+        "rhs_bias": padded(bias),
+        "diagonal": padded(diagonal),
+        "initial_impulses": padded(seeds),
+        "row_factor": padded(z),
+        "row_incident": padded(jacobian @ initial),
+        "row_type": padded(kinds, np.int32),
+        "row_parent": padded(parents, np.int32),
+        "row_mu": padded(mu),
+        "support_row_class": np.zeros((worlds, capacity), np.int32),
+        "support_class_dof": np.arange(3, dtype=np.int32)[None],
+        "iterations": np.array(iterations),
+        "omega": np.array(omega),
+        "reference_factor_delta": np.zeros((worlds, 3), np.float32),
+    }
+    expected, impulses = _sweep(
+        jacobian, response, initial, bias, diagonal, kinds, parents, mu, seeds, iterations=iterations, omega=omega
+    )
+    return data, initial, factor, expected, impulses
 
 
 class TestSparseSmallWorlds(unittest.TestCase):
     @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
     def test_packed_worlds_preserve_physical_sweeps_and_replay(self):
-        """Keep signed clamps and contacts isolated through empty/regrowing graph replay."""
+        """Keep contacts isolated through empty/regrowing graph replay."""
         for lanes, local_factors in ((8, False), (16, False), (8, True), (16, True)):
             for table in (False, True):
                 with self.subTest(lanes=lanes, table=table, local_factors=local_factors):
-                    data, physical, factor = velocity._solve_data(-1.0, contact=True, iterations=8, omega=0.4)
-                    expected, impulses = velocity._physical_sweep(*physical, iterations=8, omega=0.4)
+                    data, initial, factor, expected, impulses = _contact_problem(iterations=8, omega=0.4)
                     count = len(impulses)
                     worlds = 17  # Multiple blocks and a partial last subgroup.
                     for name, values in list(data.items()):
@@ -49,7 +93,6 @@ class TestSparseSmallWorlds(unittest.TestCase):
                                 dofs,
                                 width,
                                 use_support_table=_table,
-                                velocity_limits=True,
                                 lanes_per_world=_lanes,
                                 local_factors=_local,
                             )
@@ -87,7 +130,7 @@ class TestSparseSmallWorlds(unittest.TestCase):
                             if counts[world] == 0:
                                 np.testing.assert_array_equal(delta[world], 0.0)
                             else:
-                                actual = physical[2] + np.linalg.solve(factor.T, delta[world, coordinates])
+                                actual = initial + np.linalg.solve(factor.T, delta[world, coordinates])
                                 np.testing.assert_allclose(actual, expected, atol=3e-5, rtol=3e-4)
                                 np.testing.assert_allclose(
                                     actual_impulses[world, :count],
@@ -129,45 +172,6 @@ class TestSparseSmallWorlds(unittest.TestCase):
                 warp.launch()
                 group.launch()
                 fixtures.assert_output(self, data, *group.result(), physical=physical, reference=warp.result())
-
-    @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
-    def test_velocity_limits_compose_the_active_scan_and_units(self):
-        """The last-word velocity-limit pass after an active sweep with contact units, in a warp or a smaller group:
-        the physical sweep's answer (contacts first, then the velocity-limit totals)."""
-        for lanes, sign in product((32, 16, 8), (-1.0, 1.0)):
-            with self.subTest(lanes=lanes, sign=sign):
-                data, physical, factor = velocity._solve_data(sign, contact=True, iterations=8, omega=0.4)
-                data["initial_impulses"][:] = 0.0
-                physical = (*physical[:-1], np.zeros_like(physical[-1]))
-
-                def factory(capacity, dofs, width, *, _lanes=lanes, **_kwargs):
-                    return sweep_kernel(
-                        SparseSweep(
-                            capacity,
-                            dofs,
-                            width,
-                            active_rows=True,
-                            use_support_table=True,
-                            contact_triplets=True,
-                            velocity_limits=True,
-                            lanes_per_world=_lanes,
-                        )
-                    )
-
-                with mock.patch.object(fixtures, "factory", factory):
-                    solve = fixtures.DeviceSolve(data, candidate=True)
-                self.assertTrue(solve.units)
-                self.assertIn("_active_support_table_contact_triplets_velocity_limits", solve.kernel.key)
-                solve.launch()
-                delta, impulses = solve.result()
-                expected_velocity, expected_impulses = velocity._physical_sweep(*physical, iterations=8, omega=0.4)
-                for world in (0, 2):
-                    actual = physical[2] + np.linalg.solve(factor.T, delta[world])
-                    np.testing.assert_allclose(actual, expected_velocity, atol=3e-5, rtol=3e-4)
-                    np.testing.assert_allclose(
-                        impulses[world, : len(expected_impulses)], expected_impulses, atol=3e-5, rtol=3e-4
-                    )
-                np.testing.assert_array_equal(delta[1], 0.0)
 
 
 if __name__ == "__main__":

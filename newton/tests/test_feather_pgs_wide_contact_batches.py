@@ -92,7 +92,7 @@ class TestWideContactBatches(unittest.TestCase):
             types,
             parents,
             mu,
-            np.full((worlds, 2), prefix, dtype=np.int32),
+            np.full(worlds, prefix, dtype=np.int32),
             # No scalar contact: no level.
             np.zeros(worlds, np.int32),
             np.zeros((worlds, capacity + 1), np.int32),

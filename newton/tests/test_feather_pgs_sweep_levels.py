@@ -216,7 +216,7 @@ def _mates_kernel(total: int, head: int, mates: int, taken: wp.array[int]):
 
 class TestWorldLists(unittest.TestCase):
     def test_each_world_lands_in_its_claim_s_bucket(self):
-        """A world of dense rows only (no speed row) and at most the bound lands in the bucket of its 32-row tier, once;
+        """A world of dense rows only and at most the bound lands in the bucket of its 32-row tier, once;
         any other world with rows in the colored candidates' bucket where it has a slot (and the claims have one), else
         in the general sweep's bucket of its cost class (heaviest first, the last class the lightest); a world without
         rows in none."""
@@ -224,8 +224,6 @@ class TestWorldLists(unittest.TestCase):
         worlds, bound, width = 500, 100, 32
         rows = rng.integers(0, 140, worlds).astype(np.int32)
         free = (rng.random(worlds) < 0.2).astype(np.int32) * rng.integers(1, 9, worlds).astype(np.int32)
-        # Where the line's speed rows start: a world with any (rows past it) is the general sweep's too.
-        speed_first = rows - (rng.random(worlds) < 0.2).astype(np.int32) * rng.integers(0, 3, worlds).astype(np.int32)
         slot = np.where(rng.random(worlds) < 0.3, np.arange(worlds), -1).astype(np.int32)
         # The worlds' acts words: a world none of whose rows can act takes no bucket (empty: every world acts).
         words = (rng.random(worlds) < 0.8).astype(np.int32)
@@ -244,7 +242,6 @@ class TestWorldLists(unittest.TestCase):
                     inputs=[
                         wp.array(rows, dtype=int, device=device),
                         wp.array(free, dtype=int, device=device),
-                        wp.array(speed_first, dtype=int, device=device),
                         wp.array(slot, dtype=wp.int32, device=device),
                         wp.array(cost, dtype=wp.int32, device=device),
                         bound,
@@ -258,7 +255,7 @@ class TestWorldLists(unittest.TestCase):
                     device=device,
                 )
                 acting = acts != 0 if acts.size else np.ones(worlds, dtype=bool)
-                tiered = (rows > 0) & (rows <= bound) & (free == 0) & (rows <= speed_first) & acting
+                tiered = (rows > 0) & (rows <= bound) & (free == 0) & acting
                 rest = ~tiered & ((rows > 0) | (free > 0)) & acting
                 slotted = (slot >= 0) & candidates
                 for bucket in range(buckets):
@@ -306,7 +303,6 @@ class TestWorldLists(unittest.TestCase):
                     inputs=[
                         wp.array(rows, dtype=int, device=device),
                         wp.zeros(worlds, dtype=int, device=device),
-                        wp.array(rows, dtype=int, device=device),
                         wp.zeros(1, dtype=wp.int32, device=device),
                         wp.zeros(worlds, dtype=wp.int32, device=device),
                         3 * width,

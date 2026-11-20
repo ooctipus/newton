@@ -13,12 +13,11 @@ also exercise impact and settling.
 Scenes by topology:
 
 - free rigid bodies: :func:`box_drop`, :func:`box_stack`, :func:`incline`,
-  :func:`ball_drop`, :func:`heightfield`, :func:`box_push`; two free bodies a
-  world, so their contacts take the free bodies' run (the region route on the
+  :func:`ball_drop`, :func:`heightfield`; two free bodies a world, so their contacts take the free bodies' run (the region route on the
   CPU): :func:`incline_pair` and :func:`curved_patch` (a box on one region whose
   contacts' normals differ, a cone of shallow facets);
 - fixed-base articulations without contact: :func:`chain`, :func:`four_bar`,
-  :func:`mimic_pair`, :func:`spring_hinge`, :func:`pushed_arm`;
+  :func:`mimic_pair`, :func:`spring_hinge`;
 - articulations in contact: :func:`legged` (a free-floating base on legs),
   :func:`gripper` (an articulation holding a free box), :func:`keyboard` (a
   diagonal-mass articulation pressed by a six-coordinate arm) and :func:`hand`
@@ -379,55 +378,6 @@ def heightfield(*, mu: float = 0.6) -> Scene:
         passive=True,
         rigid_contact_max=256,
         tags=frozenset({"heightfield"}),
-    )
-
-
-def box_push(*, speed_limit: float = 0.5, force: float = 20.0) -> Scene:
-    """A 1 kg box on a frictionless plane pushed by ``force`` [N] under a rigid-body speed limit [m/s].
-
-    World 0 pushes along ``+x``, world 1 along the diagonal ``(1, 1, 0) / sqrt(2)``.
-    PhysX's ``maxLinearVelocity`` bounds the speed, the magnitude of the linear
-    velocity, and FeatherPGS bounds it on the body's solved velocity, so both
-    boxes settle at ``speed_limit``. (PhysX clamps the unconstrained velocity,
-    gravity's increment included, before its solve, which leaves a box pushed
-    along the ground slightly below the limit.)
-    """
-    directions = ((1.0, 0.0, 0.0), (math.sqrt(0.5), math.sqrt(0.5), 0.0))
-
-    def build(device):
-        from newton.solvers import SolverFeatherPGS  # noqa: PLC0415
-
-        builder = _builder()
-        SolverFeatherPGS.register_custom_attributes(builder)
-        for _ in directions:
-            builder.begin_world()
-            builder.add_shape_plane(width=0.0, length=0.0, cfg=_cfg(mu=0.0))
-            body = builder.add_body(
-                xform=wp.transform(wp.vec3(0.0, 0.0, 0.101), wp.quat_identity()),
-                mass=1.0,
-                inertia=_box_inertia(1.0, 0.1, 0.1, 0.1),
-                custom_attributes={
-                    "rigid_body_max_linear_velocity": speed_limit,
-                    "rigid_body_max_angular_velocity": 10.0,
-                },
-            )
-            builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1, cfg=_cfg(mu=0.0, density=0.0))
-            builder.end_world()
-        return _finalize(builder, device)
-
-    def control(model, control, state, step):
-        forces = np.zeros((model.body_count, 6), dtype=np.float32)
-        forces[:, :3] = force * np.asarray(directions, dtype=np.float32)
-        state.body_f.assign(forces)
-
-    return Scene(
-        "box_push",
-        build,
-        dt=1.0 / 240.0,
-        steps=120,
-        params={"mu": [0.0, 0.0], "speed_limit": speed_limit, "force": force},
-        control=control,
-        tags=frozenset({"rigid_body_velocity_limits"}),
     )
 
 
@@ -852,49 +802,6 @@ def spring_hinge(*, stiffness: float = 2.0, damping: float = 0.02, start: float 
     )
 
 
-def pushed_arm(*, velocity_limit: float = 1.0, torque: float = 2.0) -> Scene:
-    """A fixed-base two-link revolute ``z`` arm pushed by joint torques beyond its joint velocity limits."""
-
-    def build(device):
-        builder = _builder()
-        parent, root = _fixed_base(builder)
-        joints = [root]
-        for index in range(2):
-            body = _link_box(
-                builder,
-                wp.transform(wp.vec3(0.1 + 0.2 * index, 0.0, 0.5)),
-                half=(0.1, 0.02, 0.02),
-                mass=0.5,
-            )
-            joints.append(
-                builder.add_joint_revolute(
-                    parent,
-                    body,
-                    axis=newton.Axis.Z,
-                    parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.5) if index == 0 else wp.vec3(0.1, 0.0, 0.0)),
-                    child_xform=wp.transform(wp.vec3(-0.1, 0.0, 0.0)),
-                    velocity_limit=velocity_limit,
-                )
-            )
-            parent = body
-        builder.add_articulation(joints)
-        return _finalize(builder, device)
-
-    def control(model, control, state, step):
-        if step == 0:
-            control.joint_f.assign(np.array([torque, -0.5 * torque], dtype=np.float32))
-
-    return Scene(
-        "pushed_arm",
-        build,
-        dt=1.0 / 240.0,
-        steps=120,
-        params={"velocity_limit": velocity_limit},
-        control=control,
-        tags=frozenset({"joint_velocity_limits"}),
-    )
-
-
 # ---------------------------------------------------------------------------------------------------------------------
 # Articulations in contact
 # ---------------------------------------------------------------------------------------------------------------------
@@ -1114,7 +1021,6 @@ def keyboard(
     press: float = 0.003,
     worlds: int = 2,
     contact_matching: str | None = None,
-    velocity_limit: float | None = None,
 ) -> Scene:
     """A fixed frame of ``keys`` prismatic keys (a diagonal-mass articulation) and a six-coordinate arm pressing key 0.
 
@@ -1122,10 +1028,9 @@ def keyboard(
     The arm stacks prismatic ``z``, ``x``, ``y`` and revolute ``z``, ``y``,
     ``x`` joints at one point and carries a sphere tip that starts 1 mm above
     key 0; its ``z`` drive presses ``press`` [m] past contact, ``w`` mm more in
-    world ``w``. ``velocity_limit`` [m/s or rad/s] bounds every key's and arm joint's speed, which the press passes.
+    world ``w``.
     """
     tip = 0.01
-    speed = {} if velocity_limit is None else {"velocity_limit": velocity_limit}
 
     def build(device):
         builder = _builder()
@@ -1147,7 +1052,6 @@ def keyboard(
                     target_kd=2.0,
                     limit_lower=-0.008,
                     limit_upper=0.002,
-                    **speed,
                 )
             )
         builder.add_articulation(joints)
@@ -1175,7 +1079,6 @@ def keyboard(
                     target_kd=20.0 if kind == "prismatic" else 0.2,
                     limit_lower=-0.05,
                     limit_upper=0.05,
-                    **speed,
                 )
             )
             parent = body
@@ -1191,7 +1094,7 @@ def keyboard(
                 model, control, {world * joints + keys + 2: 0.001 + press + 0.001 * world for world in range(worlds)}
             )
 
-    name = "keyboard" if velocity_limit is None else "keyboard_velocity_limit"
+    name = "keyboard"
     if contact_matching is not None:
         name = f"{name}_{contact_matching}"
     return Scene(
@@ -1213,7 +1116,6 @@ def hand(
     segments: int = 4,
     press: float = 0.002,
     worlds: int = 2,
-    lift_velocity_limit: float | None = None,
     contact_matching: str | None = None,
     mimic: bool = False,
 ) -> Scene:
@@ -1225,11 +1127,9 @@ def hand(
     world ``w``. The cube touches only the fingertips, so hand and cube are one
     coupled component without matrix-free rows. The last world sets its cube
     on the ground 0.3 m aside instead: there the hand touches nothing and the
-    cube only the ground. ``lift_velocity_limit`` [m/s] bounds the lift's speed, which its drive's step passes;
-    with ``mimic`` the first finger's second joint follows its first.
+    cube only the ground. With ``mimic`` the first finger's second joint follows its first.
     """
     cube, tip, link, palm_z = 0.05, 0.008, 0.03, 0.05
-    lift = {} if lift_velocity_limit is None else {"velocity_limit": lift_velocity_limit}
     corners = ((0.03, 0.03), (0.03, -0.03), (-0.03, 0.03), (-0.03, -0.03))[:fingers]
     cube_z = palm_z + 0.01 + segments * link + tip + 0.001 + cube
 
@@ -1246,7 +1146,6 @@ def hand(
                 parent_xform=wp.transform(wp.vec3(0.0, 0.0, palm_z)),
                 target_ke=1000.0,
                 target_kd=30.0,
-                **lift,
             ),
         ]
         for corner in corners:
@@ -1290,7 +1189,7 @@ def hand(
             joints = model.joint_count // worlds
             _set_targets(model, control, {world * joints + 1: 0.001 + press + 0.001 * world for world in range(worlds)})
 
-    name = "hand" if lift_velocity_limit is None else "hand_lift_velocity_limit"
+    name = "hand"
     if mimic:
         name = f"{name}_mimic"
     if contact_matching is not None:

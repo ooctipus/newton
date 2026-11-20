@@ -512,15 +512,6 @@ def twin_inputs(name: str, rng, n: int, device) -> dict:
             "vectors": vectors.astype(np.float32),
             **triple,
         }
-    if name == "speed_row":
-        return {
-            "speed": np.abs(scalars(rng, n, 3.0)),
-            "limit": rng.uniform(0.1, 3.0, n).astype(np.float32),
-            "effective_mass": rng.uniform(0.1, 2.0, n).astype(np.float32),
-            "old": np.abs(scalars(rng, n)),
-        }
-    if name in ("velocity_limit_update",):
-        return {"old": np.abs(scalars(rng, n)), "step": scalars(rng, n)}
     if name in ("joint_limit_side",):
         lower = scalars(rng, n)
         upper = lower + np.abs(scalars(rng, n))
@@ -533,11 +524,6 @@ def twin_inputs(name: str, rng, n: int, device) -> dict:
             "side": ints(0, 2),
             "activation_gap": np.abs(scalars(rng, n, 0.1)),
         }
-    if name == "velocity_limit_active":
-        limit = scalars(rng, n)
-        limit[5::13] = 1.0e6
-        limit[6::17] = np.inf
-        return {"limit": limit, "unauthored": np.full(n, 1.0e6, dtype=np.float32)}
     # Generic: scalars by name, kinds and counts as small integers.
     sig = law_source.law_signature(LAWS[name])
     values = {}
@@ -786,8 +772,8 @@ PREFIX_RECORDS = {
 
 
 def prefix_warp_rows(device, arts: int, size: int, rows: int, *, family="limits", mimics=0, **law) -> dict:
-    """Launch a joint row family's warp (``family``: the joint limits' :func:`.rows.joint_limit_warp_kernel`, the joint
-    velocity limits' ``"velocity"`` or the mimics' ``"mimics"``, at most ``mimics`` an articulation), as
+    """Launch a joint row family's warp (``family``: the joint limits' :func:`.rows.joint_limit_warp_kernel` or the
+    mimics' ``"mimics"``, at most ``mimics`` an articulation), as
     :meth:`.rows.RowLaws.write_limits` launches it (:func:`.rows.prefix_shape`), its seeds into unit sources
     (:func:`unit_rows`).
 
@@ -805,7 +791,6 @@ def prefix_warp_rows(device, arts: int, size: int, rows: int, *, family="limits"
     shape, arch = producers.prefix_shape(arts, device), wp.get_device(device).arch
     struct_type, kernel = {
         "limits": (prefix_rows.PrefixLaw, producers.joint_limit_warp_kernel(size, arch)),
-        "velocity": (prefix_rows.PrefixVelocityLaw, producers.velocity_limit_warp_kernel(size, arch)),
         "mimics": (prefix_rows.PrefixMimicLaw, producers.mimic_warp_kernel(size, mimics, arch)),
     }[family]
 
@@ -844,7 +829,7 @@ def prefix_warp_rows(device, arts: int, size: int, rows: int, *, family="limits"
     )
     arrays = {name: value for name, value in law.items() if isinstance(value, wp.array)}
     units, count = support.units.numpy(), counter.numpy()
-    # The seeds the one writer walks (walk_rows.joint_seeds): a limit's or velocity limit's +-e_dof, a mimic's
+    # The seeds the one writer walks (walk_rows.joint_seeds): a limit's +-e_dof, a mimic's
     # e_dof0 - coef1 e_dof1.
     J = np.zeros((arts, rows, size), dtype=np.float32)
     for a in range(arts):
@@ -1033,10 +1018,6 @@ def chain_walk(device, lowers) -> WalkTrees:
     walk.joint_start, walk.joint_end = ints(start[:-1]), ints(start[1:])
     walk.dof_start, walk.dofs = ints(start[:-1]), ints(sizes)
     walk.dof_body, walk.body_joint = ints(dof_body), ints(np.arange(total))
-    # Each chain's articulation at its first coordinate (a free body's tree, found by a sweep).
-    first_art = np.full(total, -1, dtype=np.int32)
-    first_art[start[:-1]] = np.arange(arts)
-    walk.first_art = ints(first_art)
     release = WalkRelease()
     release.count = ints(np.zeros(arts))
     release.dof = wp.zeros((1, 1), dtype=wp.int32, device=device)
@@ -1121,7 +1102,7 @@ def walked_worlds(solver) -> np.ndarray:
     placement, seeds = solver.placement, solver.placement.row_seeds
     counts, free = placement.constraint_count.numpy(), placement.mf_constraint_count.numpy()
     tier = (np.maximum(counts, 1) - 1) // max(int(seeds.width), 1)
-    dense = (free == 0) & (counts > 0) & (counts <= int(seeds.bound)) & (counts <= placement.speed_first.numpy())
+    dense = (free == 0) & (counts > 0) & (counts <= int(seeds.bound))
     return dense & ((int(seeds.tiers) >> tier) & 1 != 0)
 
 
@@ -1142,16 +1123,11 @@ def free_body_incident_gaps(solver) -> tuple[np.ndarray, np.ndarray]:
     Z = free_body_Z(solver).astype(np.float64)
     Z_a, Z_b = Z[..., :6], Z[..., 6:]
     # Each row's sides: its responding bodies' articulations (one-node trees), -1 for none.
-    sides, kinds = (
-        solver.placement.row_sides.numpy()[:, solver.placement.body_base :],
-        solver.placement.row_type.numpy()[:, solver.placement.body_base :],
-    )
+    sides = solver.placement.row_sides.numpy()[:, solver.placement.body_base :]
     walked, offsets = _walked_coordinates(solver), solver.forest.articulation_world_dof_offset.numpy()
     gaps, terms = np.zeros(incident.shape), np.zeros(incident.shape)
     for world, count in enumerate(solver.placement.mf_constraint_count.numpy()):
         for row in range(int(count)):
-            if kinds[world, row] == row_laws.ROW_SPEED:
-                continue  # A speed row carries no Z.
             term = np.zeros(0)
             for art, Z in ((sides[world, row, 0], Z_a), (sides[world, row, 1], Z_b)):
                 if art < 0:
@@ -1426,7 +1402,6 @@ def plain_laws(**changes) -> Laws:
         "compliance": False,
         "authored": False,
         "limits": True,
-        "velocity_limits": False,
         "warm_start": False,
         "preelimination": False,
         "mimic": False,

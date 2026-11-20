@@ -257,8 +257,6 @@ def _law_mf_position_rhs(
     elif kind == row_laws.ROW_FRICTION:
         # The scene's friction rows carry a unit beta: phi is the anchor's gain times its displacement.
         value, w = row_laws.row_rhs(kind, phi, 1.0, target, inv_dt, 1.0, 0.0, 0.0, 1.0)
-    else:
-        value = -target  # a free body's speed row carries ``-limit`` in its target
     rhs[world, i] = value
     row_w[world, i] = w
 
@@ -296,11 +294,7 @@ def test_contact_rhs_matches_mf_effective_mass_rhs(test, device):
     worlds, rows = 8, 48
     layout = _mf_layout(rng, worlds, rows)
     phi = scalars(rng, worlds * rows, 0.02).reshape(worlds, rows)
-    speed = int(row_laws.ROW_SPEED)
-    kind = rng.choice(np.array([0, 0, 0, 2, speed], dtype=np.int32), (worlds, rows))
-    # A speed row's diagonal walks its body's covector, which needs the body's walk: here its rows name no body.
-    for side in "ab":
-        layout[f"mf_body_{side}"] = np.where(kind == speed, -1, layout[f"mf_body_{side}"]).astype(np.int32)
+    kind = rng.choice(np.array([0, 0, 0, 2], dtype=np.int32), (worlds, rows))
     target = scalars(rng, worlds * rows).reshape(worlds, rows)
     restitution = rng.choice(np.array([0.0, 0.0, 0.5, 1.0], dtype=np.float32), (worlds, rows))
     shared = {
@@ -378,9 +372,6 @@ def test_contact_rhs_matches_mf_effective_mass_rhs(test, device):
         unified("mf rhs (row_bias)", reference_rhs.ravel(), law_rhs.ravel(), magnitude.ravel(), 2.0),
         2.0,
     )
-    # Rows whose bias the variant does not touch (speed rows, restitution) stay bitwise.
-    untouched = (kind == speed).ravel()
-    test.assertFalse(mismatches(reference_rhs.ravel()[untouched, None], law_rhs.ravel()[untouched, None]).any())
 
 
 @wp.kernel
@@ -663,58 +654,6 @@ def test_joint_limit_side_matches_limit_rows(test, device):
     )
     np.testing.assert_array_equal(out["count"], law["count"].numpy())
     test.assertFalse(mismatches(out["phi"], law["phi"].numpy()).any())
-
-
-@wp.kernel
-def _law_velocity_limit_active(joint_velocity_limit: wp.array[float], unauthored: float, active: wp.array[int]):
-    dof = wp.tid()
-    active[dof] = wp.where(row_laws.velocity_limit_active(joint_velocity_limit[dof], unauthored), 1, 0)
-
-
-def test_velocity_limit_active_matches_velocity_limit_rows(test, device):
-    """Give rows to the coordinates the joint velocity-limit warp (``rows.velocity_limit_warp_kernel``) gives rows
-    to: one row each for both sides (``J = +1``), in coordinate order; every authored limit, none at the unauthored
-    value or past it."""
-    rng = np.random.default_rng(21)
-    arts, dofs = 8, 6
-    count = arts * dofs
-    limit = scalars(rng, count, 2.0)
-    limit[4::9] = 1.0e6
-    limit[7::11] = np.inf
-    qd = scalars(rng, count, 2.0)
-    for unauthored in (1.0e6, np.inf):
-        with test.subTest(unauthored=unauthored):
-            out = prefix_warp_rows(
-                device,
-                arts,
-                dofs,
-                2 * dofs,
-                family="velocity",
-                velocity_limit=limit,
-                vhat=qd,
-                unauthored=unauthored,
-                cfm=0.0,
-            )
-            law = (
-                call(
-                    _law_velocity_limit_active,
-                    count,
-                    device,
-                    joint_velocity_limit=limit,
-                    unauthored=unauthored,
-                    active=np.zeros(count, dtype=np.int32),
-                )
-                .get("active")
-                .numpy()
-                .reshape(arts, dofs)
-            )
-            np.testing.assert_array_equal(out["count"], law.sum(axis=1))
-            for art in range(arts):
-                coordinates = np.flatnonzero(law[art])
-                J = out["J"][art, : out["count"][art]]
-                expected = np.zeros_like(J)
-                expected[np.arange(coordinates.size), coordinates] = 1.0
-                np.testing.assert_array_equal(J, expected)
 
 
 class TestFeatherPGSRowLaws(unittest.TestCase):

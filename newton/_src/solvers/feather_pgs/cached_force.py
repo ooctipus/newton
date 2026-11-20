@@ -14,15 +14,14 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class ForceOperands:
-    """Bind current scalar force inputs separately from predictor velocity.
+    """Bind current scalar force inputs: the predictor steps from the input state's velocity ``qd``.
 
     All array operands are native pointer expressions. q and the spring reference use a
     coordinate index; all other arrays use physical DOF indices, never factor indices.
     """
 
     q: str
-    state_qd: str
-    predictor_qd: str
+    qd: str
     stiffness: str
     reference: str
     damping: str
@@ -32,12 +31,12 @@ class ForceOperands:
         """Evaluate the scalar spring/damper law using current state velocity."""
         return (
             f"{self.stiffness}[{dof}]*({self.reference}[{q_index}]-{self.q}[{q_index}])"
-            f"-{self.damping}[{dof}]*{self.state_qd}[{dof}]"
+            f"-{self.damping}[{dof}]*{self.qd}[{dof}]"
         )
 
     def velocity(self, dof, acceleration):
-        """Increment the declared predictor velocity with the held action."""
-        return f"{self.predictor_qd}[{dof}]+{self.dt}*{acceleration}"
+        """Increment the state's velocity with the held action."""
+        return f"{self.qd}[{dof}]+{self.dt}*{acceleration}"
 
     def transport(self, first_dof, output):
         """Add free-root transport (:func:`.spatial_laws.free_root_transport`); the owner guards prescribed roots.
@@ -45,7 +44,7 @@ class ForceOperands:
         Output is a component expression using ``k`` and may address scratch
         for deferred publication or the owner's existing output bank.
         """
-        qd, d = self.predictor_qd, first_dof
+        qd, d = self.qd, first_dof
         return f"""{{
             const wp::vec3 v({qd}[{d}],{qd}[{d}+1],{qd}[{d}+2]);
             const wp::vec3 w({qd}[{d}+3],{qd}[{d}+4],{qd}[{d}+5]);

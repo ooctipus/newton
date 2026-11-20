@@ -14,7 +14,7 @@ A sweep is a configuration ``Sweep(mapping, staging, blocks, update, laws, exit,
 - the **row visit** admits a row of a row loop (:func:`row_visit`): a friction pair at its first tangent (:func:`admit_pair`), the diagonal check and the pair's disk on the patch
   ring's pooled load (:func:`friction_radius`), then the operator's residual;
 - the **row law** is one function, :func:`row_update`: step, regularization, the projection of each row kind
-  (unilateral, friction pair, velocity limit, bilateral), the change vote (:func:`change_vote`) and the
+  (unilateral, friction pair, bilateral), the change vote (:func:`change_vote`) and the
   apply. Every block of every sweep runs it;
 - the **contact unit** is a contact normal and its friction pair visited by the row law on the unit's Gram block
   (:func:`contact_unit`, :class:`UnitZ`): the placement reduces the unit's terms once and applies its changes
@@ -49,7 +49,7 @@ from .law_source import law_preludes
 from .projection_laws import CONE_LAW, PROJECTION_LAW, RECORD_LAW
 from .response_operator import Lanes, ResponseOperator, Velocity
 from .row_inputs import RowArgument
-from .row_laws import ROW_CONTACT, ROW_FRICTION, ROW_JOINT_LIMIT, ROW_JOINT_VELOCITY_LIMIT, ROW_SPEED, ROW_TORSION
+from .row_laws import ROW_CONTACT, ROW_FRICTION, ROW_JOINT_LIMIT, ROW_TORSION
 from .row_metadata import (
     load_row_record,
     record_kind,
@@ -632,12 +632,6 @@ class Diagonal:
             return f"-{residual} * {self.inverse(row)}"
         return f"-{residual} / {self.diagonal(row)}"
 
-    def scale(self, residual: str, row: str) -> str:
-        """``r / A_ii`` (the step's magnitude, as the velocity-limit law takes it)."""
-        if self.inverse is not None:
-            return f"{residual} * {self.inverse(row)}"
-        return f"{residual} / {self.diagonal(row)}"
-
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class RowContext:
@@ -797,8 +791,8 @@ def idle_growth(ctx: RowContext, changes: tuple[tuple[str, str], ...]) -> str:
 def row_update(ctx: RowContext, laws: RowLaws, *, residual: str, pad: str) -> str:
     """The projected Gauss-Seidel update of one row, after its residual's velocity term ``residual`` is reduced.
 
-    The row's kind selects its projection (velocity limit,
-    unilateral, friction pair, bilateral); a first tangent solves its pair on
+    The row's kind selects its projection (unilateral, friction pair,
+    bilateral); a first tangent solves its pair on
     the disk of ``radius`` (declared by the block). Then one tail for every
     kind: the impulses are stored (the row's first lane owns them), an
     impulse-space operator records what it applied, and the changes are voted
@@ -1671,8 +1665,8 @@ class LiveOrder:
     each read at its row (``rec_a``, ``rec_b`` where the records stream).
 
     A window's rows are tested once a sweep, from their records and the staged impulses: a row whose visit passes it
-    without a look at the velocity never acts (a spin row, solved with its pair; a velocity limit, which the last word
-    solves; a second tangent, solved with its first; a row other than a friction row whose diagonal is not positive). A contact normal
+    without a look at the velocity never acts (a spin row, solved with its pair; a second tangent, solved with its
+    first; a row other than a friction row whose diagonal is not positive). A contact normal
     or joint limit at a zero impulse is idle while the loop's bound of the velocity's norm ``reach`` stays at most its
     key ``rhs / sqrt(A_ii)``: ``A_ii = |Z|^2 + cfm`` bounds the row's norm, so ``|Z . u| <= sqrt(A_ii) |u|`` and the
     residual ``Z . u + rhs`` is not negative, its computed sum included (the bound's margin covers its rounding and the
@@ -1692,8 +1686,6 @@ class LiveOrder:
     rows: WorldRows
     reach: str
     torsion: bool
-    never: tuple[int, ...] = (ROW_JOINT_VELOCITY_LIMIT,)
-    """The kinds the loop's admission passes (velocity limits, and the line's speed rows where it holds them)."""
 
     def inner(self, pad: str) -> str:
         return pad + "        "
@@ -1718,7 +1710,7 @@ class LiveOrder:
             kind, diagonal, parent, rhs = record_head({1: "ta.y", 2: "ta.z", 3: "ta.w"}.__getitem__, rows.parent_of)
         else:
             kind, diagonal, parent, rhs = rows.live_head("t")
-        never = (*self.never, ROW_TORSION) if self.torsion else self.never
+        never = (ROW_TORSION,) if self.torsion else ()
         kinds = " && ".join(f"t_kind != {k}" for k in never) or "true"
         unilateral = f"t_kind == {ROW_CONTACT} || t_kind == {ROW_JOINT_LIMIT}"
         ring_kinds = " && ".join(f"r_kind != {k}" for k in never) or "true"
@@ -2073,7 +2065,6 @@ ITERATION = "iter"
 
 def level_loop(
     phases: Sequence[str],
-    last_word: Sequence[str] = (),
     *,
     exit: str,
     iteration: str = ITERATION,
@@ -2082,11 +2073,10 @@ def level_loop(
     pad: str = "    ",
 ) -> str:
     """The iteration frame of every sweep: per sweep, no change voted yet (``iteration_changed``), the schedule's
-    phases in order, the last word (the rows sorted last: velocity limits, the free bodies' speed rows), then the exit
-    law (``exit``: :func:`end_sweep` at ``iteration``), which ends the loop once a sweep is quiet, or the ``budget``
+    phases in order, then the exit law (``exit``: :func:`end_sweep` at ``iteration``), which ends the loop once a sweep is quiet, or the ``budget``
     of sweeps. With ``resume`` the counter is the caller's and the loop takes it up where it stopped: a Jacobi law's
     epochs, each a run of sweeps of one metric (:func:`jacobi_sweeps`)."""
-    body = "\n".join(text.rstrip("\n") for text in (*phases, *last_word) if text.strip())
+    body = "\n".join(text.rstrip("\n") for text in phases if text.strip())
     start = "" if resume else f"int {iteration} = 0"
     return (
         f"{pad}for ({start}; {iteration} < {budget}; ++{iteration}) {{\n"
@@ -2328,7 +2318,7 @@ def row_step(
       sparse-diagonal sweep's chains).
 
     A spin row is skipped first (solved with its pair, here or in the triple phase), then ``admission``, the
-    schedule's own skips (velocity limits, which the last word solves); with ``reach`` (the live order's bound of the
+    schedule's own skips; with ``reach`` (the live order's bound of the
     velocity, :class:`LiveOrder`) every apply grows the bound (:func:`idle_growth`).
     """
     ctx = RowContext.of(
@@ -2377,7 +2367,7 @@ def rows_block(
     selected: bool = False,
     unit: str = "",
     triple_phase: bool = False,
-    live: tuple[Velocity, str, tuple[int, ...]] | None = None,
+    live: tuple[Velocity, str] | None = None,
     pad: str = "        ",
 ) -> str:
     """The Gauss-Seidel loop over a world's rows of one class ``[0, end)`` in slot order (:class:`WorldRows`): the
@@ -2410,7 +2400,7 @@ def rows_block(
     if live is not None and (selected or unit or rows.free or not rows.owned):
         raise ValueError("the live order bounds a dense loop whose own row applies are the only ones inside it")
     if live is not None:
-        order = LiveOrder(end, rows, "idle_reach", laws.torsion, live[2])
+        order = LiveOrder(end, rows, "idle_reach", laws.torsion)
         visit = row_step(rows, op, laws, **step, reach="idle_reach", pad=order.inner(pad + "    "))
         bound = idle_reach("idle_reach", live[0], live[1], rows.lanes, pad + "    ")
         return f"{pad}{{\n{bound}\n{order.wrap(visit, pad + '    ')}\n{pad}}}"
@@ -2558,24 +2548,19 @@ def friction_metric_law(name: str, record: Callable[[str], str], pad: str) -> st
 def impulse_seed(
     count: str,
     impulse: str,
-    kind: str,
     apply: str,
     sync: str,
     *,
-    skip: int = ROW_JOINT_VELOCITY_LIMIT,
     declare: tuple[str, ...] = (),
     pad: str = "    ",
 ) -> str:
     """Give the velocity change the response of the impulses a sweep starts from, ``du = sum_i Z_i lambda_i``, row by
-    row in order, before the first sweep: the warm start's and the closed loop's. A velocity-limit row carries no
-    impulse into a sweep, and a free body's speed row no ``Z``: rows of kind ``skip`` are left out. A row's lanes'
-    updates never collide; ``sync`` serializes the rows.
+    row in order, before the first sweep: the warm start's and the closed loop's. A row's lanes' updates never collide;
+    ``sync`` serializes the rows.
 
     Args:
         count: The rows.
         impulse: Row ``i``'s impulse.
-        kind: Row ``i``'s type.
-        skip: The kind left out (``VELOCITY_LIMIT`` or ``SPEED``).
         apply: ``du += Z_i seed`` (the operator's ``axpy`` of row ``i``, indented for this block).
         sync: The lanes' barrier after a row.
         declare: Statements row ``i``'s ``apply`` needs.
@@ -2585,231 +2570,13 @@ def impulse_seed(
         f"for (int i = 0; i < {count}; ++i) {{",
         *(f"    {line}" for line in declare),
         f"    const float seed = {impulse};",
-        f"    if (seed != 0.0f && {kind} != {skip}) {{",
+        "    if (seed != 0.0f) {",
         apply,
         "    }",
         f"    {sync}",
         "}",
     ]
     return indent("\n".join(lines), pad)
-
-
-# ---------------------------------------------------------------------------------------------------------------------
-# End-of-sweep passes: rows whose law gives them the last word of every sweep
-# ---------------------------------------------------------------------------------------------------------------------
-
-
-def velocity_limit_pass(rows: WorldRows, op, laws: RowLaws, *, end: str = "m_dense", pad: str = "            ") -> str:
-    """Dense joint velocity-limit rows after every other row of the sweep, under the velocity-limit law.
-
-    Each row is a coordinate's two-sided limit and keeps a signed total (:func:`.projection_laws.velocity_limit`),
-    owned by the row's first lane. ``rows`` stages the rows' impulses, kinds, diagonals and right-hand sides (:class:`WorldRows`, or a route's
-    store of the same accessors); the operator reduces each row's velocity term outside the row loop
-    (``dot``).
-
-    A row whose total is zero and whose velocity lies inside its box applies nothing: its residual
-    ``r = J v + b`` (``b`` the lower side's) is in ``[0, 2 L]``. The pass first tests every row so, each lane its own
-    rows on one thread's sum, and runs only where one is not provably inside: a row within the rounding apart from the
-    ladder's sum (``(2 n + 8) 2^-24`` of its terms' magnitude, the right-hand side and ``L``, ``n`` the row's entries)
-    of its box's ends counts as live. A pass none of whose rows is live leaves every impulse, the velocity and the
-    votes as the rows' visits would (each stores its unchanged zero and applies nothing), so passing it is exact.
-    """
-    lanes = rows.lanes
-    visit = rows.visit("i")
-    # One thread's sum of a row: the operator on one lane.
-    serial = dataclasses.replace(op, lanes=Lanes(1))
-    floor = (2 * op.width + 8) * 2.0**-24
-    live = [
-        "float vlim_live = 0.0f;",
-        f"for (int i = {lanes.lane if lanes.parallel else '0'}; i < {end}; i += {lanes.width}) {{",
-        *((indent(visit, "    "),) if visit else ()),
-        f"    if (({rows.kind('i', scan=True)}) != {ROW_JOINT_VELOCITY_LIMIT}) continue;",
-        f"    if ({rows.diag('i')} <= 0.0f) continue;",
-        "    float vlim_jv = 0.0f, vlim_jv_terms = 0.0f;",
-        f"    for (int entry = 0; entry < {op.width}; ++entry) {{",
-        f"        const int index = {serial.guarded_coordinate('i')};",
-        "        if (index < 0) continue;",
-        f"        const float term = {op.element('i', 'entry')} * {op.velocity.at('index')};",
-        "        vlim_jv += term;",
-        "        vlim_jv_terms += fabsf(term);",
-        "    }",
-        f"    const float vlim_r = vlim_jv + {rows.rhs_of('i')};",
-        f"    const float vlim_limit = {rows.mu('i')};",
-        f"    const float vlim_margin = {floor!r}f * (vlim_jv_terms + fabsf({rows.rhs_of('i')}) + fabsf(vlim_limit));",
-        f"    if ({rows.load('i')} != 0.0f || !(vlim_r > vlim_margin && vlim_r < 2.0f * vlim_limit - vlim_margin))",
-        "        vlim_live = 1.0f;",
-        "}",
-        lanes.reduce("vlim_live"),
-    ]
-    lines = [
-        "{",
-        *("    " + line for line in "\n".join(live).split("\n") if line),
-        "    if (vlim_live > 0.0f) {",
-        f"    for (int i = 0; i < {end}; i++) {{",
-        *((indent(visit, "        "),) if visit else ()),
-        f"        if (({rows.kind('i', scan=True)}) != {ROW_JOINT_VELOCITY_LIMIT}) continue;",
-        f"        float denom = {rows.diag('i')};",
-        "        if (denom <= 0.0f) continue;",
-        "",
-        op.dot((("my_sum_vlim", "row", None),), {"row": "i"}, "        "),
-        "        float jv_vlim = my_sum_vlim;",
-        "",
-        f"        float residual_vlim = jv_vlim + {rows.rhs_of('i')};",
-        f"        const float old_vlim = {rows.load('i')};",
-        f"        const float bound_vlim = {bound(rows.rhs_of('i'), op.terms('my_sum_vlim', '', whole=False), 'old_vlim', diagonal='denom')};",
-        f"        const float new_vlim = ProjectionLaw::velocity_limit(old_vlim - residual_vlim / denom, {rows.mu('i')} / denom);",
-        "        const float delta_impulse_vlim = new_vlim - old_vlim;",
-        f"        {lanes.sync()}",
-    ]
-    change = Change("delta_impulse_vlim", "bound_vlim", str(ROW_JOINT_VELOCITY_LIMIT), "denom", scaled=True)
-    lines += [
-        f"        {rows.store('i', 'new_vlim')}",
-        "",
-        "        if (delta_impulse_vlim != 0.0f) {",
-        change_vote(laws, (change,), "            "),
-        op.axpy((("row", "delta_impulse_vlim"),), "            "),
-        "        }",
-        f"        {lanes.sync()}",
-        "    }",
-        "    }",
-        "}",
-    ]
-    return indent("\n".join(lines), pad)
-
-
-def speed_rows_pass(
-    rows: RowStore,
-    op,
-    laws: RowLaws,
-    *,
-    walk,
-    start: str = "mf_contact_end",
-    end: str = "m_mf",
-    body: tuple[str, str, str] | None = None,
-    pad: str = "            ",
-) -> str:
-    """Free-body speed rows (``[start, end)``, a class's last rows) after every other row: each bounds the magnitude
-    of its body's linear (axis ``e_0``) or angular (axis ``e_3``) velocity, along that velocity (:func:`speed_row`),
-    which the body's ``walk`` reads and pushes; ``op`` holds the rows' entries and the velocity.
-
-    The free bodies' run's rows (``rows.free``) carry their body's first coordinate, inverse diagonal and right-hand
-    side in their record; the line's (a dense store) name their body by ``body``: the statements that
-    declare row ``i``'s, the expression of its first world coordinate, and that of the entry its unwhitened axis marks
-    at the body's coordinate 3 (:func:`.walk_rows.speed_axis`)."""
-    lanes = rows.lanes
-    visit = indent(rows.visit("i"), "    ") if hasattr(rows, "visit") else ""
-    if getattr(rows, "free", False):
-        lines = [
-            f"for (int i = {start}; i < {end}; i++) {{",
-            visit,
-            unpack_mf_header("rec_a", "    "),
-            f"    if (mf_rt != {ROW_SPEED}) continue;",
-            "    if (mf_diag <= 0.0f || dof_a < 0) continue;",
-            "",
-            f"    const int speed_axis = {op.element('i', '3')} != 0.0f ? 3 : 0;",
-        ]
-        rhs, inverse, first = rows.rhs_of("i"), "mf_diag", "dof_a"
-        store = lanes.first(rows.store("i", "speed_row[0]")) if not rows.stream else rows.store("i", "speed_row[0]")
-    else:
-        declare, first, axis = body
-        lines = [
-            f"for (int i = {start}; i < {end}; i++) {{",
-            *((visit,) if visit else ()),
-            f"    const float speed_diag = {rows.diag('i')};",
-            "    if (speed_diag <= 0.0f) continue;",
-            "    const float speed_inverse = 1.0f / speed_diag;",
-            *(f"    {line}" for line in declare),
-            f"    const int speed_axis = {axis} != 0.0f ? 3 : 0;",
-        ]
-        rhs, inverse = rows.rhs_of("i"), "speed_inverse"
-        store = rows.store("i", "speed_row[0]")
-    lines += [
-        speed_row(
-            walk,
-            laws,
-            velocity=op.velocity,
-            load=rows.load("i"),
-            store=store,
-            lanes=lanes,
-            rhs=rhs,
-            inverse=inverse,
-            body=first,
-            pad="    ",
-        ),
-        "}",
-    ]
-    return indent("\n".join(lines), pad)
-
-
-def speed_row(
-    walk,
-    laws: RowLaws,
-    *,
-    velocity: Velocity,
-    load: str,
-    store: str,
-    lanes: Lanes,
-    rhs: str,
-    inverse: str,
-    body: str = "dof_a",
-    axis: str = "speed_axis",
-    pad: str = "    ",
-) -> str:
-    """The update of a free-body speed row on its body's velocity coordinates ``[axis, axis + 3)``.
-
-    The body's coordinates from ``body`` hold ``u``, its factor coordinates (``velocity``); the speed is the magnitude
-    of its physical velocity there: every lane forms ``speed_v = L^-T u`` by the body's walk down
-    (``walk.walk_leave(first, values)``) on the predictor, which ``v_out`` holds through the sweep, and the magnitude,
-    the squares added in coordinate order; the lanes then synchronize. The row's law (:func:`.projection_laws.speed_row`)
-    gives its stored value (``store`` stores ``speed_row[0]``, the total of the row's impulse ``load``) and the scale
-    that pushes the velocity back along itself, ``u += L^T dv`` by the walk in (``walk.walk_enter(first, velocity,
-    out)``), one thread or the first lane. ``inverse`` is the row's inverse diagonal.
-    """
-    v = velocity.at(f"{body} + k")
-    speed = [
-        "float speed_v[6];",
-        f"for (int k = 0; k < 6; ++k) speed_v[k] = {v};",
-        walk.walk_leave(body, "speed_v"),
-        f"for (int k = 0; k < 6; ++k) speed_v[k] += v_out.data[world_dof_indices.data[dof_map_base + {body} + k]];",
-        f"const float speed_mf_vlim = sqrtf((speed_v[{axis}] * speed_v[{axis}] + speed_v[{axis} + 1] * speed_v[{axis} + 1])"
-        f" + speed_v[{axis} + 2] * speed_v[{axis} + 2]);",
-    ]
-    if lanes.parallel:
-        speed.append(lanes.sync())
-    push = "\n".join(
-        [
-            "float speed_dv[6];",
-            f"for (int k = 0; k < 6; ++k) speed_dv[k] = k >= {axis} && k < {axis} + 3 ? speed_row[2] * speed_v[k] : 0.0f;",
-            "float speed_du[6];",
-            walk.walk_enter(body, "speed_dv", "speed_du"),
-            f"for (int k = 0; k < 6; ++k) {v} += speed_du[k];",
-        ]
-    )
-    if lanes.parallel:
-        push = f"if ({lanes.lane} == 0) {{\n{push}\n}}"
-    lines = [
-        "\n".join(pad + line for line in "\n".join(speed).split("\n")),
-        f"{pad}const float old_mf_vlim = {load};",
-        f"{pad}const float bound_speed = {bound(rhs, 'speed_mf_vlim', 'old_mf_vlim', step=inverse)};",
-        f"{pad}const wp::vec3 speed_row = ProjectionLaw::speed_row(speed_mf_vlim, {rhs}, {inverse}, old_mf_vlim);",
-    ]
-    if lanes.sync():
-        lines.append(f"{pad}{lanes.sync()}")
-    lines += [
-        f"{pad}{store}",
-        "",
-        f"{pad}if (speed_row[2] != 0.0f) {{",
-        change_vote(
-            laws,
-            (Change("speed_row[1]", "bound_speed", str(ROW_SPEED), f"1.0f / {inverse}"),),
-            pad + "    ",
-        ),
-        "\n".join(pad + "    " + line for line in push.split("\n")),
-        f"{pad}}}",
-    ]
-    if lanes.sync():
-        lines.append(f"{pad}{lanes.sync()}")
-    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -2847,14 +2614,12 @@ def dense_tier_world(
 # The Jacobi law: every row of a world at once, from the extrapolated impulses, with momentum
 # ---------------------------------------------------------------------------------------------------------------------
 
-JACOBI_UNILATERAL, JACOBI_FRICTION, JACOBI_BILATERAL, JACOBI_IDLE, JACOBI_LIMIT, JACOBI_FROZEN = 0, 1, 2, 3, 4, -1
+JACOBI_UNILATERAL, JACOBI_FRICTION, JACOBI_BILATERAL, JACOBI_IDLE, JACOBI_FROZEN = 0, 1, 2, 3, -1
 """The kinds of a Jacobi row (``s_kind``): its projection, decoded from its type once at staging. A unilateral row
-(contact normals, position limits) clamps at zero, a velocity limit takes its two-sided law
-(:func:`.projection_laws.velocity_limit`, its limit in ``s_mu``), a friction row's pair projects on its disk and a
-bilateral row takes its step; a frozen row keeps its warm start. An idle row is a unilateral row at zero impulse whose
-residual keeps it there: it cannot move, so it is out of the steps' bound until its residual turns negative and it
-joins (:meth:`JacobiRows.idle`, :func:`jacobi_sweeps`). A velocity limit is never idle: it counts in the bound from the
-staging, so leaving its box needs no join (a join sets every step again and restarts the momentum)."""
+(contact normals, position limits) clamps at zero, a friction row's pair projects on its disk and a bilateral row
+takes its step; a frozen row keeps its warm start. An idle row is a unilateral row at zero impulse whose residual
+keeps it there: it cannot move, so it is out of the steps' bound until its residual turns negative and it joins
+(:meth:`JacobiRows.idle`, :func:`jacobi_sweeps`)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2980,7 +2745,6 @@ class JacobiRows:
         decode = [
             f"if ({' || '.join(f'row_type == {kind}' for kind in unilateral)}) kind = {JACOBI_UNILATERAL};",
             f"else if ({friction}) kind = {JACOBI_FRICTION};",
-            f"else if (row_type == {ROW_JOINT_VELOCITY_LIMIT}) kind = {JACOBI_LIMIT};",
         ]
         lines = [
             f"for (int i = lane; i < {self.rows}; i += {self.threads}) {{",
@@ -3177,9 +2941,6 @@ def _jacobi_step(rows: JacobiRows, op, laws: RowLaws, pad: str) -> str:
     update = [
         step,
         f"if {rows.clamps('i')} value = ProjectionLaw::unilateral(value);",
-        # A velocity limit's two sides as one row: its step's measure of the limit L (s_mu) is s_i L.
-        f"if (s_kind[i] == {JACOBI_LIMIT})",
-        f"    value = ProjectionLaw::velocity_limit(value, s_step[i] * {rows.mu('i')});",
         # An idle row whose residual turned negative joins the bound after the sweep (_jacobi_join) and moves from the
         # next: it keeps its zero impulse now, its lane loud so that the world cannot stop before it has moved.
         f"if (s_kind[i] == {JACOBI_IDLE} && r < 0.0f) {{",

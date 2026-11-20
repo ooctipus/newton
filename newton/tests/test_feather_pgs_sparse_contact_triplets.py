@@ -436,7 +436,6 @@ class TestSparseContactTriplets(unittest.TestCase):
         # explicit indices (a coordinate an entry), the admission's rule, from this tree's classes.
         probe = SolverFeatherPGS(
             model,
-            enable_joint_velocity_limits=False,
             pgs_warmstart=False,
             dense_max_constraints=192,
         )
@@ -464,7 +463,6 @@ class TestSparseContactTriplets(unittest.TestCase):
                 solver = SolverFeatherPGS(
                     model,
                     pins=SolverFeatherPGS.Pins(**pins),
-                    enable_joint_velocity_limits=False,
                     pgs_warmstart=False,
                     dense_max_constraints=capacity,
                 )
@@ -758,7 +756,6 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
                 solver = SolverFeatherPGS(
                     model,
                     pins=SolverFeatherPGS.Pins(**pins),
-                    enable_joint_velocity_limits=False,
                     pgs_warmstart=False,
                     dense_max_constraints=192,
                 )

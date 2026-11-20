@@ -410,17 +410,11 @@ def _input_mismatches(kernel, inputs):
     return mismatched
 
 
-def _cpu_owner(*, motion_velocity=False, worlds=2, pins=None):
-    """A CPU solver with a mixed held-tree owner installed, as cached_dynamics installs one on CUDA.
-
-    ``motion_velocity`` builds the owner of a velocity-limit solver (whose matrix-free mode CPU
-    lacks): its groups read prescaled velocities. Each group holds one tree per world.
-    """
+def _cpu_owner(*, worlds=2, pins=None):
+    """A CPU solver with a mixed held-tree owner installed, as cached_dynamics installs one on CUDA. Each group holds
+    one tree per world."""
     model = _build(wp.get_device("cpu"), worlds=worlds)
     solver = SolverFeatherPGS(model)
-    solver.options = solver.laws.options = solver.factor.options = solver.placement.options = solver.sweep.options = (
-        dataclasses.replace(solver.options, enable_joint_velocity_limits=motion_velocity)
-    )
     solver.spec = dataclasses.replace(solver.spec, pins=SolverFeatherPGS.Pins(**(pins or {})))
     inputs = SimpleNamespace(
         model=model,
@@ -450,8 +444,8 @@ class TestFeatherPGSInputBank(unittest.TestCase):
             invalidate=lambda world_mask=None: None,
         )
         solver.factor.fk_id_cache_valid.fill_(1)
-        solver.factor.fk_id(states[0], states[1], states[0].joint_qd, DT)
-        solver.factor.fk_id(states[1], states[0], states[1].joint_qd, DT)
+        solver.factor.fk_id(states[0], states[1], DT)
+        solver.factor.fk_id(states[1], states[0], DT)
         np.testing.assert_array_equal(solver.factor.fk_id_cache_valid.numpy(), 1)
         self.assertIs(calls[-1].get("state_out"), states[0])
         none = wp.zeros(model.world_count, dtype=wp.bool, device=model.device)
@@ -557,22 +551,6 @@ class TestFeatherPGSInputBank(unittest.TestCase):
             finals.append({field: getattr(rollout.states[0], field).numpy() for field in STATE_FIELDS})
         for field in STATE_FIELDS:
             np.testing.assert_allclose(finals[1][field], finals[0][field], rtol=0.0, atol=2e-6, err_msg=field)
-
-    @unittest.skipUnless(wp.is_cuda_available(), "Held-tree owners are a CUDA path")
-    def test_cuda_velocity_limit_layouts_validate_by_identity(self):
-        """Repair every group after a copy-back under joint velocity limits, whose repair reads prescaled velocities."""
-        model = _build(wp.get_device("cuda:0"), worlds=4, speed_limit=0.8)
-        solver = _mixed_solver(model, enable_joint_velocity_limits=True)
-        owner = solver.factor.held
-        self.assertIsNotNone(owner)
-        self.assertFalse(any(group.bank_compare for group in _groups(owner)))
-        rollout = _Rollout(model, solver, copy_back=True)
-        rollout.step()
-        before = _generations(owner)
-        for _ in range(3):
-            rollout.step()
-        for start, end in zip(before, _generations(owner), strict=True):
-            np.testing.assert_array_equal(end - start, 6)
 
     @staticmethod
     def _owned(name, device, **options):
@@ -716,21 +694,13 @@ class TestFeatherPGSCapturedRepair(unittest.TestCase):
                     np.testing.assert_allclose(finals[1][field], finals[0][field], rtol=0.0, atol=2e-6, err_msg=field)
 
     @unittest.skipUnless(wp.is_cuda_available(), "Held-tree owners are a CUDA path")
-    def test_cuda_motion_layouts_and_separate_captures_repair_every_time(self):
-        """Keep every captured repair of a velocity-limit layout and of each separate capture.
+    def test_cuda_separate_captures_repair_every_time(self):
+        """Keep every captured repair of each separate capture.
 
         Two single-step graphs captured one after the other, replayed with an eager reset between
         them, each repair, and match eager stepping.
         """
         device = wp.get_device("cuda:0")
-        model = _build(device, worlds=4, speed_limit=0.8)
-        solver = _mixed_solver(model, enable_joint_velocity_limits=True)
-        owner = solver.factor.held
-        rollout = _Rollout(model, solver)
-        rollout.block()
-        with _counted_launches(_repair_kernels(owner)) as counted, wp.ScopedCapture(device=device):
-            rollout.block()
-        self.assertEqual(counted[0], 2 * len(owner.groups))
 
         def replay(rollout, graph):
             wp.capture_launch(graph)
@@ -815,23 +785,15 @@ class TestFeatherPGSColdCapture(unittest.TestCase):
         """Repair on the device on both steps of a two-step block captured before the solver stepped.
 
         In a ping-pong block (an even substep count) the first repair's replays follow resets the host
-        does not see at capture time; each step launches its group's one repair (comparing banks
-        outside the velocity-limit layout), and the device decides each group. Replays with a world
-        reset before each match eager stepping: states within 2e-6 and, outside the velocity-limit
-        layout (whose repairs follow clamped velocities that separate instances may round apart), equal
+        does not see at capture time; each step launches its group's one repair (comparing banks), and the device
+        decides each group. Replays with a world reset before each match eager stepping: states within 2e-6 and equal
         cache and geometry generations.
         """
         device = wp.get_device("cuda:0")
-
-        def velocity_limits():
-            model = _build(device, worlds=4, speed_limit=0.8)
-            return model, _mixed_solver(model, enable_joint_velocity_limits=True)
-
         cases = {
             "mixed": lambda: TestFeatherPGSInputBank._owned("mixed", device)[:2],
             "forest": lambda: TestFeatherPGSInputBank._owned("forest", device)[:2],
             "sparse": lambda: TestFeatherPGSInputBank._owned("sparse", device, update_mass_matrix_interval=2)[:2],
-            "motion": velocity_limits,
         }
         for name, build in cases.items():
             with self.subTest(owner=name):
@@ -845,8 +807,7 @@ class TestFeatherPGSColdCapture(unittest.TestCase):
                     if captured:
                         with _launch_kinds(owner) as kinds, wp.ScopedCapture(device=device) as capture:
                             rollout.block()
-                        kind = "repair" if name == "motion" else "bank_repair"
-                        self.assertEqual(kinds, {kind: 2 * len(_groups(owner))})
+                        self.assertEqual(kinds, {"bank_repair": 2 * len(_groups(owner))})
                         advance = functools.partial(wp.capture_launch, capture.graph)
                     for _ in range(4):
                         rollout.reset_worlds((1,))
@@ -858,7 +819,7 @@ class TestFeatherPGSColdCapture(unittest.TestCase):
                             "geometry_generation": [group.data.geometry_generation.numpy() for group in _groups(owner)],
                         }
                     )
-                for key in ("generation", "geometry_generation") if name != "motion" else ():
+                for key in ("generation", "geometry_generation"):
                     for eager, replayed in zip(finals[0][key], finals[1][key], strict=True):
                         np.testing.assert_array_equal(replayed, eager, err_msg=key)
                 for field in STATE_FIELDS:
@@ -867,13 +828,11 @@ class TestFeatherPGSColdCapture(unittest.TestCase):
 
 class TestFeatherPGSRepairLaunches(unittest.TestCase):
     def check_owner_launches(self, device):
-        """Run every launch form of ordinary and motion-velocity owners; each must match its kernel's parameters.
+        """Run every launch form of an owner; each must match its kernel's parameters.
 
-        Two owners of two-world scenes take two steps and a copy-back begin: an ordinary owner (the
-        repair that compares banks) and a motion-velocity owner (its motion repair). Every held-tree
-        launch, those at construction included, is checked before it runs, and every kernel each
-        group bound must have run in a launch of that group's cache. These groups are per-size trees
-        on kinetic plans.
+        An owner of a two-world scene takes two steps and a copy-back begin (the repair that compares banks). Every
+        held-tree launch, those at construction included, is checked before it runs, and every kernel each group bound
+        must have run in a launch of that group's cache. These groups are per-size trees on kinetic plans.
         """
         device = wp.get_device(device)
         launched = []
@@ -890,52 +849,42 @@ class TestFeatherPGSRepairLaunches(unittest.TestCase):
             return launch_checked
 
         with patch.multiple(wp, launch=checked(wp.launch), launch_tiled=checked(wp.launch_tiled)):
-            for name, motion in (("compare", False), ("motion", True)):
-                with self.subTest(owner=name):
-                    launched.clear()
-                    model = _build(device, worlds=2, speed_limit=0.8 if motion else None)
-                    solver = SolverFeatherPGS(model)
-                    solver.options = solver.laws.options = solver.factor.options = solver.placement.options = (
-                        solver.sweep.options
-                    ) = dataclasses.replace(solver.options, enable_joint_velocity_limits=motion)
-                    owner = HeldTree(solver, solver.spec.classes.held)
-                    groups = []
-                    for group in owner.groups:
-                        self.assertEqual(group.bank_compare, not motion)
-                        kernels = {
-                            group.repair_kernel: "repair",
-                            group.finish_kernel: "finish",
-                            group.predictor_kernel: "predict",
-                        }
-                        groups.append((group, kernels))
-                    states, control = [model.state(), model.state()], model.control()
-                    # A motion-velocity owner reads a prescaled velocity bank of its own.
-                    velocities = [wp.clone(state.joint_qd) if motion else state.joint_qd for state in states]
-                    for source, refresh in ((0, True), (1, False)):
-                        state, output, velocity = states[source], states[1 - source], velocities[source]
-                        _set_clock(solver.factor, refresh)
-                        owner.begin(state, solver.factor, velocity, DT)
-                        solver.factor.mass_update_mask.fill_(1)
-                        owner.refresh(solver.factor)
-                        owner.predict(state, solver.factor, control, velocity, DT)
-                        solver.v_out.assign(solver.v_hat)
-                        _set_clock(solver.factor, refresh, ahead=1)
-                        owner.finish(state, solver.factor, output, DT)
-                    # A copy of the bank the last finish published, one coordinate changed.
-                    states[1].assign(states[0])
-                    coordinates = states[1].joint_q.numpy()
-                    coordinates[0] += np.float32(0.01)
-                    states[1].joint_q.assign(coordinates)
-                    _set_clock(solver.factor, False)
-                    owner.begin(states[1], solver.factor, velocities[1], DT, state_out=states[0])
-                    # Checked per group, by the cache each held-tree launch passes: the owner holds two groups (a
-                    # free body and an arm).
-                    for group, kernels in groups:
-                        ran = {kernel for kernel, inputs in launched if any(value is group.data for value in inputs)}
-                        unlaunched = sorted(kind for kernel, kind in kernels.items() if kernel not in ran)
-                        self.assertEqual(unlaunched, [], f"group of {group.layout.bodies} bodies")
-                    if motion:
-                        self.assertTrue(all("_motion" in group.repair_kernel.key for group in owner.groups))
+            model = _build(device, worlds=2)
+            solver = SolverFeatherPGS(model)
+            owner = HeldTree(solver, solver.spec.classes.held)
+            groups = []
+            for group in owner.groups:
+                self.assertTrue(group.bank_compare)
+                kernels = {
+                    group.repair_kernel: "repair",
+                    group.finish_kernel: "finish",
+                    group.predictor_kernel: "predict",
+                }
+                groups.append((group, kernels))
+            states, control = [model.state(), model.state()], model.control()
+            for source, refresh in ((0, True), (1, False)):
+                state, output = states[source], states[1 - source]
+                _set_clock(solver.factor, refresh)
+                owner.begin(state, solver.factor, DT)
+                solver.factor.mass_update_mask.fill_(1)
+                owner.refresh(solver.factor)
+                owner.predict(state, solver.factor, control, DT)
+                solver.v_out.assign(solver.v_hat)
+                _set_clock(solver.factor, refresh, ahead=1)
+                owner.finish(state, solver.factor, output, DT)
+            # A copy of the bank the last finish published, one coordinate changed.
+            states[1].assign(states[0])
+            coordinates = states[1].joint_q.numpy()
+            coordinates[0] += np.float32(0.01)
+            states[1].joint_q.assign(coordinates)
+            _set_clock(solver.factor, False)
+            owner.begin(states[1], solver.factor, DT, state_out=states[0])
+            # Checked per group, by the cache each held-tree launch passes: the owner holds two groups (a free body and
+            # an arm).
+            for group, kernels in groups:
+                ran = {kernel for kernel, inputs in launched if any(value is group.data for value in inputs)}
+                unlaunched = sorted(kind for kernel, kind in kernels.items() if kernel not in ran)
+                self.assertEqual(unlaunched, [], f"group of {group.layout.bodies} bodies")
 
     def test_owner_launches_match_their_kernels(self):
         """Launch every held-tree kernel an owner binds with one input of each parameter's type, on CPU; see

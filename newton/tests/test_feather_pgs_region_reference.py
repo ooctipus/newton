@@ -345,7 +345,7 @@ class TestPassRule(unittest.TestCase):
         np.testing.assert_allclose(states[0].phi, phi, atol=1e-15)
 
     def test_anything_that_moves_the_body_ends_the_pass(self):
-        """A dense row or a speed row that changes the body's velocity between two sweeps is seen by its bits."""
+        """A dense row that changes the body's velocity between two sweeps is seen by its bits."""
         region = box_on_ground(FALL, STILL)
         velocity, states = np.zeros(6), ref.new_states([region])
         self.assertEqual(ref.sweep([region], states, velocity), ["stick"])

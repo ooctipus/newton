@@ -154,7 +154,6 @@ class HeldResponse:
 FORCE_INPUT = (
     Field("joint_q", wp.float32, ("coord",), owner="state_in"),
     Field("joint_qd", wp.float32, ("dof",), owner="state_in"),
-    Field("predictor_qd", wp.float32, ("dof",), owner="step"),
     Field("joint_f", wp.float32, ("dof",), owner="control"),
     Field("body_f", wp.spatial_vector, ("body",), owner="state_in"),
     Field("body_flags", wp.int32, ("body",), owner="model"),
@@ -206,8 +205,6 @@ class TreeGroup:
     body: int
     qs: int
     refresh: int
-    # Alternate repair motion: whether the motion velocity differs from the state bank's.
-    motion_changed: int
     # Whether this launch rebuilds the group's current state.
     admitted: int
 
@@ -222,22 +219,12 @@ _SUB_SOURCE = "    return SUB;\n"
 _LANE_STRIDE = "    const int lane=LANE,stride=STRIDE;\n"
 
 
-_DIFFERENT_MOTION_SOURCE = r"""
-    if(state_qd.data==motion_qd.data)return 0;
-    int different=0;
-    for(int i=LANE;i<count;i+=STRIDE)
-        different|=state_qd.data[start+i]!=motion_qd.data[start+i];
-    return ANY(different);
-"""
-
-
 @functools.cache
 def _thread_helpers(layout):
     """Lane, barrier and sub-tree natives for one tree layout."""
     lanes_source = layout.native(_LANES_SOURCE)
     sync_source = layout.native(_SYNC_SOURCE)
     sub_source = layout.native(_SUB_SOURCE)
-    motion_source = layout.native(_DIFFERENT_MOTION_SOURCE)
 
     @wp.func_native(lanes_source)
     def _lanes() -> wp.vec3i: ...
@@ -248,15 +235,12 @@ def _thread_helpers(layout):
     @wp.func_native(sub_source)
     def _sub() -> int: ...
 
-    @wp.func_native(motion_source)
-    def _different_motion(state_qd: wp.array[float], motion_qd: wp.array[float], start: int, count: int) -> int: ...
-
-    return _lanes, _sync, _sub, _different_motion
+    return _lanes, _sync, _sub
 
 
 # Unpacked (one tree per block) helpers under their module-level names, for the
 # tools tests that drive the natives directly.
-_lanes, _sync, _sub, _different_motion = _thread_helpers(REFERENCE_LAYOUT)
+_lanes, _sync, _sub = _thread_helpers(REFERENCE_LAYOUT)
 
 
 @wp.func_native(
@@ -568,8 +552,7 @@ inverts (the rows' inverse mass)."""
 
 _FORCE = cached_force.ForceOperands(
     q="f.joint_q.data",
-    state_qd="f.joint_qd.data",
-    predictor_qd="f.predictor_qd.data",
+    qd="f.joint_qd.data",
     stiffness="f.stiffness.data",
     reference="f.reference.data",
     damping="f.damping.data",
@@ -974,7 +957,6 @@ def get_state_kernel(
     *,
     layout: TreeLayout = REFERENCE_LAYOUT,
     twist_roots: int = 0,
-    motion_velocity: bool = False,
     bank_coordinates: int = 0,
     clocked: bool = False,
     diagonal: bool = False,
@@ -993,9 +975,9 @@ def get_state_kernel(
     poses, a zero twist, its origin and its validity alone.
 
     Every finish and repair takes one launch ABI, which keeps each stage one
-    call below the kernel: after the six common arguments, the alternate
-    motion velocity ``motion_qd`` and the ``bank`` a repair compares its input
-    bank with. A kernel leaves the inputs of the other forms unread.
+    call below the kernel: after the six common arguments, the ``bank`` a
+    repair compares its input bank with. A kernel leaves it unread where it
+    compares none.
 
     ``bank_coordinates`` (a group's coordinate count) builds the repair that
     compares input banks inside its blocks: a valid group stamped with the
@@ -1028,14 +1010,10 @@ def get_state_kernel(
     :data:`.tree_scan.WALK_BOTH`) forms the walk's step columns a second time
     at the anchor's rotation, where every other group stores S's halves.
     """
-    if finish and motion_velocity:
-        raise ValueError("Alternate motion velocity is a repair-only contract")
-    if bank_coordinates and motion_velocity:
-        raise ValueError("A compared input bank is a contract of the repair of ordinary motion")
     if finish and bank_coordinates and twist_roots != (1 << len(layout.roots)) - 1:
         raise ValueError("A finish keeps its publication only where every root is prescribed")
     h = get_helpers(layout, schedules, twist_roots, clocked=clocked, diagonal=diagonal)
-    _lanes, _sync, _sub, _different_motion = _thread_helpers(layout)
+    _lanes, _sync, _sub = _thread_helpers(layout)
     banked = bank_coordinates != 0
     kept = finish and banked
     _bank_matches = _bank_binding(bank_coordinates, layout) if banked else None
@@ -1098,7 +1076,6 @@ def get_state_kernel(
         cache: KineticData,
         requests: wp.array[int],
         clock: wp.array[Clock],
-        motion_qd: wp.array[float],
         bank: StateBank,
     ) -> TreeGroup:
         """Bind the group's threads; admit it unless a repair finds its current cache valid.
@@ -1119,8 +1096,6 @@ def get_state_kernel(
         g.art = p.group_to_art[g.group]
         g.ds = p.art_dof_start[g.art]
         g.js = p.art_joint_start[g.art]
-        if wp.static(motion_velocity):
-            g.motion_changed = _different_motion(data.joint_qd, motion_qd, g.ds, dofs)
         # A repair (before the walk's refresh advances the clock) refreshes this step's geometry where the step
         # refreshes; the finish (after it) computes the next step's on the next step's cadence.
         refresh = clock_refresh(clock[0], data.dt)
@@ -1155,7 +1130,6 @@ def get_state_kernel(
             if (
                 valid != 0
                 and source_matches != 0
-                and g.motion_changed == 0
                 and (
                     refresh == 0
                     or (
@@ -1452,19 +1426,10 @@ def get_state_kernel(
         collect(g.address, g.group, g.ds, p, plan, data, cache, g.refresh)
         if g.lane == 0:
             cache.finished[g.group] = wp.static(int(finish))
-            if wp.static(motion_velocity):
-                # An override source must not be reused when a later begin returns to
-                # ordinary motion, even if no finish occurred between the two calls.
-                if g.motion_changed == 0:
-                    _stamp_source(cache, g.group, q, data.joint_qd)
-                else:
-                    _stamp_source(cache, g.group, q, qd)
-            else:
-                _stamp_source(cache, g.group, q, qd)
+            _stamp_source(cache, g.group, q, qd)
 
-    # One launch ABI for every finish and repair: motion_qd is the velocity an
-    # alternate-motion repair reads, bank the bank a comparing repair reads.
-    # Every other kernel leaves them unread.
+    # One launch ABI for every finish and repair: bank is the bank a comparing
+    # repair reads. Every other kernel leaves it unread.
     def kinetic_state(
         p: GroupTrees,
         plan: HeldPlan,
@@ -1472,7 +1437,6 @@ def get_state_kernel(
         cache: KineticData,
         requests: wp.array[int],
         clock: wp.array[Clock],
-        motion_qd: wp.array[float],
         bank: StateBank,
     ):
         block, logical_lane = wp.tid()
@@ -1485,7 +1449,6 @@ def get_state_kernel(
             cache,
             requests,
             clock,
-            motion_qd,
             bank,
         )
         if g.admitted == 0:
@@ -1520,8 +1483,6 @@ def get_state_kernel(
         if wp.static(clocked):
             clock_2 = _clock()
         poses(g, plan, data)
-        if wp.static(motion_velocity):
-            qd = motion_qd
         if wp.static(clocked):
             clock_3 = _clock()
         if wp.static(not rest):
@@ -1550,8 +1511,6 @@ def get_state_kernel(
     if layout.pack > 1:
         name += f"_l{layout.lanes}"
     name += schedules.tag
-    if motion_velocity:
-        name += "_motion"
     if banked:
         name += "_kept" if kept else "_banked"
     if diagonal:

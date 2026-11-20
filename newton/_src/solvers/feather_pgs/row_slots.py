@@ -614,20 +614,15 @@ def reserve_world_rows(
 
 
 @wp.kernel
-def snapshot_dense_phase_bound(
+def snapshot_topology_rows(
     world_slot_counter: wp.array[int],
-    bound_index: int,
     # outputs
-    dense_phase_bounds: wp.array2d[int],
+    topology_rows: wp.array[int],
 ):
-    """Record the current dense slot watermark for one row-family boundary.
+    """Record where each world's topology rows (mimics, links, joint limits) end and its contacts start.
 
-    The dense per-world slot layout is [drive][joint-limit][joint-vel-limit]
-    [contact/friction]. Launched right after the joint-limit allocation
-    (``bound_index`` 0) and the joint-velocity-limit allocation
-    (``bound_index`` 1) so the PhysX-grasp GS phases can loop only their own
-    contiguous row range instead of scanning every dense row. The raw counter
-    is stored; consumers clamp against the per-world constraint count.
+    Launched right after the joint-limit allocation, so the sweeps' and writers' contact phases loop only their own
+    contiguous row range. The raw counter is stored; consumers clamp against the per-world constraint count.
     """
     world = wp.tid()
-    dense_phase_bounds[world, bound_index] = world_slot_counter[world]
+    topology_rows[world] = world_slot_counter[world]

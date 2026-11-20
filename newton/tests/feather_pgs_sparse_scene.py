@@ -86,7 +86,6 @@ def make_solver(model, enabled, pins=None, **overrides):
         "pgs_iterations": 8,
         "pgs_warmstart": False,
         "enable_joint_limits": True,
-        "enable_joint_velocity_limits": False,
         "enable_restitution": True,
         "restitution_velocity_threshold": 0.01,
         "dense_max_constraints": 32,
@@ -153,7 +152,6 @@ def eligible_inputs():
     forest = ForestProbe(has_free_rigid_bodies=False)
     options = SimpleNamespace(
         pgs_iterations=8,
-        enable_joint_velocity_limits=False,
         pgs_warmstart=False,
         contact_compliance=False,
     )

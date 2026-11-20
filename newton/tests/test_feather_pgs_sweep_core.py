@@ -138,7 +138,6 @@ class TestDiagonal(unittest.TestCase):
     def test_the_step_divides_by_a_value_and_multiplies_by_a_reciprocal(self):
         value = Diagonal(lambda row: f"d[{row}]")
         self.assertEqual(value.step("r", "i"), "-r / d[i]")
-        self.assertEqual(value.scale("r", "i"), "r / d[i]")
         self.assertEqual(value.value("i"), "d[i]")
         reciprocal = Diagonal(inverse=lambda row: f"inv[{row}]")
         self.assertEqual(reciprocal.step("r", "i"), "-r * inv[i]")

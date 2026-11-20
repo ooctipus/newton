@@ -7,10 +7,9 @@
 
 - the contact law: the friction law (one wrench a friction region, its stick's gain ``friction_anchor_beta > 0``), the
   regularization weight, the restitution threshold, the shape materials and contact torsion;
-- the rigid bodies' speed limits;
+- the rigid bodies' depenetration caps;
 - the joint-limit tables (limited sizes, each coordinate's limit coordinate) and the warp joint-limit row builders;
 - the mimic and link plans (the bilateral rows' tables);
-- the velocity prescale's launch;
 - :attr:`RowLaws.set`, the route table's laws axis (:class:`.route_table.Laws`), once the bilateral pre-elimination
   is decided.
 
@@ -32,7 +31,7 @@ import warp as wp
 from ...core import memory
 from ...core.execution import Shape, Work, launch, shape
 from ...geometry.flags import ShapeFlags
-from ...sim import Contacts, Model, ModelBuilder, State
+from ...sim import Contacts, Model, State
 from ...sim.enums import JointType
 from . import field_group, host_index, prefix_rows, walk_rows
 from .contact_input import ContactInput
@@ -43,7 +42,6 @@ from .field_group import Field, FieldGroup, SolverArrays
 from .forest_plan import ForestPlan, RowLaw
 from .friction_patches import _FrictionPatchState as FrictionPatchState
 from .friction_patches import patch_row_law
-from .joint_table import FreeBodies, bind_free_bodies
 from .joint_table import bind as bind_joint_table
 from .kernel_template import KernelTemplate, items, params
 from .path_selection import json_value, kernel_key
@@ -55,27 +53,20 @@ from .row_kernels import (
     Links,
     RowBias,
     allocate_link_slots,
-    allocate_rigid_velocity_limit_slots,
     prepare_fused_diagonal_joint_limits,
     write_link_rows,
 )
 from .row_laws import LINK_ROWS, ROW_LAW
-from .row_records import UNIT_LIMIT, UNIT_MIMIC, UNIT_SHIFT, UNIT_VELOCITY, RowSupport
+from .row_records import UNIT_LIMIT, UNIT_MIMIC, UNIT_SHIFT, RowSupport
 from .row_records import bind as bind_dense_rows
 from .row_slots import (
     RESERVE_BLOCK,
     RESERVE_LANES,
     admit_world_contacts,
     reserve_world_rows,
-    snapshot_dense_phase_bound,
+    snapshot_topology_rows,
 )
 from .sweep_plan import FREE_ROUTE
-
-VELOCITY_LIMIT_SLOTS = FieldGroup(
-    Field("velocity_limit_slot", wp.int32, ("limit_row",), fill=-1, owner="laws"),
-    Field("velocity_limit_sign", wp.float32, ("limit_row",), owner="laws"),
-)
-"""Two unilateral joint velocity-limit rows per DOF (lower ``+e_i``, upper ``-e_i``): their slots and signs."""
 
 MIMIC_PLAN = FieldGroup(
     Field("_mimic_art_start", wp.int32, ("articulation_bound",), owner="laws"),
@@ -101,8 +92,6 @@ __all__ = [
     "joint_limit_warp_kernel",
     "mimic_warp_kernel",
     "prefix_shape",
-    "velocity_limit_warp_kernel",
-    "velocity_prescale_launch",
 ]
 
 JOINT_ROW_WARPS = 4
@@ -118,36 +107,6 @@ def _holds_contact_rows(contacts: Contacts | None) -> bool:
         and getattr(contacts, "rigid_contact_count", None) is not None
         and contacts._rigid_contact_rows > 0
     )
-
-
-def velocity_prescale_launch(articulation_start: np.ndarray, *, joint_count: int, cuda: bool) -> tuple[int, int]:
-    """Return the lanes per articulation and the thread count of the joint velocity prescale.
-
-    A lane group as wide as the mean articulation's joint count, rounded up to a
-    power of two of at most one warp, covers a typical articulation in one
-    strided pass while many articulations share the device; larger ones take a
-    few passes. CUDA launches cover complete warps. CPU threads cannot exchange
-    values, so a CPU launch runs one lane per articulation.
-
-    Raises:
-        ValueError: If the last articulation does not end at ``joint_count``. The
-            prescale writes no DOF of a joint past it.
-    """
-    count = len(articulation_start) - 1
-    if count <= 0:
-        return 1, 0
-    if int(articulation_start[-1]) != joint_count:
-        raise ValueError(
-            "SolverFeatherPGS requires Model.articulation_start to end with the joint count "
-            f"{joint_count}, got {int(articulation_start[-1])}; ModelBuilder.finalize() writes this sentinel."
-        )
-    if not cuda:
-        return 1, count
-    mean_joints = (int(articulation_start[-1]) - int(articulation_start[0])) / count
-    lanes = 1
-    while lanes < 32 and lanes < mean_joints:
-        lanes *= 2
-    return lanes, (count * lanes + 31) // 32 * 32
 
 
 PREFIX_LINE = 40
@@ -168,7 +127,7 @@ def prefix_shape(articulations: int, device) -> Shape:
 
 def _prefix_warp_params(law) -> tuple:
     """The warp prefix producers' operands after the articulations' count (the dispatch's guard): the family's law
-    (:data:`.prefix_rows.LAW`, with the velocity or the mimic family's inputs) and the rows' placement (its unit
+    (:data:`.prefix_rows.LAW`, with the mimic family's inputs) and the rows' placement (its unit
     sources, :class:`.row_records.RowSupport`)."""
     return params(
         ("articulation_dof_start", wp.array[int]),
@@ -182,12 +141,6 @@ def _prefix_warp_params(law) -> tuple:
 # The joint row families of the prefix warp: (kernel name, native name, law, unit kind).
 _PREFIX_FAMILIES = {
     "limits": ("build_joint_limit_rows_warp", "joint_limit_warp_native", prefix_rows.PrefixLaw, UNIT_LIMIT),
-    "velocity": (
-        "build_joint_velocity_limit_rows_warp",
-        "velocity_limit_warp_native",
-        prefix_rows.PrefixVelocityLaw,
-        UNIT_VELOCITY,
-    ),
     "mimics": ("build_mimic_rows_warp", "mimic_warp_native", prefix_rows.PrefixMimicLaw, UNIT_MIMIC),
 }
 
@@ -196,7 +149,7 @@ _PREFIX_FAMILIES = {
 def _prefix_warp_kernel(size: int, family: str, device_arch, mimics: int = 0) -> wp.Kernel:
     """A joint row family of the one writer, one warp per articulation of ``size`` coordinates
     (:func:`.prefix_rows.prefix_rows`), built for ``device_arch`` (its groups a block and bound; one on the CPU): its
-    joint limits, its joint velocity limits, or its mimics (at most ``mimics`` an articulation). The warp takes each
+    joint limits or its mimics (at most ``mimics`` an articulation). The warp takes each
     candidate's law, reserves the active rows on the world's counter, writes their records and publishes each row's
     seed, its unit source, which the one writer walks (a mimic's slot in ``mimic_slot`` too); a limit that may act
     marks its world's acts word."""
@@ -212,8 +165,6 @@ def _prefix_warp_kernel(size: int, family: str, device_arch, mimics: int = 0) ->
     sink = f"""{extra}            support.units.data[(size_t)prefix_line * support.units.shape[1] + slot] = {source};"""
     if family == "mimics":
         candidates = prefix_rows.mimics(mimics, "law.")
-    elif family == "velocity":
-        candidates = prefix_rows.velocity_limits(tuple(range(size)), "first_dof + d", "law.")
     else:
         candidates = prefix_rows.limits(tuple(range(size)), "first_dof + d", "law.")
     rows = prefix_rows.prefix_rows(
@@ -248,11 +199,6 @@ def _prefix_warp_kernel(size: int, family: str, device_arch, mimics: int = 0) ->
 def joint_limit_warp_kernel(size: int, device_arch) -> wp.Kernel:
     """The one writer's joint-limit rows, one warp per articulation (:func:`_prefix_warp_kernel`)."""
     return _prefix_warp_kernel(size, "limits", device_arch)
-
-
-def velocity_limit_warp_kernel(size: int, device_arch) -> wp.Kernel:
-    """The one writer's joint velocity-limit rows, one warp per articulation (:func:`_prefix_warp_kernel`)."""
-    return _prefix_warp_kernel(size, "velocity", device_arch)
 
 
 def mimic_warp_kernel(size: int, mimics: int, device_arch) -> wp.Kernel:
@@ -321,9 +267,7 @@ class RowLaws:
             options.restitution_velocity_threshold if options.enable_restitution else np.finfo(np.float32).max
         )
 
-        # The rigid bodies' speed limits.
-        laws.rigid_body_max_linear_velocity = getattr(model, "rigid_body_max_linear_velocity", None)
-        laws.rigid_body_max_angular_velocity = getattr(model, "rigid_body_max_angular_velocity", None)
+        # The rigid bodies' depenetration caps.
         laws.rigid_body_max_depenetration_velocity = getattr(model, "rigid_body_max_depenetration_velocity", None)
         if laws.rigid_body_max_depenetration_velocity is None:
             laws.rigid_body_max_depenetration_velocity = wp.full(
@@ -332,11 +276,6 @@ class RowLaws:
                 dtype=wp.float32,
                 device=model.device,
             )
-        laws.has_rigid_body_velocity_limits = (
-            laws.rigid_body_max_linear_velocity is not None and laws.rigid_body_max_angular_velocity is not None
-        )
-        # A joint velocity limit nobody authored holds the builder's default (the importers' too): no limit.
-        laws.unauthored_velocity_limit = float(ModelBuilder.JointDofConfig().velocity_limit)
 
         laws._joint_limit_tables(model)
         # Mimic and link plans must exist before capacity selection so the row census
@@ -355,14 +294,6 @@ class RowLaws:
         else:
             laws.shape_material_restitution = wp.zeros((1,), dtype=wp.float32, device=model.device)
         laws._authored_materials(model)
-
-        # The joint velocity prescale's lanes per articulation and threads (it writes every DOF of qd_work).
-        if model.joint_count:
-            laws.velocity_prescale_lanes, laws.velocity_prescale_threads = velocity_prescale_launch(
-                model.articulation_start.numpy(), joint_count=model.joint_count, cuda=model.device.is_cuda
-            )
-        else:
-            laws.velocity_prescale_lanes, laws.velocity_prescale_threads = 1, 0
         laws.friction_patches = None
         return laws
 
@@ -415,14 +346,12 @@ class RowLaws:
 
     # --- the joint-limit tables ----------------------------------------------------------------------------------
     def _joint_limit_tables(self, model):
-        """The joint-limit tables: the limited sizes, each coordinate's limit coordinate, the warp limit and velocity-limit
-        kernels."""
+        """The joint-limit tables: the limited sizes, each coordinate's limit coordinate, the warp limit kernels."""
         if not model.articulation_count or not model.joint_count:
             self.joint_limit_sizes = frozenset()
             self.joint_limit_q_index = None
             self.joint_limit_q_index_host = np.zeros(model.joint_dof_count, dtype=np.int32)
             self.joint_limit_warp_kernels = {}
-            self.velocity_limit_warp_kernels = {}
             return
 
         response_dof_count = self.forest.response_dof_count
@@ -454,12 +383,6 @@ class RowLaws:
         self.joint_limit_q_index_host = limit_q_index
         arch = model.device.arch
         self.joint_limit_warp_kernels = {size: joint_limit_warp_kernel(size, arch) for size in self.joint_limit_sizes}
-        # The velocity limits sit on the same coordinates (limit_q_index >= 0), so on the same sizes.
-        self.velocity_limit_warp_kernels = (
-            {size: velocity_limit_warp_kernel(size, arch) for size in self.joint_limit_sizes}
-            if self.options.enable_joint_velocity_limits
-            else {}
-        )
 
     # --- the bilateral rows' plans ---------------------------------------------------------------------------------
     def _mimic_plan(self, model) -> None:
@@ -597,7 +520,7 @@ class RowLaws:
 
     # --- the slots and the friction patches, allocated with the rows ----------------------------------------------
     def allocate(self, model, pool, phi, *, region_normals: bool) -> None:
-        """Allocate the velocity-limit slots and the friction patch state.
+        """Allocate the friction patch state.
 
         Args:
             model: The model.
@@ -605,19 +528,9 @@ class RowLaws:
             phi: The contact rows' patch phi view (a contact pool field).
             region_normals: Whether any contact can hold a region normal (some body is free).
         """
-        options = self.options
-        arrays = self._arrays
         # Persistent state is owned by the body-pair patch builder, independently
         # of collision matching and the contact warm-start tables.
         self.friction_patches = FrictionPatchState(model, pool.ready, phi, pool=pool, region_normals=region_normals)
-        # Joint velocity-limit buffers (per-DOF tracking). Independent from the
-        # joint-position-limit buffers so the two flags can be used separately.
-        # Both rows of a finite limit are allocated every step, so the velocity box
-        # is present before the predicted velocity escapes.
-        if options.enable_joint_velocity_limits and model.joint_dof_count > 0:
-            arrays.allocate(VELOCITY_LIMIT_SLOTS, limit_row=2 * model.joint_dof_count)
-        else:
-            arrays.release(VELOCITY_LIMIT_SLOTS)
 
     # --- the row pass ---------------------------------------------------------------------------------------------------
     @staticmethod
@@ -640,18 +553,15 @@ class RowLaws:
         )
 
     # The row pass, in the launch order that is the slot order: the allocators reserve slots with atomics, in the order
-    # mimic, link, joint limit, velocity limit, contacts, then the free bodies' rows, and the phase-bound snapshots are
-    # glued to that sequence. The stage list (:func:`.step_plan._stages`) runs the families a class holds, in this
-    # order: :meth:`begin`, :meth:`write_mimics`, :meth:`write_links`, :meth:`prepare_fused_limits`,
-    # :meth:`write_limits`, :meth:`bound_phase` (0), :meth:`write_velocity_limits`, :meth:`bound_phase` (1),
-    # :meth:`build_patches`, :meth:`write_contacts`, :meth:`bound_free_body_contacts`, :meth:`allocate_free_body_limits`,
+    # mimic, link, joint limit, contacts, then the free bodies' rows, and the topology snapshot is glued to that
+    # sequence. The stage list (:func:`.step_plan._stages`) runs the families a class holds, in this order:
+    # :meth:`begin`, :meth:`write_mimics`, :meth:`write_links`, :meth:`prepare_fused_limits`, :meth:`write_limits`,
+    # :meth:`bound_topology`, :meth:`build_patches`, :meth:`write_contacts`, :meth:`bound_free_body_contacts`,
     # :meth:`write_free_bodies`; the placement closes the pass (:meth:`.placement.Placement.close_rows`).
     #
-    # Dense row-family layout: slots are handed out in the order [mimic][joint-limit][joint-velocity-limit]
-    # [contact/friction], so each family owns one contiguous dense row range:
-    #   mimic and position limits: [0, bounds[0])
-    #   velocity limits:           [bounds[0], bounds[1])
-    #   contacts and friction:     [bounds[1], m_dense)
+    # Dense row-family layout: slots are handed out in the order [mimic][link][joint-limit][contact/friction], so each
+    # world's topology rows (mimics, links, limits) are [0, topology_rows) and its contacts and friction
+    # [topology_rows, m_dense).
     # Mimic rows come first, ahead of the (activation-gated, flickering) limit family, so warm-started mimic lambdas
     # keep a stable slot index across steps.
 
@@ -748,24 +658,16 @@ class RowLaws:
         for size in sizes:
             self._launch_prefix_warp(solver, self.joint_limit_warp_kernels[size], size, law, support)
 
-    def bound_phase(self, solver, phase: int) -> None:
-        """Snapshot the dense rows' family boundary ``phase`` (0: after the position limits, 1: after the velocity
-        limits), where the row pass holds the dense rows' order; a family that is off leaves the current count."""
+    def bound_topology(self, solver) -> None:
+        """Snapshot where each world's topology rows (mimics, links, limits) end and its contacts start
+        (``topology_rows``), where the row pass holds the dense rows' order."""
         wp.launch(
-            snapshot_dense_phase_bound,
+            snapshot_topology_rows,
             dim=solver.forest.world_count,
-            inputs=[solver.placement.slot_counter, phase],
-            outputs=[solver.placement.dense_phase_bounds],
+            inputs=[solver.placement.slot_counter],
+            outputs=[solver.placement.topology_rows],
             device=solver.model.device,
         )
-
-    def write_velocity_limits(self, solver, state_in: State, dt: float) -> None:
-        """The joint velocity-limit rows (a per-DOF clamp on ``|qdot_i|``), one warp per articulation; the contact rows
-        follow them, and the sweeps visit them in a final pass whatever their slots."""
-        law = self._prefix_law(solver, prefix_rows.PrefixVelocityLaw, state_in, dt)
-        support = solver.placement.row_support()
-        for size, warp_kernel in self.velocity_limit_warp_kernels.items():
-            self._launch_prefix_warp(solver, warp_kernel, size, law, support)
 
     def write_contacts(
         self, solver, state_in: State, state_aug: State, contacts: Contacts, dt: float, producer: str
@@ -881,101 +783,33 @@ class RowLaws:
             )
 
     def bound_free_body_contacts(self, solver) -> None:
-        """Record where the free bodies' contact rows end in their run: every contact and friction row precedes the
-        speed rows in the run's slots, so the sweeps loop the contact prefix in the contact phases and the speed rows'
-        tail in the last word (staged with the run, :attr:`.step_plan.Capacities.free_contact_rows`)."""
+        """Record where the free bodies' contact rows end in their run (staged with the run,
+        :attr:`.step_plan.Capacities.free_contact_rows`)."""
         wp.copy(solver.placement.mf_contact_rows_end, solver.placement.mf_slot_counter)
 
-    def bound_speed_rows(self, solver) -> None:
-        """Record where the line's speed rows start (``speed_first``): every contact row is reserved, so the free
-        bodies' speed rows, reserved next, are the line's last rows (staged where the line holds them or the tiers
-        read it)."""
-        wp.copy(solver.placement.speed_first, solver.placement.slot_counter)
-
-    def allocate_free_body_limits(self, solver) -> None:
-        """The free bodies' speed limits as rows, not post-solve clamps: their slots, records and unit sources,
-        reserved after the contacts' so they are the last rows of the line (or of the free bodies' run, where their
-        contacts keep one), which the sweeps visit in their last word with the joints' velocity limits (staged with free
-        bodies that carry speed-limit slots)."""
-        placement, model = solver.placement, solver.model
-        # Without articulation metadata no root is a free rigid body's, so the kernel reads no root's first DOF.
-        root_dof_start = solver.forest.articulation_root_dof_start
-        if root_dof_start is None:
-            root_dof_start = placement.dummy_is_free_rigid
-        if placement.free_contact_rows:
-            counter, capacity, rejected = (
-                placement.mf_slot_counter,
-                placement.mf_max_constraints,
-                placement.mf_first_rejected_slot,
-            )
-            base, units = placement.body_base, placement.no_units
-        else:
-            counter, capacity, rejected = (
-                placement.slot_counter,
-                placement.dense_max_constraints,
-                placement.dense_first_rejected_slot,
-            )
-            # A class with free bodies walks (SolverFeatherPGS): the one writer takes the line's speed rows.
-            base, units = 0, placement.unit_source
-        wp.launch(
-            allocate_rigid_velocity_limit_slots,
-            dim=solver.forest.free_rigid_body_count,
-            inputs=[
-                bind_free_bodies(solver),
-                model.body_flags,
-                root_dof_start,
-                solver.v_hat,
-                solver.options.velocity_limit_activation_fraction,
-                capacity,
-                base,
-            ],
-            outputs=[
-                placement.world_acts,
-                placement.rigid_velocity_limit_slot,
-                counter,
-                rejected,
-                bind_dense_rows(placement),
-                units,
-            ],
-            device=model.device,
-        )
-
     def write_free_bodies(self, solver, state_in: State, contacts: Contacts | None, dt: float) -> None:
-        """The free bodies' rows, once their families' slots are reserved (staged with free bodies): one writer over
-        their contacts' rows and their speed rows (:func:`.walk_rows.write_free_body_rows`), on its threads at its own
-        line (:data:`.walk_rows.WRITERS`); where their contacts are regions (``Sweep.regions``) the regions' fill
-        writes their contacts' rows and the writer the speed rows alone (:func:`.walk_rows.write_free_body_regions`);
-        the pass's close finalizes their counts (:meth:`.placement.Placement.close_rows`)."""
+        """The free bodies' contact rows in their run, once their slots are reserved (staged with the run where their
+        contacts are not regions, whose fill writes them): one writer over their contacts' rows
+        (:func:`.walk_rows.write_free_body_rows`), on its threads at its own line (:data:`.walk_rows.WRITERS`); the
+        pass's close finalizes their counts (:meth:`.placement.Placement.close_rows`)."""
         placement, model = solver.placement, solver.model
-        speed = placement.rigid_velocity_limit_slot is not None
-        speed_bodies = solver.forest.free_rigid_body_count if speed else 0
-        tail = (
-            bind_free_bodies(solver) if speed else FreeBodies(),
-            placement.rigid_velocity_limit_slot if speed else placement.dummy_is_free_rigid,
-            speed_bodies,
-        )
-        head = (walk_rows.free_body_sink(solver), bind_dense_rows(placement))
-        if solver.sweep.regions is not None:
-            threads = walk_rows.support_threads(speed_bodies, model.device, walk_rows.WRITERS["free_body"])
-            writer = walk_rows.write_free_body_regions
-            inputs = [*head, *tail, threads, self.bias(solver.options, dt), bind_row_records(placement)]
-        else:
-            # The free bodies' contacts are theirs only where they keep their own run (Placement.free_contact_rows).
-            if _holds_contact_rows(contacts) and placement.free_contact_rows:
-                data = bind_contact_input(solver, state_in, solver.factor, contacts, dt, 1.0)
-                rows = placement.contact_pool.launch_rows()
-            else:
-                # No contact: the writer reads only the count, zero.
-                data, rows = ContactInput(), 0
-                data.count = placement.dummy_contact_count
-            threads = walk_rows.support_threads(rows + speed_bodies, model.device, walk_rows.WRITERS["free_body"])
-            writer = walk_rows.write_free_body_rows
-            inputs = [*head, data, patch_row_law(solver), *tail, threads, self.bias(solver.options, dt)]
-            inputs.append(bind_row_records(placement))
+        if not _holds_contact_rows(contacts):
+            return
+        data = bind_contact_input(solver, state_in, solver.factor, contacts, dt, 1.0)
+        rows = placement.contact_pool.launch_rows()
+        threads = walk_rows.support_threads(rows, model.device, walk_rows.WRITERS["free_body"])
         wp.launch(
-            writer(model.device.arch),
+            walk_rows.write_free_body_rows(model.device.arch),
             dim=threads,
-            inputs=inputs,
+            inputs=[
+                walk_rows.free_body_sink(solver),
+                bind_dense_rows(placement),
+                data,
+                patch_row_law(solver),
+                threads,
+                self.bias(solver.options, dt),
+                bind_row_records(placement),
+            ],
             block_dim=walk_rows.WRITERS["free_body"].block,
             device=model.device,
         )
@@ -1052,7 +886,7 @@ class RowLaws:
             self.mimic_slot if blocks and self.mimic_slot is not None else dummy_int,
             self.link_slot if blocks and self.link_slot is not None else dummy_int,
             *law[3:],
-            placement.dense_phase_bounds,
+            placement.topology_rows,
             int(part),
             self.row_seeds(solver, dt, *law),
             placement.world_acts,
@@ -1180,40 +1014,16 @@ class RowLaws:
             )
 
     def record(self, solver) -> dict:
-        """The row laws' route records: ``routes.contact_rows``, ``routes.velocity_limits`` and ``routes.friction``."""
+        """The row laws' route records: ``routes.contact_rows`` and ``routes.friction``."""
         producer = solver._plan.route.producer
         # The route's producer writes every contact row (the row pass, write_contacts, takes it from the plan).
         sizes = solver.forest.size_groups if producer != "none" else ()
-        if not self.options.enable_joint_velocity_limits:
-            joint, reason = "off", "enable_joint_velocity_limits is False."
-        elif solver.sweep.sparse_velocity_limits:
-            joint, reason = (
-                "sparse_factor_rows",
-                "Native sparse factors solve velocity-limit rows in factor coordinates.",
-            )
-        else:
-            joint, reason = "rows", "Dedicated velocity-limit rows."
-        limits = bool(self.has_rigid_body_velocity_limits)
-        model = self.model
-        prescale = self.options.enable_joint_velocity_limits and model.joint_count > 0 and model.articulation_count > 0
         return {
             "contact_rows": {
                 "producer": producer,
                 # Every producer, every size: the builder method, its kernels in launch order and the law they write,
                 # for the dense contact rows built outside the sweep (_row_builder names the rows built elsewhere).
                 "builder_by_dof": {str(int(size)): self._row_builder(solver, producer, size) for size in sizes},
-            },
-            "velocity_limits": {
-                "joint": joint,
-                "reason": reason,
-                # Lanes per articulation of the pre-solve PhysX velocity prescale; 0 when it launches no kernel.
-                "prescale_lanes": int(self.velocity_prescale_lanes) if prescale else 0,
-                "unauthored_limit": json_value(self.unauthored_velocity_limit),
-                "activation_fraction": json_value(self.options.velocity_limit_activation_fraction),
-                "rigid_body_limits": limits,
-                # Mirrors Placement.allocate_free_body_rows and the row allocation of write_contacts (both modes). At an
-                # infinite activation fraction the allocator still launches but reserves no row.
-                "free_body_rows": bool(limits and self.forest.free_rigid_body_count > 0),
             },
             "friction": {
                 "friction_anchor_beta": json_value(self.friction_anchor_beta),

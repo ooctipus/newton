@@ -3,103 +3,17 @@
 
 """The factor's kernels outside the walk.
 
-The velocity prescale ahead of the prediction, the free roots' prediction corrections (gyroscopic velocity, spin
-damping, the transport the integrator adds), the joint integrator, and the flags of the mass matrices' and the FK/ID
-cache's refresh.
+The free roots' prediction corrections (gyroscopic velocity, spin damping, the transport the integrator adds), the
+joint integrator, and the flags of the mass matrices' and the FK/ID cache's refresh.
 """
 
 import warp as wp
 
-from ....sim import BodyFlags, JointType
-from ..device_preludes import lane_minimum
-from ..joint_table import JointTable
+from ....sim import JointType
 from ..spatial_laws import free_root_transport
 
 # FeatherPGS takes no gradients: its kernels compile no adjoints.
 wp.set_module_options({"enable_backward": False})
-
-
-@wp.func
-def _prescaled_axis_count(joint: int, joints: JointTable) -> int:
-    """Return how many leading DOFs of ``joint`` the PhysX velocity prescale reads and scales.
-
-    Joint types without a PhysX joint velocity limit and kinematic children
-    have none.
-    """
-    jtype = joints.joint_type[joint]
-    if jtype != JointType.PRISMATIC and jtype != JointType.REVOLUTE and jtype != JointType.D6:
-        return 0
-    if (joints.body_flags[joints.joint_child[joint]] & BodyFlags.KINEMATIC) != 0:
-        return 0
-    return joints.joint_dof_dim[joint, 0] + joints.joint_dof_dim[joint, 1]
-
-
-@wp.kernel(enable_backward=False)
-def prescale_joint_velocity_limits(
-    joints: JointTable,
-    articulation_count: int,
-    lanes: int,
-    joint_qd: wp.array[float],
-    # out
-    prescaled_joint_qd: wp.array[float],
-):
-    """PhysX-style pre-solve joint velocity scaling.
-
-    PhysX computes a single ratio per articulation from maxJointVelocity and
-    applies that ratio to all articulation DOFs before building link velocities.
-    This is separate from the velocity-limit constraint rows solved later.
-
-    An aligned group of ``lanes`` threads owns each articulation, the joints
-    from ``articulation_start[art]`` up to the next articulation's start. Lane
-    ``k`` takes joints ``k, k + lanes, ...`` and the group combines the lanes'
-    ratios with a minimum. Every candidate ratio is 1 or a quotient of two
-    positive numbers, never NaN or -0, so the minimum selects one of them
-    and its bits do not depend on the order, as in the serial loop. Each DOF
-    of ``prescaled_joint_qd`` is written once: scaled DOFs get
-    ``joint_qd * ratio`` and every other DOF, including those of joints ahead
-    of the first articulation, a copy of ``joint_qd``. CUDA launches cover
-    complete warps with a power-of-two ``lanes`` of at most 32; CPU launches
-    use one lane.
-    """
-    tid = wp.tid()
-    art = tid // lanes
-    lane = tid - art * lanes
-    joint_start = int(0)
-    joint_end = int(0)
-    if art < articulation_count:
-        joint_start = joints.articulation_start[art]
-        joint_end = joints.articulation_start[art + 1]
-
-    ratio = float(1.0)
-    for j in range(joint_start + lane, joint_end, lanes):
-        qd_start = joints.joint_qd_start[j]
-        for axis in range(_prescaled_axis_count(j, joints)):
-            dof = qd_start + axis
-            limit = joints.joint_velocity_limit[dof]
-            qd_abs = wp.abs(joint_qd[dof])
-            if limit > 0.0 and wp.isfinite(limit) and qd_abs > 0.0:
-                scale = limit / qd_abs
-                if scale < ratio:
-                    ratio = scale
-    # Padding lanes past the last articulation take part with ratio 1.
-    ratio = lane_minimum(ratio, lanes)
-
-    if art == 0:
-        # Joints ahead of the first articulation keep their velocity.
-        for dof in range(lane, joints.joint_qd_start[joint_start], lanes):
-            prescaled_joint_qd[dof] = joint_qd[dof]
-    if ratio < 1.0:
-        for j in range(joint_start + lane, joint_end, lanes):
-            qd_start = joints.joint_qd_start[j]
-            scaled_end = qd_start + _prescaled_axis_count(j, joints)
-            for dof in range(qd_start, joints.joint_qd_start[j + 1]):
-                qd = joint_qd[dof]
-                if dof < scaled_end:
-                    qd = qd * ratio
-                prescaled_joint_qd[dof] = qd
-    else:
-        for dof in range(joints.joint_qd_start[joint_start] + lane, joints.joint_qd_start[joint_end], lanes):
-            prescaled_joint_qd[dof] = joint_qd[dof]
 
 
 @wp.func

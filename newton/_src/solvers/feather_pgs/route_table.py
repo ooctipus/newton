@@ -86,8 +86,6 @@ class Laws:
     from the model)."""
     limits: bool
     """Joint position limits take rows (``enable_joint_limits``)."""
-    velocity_limits: bool
-    """Joint velocity limits take rows (``enable_joint_velocity_limits``)."""
     warm_start: bool
     """Contact impulses carry from the previous step."""
     preelimination: bool
@@ -105,8 +103,8 @@ class Laws:
     @property
     def separable(self) -> bool:
         """Every row starts at zero and keeps it at a positive predictor residual, the residual the contacts'
-        admission forms: the hard contact law, an authored material's, their friction and spin rows, position and
-        velocity limits, free bodies' speeds; no warm start, relatively regularized or per-contact compliant contact,
+        admission forms: the hard contact law, an authored material's, their friction and spin rows, position limits;
+        no warm start, relatively regularized or per-contact compliant contact,
         mimic or eliminated row. (A weighted step from zero at a positive residual stays at zero; the admission forms
         an authored row's residual by its law, :func:`.row_slots.contact_separates`.)"""
         return self.verdicts and not (self.regularized or self.mimic or self.preelimination)
@@ -132,7 +130,6 @@ class Laws:
             compliance=bool(options.contact_compliance),
             authored=bool(laws.authored_materials),
             limits=bool(options.enable_joint_limits),
-            velocity_limits=bool(options.enable_joint_velocity_limits),
             warm_start=bool(options.pgs_warmstart),
             preelimination=bool(preelimination),
             mimic=bool(laws.mimic_count),

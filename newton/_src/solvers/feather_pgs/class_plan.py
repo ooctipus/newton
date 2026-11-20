@@ -98,7 +98,6 @@ class Packed:
     sweep: Mapping[str, object]
     """The sweep's options: ``active_rows``, ``use_support_table``, ``contact_triplets``, ``lanes_per_world``,
     ``local_factors``."""
-    velocity_limits: bool
     active_rows_reason: str
     contact_triplets_reason: str
     index_shape: tuple[int, int, int]
@@ -269,8 +268,7 @@ def active_rows_rule(pins, *, small_world_lanes: int, fits: Callable[[], bool]) 
     Under this law a zero-impulse row that a sweep's earlier updates violate waits for
     the next sweep. Patch friction (``friction_anchor_beta > 0``) adopts it: a friction
     pair is visited while any normal of its patch ring is selected or the pair holds
-    impulse, which skips only pairs whose update would be a no-op. Velocity-limit rows keep
-    their last word after the scanned rows. Small worlds keep their packed lanes. A scan
+    impulse, which skips only pairs whose update would be a no-op. Small worlds keep their packed lanes. A scan
     whose row bitsets exceed shared memory leaves the full ordered sweep.
 
     Args:
@@ -325,16 +323,14 @@ def contact_triplets_rule(
 
 def packed_rule(inputs: ClassInputs) -> tuple[Packed | None, str]:
     """Case K1, a single tree: native sparse factors of the class's one block, a tree shape without a free body."""
-    model, options, forest, laws, factor, pins = (
+    model, forest, laws, factor, pins = (
         inputs.model,
-        inputs.options,
         inputs.forest,
         inputs.laws,
         inputs.factor,
         inputs.pins,
     )
     dense_rows, shape = inputs.dense_rows, inputs.forest.shape
-    velocity_candidate = options.enable_joint_velocity_limits
     declined = first_failed(
         (
             (pins.storage != "dense", "A test pin keeps dense storage (storage='dense')."),
@@ -368,9 +364,7 @@ def packed_rule(inputs: ClassInputs) -> tuple[Packed | None, str]:
         local_parents(joint_ancestor, [start], end - start)[0], np.diff(joint_qd_start[start : end + 1])
     )
     plan = tree.factor
-    # Velocity rows can benefit from factor-coordinate response even for a
-    # serial chain; this owner does not require zeros in the mass factor.
-    if plan.dof_count != size or (not velocity_candidate and plan.nonzero_count >= size * (size + 1) // 2):
+    if plan.dof_count != size or plan.nonzero_count >= size * (size + 1) // 2:
         return None, "Topology has no usable sparse factor layout for this row policy."
     mimic_dofs = None
     if laws.mimic_count:
@@ -394,7 +388,6 @@ def packed_rule(inputs: ClassInputs) -> tuple[Packed | None, str]:
             dense_rows,
             forest.max_world_dofs,
             int(max_support),
-            velocity_limits=velocity_candidate,
             linked_rows=True,
             torsion=bool(laws.spin_rows),
             **options,
@@ -429,7 +422,7 @@ def packed_rule(inputs: ClassInputs) -> tuple[Packed | None, str]:
     # Unsupported mixed worlds retain explicit row indices and their existing kernels.
     use_support_table = support_classes is not None
     # A small world packs a lane group of 8 or 16 (_small_world_lanes) without changing this owner's row
-    # representation, sweep policy or velocity-limit phase.
+    # representation or sweep policy.
     lanes = small_world_lanes if small_world_lanes and not active_rows else 32
     contact_triplets, contact_triplets_reason = contact_triplets_rule(
         pins,
@@ -466,7 +459,6 @@ def packed_rule(inputs: ClassInputs) -> tuple[Packed | None, str]:
         max_support=int(max_support),
         support_classes=support_classes,
         sweep=MappingProxyType(sweep),
-        velocity_limits=bool(velocity_candidate),
         active_rows_reason=active_rows_reason,
         contact_triplets_reason=contact_triplets_reason,
         index_shape=(1, 1, 1) if use_support_table else index_shape,

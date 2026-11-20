@@ -13,7 +13,7 @@ import warp as wp
 
 from .device_preludes import CPU_MATH, CPU_WORDS, dual_native
 from .projection_laws import idle_key, idle_root
-from .row_laws import ROW_CONTACT, ROW_JOINT_LIMIT, ROW_JOINT_VELOCITY_LIMIT, ROW_TORSION
+from .row_laws import ROW_CONTACT, ROW_JOINT_LIMIT, ROW_TORSION
 from .row_metadata import HEADER_WORDS, RECORD_WORDS, pack_row_record
 from .row_records import DenseRows
 
@@ -95,10 +95,10 @@ def record_firsts(records: RowRecords, sides: wp.vec2i) -> wp.vec2i:
 def row_idle_key(kind: int, rhs: float, diagonal: float) -> float:
     """A dense row's idle key as the live order's tests take it (:class:`.sweep.LiveOrder`), a patch ring's least key
     over its rows included: a contact normal's or joint limit's :func:`.projection_laws.idle_key`; minus infinity for
-    another row of a positive diagonal (it acts whatever the bound); infinity for a row the tests pass (a velocity
-    limit, a spin row, a diagonal that is not positive)."""
+    another row of a positive diagonal (it acts whatever the bound); infinity for a row the tests pass (a spin row, a
+    diagonal that is not positive)."""
     key = float(wp.inf)
-    if not (diagonal <= 0.0) and kind != ROW_JOINT_VELOCITY_LIMIT and kind != ROW_TORSION:
+    if not (diagonal <= 0.0) and kind != ROW_TORSION:
         key = -wp.inf
         if kind == ROW_CONTACT or kind == ROW_JOINT_LIMIT:
             key = idle_key(rhs, diagonal)

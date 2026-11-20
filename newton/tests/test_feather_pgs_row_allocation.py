@@ -183,7 +183,7 @@ def _step_tripods(device, *, steps=4, sorted_contacts=False, **options):
             ),
             dense_overflow=solver.placement.dense_first_rejected_slot.numpy() < solver.placement.slot_counter.numpy(),
             starts=(
-                solver.placement.dense_phase_bounds.numpy()[:, 1].copy(),
+                solver.placement.topology_rows.numpy().copy(),
                 np.full(model.world_count, base, dtype=np.int32),
             ),
             joint_q=state_out.joint_q.numpy().copy(),

@@ -53,7 +53,6 @@ from .tree_factor import TreeFactor
 DOF_WORK = FieldGroup(
     Field("v_hat", wp.float32, ("dof",)),
     Field("v_out", wp.float32, ("dof",)),
-    Field("qd_work", wp.float32, ("dof",)),
 )
 """Per-DOF velocity work vectors."""
 
@@ -173,11 +172,8 @@ class SolverFeatherPGS(SolverBase):
     def register_custom_attributes(cls, builder: ModelBuilder) -> None:
         """Register the rigid-body attributes consumed by FeatherPGS.
 
-        ``rigid_body_max_linear_velocity`` [m/s] and ``rigid_body_max_angular_velocity``
-        [rad/s] bound the speeds of a free body, the magnitudes of its center of mass
-        velocity and of its angular velocity (``physxRigidBody:maxLinearVelocity`` and
-        ``physxRigidBody:maxAngularVelocity``, default unbounded).
-        ``rigid_body_max_depenetration_velocity`` [m/s] bounds its contact correction velocity.
+        ``rigid_body_max_depenetration_velocity`` [m/s] bounds a body's contact correction velocity
+        (``physxRigidBody:maxDepenetrationVelocity``, default unbounded).
         ``body_gravity_compensation`` is the fraction of a body's weight that is cancelled
         (``mjc:gravcomp``, MJCF ``gravcomp``, default 0): the body's weight is
         ``(1 - c) m g`` and its inertia is unchanged, so ``1`` makes it weightless. A write
@@ -185,29 +181,15 @@ class SolverFeatherPGS(SolverBase):
         :attr:`~newton.ModelFlags.BODY_INERTIAL_PROPERTIES` (:meth:`notify_model_changed`).
         """
 
-        def _angular_velocity_deg_to_rad(value, _context):
-            if value is None:
-                return float("inf")
-            value = float(value)
-            if not np.isfinite(value):
-                return float("inf")
-            return value * np.pi / 180.0
-
-        for name, usd_name, transformer in (
-            ("rigid_body_max_linear_velocity", "physxRigidBody:maxLinearVelocity", None),
-            ("rigid_body_max_angular_velocity", "physxRigidBody:maxAngularVelocity", _angular_velocity_deg_to_rad),
-            ("rigid_body_max_depenetration_velocity", "physxRigidBody:maxDepenetrationVelocity", None),
-        ):
-            builder.add_custom_attribute(
-                ModelBuilder.CustomAttribute(
-                    name=name,
-                    frequency=Model.AttributeFrequency.BODY,
-                    dtype=wp.float32,
-                    default=float("inf"),
-                    usd_attribute_name=usd_name,
-                    usd_value_transformer=transformer,
-                )
+        builder.add_custom_attribute(
+            ModelBuilder.CustomAttribute(
+                name="rigid_body_max_depenetration_velocity",
+                frequency=Model.AttributeFrequency.BODY,
+                dtype=wp.float32,
+                default=float("inf"),
+                usd_attribute_name="physxRigidBody:maxDepenetrationVelocity",
             )
+        )
         builder.add_custom_attribute(
             ModelBuilder.CustomAttribute(
                 name="body_gravity_compensation",
@@ -230,8 +212,6 @@ class SolverFeatherPGS(SolverBase):
         enable_joint_limits: bool = False,
         enable_bilateral_preelimination: bool = False,
         joint_limit_activation_gap: float = float("inf"),
-        enable_joint_velocity_limits: bool = False,
-        velocity_limit_activation_fraction: float = 0.0,
         pgs_iterations: int = 12,
         pgs_beta: float = 0.2,
         pgs_cfm: float = 1.0e-6,
@@ -367,29 +347,6 @@ class SolverFeatherPGS(SolverBase):
                 allocated when ``q <= lower + gap``; an upper row is allocated when
                 ``q >= upper - gap``. ``inf`` preserves the historical behavior of allocating all
                 finite limit rows every step. Must be non-negative and not NaN. Defaults to ``inf``.
-            enable_joint_velocity_limits (bool, optional): Enforce joint velocity limits
-                (``model.joint_velocity_limit``) as per-DOF PGS constraints. Mirrors the
-                PhysX velocity-limit row: when ``|qdot_i| > qdot_max_i``, a single
-                signed-Jacobian row is added that projects ``qdot_i`` back onto the
-                bilateral box ``[-qdot_max_i, +qdot_max_i]`` through the articulated-body
-                response ``J M^-1 J^T + cfm``, so momentum redistributes correctly across
-                the articulation (rather than a naive joint-space clip which breaks
-                multi-body Newton's third law). Every authored limit takes its rows each step,
-                whatever the speed (the solve can bring any coordinate to its limit); a limit at the
-                builder's default (``ModelBuilder.JointDofConfig.velocity_limit``, what the importers
-                write where none is authored) is no limit. No Baumgarte bias. Each row keeps a
-                non-negative impulse total, like a contact normal, so the sweeps converge
-                to the complementarity solution, independent of the row order.
-
-                Only supported on CUDA; CPU construction with
-                ``enable_joint_velocity_limits=True`` raises :class:`NotImplementedError`.
-                Defaults to False.
-            velocity_limit_activation_fraction (float, optional): Proximity gate of a free rigid
-                body's speed rows (``rigid_body_max_linear_velocity`` and
-                ``rigid_body_max_angular_velocity``). ``0.0`` allocates the speed row of every finitely
-                limited linear or angular speed each step. A positive fraction allocates one only when
-                the magnitude of the predicted linear or angular velocity reaches ``fraction * limit``.
-                Must be in ``[0, 1]`` or ``inf`` (never). Defaults to ``0.0``.
             pgs_iterations (int, optional): Number of Gauss-Seidel iterations to apply per frame. Defaults to 12.
             pgs_beta (float, optional): ERP style position correction factor for contact, joint-limit,
                 mimic and loop-closing rows. Defaults to 0.2.
@@ -470,7 +427,7 @@ class SolverFeatherPGS(SolverBase):
         # The forest plan: topology, groups, root kinds, world mapping, body maps. The matrix-free formulation
         # elides fully-kinematic free bases from the compact response mapping of its rows.
         self.forest = ForestPlan.build(self.cut, forest, self.factor.kinematic_dof_mask_host)
-        # The row laws' tables: the contact law, speed limits, the joint-limit tables, the mimic and link plans,
+        # The row laws' tables: the contact law, the depenetration caps, the joint-limit tables, the mimic and link plans,
         # contact torsion and the materials.
         self.laws = RowLaws.build(model, self.forest, options)
         # The closure's bilateral blocks, which decide the pre-elimination.
@@ -481,9 +438,7 @@ class SolverFeatherPGS(SolverBase):
         # The passive joint forces and the per-coordinate drive rows the class rules read (the held tree's admission).
         self.factor.plan(self.forest, self.laws)
         pins = Pins() if pins is None else pins
-        capacities = Capacities.build(
-            options, self.forest, self.laws.link_rows_per_world, self.laws.has_rigid_body_velocity_limits
-        )
+        capacities = Capacities.build(options, self.forest, self.laws.link_rows_per_world)
         # The class plan, axis 3 of the route table: the placement case, decided by rules over the data above before
         # any owner of the class (class_plan.RULES, in precedence order).
         classes = plan_class(
@@ -521,7 +476,6 @@ class SolverFeatherPGS(SolverBase):
             self.placement.allocate_contact_rows(model)
         self.placement.allocate_world_rows(model)
         self.placement.allocate_sparse_diagonal_rows()
-        self.placement.allocate_free_body_rows(model)
         self.factor.scatter_armature()
         self.sweep.place_tiers(classes.tiers)
         # The walk is the responding trees' factor (Z4): the predictor solves every responding root of its groups by
@@ -632,8 +586,7 @@ class SolverFeatherPGS(SolverBase):
         the plan the row build dispatches on), the sparse responses,
         the sweep kernels per route and tier, what drives them and the matrix-free
         sweep's shared-memory storage (``sweep.mf_gs_storage``), separated worlds,
-        publication, velocity limits and the lane width of their prescale, free
-        bodies and the friction law, each with a reason; ``routes.sweep.readout`` names the
+        publication, free bodies and the friction law, each with a reason; ``routes.sweep.readout`` names the
         sweep kernels that count their sweeps, the passes that count the solves
         of worlds without rows as skipped and the owners of the worlds no counter
         counts, and ``routes.sweep.exit_law`` the law every sweep stops under. The
@@ -722,7 +675,7 @@ class SolverFeatherPGS(SolverBase):
         # Derive the kinematic state first: a body-flag change the solver
         # cannot absorb raises here, before any mask, cache or owner changes.
         kinematic = (
-            self.factor.kinematic_state(sparse_velocity_limits=self.sweep.sparse_velocity_limits)
+            self.factor.kinematic_state()
             if flags & (ModelFlags.BODY_PROPERTIES | ModelFlags.JOINT_DOF_PROPERTIES)
             else None
         )

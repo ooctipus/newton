@@ -307,7 +307,7 @@ def pass_kernel(item: Pass, layout: TreeLayout, plan: TreePlan, repeat: int = 1,
             group: int,
         ): ...
 
-    _lanes, _sync, _sub, _ = tree_kinetic_state._thread_helpers(layout)
+    _lanes, _sync, _sub = tree_kinetic_state._thread_helpers(layout)
     pack = layout.pack
 
     def run(

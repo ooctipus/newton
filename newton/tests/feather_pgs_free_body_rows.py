@@ -5,8 +5,8 @@
 
 The rows' build whitens each side by the walk (:mod:`.walk_rows`): a side is the walk of the body's seed,
 ``z_c = (J_c - sum_{k > c} (s_c . ut_k) z_k) / ell_c`` over its six coordinates from the last, so a test that checks a
-row against physical velocities recovers ``J_c = ell_c z_c + sum_{k > c} (s_c . ut_k) z_k`` from the walk's data. A speed row keeps its unwhitened axis. :func:`sweep_free_body_rows` runs rows a test writes through the general
-sweep. The module defines no tests.
+row against physical velocities recovers ``J_c = ell_c z_c + sum_{k > c} (s_c . ut_k) z_k`` from the walk's data.
+:func:`sweep_free_body_rows` runs rows a test writes through the general sweep. The module defines no tests.
 """
 
 import inspect
@@ -17,7 +17,6 @@ import warp as wp
 from newton._src.core.memory import Place
 from newton._src.solvers.feather_pgs import sweep_routes
 from newton._src.solvers.feather_pgs.factor.walk import unpack_walk_records
-from newton._src.solvers.feather_pgs.row_laws import ROW_SPEED
 from newton._src.solvers.feather_pgs.row_metadata import HEADER_WORDS, record_layout
 from newton._src.solvers.feather_pgs.sweep import sweep_kernel
 from newton.tests.feather_pgs_law_harness import chain_walk, free_body_Z, one_world
@@ -34,7 +33,6 @@ def free_body_jacobians(solver, Z_a=None, Z_b=None):
     Z_a = Z[..., :6] if Z_a is None else np.asarray(Z_a)
     Z_b = Z[..., 6:] if Z_b is None else np.asarray(Z_b)
     sides = solver.placement.row_sides.numpy()[:, solver.placement.body_base :]
-    row_type = solver.placement.row_type.numpy()[:, solver.placement.body_base :]
     records = solver.factor.walk_view().data.numpy()
     data = unpack_walk_records(records, records.shape[0]).astype(np.float64)
     starts = solver.forest.articulation_dof_start.numpy()
@@ -48,7 +46,7 @@ def free_body_jacobians(solver, Z_a=None, Z_b=None):
     jacobians = []
     for Z, arts in ((Z_a, sides[..., 0]), (Z_b, sides[..., 1])):
         J = Z.astype(np.float64).copy()
-        worlds, rows = np.nonzero((arts[:, : Z.shape[1]] >= 0) & (row_type[:, : Z.shape[1]] != ROW_SPEED))
+        worlds, rows = np.nonzero(arts[:, : Z.shape[1]] >= 0)
         for world, row in zip(worlds, rows, strict=True):
             J[world, row] = physical(arts[world, row], J[world, row])
         jacobians.append(J)
@@ -111,7 +109,6 @@ def sweep_free_body_rows(
         "walk": chain_walk(device, [np.eye(6)]),
         "iterations": int(iterations),
         "omega": 1.0,
-        "v_out": wp.zeros(6, dtype=wp.float32, device=device),
     }
     kernel = sweep_kernel(
         sweep_routes.GeneralSweep(
@@ -119,7 +116,6 @@ def sweep_free_body_rows(
             capacity,
             6,
             str(wp.get_device(device).arch),
-            has_dense_velocity_limit_rows=False,
             places=sweep_routes.RowPlaces(Place.STREAMED),
             seeded=True,
             weighted=regularize,

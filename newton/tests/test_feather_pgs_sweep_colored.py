@@ -385,7 +385,7 @@ class TestColoredSweep(unittest.TestCase):
     def test_every_sweep_reads_the_records_the_placement_wrote(self):
         """Where the one-warp sweep streams its dense rows' records and the colored mapping stages them, each its own
         stage's decision (coins at 512 worlds on the GB300), the colored mapping reads its records where the placement
-        wrote them: its worlds' speed rows, which follow their contacts and bind, step bitwise as where both stage."""
+        wrote them: its worlds step bitwise as where both stage."""
         original = sweep_plan.Sweep._staged
 
         def streamed(plan, config, items):
@@ -394,14 +394,7 @@ class TestColoredSweep(unittest.TestCase):
                 return staged
             return dataclasses.replace(staged, places=dataclasses.replace(staged.places, metadata=Place.STREAMED))
 
-        def limited(device):
-            # Every box's speeds limited below its settling motion: a speed row each, reserved at every step, that binds.
-            model = tray().build(device)
-            for name, limit in (("rigid_body_max_linear_velocity", 0.02), ("rigid_body_max_angular_velocity", 0.2)):
-                setattr(model, name, wp.full(model.body_count, limit, dtype=wp.float32, device=device))
-            return model
-
-        physics = conf._physics(dataclasses.replace(tray(), build=limited), "patch", 32)
+        physics = conf._physics(tray(), "patch", 32)
         options = physics.options(32)
         runs, solvers = [], []
         for stage in (original, streamed):
@@ -413,8 +406,6 @@ class TestColoredSweep(unittest.TestCase):
         free, words = record_layout(placement.record_first, placement.body_base, placement.row_pitch)
         source = sweep_routes.mf_gs_source(sweep.colored_sweep)[0]
         self.assertIn(f"const int off_rec_mf = line * {words} + {free};", source)
-        counts, ends = placement.mf_constraint_count.numpy(), placement.mf_contact_rows_end.numpy()
-        self.assertTrue((counts > ends).all(), "every world's speed rows follow its contacts")
         for name in ("body_q", "body_qd"):
             np.testing.assert_array_equal(getattr(runs[0], name), getattr(runs[1], name), err_msg=name)
 

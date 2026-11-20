@@ -72,8 +72,6 @@ class RowLaw(enum.IntFlag):
     """A shape pair the collision filter admits (``Model.shape_contact_pairs``) on a body a tree moves."""
     LIMIT = 2
     """A joint axis with a finite position limit."""
-    VELOCITY_LIMIT = 4
-    """A joint axis with a positive velocity limit."""
     MIMIC = 8
     """A mimic on a tree's joint, of either representation (:class:`MimicRelations`)."""
     LINK = 16
@@ -758,7 +756,6 @@ def _world_classes(plan, model):
         trees = joint_tree[limited[joint]]
         finite = np.isfinite(model.joint_limit_lower.numpy()[dof]) | np.isfinite(model.joint_limit_upper.numpy()[dof])
         present(RowLaw.LIMIT, trees[finite])
-        present(RowLaw.VELOCITY_LIMIT, trees[model.joint_velocity_limit.numpy()[dof] > 0.0])
         for joints in (plan.mimics.follower, plan.mimics.reference):
             present(RowLaw.MIMIC, joint_tree[joints[joints >= 0]])
     if plan.cut.tree_primary.size:

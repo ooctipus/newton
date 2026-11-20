@@ -681,21 +681,21 @@ class HeldTree:
         for group in self.groups:
             group.invalidate(world_mask)
 
-    def begin(self, state, augmented, velocity, dt, *, state_out=None):
+    def begin(self, state, augmented, dt, *, state_out=None):
         """Repair every current component before any factor or force consumer (see :meth:`TreeKineticState.begin`):
         each group's device decides which of its trees recompute."""
         for group in self.groups:
-            group.begin(state, augmented, velocity, dt, state_out=state_out)
+            group.begin(state, augmented, dt, state_out=state_out)
 
     def refresh(self, augmented):
         """Preserve independent factor masks and numerical representations."""
         for group in self.groups:
             group.sparse.refresh(augmented)
 
-    def predict(self, state, augmented, control, velocity, dt):
+    def predict(self, state, augmented, control, dt):
         """Project current forces and apply each original held response."""
         for group in self.groups:
-            group.predict(state, augmented, control, velocity, dt)
+            group.predict(state, augmented, control, dt)
 
     def finish(self, state, augmented, output, dt):
         """Integrate and publish each physical coordinate and body once."""

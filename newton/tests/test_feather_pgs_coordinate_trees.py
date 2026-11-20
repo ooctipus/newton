@@ -454,8 +454,8 @@ class _Pair:
         mine_in, mine_out = self.states["mine"]
         head, held = self.head.factor, self.head.factor.held
         tag = f"step {self.step_index}"
-        held.begin(head_in, head, head_in.joint_qd, DT)
-        self.state.begin(mine_in, self.mine.factor, mine_in.joint_qd, DT)
+        held.begin(head_in, head, DT)
+        self.state.begin(mine_in, self.mine.factor, DT)
         same(test, head_in.body_q, mine_in.body_q, self.bodies, f"{tag} input body_q")
         same(test, head.joint_S_s, self.mine.factor.joint_S_s, self.dofs, f"{tag} input joint_S_s")
         same(test, head.articulation_origin, self.mine.factor.articulation_origin, self.arts, f"{tag} input origin")
@@ -463,8 +463,8 @@ class _Pair:
         held.refresh(head)
         # The held predictor solves by the walk (Z4.2): the walk's refresh, as the step's factor stage runs it.
         head.walk_step(head_in, DT)
-        held.predict(head_in, head, self.controls["head"], head_in.joint_qd, DT)
-        self.state.predict(mine_in, self.mine.factor, self.controls["mine"], mine_in.joint_qd, DT)
+        held.predict(head_in, head, self.controls["head"], DT)
+        self.state.predict(mine_in, self.mine.factor, self.controls["mine"], DT)
         self.check_inverse_mass(test, mine_in.joint_q.numpy(), tag)
         same(test, self.head.v_hat, self.mine.v_hat, self.dofs, f"{tag} v_hat")
         solved = self.head.v_hat.numpy() + self.rng.uniform(-0.03, 0.03, self.model.joint_dof_count).astype(np.float32)
@@ -549,13 +549,13 @@ def check_owner_launches(test, device):
         for source, refresh in ((0, True), (1, False)):
             state, output = states[source], states[1 - source]
             _set_clock(solver.factor, refresh)
-            owner.begin(state, solver.factor, state.joint_qd, DT)
+            owner.begin(state, solver.factor, DT)
             if owner.drive_dofs is not None:
                 solver.factor.prepare_drives(state, control, DT, solver.v_hat, solver.v_out, owner.drive_dofs)
             solver.factor.mass_update_mask.fill_(1)
             owner.refresh(solver.factor)
             solver.factor.walk_step(state, DT)
-            owner.predict(state, solver.factor, control, state.joint_qd, DT)
+            owner.predict(state, solver.factor, control, DT)
             solver.v_out.assign(solver.v_hat)
             _set_clock(solver.factor, refresh, ahead=1)
             owner.finish(state, solver.factor, output, DT)
@@ -566,7 +566,7 @@ def check_owner_launches(test, device):
         coordinates[0] += np.float32(0.01)
         states[1].joint_q.assign(coordinates)
         _set_clock(solver.factor, False)
-        owner.begin(states[1], solver.factor, states[1].joint_qd, DT, state_out=states[0])
+        owner.begin(states[1], solver.factor, DT, state_out=states[0])
     for group, kernels in groups:
         if group is owner.coordinate_trees:
             ran = {kernel for kernel, _ in launched}
@@ -696,7 +696,7 @@ class TestCoordinateTreesRule(unittest.TestCase):
                     self.assertIn("_banked", record["kernels"]["repair"])
                 launches(lambda owner=owner: owner.finish(s0, solver.factor, s1, DT))
                 self.assertEqual(
-                    launches(lambda owner=owner: owner.begin(s0, solver.factor, s0.joint_qd, DT, state_out=s1)),
+                    launches(lambda owner=owner: owner.begin(s0, solver.factor, DT, state_out=s1)),
                     copy_back,
                 )
 

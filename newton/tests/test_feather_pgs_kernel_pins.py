@@ -87,13 +87,13 @@ def _suite_sparse_sweeps():
         ((112, 18, 12), triplets),
         ((128, 25, 16), triplets),
         ((128, 27, 21), {"use_support_table": True}),
-        ((16, 6, 6), {"use_support_table": True, "velocity_limits": True, "lanes_per_world": 8, "local_factors": True}),
+        ((16, 6, 6), {"use_support_table": True, "lanes_per_world": 8, "local_factors": True}),
         ((256, 18, 12), triplets),
         ((48, 18, 18), triplets),
         ((48, 25, 16), triplets),
         ((56, 43, 18), active),
         ((64, 14, 10), {"use_support_table": True, "lanes_per_world": 16}),
-        ((64, 9, 9), {"velocity_limits": True, "lanes_per_world": 16}),
+        ((64, 9, 9), {"lanes_per_world": 16}),
         ((80, 18, 18), triplets),
     ):
         yield size, kwargs
@@ -161,7 +161,7 @@ def _readout_calls():
     factory = built(sweep_routes.GeneralSweep)
     for args, kwargs in (
         ((192, 64, 22, _ARCH), {}),
-        ((192, 64, 22, _ARCH), {"free_rows": False, "speed_rows": True}),
+        ((192, 64, 22, _ARCH), {"free_rows": False}),
     ):
         yield "sweep_routes.GeneralSweep", factory, args, {**kwargs, **readout}
 
@@ -186,8 +186,8 @@ def _sparse_sweep_calls():
     from newton._src.solvers.feather_pgs.sweep_routes_sparse import SparseSweep  # noqa: PLC0415
 
     factory = built(SparseSweep)
-    for size, flags in itertools.product(((32, 8, 8), (48, 18, 12)), itertools.product((False, True), repeat=6)):
-        active, table, triplets, velocity, local, warm = flags
+    for size, flags in itertools.product(((32, 8, 8), (48, 18, 12)), itertools.product((False, True), repeat=5)):
+        active, table, triplets, local, warm = flags
         # The factory folds unsatisfiable requests into another variant; pin each variant once.
         if triplets and not (active and table):
             continue
@@ -196,7 +196,6 @@ def _sparse_sweep_calls():
                 "active_rows": active,
                 "use_support_table": table,
                 "contact_triplets": triplets,
-                "velocity_limits": velocity,
                 "lanes_per_world": lanes,
                 "local_factors": local,
                 "warm_start": warm,
@@ -275,8 +274,6 @@ def _dense_build_calls():
         )
     # The sparse diagonal's one writer, the star's walker on the same classes.
     yield "walk_rows.slot_rows_kernel", walk_rows.slot_rows_kernel.__wrapped__, (True, tables), arch
-    # With velocity-limit rows: a key's joint row is one step to the world, into a slot.
-    yield "walk_rows.slot_rows_kernel", walk_rows.slot_rows_kernel.__wrapped__, (True, tables, True), arch
     # The free bodies' rows.
     yield "walk_rows.write_free_body_rows", walk_rows.write_free_body_rows.__wrapped__, (_ARCH,), {}
 
@@ -306,25 +303,12 @@ def _solver_factory_calls():
         kwargs = {"levels": LevelLaw(EXACT), "speculative_contact_batches": batches}
         factory = built(sweep_routes_diag.DiagonalSweep)
         yield "sweep_routes_diag.DiagonalSweep", factory, (64, 10, 9, _ARCH), kwargs
-        # The velocity-limit rows' last word.
-        kwargs = {**kwargs, "velocity_limits": True}
-        yield "sweep_routes_diag.DiagonalSweep", factory, (64, 10, 9, _ARCH), kwargs
-    for limits, free, speed in itertools.product(*([(False, True)] * 3)):
-        kwargs = {
-            "has_dense_velocity_limit_rows": limits,
-            "free_rows": free,
-            "speed_rows": speed,
-        }
+    for free in (False, True):
         factory = built(sweep_routes.GeneralSweep)
-        yield "sweep_routes.GeneralSweep", factory, (64, 32, 12, _ARCH), kwargs
-    # Streamed row records, which large dense capacities select; limits add the limit pass's record reads.
-    for limits in (False, True):
-        kwargs = {
-            "places": sweep_routes.RowPlaces(Place.STREAMED),
-            "has_dense_velocity_limit_rows": limits,
-        }
-        factory = built(sweep_routes.GeneralSweep)
-        yield "sweep_routes.GeneralSweep", factory, (64, 32, 12, _ARCH), kwargs
+        yield "sweep_routes.GeneralSweep", factory, (64, 32, 12, _ARCH), {"free_rows": free}
+    # Streamed row records, which large dense capacities select.
+    factory = built(sweep_routes.GeneralSweep)
+    yield "sweep_routes.GeneralSweep", factory, (64, 32, 12, _ARCH), {"places": sweep_routes.RowPlaces(Place.STREAMED)}
     # A line past the stage: every impulse read and written in place.
     factory = built(sweep_routes.GeneralSweep)
     places = {"places": sweep_routes.RowPlaces(Place.STREAMED, Place.GLOBAL, Place.GLOBAL)}
@@ -365,12 +349,11 @@ def _suite_shape_calls():
         sweep_routes_sparse,
     )
 
-    no_limits = {"has_dense_velocity_limit_rows": False}
     factory = built(sweep_routes.GeneralSweep)
     for args, kwargs in (
         ((192, 64, 22, _ARCH), {}),
-        ((192, 64, 22, _ARCH), {"free_rows": False, "speed_rows": True}),
-        ((72, 32, 18, _ARCH), no_limits),
+        ((192, 64, 22, _ARCH), {"free_rows": False}),
+        ((72, 32, 18, _ARCH), {}),
     ):
         yield "sweep_routes.GeneralSweep", factory, args, kwargs
     factory = built(sweep_routes_sparse.SparseSweep)
@@ -557,7 +540,6 @@ class TestFeatherPGSKernelPins(unittest.TestCase):
         for flag in (
             "active_rows=True",
             "contact_triplets=True",
-            "velocity_limits=True",
             "warm_start=True",
             "linked_rows=True",
         ):

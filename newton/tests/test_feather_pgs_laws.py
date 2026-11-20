@@ -546,7 +546,7 @@ def test_coordinate_force(test, device):
 # Each law meets its defining conditions, checked in float64: the tangent pair's disk problem, the friction triple's
 # elliptic cone problem against its exact solve, the contact's Coulomb problem (cone, normal complementarity and, for
 # Daviet's Newton, maximal dissipation), the regularized step's fixed point and its block-solve diagonal, and the
-# velocity-limit, drive and set projections. The laws' CUDA renderings agree with these Warp functions
+# drive and set projections. The laws' CUDA renderings agree with these Warp functions
 # (the twins below).
 # ---------------------------------------------------------------------------------------------------------------------
 
@@ -874,14 +874,6 @@ def _scalar_laws(
     out[i, 1] = laws.regularized_diagonal(diagonal[i], w[i])
     out[i, 2] = laws.unilateral(old[i])
     out[i, 3] = laws.box(old[i], -bound[i], bound[i])
-    new, delta = laws.velocity_limit_update(old[i], residual[i] / diagonal[i])
-    push_new, push_delta = laws.velocity_limit_update(0.0, residual[i] / diagonal[i])
-    out[i, 4] = new
-    out[i, 5] = delta
-    out[i, 6] = push_new
-    out[i, 7] = push_delta
-    row = laws.speed_row(wp.abs(residual[i]) * 3.0, bound[i], diagonal[i], 0.0)
-    out[i, 9] = row[2]
 
 
 @wp.kernel
@@ -918,7 +910,7 @@ def test_disk_keeps_a_pair_inside_it(test, device):
 
 
 def test_scalar_laws(test, device):
-    """Hold each scalar law's definition: steps, sets, velocity limits and the friction gate.
+    """Hold each scalar law's definition: steps and sets.
 
     The regularized step's fixed point, residual ``-(1 / w - 1) d lambda``, is the exact solve against
     :func:`~.projection_laws.regularized_diagonal`.
@@ -939,24 +931,13 @@ def test_scalar_laws(test, device):
         diagonal=diagonal,
         w=w,
         bound=bound,
-        out=np.zeros((n, 10), np.float32),
+        out=np.zeros((n, 4), np.float32),
     )["out"].numpy()
-    o, r, d, w64, b = (v.astype(np.float64) for v in (old, residual, diagonal, w, bound))
+    o, r, d, w64 = (v.astype(np.float64) for v in (old, residual, diagonal, w))
     np.testing.assert_allclose(out[:, 0], o + 0.7 * (w64 * (-r / d) - (1.0 - w64) * o), rtol=1e-5, atol=1e-6)
     np.testing.assert_allclose(out[:, 1], d / w64, rtol=1e-6)
     np.testing.assert_array_equal(out[:, 2], np.where(old < 0.0, 0.0, old))
     np.testing.assert_array_equal(out[:, 3], np.clip(old, -bound, bound))
-    np.testing.assert_allclose(out[:, 4], np.maximum(o - r / d, 0.0), rtol=1e-6, atol=1e-7)
-    np.testing.assert_allclose(out[:, 5], out[:, 4] - old, rtol=1e-6, atol=1e-6)
-    # From a zero total the update pushes a violated row onto its limit (the tiers' last word).
-    push = np.where(r < 0.0, -r / d, 0.0)
-    np.testing.assert_allclose(out[:, 6], push, rtol=1e-6, atol=1e-7)
-    np.testing.assert_allclose(out[:, 7], push, rtol=1e-6, atol=1e-7)
-    # A free body over its speed limit keeps its direction and ends on the limit.
-    speed = np.abs(r) * 3.0
-    over = speed > b
-    np.testing.assert_allclose(speed[over] * (1.0 + out[over, 9]), b[over], rtol=1e-5)
-    np.testing.assert_array_equal(out[~over, 9], 0.0)
     # The regularized step's fixed point solves the row against the regularized diagonal.
     b_free = r
     fixed = -b_free * w64 / d

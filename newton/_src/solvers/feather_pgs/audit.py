@@ -49,11 +49,9 @@ from .response_operator import Lanes, SparseFactor, Velocity, WalkedRows
 from .row_laws import (
     ROW_CONTACT,
     ROW_FRICTION,
-    ROW_JOINT_VELOCITY_LIMIT,
     ROW_LAW,
     ROW_LINK,
     ROW_MIMIC,
-    ROW_SPEED,
     ROW_TORSION,
 )
 from .row_records import DenseRows
@@ -91,7 +89,6 @@ AuditRows = struct(
         Field("impulses", float, ("line", "row"), owner="placement"),
         Field("counts", int, ("line",), owner="placement", attr="constraint_count"),
         Field("mf_counts", int, ("line",), owner="placement", attr="mf_constraint_count"),
-        Field("speed_first", int, ("line",), owner="placement"),
         Field("weighted", int, owner="step"),
         Field("material", int, owner="step"),
         Field("capacity", int, owner="placement", attr="dense_max_constraints"),
@@ -131,7 +128,6 @@ OPERANDS = FieldGroup(
     Field("incident", float, ("line", "row"), owner="placement", attr="row_incident"),
     Field("row_incident", float, ("line", "row"), owner="placement"),
     Field("mf_counts", int, ("world",), owner="placement", attr="mf_constraint_count"),
-    Field("speed_first", int, ("world",), owner="placement"),
     Field("tier_rows", int, owner="classes"),
     Field("row_type", int, ("line", "row"), owner="placement"),
     Field("dof_start", int, ("art",), owner="forest", attr="articulation_dof_start"),
@@ -160,7 +156,7 @@ OPERANDS = FieldGroup(
     Field("cfm", float, owner="options", attr="pgs_cfm"),
     Field("rhs", float, ("world", "row"), owner="audit"),
     Field("diag", float, ("world", "row"), owner="audit"),
-    Field("dense_phase_bounds", int, ("world", 2), owner="placement"),
+    Field("topology_rows", int, ("world",), owner="placement"),
 )
 """Every operand a support class reads beside the kernel's own, declared once with where the audit finds it."""
 
@@ -234,8 +230,8 @@ def rows_kernel(cls: RowClass) -> wp.Kernel:
 
 def packed_class(support: int, wide: bool, classes: bool = False) -> RowClass:
     """The packed rows (:func:`.sweep_routes.packed_operator`): ``Z_i^T u+``, ``u`` the walk's coordinates of ``v+``: a
-    tier's world reads ``J_i v+`` (``Z`` holds ``J``), every other ``(J_i v_hat + Z_i^T u+) - Z_i^T u_hat``; a free
-    body's speed row its law's own term (:func:`free_class`); with ``classes``, by their support classes."""
+    tier's world reads ``J_i v+`` (``Z`` holds ``J``), every other ``(J_i v_hat + Z_i^T u+) - Z_i^T u_hat``; with
+    ``classes``, by their support classes."""
     operator = packed_operator(support, ONE, wide=wide, classes=classes)
     at_u = dataclasses.replace(operator, velocity=Velocity("u"))
     at_hat = dataclasses.replace(operator, velocity=Velocity("u_hat"))
@@ -253,36 +249,22 @@ def packed_class(support: int, wide: bool, classes: bool = False) -> RowClass:
             "hat",
             "incident",
             "mf_counts",
-            "speed_first",
             "tier_rows",
-            "row_type",
-            "dof_start",
-            "v",
         ),
         """    const int off_dense = line * row_sides.shape[1];
     const int packed_base = line * packed_Z.shape[1] * packed_Z.shape[2];
     const int dof_map_base = world * world_dof_indices.shape[1];
     const float* u = coordinates.data + (size_t)world * coordinates.shape[1];
     const float* u_hat = hat.data + (size_t)world * hat.shape[1];
-    const bool tier = tier_rows > 0 && counts.data[world] <= tier_rows && mf_counts.data[world] == 0
-        && counts.data[world] <= speed_first.data[world];""",
-        f"""        float term = 0.0f;
-        if (row_type.data[off_dense + i] == {int(ROW_SPEED)}) {{
-            const wp::vec2i sides = row_sides.data[off_dense + i];
-            const float axis = packed_Z.data[packed_base + i * packed_Z.shape[2] + PACKED_FIRST(sides, sides[0]) + 3];
-            const int start = dof_start.data[sides[0]] + (axis != 0.0f ? 3 : 0);
-            term = -wp::length(wp::vec3(v.data[start], v.data[start + 1], v.data[start + 2]));
-        }} else {{
-"""
-        + _sum(at_u, "zu", "0.0f")
+    const bool tier = tier_rows > 0 && counts.data[world] <= tier_rows && mf_counts.data[world] == 0;""",
+        _sum(at_u, "zu", "0.0f")
         + """
-        term = zu;
+        float term = zu;
         if (!tier) {
 """
         + _sum(at_hat, "zhat", "0.0f")
         + """
             term = incident.data[(size_t)line * incident.shape[1] + i] + zu - zhat;
-        }
         }""",
         (PACKED_SIDES, *((CLASS_SIDES,) if classes else ())),
     )
@@ -347,29 +329,22 @@ def slot_class(dense: int, rows: int) -> RowClass:
 @functools.cache
 def free_class() -> RowClass:
     """The free bodies' rows, the 6 + 6 class (:func:`.sweep_routes.free_body_rows`): ``Z_i^T u+`` over the walk's
-    coordinates of ``v+``. A speed row's term is ``-|v|`` of the coordinates its unwhitened axis marks (linear from
-    ``e_0``, angular from ``e_3``), its bias the limit: the law's own term (:func:`.projection_laws.speed_row`)."""
+    coordinates of ``v+``."""
     operator = dataclasses.replace(free_body_rows(ONE, "S"), velocity=Velocity("u"))
     return RowClass(
         "free",
-        OPERANDS.select("row_type", "row_sides", "base", "packed_Z", "dof_start", "world_offset", "v", "coordinates"),
+        OPERANDS.select("row_type", "row_sides", "base", "packed_Z", "world_offset", "coordinates"),
         """    const int records = line * row_type.shape[1] + base;
     const int S = packed_Z.shape[2];
     const size_t free_base = ((size_t)line * packed_Z.shape[1] + base) * S;
     const float* u = coordinates.data + (size_t)world * coordinates.shape[1];""",
-        f"""        const wp::vec2i sides = row_sides.data[records + i];
-        float term = 0.0f;
-        if (row_type.data[records + i] == {int(ROW_SPEED)}) {{
-            const int start = dof_start.data[sides[0]] + (packed_Z.data[free_base + i * S + 3] != 0.0f ? 3 : 0);
-            term = -wp::length(wp::vec3(v.data[start], v.data[start + 1], v.data[start + 2]));
-        }} else {{
-            const int dof_a = sides[0] >= 0 ? world_offset.data[sides[0]] : -1;
-            const int dof_b = sides[1] >= 0 ? world_offset.data[sides[1]] : -1;
+        """        const wp::vec2i sides = row_sides.data[records + i];
+        const int dof_a = sides[0] >= 0 ? world_offset.data[sides[0]] : -1;
+        const int dof_b = sides[1] >= 0 ? world_offset.data[sides[1]] : -1;
 """
         + _sum(operator, "z", "0.0f")
         + """
-            term = z;
-        }""",
+        const float term = z;""",
     )
 
 
@@ -383,7 +358,7 @@ EMITTED = Dispatch(
 
 
 _SEEDED = "row_seeds rhs_bias world_row_type ink_meta walk world_dof_indices v_hat coordinates cfm rhs diag packed_Z"
-_SEEDED += " row_incident dense_phase_bounds"
+_SEEDED += " row_incident topology_rows"
 
 
 @functools.cache
@@ -497,16 +472,6 @@ def audit_store(
                 eps = rows.row_eps[line, r]
             term += contact_compliance(weight, eps, diagonal) * impulse
         residual = term + bias
-        if kind == ROW_JOINT_VELOCITY_LIMIT:
-            # Both sides of |v| <= L as one row (projection_laws.velocity_limit): the row is its lower side, its upper
-            # side's residual and bias are 2 L less the row's; a positive impulse acts on the lower side, a negative
-            # one on the upper.
-            limit = rows.row_mu[line, r]
-            upper = 2.0 * limit - residual
-            gap += wp.abs(impulse * wp.where(impulse < 0.0, upper, residual))
-            violation = wp.max(violation, wp.max(-residual, -upper))
-            work -= wp.abs(impulse) * wp.where(impulse < 0.0, 2.0 * limit - bias, bias)
-            continue
         work -= impulse * bias
         if kind == ROW_FRICTION or kind == ROW_TORSION:
             if kind == ROW_FRICTION and rows.row_parent[line, r] == r - 1:

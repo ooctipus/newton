@@ -53,7 +53,7 @@ def _schedule(rows, *, serial_contacts):
     out = {name: rows[name].copy() for name in _OUTPUTS}
     marks = out["sparse_row_dof"]
     for w in range(rows["row_count"].shape[0]):
-        start, end = int(rows["bounds"][w, 1]), int(rows["row_count"][w])
+        start, end = int(rows["topology"][w]), int(rows["row_count"][w])
         # A unit's members name its head: its tangents and, where it has one, its spin row.
         heads = [row for row in range(start, end) if int(rows["row_type"][w, row]) not in (_FRICTION, _TORSION)]
         scalar = [row for row in heads if np.any(marks[w, row] < -1)]
@@ -83,7 +83,7 @@ def _schedule(rows, *, serial_contacts):
 
 def _rows_form_units(rows, world):
     """Whether a world's contact rows form units, each head followed by its two tangent rows or none."""
-    start, end = int(rows["bounds"][world, 1]), int(rows["row_count"][world])
+    start, end = int(rows["topology"][world]), int(rows["row_count"][world])
     row_type, parent = rows["row_type"][world], rows["row_parent"][world]
     row = start
     while row < end:
@@ -102,7 +102,7 @@ def _empty_rows(worlds, capacity, serial_capacity):
     """Rows of empty contact segments, with every output at its unwritten value."""
     return {
         "row_count": np.zeros(worlds, np.int32),
-        "bounds": np.zeros((worlds, 2), np.int32),
+        "topology": np.zeros(worlds, np.int32),
         # Rows outside the segments hold a type no row family uses.
         "row_type": np.full((worlds, capacity), ROW_KINDS, np.int32),
         "row_parent": np.full((worlds, capacity), -1, np.int32),
@@ -199,7 +199,7 @@ def _unit_worlds(seed, *, worlds, capacity, dofs):
             else:
                 # The segment ends after a unit's first tangent row.
                 end = owner + 2
-        rows["bounds"][w, 1] = start
+        rows["topology"][w] = start
         rows["row_count"][w] = end
     return rows
 
@@ -212,7 +212,7 @@ def _unit_twin_rows():
 
 def _builder_arrays(rows, device):
     """Return the builder's inputs and outputs, in launch order, as device copies of the rows."""
-    inputs = ("row_count", "bounds", "row_type")
+    inputs = ("row_count", "topology", "row_type")
     arrays = [wp.array(rows[name], dtype=wp.int32, device=device) for name in inputs]
     arrays.insert(1, row_lines(device))
     return (
@@ -254,7 +254,7 @@ def _record_schedules(model, device, *, steps=6):
         dense_max_constraints=64,
         mf_max_constraints=64,
     )
-    names = ("row_count", "first", "bounds", "row_type", *_OUTPUTS)
+    names = ("row_count", "first", "topology", "row_type", *_OUTPUTS)
     records = []
     launch = wp.launch
 
@@ -293,7 +293,7 @@ class TestFeatherPGSContactSchedule(unittest.TestCase):
             schedule = _schedule(rows, serial_contacts=True)
             self.assertGreater(int(np.sum(schedule["level_count"] > 0)), worlds // 3)
             self.assertGreater(int(np.sum(np.maximum(schedule["serial_count"], 0))), worlds)
-            longest = max(longest, int(np.max(rows["row_count"] - rows["bounds"][:, 1])))
+            longest = max(longest, int(np.max(rows["row_count"] - rows["topology"])))
             deepest = max(deepest, int(np.max(schedule["level_count"])))
         # Segments and a coordinate's contacts cross batches of 32.
         self.assertGreater(longest, 64)

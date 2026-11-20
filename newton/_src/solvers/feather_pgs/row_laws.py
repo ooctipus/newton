@@ -19,8 +19,7 @@ target and its stabilization. Every row builder and sweep that forms a row's
   gives an authored material's spring and dashpot per unit mass (MuJoCo's rule);
 * :func:`contact_restitution_rhs` replaces a closing row's bias by the
   restitution target ``-target + e u`` where :func:`contact_restitution_fires`;
-* :func:`joint_limit_side`, :func:`velocity_limit_active` and :func:`mimic_phi`
-  are the candidates of the prefix families.
+* :func:`joint_limit_side` and :func:`mimic_phi` are the candidates of the prefix families.
 
 The row kinds are the solver's constraint types (:data:`ROW_CONTACT` ...).
 """
@@ -34,14 +33,10 @@ ROW_LAW = LawFamily("RowLaw")
 
 # Row kinds (the solver's constraint types).
 ROW_CONTACT = wp.constant(0)
-# A free rigid body's speed row: it bounds the magnitude of the body's linear or angular velocity (type 1 was the
-# PhysX drive row; drives fold into the mass matrix).
-ROW_SPEED = wp.constant(1)
+# Kinds 1 and 4 are retired (a free body's speed row and a joint velocity-limit row: a speed limit is the drive's
+# motor law, not a constraint).
 ROW_FRICTION = wp.constant(2)
 ROW_JOINT_LIMIT = wp.constant(3)
-# Joint velocity-limit row. Mirrors the PhysX per-DOF velocity clamp: finite limits create two unilateral rows every
-# step, one lower bound row and one upper bound row, with no Baumgarte bias.
-ROW_JOINT_VELOCITY_LIMIT = wp.constant(4)
 # Mimic (joint coupling) row: the bilateral equality ``q_follower - coef1 * q_leader - coef0 = 0`` between two
 # coordinates of one articulation, from either of the model's mimic representations
 # (:class:`.forest_plan.MimicRelations`); lambda unbounded, Baumgarte drift correction.
@@ -67,9 +62,8 @@ def separates(residual: float, magnitude: float) -> bool:
     """Whether a unilateral row keeps its zero impulse at a motion: its residual there (at the predictor,
     ``J v_hat + b``) stays above ``SEPARATION_MARGIN`` [m/s] plus ``SEPARATION_SCALE`` of its terms' ``magnitude``, so
     the complete path's own rounding of it is positive too. The one verdict of every unilateral row: a contact normal
-    (:func:`.row_slots._admit_contact`), a joint position-limit side (:func:`.prefix_rows.limits`), a joint
-    velocity-limit side and a free body's speed row; a row that does not separate is marked (it may act), and a world
-    none of whose rows is marked keeps zero impulse (P4)."""
+    (:func:`.row_slots._admit_contact`) and a joint position-limit side (:func:`.prefix_rows.limits`); a row that
+    does not separate is marked (it may act), and a world none of whose rows is marked keeps zero impulse (P4)."""
     margin = SEPARATION_MARGIN + SEPARATION_SCALE * magnitude
     return wp.isfinite(residual) and wp.isfinite(margin) and residual >= margin
 
@@ -281,7 +275,7 @@ def row_rhs(
     * friction (the anchor's tangential displacement), a contact's spin row (its twist displacement), mimic and link
       (bilateral equalities): Baumgarte from both sides, ``bias_scale * beta * phi / dt``;
     * joint limit: :func:`limit_rhs`;
-    * velocity limit and other rows: ``-target`` only.
+    * other rows: ``-target`` only.
     """
     rhs = -target
     row_w = float(1.0)
@@ -307,15 +301,6 @@ def joint_limit_side(
     if side == 0:
         return wp.isfinite(lower) and q <= lower + activation_gap, q - lower, 1.0
     return wp.isfinite(upper) and q >= upper - activation_gap, upper - q, -1.0
-
-
-@ROW_LAW.law
-def velocity_limit_active(limit: float, unauthored: float) -> bool:
-    """Return whether a coordinate's velocity limit takes its row (both sides as one, target ``-limit``): every
-    authored limit does, whatever the speed, since the solve can bring any coordinate to its limit. A limit that is
-    not positive, or at or past ``unauthored`` (the builder's default joint velocity limit, which the importers write
-    where none is authored), is no limit."""
-    return limit > 0.0 and limit < unauthored
 
 
 @ROW_LAW.law

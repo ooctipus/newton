@@ -927,7 +927,7 @@ class TestQ15Speculative(unittest.TestCase):
 
 
 class TestQ16Limits(unittest.TestCase):
-    """Q16: joint limits and velocity limits are complementarity rows. Reference: the audit's zero, and the bound."""
+    """Q16: joint limits are complementarity rows. Reference: the audit's zero."""
 
     def test_limits_are_complementary(self):
         """Two coupled hinges pressed against their limits: rows complementary, joints on the limits."""
@@ -968,29 +968,6 @@ class TestQ16Limits(unittest.TestCase):
         self.assertLess(float(audit["violation"][0]), 1.0e-3)
         np.testing.assert_allclose(state.joint_qd.numpy(), [0.0, 0.0], atol=1.0e-3)
         np.testing.assert_allclose(state.joint_q.numpy(), [0.3, 0.2], atol=2.0e-3)
-
-    def test_velocity_limit_is_the_bound(self):
-        """A pushed hinge stops accelerating at its velocity limit, and its rows are complementary."""
-        scene = scenes.pushed_arm()
-        model = scene.build(DEVICE)
-        peak = 0.0
-        control = model.control()
-        options = {
-            **BASE,
-            **scene.solver_options,
-            "enable_joint_velocity_limits": True,
-            "diagnostics": SolverFeatherPGS.Diagnostics(audit=True),
-        }
-        solver = SolverFeatherPGS(model, **options)
-        state, out = model.state(), model.state()
-        for step in range(scene.steps):
-            state.clear_forces()
-            scene.control(model, control, state, step)
-            solver.step(state, out, control, None, scene.dt)
-            state, out = out, state
-            peak = max(peak, float(np.abs(state.joint_qd.numpy()).max()))
-        self.assertLessEqual(peak, scene.params["velocity_limit"] * 1.001)
-        self.assertLess(float(solver.read_audit()["violation_max"][0]), 1.0e-3)
 
 
 class TestQ17TimeOrder(unittest.TestCase):

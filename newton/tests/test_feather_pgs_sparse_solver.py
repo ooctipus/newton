@@ -11,7 +11,7 @@ import warp as wp
 import newton
 from newton._src.core.memory import arch_budget
 from newton._src.solvers.feather_pgs import sweep_routes_sparse
-from newton._src.solvers.feather_pgs.row_laws import ROW_CONTACT, ROW_JOINT_LIMIT, ROW_JOINT_VELOCITY_LIMIT
+from newton._src.solvers.feather_pgs.row_laws import ROW_CONTACT, ROW_JOINT_LIMIT
 from newton.solvers import SolverFeatherPGS
 from newton.tests.feather_pgs_law_harness import unpacked_rows, walk_inverse
 
@@ -192,7 +192,6 @@ def _make_solver(model, sparse, *, pins=None, **overrides):
     options = {
         "pgs_iterations": 32,
         "enable_joint_limits": True,
-        "enable_joint_velocity_limits": False,
         "pgs_warmstart": False,
         "dense_max_constraints": 32,
         "update_mass_matrix_interval": 4,
@@ -380,10 +379,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
         for world, count in enumerate(solver.placement.constraint_count.numpy()):
             jacobian = self._sparse_rows_physical(solver, world, count)[1] if sparse else dense_jacobian[world, :count]
             bundles = []
-            prefix = np.isin(
-                arrays["row_type"][world, :count],
-                [ROW_JOINT_LIMIT, ROW_JOINT_VELOCITY_LIMIT],
-            )
+            prefix = arrays["row_type"][world, :count] == ROW_JOINT_LIMIT
             for row in np.flatnonzero(prefix):
                 dof = int(np.argmax(np.abs(jacobian[row])))
                 bundles.append(((0, int(arrays["row_type"][world, row]), dof, int(np.sign(jacobian[row, dof]))), [row]))
@@ -509,11 +505,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
         self.assert_sparse_state(graph)
 
     def test_unsupported_configurations_keep_existing_path(self):
-        """Reject full-support chains and oversized dense rows, and take contact torsion's spin rows.
-
-        Joint velocity limits are not among them: they compose with sparse
-        factors under either friction law (the route probe records it).
-        """
+        """Reject full-support chains and oversized dense rows, and take contact torsion's spin rows."""
         chain = _build_chain("cuda:0", base_z=1.2, contact_sphere="deep", ground=False)
         self.assertIsNone(_make_solver(chain, True).spec.classes.packed_size)
         model = _build_model()

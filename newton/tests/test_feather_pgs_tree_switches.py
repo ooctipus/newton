@@ -220,7 +220,7 @@ class TestTreeKernelSwitches(unittest.TestCase):
         state.joint_qd.assign(joint_qd)
         newton.eval_fk(model, state.joint_q, state.joint_qd, expected)
         self.assertGreater(np.max(np.abs(state.body_q.numpy() - expected.body_q.numpy())), 1e-2)
-        owner.begin(state, solver.factor, state.joint_qd, dt)
+        owner.begin(state, solver.factor, dt)
         np.testing.assert_allclose(state.body_q.numpy(), expected.body_q.numpy(), atol=2e-6)
         np.testing.assert_allclose(state.body_qd.numpy(), expected.body_qd.numpy(), atol=2e-5)
         # Finish integrates a solved velocity once and publishes every coordinate and body of the next state.

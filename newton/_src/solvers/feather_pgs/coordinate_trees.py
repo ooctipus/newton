@@ -380,7 +380,7 @@ def class_kernels(turns: bool, welded: bool) -> tuple[wp.Kernel, wp.Kernel, wp.K
         if data.kinematic_dof_mask[dof] != 0:
             qdd = 0.0
         f.qdd[dof] = qdd
-        f.vhat[dof] = f.predictor_qd[dof] + qdd * f.dt
+        f.vhat[dof] = qd + qdd * f.dt
 
     def finish(
         n: int,
@@ -588,8 +588,6 @@ def plan(inputs, *, size: int | None) -> tuple[CoordinateTreesPlan | None, str]:
     model, forest, factor = inputs.model, inputs.forest, inputs.factor
     if model.particle_count:
         return None, "One-coordinate trees exclude particles."
-    if inputs.options.enable_joint_velocity_limits:
-        return None, "Joint velocity limits keep the compact diagonal family in a held tree group (motion velocity)."
     topology, reason = coordinate_topology(model, forest, size)
     if topology is None:
         return None, reason
@@ -623,7 +621,6 @@ class CoordinateTrees:
 
     # The cache is stamped with the bank the finish published into; a repair compares the stamp, never the words.
     bank_compare = False
-    motion_velocity = False
 
     def __init__(self, solver, group, family: CoordinateTreesPlan):
         """Bind the class kernels of the held plan's one-coordinate group ``group`` (:class:`.held_tree.HeldGroupPlan`)
@@ -696,7 +693,6 @@ class CoordinateTrees:
             "schedules": None,
             "response": "diagonal",
             "input_validation": "content" if self.bank_compare else "identity",
-            "motion_velocity": bool(self.motion_velocity),
             "publishes_twists": False,
             "drive_dofs": 0 if drive_dofs is None else int(drive_dofs.shape[0]),
             "kernels": {
@@ -746,13 +742,13 @@ class CoordinateTrees:
             self._geometry_valid,
         )
 
-    def begin(self, state_in, state_aug, stage3_qd, dt, *, state_out=None):
+    def begin(self, state_in, state_aug, dt, *, state_out=None):
         """Publish the input state of articulations whose cache does not stand for ``state_in``.
 
         ``state_out`` (the step's output bank) is not compared: the group validates its input bank by its stamp alone
         (``bank_compare`` is ``False``).
         """
-        del stage3_qd, state_out
+        del state_out
         solver = self.solver
         wp.launch(
             self.repair_kernel,
@@ -774,7 +770,7 @@ class CoordinateTrees:
     def refresh(self, state_aug):
         """Nothing to do here: ``predict`` refreshes the inverse masses the mass mask selects."""
 
-    def predict(self, state_in, state_aug, control, stage3_qd, dt):
+    def predict(self, state_in, state_aug, control, dt):
         """Form each leaf's force and refresh, solve and predict its coordinate, deciding its drive's saturation."""
         solver, model = self.solver, self.solver.model
         force = field_group.bind(
@@ -785,7 +781,6 @@ class CoordinateTrees:
             state_in=state_in,
             state_aug=state_aug,
             control=control,
-            predictor_qd=stage3_qd,
             dt=dt,
             stage_clocks=cached_state_binding.stage_clocks(solver),
             predicted_twist=solver._arrays.placeholder(wp.spatial_vector),

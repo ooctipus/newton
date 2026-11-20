@@ -1,10 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""The prefix rows: one native primitive for a world's mimic, joint-limit and joint velocity-limit rows.
+"""The prefix rows: one native primitive for a world's mimic and joint-limit rows.
 
-A world's dense rows open with its prefix: the position rows (mimic equalities and joint limits), then the joint
-velocity limits (``dense_phase_bounds`` holds both ends). :func:`prefix_rows` is the candidate loop of every native
+A world's dense rows open with its prefix, the position rows (mimic equalities and joint limits; ``topology_rows``
+holds its end with the links'). :func:`prefix_rows` is the candidate loop of every native
 prefix producer: a lane group walks an articulation's candidates in order, takes each one's law from
 :data:`.row_laws.ROW_LAW`, places the active rows in candidate order and writes their records. The producers differ
 in their families and in the sink their consumer reads (the per-size Jacobian, or the one writer's unit sources); every
@@ -30,27 +30,17 @@ LAW = (
     Field("cfm", wp.float32, owner="options", attr="pgs_cfm"),
     Field("dt", wp.float32, owner="step"),
     Field("slot_counter", wp.int32, ("world",), owner="placement"),
-    Field("bounds", wp.int32, ("world", 2), attr="dense_phase_bounds", owner="placement"),
     *(field for field in RECORDS if field.name not in ("row_w", "row_eps")),
     Field("capacity", wp.int32, owner="placement", attr="dense_max_constraints"),
     Field("vhat", wp.float32, ("dof",), attr="v_hat"),
     Field("acts", wp.int32, ("world",), owner="placement", attr="world_acts"),
 )
 """The prefix law's inputs (the model's live limits; a prescribed coordinate takes no row, :data:`.joint_table.JOINTS`),
-the world's row counter and phase bounds, and the dense row records with the dense class's capacity (its rows' line of
+the world's row counter, and the dense row records with the dense class's capacity (its rows' line of
 the row store holds the free bodies' rows after them); the predictor and the worlds' acts words
 (:data:`.placement.WORLD_ACTS`)."""
 
 PrefixLaw = field_group.struct("PrefixLaw", LAW, __name__)
-
-VELOCITY_LAW = (
-    Field("velocity_limit", wp.float32, ("dof",), owner="model", attr="joint_velocity_limit"),
-    Field("unauthored", wp.float32, owner="laws", attr="unauthored_velocity_limit"),
-)
-"""The joint velocity-limit family's inputs: the limits, and the value of a limit nobody authored (no limit)."""
-
-PrefixVelocityLaw = field_group.struct("PrefixVelocityLaw", (*LAW, *VELOCITY_LAW), __name__)
-"""The prefix law with the velocity-limit family's inputs (the joint velocity limits' warp producer)."""
 
 MIMIC_LAW = (
     Field("mimic_start", wp.int32, ("articulation_bound",), owner="mimics", attr="_mimic_art_start"),
@@ -72,22 +62,22 @@ PrefixMimicLaw = field_group.struct("PrefixMimicLaw", (*LAW, *MIMIC_LAW), __name
 """The prefix law with the mimic family's inputs (the mimic rows' warp producer)."""
 
 
-def _family(coordinates, name: str, evaluation: str, sides: int = 2) -> tuple:
-    """A coordinate family: ``sides`` candidates a coordinate (both sides of a position limit; a velocity limit's one
-    row), ``coordinates`` a tuple or a native count from 0.
+def _family(coordinates, name: str, evaluation: str) -> tuple:
+    """A coordinate family: two candidates a coordinate (both sides of a position limit), ``coordinates`` a tuple or a
+    native count from 0.
 
     A dynamically indexed local array survives CUDA compilation even when its values form an interval, so an
     interval becomes arithmetic.
     """
-    per = f"index / {sides}" if sides > 1 else "index"
+    per = "index / 2"
     declaration, coordinate = "", per
     if isinstance(coordinates, str):
-        count = f"{sides} * {coordinates}" if sides > 1 else coordinates
+        count = f"2 * {coordinates}"
     elif coordinates and coordinates == tuple(range(coordinates[0], coordinates[-1] + 1)):
-        count = sides * len(coordinates)
+        count = 2 * len(coordinates)
         coordinate += f" + {coordinates[0]}" if coordinates[0] else ""
     else:
-        count = sides * len(coordinates)
+        count = 2 * len(coordinates)
         declaration = f"    const int {name}[] = {{{', '.join(map(str, coordinates)) or '0'}}};\n"
         coordinate = f"{name}[{per}]"
     return count, declaration, f"const int d = {coordinate};\n{evaluation}"
@@ -118,33 +108,6 @@ def limits(coordinates, dof: str, law: str) -> tuple:
                         {law}acts.data[world] = 1;
                 }}
             }}""",
-    )
-
-
-def velocity_limits(coordinates, dof: str, law: str) -> tuple:
-    """The joint velocity-limit family: one row a coordinate for both sides of ``|v| <= limit`` (``J = +e``, target
-    ``-limit``, the limit itself in the row's ``mu``; no bias; :func:`.projection_laws.velocity_limit`), on every
-    authored limit (:func:`.row_laws.velocity_limit_active`) of a limit joint's coordinate (a prismatic, revolute or D6
-    axis: ``limit_q_index >= 0``) that is not prescribed. A row whose residual at the predictor, ``limit - |v_hat|``
-    (its nearer side's), may not separate (:func:`.row_laws.separates`) marks its world's acts word."""
-    return _family(
-        coordinates,
-        "velocity_coordinates",
-        f"""            dof = {dof};
-            const float limit = {law}velocity_limit.data[dof];
-            active = {law}limit_q_index.data[dof] >= 0 && {law}prescribed.data[dof] == 0 &&
-                     RowLaw::velocity_limit_active(limit, {law}unauthored);
-            type = 4;
-            target = -limit;
-            mu = limit;
-            d0 = d;
-            w0 = 1.0f;
-            if (active && {law}acts.shape[0] > 0) {{
-                const float speed = fabsf({law}vhat.data[dof]);
-                if (!RowLaw::separates(limit - speed, limit + speed))
-                    {law}acts.data[world] = 1;
-            }}""",
-        sides=1,
     )
 
 
@@ -205,7 +168,7 @@ def prefix_rows(
     """The prefix producer's candidate loop over one articulation, as native code inside its lane group.
 
     Args:
-        phases: The position families, then the velocity families: per phase a tuple of families
+        phases: The families by phase: per phase a tuple of families
             ``(candidates, declaration, evaluation)``. An evaluation of ``index`` (the candidate within its family)
             sets ``active``, ``type`` (3, a limit, by default), ``phi``, ``target``, ``beta``, the coordinates and
             coefficients ``d0, w0`` and ``d1, w1``, and a coordinate family's ``dof`` and ``side``.

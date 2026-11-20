@@ -278,50 +278,6 @@ class TestRegionLaw(unittest.TestCase):
 class TestRegionStream(unittest.TestCase):
     """The stream's bodies and their marks through the solver."""
 
-    def test_only_a_body_with_a_speed_row_is_open_beside_prescribed_bodies(self):
-        """Mark open the one box whose speed row is held, among boxes resting apart on the ground behind prescribed
-        (kinematic) free bodies.
-
-        The stream's bodies are the forest's free bodies, in the order of their speed rows' slots: a prescribed
-        body, listed first in the model, takes no place, and no box reads another's slots.
-        """
-        builder = newton.ModelBuilder()
-        SolverFeatherPGS.register_custom_attributes(builder)
-        limits = {"rigid_body_max_linear_velocity": 0.5, "rigid_body_max_angular_velocity": 50.0}
-        prescribed, boxes = [], []
-        for k in range(6):
-            body = builder.add_body(
-                xform=wp.transform((2.0 * k, 0.0, 0.0505 if k >= 3 else 1.0), wp.quat_identity()),
-                custom_attributes=limits,
-            )
-            builder.add_shape_box(body, hx=0.05, hy=0.05, hz=0.05)
-            (boxes if k >= 3 else prescribed).append(body)
-        builder.add_ground_plane()
-        model = builder.finalize(device="cpu")
-        flags = model.body_flags.numpy()
-        flags[prescribed] |= int(newton.BodyFlags.KINEMATIC)
-        model.body_flags.assign(flags)
-        solver = SolverFeatherPGS(model, pgs_iterations=8, velocity_limit_activation_fraction=0.7)
-        regions = solver.sweep.regions
-        self.assertIsNotNone(regions)
-        self.assertEqual(regions.count, len(boxes))
-        self.assertEqual(regions.count, solver.forest.free_rigid_body_count)
-        state, out = model.state(), model.state()
-        # The last box slides on the ground past its linear limit: it alone holds a speed row.
-        start = int(model.joint_qd_start.numpy()[int(np.flatnonzero(model.joint_child.numpy() == boxes[-1])[0])])
-        qd = state.joint_qd.numpy()
-        qd[start] = 1.0
-        state.joint_qd.assign(qd)
-        newton.eval_fk(model, state.joint_q, state.joint_qd, state)
-        pipeline = newton.CollisionPipeline(model)
-        contacts = pipeline.contacts()
-        pipeline.collide(state, contacts)
-        solver.step(state, out, model.control(), contacts, 1.0 / 480.0)
-        slots = solver.placement.rigid_velocity_limit_slot.numpy().reshape(-1, 2)
-        np.testing.assert_array_equal((slots >= 0).any(axis=1), [False, False, True])
-        np.testing.assert_array_equal(regions.body_open.numpy(), [0, 0, 1])
-        self.assertEqual(int(regions.cursor.numpy()[2]), 2)
-
     def test_a_held_frame_keeps_the_listing_a_new_one_would_make(self):
         """List a contact frame's regions once and hold them through its later steps: a held step's listing (its
         bodies' places and marks, each region's candidates by contact, the order and its levels) is the one a new

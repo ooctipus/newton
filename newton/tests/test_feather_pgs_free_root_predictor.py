@@ -8,8 +8,8 @@ linear coordinate (see :mod:`newton.tests.test_feather_pgs_contract_bodies`
 for why that term must exist).  Every other place that converts between the
 root's velocity coordinate and its acceleration must use the same convention:
 
-* the velocity predictor ``v_hat = qd + qdd * dt`` feeds contact, friction,
-  and velocity-limit rows, so without the term those rows are built against a
+* the velocity predictor ``v_hat = qd + qdd * dt`` feeds contact and friction
+  rows, so without the term those rows are built against a
   COM velocity the integrator never realizes -- off by ``dt * (omega x v)``;
 * the post-solve conversion ``qdd = (v_out - qd) / dt`` decides what the
   integrator receives, so without the inverse term the realized velocity is

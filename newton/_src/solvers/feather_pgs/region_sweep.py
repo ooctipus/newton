@@ -82,7 +82,7 @@ from .region_laws import (
     twist_reach,
 )
 from .row_build import contact_gap_rate, member_contact_row, member_row_law
-from .row_kernels import RIGID_SPEED_ROWS, RowBias, row_bias_words
+from .row_kernels import RowBias, row_bias_words
 from .row_laws import ROW_CONTACT, ROW_TORSION, contact_restitution_rhs
 from .row_records import DenseRows, row_sides
 from .tree_scan import indent_text
@@ -606,23 +606,16 @@ def check_contacts(
 
 @wp.kernel(enable_backward=False, module="unique")
 def check_bodies(
-    speed_slot: wp.array[int],
-    speed_rows: int,
     body_pair: wp.array[int],
     body_open: wp.array[int],
     body_touch: wp.array[int],
     relist: wp.array[int],
 ):
-    """Each free body's marks: a dense row (:func:`check_contacts`) or a speed row (``speed_slot``, ``speed_rows`` a
-    body) touches it (``body_touch``); with a region between two movable bodies on it (``body_pair``, the listing's)
-    it is open. A body whose mark is not the listing's asks for a new listing (``relist[0]``)."""
+    """Each free body's marks: a dense row touches it (``body_touch``, :func:`check_contacts`); with a region between
+    two movable bodies on it (``body_pair``, the listing's) it is open. A body whose mark is not the listing's asks for
+    a new listing (``relist[0]``)."""
     f = wp.tid()
-    touch = body_touch[f]
-    for row in range(speed_rows):
-        if speed_slot[speed_rows * f + row] >= 0:
-            touch = 1
-    body_touch[f] = touch
-    if int(touch != 0 or body_pair[f] != 0) != body_open[f]:
+    if int(body_touch[f] != 0 or body_pair[f] != 0) != body_open[f]:
         relist[0] = 1
 
 
@@ -709,7 +702,7 @@ def place_bodies(
     """Where the step lists its regions anew, a world's bodies placed in the regions' stream, a thread a world (it
     reads its free bodies' counts only).
 
-    A free body is *open* when a dense row or a speed row (``body_touch``, :func:`check_bodies`) or a region between
+    A free body is *open* when a dense row (``body_touch``, :func:`check_bodies`) or a region between
     two movable bodies (``body_pair``, :func:`mark_regions`) touches it, else *closed*. The stream holds the world's
     closed bodies' regions body by body, each such body a lane of ``lanes`` (counted in ``cursor[2]``), then its open
     bodies' (``world_regions``): each body takes its regions' places (``body_regions``) and its candidates' first
@@ -1973,8 +1966,8 @@ class Regions:
         # Whether a region that cannot act waits for the sweeps' end (fill_regions; a test pin turns it off).
         self.leave_out = leave_out
         device = model.device
-        # The free bodies are the forest's: those that respond, in its order, which is the order of their speed rows'
-        # slots (Placement.rigid_velocity_limit_slot). A prescribed free body is no row's side and holds no region.
+        # The free bodies are the forest's: those that respond, in its order. A prescribed free body is no row's side and
+        # holds no region.
         free_art = np.zeros(0, dtype=np.int32)
         if forest.free_rigid_body_count:
             bodies = forest.free_rigid_body_indices.numpy()
@@ -2209,15 +2202,10 @@ class Regions:
             outputs=[self.body_touch, self.relist],
             **live,
         )
-        speed = placement.rigid_velocity_limit_slot
-        if speed is not None and speed.shape[0] != RIGID_SPEED_ROWS * self.count:
-            raise ValueError(
-                f"the speed rows' slots are {speed.shape[0]}, not {RIGID_SPEED_ROWS} a body of the stream's {self.count}"
-            )
         wp.launch(
             check_bodies,
             dim=self.count,
-            inputs=[self.lanes if speed is None else speed, 0 if speed is None else RIGID_SPEED_ROWS, self.body_pair],
+            inputs=[self.body_pair],
             outputs=[self.body_open, self.body_touch, self.relist],
             device=device,
         )

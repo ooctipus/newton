@@ -69,8 +69,6 @@ _SCALED_VOTES = {
         "fabsf(delta_impulse) * (denom)",
         "fabsf(sib_delta) * (__int_as_float(s_rec_dense[64 + (sib)]))",
         "fabsf(delta_impulse) * (mf_diag > 0.0f ? 1.0f / mf_diag : 0.0f)",
-        "fabsf(delta_impulse_vlim) * (denom)",
-        "fabsf(speed_row[1]) * (1.0f / mf_diag)",
     ),
     "sparse_diagonal": (
         "fabsf(delta_impulse) * (denom)",
@@ -105,10 +103,6 @@ def _factory_calls():
     )
 
 
-# A velocity-limit visit: its law call (projection_laws.velocity_limit, or a speed row's speed_row).
-_LAW_SITE = re.compile(r"ProjectionLaw::(?:velocity_limit|speed_row)\([^;]*\);")
-
-
 def _axis(name, values=(False, True)):
     """One census axis: a keyword over its values."""
     return tuple({name: value} for value in values)
@@ -131,7 +125,6 @@ def _vote_census():
                 _axis("active_rows"),
                 _axis("use_support_table"),
                 _axis("contact_triplets"),
-                _axis("velocity_limits"),
                 _axis("local_factors"),
                 _axis("warm_start"),
                 _axis("linked_rows"),
@@ -143,7 +136,6 @@ def _vote_census():
             (32, 8, 8),
             (
                 _axis("lanes_per_world", (16, 8)),
-                _axis("velocity_limits"),
                 _axis("local_factors"),
                 _axis("warm_start"),
             ),
@@ -152,11 +144,7 @@ def _vote_census():
             "mf_gs",
             built(sweep_routes.GeneralSweep),
             (64, 32, 12, "120"),
-            (
-                _axis("places", sweep_routes.ROW_PLACES),
-                _axis("has_dense_velocity_limit_rows"),
-                _axis("speed_rows"),
-            ),
+            (_axis("places", sweep_routes.ROW_PLACES),),
         ),
         (
             "sparse_diagonal",
@@ -166,7 +154,6 @@ def _vote_census():
                 _axis("speculative_contact_batches"),
                 _axis("levels", (LevelLaw(), LevelLaw(EXACT))),
                 _axis("seeded"),
-                _axis("velocity_limits"),
             ),
         ),
     )
@@ -303,7 +290,7 @@ class TestSolvePolicy(unittest.TestCase):
 
         counted, plain = template(SWEEPS), template(DEFAULT_POLICY)
         for names in ([name for name, _ in counted.signature], [name for name, _ in counted.native_params]):
-            self.assertEqual(names[-2:], ["v_out", "readout"])
+            self.assertEqual(names[-2:], ["omega", "readout"])
         self.assertIs(counted.signature[-1][1], SolveReadout)
         self.assertEqual(plain.signature, counted.signature[:-1])
         self.assertEqual(plain.native_params, counted.native_params[:-1])
@@ -380,13 +367,12 @@ class TestExitLaw(unittest.TestCase):
 
         A combination is valid when the factory builds it without a readout; under a readout it must
         then build as well, with every change vote bounded by its floor and, traced, one exit record.
-        Vote sites that only some flags emit (velocity-limit lanes, free-body rows, fused drive clamps,
-        streamed impulses) would otherwise escape the law unnoticed.
+        Vote sites that only some flags emit (free-body rows, fused drive clamps, streamed impulses) would
+        otherwise escape the law unnoticed.
 
         Every policy, the plain readout included, must also compose with the factory's other options:
         its kernel is the policy-less kernel's name plus the policy's suffix, it appends one readout
-        operand when it counts, and it keeps the policy-less sweep's velocity-limit law sites and its
-        row-metadata storage.
+        operand when it counts, and it keeps the policy-less sweep's row-metadata storage.
         """
         checked = dict.fromkeys(_SCALED_VOTES, 0)
         for name, factory, args, kwargs in _vote_census():
@@ -395,7 +381,6 @@ class TestExitLaw(unittest.TestCase):
             except (ValueError, NotImplementedError, RuntimeError, AssertionError):
                 continue
             body = max(_native_snippets(plain), key=len)
-            law_sites = len(_LAW_SITE.findall(body))
             places = kwargs.get("places")
             if places is not None and places.metadata is Place.STREAMED and "s_rec_dense" in body:
                 self.fail(f"{plain.key} {kwargs}: streamed rows stage their metadata")
@@ -405,10 +390,8 @@ class TestExitLaw(unittest.TestCase):
                 labels = [argument.label for argument in kernel.adj.args]
                 self.assertEqual(labels, _with_readout([argument.label for argument in plain.adj.args], policy.counts))
                 snippet = max(_native_snippets(kernel), key=len)
-                if len(_LAW_SITE.findall(snippet)) != law_sites or ("s_rec_dense" in snippet) != (
-                    "s_rec_dense" in body
-                ):
-                    self.fail(f"{kernel.key} {kwargs}: the policy rewrote the law or the row metadata")
+                if ("s_rec_dense" in snippet) != ("s_rec_dense" in body):
+                    self.fail(f"{kernel.key} {kwargs}: the policy rewrote the row metadata")
                 snippets = {snippet for snippet in _native_snippets(kernel) if QUIET_LITERAL in snippet}
                 if len(snippets) != 1:
                     self.fail(f"{kernel.key}: {len(snippets)} snippets hold the floor")
@@ -425,16 +408,14 @@ class TestExitLaw(unittest.TestCase):
                     self.fail(f"{kernel.key} {kwargs}: the readout records no exit or more than one")
             checked[name] += 1
         # The admitted combinations per factory: a factory gate that starts refusing some must not shrink the census.
-        # The sparse sweep composes velocity limits with the active scan and units, and a lane group with any of them;
-        # the general sweep composes the line's speed rows with dense velocity-limit rows and the tiers' skip, in each
-        # of the five row places (the line's impulses in place among them).
+        # The general sweep builds in each of the five row places (the line's impulses in place among them).
         self.assertEqual(
             checked,
             {
-                "sparse": 128,
-                "sparse_lanes": 16,
-                "mf_gs": 20,
-                "sparse_diagonal": 12,
+                "sparse": 64,
+                "sparse_lanes": 8,
+                "mf_gs": 5,
+                "sparse_diagonal": 6,
             },
         )
 
@@ -717,16 +698,16 @@ class TestSolveReadoutRecord(unittest.TestCase):
         """Name every constraint type at its own index of the trace's kinds, followed by the kind of no change."""
         names = {
             row_laws.ROW_CONTACT: "contact",
-            row_laws.ROW_SPEED: "speed",
             row_laws.ROW_FRICTION: "friction",
             row_laws.ROW_JOINT_LIMIT: "joint_limit",
-            row_laws.ROW_JOINT_VELOCITY_LIMIT: "velocity_limit",
             row_laws.ROW_MIMIC: "mimic",
             row_laws.ROW_LINK: "link",
             row_laws.ROW_TORSION: "torsion",
         }
-        self.assertEqual(len(names), row_laws.ROW_KINDS)
-        self.assertEqual(TRACE_KINDS, (*(names[kind] for kind in range(row_laws.ROW_KINDS)), "none"))
+        self.assertEqual(len(TRACE_KINDS), row_laws.ROW_KINDS + 1)
+        self.assertEqual(TRACE_KINDS[-1], "none")
+        for kind, name in names.items():
+            self.assertEqual(TRACE_KINDS[kind], name)
 
 
 class TestSolverReadoutOption(unittest.TestCase):

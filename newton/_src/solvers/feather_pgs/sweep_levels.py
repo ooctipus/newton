@@ -33,7 +33,7 @@ from .contact_input import ContactInput
 from .device_preludes import LANE_WORDS, SHARED_STORAGE, group_native, lane_group
 from .kernel_template import KernelTemplate, items, python_kernel
 from .packed_rows import CLASS_SIDES
-from .row_laws import ROW_CONTACT, ROW_FRICTION, ROW_JOINT_LIMIT, ROW_JOINT_VELOCITY_LIMIT, ROW_TORSION
+from .row_laws import ROW_CONTACT, ROW_FRICTION, ROW_JOINT_LIMIT, ROW_TORSION
 
 # FeatherPGS takes no gradients: its kernels compile no adjoints.
 wp.set_module_options({"enable_backward": False})
@@ -152,12 +152,11 @@ def level_offsets(*, levels: str, counts: str, lanes: int = 32, sync: str = "__s
 
 
 @wp.func
-def tier_world(rows: int, free_body_rows: int, speed_first: wp.array[int], world: int, bound: int) -> bool:
+def tier_world(rows: int, free_body_rows: int, bound: int) -> bool:
     """Whether a world of ``rows`` dense rows is a Jacobi tier's (the tiers form its rows' response in their kernel):
-    its rows are dense only, no free body's (``free_body_rows``, the free bodies' run, or a speed row of the line,
-    from ``speed_first``), and at most the tiers' ``bound``. The claims (:func:`claim_worlds`) and the audit read this
-    one predicate."""
-    return free_body_rows == 0 and rows <= bound and rows <= speed_first[world]
+    its rows are dense only, no free body's (``free_body_rows``, the free bodies' run), and at most the tiers'
+    ``bound``. The claims (:func:`claim_worlds`) and the audit read this one predicate."""
+    return free_body_rows == 0 and rows <= bound
 
 
 COST_CLASSES = 32
@@ -184,7 +183,6 @@ def cost_bucket(general: int, cost: int) -> int:
 def claim_worlds(
     rows: wp.array[int],
     free_body_rows: wp.array[int],
-    speed_first: wp.array[int],
     slot: wp.array[wp.int32],
     world_cost: wp.array[wp.int32],
     bound: int,
@@ -204,8 +202,7 @@ def claim_worlds(
     and ``slot`` is not read); the rest into the general sweep's cost classes from ``general`` on, by the bits of its
     own cycles in the sweep's last call (``world_cost``, :func:`cost_bucket`). A world without rows takes none, nor one
     none of whose rows can act (its ``acts`` word, :data:`.placement.WORLD_ACTS`). A free
-    body's rows are not dense only: those in the free bodies' run (``free_body_rows``) and the line's speed rows (its
-    rows from ``speed_first``).
+    body's rows in the free bodies' run (``free_body_rows``) are not dense only.
 
     A claim's worlds share nothing with another's, so each is a component of its own and the order inside a bucket is
     free (:func:`~newton._src.core.execution.append`'s, an atomic a warp a bucket); tier ``t`` serves
@@ -219,7 +216,7 @@ def claim_worlds(
     if (m <= 0 and mf <= 0) or (acts.shape[0] > 0 and acts[world] == 0):
         return
     bucket = int(-1)
-    if tier_world(m, mf, speed_first, world, bound):
+    if tier_world(m, mf, bound):
         bucket = (m - 1) // width
     elif candidate >= 0:
         if slot[world] >= 0:
@@ -482,7 +479,7 @@ def _sparse_contact_levels_kernel(
         if build_serial_contacts
         else ""
     )
-    units = f"""    const int contact_start = dense_phase_bounds.data[world * 2 + 1];
+    units = f"""    const int contact_start = topology_rows.data[world];
     const int contact_end = min(world_constraint_count.data[world], {M});
     const int units = contact_end - contact_start;
     const int line = dense_first.data[world];
@@ -505,7 +502,7 @@ def _sparse_contact_levels_kernel(
     params = (
         ("world_constraint_count", wp.array[int]),
         ("dense_first", wp.array[int]),
-        ("dense_phase_bounds", wp.array2d[int]),
+        ("topology_rows", wp.array[int]),
         ("world_row_type", wp.array2d[int]),
         ("sparse_row_dof", wp.array3d[int]),
         *_LEVELS_OUTPUTS,
@@ -522,8 +519,7 @@ def coordinate_levels_kernel(M: int, P: int, D: int, device_arch: str, *, torsio
     """The levels of the units on one coordinate no wider unit holds, over a world's rows by support class
     (:func:`.packed_rows.row_classes`, ``P`` rows a line), which the general sweep steps first (``coordinate_levels``).
 
-    A unit heads its contact's rows (its pair and spin row name it as parent) or is any other row but a velocity limit
-    (the last word's). A contact or joint limit of one entry ahead of every other unit on its coordinate is leveled in
+    A unit heads its contact's rows (its pair and spin row name it as parent) or is any other row. A contact or joint limit of one entry ahead of every other unit on its coordinate is leveled in
     row order (:func:`_levels_kernel`), so it commutes with every row stepped in order: the order's iterate.
     """
     L = device_lanes(device_arch, 32)
@@ -535,7 +531,7 @@ def coordinate_levels_kernel(M: int, P: int, D: int, device_arch: str, *, torsio
     entries = """const int classes = row_classes.data[row_base + row];
             const int c1 = (classes >> 13) & 0x1FFF;
             const int entries = ((classes >> 26) & 0x3F) + (c1 == 0x1FFF ? 0 : class_count.data[c1]);"""
-    unit = f"({head} && {kind} != {int(ROW_JOINT_VELOCITY_LIMIT)})"
+    unit = f"({head})"
     # A level holds contacts and joint limits (the sweep compiles their laws apart).
     kinds = f"({kind} == {int(ROW_CONTACT)} || {kind} == {int(ROW_JOINT_LIMIT)})"
     units = f"""    const int contact_start = 0;

@@ -151,7 +151,6 @@ class Sweep:
         """Case K1, a single tree: native sparse factors with independent rigid-body response blocks, from the class
         plan's choice (:class:`.class_plan.Packed`, ``None`` where the class is another case)."""
         model = self.model
-        self.sparse_velocity_limits = False
         self.support_rows = self.support_units_kernel = self._support_sink = None
         self.support_units = None
         self.support_du_base = None
@@ -162,7 +161,6 @@ class Sweep:
         if choice is None:
             return
         sweep, max_support = dict(choice.sweep), choice.max_support
-        self.sparse_velocity_limits = choice.velocity_limits
         self.factor.allocate_sparse(choice.plan)
         self.placement.sparse_body_dof_mask = wp.array(choice.body_masks, dtype=wp.uint64, device=model.device)
         if sweep["use_support_table"]:
@@ -186,7 +184,6 @@ class Sweep:
             self.forest.max_world_dofs,
             max_support,
             **sweep,
-            velocity_limits=self.sparse_velocity_limits,
             warm_start=self.options.pgs_warmstart,
             linked_rows=True,
             device_arch=model.device.arch,
@@ -347,8 +344,6 @@ class Sweep:
 
         # The sweeps start from the impulses the rows carry: the warm start's, the closed loop's projection.
         self.seeded = bool(self.options.pgs_warmstart or self.factor.eliminates)
-        # The line's speed rows (step_plan.Capacities.speed_rows), where a free body's rows are the line's.
-        speed_rows = self.placement.speed_rows > 0
         diagonal = self.classes.diagonal
         sparse_contact_schedule = diagonal is not None and diagonal.units
         self.sparse_contact_marker = (
@@ -380,7 +375,6 @@ class Sweep:
                 speculative_contact_batches=diagonal.speculative_batches,
                 levels=LevelLaw(EXACT) if diagonal.units else LevelLaw(),
                 seeded=self.seeded,
-                velocity_limits=bool(self.options.enable_joint_velocity_limits),
                 **self.law_fields,
             )
             if diagonal is not None
@@ -443,7 +437,6 @@ class Sweep:
                 self.forest.max_world_dofs,
                 device_arch,
                 pitch=self.placement.row_pitch,
-                has_dense_velocity_limit_rows=bool(self.options.enable_joint_velocity_limits),
                 places=pinned,
                 max_row_dofs=self.placement.packed_support,
                 seeded=self.seeded,
@@ -451,7 +444,6 @@ class Sweep:
                 support_classes=self.placement.classed,
                 contact_units=self.pins.contact_units == "triplets" and not small,
                 free_rows=bool(self.placement.free_contact_rows),
-                speed_rows=speed_rows,
                 one_tree=self._one_tree(),
                 **self.law_fields,
             )
@@ -645,8 +637,7 @@ class Sweep:
         """Open the claims' streams: the sweeps that own their worlds run on them beside the matrix-free sweep.
 
         The claims touch nothing the matrix-free sweep touches, so they fork after the rows are published and join
-        before the leave: the Jacobi tiers, whose worlds hold no free-body row (nor a speed row of the line), none of
-        the matrix-free sweep's. A tier's worlds are those of its row count, so each tier is a claim of its own.
+        before the leave: the Jacobi tiers, whose worlds hold no free-body row, none of the matrix-free sweep's. A tier's worlds are those of its row count, so each tier is a claim of its own.
 
         The claims' worlds are written before the fork (:func:`.sweep_levels.claim_worlds`), since the matrix-free sweep
         walks its bucket of them too. A stream a tier.
@@ -699,7 +690,6 @@ class Sweep:
             inputs=[
                 self.placement.constraint_count,
                 self.placement.mf_constraint_count,
-                self.placement.speed_first,
                 units.units["world_slot"] if units is not None else self.placement.dummy_is_free_rigid,
                 self.world_cost,
                 self.par_tiers[-1][0] if self.par_tiers else 0,
@@ -740,7 +730,7 @@ class Sweep:
             inputs += [classes.class_count, self.forest.articulation_world_dof_offset]
             outputs = levels
         else:
-            inputs = [*counts, placement.dense_phase_bounds, placement.row_type]
+            inputs = [*counts, placement.topology_rows, placement.row_type]
             outputs = [placement.sparse_diagonal_row_dof, *levels, placement.sparse_contact_serial_count]
             outputs += [placement.sparse_contact_serial_normals]
         wp.launch(
@@ -789,8 +779,7 @@ class Sweep:
             **({} if self.regions is None else self.regions.operands()),
             "world_constraint_count": placement.constraint_count,
             "dense_first": placement.dense_first,
-            "dense_phase_bounds": placement.dense_phase_bounds,
-            "speed_first": placement.speed_first,
+            "topology_rows": placement.topology_rows,
             "world_dof_indices": forest.world_dof_indices,
             "rhs_bias": placement.rhs,
             "row_incident": placement.row_incident,
@@ -1163,7 +1152,6 @@ class Sweep:
         sparse = {
             "size": json_value(row.sizes["packed"]),
             "reason": row.reasons["packed"],
-            "velocity_limits": bool(self.sparse_velocity_limits),
             "active_rows": bool(options.get("active_rows")),
             "active_rows_reason": packed.active_rows_reason if packed else unselected,
             "support_table": bool(self.placement.sparse_row_support.enabled),
