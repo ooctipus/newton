@@ -2768,10 +2768,9 @@ def create_mesh_sdf_staged_kernels(
     sample_grad = texture_sample_sdf_grad_only_hw
     get_mesh_edge = _create_mesh_edge_accessor_func(True)
     get_mesh_edge_bounding_sphere = _create_get_mesh_edge_bounding_sphere_func(True)
-    module = f"sdf_contact_staged_{speculative}_{use_texture_sdf_only}_{use_identity_sdf_scale}"
     block = MESH_SDF_BLOCK_DIM
 
-    @wp.kernel(enable_backward=False, module=module)
+    @wp.kernel(enable_backward=False, module="unique")
     def mesh_sdf_stage_context_kernel(
         shape_data: wp.array[wp.vec4],
         shape_transform: wp.array[wp.transform],
@@ -3042,7 +3041,7 @@ def create_mesh_sdf_staged_kernels(
                     reducer_data,
                 )
 
-    @wp.kernel(enable_backward=False, launch_bounds=(MESH_SDF_BLOCK_DIM, 4), grid_stride=False, module=module)
+    @wp.kernel(enable_backward=False, launch_bounds=(MESH_SDF_BLOCK_DIM, 4), grid_stride=False, module="unique")
     def mesh_sdf_stage_cull_kernel(
         texture_sdf_table: wp.array[TextureSDFData],
         shape_pairs_mesh_mesh: wp.array[wp.vec2i],
@@ -3266,7 +3265,7 @@ def create_mesh_sdf_staged_kernels(
                 else:
                     wp.atomic_max(work_state, _STAGE_OVERFLOW, 1)
 
-    @wp.kernel(enable_backward=False, launch_bounds=(MESH_SDF_BLOCK_DIM, 4), grid_stride=False, module=module)
+    @wp.kernel(enable_backward=False, launch_bounds=(MESH_SDF_BLOCK_DIM, 4), grid_stride=False, module="unique")
     def mesh_sdf_stage_search_kernel(
         texture_sdf_table: wp.array[TextureSDFData],
         mesh_edge_indices: wp.array[wp.vec2i],
@@ -3338,7 +3337,7 @@ def create_mesh_sdf_staged_kernels(
             wp.tile_scatter_masked(claim, 0, segment, t == 0)
             segment = wp.tile_extract(claim, 0)
 
-    @wp.kernel(enable_backward=False, module=module)
+    @wp.kernel(enable_backward=False, module="unique")
     def mesh_sdf_stage_export_kernel(
         shape_transform: wp.array[wp.transform],
         texture_sdf_table: wp.array[TextureSDFData],
