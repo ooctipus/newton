@@ -96,6 +96,82 @@ def _counting(s: int, trees: int, tree_asleep: wp.array2d[wp.int32]) -> int:
     return s
 
 
+LOAD_BITS = 61
+"""The bits of a tree's lumped load (:func:`_lump_contact_load`): its sums are int64 multiples of a power-of-two unit
+sized from the substep's own bound (:func:`_load_unit`), two bits below int64's range."""
+_LOAD_CEILING = wp.constant(float(2**LOAD_BITS))
+
+
+@wp.kernel
+def _load_unit(count: wp.array[int], load_bound: wp.array[float], load_unit: wp.array[float]):
+    """The substep's load unit ``2**e`` [N] and its inverse (``load_unit``), one thread: no tree's sum of its
+    contacts' loads exceeds ``count`` (the substep's contacts) times ``load_bound`` (the largest load one contact
+    carries, :func:`_contact_load`), so ``e``, the least exponent with that product under ``2**LOAD_BITS`` units,
+    keeps every sum in range whatever the order the contacts add it in. Powers of two scale a float exactly."""
+    total = float(wp.max(count[0], 1)) * load_bound[0]
+    unit = float(1.0)
+    inverse = float(1.0)
+    ceiling = _LOAD_CEILING
+    for _ in range(240):
+        if total <= ceiling * unit * 0.5 and unit > 1.0e-30:
+            unit *= 0.5
+            inverse *= 2.0
+        elif total > ceiling * unit:
+            unit *= 2.0
+            inverse *= 0.5
+        else:
+            break
+    load_unit[0] = unit
+    load_unit[1] = inverse
+
+
+@wp.func
+def _contact_trees(
+    c: int,
+    shape0: wp.array[wp.int32],
+    shape1: wp.array[wp.int32],
+    shape_body: wp.array[wp.int32],
+    body_slot: wp.array[wp.int32],
+    trees: int,
+    tree_asleep: wp.array2d[wp.int32],
+):
+    """Contact ``c``'s bodies and the slots of its trees that can count (:func:`_counting`; -1 otherwise):
+    ``(body_a, body_b, a, b)``."""
+    sa = shape0[c]
+    sb = shape1[c]
+    body_a = int(-1)
+    body_b = int(-1)
+    if sa >= 0:
+        body_a = shape_body[sa]
+    if sb >= 0:
+        body_b = shape_body[sb]
+    a = int(-1)
+    b = int(-1)
+    if body_a >= 0:
+        a = _counting(body_slot[body_a], trees, tree_asleep)
+    if body_b >= 0:
+        b = _counting(body_slot[body_b], trees, tree_asleep)
+    return body_a, body_b, a, b
+
+
+@wp.func
+def _contact_cone(
+    c: int,
+    routes: ContactRoutes,
+    shape0: wp.array[wp.int32],
+    shape1: wp.array[wp.int32],
+    shape_mu: wp.array[float],
+    rigid_contact_force: wp.array[wp.vec3],
+):
+    """Contact ``c``'s cone capacity ``mu f_n`` and friction force ``f_t`` (on its first side) from its exported
+    force."""
+    f = rigid_contact_force[c]
+    n = routes.normal[c]
+    f_n = -wp.dot(f, n)
+    f_t = f + f_n * n
+    return contact_friction(shape0[c], shape1[c], shape_mu) * wp.max(f_n, 0.0), f_t
+
+
 @wp.kernel
 def _contact_load(
     dense_first: wp.array[int],
@@ -119,30 +195,18 @@ def _contact_load(
     trees: int,
     tree_asleep: wp.array2d[wp.int32],
     rigid_contact_force: wp.array[wp.vec3],
-    load_n: wp.array[float],
-    load_t: wp.array[wp.vec3],
+    load_bound: wp.array[float],
     pressed: wp.array[wp.int32],
 ):
-    """Export the force of each contact a tree that can count touches (the solver's export) and lump it on such trees:
-    each tree's cone capacity ``sum mu f_n`` and its friction force ``sum f_t``, and whether an agent (:func:`_agent`)
-    touches it. Nothing for a contact between trees that cannot count (acted on, loaded, or never resting)."""
+    """Export the force of each contact a tree that can count touches (the solver's export), bound its load (the
+    largest cone capacity or friction component one contact carries: ``load_bound``, zeroed before, a maximum and so
+    order-free) and say whether an agent (:func:`_agent`) touches such a tree. Nothing for a contact between trees
+    that cannot count (acted on, loaded, or never resting). A load that is not finite keeps its trees awake, as an
+    agent's touch does; :func:`_lump_contact_load` lumps the others."""
     c = wp.tid()
     if c >= routes.count[0]:
         return
-    sa = shape0[c]
-    sb = shape1[c]
-    body_a = int(-1)
-    body_b = int(-1)
-    if sa >= 0:
-        body_a = shape_body[sa]
-    if sb >= 0:
-        body_b = shape_body[sb]
-    a = int(-1)
-    b = int(-1)
-    if body_a >= 0:
-        a = _counting(body_slot[body_a], trees, tree_asleep)
-    if body_b >= 0:
-        b = _counting(body_slot[body_b], trees, tree_asleep)
+    body_a, body_b, a, b = _contact_trees(c, shape0, shape1, shape_body, body_slot, trees, tree_asleep)
     if a < 0 and b < 0:
         return
     contact_linear_force(
@@ -159,21 +223,56 @@ def _contact_load(
         inv_dt,
         rigid_contact_force,
     )
-    if a >= 0 and _agent(body_b, body_agent, body_slot, body_qd, moving):
+    capacity, f_t = _contact_cone(c, routes, shape0, shape1, shape_mu, rigid_contact_force)
+    finite = wp.isfinite(capacity) and wp.isfinite(f_t)
+    if a >= 0 and (not finite or _agent(body_b, body_agent, body_slot, body_qd, moving)):
         pressed[a] = 1
-    if b >= 0 and _agent(body_a, body_agent, body_slot, body_qd, moving):
+    if b >= 0 and (not finite or _agent(body_a, body_agent, body_slot, body_qd, moving)):
         pressed[b] = 1
-    f = rigid_contact_force[c]
-    n = routes.normal[c]
-    f_n = -wp.dot(f, n)
-    f_t = f + f_n * n
-    capacity = contact_friction(sa, sb, shape_mu) * wp.max(f_n, 0.0)
+    if finite:
+        wp.atomic_max(load_bound, 0, wp.max(capacity, wp.max(wp.abs(f_t))))
+
+
+@wp.kernel
+def _lump_contact_load(
+    routes: ContactRoutes,
+    shape0: wp.array[wp.int32],
+    shape1: wp.array[wp.int32],
+    shape_body: wp.array[wp.int32],
+    shape_mu: wp.array[float],
+    body_slot: wp.array[wp.int32],
+    trees: int,
+    tree_asleep: wp.array2d[wp.int32],
+    rigid_contact_force: wp.array[wp.vec3],
+    load_unit: wp.array[float],
+    load_n: wp.array[wp.int64],
+    load_t: wp.array2d[wp.int64],
+):
+    """Lump each finite contact load (:func:`_contact_load`) on its trees that can count: each tree's cone capacity
+    ``sum mu f_n`` and its friction force ``sum f_t``, in whole units of the substep's bound (:func:`_load_unit`).
+    Integer sums are exact, so a tree's load is the same whatever the order its contacts add in, and they cannot
+    overflow."""
+    c = wp.tid()
+    if c >= routes.count[0]:
+        return
+    _body_a, _body_b, a, b = _contact_trees(c, shape0, shape1, shape_body, body_slot, trees, tree_asleep)
+    if a < 0 and b < 0:
+        return
+    capacity, f_t = _contact_cone(c, routes, shape0, shape1, shape_mu, rigid_contact_force)
+    if not (wp.isfinite(capacity) and wp.isfinite(f_t)):
+        return
+    scale = load_unit[1]
+    q_n = wp.int64(wp.round(capacity * scale))
+    for k in range(3):
+        q_t = wp.int64(wp.round(f_t[k] * scale))
+        if a >= 0:
+            wp.atomic_add(load_t, a, k, q_t)
+        if b >= 0:
+            wp.atomic_add(load_t, b, k, -q_t)
     if a >= 0:
-        wp.atomic_add(load_n, a, capacity)
-        wp.atomic_add(load_t, a, f_t)
+        wp.atomic_add(load_n, a, q_n)
     if b >= 0:
-        wp.atomic_add(load_n, b, capacity)
-        wp.atomic_add(load_t, b, -f_t)
+        wp.atomic_add(load_n, b, q_n)
 
 
 @wp.kernel
@@ -193,8 +292,9 @@ def _rest_test(
     trees: int,
     speed_squared: float,
     stick: float,
-    load_n: wp.array[float],
-    load_t: wp.array[wp.vec3],
+    load_n: wp.array[wp.int64],
+    load_t: wp.array2d[wp.int64],
+    load_unit: wp.array[float],
     pressed: wp.array[wp.int32],
     moving: wp.array[wp.int32],
     tree_asleep: wp.array2d[wp.int32],
@@ -203,11 +303,13 @@ def _rest_test(
     moved (for the next substep's :func:`_agent`). A tree that can count had its contacts' load this substep, so every
     counted substep is checked."""
     i = wp.tid()
-    capacity = load_n[i]
-    friction = load_t[i]
+    unit = load_unit[0]
+    capacity = float(load_n[i]) * unit
+    friction = wp.vec3(float(load_t[i, 0]), float(load_t[i, 1]), float(load_t[i, 2])) * unit
     touched = pressed[i] != 0
-    load_n[i] = 0.0
-    load_t[i] = wp.vec3(0.0)
+    load_n[i] = wp.int64(0)
+    for k in range(3):
+        load_t[i, k] = wp.int64(0)
     pressed[i] = 0
     moving[i] = 0
     if slot_never[i] != 0:
@@ -325,8 +427,10 @@ class Sleep:
             self.dof_slot = wp.array(layout["dof_slot"], dtype=wp.int32)
             slots = int(self.world_count * self.trees)
             self.body_agent = wp.array(layout["body_agent"], dtype=wp.int32)
-            self.load_n = wp.zeros(slots, dtype=wp.float32)
-            self.load_t = wp.zeros(slots, dtype=wp.vec3)
+            self.load_n = wp.zeros(slots, dtype=wp.int64)
+            self.load_t = wp.zeros((slots, 3), dtype=wp.int64)
+            self.load_bound = wp.zeros(1, dtype=wp.float32)
+            self.load_unit = wp.ones(2, dtype=wp.float32)
             self.pressed = wp.zeros(slots, dtype=wp.int32)
             self.moving = wp.zeros(slots, dtype=wp.int32)
             self._no_forces = wp.zeros(0, dtype=wp.float32)
@@ -455,13 +559,15 @@ class Sleep:
         device = model.device
         if contacts is not None and contacts.rigid_contact_count is not None and placement.contact_pool is not None:
             pool = placement.contact_pool
+            routes = bind_routes(placement, contacts)
+            self.load_bound.zero_()
             pool.launch(
                 _contact_load,
                 pool.launch_rows(),
                 inputs=[
                     placement.dense_first,
                     placement.body_base,
-                    bind_routes(placement, contacts),
+                    routes,
                     placement.impulses,
                     placement.constraint_count,
                     placement.mf_constraint_count,
@@ -480,7 +586,33 @@ class Sleep:
                     self.trees,
                     self.tree_asleep,
                 ],
-                outputs=[contacts.rigid_contact_force, self.load_n, self.load_t, self.pressed],
+                outputs=[contacts.rigid_contact_force, self.load_bound, self.pressed],
+                extent=contacts.rigid_contact_count,
+                max_blocks=placement.contact_capacity_blocks,
+            )
+            wp.launch(
+                _load_unit,
+                dim=1,
+                inputs=[contacts.rigid_contact_count, self.load_bound],
+                outputs=[self.load_unit],
+                device=device,
+            )
+            pool.launch(
+                _lump_contact_load,
+                pool.launch_rows(),
+                inputs=[
+                    routes,
+                    contacts.rigid_contact_shape0,
+                    contacts.rigid_contact_shape1,
+                    model.shape_body,
+                    solver.laws.shape_material_mu,
+                    self.body_slot,
+                    self.trees,
+                    self.tree_asleep,
+                    contacts.rigid_contact_force,
+                    self.load_unit,
+                ],
+                outputs=[self.load_n, self.load_t],
                 extent=contacts.rigid_contact_count,
                 max_blocks=placement.contact_capacity_blocks,
             )
@@ -506,7 +638,7 @@ class Sleep:
                 SLEEP_SPEED * SLEEP_SPEED,
                 STICK,
             ],
-            outputs=[self.load_n, self.load_t, self.pressed, self.moving, self.tree_asleep],
+            outputs=[self.load_n, self.load_t, self.load_unit, self.pressed, self.moving, self.tree_asleep],
             device=device,
         )
 
