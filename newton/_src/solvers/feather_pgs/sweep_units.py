@@ -11,7 +11,10 @@ gives every unit a *color*, its level in row order: one past the latest color
 of an earlier unit on either of its bodies. No two units of a color share a
 body, and units that share one keep their row order, so a sweep that visits
 the colors in order and a color's units in parallel is the row-order
-Gauss-Seidel sweep itself. The row order is a physics parameter (the iterate a
+Gauss-Seidel sweep itself. Each unit also records its turn: the colors of the
+latest earlier unit on each of its bodies. The sweep runs a unit as soon as
+those units ran, without waiting for whole colors: the same order on every
+body, so the same arithmetic. The row order is a physics parameter (the iterate a
 budget of sweeps reaches depends on it), and the colors keep it.
 
 A body with many contacts (a tray under a coin tower) holds a unit in as many
@@ -110,12 +113,18 @@ UNIT_FIELDS = FieldGroup(
     # Packed first coordinates of the unit's bodies (``dof_a << 16 | dof_b``, as the rows' packed word).
     Field("unit_dofs", wp.int32, ("slot", "unit")),
     Field("unit_color", wp.int32, ("slot", "unit")),
-    # The unit's place among its color's units, in row order (the builder's scratch).
+    # The unit's place among its color's units, in row order, and the colors of its latest earlier unit on each of its
+    # bodies (-1 for none) (the builder's scratch).
     Field("unit_rank", wp.int32, ("slot", "unit")),
+    Field("unit_after", wp.int32, ("slot", "unit", 2)),
     # Colors: offsets into color_slot (count + 1 of them; at most one color per unit), and the units of each color in
     # row order, each as the record the sweep reads: first row, row count and its bodies' first coordinates.
     Field("color_offset", wp.int32, ("slot", "color")),
     Field("color_slot", wp.int32, ("slot", "unit", 4)),
+    # Each unit's turn on its bodies, by place: the colors of the latest earlier unit on its first and its second body
+    # (-1 for none). The sweep runs a unit once its bodies' units of those colors ran, so one past the larger is its
+    # color.
+    Field("color_after", wp.int32, ("slot", "unit", 2)),
 )
 """The units and colors of each slot's world (``unit``: the slot's unit capacity, :func:`unit_capacity`; ``color``:
 one more)."""
@@ -445,6 +454,8 @@ LEVEL_OFFSETS
         color_slot.data[at + 1] = unit_rows.data[off_mf + unit];
         color_slot.data[at + 2] = dofs >> 16;
         color_slot.data[at + 3] = (dofs << 16) >> 16;
+        color_after.data[(off_mf + position) * 2] = unit_after.data[(off_mf + unit) * 2];
+        color_after.data[(off_mf + position) * 2 + 1] = unit_after.data[(off_mf + unit) * 2 + 1];
     }
     if (tid == 0) {
         unit_count.data[world] = units;
@@ -466,7 +477,9 @@ _LEVEL_PASS = sweep_levels.level_pass(
     units="units",
     resources=_UNIT_RESOURCES,
     counts="color_offset.data[off_color + {}]",
-    store="unit_color.data[off_mf + unit] = level;\n                unit_rank.data[off_mf + unit] = rank;",
+    store="unit_color.data[off_mf + unit] = level;\n                unit_rank.data[off_mf + unit] = rank;"
+    "\n                unit_after.data[(off_mf + unit) * 2] = after_a;\n                unit_after.data[(off_mf + unit) * 2 + 1] = after_b;",
+    after=True,
 )
 _LEVEL_OFFSETS = sweep_levels.level_offsets(levels="colors", counts="color_offset.data[off_color + {}]")
 
@@ -746,7 +759,7 @@ class ColoredUnits:
 
     def operands(self) -> dict:
         """The colored sweep's operands by name (:data:`.sweep_routes.COLORED_ABI`, after the matrix-free sweep's)."""
-        names = ("world_slot", "color_count", "color_offset", "color_slot")
+        names = ("world_slot", "color_count", "color_offset", "color_slot", "color_after")
         return {**{name: self.units[name] for name in names}, **self.slots}
 
     def stats(self) -> list[dict]:

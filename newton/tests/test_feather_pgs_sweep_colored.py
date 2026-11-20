@@ -118,12 +118,19 @@ def reference_units(meta, count: int, end: int) -> dict:
     count = int(colors.max(initial=-1)) + 1
     sizes = np.bincount(np.asarray(colors, dtype=np.int64), minlength=count)
     order = sorted(range(len(units)), key=lambda unit: (colors[unit], unit))
+    # Each unit's turn: the colors of the latest earlier unit on its first and its second body (-1 for none).
+    last, after = {}, []
+    for (_, _, a, b), color in zip(units, colors, strict=True):
+        after.append((last.get(a, -1) if a >= 0 else -1, last.get(b, -1) if b >= 0 and b != a else -1))
+        for dof in (dof for dof in {a, b} if dof >= 0):
+            last[dof] = int(color)
     return {
         "unit_count": len(units),
         "unit_color": np.asarray(colors, dtype=np.int64),
         "color_count": count,
         "color_offset": np.concatenate([[0], np.cumsum(sizes)]),
         "color_slot": np.asarray([units[unit] for unit in order], dtype=np.int64).reshape(-1, 4),
+        "color_after": np.asarray([after[unit] for unit in order], dtype=np.int64).reshape(-1, 2),
     }
 
 
@@ -289,6 +296,10 @@ class TestColoredSweep(unittest.TestCase):
             self.assertEqual(colors, want["color_count"])
             np.testing.assert_array_equal(host["color_offset"][slot, : colors + 1], want["color_offset"])
             np.testing.assert_array_equal(host["color_slot"][slot, :units], want["color_slot"])
+            np.testing.assert_array_equal(host["color_after"][slot, :units], want["color_after"])
+            # A unit's color is one past its bodies' latest earlier colors: its place's color.
+            place_color = np.repeat(np.arange(colors), np.diff(want["color_offset"]))
+            np.testing.assert_array_equal(host["color_after"][slot, :units].max(axis=1) + 1, place_color)
         stats = solver.sweep.colored_units.stats()
         self.assertEqual(len(stats), solver.forest.world_count)
         self.assertTrue(all(world["largest_color"] <= world["units"] for world in stats))

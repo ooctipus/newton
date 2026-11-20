@@ -2024,58 +2024,25 @@ class Pipelined:
         )
 
 
-LEVEL_TOUCH = 8
-"""Places past a level's end whose unit data :class:`Levels` asks L1 for (``TOUCH``, a line of each field): the
-colored mapping's narrow levels hold one or two units, so the line holding the place 8 ahead is asked for four to
-eight levels before a unit loads from it, a few microseconds, more than a round to DRAM."""
-
-
 @dataclasses.dataclass(frozen=True)
 class Levels:
-    """A phase's units by level (the exact law, :class:`LevelLaw`): a level at a time, its units at once, a thread a
-    unit (``place``), synchronized after each level. ``count`` is the world's levels, ``offsets(level)`` a level's first
-    place (level ``count``'s: the end), ``unit`` what a visit declares of its unit. A warp strides by ``stride``; with
-    ``chunk`` a block's warps share each level's offsets, staged ``chunk`` levels at a time (:meth:`buffers`), and
-    ``touch(place)``, where given, is the statement that asks L1 for the unit data at ``place``: the block's last thread,
-    idle at all but the widest levels, asks for the places :data:`LEVEL_TOUCH` past a level's end while its units run,
-    so the narrow levels after it load from L1."""
+    """A phase's units by level (the exact law, :class:`LevelLaw`): a level at a time, its units at once, a lane a unit
+    (``place``), synchronized after each level. ``count`` is the world's levels, ``offsets(level)`` a level's first
+    place (level ``count``'s: the end), ``unit`` what a visit declares of its unit. A warp strides by ``stride``."""
 
     count: str
     offsets: Callable[[str], str]
     unit: str = ""
     stride: int = 32
-    chunk: int = 0
-    touch: Callable[[str], str] | None = None
-
-    def buffers(self) -> tuple[Buffer, ...]:
-        return (Buffer("s_level_offset", "int", self.chunk + 1),) if self.chunk else ()
 
     def wrap(self, visit: str, pad: str) -> str:
         first, end = self.offsets("level"), self.offsets("level + 1")
-        stage, thread, stride, sync = "", "lane", self.stride, "SYNC();"
-        if self.chunk:
-            first, end, thread, stride = "s_level_offset[chunk]", "s_level_offset[chunk + 1]", "tid", "blockDim.x"
-            sync = "__syncthreads();"
-            stage = f"""    // The offsets of the next chunk of levels (the barrier after the last level freed the previous one).
-    const int chunk = level % {self.chunk};
-    if (chunk == 0) {{
-        for (int c = tid; c <= {self.chunk} && level + c <= levels; c += blockDim.x)
-            s_level_offset[c] = {self.offsets("level + c")};
-        __syncthreads();
-    }}
-"""
         unit = "\n" + indent(self.unit, "        ") if self.unit else ""
-        touch = ""
-        if self.chunk and self.touch is not None:
-            touch = (
-                f"\n{pad}    if (tid == (int)blockDim.x - 1) {{\n"
-                f"{indent(self.touch(f'level_end + {LEVEL_TOUCH}'), pad + '        ')}\n{pad}    }}"
-            )
         text = f"""const int levels = {self.count};
 for (int level = 0; level < levels; ++level) {{
-{stage}    const int level_end = {end};
-    for (int place = {first} + {thread}; place < level_end; place += {stride}) {{{unit}"""
-        return indent(text, pad) + f"\n{visit}\n{pad}    }}{touch}\n{pad}    {sync}\n{pad}}}"
+    const int level_end = {end};
+    for (int place = {first} + lane; place < level_end; place += {self.stride}) {{{unit}"""
+        return indent(text, pad) + f"\n{visit}\n{pad}    }}\n{pad}    SYNC();\n{pad}}}"
 
 
 SEQUENTIAL, EXACT, SPLIT = "sequential", "exact", "split"

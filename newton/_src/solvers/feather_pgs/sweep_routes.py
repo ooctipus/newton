@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Callable
+from textwrap import dedent
 
 import warp as wp
 
@@ -319,16 +320,26 @@ BLOCK_WARPS, WARP_LINE = 2, 64
 """The warp mapping's block where its worlds' stages fit, and its register line then (the sparse sweeps')."""
 
 COLORED_THREADS = 256
-"""Threads of a colored world's block: a color's units beyond them run in turns. The block is the world's (its staging,
-its barriers and its ``tid``), so the mapping declares it; the layer would otherwise pack worlds of 32 lanes or fewer
-into one block."""
+"""Threads of a colored world's block: a thread takes every ``COLORED_THREADS``-th unit in color order. The block is the
+world's (its staging, its barriers and its ``tid``), so the mapping declares it; the layer would otherwise pack worlds
+of 32 lanes or fewer into one block."""
 
 COLOR_SLOT = "LOAD_slots(reinterpret_cast<const int4*>(&color_slot.data[(off_unit + {}) * 4]))"
 """The colored unit at a place of its world's colors: its first row, rows and bodies (:data:`.sweep_units.UNIT_FIELDS`)."""
 
-COLORS = Levels("color_count.data[world]", lambda color: f"color_offset.data[off_color + {color}]", chunk=256)
-"""A colored world's free-body units by color (the exact level law, :mod:`.sweep_units`), a thread a unit of the block:
-256 colors' offsets staged at a time, since a world's colors are bounded by its units, not by the block."""
+RAN_SLOT = 6
+"""A colored unit's body's slot in ``s_ran``: its first coordinate over its six. Both sides of a colored unit are free
+bodies of six coordinates each, so two bodies' first coordinates lie six apart at least and their slots differ."""
+
+
+def ran_slots(dofs: int) -> int:
+    """Slots of ``s_ran`` for a world of ``dofs`` coordinates (:data:`RAN_SLOT`)."""
+    return int(dofs) // RAN_SLOT + 1
+
+
+COLOR_AFTER = "LOAD_slots(reinterpret_cast<const int2*>(&color_after.data[(off_unit + {}) * 2]))"
+"""The colored unit's turn at a place: the colors of the latest earlier unit on each of its bodies
+(:data:`.sweep_units.UNIT_FIELDS`)."""
 
 COLORED_ABI = kernel_template.params(
     *MF_GS_ABI[:-1],
@@ -336,6 +347,7 @@ COLORED_ABI = kernel_template.params(
     ("color_count", wp.array[int]),
     ("color_offset", wp.array2d[int]),
     ("color_slot", wp.array3d[int]),
+    ("color_after", wp.array3d[int]),
     ("slot_data", wp.array3d[float]),
     ("slot_words", wp.array3d[int]),
     ("v_out", wp.array[float]),
@@ -424,10 +436,21 @@ _SLOTS = Operand("slots")
 
 
 def _colored_units(free: WorldRows, laws: RowLaws, M_MF: int, units: int, record: Callable[[str], str]) -> str:
-    """A color's units, one thread each, at block stride: each loads its slot's fields at once
-    (:data:`.sweep_units.SLOT_FIELDS`, field by field across the color's ``units`` slots) and its contact's ``record``
-    (:func:`.sweep.friction_record_stage`), and runs the free-body row law, unrolled over the unit's rows, on the
-    world's staged velocity. No other unit of the color shares a body."""
+    """A sweep of the world's units in color order, each when its turn comes. The block takes the places in rounds of
+    ``blockDim.x``, a thread a place; a unit loads its slot's fields at once (:data:`.sweep_units.SLOT_FIELDS`, field by
+    field across the ``units`` slots) and its contact's ``record`` (:func:`.sweep.friction_record_stage`), then its
+    warp polls: each pass runs together the lanes whose turn came, where the latest earlier unit on each of their bodies
+    ran (:data:`COLOR_AFTER`: those units' colors, which they published in ``s_ran`` at their bodies' slots,
+    :data:`RAN_SLOT`). A unit runs the free-body row law, unrolled over its rows, on the world's staged velocity, and
+    publishes its own color on its bodies.
+
+    Every unit thus reads the velocities and impulses that the units before it in row order on its bodies left, as the
+    row-order Gauss-Seidel sweep does (its patch ring's rows are its bodies' units too), with no barrier between
+    colors: a body's units run one after another in its row order and the others at once, so a sweep takes the
+    longest chain of turns rather than a barrier and the slowest unit of every color. No unit waits forever: the
+    units a unit waits for sit at earlier places, a warp takes its rounds in order and polls until its lanes ran, so
+    the earliest unit not yet run always runs. A sweep's turns follow the last sweep's (``turn``, the sweep's index
+    times the colors), so ``s_ran`` needs no clearing between sweeps."""
     unit_rows = WorldRows(M_MF, Place.STREAMED, free=True, stream=free.stream, lanes=Lanes(1))
     torsion = laws.torsion
     layout = sweep_units.slot_layout(torsion)
@@ -524,6 +547,7 @@ const float mf_diag = __int_as_float(meta.y);"""
     )
     visit = f"""                    const int4 slot = {COLOR_SLOT.format("place")};
                     const int unit_row = slot.x, rows = slot.y, dof_a = slot.z, dof_b = slot.w;
+                    const int2 after = {COLOR_AFTER.format("place")};
                     const int slot_base = unit_slot * {fields * units} + place;
                     const int word_base = unit_slot * {words * units} + place;
                     // Every field of the slot at once, beside the slot's own load: one round of memory latency per
@@ -538,31 +562,41 @@ const float mf_diag = __int_as_float(meta.y);"""
                     // metric, then the normal's couplings with its friction rows; unread without a friction pair.
                     const float* const unit_record = {record("place")};
                     const float4 {", ".join(f"{name} = make_float4({', '.join('0.0f' if 4 * k + c == 3 else f'unit_record[{(4 * k + c) * units}]' for c in range(4))})" for k, name in enumerate(FORMED_RECORD))};
-{indent(laws_text, " " * 20)}
-{_unit_terms(" " * 20, torsion=torsion)}
-{unit}
-{_unit_apply(" " * 20, torsion=torsion)}"""
-    record_words = [(4 * k + c) * units for k in range(len(FORMED_RECORD)) for c in range(4) if 4 * k + c != 3]
-
-    def touch(place: str) -> str:
-        # Every word the unit at ``place`` loads: its slot's fields and words, its contact's record and its slot
-        # (TOUCH, the memory toolkit's, which the free bodies' walks declare).
-        fields_at = f"&slot_data.data[unit_slot * {fields * units} + ahead]"
-        words_at = f"&slot_words.data[unit_slot * {words * units} + ahead]"
-        return f"""const int ahead = {place};
-if (ahead < {units}) {{
-    const float* const touch_fields = {fields_at};
-    const int* const touch_words = {words_at};
-    const float* const touch_record = {record("ahead")};
-#pragma unroll
-    for (int f = 0; f < {fields}; ++f) TOUCH(touch_fields + f * {units});
-#pragma unroll
-    for (int f = 0; f < {words}; ++f) TOUCH(touch_words + f * {units});
-{chr(10).join(f"    TOUCH(touch_record + {offset});" for offset in record_words)}
-    TOUCH(&color_slot.data[(off_unit + ahead) * 4]);
-}}"""
-
-    return f"{ring_sum}\n{dataclasses.replace(COLORS, touch=touch).wrap(visit, ' ' * 12)}"
+{indent(laws_text, " " * 20)}"""
+    turn_text = f"""                    // Its warp's rounds: each round its units whose turn came run (the latest earlier unit on each
+                    // of their bodies ran: their colors in s_ran), together.
+                    while (__any_sync(0xffffffffu, pending)) {{
+                        if (pending) {{
+                            volatile const int* const ran = s_ran;
+                            const bool ready = (after.x < 0 || ran[dof_a / {RAN_SLOT}] == turn + after.x)
+                                && (after.y < 0 || ran[dof_b / {RAN_SLOT}] == turn + after.y);
+                            if (ready) {{
+                                __threadfence_block();
+{indent(_unit_terms("", torsion=torsion), " " * 32)}
+{indent(dedent(unit), " " * 32)}
+{indent(_unit_apply("", torsion=torsion), " " * 32)}
+                                // Its color on its bodies, after its changes: the next unit on each may run.
+                                __threadfence_block();
+                                volatile int* const done = s_ran;
+                                const int color = turn + max(after.x, after.y) + 1;
+                                if (dof_a >= 0) done[dof_a / {RAN_SLOT}] = color;
+                                if (dof_b >= 0) done[dof_b / {RAN_SLOT}] = color;
+                                pending = false;
+                            }}
+                        }}
+                    }}"""
+    return f"""{ring_sum}
+            const int colors = color_count.data[world];
+            const int units_end = color_offset.data[off_color + colors];
+            const int turn = {ITERATION} * colors;
+            for (int base = 0; base < units_end; base += blockDim.x) {{
+                // A warp's lanes take their places together (a lane past the end loads the last unit and skips it).
+                const int place = min(base + tid, units_end - 1);
+                bool pending = base + tid < units_end;
+{visit}
+{turn_text}
+            }}
+            __syncthreads();"""
 
 
 def dense_units(
@@ -1220,7 +1254,8 @@ def mf_gs_staging(
     rows = sorted((*dense.buffers(), *free.buffers()), key=lambda buffer: buffer.alternative is not Place.GLOBAL)
     levels = ()
     if colored:
-        levels = COLORS.buffers()
+        # Each body's latest unit's turn, at its first coordinate (_colored_units).
+        levels = (Buffer("s_ran", "int", ran_slots(max_world_dofs)),)
         if traces:
             levels += block_argmax(COLORED_THREADS // 32, warp="warp", lane="lane")[1]
     return Staging(
@@ -1359,8 +1394,12 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         free_phase = _colored_units(free, laws, M_MF, units, unit_metric)
         # The units' records at the block's stride, with the normal's couplings a unit moves its rows' terms by.
         listed = ("color_offset.data[off_color + color_count.data[world]]", COLOR_SLOT, units)
-        metric_build = friction_record_stage(
-            free, free_op, end="mf_contact_end", record=unit_metric, declare=sides, units=listed, pad="    "
+        # No unit ran yet (turns are at least zero), before the records' barrier.
+        metric_build = (
+            f"    for (int d = tid; d < {ran_slots(D)}; d += blockDim.x) s_ran[d] = -1;\n"
+            + friction_record_stage(
+                free, free_op, end="mf_contact_end", record=unit_metric, declare=sides, units=listed, pad="    "
+            )
         )
         trace_reduction = ""
         if solve_policy.traces:

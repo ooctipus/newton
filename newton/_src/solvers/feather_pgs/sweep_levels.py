@@ -39,7 +39,7 @@ from .row_laws import ROW_CONTACT, ROW_FRICTION, ROW_JOINT_LIMIT, ROW_JOINT_VELO
 wp.set_module_options({"enable_backward": False})
 
 
-def level_pass(*, units: str, resources: str, counts: str, store: str, lanes: int = 32) -> str:
+def level_pass(*, units: str, resources: str, counts: str, store: str, lanes: int = 32, after: bool = False) -> str:
     """Return CUDA source that levels a world's ``units`` units in row order (Cartier-Foata), by one warp, a batch of
     32 at a time.
 
@@ -54,7 +54,9 @@ def level_pass(*, units: str, resources: str, counts: str, store: str, lanes: in
     a unit that takes no level), its resources ``node_a`` and ``node_b``: compact ids into the warp's shared
     ``node_owner`` (32 at the start) and ``node_level`` (-1, or any other value no level overwrites), or -1 for
     none. ``counts`` formats an index into the units of each level so far: zero at the start for levels ``[0,
-    units]``, and the batch's counts added. ``store`` keeps a valid unit's ``level`` and ``rank``. The fragment runs on
+    units]``, and the batch's counts added. ``store`` keeps a valid unit's ``level`` and ``rank``; with ``after`` it may
+    also read ``after_a`` and ``after_b``, the levels its resources held before it (its latest earlier unit's on each,
+    -1 for none or no resource). The fragment runs on
     every lane of the warp, uses the lane group, ``lane`` and the names ``resources`` and ``store`` read, and declares
     ``levels``, the world's level count, on every lane. ``lanes`` is the group: a warp, or the CPU's one thread, a batch
     of one unit, whose words are the lane group's (``MATCH``, ``BELOW``, ``COUNT``; :data:`.device_preludes.LANE_WORDS`).
@@ -69,13 +71,19 @@ def level_pass(*, units: str, resources: str, counts: str, store: str, lanes: in
         same, below, count = "MATCH(level)", "BELOW(same)", "COUNT(same)"
     else:
         raise ValueError(f"the level pass runs a warp or one thread, got {lanes}")
+    held = (
+        "\n                    if (node_a >= 0) after_a = node_level[node_a];"
+        "\n                    if (node_b >= 0) after_b = node_level[node_b];"
+        if after
+        else ""
+    )
     return f"""        int levels = 0;
         for (int base = 0; base < {units}; base += {lanes}) {{
             const int unit = base + lane;
             bool valid = unit < {units};
 {resources}
             unsigned pending = BALLOT(valid);
-            int level = -1;
+            int level = -1{", after_a = -1, after_b = -1" if after else ""};
             while (pending != 0u) {{
                 const bool mine = ((pending >> lane) & 1u) != 0u;
                 if (mine) {{
@@ -85,7 +93,7 @@ def level_pass(*, units: str, resources: str, counts: str, store: str, lanes: in
                 SYNC();
                 const bool ready = mine && (node_a < 0 || node_owner[node_a] == lane)
                     && (node_b < 0 || node_owner[node_b] == lane);
-                if (ready) {{
+                if (ready) {{{held}
                     level = 0;
                     if (node_a >= 0) level = max(level, node_level[node_a] + 1);
                     if (node_b >= 0) level = max(level, node_level[node_b] + 1);
