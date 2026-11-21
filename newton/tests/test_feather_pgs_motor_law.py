@@ -321,18 +321,18 @@ class TestMotorLawOnCoordinateTrees(unittest.TestCase):
         forces = np.zeros(model.joint_dof_count, dtype=np.float32)
         forces[dofs[1]] = 3.0 * E
         control.joint_f.assign(forces)
+        # From rest: the branch scene draws its joints' velocities at random (up to 0.05).
         state, out = model.state(), model.state()
+        state.joint_qd.zero_()
         newton.eval_fk(model, state.joint_q, state.joint_qd, state)
-        history = []
+        history = [np.zeros(2)]
         for _ in range(120):
             solver.step(state, out, control, None, H)
             state, out = out, state
             history.append(state.joint_qd.numpy()[dofs[:2]].astype(np.float64))
         history = np.asarray(history)
-        # Each step from the solver's own state against the exact step. The leaf route's first step from rest is short
-        # of its exact step for a saturated drive whatever the bound (the effort limit alone too, about 8% here), a
-        # defect of that route's first step apart from this law; every later step is the law's.
-        for k in range(1, 120):
+        # Each step from the solver's own state against the exact step, the first from rest.
+        for k in range(1, 121):
             driven = _leaf_step(inertia[0], kd[0], E, V[0], 20.0 * V[0], history[k - 1, 0])
             pushed = _leaf_step(inertia[1], kd[1], E, V[1], 0.0, history[k - 1, 1], joint_f=3.0 * E)
             self.assertAlmostEqual(history[k, 0], driven, delta=1.0e-4 * V[0])
