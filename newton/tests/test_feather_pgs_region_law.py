@@ -112,10 +112,10 @@ def _region_terms(
 class Bodies:
     """Synthetic free bodies with their regions: the kernel's stream and the reference's regions."""
 
-    def __init__(self, count: int, compliance: int, seed: int, light: bool = False):
+    def __init__(self, count: int, compliance: int, seed: int, light: bool = False, spread: tuple = (1, 9)):
         """``light``: parts of 5 to 50 g with gyration radii of 2 to 6 mm and their regions' candidates within a
         patch of 0.1 to 0.6 mm (a screw or a nut on a hardware pile), where the region's tilt response is 1e4 to
-        1e6 times its normal one."""
+        1e6 times its normal one. ``spread``: a body's regions, drawn from ``[lo, hi)``."""
         rng = np.random.default_rng(seed)
         self.count = count
         self.spans, self.frames, self.arms, self.cands, self.cand_spans = [], [], [], [], []
@@ -136,7 +136,7 @@ class Bodies:
             predicted = np.concatenate([rng.normal(size=3) * 0.02 + [0.0, 0.0, -0.0125], rng.normal(size=3) * 0.2])
             if light:
                 predicted = np.concatenate([rng.normal(size=3) * 0.3 + [0.0, 0.0, -1.0], rng.normal(size=3) * 30.0])
-            for _ in range(rng.integers(1, 9)):
+            for _ in range(rng.integers(*spread)):
                 n = rng.normal(size=3)
                 n[2] = abs(n[2]) + 0.5
                 n /= np.linalg.norm(n)
@@ -176,9 +176,9 @@ class Bodies:
             self.spans.append([first, len(self.frames)])
             self.regions.append(regions)
 
-    def sweep(self, sweeps: int, device) -> tuple[np.ndarray, np.ndarray]:
+    def sweep(self, sweeps: int, device, warp: bool = False) -> tuple[np.ndarray, np.ndarray]:
         """The kernel's sweeps from rest: each body's change in the reference's coordinates, and the candidates'
-        impulses."""
+        impulses. ``warp``: every body listed as one whose regions outnumber a warp's lanes (a warp a body on CUDA)."""
 
         def array(values, dtype):
             kind = np.int32 if dtype in (int, wp.vec2i, wp.vec3i) else np.float32
@@ -204,12 +204,13 @@ class Bodies:
         cands, cand_spans = array(self.cands, wp.vec4), array(self.cand_spans, wp.vec2i)
         bound = wp.zeros(regions, dtype=wp.vec2, device=device)
         wp.launch(_region_bound, dim=regions, inputs=[cands, cand_spans], outputs=[bound], device=device)
+        threads = bodies * (int(region_sweep.CLOSED_WARP) if warp and device.is_cuda else 1)
         wp.launch(
             region_sweep.sweep_closed_bodies,
-            dim=bodies,
+            dim=threads,
             inputs=[
-                bodies,
-                array([0, 0, bodies, 0], int),
+                threads,
+                array([0, 0, 0, 0, bodies] if warp else [0, 0, bodies, 0, 0], int),
                 array(np.arange(bodies), int),
                 array(self.spans, wp.vec2i),
                 inertia,
@@ -238,6 +239,7 @@ class Bodies:
                 impulses,
                 change,
             ],
+            block_dim=32,
             device=device,
         )
         return change.numpy().reshape(bodies, 6).astype(np.float64), impulses.numpy().astype(np.float64)
@@ -283,6 +285,19 @@ class TestRegionLaw(unittest.TestCase):
         difference of nearly equal Gram entries, and float32 read 5e-4 m/s off the reference here (on hardware's
         pile, a near-dependent third row entered and threw a 13 g part to 200 m/s)."""
         self.check(RIGID, 300, 2.0e-6, 1.0e-4, light=True)
+
+    def test_a_warp_a_body_sweeps_as_a_thread_does(self):
+        """Bodies of 33 to 70 regions, each swept by a warp (its scan a warp's width of regions at once, every lane
+        visiting the first live one alike) and by a thread: every impulse and change bit for bit, on each device."""
+        problem = Bodies(24, MIXED, seed=5, spread=(33, 71))
+        devices = [wp.get_device("cpu")] + ([wp.get_device("cuda:0")] if wp.is_cuda_available() else [])
+        for device in devices:
+            with self.subTest(device=str(device)):
+                change, impulses = problem.sweep(self.SWEEPS, device)
+                change_w, impulses_w = problem.sweep(self.SWEEPS, device, warp=True)
+                np.testing.assert_array_equal(change_w, change)
+                np.testing.assert_array_equal(impulses_w, impulses)
+                self.assertGreater(float(np.abs(impulses).sum()), 0.0)
 
     def test_the_closing_bound_passes_only_regions_that_do_not_close(self):
         """A region the closing bound passes is one whose candidates' test finds none closing (the bound is exact),

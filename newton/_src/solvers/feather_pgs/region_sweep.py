@@ -115,6 +115,9 @@ of 112 or less spills on the PRO (104: 289 us)."""
 _FILL_SHAPE = shape(
     Work(0, lanes=int(_FILL_LANES), block=128, registers=FILL_LINE), memory.built_for(memory.REFERENCE_ARCH)
 )
+CLOSED_WARP = wp.constant(32)
+"""A closed body whose regions outnumber a warp's lanes takes a warp (:func:`sweep_closed_bodies`): its scan tests a
+warp's width of regions at once. The rest take a thread each."""
 _CLOSED_SHAPE_WORK = Work(0, lanes=1, block=32, registers=VISIT_LINE, persistent=True)
 _CLOSED_SHAPE = shape(_CLOSED_SHAPE_WORK, memory.built_for(memory.REFERENCE_ARCH))
 """The closed bodies' sweeps' launch (:func:`sweep_closed_bodies`): at the visit's register line
@@ -248,6 +251,8 @@ def publish_region(
 def closed_body(
     lane: int,
     b: int,
+    member: int,
+    group: int,
     body_regions: wp.array[wp.vec2i],
     body_inertia: wp.array2d[wp.mat33],
     body_basis: wp.array2d[wp.spatial_vector],
@@ -281,7 +286,9 @@ def closed_body(
     impulses: wp.array[float],
     lane_change: wp.array[wp.spatial_vector],
 ):
-    """Lane ``lane``'s sweeps of the closed free body ``b`` (:func:`sweep_closed_bodies`)."""
+    """The sweeps of the closed free body ``b``, list place ``lane`` (:func:`sweep_closed_bodies`), by a group of
+    ``group`` threads, this one its ``member``: the group scans ``group`` regions at once and every thread visits the
+    first live one alike; its first thread stores."""
     span = body_regions[b]
     r0 = span[0]
     r1 = span[1]
@@ -302,39 +309,46 @@ def closed_body(
             limit = quiet_at
         g = r0
         while g < limit:
-            # Scan: the first live region from g on. A step's reads are issued together (none waits on another).
+            # Scan: the first live region from g on, the group's regions g, g + 1, ... tested at once at the twist (a
+            # test reads the twist and its region only, so each finds what the scan in order would). A step's reads
+            # are issued together (none waits on another).
             found = int(_BIG)
             while g < limit and found == _BIG:
-                state = reg_state[g]
-                frame = reg_frame[g]
-                arm = reg_arm[g]
-                kind = reg_kind[g]
-                span_c = reg_cand[g]
-                bound = reg_bound[g]
+                at_g = g + member
                 live = int(0)
-                if state != version:
-                    if state >= REGION_LOOSE:
-                        live = 1
-                    else:
-                        # A region that holds nothing is opened only if a candidate closes at the body's twist; its
-                        # closing bound passes it without the candidates' reads where none can (stays_open, exact).
-                        at = v + wp.cross(w, arm)
-                        sn = wp.vec3(wp.dot(frame[0], at), wp.dot(frame[1], w), wp.dot(frame[2], w))
-                        if (kind & KIND_SECOND) != 0:
-                            sn = -sn
-                        if not stays_open(sn, bound):
-                            if region_closes(sn, cand, cand_floor, span_c[0], span_c[1]):
-                                live = 1
-                if live == 1:
-                    found = g
+                if at_g < limit:
+                    state = reg_state[at_g]
+                    frame = reg_frame[at_g]
+                    arm = reg_arm[at_g]
+                    kind = reg_kind[at_g]
+                    span_c = reg_cand[at_g]
+                    bound = reg_bound[at_g]
+                    if state != version:
+                        if state >= REGION_LOOSE:
+                            live = 1
+                        else:
+                            # A region that holds nothing is opened only if a candidate closes at the body's twist;
+                            # its closing bound passes it without the candidates' reads where none can (stays_open,
+                            # exact).
+                            at = v + wp.cross(w, arm)
+                            sn = wp.vec3(wp.dot(frame[0], at), wp.dot(frame[1], w), wp.dot(frame[2], w))
+                            if (kind & KIND_SECOND) != 0:
+                                sn = -sn
+                            if not stays_open(sn, bound):
+                                if region_closes(sn, cand, cand_floor, span_c[0], span_c[1]):
+                                    live = 1
+                votes = lane_ballot(live != 0, group)
+                if votes != wp.uint32(0):
+                    found = g + lane_first(votes, group)
                 else:
-                    g += 1
+                    g += group
             if found == _BIG:
                 if limit < r1:
                     done = 1
                 break
-            # Solve: every lane of the warp that found a live region is here together. The region's terms and the
-            # body's inertia are read where they are used (region_laws.reread), not held across the visit.
+            # Solve: every thread of the group, and every lane of the warp that found a live region, is here
+            # together. The region's terms and the body's inertia are read where they are used
+            # (region_laws.reread), not held across the visit.
             g = found + 1
             frame = reg_frame[found]
             arm = reg_arm[found]
@@ -394,28 +408,32 @@ def closed_body(
             w_new = wp.transpose(Avw) * force + body_inertia[body, 2] * torque
             set_new = wp.vec3i(i0, i1, i2)
             span_c = reg_cand[again]
-            publish_region(
-                cand,
-                cand_row,
-                span_c[0],
-                span_c[1],
-                velocity,
-                reg_set[again],
-                set_new,
-                multipliers,
-                (kind & KIND_SPRINGS) != 0,
-                impulses,
-            )
-            row = reg_row[found]
-            if row >= 0:
-                impulses[row] = phi[0]
-                impulses[row + 1] = phi[1]
-                if (kind & FRICTION_ROWS) == 3:
-                    impulses[row + 2] = phi[2]
-            reg_wrench[found] = wrench
-            reg_phi[found] = phi
-            reg_set[found] = set_new
-            reg_spring[found] = spring
+            set_held = reg_set[again]
+            # The group's threads read alike and computed the same bits; its first stores them, after every read.
+            lane_sync(group)
+            if member == 0:
+                publish_region(
+                    cand,
+                    cand_row,
+                    span_c[0],
+                    span_c[1],
+                    velocity,
+                    set_held,
+                    set_new,
+                    multipliers,
+                    (kind & KIND_SPRINGS) != 0,
+                    impulses,
+                )
+                row = reg_row[found]
+                if row >= 0:
+                    impulses[row] = phi[0]
+                    impulses[row + 1] = phi[1]
+                    if (kind & FRICTION_ROWS) == 3:
+                        impulses[row + 2] = phi[2]
+                reg_wrench[found] = wrench
+                reg_phi[found] = phi
+                reg_set[found] = set_new
+                reg_spring[found] = spring
             if twist_differs(v_new, w_new, v, w):
                 version += 1
                 quiet_at = found
@@ -423,28 +441,32 @@ def closed_body(
                 limit = r1
             v = v_new
             w = w_new
+            state = int(REGION_IDLE)
             if outcome == REGION_SLIDE:
-                reg_state[found] = REGION_LOOSE
+                state = REGION_LOOSE
                 sliding = 1
                 quiet_at = r1
                 quiet_sweep = sweep
                 limit = r1
             elif wrench[0] > 0.0:
-                reg_state[found] = version
-            else:
-                reg_state[found] = REGION_IDLE
+                state = version
+            if member == 0:
+                reg_state[found] = state
+            # The stores are seen by the group's next scan.
+            lane_sync(group)
         if done == 1 or (version == version_before and sliding == 0):
             break
     # The body's change in walk coordinates: its wrench through its basis.
-    change = (
-        body_basis[b, 0] * force[0]
-        + body_basis[b, 1] * force[1]
-        + body_basis[b, 2] * force[2]
-        + body_basis[b, 3] * torque[0]
-        + body_basis[b, 4] * torque[1]
-        + body_basis[b, 5] * torque[2]
-    )
-    lane_change[lane] = change
+    if member == 0:
+        change = (
+            body_basis[b, 0] * force[0]
+            + body_basis[b, 1] * force[1]
+            + body_basis[b, 2] * force[2]
+            + body_basis[b, 3] * torque[0]
+            + body_basis[b, 4] * torque[1]
+            + body_basis[b, 5] * torque[2]
+        )
+        lane_change[lane] = change
 
 
 @wp.kernel(enable_backward=False, launch_bounds=_CLOSED_SHAPE.bounds, module="unique")
@@ -485,21 +507,34 @@ def sweep_closed_bodies(
     impulses: wp.array[float],
     lane_change: wp.array[wp.spatial_vector],
 ):
-    """The closed bodies' sweeps (the module's statement): thread ``tid`` takes the lanes ``tid``, ``tid + stride``, ...
-    of the list (their count ``cursor[2]``), lane ``k`` the free body ``lanes[k]``, whose regions are ``body_regions``
-    of the region stream (``reg_*``, their candidates ``cand``).
+    """The closed bodies' sweeps (the module's statement) over the list ``lanes``: the bodies whose regions outnumber
+    a warp's lanes (:data:`CLOSED_WARP`; ``cursor[4]`` of them, listed from the list's end) a warp each, then the others
+    (``cursor[2]``, from its start) a thread each, at the grid's ``stride``; place ``k`` holds the free body
+    ``lanes[k]``, whose regions are ``body_regions`` of the region stream (``reg_*``, their candidates ``cand``). A
+    warp scans its body's regions a warp's width at a time (on the CPU, where a thread runs a group, one at a time).
 
     A region's frame is ``reg_frame`` (rows ``n``, ``t0``, ``t1``) at ``reg_arm`` from the body's origin; its law
     ``reg_law`` (``mu``, ``mu_t``) and its friction rows' right-hand sides ``reg_bf``; its
     kind ``reg_kind`` (:data:`FRICTION_ROWS`, :data:`KIND_SPRINGS`, :data:`KIND_SECOND`); ``reg_row`` its friction
-    rows' first impulse row (-1: none) and ``cand_row`` each candidate's. The lane writes the regions' state, their
-    impulses, and the body's change in walk coordinates (``lane_change[k]``, through the body's basis), which
+    rows' first impulse row (-1: none) and ``cand_row`` each candidate's. The body writes the regions' state, their
+    impulses, and its change in walk coordinates (``lane_change[k]``, through the body's basis), which
     :func:`add_closed_changes` adds to the walk's ``du`` once the other sweeps are done."""
-    lane = wp.tid()
-    while lane < cursor[2]:
+    width = lane_stride(CLOSED_WARP)
+    heavy = cursor[4]
+    item = wp.tid()
+    while item < width * heavy + cursor[2]:
+        lane = item - width * heavy
+        member = int(0)
+        group = int(1)
+        if lane < 0:
+            lane = lanes.shape[0] - 1 - item / width
+            member = item % width
+            group = width
         closed_body(
             lane,
             lanes[lane],
+            member,
+            group,
             body_regions,
             body_inertia,
             body_basis,
@@ -533,7 +568,7 @@ def sweep_closed_bodies(
             impulses,
             lane_change,
         )
-        lane += stride
+        item += stride
 
 
 @wp.kernel(enable_backward=False, module="unique")
@@ -545,13 +580,17 @@ def add_closed_changes(
     du: wp.array[float],
 ):
     """The closed bodies' changes (:func:`sweep_closed_bodies`'s ``lane_change``) into the walk's ``du``, a thread a
-    lane. The other sweeps add zero at a closed body's coordinates (a world's sweep adds its whole span), so the sum
-    is the change itself in either order."""
+    listed body (``cursor[2]`` from the list's start, ``cursor[4]`` from its end). The other sweeps add zero at a closed
+    body's coordinates (a world's sweep adds its whole span), so the sum is the change itself in either order."""
     tid = wp.tid()
-    if tid >= cursor[2]:
+    light = cursor[2]
+    if tid >= light + cursor[4]:
         return
-    change = lane_change[tid]
-    dof = body_dof[lanes[tid]]
+    lane = tid
+    if tid >= light:
+        lane = lanes.shape[0] - 1 - (tid - light)
+    change = lane_change[lane]
+    dof = body_dof[lanes[lane]]
     for k in range(6):
         du[dof + k] += change[k]
 
@@ -725,7 +764,7 @@ def clear_layout(
     if relist[0] == 0:
         return
     f = wp.tid()
-    if f < 4:
+    if f < 5:
         cursor[f] = 0
     if f == 0:
         blk_words[0] = 0
@@ -797,7 +836,9 @@ def place_bodies(
 
     A free body is *open* when a dense row (``body_touch``, :func:`check_bodies`) or a region between
     two movable bodies (``body_pair``, :func:`mark_regions`) touches it, else *closed*. The stream holds the world's
-    closed bodies' regions body by body, each such body a lane of ``lanes`` (counted in ``cursor[2]``), then its open
+    closed bodies' regions body by body, each such body a place of ``lanes`` (from the list's start, counted in
+    ``cursor[2]``; one whose regions outnumber a warp's lanes, :data:`CLOSED_WARP`, from its end, in ``cursor[4]``), then
+    its open
     bodies' (``world_regions``): each body takes its regions' places (``body_regions``) and its candidates' first
     (``body_cand``). The places are taken from ``cursor`` as worlds arrive: they decide no result. A world whose
     regions do not fit the stream (``capacity``: the contact pool's ready rows) lists none and sets ``cursor[3]``."""
@@ -827,7 +868,10 @@ def place_bodies(
         if body_open[f] == 0 and count > 0:
             body_regions[f] = wp.vec2i(region_at, region_at + count)
             body_cand[f] = candidate_at
-            lanes[wp.atomic_add(cursor, 2, 1)] = f
+            if count > CLOSED_WARP:
+                lanes[lanes.shape[0] - 1 - wp.atomic_add(cursor, 4, 1)] = f
+            else:
+                lanes[wp.atomic_add(cursor, 2, 1)] = f
             region_at += count
             candidate_at += body_count[f, 1]
     first = region_at
@@ -2097,7 +2141,7 @@ class Regions:
         self.body_pair = wp.zeros(count, dtype=wp.int32, device=device)
         self.lanes = wp.zeros(count, dtype=wp.int32, device=device)
         self.lane_change = wp.zeros(count, dtype=wp.spatial_vector, device=device)
-        self.cursor = wp.zeros(4, dtype=wp.int32, device=device)
+        self.cursor = wp.zeros(5, dtype=wp.int32, device=device)
         # Whether a step lists its regions anew ([0]) and whether the last listing fit the stream ([1]: none yet).
         self.relist = wp.array([1, 0], dtype=wp.int32, device=device)
         self.no_hold = wp.zeros(1, dtype=wp.int32, device=device)
@@ -2304,7 +2348,7 @@ class Regions:
         )
         wp.launch(
             clear_layout,
-            dim=max(self.count, 4),
+            dim=max(self.count, 5),
             inputs=[self.relist],
             outputs=[self.cursor, self.blk_words, self.body_count, self.body_regions, self.body_pair],
             device=device,
@@ -2535,8 +2579,10 @@ class Regions:
             return
         impulses = self.placement.impulses
         device = self.model.device
-        # A grid over the list (cursor[2] lanes), at most the bodies' warps the multiprocessors keep at the line.
-        closed = shape(dataclasses.replace(_CLOSED_SHAPE_WORK, items=self.count), memory.device(device))
+        # A grid over the list (a warp a body at most), at most the warps the multiprocessors keep at the line.
+        closed = shape(
+            dataclasses.replace(_CLOSED_SHAPE_WORK, items=self.count * int(CLOSED_WARP)), memory.device(device)
+        )
         threads = closed.grid * closed.block
         wp.launch(
             sweep_closed_bodies,
