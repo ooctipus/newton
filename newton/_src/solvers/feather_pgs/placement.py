@@ -491,7 +491,16 @@ class Placement:
         ]
         # The row order's records (row_slots.RowOrder).
         contact_fields += [ContactField(name, wp.vec4i) for name in ("contact_rows_frame", "contact_rows_before")]
-        contact_fields += [ContactField(name, wp.int32) for name in ("contact_pairs_before", "contact_pairs")]
+        contact_fields += [
+            ContactField(name, wp.int32)
+            for name in (
+                "contact_pairs_before",
+                "contact_pairs",
+                "contact_pair_island",
+                "contact_pair_rank",
+                "contact_row_pairs",
+            )
+        ]
         # Row builders always receive a zero phi view when patch friction is off.
         contact_fields.append(ContactField("friction_patch_phi", wp.vec2))
         # The warm start's carry by contact identity (:data:`.warm_start.ContactCarry`).
@@ -508,6 +517,11 @@ class Placement:
             or bool(np.any(body_to_articulation.numpy() < 0))
         )
         self.laws.allocate(model, self.contact_pool, self.friction_patch_phi, region_normals=region_normals)
+        # The row order's islands, by articulation (row_slots.RowOrder): each world's reservation writes its own trees'.
+        trees = max(int(self.forest.articulation_response_dof_count.shape[0]), 1)
+        self.island_parent = wp.zeros(trees, dtype=wp.int32, device=device)
+        self.island_size = wp.zeros(trees, dtype=wp.int32, device=device)
+        self.island_base = wp.zeros(trees, dtype=wp.int32, device=device)
         # Allocated once here: per-step allocation is forbidden under CUDA graph capture.
         arrays.allocate(WORLD_ROW_STATE, world=self.forest.world_count)
         arrays.allocate(WORLD_CONTACTS, world=self.forest.world_count)
@@ -538,8 +552,10 @@ class Placement:
         order.pair_keys = pair_keys
         order.world_contact_first = self.world_contact_first
         order.world_contact_last = self.world_contact_last
-        for name in ("rows_frame", "pairs_before", "pairs", "rows_before"):
+        for name in ("rows_frame", "pairs_before", "pairs", "pair_island", "pair_rank", "row_pairs", "rows_before"):
             setattr(order, name, getattr(self, f"contact_{name}"))
+        for name in ("island_parent", "island_size", "island_base"):
+            setattr(order, name, getattr(self, name))
         return order
 
     def _on_contact_rows(self, rows) -> None:

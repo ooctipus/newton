@@ -46,6 +46,7 @@ from collections.abc import Callable
 import numpy as np
 import warp as wp
 
+from ..core import union_find
 from ..sim.shape_contact_pairs import _shape_contact_pairs_host
 from .terrain_law import (
     TERRAIN_FINE_CELLS,
@@ -198,51 +199,6 @@ def _flat_edge(grid: _Grid, triangle: int, far: int) -> bool:
     return wp.float64(deviation) <= wp.float64(_FLAT_EPS)
 
 
-@wp.func
-def _find(parent: wp.array[wp.int32], x: int) -> int:
-    """Root of ``x``'s tree as the union pass sees it, halving the path on the way (union pass only)."""
-    while True:
-        p = parent[x]
-        if p == x:
-            return x
-        grand = parent[p]
-        if grand != p:
-            # Path halving stores into other triangles' slots. In the union pass that is safe: a node only ever
-            # points further up its own tree (a store computed from an older parent still points at an ancestor),
-            # and nothing reads a parent as final there. A pass that stores final parents must not halve.
-            parent[x] = grand
-        x = grand
-
-
-@wp.func
-def _root(parent: wp.array[wp.int32], x: int) -> int:
-    """Root of ``x``'s tree, by loads alone: parents only point to lower ids, so the walk ends at the root."""
-    p = parent[x]
-    while p != x:
-        x = p
-        p = parent[x]
-    return x
-
-
-@wp.func
-def _union(parent: wp.array[wp.int32], a: int, b: int):
-    ra = _find(parent, a)
-    rb = _find(parent, b)
-    while ra != rb:
-        lo = wp.min(ra, rb)
-        hi = wp.max(ra, rb)
-        # Hook the higher root under the lower one: every root is its component's lowest id.
-        old = wp.atomic_cas(parent, hi, hi, lo)
-        if old == hi:
-            return
-        # Another thread hooked hi first. Continue from its parent as the atomic returned it (lower than hi, so the
-        # loop ends) rather than from a plain reread, which a non-coherent cache may serve stale on CUDA.
-        if ra == hi:
-            ra = old
-        else:
-            rb = old
-
-
 @wp.kernel(enable_backward=False)
 def _cluster_init(active: wp.array[wp.int32], label: wp.array[wp.int32]):
     t = wp.tid()
@@ -268,19 +224,19 @@ def _cluster_union(grid: _Grid, active: wp.array[wp.int32], parent: wp.array[wp.
     # Diagonal: sub 0 against the far vertex p01 of sub 1.
     if active[t0] != 0 and active[t1] != 0:
         if _flat_edge(grid, t0, v00 + grid.ncol):
-            _union(parent, t0, t1)
+            union_find.union(parent, t0, t1)
     # x-edge (r, c)-(r, c + 1): sub 0 against p00 of the cell below.
     if r > 0:
         below = t1 - 2 * cols
         if active[t0] != 0 and active[below] != 0:
             if _flat_edge(grid, t0, v00 - grid.ncol):
-                _union(parent, t0, below)
+                union_find.union(parent, t0, below)
     # y-edge (r, c)-(r + 1, c): sub 1 against p00 of the cell to the left.
     if c > 0:
         left = t0 - 2
         if active[t1] != 0 and active[left] != 0:
             if _flat_edge(grid, t1, v00 - 1):
-                _union(parent, t1, left)
+                union_find.union(parent, t1, left)
 
 
 @wp.kernel(enable_backward=False)
@@ -294,7 +250,7 @@ def _cluster_compress(active: wp.array[wp.int32], parent: wp.array[wp.int32]):
     """
     t = wp.tid()
     if active[t] != 0:
-        parent[t] = _root(parent, t)
+        parent[t] = union_find.root(parent, t)
 
 
 @wp.kernel(enable_backward=False)

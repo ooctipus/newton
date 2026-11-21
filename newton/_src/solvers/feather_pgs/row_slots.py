@@ -6,6 +6,7 @@ world's rows under sorted contacts, and the counts with their capacity status.""
 
 import warp as wp
 
+from ...core import union_find
 from ...sim import BodyFlags
 from .contact_filters import contact_normal_gap_limit
 from .contact_input import ContactInput
@@ -22,6 +23,7 @@ from .device_preludes import (
     lane_below,
     lane_count,
     lane_index,
+    lane_read,
     lane_scan,
     lane_stride,
     lane_sum,
@@ -37,7 +39,7 @@ from .row_laws import (
     contact_rhs,
     separates,
 )
-from .row_records import UNIT_CONTACT, unit_source
+from .row_records import UNIT_CONTACT, row_sides, unit_source
 
 # FeatherPGS takes no gradients: its kernels compile no adjoints.
 wp.set_module_options({"enable_backward": False})
@@ -265,6 +267,9 @@ def _admit_world_contact(
     )
     if data.acts.shape[0] > 0:
         data.acts[c] = wp.where(admitted and not separating, 1, 0)
+    # Its articulations, admitted or not: its body pair's trees join the world's islands (reserve_world_rows).
+    data.art0[c] = art_a
+    data.art1[c] = art_b
     if not admitted:
         # Its world still names the run of frame positions it lies in (_heads_pair).
         data.world[c] = world
@@ -290,8 +295,6 @@ def _admit_world_contact(
         slots_needed = 3 + patch_spin_rows(friction_patches, c, data.spin)
     data.slots_needed[c] = slots_needed
     data.world[c] = world
-    data.art0[c] = art_a
-    data.art1[c] = art_b
     data.path[c] = is_mf
     return world
 
@@ -389,8 +392,11 @@ class RowOrder:
     positions: each position's body-pair key; the world's span of positions (``world_contact_first``,
     ``world_contact_last``, which the admission records); at each of its contacts the admitted contacts' rows of the
     four lists before it in the world's frame order (``rows_frame``) and its body pair's index among the world's
-    (``pairs_before``); its ``j``-th pair's head at ``first + j`` (``pairs``); and at each pair's head the rows of each
-    list of the pairs before it in the row order (``rows_before``)."""
+    (``pairs_before``); its ``j``-th pair's head at ``first + j`` (``pairs``), the pair's island and its rank there
+    (``pair_island``, ``pair_rank``), and the index of the pair the row order visits ``q``-th at ``first + q``
+    (``row_pairs``); at each pair's head the rows of each list of the pairs before it in the row order
+    (``rows_before``); and by articulation, the islands' union-find parents, sizes and first places in the row order
+    (``island_parent``, ``island_size``, ``island_base``)."""
 
     pair_keys: wp.array[wp.int64]
     world_contact_first: wp.array[int]
@@ -398,7 +404,13 @@ class RowOrder:
     rows_frame: wp.array[wp.vec4i]
     pairs_before: wp.array[int]
     pairs: wp.array[int]
+    pair_island: wp.array[int]
+    pair_rank: wp.array[int]
+    row_pairs: wp.array[int]
     rows_before: wp.array[wp.vec4i]
+    island_parent: wp.array[wp.int32]
+    island_size: wp.array[int]
+    island_base: wp.array[int]
 
 
 @wp.func
@@ -441,7 +453,7 @@ def _lane_sum4(value: wp.vec4i) -> wp.vec4i:
 
 @wp.func
 def _row_stride(n: int) -> int:
-    """The stride of a world's row order over its ``n`` body pairs: the golden ratio's share of ``n`` (``n`` times
+    """The stride of an island's row order over its ``n`` body pairs: the golden ratio's share of ``n`` (``n`` times
     ``2**32 / phi``, 2654435769, over ``2**32``, in integers), raised to the first value coprime with ``n``, so
     ``j -> j * stride mod n`` visits every pair once."""
     stride = wp.max(int((wp.int64(n) * wp.int64(2654435769)) >> wp.int64(32)), 1)
@@ -456,6 +468,128 @@ def _row_stride(n: int) -> int:
             break
         stride += 1
     return stride
+
+
+@wp.func
+def _row_inverse(n: int) -> int:
+    """The place of rank 1 in an island's row order over its ``n`` pairs: the inverse of :func:`_row_stride` modulo
+    ``n`` (extended Euclid), so the pair of rank ``j`` takes place ``j * inverse mod n`` and place ``q`` holds rank
+    ``q * stride mod n``."""
+    t = wp.int64(0)
+    t_next = wp.int64(1)
+    r = wp.int64(n)
+    r_next = wp.int64(_row_stride(n))
+    while r_next != wp.int64(0):
+        q = r // r_next
+        t_new = t - q * t_next
+        t = t_next
+        t_next = t_new
+        r_new = r - q * r_next
+        r = r_next
+        r_next = r_new
+    if t < wp.int64(0):
+        t += wp.int64(n)
+    return int(t)
+
+
+@wp.func
+def _pair_side(data: ContactInput, order: RowOrder, first: int, j: int) -> int:
+    """The lowest tree with response coordinates the world's ``j``-th body pair touches (:func:`.row_records.row_sides`;
+    -1 for none)."""
+    head = order.pairs[first + j]
+    return row_sides(data.art0[head], data.art1[head], data.response_dofs)[0]
+
+
+@wp.func
+def _order_islands(data: ContactInput, order: RowOrder, first: int, pairs: int, lanes: int, lane: int):
+    """The world's row order over its ``pairs`` body pairs (``order.pairs`` from ``first``), by its group's ``lanes``:
+    ``order.row_pairs[first + q]`` the index of the pair the order visits ``q``-th.
+
+    An island is a component of the world's pairs joined by the trees they touch (:func:`.row_records.row_sides`, the
+    sweeps' resources), labelled by its lowest tree (:mod:`~newton._src.core.union_find`). The islands take the row
+    order in the frame order of their first pairs, each a run of its own pairs at a golden-ratio stride over their
+    ranks in frame order (:func:`_row_stride` of its own count). A pair that touches no tree with coordinates holds no
+    rows: those follow the islands, in frame order. Every place depends only on the pair's island, so a pair of another
+    island never moves it; the islands' places among each other are free (they share no tree). A world that is one
+    island takes the order of a stride over all its pairs."""
+    parent = order.island_parent
+    size = order.island_size
+    # Each tree a singleton.
+    for j in range(lane, pairs, lanes):
+        head = order.pairs[first + j]
+        sides = row_sides(data.art0[head], data.art1[head], data.response_dofs)
+        for k in range(2):
+            if sides[k] >= 0:
+                parent[sides[k]] = sides[k]
+                size[sides[k]] = 0
+    lane_sync(RESERVE_LANES)
+    # Each pair joins its trees.
+    for j in range(lane, pairs, lanes):
+        head = order.pairs[first + j]
+        sides = row_sides(data.art0[head], data.art1[head], data.response_dofs)
+        if sides[1] >= 0:
+            union_find.union(parent, sides[0], sides[1])
+    lane_sync(RESERVE_LANES)
+    # Each pair's island and its rank there in frame order, a batch of the group's lanes at a time; each island's size.
+    for base in range(0, pairs, lanes):
+        j = base + lane
+        island = int(-2)
+        if j < pairs:
+            island = _pair_side(data, order, first, j)
+            if island >= 0:
+                island = union_find.root_now(parent, island)
+        before = int(0)
+        after = int(0)
+        for k in range(lanes):
+            other = lane_read(island, k, RESERVE_LANES)
+            if other == island:
+                if k < lane:
+                    before += 1
+                elif k > lane:
+                    after += 1
+        held = int(0)
+        if island >= 0:
+            held = size[island]
+        lane_sync(RESERVE_LANES)
+        if j < pairs:
+            order.pair_island[first + j] = island
+            order.pair_rank[first + j] = held + before
+            if island >= 0 and after == 0:
+                size[island] = held + before + 1
+        lane_sync(RESERVE_LANES)
+    # Each island's first place, in the frame order of its first pair; the pairs without rows after them.
+    placed = int(0)
+    loose = int(0)
+    for base in range(0, pairs, lanes):
+        j = base + lane
+        island = int(-2)
+        rank = int(0)
+        if j < pairs:
+            island = order.pair_island[first + j]
+            rank = order.pair_rank[first + j]
+        span = int(0)
+        if island >= 0 and rank == 0:
+            span = size[island]
+        lone = wp.where(j < pairs and island < 0, 1, 0)
+        start = placed + lane_scan(span, RESERVE_LANES)
+        lone_rank = loose + lane_scan(lone, RESERVE_LANES)
+        if span > 0:
+            order.island_base[island] = start
+        if lone != 0:
+            order.pair_rank[first + j] = lone_rank
+        placed += lane_sum(span, RESERVE_LANES)
+        loose += lane_sum(lone, RESERVE_LANES)
+    lane_sync(RESERVE_LANES)
+    # Each pair's place.
+    for j in range(lane, pairs, lanes):
+        island = order.pair_island[first + j]
+        rank = order.pair_rank[first + j]
+        q = placed + rank
+        if island >= 0:
+            m = size[island]
+            q = order.island_base[island] + int((wp.int64(rank) * wp.int64(_row_inverse(m))) % wp.int64(m))
+        order.row_pairs[first + q] = j
+    lane_sync(RESERVE_LANES)
 
 
 @wp.kernel(enable_backward=False, module="unique")
@@ -486,15 +620,21 @@ def reserve_world_rows(
 
     A world's contacts lie in one run of the frame's positions (``order.world_contact_first`` to
     ``order.world_contact_last``, which the admission recorded; a contact of no world may lie between them). The
-    lanes take it in three passes. In the frame's order, each contact's rows of the four lists before it and its body
+    lanes take it in four passes. In the frame's order, each contact's rows of the four lists before it and its body
     pair (a pair heads at the run's first position or at a change of the frame's pair key, admitted or not: a pair's
-    contacts share their bodies, so they respond alike), each pair's head. In the row order, the world's ``m`` body
-    pairs at a golden-ratio stride over their indices (:func:`_row_stride`; each pair's contacts together in frame
-    order), each pair's rows before it: a sorted frame lays a body's pairs side by side, and their rows in that order
-    chain through shared bodies into a deep trace for the colored sweeps, while a pair's own contacts, which share both
-    bodies, chain whatever their order and converge best together. It reads only the frame's keys and the bodies'
-    response, so a contact's admission moves no other's rows, and nor does a contact that can never take rows. Then each
-    contact's slot.
+    contacts share their bodies, so they respond alike), each pair's head. Then the world's islands
+    (:func:`_order_islands`): its pairs joined by the trees they touch, each island's pairs at a golden-ratio stride
+    over their own ranks. In that row order, each pair's rows before it (each pair's contacts together in frame order).
+    Then each contact's slot.
+
+    The row order is the Gauss-Seidel order, so a body's rows must not move with rows it does not share an island
+    with: two bodies that never touch must not change each other's motion. An island's order is a function of its own
+    pairs' keys alone, and pairs of different islands share no tree, so whatever else the world holds leaves every
+    island's sweep as it was. Within an island the stride spreads the pairs: a sorted frame lays a body's pairs side
+    by side, and their rows in that order chain through shared bodies into a deep trace for the colored sweeps, while
+    a pair's own contacts, which share both bodies, chain whatever their order and converge best together. It reads
+    only the frame's keys and the bodies' response, so a contact's admission moves no other's rows, and nor does a
+    contact that can never take rows.
 
     A contact takes the next rows of its family in its world's line: the dense rows, or the free bodies' (``path`` 1),
     which follow the dense class's (one row index for both classes); the contacts with an immovable side first
@@ -541,15 +681,15 @@ def reserve_world_rows(
         rows = rows + _lane_sum4(own)
         pairs += lane_count(votes, RESERVE_LANES)
     lane_sync(RESERVE_LANES)
+    _order_islands(data, order, first, pairs, lanes, lane)
     # The row order: each pair's rows before it.
-    stride = _row_stride(pairs)
     seen = wp.vec4i(0)
     for base in range(0, pairs, lanes):
         q = base + lane
         own = wp.vec4i(0)
         head = int(-1)
         if q < pairs:
-            j = int((wp.int64(q) * wp.int64(stride)) % wp.int64(pairs))
+            j = order.row_pairs[first + q]
             head = order.pairs[first + j]
             after = rows
             if j + 1 < pairs:

@@ -18,6 +18,7 @@ from unittest import mock
 import numpy as np
 import warp as wp
 
+from newton._src.core import union_find
 from newton._src.geometry import terrain_contacts
 from newton._src.geometry.narrow_phase import record_narrow_phase_buffers
 from newton._src.geometry.terrain_contacts import TerrainFeatures
@@ -105,7 +106,8 @@ class _StaleParents:
 
 
 def _python_kernel(kernel):
-    """Return a kernel's own Python body as ``body(t, *args)``: its Warp functions run as Python, ``wp.tid()`` is t."""
+    """Return a kernel's own Python body as ``body(t, *args)``: its Warp functions (its module's or another module's)
+    run as Python, ``wp.tid()`` is t."""
     thread = [0]
 
     class ThreadScope:
@@ -115,7 +117,22 @@ def _python_kernel(kernel):
         def tid(self):
             return thread[0]
 
-    scope = {k: v.func if isinstance(v, wp.Function) else v for k, v in kernel.func.__globals__.items()}
+    class PythonModule:
+        """A module's Warp functions as Python (a kernel may call them as ``module.function``)."""
+
+        def __init__(self, module):
+            self.module = module
+
+        def __getattr__(self, name):
+            value = getattr(self.module, name)
+            return value.func if isinstance(value, wp.Function) else value
+
+    def python(value):
+        if isinstance(value, wp.Function):
+            return value.func
+        return PythonModule(value) if isinstance(value, types.ModuleType) else value
+
+    scope = {k: python(v) for k, v in kernel.func.__globals__.items()}
     scope["wp"] = ThreadScope()
     function = types.FunctionType(kernel.func.__code__, scope)
 
@@ -574,7 +591,7 @@ class TestTerrainLawFeatures(unittest.TestCase):
         def halving(t, active, parent):
             # The compression as it was: the union pass's find, which halves paths.
             if active[t] != 0:
-                parent[t] = terrain_contacts._find.func(parent, t)
+                parent[t] = union_find.find.func(parent, t)
 
         chain = [0, 0, 1, 2, 3, 4, 5]
         # Thread 4 stores its root, then thread 6, whose loads predate that store, halves slot 4 back to 2.

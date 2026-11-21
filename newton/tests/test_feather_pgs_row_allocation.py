@@ -168,6 +168,16 @@ def _step_tripods(device, *, steps=4, sorted_contacts=False, **options):
             for name in ("world", "path", "slot")
         }
         record["pair_keys"] = solver.laws.friction_patches.current.keys.numpy()[:live].copy()
+        # Each contact's trees with response coordinates (row_records.row_sides), which join its world's islands.
+        responds = solver.forest.articulation_response_dof_count.numpy() > 0
+        arts = np.stack(
+            [solver.placement.contact_art_a.numpy()[:live], solver.placement.contact_art_b.numpy()[:live]], 1
+        )
+        trees = np.where((arts >= 0) & responds[np.maximum(arts, 0)], arts, -1)
+        trees = np.where((trees[:, :1] == trees[:, 1:]), np.stack([trees[:, 0], np.full(live, -1)], 1), trees)
+        record["sides"] = np.where(
+            (trees >= 0).all(1, keepdims=True), np.sort(trees, 1), np.sort(trees, 1)[:, ::-1]
+        ).copy()
         # Whether each contact has an immovable side (a shape without a body): those take a world's rows first.
         shape_body = model.shape_body.numpy()
         sides = [getattr(contacts, f"rigid_contact_{name}").numpy()[:live] for name in ("shape0", "shape1")]
@@ -197,9 +207,9 @@ def _step_tripods(device, *, steps=4, sorted_contacts=False, **options):
 def _family_contacts(record, path, world):
     """Frame positions of the contacts that hold rows of ``path`` in ``world`` in their rows' order: those with an
     immovable side first, then the others, each in the world's row order over the body pairs of its contacts, admitted
-    or not (:func:`.feather_pgs_law_harness.row_order`)."""
+    or not, by their islands (:func:`.feather_pgs_law_harness.row_order`)."""
     run = np.flatnonzero(record["world"] == world)
-    order = row_order(run, record["pair_keys"][run])
+    order = row_order(run, record["pair_keys"][run], record["sides"][run])
     rank = np.empty(len(record["world"]), dtype=np.int64)
     rank[order] = np.arange(len(order))
     contacts = np.flatnonzero((record["path"] == path) & (record["world"] == world) & (record["slot"] >= 0))
@@ -261,6 +271,111 @@ class TestFeatherPGSContactRowOrder(unittest.TestCase):
                     self.assertTrue(np.all(np.diff(slots) > 0), f"step {step}: {slots}")
             self.assertTrue(np.all(record["dense_overflow"]), f"step {step}: dense rows did not overflow")
             self.assertTrue(np.isfinite(record["joint_qd"]).all())
+
+
+_HALF = 0.05
+_SINK = 0.003
+_GAP = 0.0003
+
+
+def _pinch_scene(device, worlds: int, resting: bool, cover: bool):
+    """Per world: a fixed-base arm, a stacked pair of boxes, and a box sunk ``_SINK`` into the ground under a static
+    slab ``_GAP`` above it, so its depenetration and the slab ask more than the box can give (a squeeze none of their
+    orders satisfies); after them, in the same world and touching none of them, a box resting on the ground
+    (``resting``) and a static slab above it (``cover``). Returns the model and each world's first bodies (those of
+    every variant) with its sunk box."""
+    builder = newton.ModelBuilder()
+    cfg = builder.default_shape_cfg.copy()
+    cfg.mu = 0.6
+    builder.add_ground_plane(cfg=cfg)
+    kept, sunk_boxes = [], []
+    for _ in range(worlds):
+        builder.begin_world()
+        base = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * 0.01), lock_inertia=True)
+        builder.add_shape_box(base, hx=0.04, hy=0.04, hz=0.04, cfg=cfg)
+        joints = [builder.add_joint_fixed(-1, base, parent_xform=wp.transform((-1.0, 0.0, 0.3), wp.quat_identity()))]
+        link = builder.add_link(mass=0.5, inertia=wp.mat33(np.eye(3) * 0.004), lock_inertia=True)
+        builder.add_shape_capsule(link, radius=0.03, half_height=0.1, cfg=cfg)
+        joints.append(
+            builder.add_joint_revolute(
+                base,
+                link,
+                axis=(1.0, 0.0, 0.0),
+                parent_xform=wp.transform((0.0, 0.0, -0.08), wp.quat_identity()),
+                child_xform=wp.transform((0.0, 0.0, 0.1), wp.quat_identity()),
+            )
+        )
+        builder.add_articulation(joints)
+        first = base
+        for z in (_HALF, 3.0 * _HALF):
+            box = builder.add_body(xform=wp.transform((1.0, 0.0, z), wp.quat_identity()))
+            builder.add_shape_box(box, hx=_HALF, hy=_HALF, hz=_HALF, cfg=cfg)
+        sunk = builder.add_body(xform=wp.transform((3.0, 0.0, _HALF - _SINK), wp.quat_identity()))
+        builder.add_shape_box(sunk, hx=_HALF, hy=_HALF, hz=_HALF, cfg=cfg)
+        slab = wp.transform((3.0, 0.0, 2.0 * _HALF - _SINK + _GAP + 0.01), wp.quat_identity())
+        builder.add_shape_box(-1, xform=slab, hx=0.2, hy=0.2, hz=0.01, cfg=cfg)
+        kept.extend(range(first, sunk + 1))
+        sunk_boxes.append(sunk)
+        if resting:
+            box = builder.add_body(xform=wp.transform((4.0, 0.0, _HALF), wp.quat_identity()))
+            builder.add_shape_box(box, hx=_HALF, hy=_HALF, hz=_HALF, cfg=cfg)
+        if cover:
+            lid = wp.transform((4.0, 0.0, 2.0 * _HALF + 0.001 + 0.01), wp.quat_identity())
+            builder.add_shape_box(-1, xform=lid, hx=0.2, hy=0.2, hz=0.01, cfg=cfg)
+        builder.end_world()
+    return builder.finalize(device=device), np.array(kept), sunk_boxes
+
+
+def _settle_pinch(model, steps: int = 12) -> np.ndarray:
+    """Step the scene from rest on the free bodies' regions (the general sweep's dense storage); each step's poses."""
+    solver = SolverFeatherPGS(
+        model, pins=SolverFeatherPGS.Pins(storage="dense", tiers=0), pgs_iterations=8, dense_max_constraints=64
+    )
+    pipeline = newton.CollisionPipeline(model)
+    contacts = pipeline.contacts()
+    state_in, state_out = model.state(), model.state()
+    newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+    control = model.control()
+    poses = []
+    for _ in range(steps):
+        pipeline.collide(state_in, contacts)
+        state_in.clear_forces()
+        solver.step(state_in, state_out, control, contacts, 1.0 / 60.0)
+        state_in, state_out = state_out, state_in
+        poses.append(state_in.body_q.numpy().copy())
+    return np.array(poses)
+
+
+class TestFeatherPGSRowIslands(unittest.TestCase):
+    """A world's row order is its islands': bodies that never touch keep each other's motion bit for bit."""
+
+    def _check(self, device, worlds: int):
+        """Step the pinch scene with and without a resting box and a slab over it, in every combination; the first
+        bodies' motion must be the same bits in each. The order of a body's rows was once a stride over every pair of
+        its world, so the resting box and its slab, a pair more, reordered the sunk box's rows: its squeeze resolved
+        the other way and it rose 2.5 mm into its slab."""
+        runs = {}
+        for resting in (False, True):
+            for cover in (False, True):
+                model, kept, sunk_boxes = _pinch_scene(device, worlds, resting, cover)
+                runs[resting, cover] = _settle_pinch(model)[:, kept]
+        base = runs[False, False]
+        for variant, poses in runs.items():
+            np.testing.assert_array_equal(poses, base, err_msg=f"resting box, cover: {variant}")
+        # The squeeze resolves at the slab, frame order (the ground's pair first) visiting the slab's last.
+        model, kept, sunk_boxes = _pinch_scene(device, worlds, False, False)
+        index = {body: k for k, body in enumerate(kept)}
+        slab_bottom = 2.0 * _HALF - _SINK + _GAP
+        for sunk in sunk_boxes:
+            self.assertLess(float((base[:, index[sunk], 2] + _HALF - slab_bottom).max()), 1.0e-6)
+
+    def test_bodies_that_never_touch_keep_their_motion_cpu(self):
+        self._check(wp.get_device("cpu"), worlds=1)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "CUDA")
+    def test_bodies_that_never_touch_keep_their_motion_cuda(self):
+        # From 1,024 worlds the free bodies' contacts are regions on the GPU (no world takes the colored mapping).
+        self._check(wp.get_device("cuda:0"), worlds=1024)
 
 
 class TestFeatherPGSRowAllocationCPU(unittest.TestCase):

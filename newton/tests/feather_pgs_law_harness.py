@@ -1463,19 +1463,50 @@ def _own_pair_keys(pair_keys: wp.array[wp.int64]):
     pair_keys[c] = wp.int64(c)
 
 
-def row_order(contacts: np.ndarray, pair_keys: np.ndarray | None = None) -> np.ndarray:
+def row_order(contacts: np.ndarray, pair_keys: np.ndarray | None = None, sides: np.ndarray | None = None) -> np.ndarray:
     """A world's ``contacts`` (their frame positions, ascending: every contact of its run, admitted or not) in its rows'
-    order (:func:`.row_slots.reserve_world_rows`): their body pairs (``pair_keys`` of those contacts; each its own without) at a
-    golden-ratio stride over the pairs' ranks, coprime with their count, each pair's contacts together."""
+    order (:func:`.row_slots.reserve_world_rows`): their body pairs (``pair_keys`` of those contacts; each its own
+    without) joined into islands by the trees they touch (``sides`` of those contacts, rows of two, -1 for none; one
+    tree for all without), the islands in the frame order of their first pairs, each island's pairs at a golden-ratio
+    stride over their ranks, coprime with their count (place ``q`` holds rank ``q * stride mod n``), each pair's
+    contacts together; the pairs that touch no tree last, in frame order."""
     contacts = np.asarray(contacts)
     keys = np.arange(len(contacts)) if pair_keys is None else np.asarray(pair_keys)
+    sides = np.zeros((len(contacts), 2), dtype=np.int64) - np.array([0, 1]) if sides is None else np.asarray(sides)
     starts = np.flatnonzero(np.r_[True, keys[1:] != keys[:-1]]) if len(keys) else np.zeros(0, dtype=int)
     groups = np.split(contacts, starts[1:])
-    n = len(groups)
-    stride = max((n * 2654435769) >> 32, 1)
-    while n and math.gcd(stride, n) != 1:
-        stride += 1
-    return np.concatenate([groups[j] for j in (np.arange(n, dtype=np.int64) * stride) % n]) if n else contacts
+    pair_sides = [tuple(int(v) for v in sides[start]) for start in starts]
+    parent = {}
+
+    def find(x):
+        while parent[x] != x:
+            x = parent[x]
+        return x
+
+    for pair in pair_sides:
+        for side in pair:
+            if side >= 0:
+                parent.setdefault(side, side)
+        if pair[0] >= 0 and pair[1] >= 0:
+            a, b = find(pair[0]), find(pair[1])
+            parent[max(a, b)] = min(a, b)
+    islands = {}
+    loose = []
+    for j, pair in enumerate(pair_sides):
+        tree = next((side for side in pair if side >= 0), -1)
+        if tree < 0:
+            loose.append(j)
+        else:
+            islands.setdefault(find(tree), []).append(j)
+    order = []
+    for members in islands.values():
+        n = len(members)
+        stride = max((n * 2654435769) >> 32, 1)
+        while math.gcd(stride, n) != 1:
+            stride += 1
+        order += [members[q] for q in (np.arange(n, dtype=np.int64) * stride) % n]
+    order += loose
+    return np.concatenate([groups[j] for j in order]) if groups else contacts
 
 
 def allocate_contacts(operands, device) -> None:
@@ -1504,8 +1535,11 @@ def allocate_contacts(operands, device) -> None:
     order.world_contact_first, order.world_contact_last = values["world_contact_first"], values["world_contact_last"]
     for name, dtype in (("rows_frame", wp.vec4i), ("rows_before", wp.vec4i)):
         setattr(order, name, wp.zeros(n, dtype=dtype, device=device))
-    order.pairs_before = wp.zeros(n, dtype=int, device=device)
-    order.pairs = wp.zeros(n, dtype=int, device=device)
+    for name in ("pairs_before", "pairs", "pair_island", "pair_rank", "row_pairs"):
+        setattr(order, name, wp.zeros(n, dtype=int, device=device))
+    trees = max(values["data"].response_dofs.shape[0], 1)
+    for name in ("island_parent", "island_size", "island_base"):
+        setattr(order, name, wp.zeros(trees, dtype=wp.int32, device=device))
     values["order"] = order
 
     def args(kernel):
