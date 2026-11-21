@@ -193,6 +193,7 @@ class Bodies:
             region_sweep.sweep_closed_bodies,
             dim=bodies,
             inputs=[
+                bodies,
                 array([0, 0, bodies, 0], int),
                 array(np.arange(bodies), int),
                 array(self.spans, wp.vec2i),

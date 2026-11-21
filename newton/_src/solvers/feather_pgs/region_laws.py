@@ -63,6 +63,12 @@ REGION_SLIDE = wp.constant(2)
 REGION_STEPS = wp.constant(16)
 """Steps a block takes at most: its active-set steps and its Newton steps together."""
 
+VISIT_LINE = 168
+"""The register line of a sweep kernel that visits regions (:func:`.region_sweep.sweep_closed_bodies`): twelve warps a
+multiprocessor, where the unbounded kernel (255 registers and a stack) kept eight. The visit holds no term across its
+solves (:func:`reread`), so its text fits the line without a spill inside a visit; the kernel's lane and sweep control
+words are saved once a lane or a sweep."""
+
 _NONE = wp.constant(1.0e30)
 
 _QUIET = wp.constant(QUIET)

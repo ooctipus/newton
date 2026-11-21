@@ -32,6 +32,7 @@ region would have opened it (a sweep more where the budget is spent). So every r
 nothing at a twist where none of its candidates closes.
 """
 
+import dataclasses
 import warnings
 
 import numpy as np
@@ -71,6 +72,7 @@ from .friction_patches import PatchRowLaw, patch_friction_location
 from .projection_laws import friction_ball_metric
 from .region_laws import (
     REGION_SLIDE,
+    VISIT_LINE,
     candidate_closes,
     candidate_row,
     frame_response,
@@ -111,6 +113,12 @@ of 112 or less spills on the PRO (104: 289 us)."""
 _FILL_SHAPE = shape(
     Work(0, lanes=int(_FILL_LANES), block=128, registers=FILL_LINE), memory.built_for(memory.REFERENCE_ARCH)
 )
+_CLOSED_SHAPE_WORK = Work(0, lanes=1, block=32, registers=VISIT_LINE, persistent=True)
+_CLOSED_SHAPE = shape(_CLOSED_SHAPE_WORK, memory.built_for(memory.REFERENCE_ARCH))
+"""The closed bodies' sweeps' launch (:func:`sweep_closed_bodies`): at the visit's register line
+(:data:`.region_laws.VISIT_LINE`), a warp a block, so a block takes a twelfth of a multiprocessor (the unbounded kernel's
+blocks of 256 each held a whole one): the bodies' warps spread over every multiprocessor and start beside any other
+launch's warps."""
 # The lanes that list a world's blocks and levels together (form_blocks, level_regions): a world's serial passes over
 # its regions taken a stride at a time.
 _WORLD_LANES = wp.constant(32)
@@ -234,10 +242,10 @@ def publish_region(
                 impulses[cand_row[i]] = -closing / record[3]
 
 
-@wp.kernel(enable_backward=False, module="unique")
-def sweep_closed_bodies(
-    cursor: wp.array[int],
-    lanes: wp.array[int],
+@wp.func
+def closed_body(
+    lane: int,
+    b: int,
     body_regions: wp.array[wp.vec2i],
     body_inertia: wp.array2d[wp.mat33],
     body_basis: wp.array2d[wp.spatial_vector],
@@ -271,20 +279,7 @@ def sweep_closed_bodies(
     impulses: wp.array[float],
     lane_change: wp.array[wp.spatial_vector],
 ):
-    """The closed bodies' sweeps (the module's statement): lane ``tid`` takes the free body ``lanes[tid]`` (their
-    count ``cursor[2]``), whose regions are ``body_regions`` of the region stream (``reg_*``, their candidates
-    ``cand``).
-
-    A region's frame is ``reg_frame`` (rows ``n``, ``t0``, ``t1``) at ``reg_arm`` from the body's origin; its law
-    ``reg_law`` (``mu``, ``mu_t``) and its friction rows' right-hand sides ``reg_bf``; its
-    kind ``reg_kind`` (:data:`FRICTION_ROWS`, :data:`KIND_SPRINGS`, :data:`KIND_SECOND`); ``reg_row`` its friction
-    rows' first impulse row (-1: none) and ``cand_row`` each candidate's. The lane writes the regions' state, their
-    impulses, and the body's change in walk coordinates (``lane_change[tid]``, through the body's basis), which
-    :func:`add_closed_changes` adds to the walk's ``du`` once the other sweeps are done."""
-    tid = wp.tid()
-    if tid >= cursor[2]:
-        return
-    b = lanes[tid]
+    """Lane ``lane``'s sweeps of the closed free body ``b`` (:func:`sweep_closed_bodies`)."""
     span = body_regions[b]
     r0 = span[0]
     r1 = span[1]
@@ -443,7 +438,96 @@ def sweep_closed_bodies(
         + body_basis[b, 4] * torque[1]
         + body_basis[b, 5] * torque[2]
     )
-    lane_change[tid] = change
+    lane_change[lane] = change
+
+
+@wp.kernel(enable_backward=False, launch_bounds=_CLOSED_SHAPE.bounds, module="unique")
+def sweep_closed_bodies(
+    stride: int,
+    cursor: wp.array[int],
+    lanes: wp.array[int],
+    body_regions: wp.array[wp.vec2i],
+    body_inertia: wp.array2d[wp.mat33],
+    body_basis: wp.array2d[wp.spatial_vector],
+    reg_frame: wp.array[wp.mat33],
+    reg_arm: wp.array[wp.vec3],
+    reg_cand: wp.array[wp.vec2i],
+    reg_law: wp.array[wp.vec2],
+    reg_bf: wp.array[wp.vec3],
+    reg_kind: wp.array[int],
+    reg_row: wp.array[int],
+    reg_wnn: wp.array[wp.mat33],
+    reg_wnf: wp.array[wp.mat33],
+    reg_wff: wp.array[wp.mat33],
+    reg_ball_values: wp.array[wp.vec3],
+    reg_ball_vectors: wp.array[wp.mat33],
+    reg_ginv: wp.array[wp.mat33],
+    reg_k: wp.array[wp.mat33],
+    reg_lk: wp.array[wp.mat33],
+    reg_lw: wp.array[wp.mat33],
+    cand: wp.array[wp.vec4],
+    cand_floor: wp.array[float],
+    cand_row: wp.array[int],
+    sweeps: int,
+    cfm: float,
+    reg_wrench: wp.array[wp.vec3],
+    reg_phi: wp.array[wp.vec3],
+    reg_set: wp.array[wp.vec3i],
+    reg_spring: wp.array[wp.vec3],
+    reg_state: wp.array[int],
+    reg_reach: wp.array[wp.vec2],
+    impulses: wp.array[float],
+    lane_change: wp.array[wp.spatial_vector],
+):
+    """The closed bodies' sweeps (the module's statement): thread ``tid`` takes the lanes ``tid``, ``tid + stride``, ...
+    of the list (their count ``cursor[2]``), lane ``k`` the free body ``lanes[k]``, whose regions are ``body_regions``
+    of the region stream (``reg_*``, their candidates ``cand``).
+
+    A region's frame is ``reg_frame`` (rows ``n``, ``t0``, ``t1``) at ``reg_arm`` from the body's origin; its law
+    ``reg_law`` (``mu``, ``mu_t``) and its friction rows' right-hand sides ``reg_bf``; its
+    kind ``reg_kind`` (:data:`FRICTION_ROWS`, :data:`KIND_SPRINGS`, :data:`KIND_SECOND`); ``reg_row`` its friction
+    rows' first impulse row (-1: none) and ``cand_row`` each candidate's. The lane writes the regions' state, their
+    impulses, and the body's change in walk coordinates (``lane_change[k]``, through the body's basis), which
+    :func:`add_closed_changes` adds to the walk's ``du`` once the other sweeps are done."""
+    lane = wp.tid()
+    while lane < cursor[2]:
+        closed_body(
+            lane,
+            lanes[lane],
+            body_regions,
+            body_inertia,
+            body_basis,
+            reg_frame,
+            reg_arm,
+            reg_cand,
+            reg_law,
+            reg_bf,
+            reg_kind,
+            reg_row,
+            reg_wnn,
+            reg_wnf,
+            reg_wff,
+            reg_ball_values,
+            reg_ball_vectors,
+            reg_ginv,
+            reg_k,
+            reg_lk,
+            reg_lw,
+            cand,
+            cand_floor,
+            cand_row,
+            sweeps,
+            cfm,
+            reg_wrench,
+            reg_phi,
+            reg_set,
+            reg_spring,
+            reg_state,
+            reg_reach,
+            impulses,
+            lane_change,
+        )
+        lane += stride
 
 
 @wp.kernel(enable_backward=False, module="unique")
@@ -2444,10 +2528,15 @@ class Regions:
         if self.count == 0:
             return
         impulses = self.placement.impulses
+        device = self.model.device
+        # A grid over the list (cursor[2] lanes), at most the bodies' warps the multiprocessors keep at the line.
+        closed = shape(dataclasses.replace(_CLOSED_SHAPE_WORK, items=self.count), memory.device(device))
+        threads = closed.grid * closed.block
         wp.launch(
             sweep_closed_bodies,
-            dim=self.count,
+            dim=threads,
             inputs=[
+                threads,
                 self.cursor,
                 self.lanes,
                 self.body_regions,
@@ -2485,7 +2574,8 @@ class Regions:
                 impulses.reshape((impulses.size,)),
                 self.lane_change,
             ],
-            device=self.model.device,
+            device=device,
+            block_dim=closed.block,
         )
 
     def add_closed(self, du: wp.array) -> None:
