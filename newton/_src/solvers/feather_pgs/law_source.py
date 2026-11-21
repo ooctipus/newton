@@ -732,6 +732,10 @@ class _Renderer:
         variable = self.fresh("i") if name == "_" else self.cname(name)
         compare = "<" if step_value > 0 else ">"
         increment = "++" + variable if step == "1" else f"{variable} += {step}"
+        if name == "_":
+            # An iteration loop (its counter unused) runs one copy of its body: unrolled, an iterative solve's
+            # trip count of copies is code the sweep fetches, not arithmetic it saves.
+            self.emit(indent, "#pragma unroll 1")
         self.emit(indent, f"for (int {variable} = {start}; {variable} {compare} {stop}; {increment}) {{")
         self.block(node.body, indent + "    ", {name: _SCALAR})
         self.emit(indent, "}")
