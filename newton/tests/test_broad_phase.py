@@ -426,8 +426,8 @@ class TestBroadPhase(unittest.TestCase):
         expected_pairs = {(i, j) for i in range(shape_count) for j in range(i + 1, shape_count)}
         self.assertEqual(actual_pairs, expected_pairs)
 
-    def test_swept_aabb_requires_simultaneous_overlap(self):
-        """Reject swept-union overlap unless both AABBs overlap at one time."""
+    def test_swept_aabb_sweeps_each_shape_by_its_own_motion(self):
+        """Test each shape's box swept by its own displacement: either shape may be stopped within the window."""
         device = wp.get_device()
         shape_world = wp.zeros(2, dtype=wp.int32, device=device)
         shape_group = wp.ones(2, dtype=wp.int32, device=device)
@@ -466,7 +466,12 @@ class TestBroadPhase(unittest.TestCase):
         half_extent = wp.vec3(0.1)
         lower = wp.array([-half_extent, wp.vec3(0.5, -0.5, 0.0) - half_extent], dtype=wp.vec3, device=device)
         upper = wp.array([half_extent, wp.vec3(0.5, -0.5, 0.0) + half_extent], dtype=wp.vec3, device=device)
-        same_displacement = wp.array([wp.vec3(1.0, 1.0, 0.0), wp.vec3(1.0, 1.0, 0.0)], dtype=wp.vec3, device=device)
+        # Common motion across the separation: neither shape's sweep reaches the other.
+        across_displacement = wp.array([wp.vec3(0.0, 1.0, 0.0), wp.vec3(0.0, 1.0, 0.0)], dtype=wp.vec3, device=device)
+        # Common motion along the separation: the leading shape may stop and the trailing one reach it.
+        trail_lower = wp.array([-half_extent, wp.vec3(0.5, 0.0, 0.0) - half_extent], dtype=wp.vec3, device=device)
+        trail_upper = wp.array([half_extent, wp.vec3(0.5, 0.0, 0.0) + half_extent], dtype=wp.vec3, device=device)
+        along_displacement = wp.array([wp.vec3(1.0, 0.0, 0.0), wp.vec3(1.0, 0.0, 0.0)], dtype=wp.vec3, device=device)
         union_lower = wp.array([-half_extent, wp.vec3(0.5, -0.5, 0.0) - half_extent], dtype=wp.vec3, device=device)
         union_upper = wp.array(
             [wp.vec3(1.0, 1.0, 0.0) + half_extent, wp.vec3(1.5, 0.5, 0.0) + half_extent],
@@ -485,7 +490,8 @@ class TestBroadPhase(unittest.TestCase):
         ):
             with self.subTest(broad_phase=type(broad_phase).__name__):
                 self.assertEqual(launch(broad_phase, union_lower, union_upper, None), 1)
-                self.assertEqual(launch(broad_phase, lower, upper, same_displacement), 0)
+                self.assertEqual(launch(broad_phase, lower, upper, across_displacement), 0)
+                self.assertEqual(launch(broad_phase, trail_lower, trail_upper, along_displacement), 1)
                 self.assertEqual(launch(broad_phase, colliding_lower, colliding_upper, colliding_displacement), 1)
 
         fast_lower = wp.array([-half_extent, wp.vec3(0.4, 0.0, 0.0) - half_extent], dtype=wp.vec3, device=device)

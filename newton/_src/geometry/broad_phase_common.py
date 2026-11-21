@@ -47,44 +47,27 @@ def check_aabb_overlap_moving(
     cutoff2: float,
     shape_displacement: wp.array[wp.vec3],
 ) -> bool:
-    """Return static or continuous overlap according to the optional sweep array."""
-    if shape_displacement.shape[0] == 0:
-        return check_aabb_overlap(
-            box_lower[shape1], box_upper[shape1], cutoff1, box_lower[shape2], box_upper[shape2], cutoff2
-        )
+    """Return whether two boxes, each swept by its own displacement over the window, overlap.
 
-    cutoff_combined = cutoff1 + cutoff2
-    relative_displacement = shape_displacement[shape1] - shape_displacement[shape2]
-    lower_box1 = box_lower[shape1]
-    upper_box1 = box_upper[shape1]
-    lower_box2 = box_lower[shape2]
-    upper_box2 = box_upper[shape2]
+    Each shape's box covers every place the shape can reach in the window: either shape may be stopped by its other
+    contacts at any time in it (a stack whose lower part lands mid-window), so a pair is tested on its two swept
+    boxes, not on their relative motion. Without the optional sweep array the boxes are tested as they are.
+    """
+    lower1 = box_lower[shape1]
+    upper1 = box_upper[shape1]
+    lower2 = box_lower[shape2]
+    upper2 = box_upper[shape2]
     # An empty box, such as that of an empty variant row (see Model.select_body_variants), never overlaps.
-    if lower_box1[0] > upper_box1[0] or lower_box2[0] > upper_box2[0]:
+    if lower1[0] > upper1[0] or lower2[0] > upper2[0]:
         return False
-    enter = float(0.0)
-    exit_time = float(1.0)
-    for axis in range(3):
-        lower1 = lower_box1[axis]
-        upper1 = upper_box1[axis]
-        lower2 = lower_box2[axis] - cutoff_combined
-        upper2 = upper_box2[axis] + cutoff_combined
-        delta = relative_displacement[axis]
-        if delta == 0.0:
-            if lower1 > upper2 or upper1 < lower2:
-                return False
-        else:
-            axis_enter = (lower2 - upper1) / delta
-            axis_exit = (upper2 - lower1) / delta
-            if axis_enter > axis_exit:
-                tmp = axis_enter
-                axis_enter = axis_exit
-                axis_exit = tmp
-            enter = wp.max(enter, axis_enter)
-            exit_time = wp.min(exit_time, axis_exit)
-            if enter > exit_time:
-                return False
-    return True
+    if shape_displacement.shape[0] != 0:
+        d1 = shape_displacement[shape1]
+        d2 = shape_displacement[shape2]
+        lower1 = lower1 + wp.min(d1, wp.vec3(0.0))
+        upper1 = upper1 + wp.max(d1, wp.vec3(0.0))
+        lower2 = lower2 + wp.min(d2, wp.vec3(0.0))
+        upper2 = upper2 + wp.max(d2, wp.vec3(0.0))
+    return check_aabb_overlap(lower1, upper1, cutoff1, lower2, upper2, cutoff2)
 
 
 @wp.func

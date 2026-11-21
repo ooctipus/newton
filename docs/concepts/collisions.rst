@@ -1609,10 +1609,14 @@ limit ``e_max``, the effective admission distance is:
 
    g_{effective} = \max\left(g, \min\left(v\,dt, e_{max}\right)\right)
 
-The contact is kept when ``d <= g_effective``. Newton computes ``v`` from relative
-linear and angular velocity at the contact points. Common motion and receding motion
-therefore do not enlarge the gap. Broad phase uses a conservative motion bound; narrow
-phase applies the normal-directed test above.
+The contact is kept when ``d <= g_effective``. Newton computes ``v`` as the sum of each
+contact point's own speed (linear and angular) toward the other surface: within the
+horizon either body may be stopped by its other contacts, as when the lower part of a
+falling stack lands and the upper part keeps falling onto it, so common motion along the
+normal closes the gap at the leading body's speed. Tangential common motion and receding
+points do not enlarge the gap, and against an immobile shape ``v`` is the plain closing
+speed. Broad phase sweeps each shape's bounding box by its own motion over the horizon;
+narrow phase applies the normal-directed test above.
 
 The configured maximum extension is one limit for the shape pair, not a
 per-shape distance to add twice. If collision detection is skipped between

@@ -150,12 +150,18 @@ def compute_contact_approach_speed(
     shape_linear_velocity: wp.array[wp.vec3],
     shape_angular_velocity: wp.array[wp.vec3],
 ) -> float:
-    """Return the closing speed of two shape points along a contact normal."""
+    """Return the speed at which a collision window can close a contact along its normal.
+
+    Each point's own speed toward the other surface, summed: within the window either shape may be stopped by its
+    other contacts (a stack whose lower part lands mid-window keeps its upper part falling onto it), so common motion
+    along the normal closes the contact at the leading shape's speed. Tangential common motion and receding points
+    add nothing; against an immobile shape it is the plain closing speed.
+    """
     origin_a = wp.transform_get_translation(shape_transform[shape_a])
     origin_b = wp.transform_get_translation(shape_transform[shape_b])
     velocity_a = shape_linear_velocity[shape_a] + wp.cross(shape_angular_velocity[shape_a], point_a - origin_a)
     velocity_b = shape_linear_velocity[shape_b] + wp.cross(shape_angular_velocity[shape_b], point_b - origin_b)
-    return wp.max(-wp.dot(velocity_b - velocity_a, normal_a_to_b), 0.0)
+    return wp.max(wp.dot(velocity_a, normal_a_to_b), 0.0) + wp.max(-wp.dot(velocity_b, normal_a_to_b), 0.0)
 
 
 @wp.func

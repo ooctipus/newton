@@ -1065,7 +1065,7 @@ def compute_shape_velocities(
     displacement = shape_origin_velocity * collision_update_dt
     angular_extension = angular_speed_bound * collision_update_dt
     cap = wp.vec3(max_speculative_extension)
-    # Preserve absolute motion so pairwise subtraction retains relative velocity.
+    # Each shape sweeps its box by its own motion: either shape of a pair may be stopped within the window.
     shape_displacement[shape_id] = displacement
     angular_extension_vec = wp.min(wp.vec3(angular_extension), cap)
     shape_aabb_lower[shape_id] = shape_aabb_lower[shape_id] - angular_extension_vec

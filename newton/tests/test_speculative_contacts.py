@@ -366,30 +366,82 @@ def test_speculative_candidates_reject_invalid_gap_max(test, device):
             newton.CollisionPipeline(model, broad_phase="nxn", speculative_contact_gap_max=value)
 
 
-def test_speculative_candidates_reject_common_motion(test, device):
-    """Reject separated shapes whose large common motion makes their swept unions overlap."""
+def _build_moving_pair(device, velocity):
+    """Two separated spheres, 0.2 m apart along x, both moving at ``velocity``."""
     builder = newton.ModelBuilder(gravity=wp.vec3(0.0))
     builder.rigid_gap = 0.0
     body_a = builder.add_body(xform=wp.transform_identity())
     builder.add_shape_sphere(body_a, radius=0.1)
-    builder.body_qd[body_a] = (20.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    builder.body_qd[body_a] = (*velocity, 0.0, 0.0, 0.0)
     body_b = builder.add_body(xform=wp.transform(wp.vec3(0.4, 0.0, 0.0)))
     builder.add_shape_sphere(body_b, radius=0.1)
-    builder.body_qd[body_b] = (20.0, 0.0, 0.0, 0.0, 0.0, 0.0)
-    model = builder.finalize(device=device)
-    shape_pairs = wp.array([wp.vec2i(0, 1)], dtype=wp.vec2i, device=device)
+    builder.body_qd[body_b] = (*velocity, 0.0, 0.0, 0.0)
+    return builder.finalize(device=device)
+
+
+def _collide_moving_pair(model, device, broad_phase):
+    pipeline = newton.CollisionPipeline(
+        model,
+        broad_phase=broad_phase,
+        shape_pairs_filtered=(
+            wp.array([wp.vec2i(0, 1)], dtype=wp.vec2i, device=device) if broad_phase == "explicit" else None
+        ),
+        speculative_contact_gap_max=0.25,
+    )
+    contacts = pipeline.contacts()
+    pipeline.collide(model.state(), contacts, dt=0.1)
+    return int(pipeline.broad_phase_pair_count.numpy()[0]), int(contacts.rigid_contact_count.numpy()[0])
+
+
+def test_speculative_candidates_reject_tangential_common_motion(test, device):
+    """Reject separated shapes whose common motion is across their separation: no stop of either closes it."""
+    model = _build_moving_pair(device, (0.0, 20.0, 0.0))
     for broad_phase in ("nxn", "sap", "explicit"):
         with test.subTest(broad_phase=broad_phase):
-            pipeline = newton.CollisionPipeline(
-                model,
-                broad_phase=broad_phase,
-                shape_pairs_filtered=shape_pairs if broad_phase == "explicit" else None,
-                speculative_contact_gap_max=0.25,
-            )
-            contacts = pipeline.contacts()
-            pipeline.collide(model.state(), contacts, dt=0.1)
-            test.assertEqual(int(pipeline.broad_phase_pair_count.numpy()[0]), 0)
-            test.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), 0)
+            pairs, count = _collide_moving_pair(model, device, broad_phase)
+            if broad_phase != "explicit":
+                test.assertEqual(pairs, 0)
+            test.assertEqual(count, 0)
+
+
+def test_speculative_candidates_cover_a_stopped_leader(test, device):
+    """Keep separated shapes whose common motion is along their separation: the leader may stop in the window."""
+    model = _build_moving_pair(device, (20.0, 0.0, 0.0))
+    for broad_phase in ("nxn", "sap", "explicit"):
+        with test.subTest(broad_phase=broad_phase):
+            pairs, count = _collide_moving_pair(model, device, broad_phase)
+            test.assertEqual(pairs, 1)
+            test.assertGreater(count, 0)
+
+
+def test_speculative_window_holds_a_landing_stack(test, device):
+    """A stack dropped as one onto the ground, one collision pass held over eight substeps: the lower box lands
+    mid-window and the upper one keeps falling onto it, so the pass before must hold their contact (1.2 mm apart,
+    closing speed zero at that pass). FeatherPGS then stops the upper box on the lower one, not 1.9 mm inside it."""
+    builder = newton.ModelBuilder()
+    builder.rigid_gap = 0.0003
+    half = 0.01
+    lower = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, half + 0.005)))
+    builder.add_shape_box(lower, hx=half, hy=half, hz=half)
+    upper = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 3.0 * half + 0.0062)))
+    builder.add_shape_box(upper, hx=half, hy=half, hz=half)
+    builder.add_ground_plane()
+    model = builder.finalize(device=device)
+    pipeline = newton.CollisionPipeline(model, broad_phase="sap", speculative_contact_gap_max=0.015)
+    contacts = pipeline.contacts()
+    solver = newton.solvers.SolverFeatherPGS(model)
+    state_0, state_1 = model.state(), model.state()
+    window, substeps = 0.01, 8
+    worst = np.inf
+    for _ in range(6):
+        pipeline.collide(state_0, contacts, dt=window)
+        for _ in range(substeps):
+            state_0.clear_forces()
+            solver.step(state_0, state_1, None, contacts, window / substeps)
+            state_0, state_1 = state_1, state_0
+            z = state_0.body_q.numpy()[:, 2]
+            worst = min(worst, float(z[upper] - z[lower] - 2.0 * half))
+    test.assertGreater(worst, -2.0e-4)
 
 
 def test_speculative_candidates_preserve_physical_geometry(test, device):
@@ -1161,7 +1213,12 @@ for _name, _test in (
     ),
     ("test_speculative_candidates_reject_invalid_dt_override", test_speculative_candidates_reject_invalid_dt_override),
     ("test_speculative_candidates_reject_invalid_gap_max", test_speculative_candidates_reject_invalid_gap_max),
-    ("test_speculative_candidates_reject_common_motion", test_speculative_candidates_reject_common_motion),
+    (
+        "test_speculative_candidates_reject_tangential_common_motion",
+        test_speculative_candidates_reject_tangential_common_motion,
+    ),
+    ("test_speculative_candidates_cover_a_stopped_leader", test_speculative_candidates_cover_a_stopped_leader),
+    ("test_speculative_window_holds_a_landing_stack", test_speculative_window_holds_a_landing_stack),
     ("test_speculative_candidates_preserve_physical_geometry", test_speculative_candidates_preserve_physical_geometry),
     ("test_speculative_candidates_include_angular_motion", test_speculative_candidates_include_angular_motion),
     ("test_speculative_cone_reaches_infinite_plane", test_speculative_cone_reaches_infinite_plane),
