@@ -10,6 +10,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.geometry.sleep_filter import SleepFilter
 from newton.solvers import SolverFeatherPGS
 
 _H = 0.02
@@ -219,6 +220,74 @@ class TestFeatherPGSSleep(unittest.TestCase):
         builder.body_flags[body] = int(newton.BodyFlags.KINEMATIC)
         solver = SolverFeatherPGS(builder.finalize(device="cpu"))
         self.assertIsNone(solver.collision_sleep_filter())
+
+
+def _lowest_labels(count: int, edges: np.ndarray) -> np.ndarray:
+    """Each node's component labelled by its lowest node (a host union-find)."""
+    parent = np.arange(count)
+
+    def find(x):
+        while parent[x] != x:
+            x = parent[x]
+        return x
+
+    for a, b in edges:
+        ra, rb = find(a), find(b)
+        parent[max(ra, rb)] = min(ra, rb)
+    return np.array([find(i) for i in range(count)])
+
+
+class TestFeatherPGSSleepIslands(unittest.TestCase):
+    """The sleep filter's islands are the overlap graph's components, each labelled by its lowest tree."""
+
+    def _check(self, device):
+        """Join trees by candidate pairs whose boxes all overlap, with one tree in some islands not ready: every tree's
+        label must be its island's lowest tree, a ready island must sleep and a held-back one stay awake. Graphs: a
+        chain joined from its high end, a star on its highest tree, and random dense worlds (many threads uniting the
+        same roots at once)."""
+        rng = np.random.default_rng(3)
+        worlds, trees = 64, 256
+        count = worlds * trees
+        world_base = (np.arange(worlds) * trees)[:, None]
+        chain = np.stack([np.arange(trees - 1), np.arange(1, trees)], axis=1)[::-1]
+        star = np.stack([np.full(trees - 1, trees - 1), np.arange(trees - 1)], axis=1)
+        dense = rng.integers(0, trees, (8 * trees, 2))
+        dense = dense[dense[:, 0] != dense[:, 1]]
+        graphs = {"chain": chain, "star": star, "dense": dense}
+        index = np.stack([np.arange(count) // trees, np.arange(count) % trees], axis=1)
+        shape_sleep_index = wp.array(index, dtype=wp.vec2i, device=device)
+        shape_body = wp.array(np.arange(count), dtype=wp.int32, device=device)
+        body_qd = wp.zeros(count, dtype=wp.spatial_vector, device=device)
+        lower = wp.zeros(count, dtype=wp.vec3, device=device)
+        upper = wp.array(np.ones((count, 3)), dtype=wp.vec3, device=device)
+        displacement = wp.zeros(0, dtype=wp.vec3, device=device)
+        for name, graph in graphs.items():
+            edges = (graph[None, :, :] + world_base[:, :, None]).reshape(-1, 2)
+            edges = edges[rng.permutation(len(edges))]
+            labels = _lowest_labels(count, edges)
+            state = np.full(count, -1, dtype=np.int32)
+            hold = rng.random(count) < 0.01
+            state[hold] = -5
+            tree_asleep = wp.array(state.reshape(worlds, trees), dtype=wp.int32, device=device)
+            sleep_filter = SleepFilter(shape_sleep_index, tree_asleep, shape_body, device)
+            for _ in range(2):  # the second pass starts from the first pass's reseeded islands
+                tree_asleep.assign(state.reshape(worlds, trees))
+                pairs = wp.array(edges, dtype=wp.vec2i, device=device)
+                sleep_filter.apply(
+                    pairs, wp.array([len(edges)], dtype=wp.int32, device=device), lower, upper, displacement, body_qd
+                )
+                np.testing.assert_array_equal(sleep_filter.root.numpy(), labels, err_msg=name)
+                held = np.zeros(count, dtype=bool)
+                held[labels[hold]] = True
+                expected = np.where(hold, -5, np.where(held[labels], -1, np.arange(count) % trees))
+                np.testing.assert_array_equal(tree_asleep.numpy().reshape(-1), expected, err_msg=name)
+
+    def test_islands_are_labelled_by_their_lowest_tree_cpu(self):
+        self._check(wp.get_device("cpu"))
+
+    @unittest.skipUnless(wp.is_cuda_available(), "CUDA")
+    def test_islands_are_labelled_by_their_lowest_tree_cuda(self):
+        self._check(wp.get_device("cuda:0"))
 
 
 if __name__ == "__main__":

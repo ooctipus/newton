@@ -13,7 +13,8 @@ import warp as wp
 
 @wp.func
 def find(parent: wp.array[wp.int32], x: int) -> int:
-    """Root of ``x``'s tree as the union pass sees it, halving the path on the way (union pass only)."""
+    """Root of ``x``'s tree, halving the path on the way: in the union pass, or in a pass that writes the roots into
+    another array (it stores no final parent)."""
     while True:
         p = parent[x]
         if p == x:
@@ -22,7 +23,7 @@ def find(parent: wp.array[wp.int32], x: int) -> int:
         if grand != p:
             # Path halving stores into other nodes' slots. In the union pass that is safe: a node only ever points
             # further up its own tree (a store computed from an older parent still points at an ancestor), and nothing
-            # reads a parent as final there. A pass that stores final parents must not halve.
+            # reads a parent as final there. A pass that stores final parents must not halve (:func:`root`).
             parent[x] = grand
         x = grand
 

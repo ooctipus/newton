@@ -29,14 +29,16 @@ At every pass, after the broad phase and before the narrow phase, :meth:`SleepFi
    of its supports; every tree of an island that holds an acted-on tree is loaded;
 4. drops every candidate pair whose two sides are each static, never held or asleep: no contact is made for them.
 
-The islands are connected components of the overlap graph (a union-find, hooked lock-free and exact in one launch),
-so the decision holds at any island size, in a fixed launch list that a CUDA graph replays.
+The islands are connected components of the overlap graph (:mod:`~newton._src.core.union_find`: hooked lock-free
+in one launch, each tree labelled by its island's lowest tree in the next), so the decision holds at any island size,
+in a fixed launch list that a CUDA graph replays.
 """
 
 from __future__ import annotations
 
 import warp as wp
 
+from ..core import union_find
 from .broad_phase_common import check_aabb_overlap_moving
 from .contact_data import SHAPE_PAIR_INDEX_MASK
 
@@ -54,35 +56,6 @@ LOADED = wp.constant(-(1 << 29))
 """A tree whose island held an acted-on tree at the last pass, in ``tree_asleep`` (the filter writes it)."""
 RELEASED = wp.constant(-(1 << 28))
 """A loaded tree whose island no longer holds an acted-on tree, in ``tree_asleep`` (the filter writes it)."""
-
-
-@wp.func
-def _find(parent: wp.array[wp.int32], node: int) -> int:
-    """The root of ``node``'s island, halving its path (a parent always has the lower index)."""
-    x = node
-    p = parent[x]
-    while p != x:
-        g = parent[p]
-        if g != p:
-            parent[x] = g
-        x = p
-        p = parent[x]
-    return x
-
-
-@wp.func
-def _unite(parent: wp.array[wp.int32], a: int, b: int):
-    """Join the islands of ``a`` and ``b``: the higher root hooks onto the lower, retried when another thread moved
-    it first (lock-free; every parent points to a lower index, so the forest stays acyclic)."""
-    while True:
-        ra = _find(parent, a)
-        rb = _find(parent, b)
-        if ra == rb:
-            return
-        high = wp.max(ra, rb)
-        low = wp.min(ra, rb)
-        if wp.atomic_cas(parent, high, high, low) == high:
-            return
 
 
 @wp.func
@@ -136,7 +109,7 @@ def _join(
         if not check_aabb_overlap_moving(sa, sb, lower, upper, 0.0, 0.0, displacement):
             continue
         if ia[1] >= 0 and ib[1] >= 0:
-            _unite(parent, a, b)
+            union_find.union(parent, a, b)
         elif ia[1] >= 0:
             if ib[1] == UNHELD and _moving(sb, shape_body, body_qd):
                 held_back[ia[0] * trees + ia[1]] = 1
@@ -156,7 +129,9 @@ def _close(
     """Each tree's island root; a tree awake and not ready (or one a moving unheld body reaches) holds back its
     island, an acted-on tree loads it."""
     i = wp.tid()
-    r = _find(parent, i)
+    # Its threads halve paths as they read (a chain of trees is walked once, not once a tree): the labels go to
+    # ``root``, never into ``parent``, so a halving store meets no final parent.
+    r = union_find.find(parent, i)
     root[i] = r
     state = tree_asleep[i // trees, i % trees]
     if held_back[i] != 0 or state < READY:
