@@ -1896,6 +1896,25 @@ class TestContactPool(unittest.TestCase):
     pass
 
 
+def test_an_unprepared_graph_bridge_fails_closed(test, device):
+    """Refuse a pool whose virtual rows' graph bridge cannot be prepared (no usable nvcc), rather than run unbound.
+
+    Its captures would size contact work by the rows of their start and ask for a recapture on every growth, while
+    the rows themselves never move: one layer half present, which no caller can tell from the whole one.
+    """
+    vm = contact_pool._virtual_memory()
+    if vm is None:
+        test.skipTest("only gpu_components' virtual rows prepare a graph bridge")
+
+    def prepare_updates(*args, **kwargs):
+        raise RuntimeError("CUDA bridge compilation failed")
+
+    with mock.patch.object(vm[3], "prepare_updates", prepare_updates):
+        with test.assertRaisesRegex(RuntimeError, "graph bridge could not be prepared"):
+            ContactPool(device=device)
+    test.assertTrue(ContactPool(device=device).bindable, "a prepared bridge binds every launch over virtual rows")
+
+
 devices = get_test_devices()
 cuda_devices = get_cuda_test_devices()
 # Every test runs as well with gpu_components hidden: CUDA rows then fall back to ordinary arrays.
@@ -1979,6 +1998,13 @@ add_function_test(
     TestContactPool,
     "test_superseded_rows_live_while_a_graph_captured_before_lives",
     test_superseded_rows_live_while_a_graph_captured_before_lives,
+    devices=cuda_devices,
+    check_output=False,
+)
+add_function_test(
+    TestContactPool,
+    "test_an_unprepared_graph_bridge_fails_closed",
+    test_an_unprepared_graph_bridge_fails_closed,
     devices=cuda_devices,
     check_output=False,
 )

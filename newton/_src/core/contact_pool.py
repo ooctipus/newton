@@ -1054,18 +1054,23 @@ class ContactPool:
             graph_ops = vm[3]
             # Each updater claims its own UPDATE_BINDINGS words, so a check reads every binding's last replay.
             self._update_status = wp.zeros(UPDATE_TABLES * UPDATE_BINDINGS, dtype=wp.int32, device=self.device)
+            # One preparation outside capture loads the updater; captures then prepare tables freely. Virtual rows
+            # and bound launches are one layer: a capture whose launches cannot bind sizes work by the rows of its
+            # start, so a bridge that cannot be prepared is an environment to fix, never a mode to run in.
             try:
-                # One preparation outside capture loads the updater; captures then prepare tables freely.
                 graph_ops.prepare_updates(
                     self.ready_rows,
                     enable_count_maximum=INDEX_LIMIT,
                     binding_capacity=UPDATE_BINDINGS,
                     errors=self._update_status,
                 )
-            except Exception as error:  # No toolkit or bridge: launches stay unbound.
-                logger.debug("Rigid contact launches are not bound to graph updates: %s", error)
-            else:
-                self._graph_ops = (graph_ops, vm[4])
+            except Exception as error:
+                raise RuntimeError(
+                    "gpu_components' CUDA graph bridge could not be prepared, so captured contact launches could not "
+                    "follow the rows: provide nvcc with its own toolkit's headers through CUDACXX, or a prepared "
+                    "GPU_COMPONENTS_CUDA_GRAPH_LIBRARY, or uninstall gpu_components"
+                ) from error
+            self._graph_ops = (graph_ops, vm[4])
 
     @property
     def bound(self) -> int:
