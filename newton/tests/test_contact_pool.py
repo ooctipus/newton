@@ -276,33 +276,6 @@ class TestContactPoolPolicy(unittest.TestCase):
         pool.restart_transit()
         self.assertFalse(pool._settled, "a measured state starts a graph's transit")
 
-    def test_rows_stay_ahead_of_a_demand_that_doubles_every_pass(self):
-        """A scene's first landing doubles the contacts every pass (NIST's parts, seed 0: 11k, 22k, 45k, 92k, 175k).
-        A bound graph never recaptures, so nothing but the service grows the rows; reading the record a few replays
-        behind the device, it holds, at every service, the rows the pass of the replay launched next will need, though
-        the forecast (one pass in eight) still holds the first landing's share, which the landing outruns."""
-        pool = ContactPool(device="cpu")
-        pool.rows((ContactField("value", wp.int32, -1),))
-        lag = contact_pool.FORECAST_QUEUE + 1
-        demand = [1_000 * 2**k for k in range(8)]
-        forecast = 80_000
-        for k, mark in enumerate(demand):
-            pool._high_water_host.assign([mark, mark, k + 1, forecast, 0, 0, 0, 0, 0])
-            pool.service()
-            ahead = demand[k + lag] if k + lag < len(demand) else demand[-1]
-            if k > 0:
-                self.assertGreaterEqual(pool.ready, ahead, f"pass {k + 1 + lag} would drop contacts")
-        held = pool.ready
-        for k in range(3):
-            pool._high_water_host.assign([demand[-1], demand[-1], len(demand) + 1 + k, forecast, 0, 0, 0, 0, 0])
-            pool.service()
-        self.assertEqual(pool.ready, held, "a mark that holds still grows nothing")
-        self.assertLessEqual(
-            held,
-            contact_pool.reserved_rows(contact_pool.HEADROOM * max(forecast, demand[-1]), pool.bound),
-            "no more than the headroom over the forecast or the mark",
-        )
-
     def test_service_waits_for_a_device_behind_the_queue(self):
         """Hold the host at most FORECAST_QUEUE replays ahead, and let go when no replay comes."""
         pool = ContactPool(device="cpu")
@@ -1075,6 +1048,76 @@ def test_forecast_holds_a_landing_from_the_floor(test, device):
     test.assertEqual(pool.high_water, demand)
     test.assertFalse(pipeline.narrow_phase.buffer_capacity_status()["contacts"])
     solver.check_constraint_capacity()
+
+
+# NIST's landing, 4,096 worlds, seed 1 (GPU GB300, Newton 52911e7d4, a forecast every pass over a 6-pass horizon): per
+# pass, the contacts, then the broad phase's two forecast sums, the worst case of the pairs within reach and of those
+# whose boxes overlap now. The parts land from pass 9 to 21; the share of the second sum the contacts make rises from
+# 0.007 to 0.05 meanwhile.
+NIST_LANDING = (
+    (373, 0, 0),
+    (367, 173400, 52275),
+    (367, 0, 0),
+    (366, 349860, 59160),
+    (371, 632145, 63495),
+    (398, 1109505, 67065),
+    (448, 1992315, 72675),
+    (555, 3660015, 86700),
+    (842, 7027545, 109905),
+    (1721, 12892800, 169320),
+    (4182, 19991235, 297330),
+    (8985, 25384995, 586755),
+    (19816, 27679740, 1228080),
+    (48341, 29236515, 2450805),
+    (99594, 30417420, 4842450),
+    (252994, 31419315, 8926530),
+    (426947, 32279685, 13958955),
+    (711745, 32794275, 17160735),
+    (882109, 32738685, 17910435),
+    (914734, 31920135, 18140700),
+    (919201, 30845310, 18102960),
+    (912611, 29969385, 18024420),
+    (904612, 29313780, 17957100),
+    (897550, 28778280, 17893350),
+)
+
+
+def test_rows_stay_ahead_of_a_landing(test, device):
+    """Replay NIST's landing through the pool's record and service, one pass a replay, the host FORECAST_QUEUE
+    replays ahead: the service that reads pass k sizes the rows of pass k + FORECAST_QUEUE. No pass drops a contact.
+
+    A forecast measured on the landing's first contacts holds a third of what its last parts make within its own
+    horizon (0.007 of the pairs' worst case against 0.03 at pass 17). A rising demand forecasts every pass, so the
+    service reads a forecast two passes old, whose share the landing has not outrun.
+    """
+    pool = ContactPool(device=device)
+    pool.rows((ContactField("value", wp.int32, -1),))
+    lag = contact_pool.FORECAST_QUEUE
+    ready = dict.fromkeys(range(1, lag + 1), pool.ready)
+    slots = np.zeros(2 * contact_pool.FORECAST_SLOTS, dtype=np.int64)
+    dropped = []
+    for k, (demand, reach, near) in enumerate(NIST_LANDING, start=1):
+        if int(pool.forecast_on.numpy()[0]) != 0:
+            # The broad phase of a forecasting pass leaves its sums in the counters.
+            slots[0], slots[contact_pool.FORECAST_SLOTS] = reach, near
+            pool.forecast_slots.assign(slots)
+        count = wp.array([demand], dtype=wp.int32, device=device)
+        rows = wp.array([ready[k]], dtype=wp.int32, device=device)
+        pool.record_demand(count, rows)
+        wp.synchronize_device(device)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            pool.service()
+        ready[k + lag] = pool.ready
+        if demand > ready[k]:
+            dropped.append((k, demand, ready[k]))
+    test.assertEqual(dropped, [], "passes that dropped contacts: (pass, contacts, rows)")
+    test.assertEqual(pool.drops().contacts, 0)
+    test.assertLessEqual(
+        pool.ready,
+        contact_pool.reserved_rows(contact_pool.HEADROOM * max(c for c, _, _ in NIST_LANDING), pool.bound) + (1 << 20),
+        "the landing holds the demand's headroom, within two 2 MiB granules of an int32 field past it",
+    )
 
 
 def test_forecast_keeps_the_candidates_of_every_broad_phase(test, device):
@@ -1871,6 +1914,7 @@ for name, function, check_output in (
     ("test_service_measures_a_state_before_capture", test_service_measures_a_state_before_capture, True),
     ("test_example_runner_measures_and_recaptures", test_example_runner_measures_and_recaptures, True),
     ("test_forecast_holds_a_landing_from_the_floor", test_forecast_holds_a_landing_from_the_floor, True),
+    ("test_rows_stay_ahead_of_a_landing", test_rows_stay_ahead_of_a_landing, True),
     ("test_contactless_model_stays_at_the_floor", test_contactless_model_stays_at_the_floor, True),
     ("test_pipelines_of_a_model_share_its_pool", test_pipelines_of_a_model_share_its_pool, True),
     (
