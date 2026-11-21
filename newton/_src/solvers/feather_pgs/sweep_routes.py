@@ -868,9 +868,10 @@ def region_phase(pad: str = "        ") -> str:
     The order is taken by its exact levels (:func:`.region_sweep.level_regions`): a level's regions share no body,
     so the world's lanes visit them at once, and a barrier ends a level; that is the sequential sweep itself. A
     world whose levels hold fewer regions than the colored rule's parallelism (a chain: a tangled pair's regions
-    share both bodies, one a level) is walked by its first lane in the order the levels were made from
+    share both bodies, one a level) is walked by its lanes together in the order the levels were made from
     (``reg_order``: a body's regions together within a depth), a first body's twist kept from one of its regions to
-    the next, as a sequential walk does; the result is the same either way. A pair block (:func:`.region_sweep.form_blocks`)
+    the next, as a sequential walk does; the result is the same either way. The walk reads its order's states a
+    lanes' width at a time and takes the regions that are not left out (a left-out region's turn writes nothing). A pair block (:func:`.region_sweep.form_blocks`)
     takes every lane of its world either way: its member batches and candidate passes split over them, so its sums
     reduce in one order whatever its world's walk. A region's response and the other terms
     that stand for the step are the listing's (:func:`.region_sweep.region_terms`), and its wrench's change returns
@@ -929,8 +930,6 @@ if (moved) {{
     // from one region to the next of the same body; the others' levels take the lanes. Both are the same sweep.
     const int kept_end = levels > 0 ? level_end.data[region_span[0] + levels - 1] : region_span[0];
     const bool alone = (float)(kept_end - region_span[0]) < {parallelism}f * (float)levels;
-    // A chain world's lanes all walk its order, each doing the same work (a block's candidate passes split over them).
-    const int stride = alone ? 1 : STRIDE;
     // Whether the world holds a pair block: its first is listed first (region_sweep.form_blocks).
     const bool holds_block = blk_pair.data[world * {int(PAIR_BLOCKS)}][0] >= 0;
     int level_first = region_span[0];
@@ -943,18 +942,22 @@ if (moved) {{
     const int spans = alone ? 1 : levels;
     for (int level = 0; level < spans; ++level) {{
     const int level_last = alone ? kept_end : level_end.data[region_span[0] + level];
-    for (int chunk = level_first; chunk < level_last; chunk += stride) {{
+    for (int chunk = level_first; chunk < level_last; chunk += STRIDE) {{
+    // A chain world's lanes all walk its order, each doing the same work (a block's candidate passes split over them),
+    // a chunk of the lanes' width at a time: each lane reads one place's state, and the chunk's turns are its regions
+    // that are not left out, in order (a left-out region stays so until the sweeps' end and its turn writes nothing).
     // A pair block takes every lane (teamed): the lanes visit a chunk's blocks together, one after another, then each
     // lane its own other region; a level's regions share no body, so its order inside the level is the same sweep.
-    const unsigned blocks = alone || !holds_block ? 0u : BALLOT(chunk + lane < level_last
-        && (reg_kind.data[level_region.data[chunk + lane]] & {int(KIND_BLOCK)}) != 0);
+    const unsigned blocks = alone ? BALLOT(chunk + lane < level_last
+        && reg_state.data[reg_order.data[chunk + lane]] != {int(REGION_LEFT)}) : !holds_block ? 0u
+        : BALLOT(chunk + lane < level_last && (reg_kind.data[level_region.data[chunk + lane]] & {int(KIND_BLOCK)}) != 0);
     unsigned left = blocks;
-    const int turns = alone ? 1 : COUNT(blocks) + 1;
+    const int turns = alone ? COUNT(blocks) : COUNT(blocks) + 1;
     // One copy of a region's visit: the turns are a schedule, not to be unrolled (each copy is the whole visit).
     #pragma unroll 1
     for (int turn = 0; turn < turns; ++turn) {{
         const bool teamed = alone || left != 0u;
-        const int place = chunk + (left != 0u ? FIRST(left) : alone ? 0 : lane);
+        const int place = chunk + (left != 0u ? FIRST(left) : lane);
         left &= left - 1u;
         if (!teamed && (place >= level_last || ((blocks >> lane) & 1u) != 0u)) continue;
         if (teamed) WARP_SYNC();
