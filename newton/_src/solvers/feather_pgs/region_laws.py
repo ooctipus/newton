@@ -582,24 +582,35 @@ def stick_terms(
     return Ginv, K, Lk, Lw
 
 
+@REGION_LAW.law(
+    native=('int read; asm volatile("mov.b32 %0, %1;" : "=r"(read) : "r"(at));', "return read;"), everywhere=True
+)
+def reread(at: int) -> int:
+    """``at``, as an index the compiler cannot prove equal to ``at``: a read at it is issued again, so a term read
+    before a solve and used after it is read twice instead of held in registers across the solve (an opaque copy of
+    the index, no arithmetic)."""
+    return at
+
+
 @REGION_LAW.law
 def region_visit(
     sn: wp.vec3,
     sf: wp.vec3,
-    Wnn: wp.mat33,
-    C: wp.mat33,
-    G: wp.mat33,
+    g: int,
+    reg_wnn: wp.array[wp.mat33],
+    reg_wnf: wp.array[wp.mat33],
+    reg_wff: wp.array[wp.mat33],
     cfm: float,
     bf: wp.vec3,
     mu: float,
     mu_t: float,
     friction: int,
-    ball_values: wp.vec3,
-    ball_vectors: wp.mat33,
-    Ginv: wp.mat33,
-    K: wp.mat33,
-    Lk: wp.mat33,
-    Lw: wp.mat33,
+    reg_ball_values: wp.array[wp.vec3],
+    reg_ball_vectors: wp.array[wp.mat33],
+    reg_ginv: wp.array[wp.mat33],
+    reg_k: wp.array[wp.mat33],
+    reg_lk: wp.array[wp.mat33],
+    reg_lw: wp.array[wp.mat33],
     cand: wp.array[wp.vec4],
     cand_floor: wp.array[float],
     g0: int,
@@ -611,26 +622,31 @@ def region_visit(
     i2_in: int,
     spring_in: wp.vec3,
 ) -> tuple[wp.vec3, wp.vec3, int, int, int, wp.vec3, wp.vec3, wp.vec3, int, int]:
-    """One visit of a region (the module's statement), every other impulse held.
+    """One visit of region ``g`` (the module's statement), every other impulse held.
+
+    The region's terms are read where they are used (:func:`reread` where a solve lies between two uses), so none is
+    held in registers across a candidates' block: the visit's registers are the block's.
 
     Args:
         sn: The pair's relative twist in the region's normal coordinates ``N``, with the region's wrench in it.
         sf: The same in its friction coordinates ``F``.
-        Wnn: The pair's response over ``N``.
-        C: The response of ``N`` to a wrench over ``F`` (``Wnf``).
-        G: The response over ``F``.
+        g: The region.
+        reg_wnn: The pair's response over ``N`` (``Wnn``), a region each.
+        reg_wnf: The response of ``N`` to a wrench over ``F`` (``Wnf``, ``C``).
+        reg_wff: The response over ``F`` (``G``).
         cfm: The friction unit's regularization, added to ``G``'s diagonal in its slide's cone law (a step metric).
         bf: The friction rows' right-hand sides.
         mu: The friction coefficient.
         mu_t: The torsional coefficient [m], 0 for a unit without a spin row.
         friction: The friction unit's rows: 0 (none), 2 (a tangent pair) or 3 (with the spin row).
-        ball_values: The cone law's metric of the regularized friction block (:func:`.projection_laws.friction_ball_metric`
-            of ``G`` plus ``cfm``), its eigenvalues; read where ``mu_t`` is positive.
-        ball_vectors: Its eigenvectors.
-        Ginv: The friction block's inverse (:func:`stick_terms`).
-        K: The stick metric.
-        Lk: Its factor.
-        Lw: ``Wnn``'s factor.
+        reg_ball_values: The cone law's metric of the regularized friction block
+            (:func:`.projection_laws.friction_ball_metric` of ``G`` plus ``cfm``), its eigenvalues; read where ``mu_t``
+            is positive.
+        reg_ball_vectors: Its eigenvectors.
+        reg_ginv: The friction block's inverse (:func:`stick_terms`).
+        reg_k: The stick metric.
+        reg_lk: Its factor.
+        reg_lw: ``Wnn``'s factor.
         cand: The candidates' records.
         cand_floor: The roundings [m/s] of their right-hand sides (:func:`closing_floor`).
         g0: The region's first candidate.
@@ -650,12 +666,12 @@ def region_visit(
     """
     zero = wp.vec3(0.0, 0.0, 0.0)
     # A unit without a spin row holds two coordinates: the third is free (no coupling, no residual).
-    Cu, Gu = friction_unit(C, G, friction)
+    Cu, Gu = friction_unit(reg_wnf[g], reg_wff[g], friction)
     rf0 = sf + bf
     if friction < 3:
         rf0 = wp.vec3(rf0[0], rf0[1], 0.0)
     # The region's own wrench leaves the velocity.
-    without = sn - Wnn * wrench_in
+    without = sn - reg_wnn[g] * wrench_in
     if friction > 0:
         without = without - Cu * phi_in
         rf0 = rf0 - wp.transpose(Cu) * wrench_in - Gu * phi_in
@@ -663,13 +679,17 @@ def region_visit(
     # residual, in the stick metric), and where the unit slides it is solved once more with the friction as it was
     # (in Wnn's metric), from the set and the springs the stick left; without friction it is solved once.
     start = without
-    metric = Wnn
-    factor = Lw
+    metric = wp.mat33(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    factor = metric
     if friction > 0:
-        CG = Cu * Ginv
+        CG = Cu * reg_ginv[g]
         start = without - CG * rf0
-        metric = K
-        factor = Lk
+        metric = reg_k[g]
+        factor = reg_lk[g]
+    else:
+        first = reread(g)
+        metric = reg_wnn[first]
+        factor = reg_lw[first]
     j0 = i0_in
     j1 = i1_in
     j2 = i2_in
@@ -694,29 +714,34 @@ def region_visit(
         if friction == 0:
             return wrench, zero, i0, i1, i2, multipliers, spring, velocity, REGION_STICK, steps
         load = wrench[0]
-        phi = zero - Ginv * (rf0 + wp.transpose(Cu) * wrench)
+        after = reread(g)
+        Ca, _Ga = friction_unit(reg_wnf[after], reg_wff[after], friction)
+        phi = zero - reg_ginv[after] * (rf0 + wp.transpose(Ca) * wrench)
         scaled = wp.vec3(phi[0] / mu, phi[1] / mu, 0.0)
         if mu_t > 0.0:
             scaled = wp.vec3(phi[0] / mu, phi[1] / mu, phi[2] / mu_t)
         if bounded == 1 and load > 0.0 and mu > 0.0 and wp.dot(scaled, scaled) <= load * load:
             return wrench, phi, i0, i1, i2, multipliers, spring, velocity, REGION_STICK, steps
         # Slide: the block with the friction as it was, then the unit's cone law at the block's load, once.
-        start = without + Cu * phi_in
-        metric = Wnn
-        factor = Lw
+        start = without + Ca * phi_in
+        slide = reread(g)
+        metric = reg_wnn[slide]
+        factor = reg_lw[slide]
         j0 = i0
         j1 = i1
         j2 = i2
         held = spring
         stuck = steps
-    residual = rf0 + wp.transpose(Cu) * wrench + Gu * phi_in
+    last = reread(g)
+    Cl, Gl = friction_unit(reg_wnf[last], reg_wff[last], friction)
+    residual = rf0 + wp.transpose(Cl) * wrench + Gl * phi_in
     friction_phi = wp.vec3(0.0, 0.0, 0.0)
     if mu_t > 0.0:
         friction_phi = friction_triple_from_metric(
-            ball_values, ball_vectors, residual, phi_in, mu, mu_t, wrench[0], 1.0
+            reg_ball_values[last], reg_ball_vectors[last], residual, phi_in, mu, mu_t, wrench[0], 1.0
         )
     else:
-        Gs = Gu + wp.mat33(cfm, 0.0, 0.0, 0.0, cfm, 0.0, 0.0, 0.0, cfm)
+        Gs = Gl + wp.mat33(cfm, 0.0, 0.0, 0.0, cfm, 0.0, 0.0, 0.0, cfm)
         friction_phi = friction_triple(Gs, residual, phi_in, mu, mu_t, wrench[0], 1.0)
     return wrench, friction_phi, i0, i1, i2, multipliers, spring, velocity, REGION_SLIDE, stuck + steps
 

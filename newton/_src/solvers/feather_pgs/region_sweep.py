@@ -78,6 +78,7 @@ from .region_laws import (
     frame_wrench,
     idle_reach,
     region_visit,
+    reread,
     stick_terms,
     twist_reach,
 )
@@ -287,9 +288,6 @@ def sweep_closed_bodies(
     span = body_regions[b]
     r0 = span[0]
     r1 = span[1]
-    Avv = body_inertia[b, 0]
-    Avw = body_inertia[b, 1]
-    Aww = body_inertia[b, 2]
     force = wp.vec3(0.0, 0.0, 0.0)
     torque = wp.vec3(0.0, 0.0, 0.0)
     v = wp.vec3(0.0, 0.0, 0.0)
@@ -334,12 +332,10 @@ def sweep_closed_bodies(
                 if limit < r1:
                     done = 1
                 break
-            # Solve: every lane of the warp that found a live region is here together.
+            # Solve: every lane of the warp that found a live region is here together. The region's terms and the
+            # body's inertia are read where they are used (region_laws.reread), not held across the visit.
             g = found + 1
             frame = reg_frame[found]
-            n = frame[0]
-            t0 = frame[1]
-            t1 = frame[2]
             arm = reg_arm[found]
             law = reg_law[found]
             kind = reg_kind[found]
@@ -349,54 +345,61 @@ def sweep_closed_bodies(
             sign = float(1.0)
             if (kind & KIND_SECOND) != 0:
                 sign = -1.0
-            sn, sf = frame_twist(v, w, arm, n, t0, t1)
-            Wnn = reg_wnn[found]
-            C = reg_wnf[found]
-            G = reg_wff[found]
-            wrench_old = reg_wrench[found]
-            phi_old = reg_phi[found]
+            sn, sf = frame_twist(v, w, arm, frame[0], frame[1], frame[2])
             set_old = reg_set[found]
             wrench, phi, i0, i1, i2, multipliers, spring, velocity, outcome, _steps = region_visit(
                 sn * sign,
                 sf * sign,
-                Wnn,
-                C,
-                G,
+                found,
+                reg_wnn,
+                reg_wnf,
+                reg_wff,
                 cfm,
                 reg_bf[found],
                 law[0],
                 law[1],
                 kind & FRICTION_ROWS,
-                reg_ball_values[found],
-                reg_ball_vectors[found],
-                reg_ginv[found],
-                reg_k[found],
-                reg_lk[found],
-                reg_lw[found],
+                reg_ball_values,
+                reg_ball_vectors,
+                reg_ginv,
+                reg_k,
+                reg_lk,
+                reg_lw,
                 cand,
                 cand_floor,
                 c0,
                 c1,
-                wrench_old,
-                phi_old,
+                reg_wrench[found],
+                reg_phi[found],
                 set_old[0],
                 set_old[1],
                 set_old[2],
                 reg_spring[found],
             )
-            push, turn = frame_wrench(wrench - wrench_old, phi - phi_old, arm, n, t0, t1)
+            again = reread(found)
+            frame = reg_frame[again]
+            kind = reg_kind[again]
+            sign = float(1.0)
+            if (kind & KIND_SECOND) != 0:
+                sign = -1.0
+            push, turn = frame_wrench(
+                wrench - reg_wrench[again], phi - reg_phi[again], reg_arm[again], frame[0], frame[1], frame[2]
+            )
             force += push * sign
             torque += turn * sign
-            v_new = Avv * force + Avw * torque
-            w_new = wp.transpose(Avw) * force + Aww * torque
+            body = reread(b)
+            Avw = body_inertia[body, 1]
+            v_new = body_inertia[body, 0] * force + Avw * torque
+            w_new = wp.transpose(Avw) * force + body_inertia[body, 2] * torque
             set_new = wp.vec3i(i0, i1, i2)
+            span_c = reg_cand[again]
             publish_region(
                 cand,
                 cand_row,
-                c0,
-                c1,
+                span_c[0],
+                span_c[1],
                 velocity,
-                set_old,
+                reg_set[again],
                 set_new,
                 multipliers,
                 (kind & KIND_SPRINGS) != 0,

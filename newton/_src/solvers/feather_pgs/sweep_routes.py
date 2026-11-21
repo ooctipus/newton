@@ -1024,20 +1024,23 @@ if (moved) {{
             }}
             if (!closes) continue;
         }}
-        struct {{ wp::mat33 v0, v1, v2; }} response{{reg_wnn.data[g], reg_wnf.data[g], reg_wff.data[g]}};
         const wp::vec2 law = reg_law.data[g];
-        const wp::vec3 rhs_f = reg_bf.data[g];
-        const wp::vec3 wrench_old = reg_wrench.data[g], phi_old = reg_phi.data[g];
-        const wp::vec3i set_old = reg_set.data[g];
+        const wp::vec3i set_in = reg_set.data[g];
+        // The region's terms are read where they are used (RegionLaw::reread), not held across the visit.
         const auto out = RegionLaw::region_visit(
-            sn, sf, response.v0, response.v1, response.v2, region_cfm, rhs_f, law[0], law[1],
-            kind & {int(FRICTION_ROWS)}, reg_ball_values.data[g], reg_ball_vectors.data[g],
-            reg_ginv.data[g], reg_k.data[g], reg_lk.data[g], reg_lw.data[g], cand, cand_floor, span[0], span[1], wrench_old, phi_old, set_old[0], set_old[1], set_old[2],
+            sn, sf, g, reg_wnn, reg_wnf, reg_wff, region_cfm, reg_bf.data[g], law[0], law[1],
+            kind & {int(FRICTION_ROWS)}, reg_ball_values, reg_ball_vectors, reg_ginv, reg_k, reg_lk, reg_lw, cand,
+            cand_floor, span[0], span[1], reg_wrench.data[g], reg_phi.data[g], set_in[0], set_in[1], set_in[2],
             reg_spring.data[g]);
+        const int again = RegionLaw::reread(g);
         // The change of the region's wrench through its bodies' bases.
-        const wp::vec3 d_wrench = wp::sub(out.v0, wrench_old), d_phi = wp::sub(out.v1, phi_old);
+        const wp::vec3 d_wrench = wp::sub(out.v0, reg_wrench.data[again]), d_phi = wp::sub(out.v1, reg_phi.data[again]);
+        const wp::mat33 frame_out = reg_frame.data[again];
+        const wp::vec3 n_out(frame_out.data[0][0], frame_out.data[0][1], frame_out.data[0][2]);
+        const wp::vec3 t0_out(frame_out.data[1][0], frame_out.data[1][1], frame_out.data[1][2]);
+        const wp::vec3 t1_out(frame_out.data[2][0], frame_out.data[2][1], frame_out.data[2][2]);
         {{
-            const auto push = RegionLaw::frame_wrench(d_wrench, d_phi, arm, n, t0, t1);
+            const auto push = RegionLaw::frame_wrench(d_wrench, d_phi, reg_arm.data[again], n_out, t0_out, t1_out);
 {push_a}
             if (moved) {{
                 v = wp::vec3(wp::dot(basis[0], u), wp::dot(basis[1], u), wp::dot(basis[2], u));
@@ -1046,17 +1049,20 @@ if (moved) {{
             }}
         }}
         if (f_b >= 0) {{
-            const auto push_b = RegionLaw::frame_wrench(d_wrench, d_phi, arm_b, n, t0, t1);
+            const auto push_b = RegionLaw::frame_wrench(d_wrench, d_phi, reg_arm_b.data[again], n_out, t0_out, t1_out);
 {push_b}
         }}
         // The exit law's vote: a coordinate of the region whose own change is past the floor of its terms (its
         // velocity, its right-hand side, what the region's wrench holds of it).
         {{
-            const wp::mat33 coupling = wp::transpose(response.v1);
-            const wp::vec3 own_n = wp::add(wp::mul(response.v0, d_wrench), wp::mul(response.v1, d_phi));
-            const wp::vec3 own_f = wp::add(wp::mul(coupling, d_wrench), wp::mul(response.v2, d_phi));
-            const wp::vec3 held_n = wp::add(wp::mul(response.v0, out.v0), wp::mul(response.v1, out.v1));
-            const wp::vec3 held_f = wp::add(wp::mul(coupling, out.v0), wp::mul(response.v2, out.v1));
+            const wp::vec3 rhs_f = reg_bf.data[again];
+            const wp::mat33 response_nn = reg_wnn.data[again], response_nf = reg_wnf.data[again];
+            const wp::mat33 response_ff = reg_wff.data[again];
+            const wp::mat33 coupling = wp::transpose(response_nf);
+            const wp::vec3 own_n = wp::add(wp::mul(response_nn, d_wrench), wp::mul(response_nf, d_phi));
+            const wp::vec3 own_f = wp::add(wp::mul(coupling, d_wrench), wp::mul(response_ff, d_phi));
+            const wp::vec3 held_n = wp::add(wp::mul(response_nn, out.v0), wp::mul(response_nf, out.v1));
+            const wp::vec3 held_f = wp::add(wp::mul(coupling, out.v0), wp::mul(response_ff, out.v1));
             for (int k = 0; k < 3; ++k) {{
                 if (!(fabsf(own_n[k]) <= {QUIET_LITERAL} * (fabsf(sn[k]) + fabsf(held_n[k])))) iteration_changed = 1;
                 if (!(fabsf(own_f[k]) <= {QUIET_LITERAL} * (fabsf(sf[k]) + fabsf(rhs_f[k]) + fabsf(held_f[k]))))
@@ -1065,6 +1071,7 @@ if (moved) {{
         }}
         // The candidates' impulses, the friction's, the region's state.
         float* const lambda = world_impulses.data;
+        const wp::vec3i set_old = reg_set.data[again];
         for (int k = 0; k < 3; ++k) if (set_old[k] >= 0) lambda[cand_row.data[set_old[k]]] = 0.0f;
         const int set_new[3] = {{out.v2, out.v3, out.v4}};
         for (int k = 0; k < 3; ++k) if (set_new[k] >= 0) lambda[cand_row.data[set_new[k]]] = out.v5[k];

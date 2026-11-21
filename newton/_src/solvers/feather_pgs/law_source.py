@@ -44,6 +44,7 @@ struct and is called only in a tuple assignment.
 from __future__ import annotations
 
 import ast
+import dataclasses
 import inspect
 import math
 import textwrap
@@ -54,7 +55,7 @@ from typing import Any, get_args, get_origin
 import numpy as np
 import warp as wp
 
-from .device_preludes import DevicePrelude
+from .device_preludes import DevicePrelude, device_branches
 
 __all__ = ["LawFamily", "LawSignature", "law_preludes", "law_signature", "render_cuda"]
 
@@ -231,6 +232,7 @@ class LawFamily:
         cuda: bool = True,
         native: tuple[str, ...] = (),
         dense: tuple[str, ...] = (),
+        everywhere: bool = False,
     ):
         """Register ``definition`` as a law of this family and return its Warp function.
 
@@ -246,9 +248,14 @@ class LawFamily:
             dense: Array arguments the CUDA function reads as dense memory (``data[i]``, constant offsets from one
                 address), where a law reads a record at an offset; its native callers pass contiguous arrays. The
                 Warp function reads them as Warp reads any array.
+            everywhere: The ``native`` statements are the Warp function's CUDA form too (``wp.func_native``, the
+                definition's rendering on the CPU): for a law whose instructions are its point (a value the compiler
+                must not see through), not its arithmetic.
         """
         if definition is None:
-            return lambda fn: self.law(fn, inline=inline, cuda=cuda, native=native, dense=dense)
+            return lambda fn: self.law(fn, inline=inline, cuda=cuda, native=native, dense=dense, everywhere=everywhere)
+        if everywhere and not native:
+            raise ValueError(f"law {definition.__name__}: everywhere states its native statements")
         if inline not in _INLINE:
             raise ValueError(f"inline must be one of {tuple(_INLINE)}, got {inline!r}")
         if self._prelude is not None:
@@ -262,7 +269,7 @@ class LawFamily:
         for parameter in signature.parameters.values():
             if parameter.annotation is inspect.Parameter.empty:
                 raise TypeError(f"law {definition.__name__} must annotate argument {parameter.name}")
-        function = wp.func(definition)
+        function = None if everywhere else wp.func(definition)
         for name in dense:
             annotation = signature.parameters[name].annotation if name in signature.parameters else None
             if annotation is None or not wp.types.is_array(annotation) or annotation.ndim != 1:
@@ -270,6 +277,15 @@ class LawFamily:
         entry = _Law(
             definition, function, self, inline, cuda, signature, annotations, results, tuple(native), tuple(dense)
         )
+        if everywhere:
+            # The CUDA statements under the guard, the definition's CPU rendering past it.
+            lines = _Renderer(entry).render("", cpu=True).splitlines()
+            opening = next(k for k, line in enumerate(lines) if line.startswith("static "))
+            snippet = device_branches(
+                "".join(f"    {line}\n" for line in native), "".join(line + "\n" for line in lines[opening + 1 : -1])
+            )
+            function = wp.func_native(snippet)(definition)
+            entry = dataclasses.replace(entry, function=function)
         self._laws.append(entry)
         _LAWS[id(function)] = entry
         _LAWS[id(definition)] = entry

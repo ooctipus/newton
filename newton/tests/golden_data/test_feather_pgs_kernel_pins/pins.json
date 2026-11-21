@@ -75,7 +75,7 @@
   "region_sweep.place_bodies": "a278791abe48fe407e2980cfbe88d7cec551fefc79a9b0c66a75185b70fa3ab6",
   "region_sweep.place_regions": "b1d71a3c02cce2f7059ff3b8f5d64ede13137b074a19629910a2ccc6a1887147",
   "region_sweep.stage_blocks": "15981339dc3bb2acd28bfed66823ab9a2d74fca8a26865ea5920d83febac7ad2",
-  "region_sweep.sweep_closed_bodies": "14633a8827275df4aac1e14669baf222da39edf70f7280e699d214c5b1d4e613",
+  "region_sweep.sweep_closed_bodies": "2c00184a81d6feadf6a4b8496e7dd93f3e6df7433a9715fb998a25a860eb6007",
   "row_kernels.allocate_link_slots": "486e985b17405adbd3051190872d26f2d534932c4b2ecd98f50d915c769c8337",
   "row_kernels.prepare_fused_diagonal_joint_limits": "feb59355265de073af569080267decd828e5316e8cd1881d6da2dc08c4c9c881",
   "row_kernels.write_link_rows": "990ba072b2805e8b72487fbaa29203f9ab5686a49f3ce2b5c527aa06323e9813",
