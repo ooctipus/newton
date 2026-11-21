@@ -37,13 +37,28 @@ def tangent_basis(n):
 
 
 @wp.kernel(enable_backward=False)
-def _region_reach(
-    cand: wp.array[wp.vec4], spans: wp.array[wp.vec2i], arms: wp.array[wp.vec3], reach: wp.array[wp.vec2]
-):
-    """Each region's idle reach (:func:`.region_laws.idle_reach`), as the listing's fill forms it (no second body)."""
+def _region_bound(cand: wp.array[wp.vec4], spans: wp.array[wp.vec2i], bound: wp.array[wp.vec2]):
+    """Each region's closing bound (:func:`.region_laws.idle_bound`), as the listing's fill forms it."""
     g = wp.tid()
     span = spans[g]
-    reach[g] = region_laws.idle_reach(cand, span[0], span[1], arms[g], wp.vec3(0.0), False)
+    bound[g] = region_laws.idle_bound(cand, span[0], span[1])
+
+
+@wp.kernel(enable_backward=False)
+def _bound_against_closing(
+    cand: wp.array[wp.vec4],
+    floors: wp.array[float],
+    spans: wp.array[wp.vec2i],
+    velocities: wp.array[wp.vec3],
+    passed: wp.array[int],
+    closes: wp.array[int],
+):
+    """Each region's closing bound's verdict at its velocity, and the candidates' closing test's."""
+    g = wp.tid()
+    span = spans[g]
+    s = velocities[g]
+    passed[g] = int(region_laws.stays_open(s, region_laws.idle_bound(cand, span[0], span[1])))
+    closes[g] = int(region_sweep.region_closes(s, cand, floors, span[0], span[1]))
 
 
 @wp.kernel(enable_backward=False)
@@ -187,8 +202,8 @@ class Bodies:
             device=device,
         )
         cands, cand_spans = array(self.cands, wp.vec4), array(self.cand_spans, wp.vec2i)
-        reach = wp.zeros(regions, dtype=wp.vec2, device=device)
-        wp.launch(_region_reach, dim=regions, inputs=[cands, cand_spans, arms], outputs=[reach], device=device)
+        bound = wp.zeros(regions, dtype=wp.vec2, device=device)
+        wp.launch(_region_bound, dim=regions, inputs=[cands, cand_spans], outputs=[bound], device=device)
         wp.launch(
             region_sweep.sweep_closed_bodies,
             dim=bodies,
@@ -219,7 +234,7 @@ class Bodies:
                 array(-np.ones((regions, 3)), wp.vec3i),
                 wp.zeros(regions, dtype=wp.vec3, device=device),
                 array(np.full(regions, int(region_sweep.REGION_IDLE)), int),
-                reach,
+                bound,
                 impulses,
                 change,
             ],
@@ -269,10 +284,52 @@ class TestRegionLaw(unittest.TestCase):
         pile, a near-dependent third row entered and threw a 13 g part to 200 m/s)."""
         self.check(RIGID, 300, 2.0e-6, 1.0e-4, light=True)
 
+    def test_the_closing_bound_passes_only_regions_that_do_not_close(self):
+        """A region the closing bound passes is one whose candidates' test finds none closing (the bound is exact),
+        at velocities placed at the bound's edge from both sides, at scales from 1e-30 to 1e6 m/s; and it passes
+        nearly every region that opens away from its candidates."""
+        rng = np.random.default_rng(11)
+        regions, per = 40000, 5
+        scale = 10.0 ** rng.uniform(-30.0, 6.0, regions)
+        a = rng.uniform(-1.0, 1.0, (regions, per, 2)) * 10.0 ** rng.uniform(-4.0, 0.0, (regions, 1, 1))
+        b = scale[:, None] * rng.uniform(-0.2, 1.0, (regions, per))
+        eps = np.where(rng.random((regions, per)) < 0.5, 0.0, rng.uniform(0.0, 1.0, (regions, per)))
+        records = np.concatenate([a, b[..., None], eps[..., None]], axis=2).astype(np.float32)
+        floors = (scale[:, None] * rng.uniform(0.0, 1.0e-6, (regions, per))).astype(np.float32)
+        tangential = scale[:, None] * rng.uniform(-1.0, 1.0, (regions, 2))
+        lever = (np.abs(records[..., 0]) + np.abs(records[..., 1])).max(axis=1).astype(np.float64)
+        edge = lever * np.abs(tangential).max(axis=1) - records[..., 2].min(axis=1)
+        # Half the regions at the bound's edge (a relative nudge of a few roundings either way), half spread wide.
+        nudge = np.where(
+            rng.random(regions) < 0.5, rng.uniform(-1.0e-5, 1.0e-5, regions), rng.uniform(-2.0, 2.0, regions)
+        )
+        normal = edge + nudge * np.maximum(np.abs(edge), scale)
+        velocities = np.column_stack([normal, tangential]).astype(np.float32)
+        device = wp.get_device("cpu")
+        spans = np.stack([np.arange(regions) * per, np.arange(regions) * per + per], axis=1)
+        passed = wp.zeros(regions, dtype=int, device=device)
+        closes = wp.zeros(regions, dtype=int, device=device)
+        wp.launch(
+            _bound_against_closing,
+            dim=regions,
+            inputs=[
+                wp.array(records.reshape(-1, 4), dtype=wp.vec4, device=device),
+                wp.array(floors.reshape(-1), dtype=float, device=device),
+                wp.array(spans, dtype=wp.vec2i, device=device),
+                wp.array(velocities, dtype=wp.vec3, device=device),
+            ],
+            outputs=[passed, closes],
+            device=device,
+        )
+        passed, closes = passed.numpy().astype(bool), closes.numpy().astype(bool)
+        self.assertEqual(int((passed & closes).sum()), 0)
+        clear = velocities[:, 0].astype(np.float64) > edge + 1.0e-3 * np.maximum(np.abs(edge), scale)
+        self.assertGreater(float(passed[clear].mean()), 0.99)
+
     def test_the_laws_render_for_native_sweeps(self):
         """Every law of the family has a native form (the general sweep's region phase calls them)."""
         source = region_laws.REGION_LAW.prelude().source
-        for law in ("region_visit", "region_block", "frame_twist", "frame_wrench", "frame_response"):
+        for law in ("region_visit", "region_block", "frame_twist", "frame_wrench", "frame_response", "stays_open"):
             self.assertIn(f" {law}(", source)
 
 

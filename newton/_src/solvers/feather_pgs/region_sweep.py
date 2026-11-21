@@ -15,7 +15,9 @@ The lanes of a warp take two kinds of step together:
 - *scan*: the body's regions in their order. A region that holds a wrench and whose body's twist has the bits its
   last settled visit left is passed (the pass rule, in its exact form: a stamp against a version the lane raises
   whenever a visit changes a bit of the twist). A region that holds nothing is opened only if one of its candidates
-  closes at the body's twist: its frame and its candidates' records are read, nothing is written.
+  closes at the body's twist: its frame and closing bound are read, and where the bound cannot rule a closing out
+  (:func:`.region_laws.stays_open`, exact) its candidates' records; nothing is written. A scan step's reads are issued
+  together.
 - *solve*: every lane that found a live region visits it now.
 
 A lane leaves the sweeps when every region has been seen at the twist as it is: after a sweep in which no visit
@@ -24,7 +26,7 @@ running every configured sweep: every later visit would be passed or idle).
 
 A region that cannot act is *left out* (:data:`REGION_LEFT`, :func:`region_left`): no candidate of it closes at the
 predictor, none of its contacts carried a load from the last substep, and it is no block's. Each is tested once a
-sweep, as a region that holds nothing is (its idle reach, then the closing test). A closed body's lane reaches each
+sweep, as a region that holds nothing is (its closing bound, then the closing test). A closed body's lane reaches each
 of its regions once a sweep, so its scan tests a left-out region in place, as any region that holds nothing. The
 general sweep's region phase passes it, and the world's lanes test it at the sweep's end at the twist the sweep leaves
 (:func:`.sweep_routes.region_verify`): one that closes joins the next sweep, at most one sweep after the sweep of every
@@ -78,11 +80,11 @@ from .region_laws import (
     frame_response,
     frame_twist,
     frame_wrench,
-    idle_reach,
+    idle_bound,
     region_visit,
     reread,
+    stays_open,
     stick_terms,
-    twist_reach,
 )
 from .row_build import contact_gap_rate, member_contact_row, member_row_law
 from .row_kernels import RowBias, row_bias_words
@@ -275,7 +277,7 @@ def closed_body(
     reg_set: wp.array[wp.vec3i],
     reg_spring: wp.array[wp.vec3],
     reg_state: wp.array[int],
-    reg_reach: wp.array[wp.vec2],
+    reg_bound: wp.array[wp.vec2],
     impulses: wp.array[float],
     lane_change: wp.array[wp.spatial_vector],
 ):
@@ -300,25 +302,29 @@ def closed_body(
             limit = quiet_at
         g = r0
         while g < limit:
-            # Scan: the first live region from g on.
+            # Scan: the first live region from g on. A step's reads are issued together (none waits on another).
             found = int(_BIG)
             while g < limit and found == _BIG:
                 state = reg_state[g]
+                frame = reg_frame[g]
+                arm = reg_arm[g]
+                kind = reg_kind[g]
+                span_c = reg_cand[g]
+                bound = reg_bound[g]
                 live = int(0)
                 if state != version:
                     if state >= REGION_LOOSE:
                         live = 1
-                    elif not (reg_reach[g][0] * twist_reach(v, w) <= 1.0 and reg_reach[g][1] == 0.0):
-                        # Within its idle reach a region that holds nothing stays open (region_laws.idle_reach).
-                        frame = reg_frame[g]
-                        arm = reg_arm[g]
+                    else:
+                        # A region that holds nothing is opened only if a candidate closes at the body's twist; its
+                        # closing bound passes it without the candidates' reads where none can (stays_open, exact).
                         at = v + wp.cross(w, arm)
                         sn = wp.vec3(wp.dot(frame[0], at), wp.dot(frame[1], w), wp.dot(frame[2], w))
-                        if (reg_kind[g] & KIND_SECOND) != 0:
+                        if (kind & KIND_SECOND) != 0:
                             sn = -sn
-                        span_c = reg_cand[g]
-                        if region_closes(sn, cand, cand_floor, span_c[0], span_c[1]):
-                            live = 1
+                        if not stays_open(sn, bound):
+                            if region_closes(sn, cand, cand_floor, span_c[0], span_c[1]):
+                                live = 1
                 if live == 1:
                     found = g
                 else:
@@ -475,7 +481,7 @@ def sweep_closed_bodies(
     reg_set: wp.array[wp.vec3i],
     reg_spring: wp.array[wp.vec3],
     reg_state: wp.array[int],
-    reg_reach: wp.array[wp.vec2],
+    reg_bound: wp.array[wp.vec2],
     impulses: wp.array[float],
     lane_change: wp.array[wp.spatial_vector],
 ):
@@ -523,7 +529,7 @@ def sweep_closed_bodies(
             reg_set,
             reg_spring,
             reg_state,
-            reg_reach,
+            reg_bound,
             impulses,
             lane_change,
         )
@@ -1252,7 +1258,7 @@ def fill_regions(
     reg_set: wp.array[wp.vec3i],
     reg_spring: wp.array[wp.vec3],
     reg_state: wp.array[int],
-    reg_reach: wp.array[wp.vec2],
+    reg_bound: wp.array[wp.vec2],
 ):
     """The placed regions formed (:func:`order_regions`; the first ``cursor[0]`` of the stream), ``threads`` lanes
     striding over them.
@@ -1263,8 +1269,8 @@ def fill_regions(
     incident velocity the frame's); its friction rows' right-hand sides are the row law's with the predictor's
     slips and spin. Each member's rows take their laws where its front end is formed (:func:`member_laws`), the
     carrier's first, so the region reads them: the free bodies' writer leaves the regions' rows their kinds alone. It
-    starts holding nothing, with the coefficients up to which its bodies' twists leave it open
-    (:func:`.region_laws.idle_reach`), formed once its candidates are, and left out of the sweeps until their end where
+    starts holding nothing, with its candidates' closing bound (:func:`.region_laws.idle_bound`), formed once they are,
+    and left out of the sweeps until their end where
     it cannot act (:func:`region_left`, under ``leave_out``: ``anchored`` and ``anchor_source`` the patch frame's).
 
     A region's candidates are the work a region has, 1 to tens of them, and a warp's 32 regions would hold its lanes
@@ -1352,7 +1358,7 @@ def fill_regions(
         lane_sync(_FILL_LANES)
         if holds:
             reg_kind[g] = kind
-            reg_reach[g] = idle_reach(cand, c0, c0 + size, reg_arm[g], reg_arm_b[g], reg_body[g][1] >= 0)
+            reg_bound[g] = idle_bound(cand, c0, c0 + size)
             if leave_out != 0 and region_left(
                 kind, c0, c0 + size, cand, cand_floor, cand_contact, anchored, anchor_source
             ):
@@ -2024,7 +2030,7 @@ _REGION_FIELDS = (
     ("reg_spring", wp.vec3, 1),
     ("reg_state", wp.int32, 1),
     ("reg_stamp", wp.int32, 1),
-    ("reg_reach", wp.vec2, 1),
+    ("reg_bound", wp.vec2, 1),
     ("reg_level", wp.int32, 1),
     ("reg_order", wp.int32, 1),
     ("level_region", wp.int32, 1),
@@ -2401,7 +2407,7 @@ class Regions:
                 self.reg_set,
                 self.reg_spring,
                 self.reg_state,
-                self.reg_reach,
+                self.reg_bound,
             ],
             block_dim=_FILL_SHAPE.block,
             **live,
@@ -2570,7 +2576,7 @@ class Regions:
                 self.reg_set,
                 self.reg_spring,
                 self.reg_state,
-                self.reg_reach,
+                self.reg_bound,
                 impulses.reshape((impulses.size,)),
                 self.lane_change,
             ],
@@ -2629,7 +2635,7 @@ class Regions:
         names += " reg_frame reg_arm reg_arm_b reg_body reg_cand reg_law reg_wnn reg_wnf reg_wff reg_ball_values"
         names += " reg_ball_vectors reg_ginv reg_k reg_lk reg_lw"
         names += " reg_bf reg_kind reg_row cand cand_floor cand_row reg_wrench reg_phi reg_set reg_spring reg_state reg_stamp"
-        names += " reg_reach body_seen body_version blk_pair blk_blob blk_L blk_d blk_wrench blk_stage blk_istage"
+        names += " reg_bound body_seen body_version blk_pair blk_blob blk_L blk_d blk_wrench blk_stage blk_istage"
         return {**{name: getattr(self, name) for name in names.split()}, "region_cfm": float(self.options.pgs_cfm)}
 
 

@@ -935,43 +935,51 @@ def frame_twist(v: wp.vec3, w: wp.vec3, r: wp.vec3, n: wp.vec3, t0: wp.vec3, t1:
     return wp.vec3(wp.dot(n, at), wp.dot(t0, w), wp.dot(t1, w)), wp.vec3(wp.dot(t0, at), wp.dot(t1, at), wp.dot(n, w))
 
 
-IDLE_MARGIN = wp.constant(1.00390625)
-"""The idle pass's margin, ``1 + 2^-8`` (:func:`idle_reach`, :func:`twist_reach`): far beyond the rounding of the
-bound's terms and of the closing test it stands for (a few ``2^-24`` relative to their magnitudes)."""
+STAY_MARGIN = wp.constant(1.0 + 2.0**-16)
+"""The closing bound's relative margin (:func:`stays_open`), ``1 + 2^-16``: past the few roundings of the bound's terms
+(``2^-24`` each) by a factor of a thousand."""
+STAY_FLOOR = wp.constant(2.0**-100)
+"""The closing bound's absolute margin (:func:`stays_open`), ``2^-100``: past the underflow of every rounding in the
+bound and in the closing test (``2^-126`` each, flushed or gradual) by a factor of 2^20."""
 
 
 @REGION_LAW.law
-def twist_reach(v: wp.vec3, w: wp.vec3) -> float:
-    """A bound of a body's twist ``|(v, w)|`` as computed: the root of its rounded square, times :data:`IDLE_MARGIN`."""
-    return wp.sqrt(wp.dot(v, v) + wp.dot(w, w)) * IDLE_MARGIN
-
-
-@REGION_LAW.law
-def idle_reach(cand: wp.array[wp.vec4], g0: int, g1: int, arm: wp.vec3, arm_b: wp.vec3, second: bool) -> wp.vec2:
-    """The coefficients ``(c_a, c_b)`` up to which a region that holds nothing stays open: while ``c_a R_a + c_b R_b
-    <= 1``, ``R`` its bodies' :func:`twist_reach`, no candidate of ``cand[g0:g1]`` closes (``b`` its right-hand side).
-
-    A candidate's closing ``n . (v + w x arm) + a1 t0 . w + a2 t1 . w + b`` (:func:`frame_twist`, the frame unit) moves
-    from ``b`` by at most ``(1 + |arm| + |a1| + |a2|) |(v, w)|`` a body. So ``c = (1 + |arm| + max |a1| + |a2|) / min b``,
-    times :data:`IDLE_MARGIN` cubed, which covers the rounding of the bound and of the test: the test's computed
-    closing stays positive. A candidate whose ``b`` is not positive (or NaN) gives infinite coefficients, which no
-    twist passes; a region without a second body has ``c_b = 0``."""
+def idle_bound(cand: wp.array[wp.vec4], g0: int, g1: int) -> wp.vec2:
+    """The closing bound ``(b_min, lever)`` of a region whose candidates are ``cand[g0:g1]`` (records ``(a1, a2, b,
+    eps)``): their least right-hand side ``b`` (NaN where one is NaN) and their largest ``|a1| + |a2|`` as rounded, for
+    :func:`stays_open`. Without candidates ``(1e30, 0)``."""
     least = float(_NONE)
     lever = float(0.0)
-    passable = bool(True)
+    finite = bool(True)
     for i in range(g0, g1):
         record = cand[i]
-        if not (record[2] > 0.0):
-            passable = False
+        if not (record[2] == record[2]):
+            finite = False
         least = wp.min(least, record[2])
         lever = wp.max(lever, wp.abs(record[0]) + wp.abs(record[1]))
-    if not passable:
-        return wp.vec2(wp.inf, wp.inf)
-    scale = IDLE_MARGIN * IDLE_MARGIN * IDLE_MARGIN / least
-    c_b = float(0.0)
-    if second:
-        c_b = (1.0 + wp.length(arm_b) + lever) * scale
-    return wp.vec2((1.0 + wp.length(arm) + lever) * scale, c_b)
+    if not finite:
+        least = wp.nan
+    return wp.vec2(least, lever)
+
+
+@REGION_LAW.law
+def stays_open(s: wp.vec3, bound: wp.vec2) -> bool:
+    """Whether no candidate of a region closes at its velocity ``s`` (the normal coordinates the closing test reads,
+    :func:`candidate_closes`), from the region's closing bound ``(b_min, lever)`` (:func:`idle_bound`) alone: as
+    computed, ``s0 + b_min >= lever max(|s1|, |s2|)`` times :data:`STAY_MARGIN` plus :data:`STAY_FLOOR`.
+
+    The test is exact: where it holds, the closing test of every candidate is false, so a region it passes is one the
+    candidates' test would pass, and every result is the same bit for bit. With ``u = 2^-24``, ``m = max(|s1|, |s2|)``
+    and ``q = fl(lever m)``, the test's two roundings and ``s0 + b_min``'s give ``s0 + b_min >= (1 - 3u) (q
+    STAY_MARGIN + STAY_FLOOR)``; each candidate's ``|a1| + |a2| <= (1 + u) lever``, and ``lever m <= q / (1 - u) +
+    2^-126``, so its residual ``s0 + a1 s1 + a2 s2 + b >= s0 + b_min - (1 + u) lever m >= 2^-101`` exactly. Its
+    computed residual (three products and sums of the dot, one sum with ``b``) lies within ``4u S + 2^-124`` of it,
+    ``S = |s0| + |a1 s1| + |a2 s2| + |b|``, and its computed floor (:func:`closing_floor`) is at least ``QUIET S (1 -
+    6u) - 2^-123``, ``QUIET = 16u``: the residual is at least minus the floor, and the candidate does not close. A NaN in
+    ``s0``, ``b_min`` or ``lever``, or a bound past the largest float, fails the test (the candidates' test runs); a NaN
+    in ``s1`` or ``s2`` makes every candidate's residual NaN, which closes none."""
+    reach = bound[1] * wp.max(wp.abs(s[1]), wp.abs(s[2])) * STAY_MARGIN + STAY_FLOOR
+    return reach < wp.inf and s[0] + bound[0] >= reach
 
 
 @REGION_LAW.law

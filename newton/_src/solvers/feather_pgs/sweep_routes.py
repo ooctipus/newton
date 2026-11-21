@@ -839,7 +839,7 @@ REGION_OPERANDS = (
     ("reg_spring", wp.array[wp.vec3]),
     ("reg_state", wp.array[int]),
     ("reg_stamp", wp.array[int]),
-    ("reg_reach", wp.array[wp.vec2]),
+    ("reg_bound", wp.array[wp.vec2]),
     ("body_seen", wp.array[wp.spatial_vector]),
     ("body_version", wp.array[int]),
     ("blk_pair", wp.array[wp.vec2i]),
@@ -937,7 +937,6 @@ if (moved) {{
     int body = -1, first = 0, version = 0;
     wp::spatial_vector u;
     wp::vec3 v, w;
-    float reach = 0.0f;
     const wp::spatial_vector* basis = body_basis.data;
     // A chain world walks its order itself (reg_order: a body's regions together, so its twist stays kept), as one
     // span; the others take the levels.
@@ -975,14 +974,12 @@ if (moved) {{
             }}
             v = wp::vec3(wp::dot(basis[0], u), wp::dot(basis[1], u), wp::dot(basis[2], u));
             w = wp::vec3(wp::dot(basis[3], u), wp::dot(basis[4], u), wp::dot(basis[5], u));
-            reach = RegionLaw::twist_reach(v, w);
         }}
         // A region between two movable bodies: its second body's walk coordinates, version and twist.
         int first_b = -1, version_b = 0;
         wp::spatial_vector u_b;
         const wp::spatial_vector* basis_b = basis;
         wp::vec3 v_b, w_b;
-        float reach_b = 0.0f;
         if (f_b >= 0) {{
             first_b = body_first.data[f_b];
             basis_b = body_basis.data + (size_t)f_b * 6;
@@ -991,17 +988,10 @@ if (moved) {{
             }}
             v_b = wp::vec3(wp::dot(basis_b[0], u_b), wp::dot(basis_b[1], u_b), wp::dot(basis_b[2], u_b));
             w_b = wp::vec3(wp::dot(basis_b[3], u_b), wp::dot(basis_b[4], u_b), wp::dot(basis_b[5], u_b));
-            reach_b = RegionLaw::twist_reach(v_b, w_b);
         }}
         if (state == version && (f_b < 0 || reg_stamp.data[g] == version_b)) continue;
         const int kind = reg_kind.data[g];
 {pair_block}
-        // A region that holds nothing stays open while its bodies' twists stay within its idle reach: no candidate
-        // can close (region_laws.idle_reach), so the closing test below would leave it.
-        if (state == {int(REGION_IDLE)}) {{
-            const wp::vec2 idle = reg_reach.data[g];
-            if (idle[0] * reach + idle[1] * reach_b <= 1.0f) continue;
-        }}
         const float sign = (kind & {int(KIND_SECOND)}) != 0 ? -1.0f : 1.0f;
         const wp::mat33 frame = reg_frame.data[g];
         const wp::vec3 n(frame.data[0][0], frame.data[0][1], frame.data[0][2]);
@@ -1017,6 +1007,9 @@ if (moved) {{
         }}
         const wp::vec2i span = reg_cand.data[g];
         if (state == {int(REGION_IDLE)}) {{
+            // A region that holds nothing is opened only if a candidate closes; its closing bound passes it without
+            // the candidates' reads where none can (region_laws.stays_open, exact: the test below would leave it).
+            if (RegionLaw::stays_open(sn, reg_bound.data[g])) continue;
             bool closes = false;
             for (int i = span[0]; i < span[1]; ++i) {{
                 const wp::vec4 record = cand.data[i];
@@ -1045,7 +1038,6 @@ if (moved) {{
             if (moved) {{
                 v = wp::vec3(wp::dot(basis[0], u), wp::dot(basis[1], u), wp::dot(basis[2], u));
                 w = wp::vec3(wp::dot(basis[3], u), wp::dot(basis[4], u), wp::dot(basis[5], u));
-                reach = RegionLaw::twist_reach(v, w);
             }}
         }}
         if (f_b >= 0) {{
@@ -1111,7 +1103,8 @@ def region_verify(iteration: str = ITERATION, budget: str = "sweep_budget", pad:
     """Native statements of a sweep's end that test the world's left-out regions (:data:`.region_sweep.REGION_LEFT`:
     none of their candidates closed at the predictor): the world's lanes take its regions, each left-out one at its
     bodies' twists as the sweep leaves them (their walk coordinates ``s_v`` through their bases) by the phase's own
-    test of a region that holds nothing (within its idle reach none closes; past it, the closing test). One that
+    test of a region that holds nothing (its closing bound, then the closing test where the bound cannot rule it
+    out). One that
     closes joins the next sweep as a region that holds nothing (:data:`.region_sweep.REGION_IDLE`) and the sweeps may
     not stop; a sweep more where ``budget`` ends at ``iteration``. So every region still left out at the end holds
     nothing at a motion where none of its candidates closes."""
@@ -1129,17 +1122,12 @@ const wp::vec3 w{s}(wp::dot(basis{s}[3], u{s}), wp::dot(basis{s}[4], u{s}), wp::
         if (reg_state.data[g] != {int(REGION_LEFT)}) continue;
         const wp::vec2i sides = reg_body.data[g];
 {indent(twist.format(s="", f="sides[0]"), "        ")}
-        // Within its idle reach no candidate closes (region_laws.idle_reach), as in the phase.
-        const wp::vec2 idle = reg_reach.data[g];
-        float reach_b = 0.0f;
         wp::vec3 v_b, w_b;
         if (sides[1] >= 0) {{
 {indent(twist.format(s="_b_", f="sides[1]"), "            ")}
             v_b = v_b_;
             w_b = w_b_;
-            reach_b = RegionLaw::twist_reach(v_b, w_b);
         }}
-        if (idle[0] * RegionLaw::twist_reach(v, w) + idle[1] * reach_b <= 1.0f) continue;
         const float sign = (reg_kind.data[g] & {int(KIND_SECOND)}) != 0 ? -1.0f : 1.0f;
         const wp::mat33 frame = reg_frame.data[g];
         const wp::vec3 n(frame.data[0][0], frame.data[0][1], frame.data[0][2]);
@@ -1149,6 +1137,8 @@ const wp::vec3 w{s}(wp::dot(basis{s}[3], u{s}), wp::dot(basis{s}[4], u{s}), wp::
         if (sides[1] >= 0) {{
             sn = wp::sub(sn, wp::mul(RegionLaw::frame_twist(v_b, w_b, reg_arm_b.data[g], n, t0, t1).v0, sign));
         }}
+        // Where its closing bound rules a closing out none closes (region_laws.stays_open), as in the phase.
+        if (RegionLaw::stays_open(sn, reg_bound.data[g])) continue;
         const wp::vec2i span = reg_cand.data[g];
         bool closes = false;
         for (int i = span[0]; i < span[1]; ++i) {{
