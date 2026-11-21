@@ -1463,6 +1463,14 @@ def _own_pair_keys(pair_keys: wp.array[wp.int64]):
     pair_keys[c] = wp.int64(c)
 
 
+@wp.kernel
+def _own_roots(parent: wp.array[wp.int32]):
+    """Each tree its own root, as the reservation leaves them: a launch, which a graph capture holds (a copy from a
+    host buffer replays whatever that buffer's memory holds by then)."""
+    t = wp.tid()
+    parent[t] = t
+
+
 def row_order(contacts: np.ndarray, pair_keys: np.ndarray | None = None, sides: np.ndarray | None = None) -> np.ndarray:
     """A world's ``contacts`` (their frame positions, ascending: every contact of its run, admitted or not) in its rows'
     order (:func:`.row_slots.reserve_world_rows`): their body pairs (``pair_keys`` of those contacts; each its own
@@ -1537,9 +1545,12 @@ def allocate_contacts(operands, device) -> None:
         setattr(order, name, wp.zeros(n, dtype=dtype, device=device))
     for name in ("pairs_before", "pairs", "pair_island", "pair_rank", "row_pairs"):
         setattr(order, name, wp.zeros(n, dtype=int, device=device))
+    order.pair_sides = wp.zeros(n, dtype=wp.vec2i, device=device)
     trees = max(values["data"].response_dofs.shape[0], 1)
-    for name in ("island_parent", "island_size", "island_base"):
-        setattr(order, name, wp.zeros(trees, dtype=wp.int32, device=device))
+    order.island_parent = wp.empty(trees, dtype=wp.int32, device=device)
+    wp.launch(_own_roots, dim=trees, outputs=[order.island_parent], device=device)
+    order.island_size = wp.zeros(trees, dtype=wp.int32, device=device)
+    order.island_base = wp.zeros(trees, dtype=wp.vec2i, device=device)
     values["order"] = order
 
     def args(kernel):

@@ -747,6 +747,11 @@ def lane_ballot(p: bool, lanes: int) -> wp.uint32:
     """The group's votes on ``p``, a bit a lane, lane 0 lowest (one bit on the CPU)."""
 
 
+@wp.func_native(lane_word(_RETURN.format("MATCH(value)"), "lanes", (LANE_WORDS,)))
+def lane_match(value: int, lanes: int) -> wp.uint32:
+    """The group's lanes whose ``value`` is this lane's, a bit a lane, lane 0 lowest (one bit on the CPU)."""
+
+
 @wp.func_native(lane_word(_RETURN.format("BELOW(bits)"), "lanes"))
 def lane_below(bits: wp.uint32, lanes: int) -> int:
     """The ``bits`` of this thread's lower lanes (0 on the CPU): its rank among the lanes that voted."""

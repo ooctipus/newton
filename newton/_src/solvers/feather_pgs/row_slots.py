@@ -23,7 +23,8 @@ from .device_preludes import (
     lane_below,
     lane_count,
     lane_index,
-    lane_read,
+    lane_last,
+    lane_match,
     lane_scan,
     lane_stride,
     lane_sum,
@@ -392,11 +393,13 @@ class RowOrder:
     positions: each position's body-pair key; the world's span of positions (``world_contact_first``,
     ``world_contact_last``, which the admission records); at each of its contacts the admitted contacts' rows of the
     four lists before it in the world's frame order (``rows_frame``) and its body pair's index among the world's
-    (``pairs_before``); its ``j``-th pair's head at ``first + j`` (``pairs``), the pair's island and its rank there
-    (``pair_island``, ``pair_rank``), and the index of the pair the row order visits ``q``-th at ``first + q``
-    (``row_pairs``); at each pair's head the rows of each list of the pairs before it in the row order
-    (``rows_before``); and by articulation, the islands' union-find parents, sizes and first places in the row order
-    (``island_parent``, ``island_size``, ``island_base``)."""
+    (``pairs_before``); its ``j``-th pair's head at ``first + j`` (``pairs``), the trees it touches (``pair_sides``,
+    :func:`.row_records.row_sides`), its island and its rank there (``pair_island``, ``pair_rank``), and the index of
+    the pair the row order visits ``q``-th at ``first + q`` (``row_pairs``); at each pair's head the rows of each list
+    of the pairs before it in the row order
+    (``rows_before``); and by articulation, the islands' union-find parents, sizes, and first places in the row order
+    with their strides' inverses (``island_parent``, ``island_size``, ``island_base``), each tree its own root and
+    size zero between reservations."""
 
     pair_keys: wp.array[wp.int64]
     world_contact_first: wp.array[int]
@@ -404,13 +407,14 @@ class RowOrder:
     rows_frame: wp.array[wp.vec4i]
     pairs_before: wp.array[int]
     pairs: wp.array[int]
+    pair_sides: wp.array[wp.vec2i]
     pair_island: wp.array[int]
     pair_rank: wp.array[int]
     row_pairs: wp.array[int]
     rows_before: wp.array[wp.vec4i]
     island_parent: wp.array[wp.int32]
     island_size: wp.array[int]
-    island_base: wp.array[int]
+    island_base: wp.array[wp.vec2i]
 
 
 @wp.func
@@ -475,11 +479,11 @@ def _row_inverse(n: int) -> int:
     """The place of rank 1 in an island's row order over its ``n`` pairs: the inverse of :func:`_row_stride` modulo
     ``n`` (extended Euclid), so the pair of rank ``j`` takes place ``j * inverse mod n`` and place ``q`` holds rank
     ``q * stride mod n``."""
-    t = wp.int64(0)
-    t_next = wp.int64(1)
-    r = wp.int64(n)
-    r_next = wp.int64(_row_stride(n))
-    while r_next != wp.int64(0):
+    t = int(0)
+    t_next = int(1)
+    r = n
+    r_next = _row_stride(n)
+    while r_next != 0:
         q = r // r_next
         t_new = t - q * t_next
         t = t_next
@@ -487,17 +491,9 @@ def _row_inverse(n: int) -> int:
         r_new = r - q * r_next
         r = r_next
         r_next = r_new
-    if t < wp.int64(0):
-        t += wp.int64(n)
-    return int(t)
-
-
-@wp.func
-def _pair_side(data: ContactInput, order: RowOrder, first: int, j: int) -> int:
-    """The lowest tree with response coordinates the world's ``j``-th body pair touches (:func:`.row_records.row_sides`;
-    -1 for none)."""
-    head = order.pairs[first + j]
-    return row_sides(data.art0[head], data.art1[head], data.response_dofs)[0]
+    if t < 0:
+        t += n
+    return t
 
 
 @wp.func
@@ -506,58 +502,41 @@ def _order_islands(data: ContactInput, order: RowOrder, first: int, pairs: int, 
     ``order.row_pairs[first + q]`` the index of the pair the order visits ``q``-th.
 
     An island is a component of the world's pairs joined by the trees they touch (:func:`.row_records.row_sides`, the
-    sweeps' resources), labelled by its lowest tree (:mod:`~newton._src.core.union_find`). The islands take the row
-    order in the frame order of their first pairs, each a run of its own pairs at a golden-ratio stride over their
-    ranks in frame order (:func:`_row_stride` of its own count). A pair that touches no tree with coordinates holds no
-    rows: those follow the islands, in frame order. Every place depends only on the pair's island, so a pair of another
-    island never moves it; the islands' places among each other are free (they share no tree). A world that is one
-    island takes the order of a stride over all its pairs."""
+    sweeps' resources): the frame's pass joined each pair's trees (:mod:`~newton._src.core.union_find`), so each
+    island's root is its lowest tree. The islands take the row order in the frame order of their first pairs, each a
+    run of its own pairs at a golden-ratio stride over their ranks in frame order (place ``q`` holds rank
+    ``q * stride mod n``, :func:`_row_stride` of its own count ``n``). A pair that touches no tree with coordinates
+    holds no rows: those follow the islands, in frame order. Every place depends only on the pair's island, so a pair
+    of another island never moves it; the islands' places among each other are free (they share no tree). A world that
+    is one island takes the order of a stride over all its pairs. Each tree starts as its own root with an empty island,
+    as the reservation leaves it after the slots."""
     parent = order.island_parent
     size = order.island_size
-    # Each tree a singleton.
-    for j in range(lane, pairs, lanes):
-        head = order.pairs[first + j]
-        sides = row_sides(data.art0[head], data.art1[head], data.response_dofs)
-        for k in range(2):
-            if sides[k] >= 0:
-                parent[sides[k]] = sides[k]
-                size[sides[k]] = 0
-    lane_sync(RESERVE_LANES)
-    # Each pair joins its trees.
-    for j in range(lane, pairs, lanes):
-        head = order.pairs[first + j]
-        sides = row_sides(data.art0[head], data.art1[head], data.response_dofs)
-        if sides[1] >= 0:
-            union_find.union(parent, sides[0], sides[1])
-    lane_sync(RESERVE_LANES)
     # Each pair's island and its rank there in frame order, a batch of the group's lanes at a time; each island's size.
+    grouped = int(0)
     for base in range(0, pairs, lanes):
         j = base + lane
         island = int(-2)
         if j < pairs:
-            island = _pair_side(data, order, first, j)
+            island = order.pair_sides[first + j][0]
             if island >= 0:
                 island = union_find.root_now(parent, island)
-        before = int(0)
-        after = int(0)
-        for k in range(lanes):
-            other = lane_read(island, k, RESERVE_LANES)
-            if other == island:
-                if k < lane:
-                    before += 1
-                elif k > lane:
-                    after += 1
+        peers = lane_match(island, RESERVE_LANES)
         held = int(0)
         if island >= 0:
             held = size[island]
         lane_sync(RESERVE_LANES)
-        if j < pairs:
+        if island >= 0:
             order.pair_island[first + j] = island
-            order.pair_rank[first + j] = held + before
-            if island >= 0 and after == 0:
-                size[island] = held + before + 1
+            order.pair_rank[first + j] = held + lane_below(peers, RESERVE_LANES)
+            if lane_last(peers, RESERVE_LANES) == lane:
+                size[island] = held + lane_count(peers, RESERVE_LANES)
+        elif island == -1:
+            order.pair_island[first + j] = -1
+        grouped += lane_sum(wp.where(island >= 0, 1, 0), RESERVE_LANES)
         lane_sync(RESERVE_LANES)
-    # Each island's first place, in the frame order of its first pair; the pairs without rows after them.
+    # Each pair's place: an island's first pair takes the island's first place (its base and stride's inverse), then
+    # every pair its own; the pairs without rows after the islands.
     placed = int(0)
     loose = int(0)
     for base in range(0, pairs, lanes):
@@ -570,25 +549,20 @@ def _order_islands(data: ContactInput, order: RowOrder, first: int, pairs: int, 
         span = int(0)
         if island >= 0 and rank == 0:
             span = size[island]
-        lone = wp.where(j < pairs and island < 0, 1, 0)
+        lone = wp.where(island == -1, 1, 0)
         start = placed + lane_scan(span, RESERVE_LANES)
         lone_rank = loose + lane_scan(lone, RESERVE_LANES)
         if span > 0:
-            order.island_base[island] = start
-        if lone != 0:
-            order.pair_rank[first + j] = lone_rank
+            order.island_base[island] = wp.vec2i(start, _row_inverse(span))
         placed += lane_sum(span, RESERVE_LANES)
         loose += lane_sum(lone, RESERVE_LANES)
-    lane_sync(RESERVE_LANES)
-    # Each pair's place.
-    for j in range(lane, pairs, lanes):
-        island = order.pair_island[first + j]
-        rank = order.pair_rank[first + j]
-        q = placed + rank
+        lane_sync(RESERVE_LANES)
         if island >= 0:
-            m = size[island]
-            q = order.island_base[island] + int((wp.int64(rank) * wp.int64(_row_inverse(m))) % wp.int64(m))
-        order.row_pairs[first + q] = j
+            at = order.island_base[island]
+            q = at[0] + int((wp.int64(rank) * wp.int64(at[1])) % wp.int64(size[island]))
+            order.row_pairs[first + q] = j
+        elif island == -1:
+            order.row_pairs[first + grouped + lone_rank] = j
     lane_sync(RESERVE_LANES)
 
 
@@ -620,12 +594,12 @@ def reserve_world_rows(
 
     A world's contacts lie in one run of the frame's positions (``order.world_contact_first`` to
     ``order.world_contact_last``, which the admission recorded; a contact of no world may lie between them). The
-    lanes take it in four passes. In the frame's order, each contact's rows of the four lists before it and its body
-    pair (a pair heads at the run's first position or at a change of the frame's pair key, admitted or not: a pair's
-    contacts share their bodies, so they respond alike), each pair's head. Then the world's islands
-    (:func:`_order_islands`): its pairs joined by the trees they touch, each island's pairs at a golden-ratio stride
-    over their own ranks. In that row order, each pair's rows before it (each pair's contacts together in frame order).
-    Then each contact's slot.
+    lanes take it in passes. In the frame's order, each contact's rows of the four lists before it and its body pair
+    (a pair heads at the run's first position or at a change of the frame's pair key, admitted or not: a pair's
+    contacts share their bodies, so they respond alike), each pair's head, which joins the trees it touches. Then the
+    world's islands (:func:`_order_islands`), each island's pairs at a golden-ratio stride over their own ranks. In
+    that row order, each pair's rows before it (each pair's contacts together in frame order). Then each contact's
+    slot, each pair's head restoring its trees.
 
     The row order is the Gauss-Seidel order, so a body's rows must not move with rows it does not share an island
     with: two bodies that never touch must not change each other's motion. An island's order is a function of its own
@@ -678,6 +652,11 @@ def reserve_world_rows(
             order.rows_frame[c] = rows + lower
             if heads:
                 order.pairs[first + pair] = c
+                # The pair joins its trees' islands (_order_islands).
+                sides = row_sides(data.art0[c], data.art1[c], data.response_dofs)
+                order.pair_sides[first + pair] = sides
+                if sides[1] >= 0:
+                    union_find.union(order.island_parent, sides[0], sides[1])
         rows = rows + _lane_sum4(own)
         pairs += lane_count(votes, RESERVE_LANES)
     lane_sync(RESERVE_LANES)
@@ -700,14 +679,21 @@ def reserve_world_rows(
             order.rows_before[head] = before
         seen = seen + _lane_sum4(own)
     lane_sync(RESERVE_LANES)
-    # Each admitted contact's slot.
+    # Each admitted contact's slot; each pair's head restores its trees (_order_islands' starting state).
     for c in range(first + lane, end, lanes):
         if data.world[c] != world:
             continue
+        pair = first + order.pairs_before[c]
+        head = order.pairs[pair]
+        if head == c:
+            sides = order.pair_sides[pair]
+            for side in range(2):
+                if sides[side] >= 0:
+                    order.island_parent[sides[side]] = sides[side]
+                    order.island_size[sides[side]] = 0
         path = data.path[c]
         if path < 0:
             continue
-        head = order.pairs[first + order.pairs_before[c]]
         before = order.rows_before[head] + order.rows_frame[c] - order.rows_frame[head]
         k = int(0)
         if path != 0:
