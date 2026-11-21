@@ -2092,6 +2092,10 @@ class _FrictionPatchState:
         :func:`_publish_extent`)."""
         return self.extent[_CARRY_EXTENT : _CARRY_EXTENT + 1]
 
+    def kept_frame(self) -> wp.array:
+        """Whether the last build kept the frame of the build before it (one word on the device, :func:`_prepare`)."""
+        return self.extent[_KEPT_EXTENT : _KEPT_EXTENT + 1]
+
     def forget_frame(self):
         """Make the next build write its keys and make its regions, as it does for a new contact frame: the record
         names no frame."""

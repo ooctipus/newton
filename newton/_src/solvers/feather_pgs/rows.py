@@ -763,7 +763,7 @@ class RowLaws:
                     max_constraints,
                     placement.mf_max_constraints,
                     1,
-                    placement.row_order(self.friction_patches.current.keys),
+                    placement.row_order(self.friction_patches.current.keys, self.friction_patches.kept_frame()),
                     placement.slot_counter,
                     mf_slot_counter,
                     placement.contact_worlds,

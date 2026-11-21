@@ -399,7 +399,8 @@ class RowOrder:
     of the pairs before it in the row order
     (``rows_before``); and by articulation, the islands' union-find parents, sizes, and first places in the row order
     with their strides' inverses (``island_parent``, ``island_size``, ``island_base``), each tree its own root and
-    size zero between reservations."""
+    size zero between reservations; and whether the contact frame is the last build's (``frame_kept``, the patch
+    builder's word), whose islands' order the last reservation left in ``row_pairs``."""
 
     pair_keys: wp.array[wp.int64]
     world_contact_first: wp.array[int]
@@ -415,6 +416,7 @@ class RowOrder:
     island_parent: wp.array[wp.int32]
     island_size: wp.array[int]
     island_base: wp.array[wp.vec2i]
+    frame_kept: wp.array[int]
 
 
 @wp.func
@@ -599,7 +601,9 @@ def reserve_world_rows(
     contacts share their bodies, so they respond alike), each pair's head, which joins the trees it touches. Then the
     world's islands (:func:`_order_islands`), each island's pairs at a golden-ratio stride over their own ranks. In
     that row order, each pair's rows before it (each pair's contacts together in frame order). Then each contact's
-    slot, each pair's head restoring its trees.
+    slot, each pair's head restoring its trees. The islands' order is a function of the frame's pairs alone, so a
+    build that keeps the last build's frame (``order.frame_kept``) reads the order the last reservation left and
+    joins no trees.
 
     The row order is the Gauss-Seidel order, so a body's rows must not move with rows it does not share an island
     with: two bodies that never touch must not change each other's motion. An island's order is a function of its own
@@ -629,6 +633,8 @@ def reserve_world_rows(
     if item >= listed:
         return
     world = contact_worlds[item]
+    # A kept frame's islands are ordered: the last reservation, of the same frame, left their order in row_pairs.
+    kept = order.frame_kept[0]
     first = order.world_contact_first[world]
     end = wp.min(order.world_contact_last[world] + 1, data.count[0])
     # The frame's order: each contact's rows before it and its pair, each pair's head.
@@ -652,15 +658,17 @@ def reserve_world_rows(
             order.rows_frame[c] = rows + lower
             if heads:
                 order.pairs[first + pair] = c
-                # The pair joins its trees' islands (_order_islands).
-                sides = row_sides(data.art0[c], data.art1[c], data.response_dofs)
-                order.pair_sides[first + pair] = sides
-                if sides[1] >= 0:
-                    union_find.union(order.island_parent, sides[0], sides[1])
+                if kept == 0:
+                    # The pair joins its trees' islands (_order_islands).
+                    sides = row_sides(data.art0[c], data.art1[c], data.response_dofs)
+                    order.pair_sides[first + pair] = sides
+                    if sides[1] >= 0:
+                        union_find.union(order.island_parent, sides[0], sides[1])
         rows = rows + _lane_sum4(own)
         pairs += lane_count(votes, RESERVE_LANES)
     lane_sync(RESERVE_LANES)
-    _order_islands(data, order, first, pairs, lanes, lane)
+    if kept == 0:
+        _order_islands(data, order, first, pairs, lanes, lane)
     # The row order: each pair's rows before it.
     seen = wp.vec4i(0)
     for base in range(0, pairs, lanes):
@@ -685,7 +693,7 @@ def reserve_world_rows(
             continue
         pair = first + order.pairs_before[c]
         head = order.pairs[pair]
-        if head == c:
+        if kept == 0 and head == c:
             sides = order.pair_sides[pair]
             for side in range(2):
                 if sides[side] >= 0:

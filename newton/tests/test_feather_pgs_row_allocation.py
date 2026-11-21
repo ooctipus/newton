@@ -135,13 +135,14 @@ def _allocate_overflowing_contacts(device, contact_count, row_capacity):
     )
 
 
-def _step_tripods(device, *, steps=4, sorted_contacts=False, **options):
+def _step_tripods(device, *, steps=4, sorted_contacts=False, substeps=1, **options):
     """Step the tripod worlds, the collision pipeline matching its contacts (``sorted_contacts``) or not: either
-    leaves them in its one order.
+    leaves them in its one order. Each collision pass serves ``substeps`` solver steps, whose later builds keep its
+    contact frame.
 
-    ``options`` override the route's solver options. Returns, per step, the live contacts' world,
-    path and slot at their frame positions, the worlds' dense and matrix-free row counts, contact
-    rows' start and dense overflow, and the output joint state.
+    ``options`` override the route's solver options. Returns, per solver step, the live contacts' world,
+    path and slot at their frame positions, whether the build kept the last build's frame, the worlds' dense and
+    matrix-free row counts, contact rows' start and dense overflow, and the output joint state.
     """
     model = _build_model(free_count=2, robot_count=2, device=device)
     solver = SolverFeatherPGS(model, pins=SolverFeatherPGS.Pins(storage="dense"), **{**_ROUTE_OPTIONS, **options})
@@ -157,8 +158,9 @@ def _step_tripods(device, *, steps=4, sorted_contacts=False, **options):
     contacts = pipeline.contacts()
     control = model.control()
     records = []
-    for _ in range(steps):
-        pipeline.collide(state_in, contacts)
+    for step in range(steps * substeps):
+        if step % substeps == 0:
+            pipeline.collide(state_in, contacts)
         state_in.clear_forces()
         solver.step(state_in, state_out, control, contacts, 1.0 / 240.0)
         live = int(contacts.rigid_contact_count.numpy()[0])
@@ -168,6 +170,7 @@ def _step_tripods(device, *, steps=4, sorted_contacts=False, **options):
             for name in ("world", "path", "slot")
         }
         record["pair_keys"] = solver.laws.friction_patches.current.keys.numpy()[:live].copy()
+        record["kept"] = int(solver.laws.friction_patches.kept_frame().numpy()[0])
         # Each contact's trees with response coordinates (row_records.row_sides), which join its world's islands.
         responds = solver.forest.articulation_response_dof_count.numpy() > 0
         arts = np.stack(
@@ -368,6 +371,24 @@ class TestFeatherPGSRowIslands(unittest.TestCase):
         slab_bottom = 2.0 * _HALF - _SINK + _GAP
         for sunk in sunk_boxes:
             self.assertLess(float((base[:, index[sunk], 2] + _HALF - slab_bottom).max()), 1.0e-6)
+
+    def _check_kept_frame(self, device):
+        """Two solver steps a collision pass: the second build keeps the frame, and its reservation reads the islands'
+        order the first left (the order is the frame's pairs' alone); every step's rows follow the reference order."""
+        records = _step_tripods(device, steps=3, substeps=2)
+        self.assertEqual([record["kept"] for record in records], [0, 1] * 3)
+        for step, record in enumerate(records):
+            for path in _ROW_PATHS:
+                for world in np.unique(record["world"][record["path"] == path]):
+                    slots = record["slot"][_family_contacts(record, path, world)]
+                    self.assertTrue(np.all(np.diff(slots) > 0), f"step {step}, path {path}, world {world}: {slots}")
+
+    def test_a_kept_frame_keeps_its_islands_order_cpu(self):
+        self._check_kept_frame(wp.get_device("cpu"))
+
+    @unittest.skipUnless(wp.is_cuda_available(), "CUDA")
+    def test_a_kept_frame_keeps_its_islands_order_cuda(self):
+        self._check_kept_frame(wp.get_device("cuda:0"))
 
     def test_bodies_that_never_touch_keep_their_motion_cpu(self):
         self._check(wp.get_device("cpu"), worlds=1)

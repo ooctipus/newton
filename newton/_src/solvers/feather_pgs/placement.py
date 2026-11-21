@@ -548,10 +548,12 @@ class Placement:
             }
             self.J_by_size[size] = arrays.allocate(SIZE_JACOBIAN, owner={}, **sizes)["J"]
 
-    def row_order(self, pair_keys) -> RowOrder:
-        """The row order's records (:class:`.row_slots.RowOrder`) over the contact rows, with the frame's pair keys."""
+    def row_order(self, pair_keys, frame_kept) -> RowOrder:
+        """The row order's records (:class:`.row_slots.RowOrder`) over the contact rows, with the frame's pair keys and
+        whether the patch builder kept the last build's frame."""
         order = RowOrder()
         order.pair_keys = pair_keys
+        order.frame_kept = frame_kept
         order.world_contact_first = self.world_contact_first
         order.world_contact_last = self.world_contact_last
         for name in (
