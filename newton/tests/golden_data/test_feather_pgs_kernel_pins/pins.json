@@ -72,7 +72,7 @@
   "region_sweep.list_blocks": "9b62d575ef4c1f053e1f637030858c0c6a80ac187643d10515705a7e5cb508f1",
   "region_sweep.mark_regions": "9440ef9caa9b4668401bda5f5093a74fcbccab587cb806086f9374920c1db5c2",
   "region_sweep.order_regions": "32008ceda3e8ec115d51a85ccf1466e90acdc76c034aba0b5128dfd7b2f1c789",
-  "region_sweep.place_bodies": "1d6f49eee645fd0643cda72447f9271cec97782ef80e32e40d16092a6c456ce6",
+  "region_sweep.place_bodies": "6c9f87304fbdf3a8e431cf7bdb6d40d537054e96cca44d360b0b45368e93732c",
   "region_sweep.place_regions": "b1d71a3c02cce2f7059ff3b8f5d64ede13137b074a19629910a2ccc6a1887147",
   "region_sweep.stage_blocks": "15981339dc3bb2acd28bfed66823ab9a2d74fca8a26865ea5920d83febac7ad2",
   "region_sweep.sweep_closed_bodies": "9327321ee8c6de56337b3987295bd2f6c8597e4a50289f90d443331a699e08ec",
@@ -311,7 +311,7 @@
   "warm_start.forget_carried_contacts": "b5f1b662d29016bfb5e58b9e9dca88dba7a3a3f65e975c07b5c6375322687311",
   "warm_start.gather_carried_normals": "b933dada24b619638508aa30cca8d699ea6c0f5210f44899954d8fbb33feae52",
   "warm_start.prepare_world_impulses": "22c4c1a6a3e25a042ad887937cc758323a4b974334bd066e5e521af9dd2dc0b8",
-  "warm_start.reset_world_impulses": "eaff9d7e371f52a8e01e264aac4b43427fb7b35d5681420bc0ae82cb50466b3e"
+  "warm_start.reset_world_impulses": "296698c79feafca5ec3dff7af694ffef2ab21198df310c0048227e3e93df5d83"
  },
  "warp": "1.20.0.dev20261114"
 }
