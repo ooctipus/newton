@@ -20,7 +20,8 @@ One law each, written once for Warp kernels and native CUDA (:mod:`.law_source`)
   a contact's rows act at) and :func:`contact_row_frame`, each row's direction and
   point under the point or patch law;
 * :func:`prescribed_target`, the row target that prescribed bodies' motion
-  imposes, and the spin row's, :func:`prescribed_spin_target`;
+  imposes, and the spin row's, :func:`prescribed_spin_target`; a friction row's
+  share of moving surfaces (a conveyor's), :func:`surface_target`;
 * :func:`jacobian_entry`, ``J = d . (S_lin + S_ang x (p - o))`` for one motion
   subspace column ``S`` of a body whose twists are taken about ``o``, and the
   spin row's (contact torsion, :data:`CONTACT_SPIN_ROW`), ``J = n . S_ang``,
@@ -411,3 +412,12 @@ def prescribed_spin_target(
         if prescribed_articulation[art_b] != 0:
             known -= spin_entry(body_v_s[body_b], normal)
     return -known
+
+
+@wp.func
+def surface_target(direction: wp.vec3, surface_velocity: wp.vec3) -> float:
+    """Return a friction row's target share of its contact's moving surfaces, ``surface_velocity`` the velocity of
+    shape1's surface less shape0's (a conveyor's belt): stuck surfaces slip as bodies at ``u1 - u0``, so the row's
+    unknown relative velocity ``v_a - v_b`` along ``direction`` takes it, as a prescribed body's twist enters
+    :func:`prescribed_target`. A tangent row reads only the surfaces' tangential motion."""
+    return wp.dot(direction, surface_velocity)

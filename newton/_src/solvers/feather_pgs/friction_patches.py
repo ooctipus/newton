@@ -2379,14 +2379,25 @@ class _FrictionPatchState:
             clamp=True,
         )
 
-    def finish(self, state_in, state_out, com, world, slot, path, slots_needed, routes, dt):
+    def finish(self, state_in, state_out, com, world, slot, path, slots_needed, routes, dt, surface_velocity=None):
         """Place the next anchors at the solved centres of pressure and release sliding anchors on the enabled routes,
-        then store the frame."""
+        then store the frame. ``surface_velocity`` is the contacts' (``rigid_contact_surface_velocity``), ``None``
+        where no surface moves: an anchor's stuck pair is its surfaces', which slide past their bodies there."""
         self._finish(
-            state_in.body_q, state_out.body_q, state_out.body_qd, com, world, slot, path, slots_needed, routes, dt
+            state_in.body_q,
+            state_out.body_q,
+            state_out.body_qd,
+            com,
+            world,
+            slot,
+            path,
+            slots_needed,
+            routes,
+            dt,
+            surface_velocity,
         )
 
-    def _finish(self, q, q_out, qd_out, com, world, slot, path, slots_needed, routes, dt):
+    def _finish(self, q, q_out, qd_out, com, world, slot, path, slots_needed, routes, dt, surface_velocity=None):
         self._grids(self.pool.launch_rows())
         # The regions, none more than the live contacts: a thread a region, striding over the frame's count.
         self.pool.launch(
@@ -2408,6 +2419,7 @@ class _FrictionPatchState:
                 dt,
                 self.threads,
                 self.current,
+                surface_velocity,
             ],
             extent=self.extent[1:2],
             clamp=True,
@@ -2628,6 +2640,29 @@ def _point_velocity(
 
 
 @wp.func
+def _surface_slip(surface_velocity: wp.array[wp.vec3], frame: _PatchFrame, c: int) -> wp.vec3:
+    """Contact ``c``'s surfaces' own relative velocity in its frame's order, side b's surface less side a's: the
+    pipeline's ``u1 - u0`` (side a its shape0's), negated where the frame flips the pair; zero where none moves."""
+    if surface_velocity.shape[0] == 0:
+        return wp.vec3(0.0)
+    if frame.flipped[c] != 0:
+        return -surface_velocity[c]
+    return surface_velocity[c]
+
+
+@wp.func
+def _surface_travel(c: int, frame: _PatchFrame, q: wp.array[wp.transform], slip: wp.vec3, dt: float):
+    """Move anchor ``c``'s displacement by its surfaces' travel over the step: the stuck pair is the surfaces', which
+    slide past their bodies at ``slip`` (side b's less side a's), so the bodies' pose increments, which the next build
+    adds, overcount the pair's a-less-b motion by ``slip dt``. The displacement is stored in body a's frame at the build's pose ``q``."""
+    travel = slip * dt
+    a = frame.body_a[c]
+    if a >= 0:
+        travel = wp.transform_vector(wp.transform_inverse(q[a]), travel)
+    frame.displacement[c] = frame.displacement[c] - travel
+
+
+@wp.func
 def _finish_contact(
     c: int,
     frame: _PatchFrame,
@@ -2645,8 +2680,10 @@ def _finish_contact(
     impulses: wp.array2d[float],
     dt: float,
     first: wp.array[int],
+    slip: wp.vec3,
 ):
-    """Record the region's centre of pressure and release saturated anchors with tangential motion.
+    """Record the region's centre of pressure and release saturated anchors with tangential motion: the surfaces'
+    relative motion, the bodies' less the surfaces' own ``slip`` (:func:`_surface_slip`).
 
     The tolerance is relative to geometry and timestep. Merely resting at the
     Coulomb limit does not prove sliding, so it must not erase static history.
@@ -2690,8 +2727,10 @@ def _finish_contact(
         frame.pressure[c] = _local_point(q, a, moment / moment_load)
         frame.pressured[c] = 1
     radius = wp.max(mu[w, s + 1] * load, 0.0)
-    speed = _point_velocity(q_out, qd_out, com, a, frame.anchor_a[c]) - _point_velocity(
-        q_out, qd_out, com, b, frame.anchor_b[c]
+    speed = (
+        _point_velocity(q_out, qd_out, com, a, frame.anchor_a[c])
+        - _point_velocity(q_out, qd_out, com, b, frame.anchor_b[c])
+        - slip
     )
     # Check opposing motion to distinguish slipping from impending slip. The anchor saturates on the ball of the pair
     # and the spin row, not on the pair's disk; tangential slip releases it, and opposing spin its twist alone.
@@ -2734,9 +2773,14 @@ def _finish_regions(
     dt: float,
     threads: int,
     frame: _PatchFrame,
+    surface_velocity: wp.array[wp.vec3],
 ):
     """Finish each live anchor on its route, a thread a region of the frame (:func:`_build` lists them): only a
     region's carrier holds an anchor, so the threads visit the anchors and no other contact.
+
+    Where the contacts' surfaces move (``surface_velocity``, empty where none does), an anchor's stuck pair is the
+    surfaces': its slip is measured against their motion, and every anchor that holds its history carries the step's
+    surface travel in its displacement (:func:`_surface_travel`), on any route.
 
     Finishing writes only the carrier's own validity, centre of pressure and twist, and reads other contacts only
     through the row arrays and its region's ring, so the regions finish in any order. A contact on its route in a
@@ -2749,6 +2793,7 @@ def _finish_regions(
     live = extent[1]
     for region in range(wp.tid(), regions[0] + regions[1], threads):
         c = frame.carrier[frame.regions[_listed_region(regions, live, region)]]
+        slip = _surface_slip(surface_velocity, frame, c)
         if frame.valid[c] != 0:
             route = _contact_route(routes, slot, path, c)
             if route >= 0 and routes.acts.shape[0] > 0 and routes.acts[world[c]] == 0:
@@ -2774,7 +2819,10 @@ def _finish_regions(
                     impulses,
                     dt,
                     _route_first(routes, route),
+                    slip,
                 )
+        if frame.valid[c] != 0 and surface_velocity.shape[0] > 0:
+            _surface_travel(c, frame, q, slip, dt)
 
 
 @wp.kernel(enable_backward=False)

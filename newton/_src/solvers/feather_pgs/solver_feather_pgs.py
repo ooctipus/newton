@@ -115,6 +115,12 @@ class SolverFeatherPGS(SolverBase):
     post-impact velocity but a first-order, impact-phase-dependent position
     offset. Reduce the timestep when substep impact position matters.
 
+    Moving surfaces (a conveyor's belt: a mesh built with ``enable_surface_velocity=True``, whose
+    ``Contacts.rigid_contact_surface_velocity`` the collision pipeline samples) move their material past their
+    bodies: a contact's friction holds its surfaces, not its bodies, together. Its friction rows' target is the
+    surfaces' tangential relative velocity and its friction anchor travels with them, so a box on a belt slides at
+    Coulomb's rate until it rides at the belt's speed.
+
     ``placement.constraint_overflow`` is a device boolean array with one entry per solver
     world. It records contact-buffer overflow or dropped constraint rows even
     when detailed row watermarks are disabled, and persists until :meth:`reset`.

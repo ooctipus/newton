@@ -25,6 +25,7 @@ from .contact_laws import (
     contact_row_frame,
     prescribed_spin_target,
     prescribed_target,
+    surface_target,
 )
 from .friction_patches import PatchRowLaw, patch_spin_row, patch_tangent_row, ring_parent
 from .row_laws import (
@@ -136,7 +137,8 @@ def contact_row_writer(kinds: bool = True, laws: bool = True, stores: bool = Tru
     restitution)``, and takes no ``with_rhs``.
 
     A tangent row follows the friction row law (:func:`.friction_patches.patch_tangent_row`): the anchor's tangential
-    displacement as its gap, the law's beta and the undivided coefficient ``mu``. A normal row's rhs is
+    displacement as its gap, the law's beta and the undivided coefficient ``mu``; its target adds the contact's moving
+    surfaces' (:func:`.contact_laws.surface_target`), where the pipeline samples them. A normal row's rhs is
     :func:`.row_laws.contact_rhs` at its capped beta (:func:`contact_normal_beta`), a bouncing one's the restitution
     target from its incident velocity summed per body (:func:`incident_projection`). A spin row
     (:data:`.contact_laws.CONTACT_SPIN_ROW`) turns about the normal: its coefficient :func:`contact_torsion_mu`, its
@@ -180,6 +182,8 @@ def contact_row_writer(kinds: bool = True, laws: bool = True, stores: bool = Tru
             )
             if row == CONTACT_SPIN_ROW:
                 target = prescribed_spin_target(body_a, art_a, body_b, art_b, normal, data.prescribed, data.body_v)
+            elif row != 0 and data.surface_velocity.shape[0] > 0:
+                target += surface_target(direction, data.surface_velocity[c])
         r = slot + row
         normal_beta = float(0.0)
         friction_mu = mu

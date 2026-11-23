@@ -423,7 +423,23 @@ def finish_patch_impulses(
     if c >= count[0] or frame.valid[c] == 0 or slot[c] < 0 or path[c] != route:
         return
     _finish_contact(
-        c, frame, patches, q, q_out, qd_out, com, world, slot, path, slots_needed, parents, mu, impulses, dt, first
+        c,
+        frame,
+        patches,
+        q,
+        q_out,
+        qd_out,
+        com,
+        world,
+        slot,
+        path,
+        slots_needed,
+        parents,
+        mu,
+        impulses,
+        dt,
+        first,
+        wp.vec3(0.0),
     )
 
 

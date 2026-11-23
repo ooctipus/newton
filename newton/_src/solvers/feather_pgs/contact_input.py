@@ -30,6 +30,9 @@ CONTACT_INPUT = (
     Field("shape1", wp.int32, ("contact",), owner="contacts", attr="rigid_contact_shape1"),
     Field("margin0", wp.float32, ("contact",), owner="contacts", attr="rigid_contact_margin0"),
     Field("margin1", wp.float32, ("contact",), owner="contacts", attr="rigid_contact_margin1"),
+    # Each contact's surface velocity, shape1's surface less shape0's [m/s] (a conveyor's belt: a mesh with
+    # surface velocities), where the pipeline samples one; none (an empty array) where no shape moves its surface.
+    Field("surface_velocity", wp.vec3, ("contact",), owner="contacts", attr="rigid_contact_surface_velocity"),
     # The allocator's record of each contact.
     Field("world", wp.int32, ("contact",), attr="contact_world", owner="placement"),
     Field("slot", wp.int32, ("contact",), attr="contact_slot", owner="placement"),

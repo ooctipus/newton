@@ -1028,6 +1028,7 @@ class Sweep:
             self.placement.contact_slots_needed,
             routes,
             dt,
+            contacts.rigid_contact_surface_velocity,
         )
 
     def patch_routes(self, route: int | None = None):
