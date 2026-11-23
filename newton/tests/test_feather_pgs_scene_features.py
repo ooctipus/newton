@@ -14,6 +14,9 @@ through a scanner volume as through air, and a sensor shape on a sliding box nei
 Kinematic bodies prescribed by their body state (``body_q``/``body_qd``, as maximal-coordinate scenes write them): a
 kinematic pusher written that way pushes a box as one written through its joint state does, and a kinematic root carries
 its jointed children.
+
+Joint reaction wrenches (Newton's ``BODY_PARENT_F`` observable): a hinge carries a hanging bob's weight, a released
+level rod's pivot a quarter of its weight, and a fixed platform its own weight and that of a box resting on it.
 """
 
 import unittest
@@ -319,6 +322,92 @@ class TestFeatherPGSKinematicBodyState(unittest.TestCase):
     pass
 
 
+
+
+def _wrenches(model, steps: int, dt: float, contacts_on: bool = False, **options):
+    """Step ``model`` from rest, reading the BODY_PARENT_F observable at every step; return the wrenches [N, N m]."""
+    solver = newton.solvers.SolverFeatherPGS(model, **options)
+    test_kinds = {solver.ObservableKind.BODY_PARENT_F}
+    pipeline = newton.CollisionPipeline(model) if contacts_on else None
+    contacts = pipeline.contacts() if contacts_on else None
+    if contacts_on:
+        test_kinds.add(solver.ObservableKind.CONTACT_F)
+    observables = solver.observables(contacts=contacts, kinds=test_kinds)
+    state_in, state_out, control = model.state(), model.state(), model.control()
+    wrenches = []
+    for _ in range(steps):
+        if contacts_on:
+            pipeline.collide(state_in, contacts)
+        solver.step(state_in, state_out, control, contacts, dt, observables=observables)
+        state_in, state_out = state_out, state_in
+        wrenches.append(observables.body_parent_f.numpy().copy())
+    return np.array(wrenches)
+
+
+def test_hinge_carries_a_hanging_load(test, device):
+    """A bob hanging at rest from a hinge on the world: the hinge's wrench is the bob's weight, upward, its moment
+    about the bob's centre zero (the hinge lies above it)."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -_G))
+    bob = builder.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity()))
+    builder.add_shape_sphere(bob, radius=0.05)
+    hinge = builder.add_joint_revolute(
+        -1, bob, parent_xform=wp.transform(wp.vec3(0.0, 0.0, 1.0), wp.quat_identity()),
+        child_xform=wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity()), axis=newton.Axis.Y,
+    )  # fmt: skip
+    builder.add_articulation([hinge])
+    model = builder.finalize(device=device)
+    weight = float(model.body_mass.numpy()[bob]) * _G
+    wrenches = _wrenches(model, 20, _DT)
+    np.testing.assert_allclose(wrenches[:, bob, :3], np.tile([0.0, 0.0, weight], (20, 1)), atol=1.0e-4 * weight)
+    np.testing.assert_allclose(wrenches[:, bob, 3:], 0.0, atol=1.0e-5 * weight)
+
+
+def test_hinge_wrench_of_a_released_rod(test, device):
+    """A uniform rod pivoted at its end on the world, released level from rest: its first instant's pivot force is a
+    quarter of its weight upward (the rod's centre falls at three quarters of g), with no force along it."""
+    length, dt = 1.0, 1.0e-3
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -_G))
+    rod = builder.add_link(xform=wp.transform(wp.vec3(0.5 * length, 0.0, 1.0), wp.quat_identity()))
+    builder.add_shape_box(rod, hx=0.5 * length, hy=0.01, hz=0.01)
+    pivot = builder.add_joint_revolute(
+        -1, rod, parent_xform=wp.transform(wp.vec3(0.0, 0.0, 1.0), wp.quat_identity()),
+        child_xform=wp.transform(wp.vec3(-0.5 * length, 0.0, 0.0), wp.quat_identity()), axis=newton.Axis.Y,
+    )  # fmt: skip
+    builder.add_articulation([pivot])
+    model = builder.finalize(device=device)
+    weight = float(model.body_mass.numpy()[rod]) * _G
+    first = _wrenches(model, 1, dt)[0, rod]
+    test.assertAlmostEqual(first[2], 0.25 * weight, delta=0.01 * weight)
+    test.assertAlmostEqual(first[0], 0.0, delta=0.01 * weight)
+    # Its moment about the rod's centre: the pivot force's lever, half the rod back.
+    test.assertAlmostEqual(first[4], 0.5 * length * 0.25 * weight, delta=0.01 * weight)
+
+
+def test_fixed_platform_carries_what_rests_on_it(test, device):
+    """A platform fixed to the world carries its own weight and that of a box resting on it, through its contacts."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -_G))
+    platform = builder.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity()))
+    builder.add_shape_box(platform, hx=0.5, hy=0.5, hz=0.02)
+    builder.add_articulation(
+        [builder.add_joint_fixed(-1, platform, parent_xform=wp.transform(wp.vec3(0.0, 0.0, 0.5), wp.quat_identity()))]
+    )
+    box = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.52 + _HALF), wp.quat_identity()))
+    builder.add_shape_box(box, hx=_HALF, hy=_HALF, hz=_HALF)
+    model = builder.finalize(device=device)
+    mass = model.body_mass.numpy()
+    wrenches = _wrenches(model, 100, _DT, contacts_on=True)
+    carried = wrenches[-20:, platform]
+    np.testing.assert_allclose(carried[:, 2], (mass[platform] + mass[box]) * _G, rtol=1.0e-3)
+    np.testing.assert_allclose(carried[:, :2], 0.0, atol=1.0e-3 * mass[box] * _G)
+    np.testing.assert_allclose(carried[:, 3:], 0.0, atol=1.0e-3 * mass[box] * _G)
+    # The box's own free joint carries nothing: the contact holds it.
+    np.testing.assert_allclose(wrenches[-20:, box], 0.0, atol=1.0e-3 * mass[box] * _G)
+
+
+class TestFeatherPGSJointWrenches(unittest.TestCase):
+    pass
+
+
 class TestFeatherPGSConveyorSurface(unittest.TestCase):
     pass
 
@@ -330,6 +419,12 @@ for _fn in (test_box_falls_through_a_tracking_volume, test_sensor_shape_neither_
     add_function_test(TestFeatherPGSTrackingVolumes, _fn.__name__, _fn, devices=devices)
 for _fn in (test_body_state_drives_a_kinematic_pusher, test_body_state_drives_a_kinematic_root_and_its_children):
     add_function_test(TestFeatherPGSKinematicBodyState, _fn.__name__, _fn, devices=devices)
+for _fn in (
+    test_hinge_carries_a_hanging_load,
+    test_hinge_wrench_of_a_released_rod,
+    test_fixed_platform_carries_what_rests_on_it,
+):
+    add_function_test(TestFeatherPGSJointWrenches, _fn.__name__, _fn, devices=devices)
 
 
 if __name__ == "__main__":

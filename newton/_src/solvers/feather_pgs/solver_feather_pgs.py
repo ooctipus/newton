@@ -17,6 +17,7 @@ import copy
 import dataclasses
 import sys
 from collections.abc import Sequence
+from types import SimpleNamespace
 
 import numpy as np
 import warp as wp
@@ -42,6 +43,7 @@ from .class_plan import ClassInputs, general_reason, plan_class
 from .configuration import Diagnostics, check_options
 from .field_group import Field, FieldGroup, SolverArrays
 from .forest_plan import ForestPlan, joint_forest
+from .joint_wrenches import parent_wrenches
 from .path_selection import applied_options, measurement_selection, route_selection
 from .placement import Placement
 from .route_table import Pins, RouteRow
@@ -163,7 +165,7 @@ class SolverFeatherPGS(SolverBase):
     # contact buffers (test_contact_reduction_body_pairs). Warm-start modes have
     # stricter contact-identity requirements and reject those buffers in step().
     supports_body_pair_reduced_contacts: bool = True
-    SUPPORTED_OBSERVABLES = frozenset({SolverBase.ObservableKind.CONTACT_F})
+    SUPPORTED_OBSERVABLES = frozenset({SolverBase.ObservableKind.CONTACT_F, SolverBase.ObservableKind.BODY_PARENT_F})
 
     joint_qd_public_convention: bool = True
     """Whether free-joint ``joint_qd`` uses Newton's public twist convention.
@@ -818,6 +820,19 @@ class SolverFeatherPGS(SolverBase):
 
     def _allocate_common_buffers(self, model):
         arrays = self._arrays
+        # The joints' reaction wrenches (BODY_PARENT_F, joint_wrenches): each forest body's accumulator, joint wrench and
+        # velocity product, and the input pose's twists of the speeds before and after the solve.
+        bodies = max(1, model.body_count)
+        self._parent_wrench_acc, self._parent_wrench, self._parent_wrench_product = (
+            wp.zeros(bodies, dtype=wp.spatial_vector, device=model.device) for _ in range(3)
+        )
+        self._parent_wrench_twists = tuple(
+            SimpleNamespace(
+                body_q=wp.zeros(bodies, dtype=wp.transform, device=model.device),
+                body_qd=wp.zeros(bodies, dtype=wp.spatial_vector, device=model.device),
+            )
+            for _ in range(2)
+        )
         if model.joint_count:
             arrays.allocate(DOF_WORK, dof=model.joint_dof_count)
             # Stage-3 snapshots for external NaN dumpers, which read their values
@@ -878,7 +893,11 @@ class SolverFeatherPGS(SolverBase):
         observables: SolverBase.Observables | None = None,
     ):
         """Advance one step; with :attr:`~newton.solvers.SolverBase.ObservableKind.CONTACT_F` requested in
-        ``observables``, also write each contact's solved force into ``observables.contact_f``.
+        ``observables``, also write each contact's solved force into ``observables.contact_f``; with
+        :attr:`~newton.solvers.SolverBase.ObservableKind.BODY_PARENT_F`, each body's incoming joint wrench over the step
+        into ``observables.body_parent_f`` (world frame, at the body's centre of mass: the joint's constraint wrench with
+        its drive, limit and passive forces, from the bodies' momentum balance over the solve; see
+        :mod:`.joint_wrenches`). A body whose joint the solver cuts into a loop reports its tree joint's wrench.
 
         The contact force is linear only: its torque half is zero, not a solved wrench about body0's center of
         mass. With persistent patches, normal and friction rows can act at different points, so crossing the
@@ -891,6 +910,8 @@ class SolverFeatherPGS(SolverBase):
         self._plan.run(Step(state_in, state_out, control, contacts, dt, collide_done_event, self._step))
         if observables is not None and observables.is_requested(SolverBase.ObservableKind.CONTACT_F):
             self.sweep.forces(contacts, observables.contact_f)
+        if observables is not None and observables.is_requested(SolverBase.ObservableKind.BODY_PARENT_F):
+            parent_wrenches(self, state_in, state_out, contacts, observables.body_parent_f)
         return state_out
 
     def collision_sleep_filter(self) -> tuple[wp.array[wp.vec2i], wp.array2d[wp.int32]] | None:
