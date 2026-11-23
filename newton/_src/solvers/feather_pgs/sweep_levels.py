@@ -352,6 +352,13 @@ def levels_staging(max_world_dofs: int, device_arch) -> Staging:
     return Staging(buffers, groups=groups, layout="arrays")
 
 
+def levels_fit(max_constraints: int, max_world_dofs: int, device_arch) -> bool:
+    """Whether a world of ``max_constraints`` rows and ``max_world_dofs`` coordinates takes a level schedule: a unit's
+    level and rank packed in 16 bits each, and its lane group's stage in a block (:func:`levels_staging`)."""
+    budget = arch_budget(device_arch)
+    return int(max_constraints) < 1 << 15 and levels_staging(int(max_world_dofs), device_arch).fits(budget)
+
+
 def levels_launch(world_count: int, max_world_dofs: int, device_arch) -> tuple[int, int]:
     """The contact schedule's launch, ``(dim, block_dim)``: a world's lane group (a warp, or the CPU's one thread,
     :func:`.execution.device_lanes`), :func:`levels_staging`'s groups a block."""

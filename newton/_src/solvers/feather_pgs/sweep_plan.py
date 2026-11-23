@@ -452,8 +452,16 @@ class Sweep:
                 self.pins, small_world_lanes=small, fits=lambda: general(active_rows=True).staging().fits(budget)
             )
             # A tree of one coordinate (forest.diagonal_mass_sizes) holds units of one entry where the rows keep their
-            # support classes: in the full ordered sweep they step by level (the builder's schedule), before the order.
-            coordinate_levels = bool(self.forest.diagonal_mass_sizes and self.placement.classed and not active_rows)
+            # support classes: in the full ordered sweep they step by level (the builder's schedule), before the order,
+            # where the world's schedule fits a block (the levels give the order's iterate: without them, the order).
+            coordinate_levels = bool(
+                self.forest.diagonal_mass_sizes
+                and self.placement.classed
+                and not active_rows
+                and sweep_levels.levels_fit(
+                    self.placement.dense_max_constraints, self.forest.max_world_dofs, device_arch
+                )
+            )
             general = functools.partial(general, active_rows=active_rows, coordinate_levels=coordinate_levels)
             worlds = self.forest.world_count
             alone = self._staged(general(), worlds)
