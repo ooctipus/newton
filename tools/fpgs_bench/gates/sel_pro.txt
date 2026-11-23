@@ -154,3 +154,4 @@ test_feather_pgs_placement_invariants
 test_feather_pgs_motor_law
 test_feather_pgs_forest
 test_feather_pgs_row_activation
+test_feather_pgs_scene_features

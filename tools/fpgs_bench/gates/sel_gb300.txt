@@ -200,3 +200,4 @@ test_feather_pgs_deep_chains
 test_feather_pgs_device_preludes
 test_feather_pgs_launch
 test_feather_pgs_laws
+test_feather_pgs_scene_features
