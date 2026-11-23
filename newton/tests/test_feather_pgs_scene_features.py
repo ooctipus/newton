@@ -10,6 +10,10 @@ travels with the belt.
 
 Tracking volumes (``tracking_volumes``): shapes whose contacts are made and reported but take no rows. A box falls
 through a scanner volume as through air, and a sensor shape on a sliding box neither lifts it nor takes its friction.
+
+Kinematic bodies prescribed by their body state (``body_q``/``body_qd``, as maximal-coordinate scenes write them): a
+kinematic pusher written that way pushes a box as one written through its joint state does, and a kinematic root carries
+its jointed children.
 """
 
 import unittest
@@ -202,6 +206,119 @@ class TestFeatherPGSTrackingVolumes(unittest.TestCase):
     pass
 
 
+_PUSH = 0.5
+
+
+def _pusher_scene(device):
+    """A kinematic pusher box behind a dynamic box on the floor, 0.3 m apart."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -_G))
+    builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=_MU))
+    cfg = newton.ModelBuilder.ShapeConfig(mu=_MU)
+    pusher = builder.add_body(xform=wp.transform(wp.vec3(-0.5, 0.0, _HALF), wp.quat_identity()), is_kinematic=True)
+    builder.add_shape_box(pusher, hx=_HALF, hy=_HALF, hz=_HALF, cfg=cfg)
+    box = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, _HALF), wp.quat_identity()))
+    builder.add_shape_box(box, hx=_HALF, hy=_HALF, hz=_HALF, cfg=cfg)
+    return builder.finalize(device=device), pusher, box
+
+
+def _push(device, through_body_state: bool, steps: int = 240):
+    """Drive the pusher along +x at 0.5 m/s, writing its body state (pose and twist) before each step, or its joint
+    state with notify_state_changed; return the pusher's published poses and the box's poses and velocities."""
+    model, pusher, box = _pusher_scene(device)
+    solver = newton.solvers.SolverFeatherPGS(model)
+    pipeline = newton.CollisionPipeline(model)
+    contacts = pipeline.contacts()
+    state_in, state_out, control = model.state(), model.state(), model.control()
+    q_start = int(model.joint_q_start.numpy()[model.joint_child.numpy().tolist().index(pusher)])
+    articulation = wp.array([int(model.joint_articulation.numpy()[q_start // 7])], dtype=wp.int32, device=device)
+    pushed, poses, speeds = [], [], []
+    for n in range(steps):
+        x = -0.5 + _PUSH * _DT * (n + 1)
+        if through_body_state:
+            body_q, body_qd = state_in.body_q.numpy(), state_in.body_qd.numpy()
+            body_q[pusher][:3] = (x, 0.0, _HALF)
+            body_qd[pusher] = (_PUSH, 0.0, 0.0, 0.0, 0.0, 0.0)
+            state_in.body_q.assign(body_q)
+            state_in.body_qd.assign(body_qd)
+        else:
+            joint_q, joint_qd = state_in.joint_q.numpy(), state_in.joint_qd.numpy()
+            joint_q[q_start : q_start + 3] = (x, 0.0, _HALF)
+            joint_qd[q_start - q_start // 7 : q_start - q_start // 7 + 6] = (_PUSH, 0.0, 0.0, 0.0, 0.0, 0.0)
+            state_in.joint_q.assign(joint_q)
+            state_in.joint_qd.assign(joint_qd)
+            newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, state_in)
+            solver.notify_state_changed(articulation)
+        pipeline.collide(state_in, contacts)
+        solver.step(state_in, state_out, control, contacts, _DT)
+        state_in, state_out = state_out, state_in
+        pushed.append(state_in.body_q.numpy()[pusher][:3].copy())
+        poses.append(state_in.body_q.numpy()[box][:3].copy())
+        speeds.append(state_in.body_qd.numpy()[box][:3].copy())
+    return np.array(pushed), np.array(poses), np.array(speeds)
+
+
+def test_body_state_drives_a_kinematic_pusher(test, device):
+    """A kinematic pusher written through its body state holds each written pose and pushes the box ahead of it at
+    its own speed, as the same pusher written through its joint state does."""
+    pushed, poses, speeds = _push(device, through_body_state=True)
+    written = -0.5 + _PUSH * _DT * np.arange(1, len(pushed) + 1)
+    np.testing.assert_allclose(pushed[:, 0], written, atol=1.0e-6)
+    test.assertLess(np.abs(poses[:100, 0]).max(), 1.0e-4, "the box rests until the pusher reaches it")
+    np.testing.assert_allclose(speeds[-20:, 0], _PUSH, atol=1.0e-2)
+    test.assertGreater(poses[-1, 0], 0.2, "the box was pushed")
+    _, joint_poses, joint_speeds = _push(device, through_body_state=False)
+    np.testing.assert_allclose(poses, joint_poses, atol=1.0e-4)
+    np.testing.assert_allclose(speeds, joint_speeds, atol=1.0e-3)
+
+
+def test_body_state_drives_a_kinematic_root_and_its_children(test, device):
+    """A kinematic free root carrying a hinged pendulum, driven along +x through its body state: the root holds each
+    written pose, the hinge stays closed and the pendulum travels with it."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -_G))
+    root = builder.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, 1.0), wp.quat_identity()), is_kinematic=True)
+    builder.add_shape_box(root, hx=0.05, hy=0.05, hz=0.05)
+    bob = builder.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, 0.7), wp.quat_identity()))
+    builder.add_shape_sphere(bob, radius=0.05)
+    hinge_in_root = wp.vec3(0.0, 0.0, -0.05)
+    hinge_in_bob = wp.vec3(0.0, 0.0, 0.25)
+    joints = [
+        builder.add_joint_free(child=root),
+        builder.add_joint_revolute(
+            root,
+            bob,
+            parent_xform=wp.transform(hinge_in_root, wp.quat_identity()),
+            child_xform=wp.transform(hinge_in_bob, wp.quat_identity()),
+            axis=newton.Axis.Y,
+        ),
+    ]
+    builder.add_articulation(joints)
+    model = builder.finalize(device=device)
+    solver = newton.solvers.SolverFeatherPGS(model)
+    state_in, state_out, control = model.state(), model.state(), model.control()
+    speed, closure, roots, bobs = 0.3, [], [], []
+    for n in range(200):
+        body_q, body_qd = state_in.body_q.numpy(), state_in.body_qd.numpy()
+        body_q[root][:3] = (speed * _DT * (n + 1), 0.0, 1.0)
+        body_qd[root] = (speed, 0.0, 0.0, 0.0, 0.0, 0.0)
+        state_in.body_q.assign(body_q)
+        state_in.body_qd.assign(body_qd)
+        solver.step(state_in, state_out, control, None, _DT)
+        state_in, state_out = state_out, state_in
+        q = state_in.body_q.numpy()
+        anchor_root = wp.transform_point(wp.transform(wp.vec3(*q[root][:3]), wp.quat(*q[root][3:])), hinge_in_root)
+        anchor_bob = wp.transform_point(wp.transform(wp.vec3(*q[bob][:3]), wp.quat(*q[bob][3:])), hinge_in_bob)
+        closure.append(np.linalg.norm(np.array(anchor_root) - np.array(anchor_bob)))
+        roots.append(q[root][0])
+        bobs.append(q[bob][0])
+    np.testing.assert_allclose(roots, speed * _DT * np.arange(1, 201), atol=1.0e-6)
+    test.assertLess(max(closure), 1.0e-4, "the hinge stays closed")
+    test.assertAlmostEqual((bobs[-1] - bobs[99]) / (100 * _DT), speed, delta=0.05)
+
+
+class TestFeatherPGSKinematicBodyState(unittest.TestCase):
+    pass
+
+
 class TestFeatherPGSConveyorSurface(unittest.TestCase):
     pass
 
@@ -211,6 +328,8 @@ for _fn in (test_box_reaches_belt_speed_at_coulomb_rate, test_still_belt_holds_t
     add_function_test(TestFeatherPGSConveyorSurface, _fn.__name__, _fn, devices=devices)
 for _fn in (test_box_falls_through_a_tracking_volume, test_sensor_shape_neither_lifts_nor_holds_its_body):
     add_function_test(TestFeatherPGSTrackingVolumes, _fn.__name__, _fn, devices=devices)
+for _fn in (test_body_state_drives_a_kinematic_pusher, test_body_state_drives_a_kinematic_root_and_its_children):
+    add_function_test(TestFeatherPGSKinematicBodyState, _fn.__name__, _fn, devices=devices)
 
 
 if __name__ == "__main__":

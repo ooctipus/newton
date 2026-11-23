@@ -30,6 +30,7 @@ import warp as wp
 from ...core import execution, memory
 from ...core.host_unique import row_ids
 from ...sim import BodyFlags, JointType, ModelBuilder, ModelFlags
+from ...sim.articulation import eval_articulation_ik
 from . import field_group, host_index
 from .factor.closure import seed_blocks_kernel
 from .factor.fields import (
@@ -50,9 +51,12 @@ from .factor.kernels import (
     apply_free_root_velocity_corrections,
     build_mass_update_mask,
     damp_free_root_spin,
+    follow_prescribed_bodies,
+    forget_prescribed_bodies,
     invalidate_articulation_fk_id_cache,
     invalidate_fk_id_cache_for_articulations,
     invalidate_fk_id_cache_for_gravity,
+    publish_prescribed_bodies,
     take_gravity,
 )
 from .factor.walk import (
@@ -173,6 +177,7 @@ class TreeFactor:
         self.last_step_dt = None
         # The held tree's cache of next-step dynamics.
         self.fk_id_cache_valid = wp.zeros(model.articulation_count, dtype=wp.int32, device=model.device)
+        self._plan_prescribed_roots(model)
         # The augmented state is allocated here rather than on the first step: a wp.zeros() issued inside a CUDA
         # graph capture becomes a memset node that replays every launch.
         if model.body_count:
@@ -259,6 +264,118 @@ class TreeFactor:
                         "reconstruct the solver and recapture its CUDA graph."
                     )
         return armature, joint_mask, dof_mask
+
+    def _plan_prescribed_roots(self, model) -> None:
+        """The roots whose prescribed state the body state gives (:meth:`follow_prescribed`): every root joint with
+        coordinates (its parent the world) in an articulation, where the body flags make one of them kinematic at
+        construction; each one's body state as published, the model's initial one until a step publishes its own, and
+        each articulation's root. A model without a kinematic root follows none (``prescribes``): a root its flags make
+        kinematic later keeps its joint state."""
+        self.prescribes = False
+        if not (model.joint_count and model.body_count and model.articulation_count):
+            return
+        parent, child = model.joint_parent.numpy(), model.joint_child.numpy()
+        qd_start = model.joint_qd_start.numpy()
+        articulation = model.joint_articulation.numpy()
+        roots = np.flatnonzero((parent < 0) & (qd_start[1:] > qd_start[:-1]) & (articulation >= 0))
+        if not np.any(model.body_flags.numpy()[child[roots]] & int(BodyFlags.KINEMATIC)):
+            return
+        device = model.device
+        self.prescribes = True
+        root_articulation = articulation[roots]
+        root_of_articulation = np.full(model.articulation_count, -1, dtype=np.int32)
+        root_of_articulation[root_articulation] = np.arange(len(roots), dtype=np.int32)
+        starts = model.articulation_start.numpy()
+        self.prescribed_joints = int(np.max(starts[root_articulation + 1] - starts[root_articulation]))
+        self.prescribed_roots = wp.array(roots.astype(np.int32), dtype=wp.int32, device=device)
+        self.prescribed_root_articulation = wp.array(root_articulation.astype(np.int32), dtype=wp.int32, device=device)
+        self.prescribed_root_of_articulation = wp.array(root_of_articulation, dtype=wp.int32, device=device)
+        self.prescribed_q = wp.array(model.body_q.numpy()[child[roots]], dtype=wp.transform, device=device)
+        self.prescribed_qd = wp.array(model.body_qd.numpy()[child[roots]], dtype=wp.spatial_vector, device=device)
+        self.prescribed_valid = wp.ones(len(roots), dtype=wp.int32, device=device)
+        self.prescribed_written = wp.zeros(model.articulation_count, dtype=wp.bool, device=device)
+
+    def follow_prescribed(self, state_in) -> None:
+        """The step's entry: a kinematic root whose body state (``body_q``, ``body_qd``) was written since the solver
+        published it takes its joint coordinates and speeds from it, by Newton's inverse kinematics of its joint, and
+        its articulation's cached kinematics are invalidated; any other root keeps its joint state. So a kinematic
+        body is prescribed by whichever state its user writes: its body state (maximal coordinates, as the collision
+        reads it) or its joint state (with :meth:`notify_state_changed` or a reset)."""
+        model, count = self.model, self.prescribed_roots.shape[0]
+        wp.launch(
+            follow_prescribed_bodies,
+            dim=count,
+            inputs=[
+                self.prescribed_roots,
+                self.prescribed_root_articulation,
+                model.joint_child,
+                self.kinematic_joint_mask,
+                state_in.body_q,
+                state_in.body_qd,
+                self.prescribed_q,
+                self.prescribed_qd,
+                self.prescribed_valid,
+            ],
+            outputs=[self.prescribed_written, self.fk_id_cache_valid],
+            device=model.device,
+        )
+        wp.launch(
+            eval_articulation_ik,
+            dim=(count, self.prescribed_joints),
+            inputs=[
+                model.articulation_start,
+                model.articulation_end,
+                model.articulation_count,
+                self.prescribed_written,
+                self.prescribed_root_articulation,
+                state_in.body_q,
+                state_in.body_qd,
+                model.body_com,
+                model.joint_type,
+                model.joint_parent,
+                model.joint_child,
+                model.joint_X_p,
+                model.joint_X_c,
+                model.joint_axis,
+                model.joint_dof_dim,
+                model.joint_q_start,
+                model.joint_qd_start,
+                model.body_flags,
+                int(BodyFlags.KINEMATIC),
+            ],
+            outputs=[state_in.joint_q, state_in.joint_qd],
+            device=model.device,
+        )
+
+    def publish_prescribed(self, state_out) -> None:
+        """The step's exit: record each root body's published state, which :meth:`follow_prescribed` tells a write
+        from."""
+        wp.launch(
+            publish_prescribed_bodies,
+            dim=self.prescribed_roots.shape[0],
+            inputs=[self.prescribed_roots, self.model.joint_child, state_out.body_q, state_out.body_qd],
+            outputs=[self.prescribed_q, self.prescribed_qd, self.prescribed_valid],
+            device=self.model.device,
+        )
+
+    def forget_prescribed(self, world_mask=None, articulations=None) -> None:
+        """Let the joint state of the roots of ``articulations`` (a joint-state write), or else of the worlds
+        ``world_mask`` selects (a reset; ``None``: every world), stand at the next step."""
+        if not self.prescribes:
+            return
+        wp.launch(
+            forget_prescribed_bodies,
+            dim=self.prescribed_roots.shape[0] if articulations is None else articulations.shape[0],
+            inputs=[
+                world_mask,
+                articulations,
+                self.prescribed_root_of_articulation,
+                self.prescribed_root_articulation,
+                self.forest.art_to_world,
+            ],
+            outputs=[self.prescribed_valid],
+            device=self.model.device,
+        )
 
     def apply_kinematic_state(self, kinematic: tuple[np.ndarray, np.ndarray, np.ndarray]) -> None:
         """Publish derived kinematic masks and armature in place, where captured graphs read them."""
@@ -550,7 +667,9 @@ class TreeFactor:
     # ---------------------------------------------------------------------------------------------------------------
 
     def notify_state_changed(self, articulations: wp.array | None = None) -> None:
-        """Invalidate the cached kinematics of ``articulations`` (``None``: every articulation)."""
+        """Invalidate the cached kinematics of ``articulations`` (``None``: every articulation); their joint state was
+        written, so a kinematic root's stands (:meth:`forget_prescribed`)."""
+        self.forget_prescribed(articulations=articulations)
         if articulations is None:
             self.fk_id_cache_valid.zero_()
             return
@@ -625,8 +744,10 @@ class TreeFactor:
             )
 
     def reset_cache(self, world_mask: wp.array | None) -> None:
-        """Invalidate the FK/ID cache of the worlds ``world_mask`` selects. A step from another state than the one the
-        cache was derived from needs nothing here: the repair's stamps name the bank each tree's cache holds."""
+        """Invalidate the FK/ID cache of the worlds ``world_mask`` selects, where a kinematic root's joint state then
+        stands (:meth:`forget_prescribed`). A step from another state than the one the cache was derived from needs
+        nothing here: the repair's stamps name the bank each tree's cache holds."""
+        self.forget_prescribed(world_mask=world_mask)
         wp.launch(
             invalidate_articulation_fk_id_cache,
             dim=self.model.articulation_count,

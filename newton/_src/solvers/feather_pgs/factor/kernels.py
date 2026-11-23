@@ -547,3 +547,94 @@ def invalidate_articulation_fk_id_cache(
     if world_mask and not world_mask[world]:
         return
     fk_id_cache_valid[articulation] = 0
+
+
+@wp.func
+def _same_pose(a: wp.transform, b: wp.transform) -> bool:
+    for i in range(7):
+        if a[i] != b[i]:
+            return False
+    return True
+
+
+@wp.func
+def _same_twist(a: wp.spatial_vector, b: wp.spatial_vector) -> bool:
+    for i in range(6):
+        if a[i] != b[i]:
+            return False
+    return True
+
+
+@wp.kernel
+def follow_prescribed_bodies(
+    roots: wp.array[int],
+    root_articulation: wp.array[int],
+    joint_child: wp.array[int],
+    kinematic_joint_mask: wp.array[int],
+    body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+    published_q: wp.array[wp.transform],
+    published_qd: wp.array[wp.spatial_vector],
+    published_valid: wp.array[int],
+    # outputs
+    written: wp.array[wp.bool],
+    fk_id_cache_valid: wp.array[int],
+):
+    """Mark each kinematic root whose body state was written since the solver published it (:func:`publish_prescribed_bodies`):
+    its articulation's coordinates then follow the body (the step's inverse kinematics, which ``written`` selects) and
+    its cached kinematics are stale. A root whose publication was forgotten (a reset, a joint-state write) keeps its
+    joint state."""
+    k = wp.tid()
+    joint = roots[k]
+    articulation = root_articulation[k]
+    written[articulation] = False
+    if kinematic_joint_mask[joint] == 0 or published_valid[k] == 0:
+        return
+    body = joint_child[joint]
+    if _same_pose(body_q[body], published_q[k]) and _same_twist(body_qd[body], published_qd[k]):
+        return
+    written[articulation] = True
+    fk_id_cache_valid[articulation] = 0
+
+
+@wp.kernel
+def publish_prescribed_bodies(
+    roots: wp.array[int],
+    joint_child: wp.array[int],
+    body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+    # outputs
+    published_q: wp.array[wp.transform],
+    published_qd: wp.array[wp.spatial_vector],
+    published_valid: wp.array[int],
+):
+    """Record each root body's state as the step published it, which a later write is told from."""
+    k = wp.tid()
+    body = joint_child[roots[k]]
+    published_q[k] = body_q[body]
+    published_qd[k] = body_qd[body]
+    published_valid[k] = 1
+
+
+@wp.kernel
+def forget_prescribed_bodies(
+    world_mask: wp.array[wp.bool],
+    articulations: wp.array[int],
+    root_of_articulation: wp.array[int],
+    root_articulation: wp.array[int],
+    art_to_world: wp.array[int],
+    # outputs
+    published_valid: wp.array[int],
+):
+    """Forget the publication of the roots of the listed ``articulations`` (a joint-state write), or else of the
+    worlds ``world_mask`` selects (a reset; none: every root): their joint state stands at the next step."""
+    k = wp.tid()
+    if articulations:
+        root = root_of_articulation[articulations[k]]
+        if root >= 0:
+            published_valid[root] = 0
+        return
+    if world_mask:
+        if not world_mask[art_to_world[root_articulation[k]]]:
+            return
+    published_valid[k] = 0

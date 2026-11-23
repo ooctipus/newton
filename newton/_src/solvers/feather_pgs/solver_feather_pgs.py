@@ -116,6 +116,14 @@ class SolverFeatherPGS(SolverBase):
     post-impact velocity but a first-order, impact-phase-dependent position
     offset. Reduce the timestep when substep impact position matters.
 
+    A kinematic body (:attr:`~newton.BodyFlags.KINEMATIC`, a root joint's child) moves only as its user prescribes:
+    by its joint state (``joint_q``/``joint_qd``, with :meth:`notify_state_changed`, or :func:`newton.eval_fk` and
+    :meth:`reset`) or by its body state (``body_q``/``body_qd``, as the collision pipeline reads it). At each step's
+    entry a kinematic root whose body state differs from what the solver last published takes its joint coordinates
+    from it (Newton's inverse kinematics of its joint) and invalidates its cached kinematics; otherwise its joint state
+    stands. The pose holds for the step and the twist is what contacts and joints see. This holds for roots that are
+    kinematic when the solver is built.
+
     Moving surfaces (a conveyor's belt: a mesh built with ``enable_surface_velocity=True``, whose
     ``Contacts.rigid_contact_surface_velocity`` the collision pipeline samples) move their material past their
     bodies: a contact's friction holds its surfaces, not its bodies, together. Its friction rows' target is the
@@ -795,7 +803,10 @@ class SolverFeatherPGS(SolverBase):
         produced (ordinary dynamics derive them from the state at every step). Writes to
         ``joint_q``/``joint_qd`` of the next input state between steps (for example to
         prescribe kinematic bodies) must be notified here: the held tree sees an
-        un-notified write one step late.
+        un-notified write one step late. A kinematic root of the notified articulations
+        keeps the written joint state at the next step, whatever its body state holds.
+        A kinematic root prescribed through its body state instead (``body_q``/``body_qd``,
+        as maximal-coordinate solvers take it) needs no notification: see the class notes.
 
         Args:
             articulations: Optional device array of articulation indices whose joint

@@ -482,6 +482,8 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
     rows = (
         # The call's bind: the contacts' material, pool and identity contract.
         (call, "enter", not pure, (STEP, "enter", cut, factor.fk_id_cache_valid)),
+        # A kinematic root whose body state was written since the last publication follows it (before FK/ID).
+        (call, "follow_prescribed", factor.prescribes, (factor, "follow_prescribed", STATE_IN)),
         (call, "default_control", True, (STEP, "default_control", model)),
         (call, "bind_material", options.contact_compliance, (solver, "_bind_contact_material", CONTACTS)),
         (call, "follow_contacts", articulated, (STEP, "follow_contacts", placement)),
@@ -558,6 +560,7 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
         (dynamics, "audit_step", "audit" in diagnostics, (solver._audit, "launch")),
         # Stage 7: the finish (qdd, integration, publication), the carry the next step reads, the leave.
         (s7, "finish", True, (factor, "finish", STATE_IN, STATE_OUT, DT)),
+        (s7, "publish_prescribed", factor.prescribes, (factor, "publish_prescribed", STATE_OUT)),
         # Each tree's quiet substeps, from the published velocities and the substep's contact forces.
         (s7, "rest_test", rest is not None, (rest, "test", STATE_IN, STATE_OUT, CONTROL, CONTACTS, DT)),
         (call, "integrate_particles", particles, (solver, "integrate_particles", model, STATE_IN, STATE_OUT, DT)),
