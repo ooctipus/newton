@@ -807,7 +807,7 @@ class RowLaws:
         rows = placement.contact_pool.launch_rows()
         threads = walk_rows.support_threads(rows, model.device, walk_rows.WRITERS["free_body"])
         wp.launch(
-            walk_rows.write_free_body_rows(model.device.arch),
+            walk_rows.write_free_body_rows(model.device.arch, placement.split_records),
             dim=threads,
             inputs=[
                 walk_rows.free_body_sink(solver),

@@ -9,12 +9,14 @@ writer each free row after its rhs.
 
 from __future__ import annotations
 
+import functools
+
 import warp as wp
 
 from .device_preludes import CPU_MATH, CPU_WORDS, dual_native
 from .projection_laws import idle_key, idle_root
 from .row_laws import ROW_CONTACT, ROW_JOINT_LIMIT, ROW_TORSION
-from .row_metadata import HEADER_WORDS, RECORD_WORDS, SPLIT_WORDS, pack_row_record
+from .row_metadata import pack_row_record, record_words
 from .row_records import DenseRows
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -34,55 +36,50 @@ class RowRecords:
     """Where a line's rows' records sit (:func:`.row_metadata.record_layout`: ``record`` from row ``first``, the free
     rows' headers from row ``base`` at word ``free``) and each articulation's first world coordinate and coordinates
     (``offset``, ``dofs``), or where the rows take support classes (``classed``) each row's word (``classes``,
-    :func:`.packed_rows.row_classes`), which its record holds in place of its sides' widths; ``split`` whether the
-    records are split (:func:`.row_metadata.split_records`)."""
+    :func:`.packed_rows.row_classes`), which its record holds in place of its sides' widths."""
 
     record: wp.array2d[wp.int32]
     first: int
     base: int
     free: int
-    split: int
     offset: wp.array[int]
     dofs: wp.array[int]
     classed: int
     classes: wp.array2d[int]
 
 
-_RECORD_WORDS, _HEADER_WORDS = wp.constant(RECORD_WORDS), wp.constant(HEADER_WORDS)
-_SPLIT_WORDS = wp.constant(SPLIT_WORDS)
+def _name(func, split: bool):
+    """``func`` named for its record form: its own name for the packed form, ``_split`` after it for the split one."""
+    func.__name__ = func.__qualname__ = func.__name__ + ("_split" if split else "")
+    return func
 
 
-@wp.func_native(dual_native(pack_row_record("&record.data[at]", split="split"), preludes=(CPU_MATH, CPU_WORDS)))
-def store_row_record(
-    record: wp.array2d[wp.int32],
-    at: int,
-    words: int,
-    split: int,
-    dof_a: int,
-    dof_b: int,
-    n_a: int,
-    n_b: int,
-    diagonal: float,
-    rhs: float,
-    kind: int,
-    parent: int,
-    mu: float,
-    key: float,
-    root: float,
-): ...
+@functools.cache
+def _record_store(split: bool) -> wp.Function:
+    """Store a row's record of ``words`` words at ``at`` (:func:`.row_metadata.pack_row_record`), packed or ``split``
+    (:func:`.row_metadata.split_records`): the form is the line's, fixed where the writer is built."""
 
+    def store_row_record(
+        record: wp.array2d[wp.int32],
+        at: int,
+        words: int,
+        dof_a: int,
+        dof_b: int,
+        n_a: int,
+        n_b: int,
+        diagonal: float,
+        rhs: float,
+        kind: int,
+        parent: int,
+        mu: float,
+        key: float,
+        root: float,
+    ): ...
 
-@wp.func
-def record_at(records: RowRecords, line: int, slot: int) -> int:
-    """The flat index of row ``slot``'s record in line ``line``'s records (-1 for a row without one): a dense row's of
-    :data:`.row_metadata.RECORD_WORDS` words, a free row's header from ``free`` (a split record's
-    :data:`.row_metadata.SPLIT_WORDS` more each)."""
-    if slot < records.first:
-        return -1
-    at = line * records.record.shape[1]
-    if slot >= records.base:
-        return at + records.free + (slot - records.base) * (_HEADER_WORDS + records.split * _SPLIT_WORDS)
-    return at + (slot - records.first) * (_RECORD_WORDS + records.split * _SPLIT_WORDS)
+    _name(store_row_record, split)
+    return wp.func_native(
+        dual_native(pack_row_record("&record.data[at]", split=split), preludes=(CPU_MATH, CPU_WORDS))
+    )(store_row_record)
 
 
 @wp.func
@@ -110,73 +107,78 @@ def row_idle_key(kind: int, rhs: float, diagonal: float) -> float:
     return key
 
 
-@wp.func
-def write_row_record(records: RowRecords, rows: DenseRows, incident: float, line: int, slot: int):
-    """Store row ``slot``'s record (:func:`.row_metadata.pack_row_record`) from the row as its writers left it (its rhs
-    plus ``incident``). A free row's is its header, with its diagonal's inverse and its parent from ``base``."""
-    at = record_at(records, line, slot)
-    if at < 0:
-        return
-    diagonal = rows.diag[line, slot]
-    parent = rows.row_parent[line, slot]
-    rhs = rows.rhs[line, slot] + incident
-    kind = rows.row_type[line, slot]
-    sides = rows.sides[line, slot]
-    firsts = record_firsts(records, sides)
-    words = int(_RECORD_WORDS)
-    n_a = int(0)
-    n_b = int(0)
-    mu = float(0.0)
-    key = float(0.0)
-    root = float(0.0)
-    if slot >= records.base:
-        words = _HEADER_WORDS
-        inverse = float(0.0)
-        if diagonal > 0.0:
-            inverse = 1.0 / diagonal
-        diagonal = inverse
-        if parent >= 0:
-            parent = parent - records.base
-    else:
-        if records.classed != 0:
-            n_a = records.classes[line, slot]
+@functools.cache
+def record_writers(split: bool = False) -> tuple[wp.Function, wp.Function]:
+    """The records' writers of a line whose records are packed or ``split`` (:func:`.row_metadata.split_records`, fixed
+    where a writer is built, so a packed line's writer keeps the packed form's code): ``write_row_record`` and
+    ``write_world_records``."""
+    store = _record_store(split)
+    header, dense = record_words(True, split), record_words(False, split)
+
+    def record_at(records: RowRecords, line: int, slot: int) -> int:
+        """The flat index of row ``slot``'s record in line ``line``'s records (-1 for a row without one): a dense row's
+        of :func:`.row_metadata.record_words` words, a free row's header from ``free``."""
+        if slot < records.first:
+            return -1
+        at = line * records.record.shape[1]
+        if slot >= records.base:
+            return at + records.free + (slot - records.base) * wp.static(header)
+        return at + (slot - records.first) * wp.static(dense)
+
+    record_at = wp.func(_name(record_at, split))
+
+    def write_row_record(records: RowRecords, rows: DenseRows, incident: float, line: int, slot: int):
+        """Store row ``slot``'s record (:func:`.row_metadata.pack_row_record`) from the row as its writers left it (its
+        rhs plus ``incident``). A free row's is its header, with its diagonal's inverse and its parent from ``base``."""
+        at = record_at(records, line, slot)
+        if at < 0:
+            return
+        diagonal = rows.diag[line, slot]
+        parent = rows.row_parent[line, slot]
+        rhs = rows.rhs[line, slot] + incident
+        kind = rows.row_type[line, slot]
+        sides = rows.sides[line, slot]
+        firsts = record_firsts(records, sides)
+        words = int(wp.static(dense))
+        n_a = int(0)
+        n_b = int(0)
+        mu = float(0.0)
+        key = float(0.0)
+        root = float(0.0)
+        if slot >= records.base:
+            words = wp.static(header)
+            inverse = float(0.0)
+            if diagonal > 0.0:
+                inverse = 1.0 / diagonal
+            diagonal = inverse
+            if parent >= 0:
+                parent = parent - records.base
         else:
-            if sides[0] >= 0:
-                n_a = records.dofs[sides[0]]
-            if sides[1] >= 0:
-                n_b = records.dofs[sides[1]]
-        mu = rows.row_mu[line, slot]
-        key = row_idle_key(kind, rhs, diagonal)
-        root = idle_root(diagonal)
-    store_row_record(
-        records.record,
-        at,
-        words + records.split * _SPLIT_WORDS,
-        records.split,
-        firsts[0],
-        firsts[1],
-        n_a,
-        n_b,
-        diagonal,
-        rhs,
-        kind,
-        parent,
-        mu,
-        key,
-        root,
-    )
+            if records.classed != 0:
+                n_a = records.classes[line, slot]
+            else:
+                if sides[0] >= 0:
+                    n_a = records.dofs[sides[0]]
+                if sides[1] >= 0:
+                    n_b = records.dofs[sides[1]]
+            mu = rows.row_mu[line, slot]
+            key = row_idle_key(kind, rhs, diagonal)
+            root = idle_root(diagonal)
+        store(records.record, at, words, firsts[0], firsts[1], n_a, n_b, diagonal, rhs, kind, parent, mu, key, root)
 
+    write_row_record = wp.func(_name(write_row_record, split))
 
-@wp.func
-def write_world_records(
-    records: RowRecords, rows: DenseRows, incident: wp.array2d[float], line: int, lane: int, lanes: int, count: int
-):
-    """Store the records of a world's ``count`` dense rows from ``records.first``, ``lanes`` lanes striding over them
-    (:func:`write_row_record`), once its writer and the closure left them final: the general placement's writer, after
-    the part that writes the world's last rows. A world none of whose rows a sweep reads (no row can act, or a tier
-    walks them) stores none."""
-    for slot in range(records.first + lane, wp.min(count, records.base), lanes):
-        write_row_record(records, rows, incident[line, slot], line, slot)
+    def write_world_records(
+        records: RowRecords, rows: DenseRows, incident: wp.array2d[float], line: int, lane: int, lanes: int, count: int
+    ):
+        """Store the records of a world's ``count`` dense rows from ``records.first``, ``lanes`` lanes striding over
+        them (:func:`write_row_record`), once its writer and the closure left them final: the general placement's
+        writer, after the part that writes the world's last rows. A world none of whose rows a sweep reads (no row can
+        act, or a tier walks them) stores none."""
+        for slot in range(records.first + lane, wp.min(count, records.base), lanes):
+            write_row_record(records, rows, incident[line, slot], line, slot)
+
+    return write_row_record, wp.func(_name(write_world_records, split))
 
 
 def bind_row_records(placement) -> RowRecords:
@@ -186,7 +188,6 @@ def bind_row_records(placement) -> RowRecords:
     records.first = int(placement.record_first) if placement.writes_records else int(placement.row_pitch)
     records.base = int(placement.body_base)
     records.free = int(placement.free_records)
-    records.split = int(placement.split_records)
     records.offset = placement.forest.articulation_world_dof_offset
     records.dofs = placement.forest.articulation_response_dof_count
     records.classed = int(placement.classed)

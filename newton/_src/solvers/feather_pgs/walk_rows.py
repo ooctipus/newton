@@ -58,7 +58,7 @@ from .friction_patches import PatchRowLaw
 from .kernel_template import python_kernel
 from .packed_rows import RowClasses, class_rank
 from .projection_laws import friction_record
-from .response_builds_rows import RowRecords, write_row_record, write_world_records
+from .response_builds_rows import RowRecords, record_writers
 from .row_build import contact_row_kind, contact_row_law, write_contact_row
 from .row_kernels import RowBias, row_bias
 from .row_laws import LINK_ROWS
@@ -384,6 +384,7 @@ def walked_rows_kernel(
     block: int = 0,
     classes: bool = False,
     emit: bool = False,
+    split: bool = False,
     *,
     device_arch,
 ) -> wp.Kernel:
@@ -424,7 +425,11 @@ def walked_rows_kernel(
     classes' word beside it (which its record takes, :func:`.response_builds_rows.write_row_record`).
 
     ``emit``: a tier of the class takes the EMIT sink (:class:`RowSeeds`): a world's rows are walked here (STORE), or
-    its Jacobi tier runs their law and walks them in its prologue (:func:`emits`, the claims' predicate)."""
+    its Jacobi tier runs their law and walks them in its prologue (:func:`emits`, the claims' predicate).
+
+    ``split``: the line's records are split (:func:`.row_metadata.split_records`; their writers,
+    :func:`.response_builds_rows.record_writers`)."""
+    write_row_record, write_world_records = record_writers(split)
     has_blocks = blocks > 0
     capacity = max(blocks, 1)
     mimics = int(mimic_blocks)
@@ -549,6 +554,7 @@ def walked_rows_kernel(
     name += f"_topology{block}" if block else ""
     name += "_classes" if classes else ""
     name += "_emit" if emit else ""
+    name += "_split" if split else ""
     bounds = WRITERS["packed_blocks" if has_blocks else "packed"].bounds(device_arch)
     return python_kernel(kernel, name, launch_bounds=bounds)
 
@@ -565,8 +571,9 @@ def writer_kernel(solver, part: int = WRITE_ROWS) -> wp.Kernel:
     mimics = bool(blocks and solver.options.enable_bilateral_preelimination)
     block = WRITER_BLOCK_ROWS if part == WRITE_TOPOLOGY else 0
     tables = walk_tables(factor.walk_classes)
-    emit, classes, arch = bool(solver.placement.row_seeds.tiers), solver.placement.classed, solver.model.device.arch
-    return walked_rows_kernel(blocks, mimics, factor.walk_side, tables, block, classes, emit, device_arch=arch)
+    placement, arch = solver.placement, solver.model.device.arch
+    emit, classes, split = bool(placement.row_seeds.tiers), placement.classed, placement.split_records
+    return walked_rows_kernel(blocks, mimics, factor.walk_side, tables, block, classes, emit, split, device_arch=arch)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -1757,38 +1764,49 @@ walk_body_row = packed_walker(1, False, True, walk_tables((FREE_BODY_WALK,)))
 a row's sides in its ``a``/``b`` order, six entries each."""
 
 
-@wp.func
-def free_body_contact_rows(
-    sink: RowSink, rows: DenseRows, data: ContactInput, law: PatchRowLaw, bias: RowBias, records: RowRecords, c: int
-):
-    """Contact ``c``'s rows where the allocation routed it to the free bodies (``path`` 1): the contact's front end
-    formed once (:func:`.contact_input.contact_frame`), then each row's records by the contact law and the row as its
-    own unit (:func:`contact_row_unit`), walked by the one unit walker into the free bodies' rows
-    (:data:`walk_body_row`; the spin row a torque), with its diagonal ``|z|^2 + cfm``, its incident velocity and its rhs
-    by the row law (:func:`.row_kernels.row_bias`), as every writer's, then its streamed record
-    (:func:`.response_builds_rows.write_row_record`)."""
-    slot = data.slot[c]
-    if data.path[c] != 1 or slot < 0:
-        return
-    line = sink.layout.first[data.world[c]]
-    # The allocation's extent: recomputing eligibility can cross a floating-point threshold.
-    count = int(1)
-    if data.slots_needed[c] >= 3:
-        count = data.slots_needed[c]
-    frame = contact_frame(data, law, c)
-    for row in range(count):
-        walk_body_row(sink, contact_row_unit(data, law, frame, c, row, line, slot + row))
-        incident = sink.row_incident[line, slot + row]
-        row_bias(rows, bias, line, slot + row, incident)
-        write_row_record(records, rows, incident, line, slot + row)
+@cache
+def free_body_contact_rows(split: bool = False) -> wp.Function:
+    """The free bodies' contact rows' writer (``free_body_contact_rows``) for a line of packed or ``split`` records
+    (:func:`.response_builds_rows.record_writers`).
+
+    Contact ``c``'s rows where the allocation routed it to the free bodies (``path`` 1): the contact's front end formed
+    once (:func:`.contact_input.contact_frame`), then each row's records by the contact law and the row as its own unit
+    (:func:`contact_row_unit`), walked by the one unit walker into the free bodies' rows (:data:`walk_body_row`; the
+    spin row a torque), with its diagonal ``|z|^2 + cfm``, its incident velocity and its rhs by the row law
+    (:func:`.row_kernels.row_bias`), as every writer's, then its streamed record."""
+    write_row_record = record_writers(split)[0]
+
+    def free_body_contact_rows(
+        sink: RowSink, rows: DenseRows, data: ContactInput, law: PatchRowLaw, bias: RowBias, records: RowRecords, c: int
+    ):
+        slot = data.slot[c]
+        if data.path[c] != 1 or slot < 0:
+            return
+        line = sink.layout.first[data.world[c]]
+        # The allocation's extent: recomputing eligibility can cross a floating-point threshold.
+        count = int(1)
+        if data.slots_needed[c] >= 3:
+            count = data.slots_needed[c]
+        frame = contact_frame(data, law, c)
+        for row in range(count):
+            walk_body_row(sink, contact_row_unit(data, law, frame, c, row, line, slot + row))
+            incident = sink.row_incident[line, slot + row]
+            row_bias(rows, bias, line, slot + row, incident)
+            write_row_record(records, rows, incident, line, slot + row)
+
+    name = "free_body_contact_rows" + ("_split" if split else "")
+    free_body_contact_rows.__name__ = free_body_contact_rows.__qualname__ = name
+    return wp.func(free_body_contact_rows)
 
 
 @cache
-def write_free_body_rows(device_arch) -> wp.Kernel:
+def write_free_body_rows(device_arch, split: bool = False) -> wp.Kernel:
     """The free bodies' contact rows (the line's packed rows from ``body_base``), once their slots are reserved, built
-    for the architecture ``device_arch``: ``threads`` lanes stride over the step's contacts
-    (:func:`free_body_contact_rows`, those the allocation routed to the free bodies). Every unit's seeds walk into the
-    free-body sink with the row law after the walk; a unit's rows are its own, so the stride changes no row."""
+    for the architecture ``device_arch`` and the line's record form (``split``, :func:`.row_metadata.split_records`):
+    ``threads`` lanes stride over the step's contacts (:func:`free_body_contact_rows`, those the allocation routed to
+    the free bodies). Every unit's seeds walk into the free-body sink with the row law after the walk; a unit's rows
+    are its own, so the stride changes no row."""
+    contact_rows = free_body_contact_rows(split)
 
     def kernel(
         sink: RowSink,
@@ -1800,9 +1818,10 @@ def write_free_body_rows(device_arch) -> wp.Kernel:
         records: RowRecords,
     ):
         for item in range(wp.tid(), data.count[0], threads):
-            free_body_contact_rows(sink, rows, data, law, bias, records, item)
+            contact_rows(sink, rows, data, law, bias, records, item)
 
-    return python_kernel(kernel, "write_free_body_rows", launch_bounds=WRITERS["free_body"].bounds(device_arch))
+    name = "write_free_body_rows" + ("_split" if split else "")
+    return python_kernel(kernel, name, launch_bounds=WRITERS["free_body"].bounds(device_arch))
 
 
 def free_body_sink(solver) -> RowSink:

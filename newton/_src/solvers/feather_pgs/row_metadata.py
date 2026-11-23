@@ -111,7 +111,7 @@ def pack_row_record(
     record: str,
     words: int | str = "words",
     *,
-    split: bool | str = False,
+    split: bool = False,
     dof_a: str = "dof_a",
     dof_b: str = "dof_b",
     diagonal: str = "diagonal",
@@ -133,16 +133,11 @@ def pack_row_record(
     bounds the live order passes idle rows by, formed once with the record). Each field is a native expression, by default the local of its name, and
     ``words`` a class's count or, a native expression, the row's.
 
-    A ``split`` record (:func:`split_records`; a native expression, the line's) holds ``dof_a`` whole in the header's
-    first word and no parent in its kind word, then a last quad of ``dof_b`` and ``parent`` (:func:`split_word`)."""
-    static = not isinstance(split, str)
-    if words not in (HEADER_WORDS, RECORD_WORDS) and not isinstance(words, str) and static and not split:
+    A ``split`` record (:func:`split_records`, the line's) holds ``dof_a`` whole in the header's first word and no
+    parent in its kind word, then a last quad of ``dof_b`` and ``parent`` (:func:`split_word`)."""
+    if words not in (HEADER_WORDS, RECORD_WORDS) and not isinstance(words, str) and not split:
         raise ValueError(f"a record holds {HEADER_WORDS} or {RECORD_WORDS} words, not {words}")
-    packed = f"({dof_a} << 16) | ({dof_b} & 0xFFFF)"
-    if static:
-        firsts, kind_parent = (dof_a, "-1") if split else (packed, parent)
-    else:
-        firsts, kind_parent = f"{split} ? {dof_a} : ({packed})", f"{split} ? -1 : {parent}"
+    firsts, kind_parent = (dof_a, "-1") if split else (f"({dof_a} << 16) | ({dof_b} & 0xFFFF)", parent)
     text = (
         f"{indent}int4 record_a;\n"
         f"{indent}record_a.x = {firsts};\n"
@@ -151,16 +146,15 @@ def pack_row_record(
         f"{indent}record_a.w = {record_kind(kind, kind_parent)};"
     )
     text += f"\n{indent}*reinterpret_cast<int4*>({record}) = record_a;"
-    last = f"*reinterpret_cast<int4*>({record} + ({words}) - {SPLIT_WORDS}) = make_int4({dof_b}, {parent}, 0, 0);"
-    if static:
-        packed_words = words - SPLIT_WORDS if split and not isinstance(words, str) else words
-        if packed_words != HEADER_WORDS:
-            tail = f"*reinterpret_cast<int4*>({record} + 4) = make_int4({n_a} | ({n_b} << 16), __float_as_int({mu}), __float_as_int({key}), __float_as_int({root}));"
-            text += (f"\n{indent}if ({words} > {HEADER_WORDS}) " if isinstance(words, str) else f"\n{indent}") + tail
-        return text + (f"\n{indent}{last}" if split else "")
     tail = f"*reinterpret_cast<int4*>({record} + 4) = make_int4({n_a} | ({n_b} << 16), __float_as_int({mu}), __float_as_int({key}), __float_as_int({root}));"
-    text += f"\n{indent}if ({words} - ({split} ? {SPLIT_WORDS} : 0) > {HEADER_WORDS}) {tail}"
-    return text + f"\n{indent}if ({split}) {last}"
+    extra = SPLIT_WORDS if split else 0
+    if isinstance(words, str):
+        text += f"\n{indent}if ({words}{f' - {extra}' if extra else ''} > {HEADER_WORDS}) " + tail
+    elif words - extra != HEADER_WORDS:
+        text += f"\n{indent}" + tail
+    if split:
+        text += f"\n{indent}*reinterpret_cast<int4*>({record} + ({words}) - {SPLIT_WORDS}) = make_int4({dof_b}, {parent}, 0, 0);"
+    return text
 
 
 def record_word(row: str, word: int, base: str, words: int = RECORD_WORDS) -> str:
