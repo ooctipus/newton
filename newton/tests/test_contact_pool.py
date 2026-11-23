@@ -18,7 +18,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.core import contact_pool
+from newton._src.core import contact_pool, live_sort
 from newton._src.core.contact_pool import (
     INDEX_LIMIT,
     ContactField,
@@ -1892,6 +1892,48 @@ def test_contact_kinematics_outputs_hold_the_rows(test, device):
         )
 
 
+def test_live_sort_orders_alike_at_every_chunk(test, device):
+    """A sort of slot keys takes the smallest chunk that holds its live slots (live_sort.sort_chunk) and orders them
+    as the full chunk and its merges do: by (key, tie) with ties, stably by key without, below, at and past each
+    chunk size and past one full chunk."""
+    rng = np.random.default_rng(7)
+    for live in (1, 150, 256, 257, 700, 1024, 1025, 2048, 2049, 5000):
+        capacity = live
+        pool = ContactPool(device=device, rows=capacity, fixed=True)
+        # Few distinct keys, so equal keys are common and their order is the ties' (or the slots').
+        key_values = rng.integers(0, max(live // 8, 2), size=live).astype(np.int64)
+        tie_values = rng.permutation(1 << 20)[:live].astype(np.int64)
+        for tied in (True, False):
+            buffer = np.full(2 * capacity + int(live_sort.SORT_CHUNK), -1, dtype=np.int64)
+            buffer[:live] = key_values
+            keys = wp.array(buffer, dtype=wp.int64, device=device)
+            slots = np.zeros(buffer.size, dtype=np.int64)
+            slots[:live] = np.arange(live)
+            indices = wp.array(slots, dtype=int, device=device)
+            ties_buffer = np.zeros(buffer.size, dtype=np.int64)
+            ties_buffer[:live] = tie_values
+            ties = wp.array(ties_buffer, dtype=wp.int64, device=device) if tied else None
+            extent = wp.zeros(live_sort.EXTENT_SIZE, dtype=int, device=device)
+            count = wp.array([live], dtype=int, device=device)
+            live_sort.publish_live(pool, count, extent)
+            blocks, merges, merge_threads = live_sort.sort_grid(device, capacity)
+            live_sort.launch_live_sort(
+                pool,
+                keys,
+                indices,
+                extent,
+                capacity,
+                blocks=blocks,
+                merges=merges,
+                merge_threads=merge_threads,
+                slot_keys=True,
+                ties=ties,
+            )
+            expected = np.lexsort((tie_values, key_values)) if tied else np.argsort(key_values, kind="stable")
+            np.testing.assert_array_equal(indices.numpy()[:live], expected, err_msg=f"live {live}, ties {tied}")
+            np.testing.assert_array_equal(keys.numpy()[:live], key_values[expected])
+
+
 class TestContactPool(unittest.TestCase):
     pass
 
@@ -2006,6 +2048,14 @@ add_function_test(
     "test_an_unprepared_graph_bridge_fails_closed",
     test_an_unprepared_graph_bridge_fails_closed,
     devices=cuda_devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestContactPool,
+    "test_live_sort_orders_alike_at_every_chunk",
+    test_live_sort_orders_alike_at_every_chunk,
+    devices=devices,
     check_output=False,
 )
 

@@ -7,10 +7,14 @@ The slots live in two halves of buffers of ``2 * capacity + SORT_CHUNK``
 elements (keys and slot indices): the first half holds the live slots, the
 second is scratch, and the chunk past it lets a chunk's tile load stay in the
 buffer. A kernel that knows the live count writes the sort's extent with
-:func:`publish_sort_extent`: ``[live slots, chunks, work of each merge]``.
-:func:`launch_live_sort` then sorts each chunk of :data:`SORT_CHUNK` live slots
-in shared memory and merges sorted runs pairwise, its last round every run
-left, until one run holds every live slot, ending in the first half.
+:func:`publish_sort_extent`: ``[live slots, chunks, work of each merge, chunks
+of each sized chunk sort]``. :func:`launch_live_sort` then sorts each chunk of
+live slots in shared memory and merges sorted runs pairwise, its last round
+every run left, until one run holds every live slot, ending in the first half.
+A sort of slot keys takes chunks the live slots size (:func:`sort_chunk`): the
+smallest of :data:`SORT_CHUNKS` that holds them, else :data:`SORT_CHUNK`, so a
+few hundred live slots sort in one small tile; its order values are unique, so
+the order is the same at every chunk.
 
 Order: by key; a merge keeps the slots of its earlier run first among equal
 keys. Chunks of *slot keys* (``slot_keys``, keys of at most 51 bits) sort by
@@ -36,8 +40,13 @@ SLOT_BITS = wp.constant(11)
 """Bits of a slot within its chunk (``SORT_CHUNK == 1 << SLOT_BITS``)."""
 MAX_MERGES = wp.constant(21)
 """Merge rounds the extent holds: ``SORT_CHUNK << 21`` slots exceed any int32 count."""
-EXTENT_SIZE = 2 + MAX_MERGES
-"""Entries of a sort extent: the live slots, their chunks, and the work of each merge."""
+SORT_CHUNKS = (256, 512, 1024, int(SORT_CHUNK))
+"""The chunk sizes a sort of slot keys is built for (:func:`sort_chunk` picks one by the live slots)."""
+SMALLEST_CHUNK = wp.constant(SORT_CHUNKS[0])
+"""The smallest chunk a sort of slot keys takes."""
+EXTENT_SIZE = 2 + MAX_MERGES + len(SORT_CHUNKS)
+"""Entries of a sort extent: the live slots, their chunks, the work of each merge, and each sized chunk sort's
+chunks (:data:`SORT_CHUNKS`, zero but at the size :func:`sort_chunk` picks)."""
 _PAD = wp.constant(wp.int64(1 << 62))
 _KEY_SENTINEL = wp.constant(wp.int64(0x7FFFFFFFFFFFFFFF))
 _BLOCK_THREADS = 256
@@ -64,12 +73,23 @@ def merge_rounds(live: int):
 
 
 @wp.func
+def sort_chunk(live: int):
+    """Return the chunk a sort of ``live`` slot keys takes: the smallest of :data:`SORT_CHUNKS` that holds every live
+    slot, else :data:`SORT_CHUNK`. Below :data:`SORT_CHUNK` the live slots fit one chunk, so no merge runs."""
+    chunk = int(SMALLEST_CHUNK)
+    while chunk < live and chunk < SORT_CHUNK:
+        chunk *= 2
+    return chunk
+
+
+@wp.func
 def publish_sort_extent(extent: wp.array[int], base: int, live: int):
     """Write the sort's extent of ``live`` slots at ``extent[base:base + EXTENT_SIZE]``.
 
-    The live slots, their chunks, and for each merge the live slots when it has
-    runs to join, else 0: a captured sort follows them and launches no work past
-    the live slots.
+    The live slots, their chunks, for each merge the live slots when it has
+    runs to join, else 0, and for each chunk size of :data:`SORT_CHUNKS` its
+    chunks where :func:`sort_chunk` picks it, else 0: a captured sort follows
+    them and launches no work past the live slots.
     """
     extent[base] = live
     extent[base + 1] = (live + SORT_CHUNK - 1) // SORT_CHUNK
@@ -79,6 +99,14 @@ def publish_sort_extent(extent: wp.array[int], base: int, live: int):
         if merge < rounds:
             work = live
         extent[base + 2 + merge] = work
+    picked = sort_chunk(live)
+    chunk = int(SMALLEST_CHUNK)
+    for size in range(wp.static(len(SORT_CHUNKS))):
+        chunks = int(0)
+        if chunk == picked:
+            chunks = (live + chunk - 1) // chunk
+        extent[base + 2 + MAX_MERGES + size] = chunks
+        chunk *= 2
 
 
 @wp.kernel(enable_backward=False)
@@ -140,7 +168,10 @@ def _ranked_order(key: wp.int64, rank: int, local: int, start: int, live: int):
 # keys and indices of ordinary arrays: those capacities rely on wp.tile_store's
 # bounds check, which drops the stores past the arrays' end. Such slots only hold
 # padding past the live slots; fields hold SORT_CHUNK extra slots to avoid it.
-def _chunk_sort(order_key, stored_key):
+def _chunk_sort(order_key, stored_key, chunk: int, sized: bool):
+    """The chunk sort of ``chunk`` slots a block by ``order_key``; ``sized``: it runs only where :func:`sort_chunk`
+    picks its chunk (a sort of slot keys, whose order values are unique), else at every live count."""
+
     def sort_chunks(
         slot_keys: wp.array[wp.int64],
         slot_indices: wp.array[int],
@@ -158,17 +189,19 @@ def _chunk_sort(order_key, stored_key):
         """
         block = wp.tid()
         live = extent[0]
+        if wp.static(sized) and sort_chunk(live) != wp.static(chunk):
+            return
         output = capacity * (wp.min(merge_rounds(live), merges) % 2)
-        for start in range(block * SORT_CHUNK, live, blocks * SORT_CHUNK):
-            loaded = wp.tile_load(slot_keys, shape=SORT_CHUNK, offset=start)
-            local = wp.tile_arange(SORT_CHUNK, dtype=int)
-            first = wp.tile_full(SORT_CHUNK, start, dtype=int)
-            count = wp.tile_full(SORT_CHUNK, live, dtype=int)
-            order = wp.tile_zeros(shape=SORT_CHUNK, dtype=wp.int64, storage="shared")
+        for start in range(block * wp.static(chunk), live, blocks * wp.static(chunk)):
+            loaded = wp.tile_load(slot_keys, shape=wp.static(chunk), offset=start)
+            local = wp.tile_arange(wp.static(chunk), dtype=int)
+            first = wp.tile_full(wp.static(chunk), start, dtype=int)
+            count = wp.tile_full(wp.static(chunk), live, dtype=int)
+            order = wp.tile_zeros(shape=wp.static(chunk), dtype=wp.int64, storage="shared")
             # Warp hashes a function passed to a builtin only through wp.static();
             # otherwise edits to the key maps would reuse a stale cached kernel.
             wp.tile_assign(order, wp.tile_map(wp.static(order_key), loaded, local, first, count))
-            values = wp.tile_load(slot_indices, shape=SORT_CHUNK, offset=start, storage="shared")
+            values = wp.tile_load(slot_indices, shape=wp.static(chunk), offset=start, storage="shared")
             wp.tile_sort(order, values)
             wp.tile_store(keys, wp.tile_map(wp.static(stored_key), order), offset=output + start)
             wp.tile_store(indices, values, offset=output + start)
@@ -176,54 +209,66 @@ def _chunk_sort(order_key, stored_key):
     return sort_chunks
 
 
-@wp.kernel(enable_backward=False)
-def _sort_tied_chunks(
-    slot_keys: wp.array[wp.int64],
-    slot_indices: wp.array[int],
-    ties: wp.array[wp.int64],
-    keys: wp.array[wp.int64],
-    indices: wp.array[int],
-    extent: wp.array[int],
-    capacity: int,
-    blocks: int,
-    merges: int,
-):
-    """Sort each chunk of the live slots by (slot key, tie), into the half where ``merges`` rounds end in the first.
+def _tied_chunk_sort(chunk: int):
+    """The chunk sort by (slot key, tie) of ``chunk`` slots a block, run where :func:`sort_chunk` picks its chunk."""
 
-    The chunk's slots are first ordered by tie (``ties`` at each slot's index, which the chunk's slots hold as
-    loaded: a new frame's slots are their indices), then by (slot key, tie rank): the rank takes the slot's bits of
-    :func:`_slot_order`, so the chunk sort stays one key of at most 62 bits.
-    """
-    block = wp.tid()
-    live = extent[0]
-    output = capacity * (wp.min(merge_rounds(live), merges) % 2)
-    for start in range(block * SORT_CHUNK, live, blocks * SORT_CHUNK):
-        local = wp.tile_arange(SORT_CHUNK, dtype=int)
-        first = wp.tile_full(SORT_CHUNK, start, dtype=int)
-        count = wp.tile_full(SORT_CHUNK, live, dtype=int)
-        tied = wp.tile_load(ties, shape=SORT_CHUNK, offset=start)
-        by_tie = wp.tile_zeros(shape=SORT_CHUNK, dtype=wp.int64, storage="shared")
-        wp.tile_assign(by_tie, wp.tile_map(_tie_order, tied, local, first, count))
-        perm = wp.tile_arange(SORT_CHUNK, dtype=int, storage="shared")
-        wp.tile_sort(by_tie, perm)
-        loaded = wp.tile_load_indexed(slot_keys, perm, shape=(SORT_CHUNK,), offset=(start,), axis=0)
-        values = wp.tile_load_indexed(
-            slot_indices, perm, shape=(SORT_CHUNK,), offset=(start,), axis=0, storage="shared"
-        )
-        order = wp.tile_zeros(shape=SORT_CHUNK, dtype=wp.int64, storage="shared")
-        wp.tile_assign(order, wp.tile_map(_ranked_order, loaded, local, perm, first, count))
-        wp.tile_sort(order, values)
-        wp.tile_store(keys, wp.tile_map(_slot_key, order), offset=output + start)
-        wp.tile_store(indices, values, offset=output + start)
+    def sort_tied_chunks(
+        slot_keys: wp.array[wp.int64],
+        slot_indices: wp.array[int],
+        ties: wp.array[wp.int64],
+        keys: wp.array[wp.int64],
+        indices: wp.array[int],
+        extent: wp.array[int],
+        capacity: int,
+        blocks: int,
+        merges: int,
+    ):
+        """Sort each chunk of the live slots by (slot key, tie), into the half where ``merges`` rounds end in the
+        first.
+
+        The chunk's slots are first ordered by tie (``ties`` at each slot's index, which the chunk's slots hold as
+        loaded: a new frame's slots are their indices), then by (slot key, tie rank): the rank takes the slot's bits
+        of :func:`_slot_order`, so the chunk sort stays one key of at most 62 bits. The live slots' ranks are their
+        places in tie order whatever the chunk, so every chunk that holds them orders them alike.
+        """
+        block = wp.tid()
+        live = extent[0]
+        if sort_chunk(live) != wp.static(chunk):
+            return
+        output = capacity * (wp.min(merge_rounds(live), merges) % 2)
+        for start in range(block * wp.static(chunk), live, blocks * wp.static(chunk)):
+            local = wp.tile_arange(wp.static(chunk), dtype=int)
+            first = wp.tile_full(wp.static(chunk), start, dtype=int)
+            count = wp.tile_full(wp.static(chunk), live, dtype=int)
+            tied = wp.tile_load(ties, shape=wp.static(chunk), offset=start)
+            by_tie = wp.tile_zeros(shape=wp.static(chunk), dtype=wp.int64, storage="shared")
+            wp.tile_assign(by_tie, wp.tile_map(_tie_order, tied, local, first, count))
+            perm = wp.tile_arange(wp.static(chunk), dtype=int, storage="shared")
+            wp.tile_sort(by_tie, perm)
+            loaded = wp.tile_load_indexed(slot_keys, perm, shape=(wp.static(chunk),), offset=(start,), axis=0)
+            values = wp.tile_load_indexed(
+                slot_indices, perm, shape=(wp.static(chunk),), offset=(start,), axis=0, storage="shared"
+            )
+            order = wp.tile_zeros(shape=wp.static(chunk), dtype=wp.int64, storage="shared")
+            wp.tile_assign(order, wp.tile_map(_ranked_order, loaded, local, perm, first, count))
+            wp.tile_sort(order, values)
+            wp.tile_store(keys, wp.tile_map(_slot_key, order), offset=output + start)
+            wp.tile_store(indices, values, offset=output + start)
+
+    return sort_tied_chunks
 
 
-# Two chunk sorts that differ in their key maps, each a kernel of this module.
-_sort_slot_chunks = wp.Kernel(
-    _chunk_sort(_slot_order, _slot_key), key="live_sort_slot_chunks", options={"enable_backward": False}
+def _kernel(function, key: str) -> wp.Kernel:
+    return wp.Kernel(function, key=key, options={"enable_backward": False})
+
+
+# The chunk sorts, each a kernel of this module: of slot keys (by slot, or by tie) one a chunk size of SORT_CHUNKS,
+# of other keys, whose equal keys a smaller chunk could order otherwise, SORT_CHUNK's alone.
+_sort_slot_chunks = tuple(
+    _kernel(_chunk_sort(_slot_order, _slot_key, chunk, True), f"live_sort_slot_chunks_{chunk}") for chunk in SORT_CHUNKS
 )
-_sort_key_chunks = wp.Kernel(
-    _chunk_sort(_key_order, _key), key="live_sort_key_chunks", options={"enable_backward": False}
-)
+_sort_tied_chunks = tuple(_kernel(_tied_chunk_sort(chunk), f"live_sort_tied_chunks_{chunk}") for chunk in SORT_CHUNKS)
+_sort_key_chunks = _kernel(_chunk_sort(_key_order, _key, int(SORT_CHUNK), False), "live_sort_key_chunks")
 
 
 @wp.func
@@ -366,20 +411,24 @@ def launch_live_sort(
     if ties is not None and not slot_keys:
         raise ValueError("ties order slot keys only")
     pool.note_cover(int(SORT_CHUNK) << merges)
-    if ties is not None:
-        pool.launch(
-            _sort_tied_chunks,
-            blocks,
-            inputs=[keys, indices, ties, keys, indices, extent, capacity, blocks, merges],
-            extent=extent[1:2],
-            clamp=True,
-            row_args=(7,),
-            tiled=True,
-            block_dim=_BLOCK_THREADS,
-        )
+    if slot_keys:
+        # One launch a chunk size; each runs where its extent entry (sort_chunk's pick) holds chunks.
+        tied = ties is not None
+        for size, kernel in enumerate(_sort_tied_chunks if tied else _sort_slot_chunks):
+            entry = 2 + int(MAX_MERGES) + size
+            pool.launch(
+                kernel,
+                blocks,
+                inputs=[keys, indices, *((ties,) if tied else ()), keys, indices, extent, capacity, blocks, merges],
+                extent=extent[entry : entry + 1],
+                clamp=True,
+                row_args=(7,) if tied else (6,),
+                tiled=True,
+                block_dim=_BLOCK_THREADS,
+            )
     else:
         pool.launch(
-            _sort_slot_chunks if slot_keys else _sort_key_chunks,
+            _sort_key_chunks,
             blocks,
             inputs=[keys, indices, keys, indices, extent, capacity, blocks, merges],
             extent=extent[1:2],
