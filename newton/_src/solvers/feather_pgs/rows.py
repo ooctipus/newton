@@ -866,7 +866,10 @@ class RowLaws:
             rows = -(-placement.dense_internal_rows_at_once // walk_rows.WRITER_BLOCK_ROWS)
         else:
             rows = placement.dense_internal_max_rows
-        lanes = walk_rows.writer_lanes(rows, placement.dense_max_constraints, model.device)
+        # A world's rows without a closure are each their lane's alone: they spread over the GPU where few worlds
+        # would leave it idle (walk_rows.writer_lanes).
+        worlds = solver.forest.world_count if part != walk_rows.WRITE_TOPOLOGY and not blocks else 0
+        lanes = walk_rows.writer_lanes(rows, placement.dense_max_constraints, model.device, worlds)
         law = (bind_dense_rows(placement), contact_input, patch_row_law(solver))
         law += (self.joint_seeds(solver, state_in), self.bias(solver.options, dt))
         inputs = [

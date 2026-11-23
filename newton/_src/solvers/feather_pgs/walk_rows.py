@@ -34,7 +34,7 @@ from typing import NamedTuple
 
 import warp as wp
 
-from ...core.execution import Buckets, Queue, Work, append, bucket_item, shape
+from ...core.execution import Buckets, Queue, Work, append, bucket_item, fill_lanes, shape
 from ...core.memory import Operand, Place, built_for, table
 from . import field_group
 from .contact_input import ContactFrame, ContactInput, contact_frame
@@ -210,16 +210,24 @@ def world_sync(lanes: int):
     CPU, where one thread runs the world)."""
 
 
-def writer_lanes(rows: int, capacity: int, device) -> int:
+def writer_lanes(rows: int, capacity: int, device, worlds: int = 0) -> int:
     """A world's lane group in the one writer: the smallest power of two at or above the rows its topology fixes
     (``rows``: links, mimics and limits; contacts stride over it), at most the row capacity and a warp, so a world's
     lanes synchronize within their warp (:func:`world_sync`); one thread on the CPU.
+
+    ``worlds``: where a world's lanes never meet (no closure follows its rows), the worlds the launch holds. Each row
+    is then its lane's alone, and a few worlds of many rows spread them over the GPU (:func:`.core.execution.fill_lanes`,
+    up to the row capacity) instead of a warp each: one world of 64 figures, whose topology fixes no row, had one
+    thread write its every row. Many worlds keep the topology's lanes.
 
     A world's release and closure run serially on one of its lanes, so lanes beyond its rows idle there."""
     if not wp.get_device(device).is_cuda:
         return 1
     lanes = max(min(int(rows), int(capacity), 32), 1)
-    return 1 << (lanes - 1).bit_length()
+    lanes = 1 << (lanes - 1).bit_length()
+    if worlds > 0:
+        lanes = fill_lanes(worlds, device, least=lanes, most=1 << (max(int(capacity), 1) - 1).bit_length())
+    return lanes
 
 
 WRITE_ROWS, WRITE_TOPOLOGY, WRITE_REST = wp.constant(0), wp.constant(1), wp.constant(2)
