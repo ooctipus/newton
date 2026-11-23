@@ -134,7 +134,7 @@ class _Items:
 
 
 @wp.kernel(enable_backward=False)
-def _move(items: _Items, source: wp.array(dtype=Any), target: wp.array(dtype=Any)):
+def _move(items: _Items, source: wp.array[Any], target: wp.array[Any]):
     """The cut's one map (:class:`_Map`): ``target[into[i]] = source[outof[i]]``. A gather reads by its order into the
     identity, a scatter the identity into its order."""
     i = wp.tid()
@@ -143,50 +143,185 @@ def _move(items: _Items, source: wp.array(dtype=Any), target: wp.array(dtype=Any
             target[items.into[i]] = source[items.outof[i]]
 
 
+@wp.struct
+class _Live:
+    """The arrays a step reads live (:data:`_LIVE`) in one layout, the caller's model's or the forest's."""
+
+    joint_X_p: wp.array[wp.transform]
+    joint_X_c: wp.array[wp.transform]
+    joint_axis: wp.array[wp.vec3]
+    joint_armature: wp.array[float]
+    joint_damping: wp.array[float]
+    joint_stiffness: wp.array[float]
+    joint_effort_limit: wp.array[float]
+    joint_limit_lower: wp.array[float]
+    joint_limit_upper: wp.array[float]
+    joint_target_ke: wp.array[float]
+    joint_target_kd: wp.array[float]
+    joint_velocity_limit: wp.array[float]
+    joint_rest_q: wp.array[float]
+    body_com: wp.array[wp.vec3]
+    body_mass: wp.array[float]
+    body_inertia: wp.array[wp.mat33]
+    body_flags: wp.array[wp.int32]
+
+
+@wp.struct
+class _Boundary:
+    """A step's input across the boundary (:meth:`BodyCut.enter`): the caller's state and control (``caller_*``), their
+    mirrors' arrays, and the output's mirror's poses and twists, which take the input's for the bodies outside every
+    tree. ``bodies`` counts the caller's bodies (none: no state crosses, a notification's gather), ``controls`` the
+    control's joint inputs that exist, a bit each (force, target position, target speed, actuation)."""
+
+    bodies: int
+    caller_joint_q: wp.array[float]
+    caller_joint_qd: wp.array[float]
+    caller_body_q: wp.array[wp.transform]
+    caller_body_qd: wp.array[wp.spatial_vector]
+    caller_body_f: wp.array[wp.spatial_vector]
+    joint_q: wp.array[float]
+    joint_qd: wp.array[float]
+    body_q: wp.array[wp.transform]
+    body_qd: wp.array[wp.spatial_vector]
+    body_f: wp.array[wp.spatial_vector]
+    out_body_q: wp.array[wp.transform]
+    out_body_qd: wp.array[wp.spatial_vector]
+    controls: int
+    caller_joint_f: wp.array[float]
+    caller_joint_target_q: wp.array[float]
+    caller_joint_target_qd: wp.array[float]
+    caller_joint_act: wp.array[float]
+    joint_f: wp.array[float]
+    joint_target_q: wp.array[float]
+    joint_target_qd: wp.array[float]
+    joint_act: wp.array[float]
+
+
+@wp.func
+def _moves(items: _Items, i: int) -> bool:
+    """Whether item ``i`` of a map moves: one of its items, active (read only where it is one)."""
+    if i < items.count:
+        return items.active[i]
+    return False
+
+
 @wp.kernel(enable_backward=False)
-def _gather_frames(
-    items: _Items,
-    source: wp.array[wp.transform],
+def _gather(
+    joints: _Items,
+    dofs: _Items,
+    coords: _Items,
+    bodies: _Items,
+    outside: _Items,
     anchor: wp.array[int],
     body_q: wp.array[wp.transform],
-    target: wp.array[wp.transform],
+    share: wp.array[float],
+    primaries: int,
+    source: _Live,
+    forest: _Live,
+    boundary: _Boundary,
 ):
-    """The joints' parent frames, by the joints' map. A loop joint on a body no tree holds stands on the world, where
-    that body stands."""
+    """Every gather of the step's input, by the cut's maps (:class:`_Map`), in one launch: the live arrays
+    (:data:`_LIVE`), then the boundary's state and control (:class:`_Boundary`).
+
+    The joints' parent frames: a loop joint on a body no tree holds stands on the world, where that body stands (the
+    caller's model's ``body_q``). Each
+    piece's share of its body: a shadow is dynamic whatever its body is, as a joint's child must be to move, and
+    kinematic where its link is disabled (no share)."""
     i = wp.tid()
-    if i < items.count:
-        if items.active[i]:
-            j = items.outof[i]
-            target[i] = source[j]
-            if anchor[i] >= 0:
-                target[i] = wp.transform_multiply(body_q[anchor[i]], source[j])
+    if _moves(joints, i):
+        j = joints.outof[i]
+        forest.joint_X_c[joints.into[i]] = source.joint_X_c[j]
+        forest.joint_X_p[i] = source.joint_X_p[j]
+        if anchor[i] >= 0:
+            forest.joint_X_p[i] = wp.transform_multiply(body_q[anchor[i]], source.joint_X_p[j])
+    if _moves(dofs, i):
+        j = dofs.outof[i]
+        k = dofs.into[i]
+        forest.joint_axis[k] = source.joint_axis[j]
+        forest.joint_armature[k] = source.joint_armature[j]
+        forest.joint_damping[k] = source.joint_damping[j]
+        forest.joint_stiffness[k] = source.joint_stiffness[j]
+        forest.joint_effort_limit[k] = source.joint_effort_limit[j]
+        forest.joint_limit_lower[k] = source.joint_limit_lower[j]
+        forest.joint_limit_upper[k] = source.joint_limit_upper[j]
+        forest.joint_target_ke[k] = source.joint_target_ke[j]
+        forest.joint_target_kd[k] = source.joint_target_kd[j]
+        forest.joint_velocity_limit[k] = source.joint_velocity_limit[j]
+        if boundary.bodies > 0:
+            boundary.joint_qd[k] = boundary.caller_joint_qd[j]
+        if (boundary.controls & 1) != 0:
+            boundary.joint_f[k] = boundary.caller_joint_f[j]
+        if (boundary.controls & 4) != 0:
+            boundary.joint_target_qd[k] = boundary.caller_joint_target_qd[j]
+        if (boundary.controls & 8) != 0:
+            boundary.joint_act[k] = boundary.caller_joint_act[j]
+    if _moves(coords, i):
+        j = coords.outof[i]
+        k = coords.into[i]
+        forest.joint_rest_q[k] = source.joint_rest_q[j]
+        if boundary.bodies > 0:
+            boundary.joint_q[k] = boundary.caller_joint_q[j]
+        if (boundary.controls & 2) != 0:
+            boundary.joint_target_q[k] = boundary.caller_joint_target_q[j]
+    if i < bodies.count:
+        j = bodies.outof[i]
+        forest.body_com[bodies.into[i]] = source.body_com[j]
+        forest.body_mass[i] = source.body_mass[j] * share[i]
+        forest.body_inertia[i] = source.body_inertia[j] * share[i]
+        if i < primaries:
+            forest.body_flags[i] = source.body_flags[j]
+        elif share[i] > 0.0:
+            forest.body_flags[i] = _DYNAMIC
+        else:
+            forest.body_flags[i] = _KINEMATIC
+    if i < boundary.bodies:
+        boundary.body_q[i] = boundary.caller_body_q[i]
+        boundary.body_qd[i] = boundary.caller_body_qd[i]
+        boundary.body_f[i] = boundary.caller_body_f[i]
+        if _moves(outside, i):
+            boundary.out_body_q[outside.into[i]] = boundary.caller_body_q[outside.outof[i]]
+            boundary.out_body_qd[outside.into[i]] = boundary.caller_body_qd[outside.outof[i]]
 
 
 @wp.kernel(enable_backward=False)
-def _gather_bodies(
-    items: _Items,
-    mass: wp.array[float],
-    inertia: wp.array[wp.mat33],
-    flags: wp.array[int],
-    share: wp.array[float],
-    primaries: int,
-    forest_mass: wp.array[float],
-    forest_inertia: wp.array[wp.mat33],
-    forest_flags: wp.array[int],
+def _publish(
+    coords: _Items,
+    dofs: _Items,
+    bodies: int,
+    joint_q: wp.array[float],
+    joint_qd: wp.array[float],
+    in_body_q: wp.array[wp.transform],
+    in_body_qd: wp.array[wp.spatial_vector],
+    out_body_q: wp.array[wp.transform],
+    out_body_qd: wp.array[wp.spatial_vector],
+    caller_joint_q: wp.array[float],
+    caller_joint_qd: wp.array[float],
+    caller_in_body_q: wp.array[wp.transform],
+    caller_in_body_qd: wp.array[wp.spatial_vector],
+    caller_out_body_q: wp.array[wp.transform],
+    caller_out_body_qd: wp.array[wp.spatial_vector],
 ):
-    """Each piece's share of its body, by the bodies' map. A shadow is dynamic whatever its body is, as a joint's child
-    must be to move, and kinematic where its link is disabled (no share)."""
+    """The step's publication (:meth:`BodyCut.leave`) in one launch: the output's coordinates and speeds by the
+    publishing maps, and both states' bodies, the forest's first ``bodies`` (the primary pieces)."""
     i = wp.tid()
-    if i < items.count:
-        j = items.outof[i]
-        forest_mass[i] = mass[j] * share[i]
-        forest_inertia[i] = inertia[j] * share[i]
-        if i < primaries:
-            forest_flags[i] = flags[j]
-        elif share[i] > 0.0:
-            forest_flags[i] = _DYNAMIC
-        else:
-            forest_flags[i] = _KINEMATIC
+    if _moves(coords, i):
+        caller_joint_q[coords.into[i]] = joint_q[coords.outof[i]]
+    if _moves(dofs, i):
+        caller_joint_qd[dofs.into[i]] = joint_qd[dofs.outof[i]]
+    if i < bodies:
+        caller_in_body_q[i] = in_body_q[i]
+        caller_in_body_qd[i] = in_body_qd[i]
+        caller_out_body_q[i] = out_body_q[i]
+        caller_out_body_qd[i] = out_body_qd[i]
+
+
+@wp.kernel(enable_backward=False)
+def _seat_pieces(items: _Items, body_q: wp.array[wp.transform], body_qd: wp.array[wp.spatial_vector]):
+    """Each seated link's shadow on its primary piece: its pose and twist (the seat's map, active where seated)."""
+    i = wp.tid()
+    if _moves(items, i):
+        body_q[items.into[i]] = body_q[items.outof[i]]
+        body_qd[items.into[i]] = body_qd[items.outof[i]]
 
 
 @wp.kernel(enable_backward=False)
@@ -333,6 +468,14 @@ def _seat(
                 valid[trees[k]] = 0
         for k in range(link_start[component], link_start[component + 1]):
             seated_links[links[k]] = seat
+
+
+def _live(model: Model) -> _Live:
+    """``model``'s live arrays (:class:`_Live`) as they stand now."""
+    live = _Live()
+    for name in _Live.vars:
+        setattr(live, name, getattr(model, name))
+    return live
 
 
 @dataclasses.dataclass(frozen=True)
@@ -837,7 +980,9 @@ class BodyCut:
         # The bodies no tree holds stand outside the solver: the step passes their pose and twist through (no finish
         # writes them), so the output's mirror takes the input's at the enter.
         outside = np.flatnonzero(body_tree[: caller.body_count] < 0)
-        self._outside = mapped(outside.size, indices(outside), indices(outside)) if outside.size else None
+        self._outside = mapped(outside.size, indices(outside), indices(outside)).items
+        # The gathers' and the publication's one launch each, an item a thread of the widest map.
+        self._shape = shape(Work(int(items)), memory.device(device))
         anchor = np.full(order.size, -1, dtype=np.int32)
         anchor[position[self._anchored]] = source.joint_parent.numpy()[self._anchored]
         self._anchor = indices(anchor)
@@ -871,38 +1016,26 @@ class BodyCut:
         share[self.shadow] *= self.enabled
         self._share.assign(share)
 
-    def _gather_model(self) -> None:
-        """The arrays a step reads and the layout moves, from the caller's model as it stands now."""
-        source, forest, device = self.source, self.model, self.model.device
-        for map_, names in (
-            (self._joint_map, ("joint_X_c",)),
-            (self._dof_map, _LIVE_DOFS),
-            (self._coord_map, _LIVE_COORDS),
-            (self._body_map, ("body_com",)),
-        ):
-            for name in names:
-                map_.move(getattr(source, name), getattr(forest, name))
+    def _gather_model(self, boundary: _Boundary | None = None) -> None:
+        """The arrays a step reads and the layout moves, from the caller's model as it stands now, and ``boundary``'s
+        state and control (none at a notification), in one launch (:func:`_gather`)."""
         launch(
-            _gather_frames,
-            self._joint_map.shape,
-            inputs=[self._joint_map.items, source.joint_X_p, self._anchor, source.body_q],
-            outputs=[forest.joint_X_p],
-            device=device,
-            tiled=False,
-        )
-        launch(
-            _gather_bodies,
-            self._body_map.shape,
+            _gather,
+            self._shape,
             inputs=[
+                self._joint_map.items,
+                self._dof_map.items,
+                self._coord_map.items,
                 self._body_map.items,
-                source.body_mass,
-                source.body_inertia,
-                source.body_flags,
+                self._outside,
+                self._anchor,
+                self.source.body_q,
                 self._share,
-                source.body_count,
+                self.source.body_count,
+                _live(self.source),
             ],
-            outputs=[forest.body_mass, forest.body_inertia, forest.body_flags],
-            device=device,
+            outputs=[_live(self.model), _Boundary() if boundary is None else boundary],
+            device=self.model.device,
             tiled=False,
         )
 
@@ -984,7 +1117,7 @@ class BodyCut:
         return articulations if self.pure else None
 
     def _control(self, control: Control | None) -> Control | None:
-        """``control``'s mirror, its joint inputs gathered."""
+        """``control``'s mirror, which the enter's gather fills (:meth:`enter`)."""
         if control is None:
             return None
         mirror = self._controls.get(control)
@@ -1002,15 +1135,6 @@ class BodyCut:
                     mirror, name, None if value is None else wp.zeros(count, dtype=value.dtype, device=value.device)
                 )
             self._controls[control] = mirror
-        for name, map_ in (
-            ("joint_f", self._dof_map),
-            ("joint_target_q", self._coord_map),
-            ("joint_target_qd", self._dof_map),
-            ("joint_act", self._dof_map),
-        ):
-            value = getattr(control, name)
-            if value is not None:
-                map_.move(value, getattr(mirror, name))
         return mirror
 
     def enter(
@@ -1025,17 +1149,27 @@ class BodyCut:
             cache_valid: Each tree's kinematics cache bit; every tree of a component that holds a cleared one clears
                 its own, since seating moves it.
         """
-        self._gather_model()
         forest_in, forest_out = self.mirror(state_in), self.mirror(state_out)
-        device, count = self.model.device, self.source.body_count
-        self._coord_map.move(state_in.joint_q, forest_in.joint_q)
-        self._dof_map.move(state_in.joint_qd, forest_in.joint_qd)
-        wp.copy(forest_in.body_q, state_in.body_q, count=count)
-        wp.copy(forest_in.body_qd, state_in.body_qd, count=count)
-        wp.copy(forest_in.body_f, state_in.body_f, count=count)
-        if self._outside is not None:
-            self._outside.move(state_in.body_q, forest_out.body_q)
-            self._outside.move(state_in.body_qd, forest_out.body_qd)
+        mirror = self._control(control)
+        boundary = _Boundary()
+        boundary.bodies = self.source.body_count
+        boundary.caller_joint_q, boundary.joint_q = state_in.joint_q, forest_in.joint_q
+        boundary.caller_joint_qd, boundary.joint_qd = state_in.joint_qd, forest_in.joint_qd
+        for name in ("body_q", "body_qd", "body_f"):
+            setattr(boundary, f"caller_{name}", getattr(state_in, name))
+            setattr(boundary, name, getattr(forest_in, name))
+        boundary.out_body_q, boundary.out_body_qd = forest_out.body_q, forest_out.body_qd
+        if control is not None:
+            controls = 0
+            for bit, name in enumerate(("joint_f", "joint_target_q", "joint_target_qd", "joint_act")):
+                value = getattr(control, name)
+                if value is not None:
+                    controls |= 1 << bit
+                    setattr(boundary, f"caller_{name}", value)
+                    setattr(boundary, name, getattr(mirror, name))
+            boundary.controls = controls
+        self._gather_model(boundary)
+        device = self.model.device
 
         launch(
             _seat,
@@ -1069,10 +1203,16 @@ class BodyCut:
         if self._roots is not None:
             self._follow_loose(forest_in, cache_valid)
         eval_fk(self.model, forest_in.joint_q, forest_in.joint_qd, forest_in, mask=self._seated_trees)
-        self._seat_map.move(forest_in.body_q, forest_in.body_q)
-        self._seat_map.move(forest_in.body_qd, forest_in.body_qd)
+        launch(
+            _seat_pieces,
+            self._seat_map.shape,
+            inputs=[self._seat_map.items],
+            outputs=[forest_in.body_q, forest_in.body_qd],
+            device=device,
+            tiled=False,
+        )
         eval_ik(self._seats, forest_in, forest_in.joint_q, forest_in.joint_qd, mask=self._seated_links)
-        return forest_in, forest_out, self._control(control)
+        return forest_in, forest_out, mirror
 
     def _follow_loose(self, forest_in: State, cache_valid: wp.array) -> None:
         """The loose trees' state is their bodies': each added root takes its body's pose and twist, and a loose tree
@@ -1124,10 +1264,32 @@ class BodyCut:
     def leave(self, state_in: State, state_out: State) -> None:
         """Publish the step: the output's coordinates, and both states' bodies (the step's primary pieces, the model's
         bodies, whose indices the forest keeps)."""
-        count = self.source.body_count
         forest_in, forest_out = self.mirror(state_in), self.mirror(state_out)
-        self._publish_q.move(forest_out.joint_q, state_out.joint_q)
-        self._publish_qd.move(forest_out.joint_qd, state_out.joint_qd)
+        launch(
+            _publish,
+            self._shape,
+            inputs=[
+                self._publish_q.items,
+                self._publish_qd.items,
+                self.source.body_count,
+                forest_out.joint_q,
+                forest_out.joint_qd,
+                forest_in.body_q,
+                forest_in.body_qd,
+                forest_out.body_q,
+                forest_out.body_qd,
+            ],
+            outputs=[
+                state_out.joint_q,
+                state_out.joint_qd,
+                state_in.body_q,
+                state_in.body_qd,
+                state_out.body_q,
+                state_out.body_qd,
+            ],
+            device=self.model.device,
+            tiled=False,
+        )
         if self._spheres is not None:
             wp.launch(
                 _spheres_out,
@@ -1136,9 +1298,6 @@ class BodyCut:
                 outputs=[state_out.joint_q, state_out.joint_qd],
                 device=self.model.device,
             )
-        for state, mirror in ((state_in, forest_in), (state_out, forest_out)):
-            wp.copy(state.body_q, mirror.body_q, count=count)
-            wp.copy(state.body_qd, mirror.body_qd, count=count)
 
     def follow_shadows(self, state_in: State, state_out: State) -> None:
         """After :meth:`leave`, where links hold shadows: a caller may copy its output over its input and step that, so
