@@ -565,7 +565,7 @@ def census_calls():
             ((48, 18, 12), (32, 8, 8)),
             (
                 _axis("active_rows"),
-                _axis("use_support_table"),
+                ({"layout": "classes"}, {"layout": "sides", "sides": True}),
                 _axis("contact_triplets"),
                 _axis("velocity_limits"),
                 _axis("lanes_per_world", (32, 16, 8)),

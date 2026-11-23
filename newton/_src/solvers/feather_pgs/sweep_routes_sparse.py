@@ -3,16 +3,18 @@
 
 """The native sparse PGS sweep as a configuration of the sweep emitter (:mod:`.sweep`).
 
-The sweep solves a world's rows in factor coordinates: row ``i`` is ``Z_i = L^-1 P J_i^T``, the walk's footprints
-packed as the coordinates and values of its support (:func:`.walk_rows.support_rows_kernel`), and the velocity it
-acts on is the factor-coordinate delta from ``v_hat``, staged per world and published once
-(``factor_velocity_delta``); the step's one leave walks it down (:func:`.factor.walk.walk_leave_kernel`, at
-``Sweep.support_du_base`` and the class's nodes). A configuration chooses:
+The sweep solves a world's rows in the walk's coordinates: row ``i`` is ``Z_i = L^-1 P J_i^T``, the walk's footprints
+in the one store, the packed rows (:mod:`.packed_rows`, written by :func:`.walk_rows.support_rows_kernel`), and the
+velocity it acts on is the change from ``v_hat`` at the world's coordinates, staged per world and added once into the
+walk's ``du``, which the step's one leave walks down (:func:`.factor.walk.walk_leave_kernel`), as every sweep's. A
+configuration chooses:
 
 - the **mapping**: 32, 16 or 8 lanes per world, ``64 / lanes`` worlds per block of 64 threads, with launch bounds
   from the register line and the data (:data:`REGISTER_LINE`);
-- the **operator's layout**: packed rows read through explicit row indices (``row_dof``) or the shared support
-  table, or (``local_factors``) packed rows expanded once per call into dense rows in shared memory;
+- the **rows' layout**, the placement's (:meth:`.placement.Placement.place_row_classes`): by support class
+  (``CLASS_SIDES``) or by side (``PACKED_SIDES``), from the rows' sides or, where every world holds one tree at its
+  first coordinate, from coordinate 0 (no side read: by side entry ``e`` is coordinate ``e``); or (``local_factors``)
+  the packed rows expanded once per call into dense rows in shared memory;
 - the **schedule**: every row in slot order, stepping to the rows that can act (:class:`.sweep.LiveOrder`: an
   idle row is passed by the exact bound of the velocity's norm), or (``active_rows``) the rows selected at sweep
   entry, popped from a bitset (:func:`.sweep.active_scan`); patch rings (``linked_rows``) select their friction pairs through the ring; under
@@ -40,12 +42,13 @@ import warp as wp
 from ...core.execution import Work, device_lanes
 from ...core.memory import Buffer, Staging
 from . import kernel_template
+from .factor.walk import WalkTrees
 from .kernel_template import Dispatch
+from .packed_rows import CLASS_SIDES, PACKED_SIDES_BY_SIDE, PACKED_SIDES_DENSE
 from .projection_laws import IDLE_LAW
 from .response_operator import Lanes, SparseFactor
 from .row_inputs import RowArgument
 from .row_laws import ROW_CONTACT, ROW_TORSION
-from .sparse_mass_matrix import _SparseRowSupport
 from .sweep import (
     FORMED_RECORD,
     ITERATION,
@@ -90,8 +93,12 @@ SPARSE_ABI = kernel_template.params(
     ("rhs_bias", wp.array2d[float]),
     ("world_diag", wp.array2d[float]),
     ("world_impulses", wp.array2d[float]),
-    ("row_dof", wp.array3d[int]),
-    ("row_factor", wp.array3d[float]),
+    ("packed_Z", wp.array3d[float]),
+    ("row_sides", wp.array2d[wp.vec2i]),
+    ("row_classes", wp.array2d[int]),
+    ("class_dof", wp.array2d[int]),
+    ("response_dofs", wp.array[int]),
+    ("articulation_world_dof_offset", wp.array[int]),
     ("row_incident", wp.array2d[float]),
     ("world_row_type", wp.array2d[int]),
     ("world_row_parent", wp.array2d[int]),
@@ -100,10 +107,10 @@ SPARSE_ABI = kernel_template.params(
     ("v_hat", wp.array[float]),
     ("iterations", int),
     ("omega", float),
-    ("factor_velocity_delta", wp.array2d[float]),
-    ("support", _SparseRowSupport),
+    ("walk", WalkTrees),
 )
-"""The sparse sweep's native ABI (one world per call). ``world_dof_indices`` and ``v_hat`` are read by no
+"""The sparse sweep's native ABI (one world per call): the packed rows with their sides and classes, and the walk, whose
+``du`` takes the sweep's change at each world coordinate's (``world_dof_indices``). ``v_hat`` is read by no
 configuration: the sweep holds no free-body rows."""
 
 THREADS = 64
@@ -117,21 +124,21 @@ THREADS = 64
 
 @dataclasses.dataclass(frozen=True)
 class SparseSweep(SweepConfig):
-    """The native sparse sweep's configuration (case K1): a world's rows (at most ``max_constraints``) in factor
-    coordinates of its one tree of ``max_world_dofs`` coordinates, each row's support at most ``max_row_dofs`` entries
-    (:func:`_source`).
+    """The native sparse sweep's configuration (case K1): a world's rows (at most ``max_constraints``) over its
+    ``max_world_dofs`` coordinates, each row ``max_row_dofs`` entries of the packed rows (:func:`_source`).
 
-    Its switches, each the plan's from the class's shape and the laws (the class plan's packed choice,
-    :meth:`.sweep_plan.Sweep.place_packed`):
+    Its switches, each the plan's from the class's shape, the placement and the laws (the class plan's packed choice,
+    :meth:`.sweep_plan.Sweep.plan_support_walk`):
 
-    - the support class: ``use_support_table``, the rows' coordinates from the shared support table (at most 64
-      factored coordinates), else explicit row indices; ``local_factors`` expands the packed rows into dense rows in
-      shared memory once a call;
+    - the rows' layout (:attr:`layout`): ``"classes"``, by support class; ``"dense"``, by side at the world's
+      coordinates; ``"sides"``, by side, the first side's coordinates then the second's; ``sides``, each row's sides
+      read for their first coordinates, else every world holds one tree at coordinate 0; ``local_factors`` expands the
+      packed rows into dense rows in shared memory once a call;
     - lanes: ``lanes_per_world`` (8, 16 or 32) a world, ``64 / lanes`` worlds a block (the device's: one thread on the
       CPU, :attr:`lanes`);
     - the enumeration: ``active_rows`` visits the rows selected at sweep entry (:func:`.sweep.active_scan`);
     - the contact unit: ``contact_triplets``, a contact normal and its friction pair on their Gram block, with the
-      support table and the active scan or linked rows, three rows (four with torsion) at least; ``linked_rows``
+      active scan or linked rows, three rows (four with torsion) at least; ``linked_rows``
       (patch rings) take part only in an active scan or a contact unit;
     - ``warm_start``: the seed.
 
@@ -142,7 +149,8 @@ class SparseSweep(SweepConfig):
     max_world_dofs: int
     max_row_dofs: int
     _: dataclasses.KW_ONLY
-    use_support_table: bool = False
+    layout: str = "classes"
+    sides: bool = False
     contact_triplets: bool = False
     lanes_per_world: int = 32
     local_factors: bool = False
@@ -158,24 +166,22 @@ class SparseSweep(SweepConfig):
         M, D, S = int(self.max_constraints), int(self.max_world_dofs), int(self.max_row_dofs)
         if M <= 0 or D <= 0 or S <= 0 or S > D:
             raise ValueError("sparse PGS requires positive capacities and max_row_dofs <= max_world_dofs")
-        if self.use_support_table and D > 64:
-            raise ValueError("sparse support tables require at most 64 factored DOFs")
+        if self.layout not in ("classes", "dense", "sides") or (self.layout == "sides" and not self.sides):
+            raise ValueError("sparse PGS reads its rows by class, dense or by side (by side from their sides)")
+        if self.layout == "dense" and not self.sides and S != D:
+            raise ValueError("dense rows of one tree at coordinate 0 hold every world coordinate")
         if int(self.lanes_per_world) not in (8, 16, 32):
             raise ValueError("sparse PGS requires 8, 16 or 32 lanes per world")
         active = bool(self.active_rows)
-        triplets = (
-            bool(self.contact_triplets)
-            and (active or bool(self.linked_rows))
-            and bool(self.use_support_table)
-            and M >= 3 + self.torsion
-        )
+        triplets = bool(self.contact_triplets) and (active or bool(self.linked_rows)) and M >= 3 + self.torsion
         resolved = {
             "max_constraints": M,
             "max_world_dofs": D,
             "max_row_dofs": S,
             "lanes_per_world": int(self.lanes_per_world),
             "active_rows": active,
-            "use_support_table": bool(self.use_support_table),
+            "layout": str(self.layout),
+            "sides": bool(self.sides),
             "contact_triplets": triplets,
             "linked_rows": bool(self.linked_rows) and (active or triplets),
             "local_factors": bool(self.local_factors),
@@ -205,7 +211,7 @@ class SparseSweep(SweepConfig):
     @property
     def name(self) -> str:
         suffix = "_active" if self.active_rows else ""
-        suffix += "_support_table" if self.use_support_table else ""
+        suffix += f"_{self.layout}" + ("_sides" if self.sides else "")
         suffix += "_contact_triplets" if self.contact_triplets else ""
         suffix += "_linked" if self.linked_rows else ""
         suffix += f"_lanes{self.lanes}" if self.lanes != 32 else ""
@@ -259,28 +265,38 @@ class SparseSweep(SweepConfig):
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-def _class_coordinate(row_class: str, support: int, entry: str = "entry") -> str:
-    return f"support.class_dof.data[{row_class} * {support} + {entry}]"
-
-
 def factor_operator(sweep: SparseSweep) -> SparseFactor:
-    """The sweep's operator: packed rows through the support table or explicit row indices, expanded once per
+    """The sweep's operator: the packed rows (``packed_Z``) in the placement's layout, their coordinates by class
+    (``CLASS_COORDINATE``) or by side (``PACKED_COORDINATE``) from the rows' sides, or with ``sides`` off from
+    coordinate 0: by side entry ``e`` at coordinate ``e``, by class the row's one side's class's entry ``e`` (a row of
+    a world of one tree holds one side; its class's table is the rows' width wide, padded with -1); expanded once per
     call into dense rows with ``local_factors``."""
     S = sweep.max_row_dofs
-    if sweep.use_support_table:
 
-        def index(row, entry):
-            return _class_coordinate(f"support.row_class.data[offset + {row}]", S, entry)
-
-    else:
-
-        def index(row, entry):
-            return f"row_dof.data[row_base + {row} * {S} + {entry}]"
+    def index(row, entry):
+        at = f"offset + ({row})"
+        if sweep.layout == "classes":
+            if sweep.sides:
+                return f"CLASS_COORDINATE(row_sides.data[{at}], row_classes.data[{at}], {entry})"
+            return f"class_dof.data[(row_classes.data[{at}] & 0x1FFF) * {S} + ({entry})]"
+        if sweep.sides:
+            return f"PACKED_COORDINATE(row_sides.data[{at}], {entry})"
+        return f"({entry})"
 
     def factor(row, entry):
-        return f"row_factor.data[row_base + {row} * {S} + {entry}]"
+        return f"packed_Z.data[row_base + ({row}) * {S} + ({entry})]"
 
     return SparseFactor(S, index, factor, Lanes(sweep.lanes), dense=sweep.max_world_dofs if sweep.local_factors else 0)
+
+
+def _row_preludes(sweep: SparseSweep) -> tuple:
+    """The store's readers the operator calls from the rows' sides (:mod:`.packed_rows`): the classes', or the sides' at
+    the layout."""
+    if not sweep.sides:
+        return ()
+    if sweep.layout == "classes":
+        return (CLASS_SIDES,)
+    return (PACKED_SIDES_DENSE if sweep.layout == "dense" else PACKED_SIDES_BY_SIDE,)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -333,16 +349,20 @@ def contact_units(sweep: SparseSweep, rows: StagedRows, op: SparseFactor, laws: 
     after = "\n        const float gram_n1 = coupling.x, gram_n2 = coupling.y;\n" + cached_pair_law(
         "UNIT_PAIR", "basis.x", "basis.y", ("basis.z", "basis.w"), "        "
     )
+    # A unit's rows share one coordinate list: by side every row of a contact holds its sides' coordinates; by class
+    # the three rows' classes agree.
+    classes = sweep.layout == "classes"
+    class_loads = """
+    const int row_class = row_classes.data[offset + i];
+    const int tangent_class = row_classes.data[offset + tangent];
+    const int sibling_class = row_classes.data[offset + sibling];"""
+    class_guard = " && tangent_class == sibling_class\n        && row_class == tangent_class"
     guard = (
         f"""
-    // The guards load together; the rows, the record and the coordinates then load together.
-    const int row_class = support.row_class.data[offset + i];
-    const int tangent_class = support.row_class.data[offset + tangent];
-    const int sibling_class = support.row_class.data[offset + sibling];
+    // The guards load together; the rows, the record and the coordinates then load together.{class_loads if classes else ""}
     const int tangent_parent = world_row_parent.data[offset + tangent];
     const int sibling_parent = world_row_parent.data[offset + sibling];{normal_parent}""",
-        f"""tangent_parent == i && sibling_parent == i && tangent_class == sibling_class
-        && row_class == tangent_class{point_guard}""",
+        f"""tangent_parent == i && sibling_parent == i{class_guard if classes else ""}{point_guard}""",
     )
     return unit_visit(
         rows,
@@ -481,7 +501,11 @@ def _source(sweep: SparseSweep) -> tuple[str, Staging]:
 
 {sweeps}
 
-    for (int d = lane; d < {D}; d += {L}) factor_velocity_delta.data[world * {D} + d] = s_delta[d];
+    // The change into the walk's du at the world's coordinates, which the step's one leave walks down.
+    for (int d = lane; d < {D}; d += {L}) {{
+        const int global_dof = world_dof_indices.data[world * {D} + d];
+        if (global_dof >= 0) walk.du.data[global_dof] += s_delta[d];
+    }}
 {rows.stores("    ")}
 """
-    return sweep.native(body, lanes=L, laws=(IDLE_LAW,) if live else ()), staging
+    return sweep.native(body, lanes=L, rows=_row_preludes(sweep), laws=(IDLE_LAW,) if live else ()), staging

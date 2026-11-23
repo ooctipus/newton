@@ -25,7 +25,7 @@ from newton.tests import test_feather_pgs_sparse_contact_triplets as triplets
 from newton.tests.test_feather_pgs_native_prelude import _native_snippets
 from newton.tests.test_feather_pgs_sparse_pgs import _sweep
 
-TRIPLETS = {"active_rows": True, "use_support_table": True, "contact_triplets": True}
+TRIPLETS = {"active_rows": True, "layout": "classes", "contact_triplets": True}
 # Row capacities of the suite's two launch-bound families: shared memory admits 12 blocks of 256 rows on the
 # RTX PRO 6000, and the register budget's 16 of 96.
 CAPACITIES = (256, 96)

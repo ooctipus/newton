@@ -24,7 +24,6 @@ import numpy as np
 
 from ...core.memory import arch_budget
 from . import held_tree, host_index, sweep_routes_sparse
-from .forest_plan import row_support
 from .route_table import Pins, first_failed
 from .sweep_routes_sparse import _SPARSE_LOCAL_WORKSPACE_BYTES
 from .sweep_routes_tiers import TIER_MAX_ROWS
@@ -85,22 +84,16 @@ class Diagonal:
 
 @dataclass(frozen=True, eq=False)
 class Packed:
-    """Case K1's choice, native sparse factors of a single tree: the factored size and pattern, the row support and
-    the sweep's options."""
+    """Case K1's choice, native sparse factors of a single tree: the factored size and pattern and the sweep's options.
+    Its rows are the one store's, by their support classes (:meth:`.placement.Placement.place_row_classes`)."""
 
     size: int
     plan: object
     """The tree's factor pattern (:class:`.tree_plan.FactorPattern`)."""
-    body_masks: np.ndarray
-    max_support: int
-    support_classes: object
-    """The row support table's classes (:class:`.tree_plan.SupportClasses`), or ``None`` for explicit indices."""
     sweep: Mapping[str, object]
-    """The sweep's options: ``active_rows``, ``use_support_table``, ``contact_triplets``, ``lanes_per_world``,
-    ``local_factors``."""
+    """The sweep's options: ``active_rows``, ``contact_triplets``, ``lanes_per_world``, ``local_factors``."""
     active_rows_reason: str
     contact_triplets_reason: str
-    index_shape: tuple[int, int, int]
     held: held_tree.HeldPlan | None = None
     """The held tree's plan with these factors, which admitted the case (:func:`.held_tree.plan`)."""
 
@@ -291,9 +284,7 @@ def active_rows_rule(pins, *, small_world_lanes: int, fits: Callable[[], bool]) 
     )
 
 
-def contact_triplets_rule(
-    pins, *, active_rows: bool, use_support_table: bool, lanes: int, fits: Callable[[], bool]
-) -> tuple[bool, str]:
+def contact_triplets_rule(pins, *, active_rows: bool, lanes: int, fits: Callable[[], bool]) -> tuple[bool, str]:
     """Whether the sparse sweep fuses contact triplets, and why: wherever the row structure admits them.
 
     Patch friction fuses its anchor units, pooling their ring loads as the ordinary pair
@@ -305,7 +296,6 @@ def contact_triplets_rule(
     Args:
         pins: The test-only route pins (:class:`.route_table.Pins`).
         active_rows: Whether the sweep selects its rows at sweep entry.
-        use_support_table: Whether rows read the shared support table.
         lanes: Lanes per world of the sweep.
         fits: Whether contact units fit the row capacity and shared memory, evaluated last.
     """
@@ -313,8 +303,6 @@ def contact_triplets_rule(
         return False, "A test pin keeps unfused contact rows (contact_units=None)."
     if lanes < 32:
         return False, f"Small worlds keep their packed {lanes}-lane full sweep."
-    if not use_support_table:
-        return False, "Triplets need the row support table."
     if not fits():
         return False, "Row capacity or shared memory leaves no room for contact units."
     sweep = "active-row scan" if active_rows else "full ordered sweep"
@@ -352,9 +340,10 @@ def packed_rule(inputs: ClassInputs) -> tuple[Packed | None, str]:
     if shape.blocks != 1:
         return None, "Native sparse factors require one articulated response DOF size."
     size = shape.sizes[0]
-    # The endpoint support uses one 64-bit ancestry mask, not a robot-specific DOF limit.
-    if size > 64 or size not in forest.crba_dof_joint_offset_by_size or size in forest.diagonal_mass_sizes:
-        return None, "Articulated topology needs at most 64 response DOFs, a CRBA mapping and non-diagonal inertia."
+    # The writer's support masks are 64-bit (one bit a tree coordinate) and a row word's first side holds fewer than 64
+    # entries (packed_rows.CLASS_SIDES): not a robot-specific DOF limit.
+    if size >= 64 or size not in forest.crba_dof_joint_offset_by_size or size in forest.diagonal_mass_sizes:
+        return None, "Articulated topology needs at most 63 response DOFs, a CRBA mapping and non-diagonal inertia."
     articulated = forest.group_to_art_host[size]
     joint_ancestor = model.joint_ancestor.numpy()
     joint_qd_start = model.joint_qd_start.numpy()
@@ -366,28 +355,17 @@ def packed_rule(inputs: ClassInputs) -> tuple[Packed | None, str]:
     plan = tree.factor
     if plan.dof_count != size or plan.nonzero_count >= size * (size + 1) // 2:
         return None, "Topology has no usable sparse factor layout for this row policy."
-    mimic_dofs = None
-    if laws.mimic_count:
-        mimic_indices = laws._mimic_art_list.numpy()
-        mimic_arts, _ = host_index.expand(np.diff(laws.mimic_art_start_np))
-        starts = forest.articulation_dof_start_host[mimic_arts]
-        mimic_dofs = (
-            laws._mimic_dof0.numpy()[mimic_indices] - starts,
-            laws._mimic_dof1.numpy()[mimic_indices] - starts,
-        )
-    body_masks, max_support = row_support(forest, model, plan, articulated, shape.arts is None, mimic_dofs)
-    if not max_support:
-        return None, "Topology has no responsive row support."
     # The sweep's shared working set (sweep_routes_sparse.SparseSweep.staging) against the device's stage budget:
     # each shared-memory choice below reads its own sweep's working set, and the route is admitted by the working
-    # set of the sweep it launches, which the one factory checks the same way.
+    # set of the sweep it launches, which the one factory checks the same way. The working set holds no row entries:
+    # the rows' width (the one store's, placed later) does not enter it.
     budget = arch_budget(model.device.arch)
 
     def staging(**options):
         return sweep_routes_sparse.SparseSweep(
             dense_rows,
             forest.max_world_dofs,
-            int(max_support),
+            forest.max_world_dofs,
             linked_rows=True,
             torsion=bool(laws.spin_rows),
             **options,
@@ -401,40 +379,14 @@ def packed_rule(inputs: ClassInputs) -> tuple[Packed | None, str]:
         small_world_lanes=small_world_lanes,
         fits=lambda: staging(active_rows=True).fits(budget),
     )
-    index_shape = (forest.world_count, dense_rows, max_support)
-    support_classes = None
-    # A world of the one tree alone: its coordinates are the tree's.
-    if pins.row_support and not laws.mimic_count and shape.present(0):
-        # The classes of the bodies a contact can name (those with shapes; the row width is theirs too): a
-        # shape-less body takes the empty class.
-        contact_bodies = np.zeros(body_masks.shape[0], dtype=bool)
-        shape_body = model.shape_body.numpy()
-        contact_bodies[shape_body[shape_body >= 0]] = True
-        classes = tree.support_classes(np.where(contact_bodies, body_masks, np.uint64(0)), max_support)
-        if classes is not None:
-            table_bytes = sum(
-                getattr(classes, name).nbytes for name in ("body_class", "pair_class", "class_dof", "limit_class")
-            )
-            table_bytes += 4 * forest.world_count * dense_rows
-            # Small batches with many support patterns can favor direct indices.
-            if table_bytes < 4 * int(np.prod(index_shape)):
-                support_classes = classes
-    # Unsupported mixed worlds retain explicit row indices and their existing kernels.
-    use_support_table = support_classes is not None
     # A small world packs a lane group of 8 or 16 (_small_world_lanes) without changing this owner's row
     # representation or sweep policy.
     lanes = small_world_lanes if small_world_lanes and not active_rows else 32
     contact_triplets, contact_triplets_reason = contact_triplets_rule(
         pins,
         active_rows=active_rows,
-        use_support_table=use_support_table,
         lanes=lanes,
-        fits=lambda: (
-            dense_rows >= 3
-            and staging(active_rows=active_rows, use_support_table=use_support_table, contact_triplets=True).fits(
-                budget
-            )
-        ),
+        fits=lambda: dense_rows >= 3 and staging(active_rows=active_rows, contact_triplets=True).fits(budget),
     )
     # Large resident workspaces regressed whole-step timing in measured
     # small systems. Keep the global-row consumer when the cache is large.
@@ -444,7 +396,6 @@ def packed_rule(inputs: ClassInputs) -> tuple[Packed | None, str]:
     )
     sweep = {
         "active_rows": active_rows,
-        "use_support_table": use_support_table,
         "contact_triplets": contact_triplets,
         "lanes_per_world": lanes,
         "local_factors": local_factors,
@@ -455,13 +406,9 @@ def packed_rule(inputs: ClassInputs) -> tuple[Packed | None, str]:
     choice = Packed(
         size=size,
         plan=plan,
-        body_masks=body_masks,
-        max_support=int(max_support),
-        support_classes=support_classes,
         sweep=MappingProxyType(sweep),
         active_rows_reason=active_rows_reason,
         contact_triplets_reason=contact_triplets_reason,
-        index_shape=(1, 1, 1) if use_support_table else index_shape,
     )
     # Native sparse factors are the held tree's representation: a candidate only where it takes their group.
     try:

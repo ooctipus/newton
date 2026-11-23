@@ -49,7 +49,6 @@ from .path_selection import json_value, kernel_key
 from .placement import SPARSE_CONTACT_LEVELS
 from .region_sweep import Regions
 from .solve_policy import QUIET_UNITS, UNIT_ROUNDOFF, SolvePolicy, SolveReadoutRecord
-from .sparse_mass_matrix import _SparseRowSupport, row_supports
 from .sweep import EXACT, FRICTION_METRIC_FLOATS, LevelLaw, SweepConfig, sweep_kernel
 from .sweep_levels import (
     _get_mark_independent_sparse_contact_candidates_kernel,
@@ -78,14 +77,6 @@ _COLORED = {
 DENSE_ROUTE, FREE_ROUTE = 0, 1
 """The patch rows' routes (:meth:`Sweep.patch_row_arrays`, a contact's ``path``): the line's dense rows and the free
 bodies' rows."""
-
-SPARSE_ROWS = FieldGroup(
-    Field("sparse_row_dof", wp.int32, ("index_world", "index_row", "index_support"), fill=None, owner="placement"),
-    Field("sparse_row_factor", wp.float32, ("world", "row", "support"), fill=None, owner="placement"),
-    Field("sparse_factor_velocity_delta", wp.float32, ("world", "world_dof"), fill=None, owner="placement"),
-)
-"""Each sparse row's factor coordinates (unless the support table holds them) and factor entries, and each world's
-factor velocity change."""
 
 FRICTION_METRIC = FieldGroup(Field("friction_metric", wp.float32, ("world", "contact", "metric"), owner="placement"))
 """Where spin rows may appear, a world can take the colored mapping or K1 fuses contact units, each friction contact's
@@ -150,64 +141,33 @@ class Sweep:
 
     def place_packed(self, choice) -> None:
         """Case K1, a single tree: native sparse factors with independent rigid-body response blocks, from the class
-        plan's choice (:class:`.class_plan.Packed`, ``None`` where the class is another case)."""
-        model = self.model
+        plan's choice (:class:`.class_plan.Packed`, ``None`` where the class is another case). Its rows are the one
+        store's (the packed rows, :mod:`.packed_rows`), placed with every class's, so its sweep is built with its
+        writer (:meth:`plan_support_walk`)."""
         self.support_rows = self.support_units_kernel = self._support_sink = None
         self.support_units = None
-        self.support_du_base = None
         self.leaves = False
-        self.placement.sparse_row_support = _SparseRowSupport()
         self.placement.friction_metric = None
         self.sparse_sweep = self.sparse_kernel = None
-        if choice is None:
-            return
-        sweep, max_support = dict(choice.sweep), choice.max_support
-        self.factor.allocate_sparse(choice.plan)
-        self.placement.sparse_body_dof_mask = wp.array(choice.body_masks, dtype=wp.uint64, device=model.device)
-        if sweep["use_support_table"]:
-            self.placement.sparse_row_support = row_supports(
-                choice.support_classes, self.forest.world_count, self.placement.dense_max_constraints, model.device
-            )
-        index_shape = choice.index_shape
-        self.placement.arrays.allocate(
-            SPARSE_ROWS,
-            index_world=index_shape[0],
-            index_row=index_shape[1],
-            index_support=index_shape[2],
-            world=self.forest.world_count,
-            row=self.placement.dense_max_constraints,
-            support=max_support,
-            world_dof=self.forest.max_world_dofs,
-        )
-        # Contact torsion: each friction contact's spin row is the fourth of its unit (the laws' torsion).
-        self.sparse_sweep = sweep_routes_sparse.SparseSweep(
-            self.placement.dense_max_constraints,
-            self.forest.max_world_dofs,
-            max_support,
-            **sweep,
-            warm_start=self.options.pgs_warmstart,
-            linked_rows=True,
-            device_arch=model.device.arch,
-            **self.law_fields,
-        )
-        self.sparse_kernel = self.sweep("sparse_pgs", self.sparse_sweep)
 
     def plan_support_walk(self) -> None:
-        """Case K1 on the walk (FL3.4): the class's writer, release and leave, once the factor holds the walk
-        (:meth:`.tree_factor.TreeFactor.plan_walk`).
+        """Case K1 on the walk (FL3.4): the class's writer and sweep, once the factor holds the walk
+        (:meth:`.tree_factor.TreeFactor.plan_walk`) and the placement its packed rows
+        (:meth:`.placement.Placement.allocate_packed_rows`).
 
-        The class's tree (every articulation of the factored size shares it) and each coordinate's factor coordinate,
-        the support masks' bit, are baked into the writer's walkers (:func:`.walk_rows.support_rows_kernel`) and the
-        leave (the step's one leave, :func:`.factor.walk.walk_leave_kernel`, reading the sparse sweep's change at
-        ``support_du_base`` and the class's nodes). The writer's first launch (:func:`.walk_rows.support_units_kernel`)
-        lists the step's units, a world's lane group of :data:`.walk_rows.SUPPORT_UNIT_LANES` over its rows; its walkers
-        stride over the list on lanes sized to the GPU (:func:`.walk_rows.support_threads`). The release is the factor's
-        (:attr:`.factor.walk.WalkTrees.release`), built by :func:`.walk_rows.walk_release_kernel`.
+        The class's tree (every articulation of the factored size shares it) is baked into the writer's walkers
+        (:func:`.walk_rows.support_rows_kernel`), which store the rows into the packed rows in their layout, by class or
+        by side, a footprint at its rank in its side's support mask (a bit a tree coordinate). The writer's first launch
+        (:func:`.walk_rows.support_units_kernel`) lists the step's units, a world's lane group of
+        :data:`.walk_rows.SUPPORT_UNIT_LANES` over its rows; its walkers stride over the list on lanes sized to the GPU
+        (:func:`.walk_rows.support_threads`). The release is the factor's (:attr:`.factor.walk.WalkTrees.release`), built
+        by :func:`.walk_rows.walk_release_kernel`. The sparse sweep reads the rows in the same layout and adds its change
+        into the walk's ``du``, which the step's one leave walks down (:func:`.factor.walk.walk_leave_kernel`).
 
         Raises:
             ValueError: For a factored size whose articulations do not share one tree.
         """
-        model, forest, factor = self.model, self.forest, self.factor
+        model, forest, factor, placement = self.model, self.forest, self.factor, self.placement
         size = self.classes.packed_size
         arts = forest.group_to_art_host[size]
         # The group's tree: its articulations' walking classes' one path table.
@@ -218,7 +178,24 @@ class Sweep:
         if len(tables) != 1 or None in tables:
             raise ValueError("The native sparse factor's articulations must share one tree")
         parent, first = next(iter(tables))
-        node = tuple(int(k) for k in factor.sparse_pattern.inverse_permutation)
+        # Each body's and coordinate's support mask: its root path's coordinates, a bit each.
+        node_mask = packed_rows.path_masks(parent, first)
+        body_mask = np.zeros(max(int(model.body_count), 1), dtype=np.uint64)
+        starts, child = model.articulation_start.numpy(), model.joint_child.numpy()
+        for art in arts.tolist():
+            joints = child[starts[art] : forest.articulation_joint_end_host[art]]
+            body_mask[joints[joints >= 0]] = node_mask[joints >= 0]
+        self.support_masks = (
+            wp.array(body_mask, dtype=wp.uint64, device=model.device),
+            wp.array(np.repeat(node_mask, np.diff(first)), dtype=wp.uint64, device=model.device),
+        )
+        layout = "classes" if placement.classed else "dense" if placement.packed_dense else "sides"
+        one_tree = self._one_tree() and not np.any(
+            forest.articulation_world_dof_offset.numpy()[forest.response_dof_count > 0]
+        )
+        if one_tree and placement.classed and placement.row_classes.class_dof.shape[1] != placement.packed_support:
+            # A row of one tree holds one side: its class's table holds the rows' width.
+            raise RuntimeError("A world of one tree reads its rows' classes at the rows' width")
         torsion = bool(self.laws.spin_rows)
         self.support_lanes = walk_rows.SUPPORT_UNIT_LANES if wp.get_device(model.device).is_cuda else 1
         arch = model.device.arch
@@ -226,39 +203,34 @@ class Sweep:
         self.support_rows = walk_rows.support_rows_kernel(
             parent,
             first,
-            node,
+            layout,
             torsion=torsion,
             half=classes_half(walk for walk in factor.walk_classes if (walk.parent, walk.first) == (parent, first)),
             device_arch=arch,
         )
-        # Where the step's one leave reads each coordinate's change (factor.walk.walk_leave_kernel): the sparse sweep
-        # publishes it in factor coordinates (factor_velocity_delta), so a tree's changes start at its offset in its
-        # world's and a coordinate reads its factor coordinate, the support masks' bit.
-        width = int(forest.max_world_dofs)
-        art_world = forest.art_to_world.numpy()
-        offsets = forest.articulation_world_dof_offset.numpy()
-        du_base = np.zeros(max(int(model.articulation_count), 1), dtype=np.int32)
-        du_base[arts] = art_world[arts] * width + offsets[arts]
-        self.support_du_base = wp.array(du_base, dtype=wp.int32, device=model.device)
-        factor.plan_leave(
-            tuple(
-                node if (walk.parent, walk.first) == (parent, first) else tuple(range(walk.coordinates))
-                for walk in factor.walk_classes
-            )
+        # Contact torsion: each friction contact's spin row is the fourth of its unit (the laws' torsion). Where every
+        # world holds one tree at its first coordinate, a row's one side starts there (``sides`` off).
+        self.sparse_sweep = sweep_routes_sparse.SparseSweep(
+            placement.dense_max_constraints,
+            forest.max_world_dofs,
+            placement.packed_support,
+            **dict(self.classes.packed.sweep),
+            layout=layout,
+            sides=not one_tree,
+            warm_start=self.options.pgs_warmstart,
+            linked_rows=True,
+            device_arch=arch,
+            **self.law_fields,
         )
+        self.sparse_kernel = self.sweep("sparse_pgs", self.sparse_sweep)
 
-    def support_sink(self, v_hat: wp.array) -> walk_rows.RowSink:
-        """Case K1: what its writer reads and writes besides each unit's seeds (:class:`.walk_rows.RowSink`): the
-        support table, the support masks, the articulations' first world coordinates, and the rows' factor entries and
-        coordinates, bound once: every array is the placement's for the solver's life."""
+    def support_sink(self, solver) -> walk_rows.RowSink:
+        """Case K1: what its writer reads and writes besides each unit's seeds (:class:`.walk_rows.RowSink`): the packed
+        rows' sink (:func:`.walk_rows.packed_sink`) and the support masks, bound once: every array is the placement's
+        for the solver's life."""
         if self._support_sink is None:
-            placement, factor, forest = self.placement, self.factor, self.forest
-            sink = walk_rows.row_sink(factor, forest, placement, v_hat)
-            sink.support = placement.sparse_row_support
-            sink.body_mask = placement.sparse_body_dof_mask
-            sink.dof_mask = factor.sparse_ancestor_mask
-            sink.world_offset = forest.articulation_world_dof_offset
-            sink.entries, sink.row_dof = placement.sparse_row_factor, placement.sparse_row_dof
+            sink = walk_rows.packed_sink(solver)
+            sink.body_mask, sink.dof_mask = self.support_masks
             self._support_sink = sink
             worlds, capacity = sink.entries.shape[0], sink.entries.shape[1]
             self.support_units = walk_rows.unit_list(
@@ -907,15 +879,8 @@ class Sweep:
         return {**self._walk(), **colored, **self._queued(bucket, buckets, grid), "world_cost": self.world_cost}
 
     def _sparse_operands(self) -> dict:
-        """Case K1's operands: its rows' factor entries and coordinates, and its change in factor coordinates."""
-        placement = self.placement
-        return {
-            "world_count": self.forest.world_count,
-            "row_dof": placement.sparse_row_dof,
-            "row_factor": placement.sparse_row_factor,
-            "factor_velocity_delta": placement.sparse_factor_velocity_delta,
-            "support": placement.sparse_row_support,
-        }
+        """Case K1's operands: its worlds and the walk, whose ``du`` it adds its change into."""
+        return {"world_count": self.forest.world_count, **self._walk()}
 
     def _diagonal_operands(self) -> dict:
         """Case K2's operands: its schedule (:meth:`schedule_diagonal`), its rows' slots, its fused limits."""
@@ -980,10 +945,8 @@ class Sweep:
                 with wp.ScopedStream(closed, sync_enter=False):
                     self.regions.sweep_closed()
                 closed.record_event(self.closed_done)
-        # The sweeps' change: into the walk's du, from zero, or (the support placement's sparse sweep) its own in factor
-        # coordinates at each tree's offset (support_du_base).
-        factor_change = self.support_du_base is not None
-        if self.leaves and not factor_change:
+        # The sweeps' change: into the walk's du, from zero.
+        if self.leaves:
             self.factor.walk_view().du.zero_()
         # Under a readout, count the worlds without rows of any family, which no sweep enters.
         self.readout.count_skipped(
@@ -1010,13 +973,8 @@ class Sweep:
                 main.wait_event(self.closed_done)
             self.regions.add_closed(self.factor.walk_view().du)
         if self.leaves:
-            # The step's one leave: every walking tree's change in the walk's coordinates (the sparse sweep's in its
-            # factor coordinates).
-            if factor_change:
-                delta = self.placement.sparse_factor_velocity_delta
-                self.factor.leave(v_out, delta.reshape((delta.size,)), self.support_du_base)
-            else:
-                self.factor.leave(v_out)
+            # The step's one leave: every walking tree's change in the walk's coordinates.
+            self.factor.leave(v_out)
 
     @staticmethod
     def patch_frame_built(contacts):
@@ -1185,14 +1143,14 @@ class Sweep:
             "reason": row.reasons["packed"],
             "active_rows": bool(options.get("active_rows")),
             "active_rows_reason": packed.active_rows_reason if packed else unselected,
-            "support_table": bool(self.placement.sparse_row_support.enabled),
+            "row_layout": self.sparse_sweep.layout if packed else None,
             "contact_triplets": bool(options.get("contact_triplets")),
             "contact_triplets_reason": packed.contact_triplets_reason if packed else unselected,
         }
         if packed:
             sparse.update(
                 {
-                    "max_row_support": json_value(packed.max_support),
+                    "max_row_support": int(self.placement.packed_support),
                     "solve_lanes": int(options["lanes_per_world"]),
                     "local_factors": bool(options["local_factors"]),
                     "units_kernel": kernel_key(self.support_units_kernel),

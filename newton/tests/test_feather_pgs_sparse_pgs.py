@@ -9,9 +9,10 @@ from itertools import product
 import numpy as np
 import warp as wp
 
+from newton._src.solvers.feather_pgs.factor.walk import WalkTrees
+from newton._src.solvers.feather_pgs.packed_rows import NO_CLASS
 from newton._src.solvers.feather_pgs.projection_laws import friction_pair
 from newton._src.solvers.feather_pgs.row_laws import ROW_CONTACT, ROW_FRICTION, ROW_JOINT_LIMIT
-from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseRowSupport
 from newton._src.solvers.feather_pgs.sweep import sweep_kernel
 from newton._src.solvers.feather_pgs.sweep_routes_sparse import SparseSweep
 from newton.tests.feather_pgs_law_harness import row_lines
@@ -238,10 +239,10 @@ def _patch_problem(rng, *, dofs=10, regions=4, limits=1):
 
 
 class TestFeatherPGSSparsePGS(unittest.TestCase):
-    def test_support_table_factory(self):
-        """Build the same ordered solver with shared topology indices."""
-        kernel = sweep_kernel(SparseSweep(16, 6, 4, active_rows=True, use_support_table=True))
-        self.assertIn("support_table", kernel.key)
+    def test_class_layout_factory(self):
+        """Build the ordered solver over rows stored by support class."""
+        kernel = sweep_kernel(SparseSweep(16, 6, 4, active_rows=True, layout="classes"))
+        self.assertIn("_classes", kernel.key)
 
     def test_factor_coordinate_residual_and_cross_term(self):
         """Preserve physical residuals and paired-tangent effective mass."""
@@ -380,18 +381,18 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
         self._check_cuda_sparse_sweeps(active_rows=True)
 
     @unittest.skipUnless(wp.is_cuda_available(), "sparse PGS requires CUDA")
-    def test_cuda_support_table_sweeps(self):
-        """Match packed-index sweeps and graph replay for limits, seeded impulses and contact fallback."""
+    def test_cuda_class_layout_sweeps(self):
+        """Match the reference and graph replay by class for limits, seeded impulses and contact fallback."""
         for active_rows in (False, True):
-            self._check_cuda_sparse_sweeps(active_rows=active_rows, use_support_table=True)
+            self._check_cuda_sparse_sweeps(active_rows=active_rows, layout="classes")
 
     @unittest.skipUnless(wp.is_cuda_available(), "sparse PGS requires CUDA")
     def test_cuda_subwarp_sweeps_match_reference(self):
         """Preserve linked friction and seeded retraction."""
         for lanes in (8, 16):
-            self._check_cuda_sparse_sweeps(active_rows=False, use_support_table=True, lanes_per_world=lanes)
+            self._check_cuda_sparse_sweeps(active_rows=False, layout="classes", lanes_per_world=lanes)
             self._check_cuda_sparse_sweeps(
-                active_rows=False, use_support_table=True, lanes_per_world=lanes, local_factors=True
+                active_rows=False, layout="classes", lanes_per_world=lanes, local_factors=True
             )
 
     @unittest.skipUnless(wp.is_cuda_available(), "sparse PGS requires CUDA")
@@ -402,12 +403,12 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
         the pair selection or in its pooled load, that stops after up to five members.
         Worlds without a linked normal also match the point active kernel bitwise.
         """
-        for use_support_table in (False, True):
-            with self.subTest(use_support_table=use_support_table):
-                self._check_cuda_sparse_sweeps(active_rows=True, use_support_table=use_support_table, linked_rows=True)
+        for layout in ("dense", "classes"):
+            with self.subTest(layout=layout):
+                self._check_cuda_sparse_sweeps(active_rows=True, layout=layout, linked_rows=True)
 
     def _check_cuda_sparse_sweeps(
-        self, *, active_rows, use_support_table=False, lanes_per_world=32, local_factors=False, linked_rows=False
+        self, *, active_rows, layout="dense", lanes_per_world=32, local_factors=False, linked_rows=False
     ):
         """Compare each schedule with its own physical recurrence without weakening the exact control."""
         device = wp.get_device("cuda:0")
@@ -419,8 +420,6 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
             cases.extend((3, 3, activity) for activity in ("linked_deferral", "linked_far_ring", "linked_long_ring"))
         for dofs, support, contact_activity in cases:
             if lanes_per_world < 32 and dofs > lanes_per_world:
-                continue
-            if use_support_table and dofs > 64:
                 continue
             settings = product((False, True), _SWEEP_OMEGAS) if contact_activity is None else [(False, 1.0)]
             if contact_activity == "negative_omega":
@@ -438,7 +437,7 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
                     )
                     if active_rows and contact_activity is None and not linked_rows:
                         parents[types == ROW_CONTACT] = -1
-                    offset = 30 if active_rows and (dofs == 75 or (use_support_table and dofs == 43)) else 0
+                    offset = 30 if active_rows and (dofs == 75 or (layout == "classes" and dofs == 43)) else 0
                     if offset:
                         # Cross a bitset word boundary and retain an incomplete final word.
                         rows = np.pad(rows, ((offset, 0), (0, 0)))
@@ -494,56 +493,65 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
 
                     initial_impulses = padded(impulses)
                     actual_impulses = wp.clone(initial_impulses)
-                    delta = wp.full((worlds, dofs), float("nan"), device=device)
-                    row_support = _SparseRowSupport()
-                    packed_indices = wp.array(row_dof, device=device)
-                    if use_support_table:
+                    # The one store's rows: by class (the rows' distinct supports, a word a row), or dense (entry e at
+                    # coordinate e).
+                    if layout == "classes":
                         unique, row_class = np.unique(row_dof.reshape(-1, support), axis=0, return_inverse=True)
-                        row_support.enabled = 1
-                        row_support.class_dof = wp.array(unique, dtype=int, device=device)
-                        row_support.row_class = wp.array(row_class.reshape(worlds, capacity), dtype=int, device=device)
-                        packed_indices = wp.full((1, 1, 1), -9, dtype=int, device=device)
+                        words = row_class.reshape(worlds, capacity) | (NO_CLASS << 13) | (support << 26)
+                        width, packed = support, row_factor
+                    else:
+                        unique, words, width = np.full((1, 1), -1), np.zeros((worlds, capacity), np.int64), dofs
+                        packed = np.zeros((worlds, capacity, dofs), dtype=np.float32)
+                        world, row, entry = np.nonzero(row_dof >= 0)
+                        packed[world, row, row_dof[world, row, entry]] = row_factor[world, row, entry]
+                    walk = WalkTrees()
+                    walk.du = wp.zeros(worlds * dofs, device=device)
                     kernel = sweep_kernel(
                         SparseSweep(
                             capacity,
                             dofs,
-                            support,
+                            width,
                             active_rows=active_rows,
-                            use_support_table=use_support_table,
+                            layout=layout,
                             lanes_per_world=lanes_per_world,
                             local_factors=local_factors,
                             linked_rows=linked_rows,
                         )
                     )
                     self.assertEqual("_linked" in kernel.key, linked_rows and active_rows)
-                    launch_args = {
-                        "dim": [2],
-                        "inputs": [
-                            worlds,
-                            wp.array([count, 0, count], dtype=int, device=device),
-                            row_lines(device),
-                            padded(bias),
-                            padded(diag),
-                            actual_impulses,
-                            packed_indices,
-                            wp.array(row_factor, device=device),
-                            padded(incident),
-                            padded(types, np.int32),
-                            padded(parents, np.int32),
-                            padded(mu),
-                            wp.array(np.arange(worlds * dofs).reshape(worlds, dofs), dtype=int, device=device),
-                            wp.zeros(worlds * dofs, device=device),
-                            8,
-                            omega,
-                        ],
-                        "outputs": [delta, row_support],
-                        "block_dim": 64,
-                        "device": device,
+                    named = {
+                        "world_count": worlds,
+                        "world_constraint_count": wp.array([count, 0, count], dtype=int, device=device),
+                        "dense_first": row_lines(device),
+                        "rhs_bias": padded(bias),
+                        "world_diag": padded(diag),
+                        "world_impulses": actual_impulses,
+                        "packed_Z": wp.array(packed, device=device),
+                        "row_sides": wp.zeros((1, 1), dtype=wp.vec2i, device=device),
+                        "row_classes": wp.array(words.astype(np.int32), dtype=int, device=device),
+                        "class_dof": wp.array(unique.astype(np.int32), dtype=int, device=device),
+                        "response_dofs": wp.zeros(1, dtype=int, device=device),
+                        "articulation_world_dof_offset": wp.zeros(1, dtype=int, device=device),
+                        "row_incident": padded(incident),
+                        "world_row_type": padded(types, np.int32),
+                        "world_row_parent": padded(parents, np.int32),
+                        "world_row_mu": padded(mu),
+                        "world_dof_indices": wp.array(
+                            np.arange(worlds * dofs).reshape(worlds, dofs), dtype=int, device=device
+                        ),
+                        "v_hat": wp.zeros(worlds * dofs, device=device),
+                        "iterations": 8,
+                        "omega": omega,
+                        "walk": walk,
                     }
-                    wp.launch_tiled(kernel, **launch_args)
-                    actual = delta.numpy()
-                    if use_support_table:
-                        np.testing.assert_array_equal(packed_indices.numpy(), -9)
+
+                    def launch(kernel, named=named, walk=walk):
+                        walk.du.zero_()
+                        inputs = [named[arg.label] for arg in kernel.adj.args]
+                        wp.launch_tiled(kernel, dim=[2], inputs=inputs, block_dim=64, device=device)
+
+                    launch(kernel)
+                    actual = walk.du.numpy().reshape(worlds, dofs)
                     result_impulses = actual_impulses.numpy()
                     np.testing.assert_array_equal(actual[1], 0.0)
                     for world in (0, 2):
@@ -557,44 +565,25 @@ class TestFeatherPGSSparsePGS(unittest.TestCase):
                             SparseSweep(
                                 capacity,
                                 dofs,
-                                support,
+                                width,
                                 active_rows=active_rows,
-                                use_support_table=use_support_table,
+                                layout=layout,
                                 lanes_per_world=lanes_per_world,
                                 local_factors=local_factors,
                             )
                         )
                         self.assertNotIn("_linked", point_kernel.key)
                         wp.copy(actual_impulses, initial_impulses)
-                        wp.launch_tiled(point_kernel, **launch_args)
-                        np.testing.assert_array_equal(delta.numpy(), actual)
+                        launch(point_kernel)
+                        np.testing.assert_array_equal(walk.du.numpy().reshape(worlds, dofs), actual)
                         np.testing.assert_array_equal(actual_impulses.numpy(), result_impulses)
-                    if use_support_table:
-                        packed_kernel = sweep_kernel(
-                            SparseSweep(
-                                capacity,
-                                dofs,
-                                support,
-                                active_rows=active_rows,
-                                lanes_per_world=lanes_per_world,
-                                local_factors=local_factors,
-                                linked_rows=linked_rows,
-                            )
-                        )
-                        wp.copy(actual_impulses, initial_impulses)
-                        launch_args["inputs"][6] = wp.array(row_dof, device=device)
-                        launch_args["outputs"][1] = _SparseRowSupport()
-                        wp.launch_tiled(packed_kernel, **launch_args)
-                        np.testing.assert_array_equal(delta.numpy(), actual)
-                        np.testing.assert_array_equal(actual_impulses.numpy(), result_impulses)
-                        launch_args["inputs"][6] = packed_indices
-                        launch_args["outputs"][1] = row_support
+                    if layout == "classes":
                         with wp.ScopedCapture(device=device) as capture:
                             wp.copy(actual_impulses, initial_impulses)
-                            wp.launch_tiled(kernel, **launch_args)
+                            launch(kernel)
                         for _ in range(2):
                             wp.capture_launch(capture.graph)
-                            np.testing.assert_array_equal(delta.numpy(), actual)
+                            np.testing.assert_array_equal(walk.du.numpy().reshape(worlds, dofs), actual)
                             np.testing.assert_array_equal(actual_impulses.numpy(), result_impulses)
 
 

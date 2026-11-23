@@ -20,8 +20,7 @@ template tree and a whole model alike):
   (:meth:`TreePlan.scan_down`), and how a leaf-to-root walk meets each node
   (:attr:`TreePlan.up_flags`);
 * the fill-free factor pattern of the joint-space inertia
-  (:meth:`TreePlan.factor`) and its row support classes
-  (:meth:`TreePlan.support_classes`).
+  (:meth:`TreePlan.factor`).
 
 Plans of a template tree also carry the schedule data the native scans bake
 in; :func:`local_parents` maps a model's global ancestors to template-local
@@ -43,7 +42,6 @@ __all__ = [
     "UP_SUMS",
     "ChainPacking",
     "FactorPattern",
-    "SupportClasses",
     "TreePlan",
     "bit_range",
     "local_parents",
@@ -179,22 +177,6 @@ def level_schedule(rows: np.ndarray, cols: np.ndarray, n: int) -> dict:
         "factor_level_entry_offsets": offsets(np.bincount(levels[cols[entries]], minlength=level_count), np.int32),
         "factor_level_entries": entries.astype(np.int32),
     }
-
-
-@dataclass(frozen=True, eq=False)
-class SupportClasses:
-    """Row support patterns over a tree's factor coordinates: every endpoint and endpoint pair, and every limit.
-
-    ``body_class[node]`` is the node's pattern index among the endpoint classes
-    (index 0, the empty pattern, is the world); ``pair_class[a, b]`` the union's
-    index among all patterns; ``class_dof[k]`` the factor coordinates of pattern
-    ``k`` (``-1`` padded); ``limit_class[dof]`` a physical coordinate's pattern.
-    """
-
-    body_class: np.ndarray
-    pair_class: np.ndarray
-    class_dof: np.ndarray
-    limit_class: np.ndarray
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -554,33 +536,3 @@ class TreePlan:
         for value in values.values():
             value.setflags(write=False)
         return FactorPattern(**values)
-
-    def support_classes(self, body_masks, max_row_dofs: int) -> SupportClasses | None:
-        """Classify the row supports of a tree whose bodies have the factor-coordinate ``body_masks``.
-
-        Every body is a possible contact endpoint, so the classes are the bodies'
-        masks with the world's empty one, their pairwise unions and every
-        coordinate's limit support. ``None`` when a support exceeds ``max_row_dofs``.
-        """
-        factor = self.factor
-        body_masks = np.asarray(body_masks, dtype=np.uint64)
-        if body_masks.ndim != 1 or not 1 <= max_row_dofs <= factor.dof_count:
-            raise ValueError("Row supports need one-dimensional masks and a valid row width")
-        if factor.dof_count < 64 and np.any(body_masks >> np.uint64(factor.dof_count)):
-            raise ValueError("A row support exceeds the tree's coordinates")
-        classes = np.unique(np.concatenate((np.zeros(1, dtype=np.uint64), body_masks)))
-        pairs = classes[:, None] | classes[None, :]
-        masks = np.unique(np.concatenate((pairs.ravel(), factor.ancestor_mask)))
-        bits = ((masks[:, None] >> np.arange(factor.dof_count, dtype=np.uint64)) & np.uint64(1)).astype(bool)
-        if np.any(bits.sum(axis=1) > max_row_dofs):
-            return None
-        class_dof = np.full((masks.size, max_row_dofs), -1, dtype=np.int32)
-        rank = np.cumsum(bits, axis=1) - 1
-        which, dof = np.nonzero(bits)
-        class_dof[which, rank[which, dof]] = dof
-        return SupportClasses(
-            body_class=np.searchsorted(classes, body_masks).astype(np.int32),
-            pair_class=np.searchsorted(masks, pairs).astype(np.int32),
-            class_dof=class_dof,
-            limit_class=np.searchsorted(masks, factor.ancestor_mask).astype(np.int32),
-        )

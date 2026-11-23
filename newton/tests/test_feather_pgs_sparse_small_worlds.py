@@ -66,8 +66,8 @@ class TestSparseSmallWorlds(unittest.TestCase):
     def test_packed_worlds_preserve_physical_sweeps_and_replay(self):
         """Keep contacts isolated through empty/regrowing graph replay."""
         for lanes, local_factors in ((8, False), (16, False), (8, True), (16, True)):
-            for table in (False, True):
-                with self.subTest(lanes=lanes, table=table, local_factors=local_factors):
+            for layout in ("dense", "classes"):
+                with self.subTest(lanes=lanes, layout=layout, local_factors=local_factors):
                     data, initial, factor, expected, impulses = _contact_problem(iterations=8, omega=0.4)
                     count = len(impulses)
                     worlds = 17  # Multiple blocks and a partial last subgroup.
@@ -80,49 +80,29 @@ class TestSparseSmallWorlds(unittest.TestCase):
                     coordinates = np.array([0, lanes // 2, lanes - 1])
                     indices = np.full(lanes, -1, np.int32)
                     indices[coordinates] = coordinates
-                    factors = np.full((*data["row_factor"].shape[:2], lanes), 17.0, np.float32)
+                    # By class a padded entry holds a value no coordinate reads; by side every entry is a coordinate's.
+                    filler = 17.0 if layout == "classes" else 0.0
+                    factors = np.full((*data["row_factor"].shape[:2], lanes), filler, np.float32)
                     factors[:, :, coordinates] = data["row_factor"]
                     data["row_factor"] = factors
                     data["support_class_dof"] = indices[None]
                     data["reference_factor_delta"] = np.zeros((worlds, lanes), np.float32)
-
-                    def factory(capacity, dofs, width, *, _table=table, _lanes=lanes, _local=local_factors, **_kwargs):
-                        return sweep_kernel(
-                            SparseSweep(
-                                capacity,
-                                dofs,
-                                width,
-                                use_support_table=_table,
-                                lanes_per_world=_lanes,
-                                local_factors=_local,
-                            )
-                        )
-
-                    with mock.patch.object(fixtures, "factory", factory):
-                        solve = fixtures.DeviceSolve(data, candidate=True)
-                    if not table:
-                        solve.support.enabled = 0
-                        row_indices = np.broadcast_to(indices, data["row_factor"].shape).copy()
-                        solve.inputs[6] = wp.array(row_indices, dtype=int, device=solve.device)
-
-                    def launch(solve=solve, lanes=lanes, worlds=worlds):
-                        groups = 64 // lanes
-                        wp.launch_tiled(
-                            solve.kernel,
-                            dim=[(worlds + groups - 1) // groups],
-                            inputs=solve.inputs,
-                            outputs=[solve.delta, solve.support],
-                            block_dim=64,
-                            device=solve.device,
-                        )
-
-                    launch()
+                    sweep = SparseSweep(
+                        data["row_factor"].shape[1],
+                        lanes,
+                        lanes,
+                        layout=layout,
+                        lanes_per_world=lanes,
+                        local_factors=local_factors,
+                    )
+                    solve = fixtures.DeviceSolve(data, candidate=True, kernel=sweep_kernel(sweep), lanes=lanes)
+                    solve.launch()
                     with wp.ScopedCapture(device=solve.device) as capture:
-                        launch()
+                        solve.launch()
                     for phase in range(3):
                         counts = np.full(worlds, count, np.int32)
                         counts[phase::3] = 0
-                        solve.inputs[1].assign(counts)
+                        solve.named["world_constraint_count"].assign(counts)
                         solve.reset_impulses()
                         wp.capture_launch(capture.graph)
                         delta, actual_impulses = solve.result()
@@ -158,7 +138,7 @@ class TestSparseSmallWorlds(unittest.TestCase):
                             dofs,
                             width,
                             active_rows=True,
-                            use_support_table=True,
+                            layout="classes",
                             contact_triplets=True,
                             lanes_per_world=_lanes,
                             local_factors=_local,
@@ -168,7 +148,7 @@ class TestSparseSmallWorlds(unittest.TestCase):
                 with mock.patch.object(fixtures, "factory", factory):
                     group = fixtures.DeviceSolve(data, candidate=True)
                 self.assertTrue(group.units)
-                self.assertIn("_active_support_table_contact_triplets", group.kernel.key)
+                self.assertIn("_active_classes_contact_triplets", group.kernel.key)
                 warp.launch()
                 group.launch()
                 fixtures.assert_output(self, data, *group.result(), physical=physical, reference=warp.result())

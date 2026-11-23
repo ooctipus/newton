@@ -8,8 +8,9 @@ rows walked together from its first (1, 3, or 4 under contact torsion), or a joi
 (:func:`unit_reader`); its seeds, a wrench at a body's frame or a covector at a coordinate (``WALK_WRENCH``,
 :func:`joint_seeds`), walk up their root paths (``WALK_ROW``) into the placement's sink:
 
-- **the support placement** (case K1, FL3.4): each footprint at its rank in the row's support; the walkers stride
-  over the step's unit list (:func:`support_units_kernel`, :func:`support_rows_kernel`);
+- **the support placement** (case K1, FL3.4): each side's entries in the packed rows by its support class, each
+  footprint at its rank in the class's mask; the walkers stride over the step's unit list
+  (:func:`support_units_kernel`, :func:`support_rows_kernel`);
 - **the general placement** (case K6, FL3.3): each side's entries in the packed rows, at its coordinates or its
   support class's (:func:`packed_walker`), world-major with the bilateral blocks' closure (:func:`walked_rows_kernel`);
 - **the sparse diagonal** (case K2, FL3.5): the arm's side into the row's dense part, a key of the star one step to
@@ -35,11 +36,11 @@ from typing import NamedTuple
 import warp as wp
 
 from ...core.execution import Buckets, Queue, Work, append, bucket_item, fill_lanes, shape
-from ...core.memory import Operand, Place, built_for, table
+from ...core.memory import Operand, Place, built_for
 from . import field_group
 from .contact_input import ContactFrame, ContactInput, contact_frame
 from .contact_laws import CONTACT_SPIN_ROW, contact_row_entry, contact_seed, spin_seed
-from .device_preludes import DevicePrelude, dual_native, lane_group, memory_words, substitute
+from .device_preludes import dual_native, lane_group, memory_words, substitute
 from .factor.closure import close_block, close_row
 from .factor.fields import Preelim
 from .factor.walk import (
@@ -71,7 +72,6 @@ from .row_records import (
     DenseRows,
     RowSupport,
 )
-from .sparse_mass_matrix import _SparseRowSupport
 from .sweep_levels import tier_world
 from .tree_scan import WALK_BOTH, held_fits, record_half
 
@@ -577,13 +577,13 @@ def writer_kernel(solver, part: int = WRITE_ROWS) -> wp.Kernel:
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# The support placement (case K1, FL3.4): the support sink, a lane per unit, the release and the leave
+# The support placement (case K1, FL3.4): the packed rows by a lane a unit, each footprint by its support mask
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-_SUPPORT = """    // One unit's rows into the support sink (walk_rows.support_rows_kernel): its seeds walked through the class's
-    // path table (WALK_ROW), each footprint stored at its rank in the row's support (SUPPORT_NODE: a
-    // coordinate's factor coordinate, the support mask's bit), the unit's Gram and incident from the same walk.
+_SUPPORT = """    // One unit's rows into the packed rows (walk_rows.support_rows_kernel): its seeds walked through the class's
+    // path table (WALK_ROW), each footprint stored at its rank in the side's support class (its mask's bits, the
+    // tree's coordinates), the unit's Gram and incident from the same walk.
     const auto POPC = [](unsigned long long bits) -> int {
 #if defined(__CUDA_ARCH__)
         return __popcll(bits);
@@ -600,7 +600,6 @@ _SUPPORT = """    // One unit's rows into the support sink (walk_rows.support_ro
     };
     const auto& walk = sink.walk;
     const auto& release = sink.release;
-    const auto& support = sink.support;
     const int rows = unit.rows, art_a = unit.art_a, art_b = unit.art_b, body_a = unit.body_a, body_b = unit.body_b;
     const int dof0 = unit.dof0, dof1 = unit.dof1;
     const int S = sink.entries.shape[2];
@@ -649,8 +648,8 @@ $side
                 float x[$rows];
                 for (int r = 0; r < $rows; ++r) x[r] = 0.0f;
                 x[0] = k == 0 ? unit.value0 : unit.value1;
-                // A covector enters at its coordinate: its body's coordinates after it (below it in factor order) are
-                // the row's zeros.
+                // A covector enters at its coordinate: its body's coordinates after it (the side's last bits) are the
+                // row's zeros.
 $below                WALK_ROW(data, link, nullptr, nullptr, nullptr, LOAD_inputs(walk.dof_body.data + d0 + c), c, x, store);
                 incident[0] += x[0] * LOAD_inputs(vh + c);
             }
@@ -707,7 +706,7 @@ $close    if (reread) {
         STORE_rows(sink.row_incident.data + rec0 + r, incident[r]);
     }
 """
-"""The support sink's unit walker, ``$rows`` rows a lane (:func:`support_rows_kernel`)."""
+"""The support writer's unit walker, ``$rows`` rows a lane (:func:`support_rows_kernel`)."""
 
 # The writers' operands, placed by the memory toolkit's read rule: their inputs (the walk and the sink's tables, which no
 # thread writes while a writer runs) and the rows they store, add into and read back (a row's sides among them: its
@@ -716,44 +715,41 @@ $close    if (reread) {
 _INPUTS, _ROWS = Operand("inputs"), Operand("rows", writes=True)
 _PACKED_INPUTS = Operand("inputs", measured=Place.GLOBAL)
 
-_SUPPORT_CLOSE = """    // The pad past the support; the rows' coordinates (explicit) or their support class (the table).
-    for (int r = 0; r < rows; ++r)
+_SUPPORT_CLOSE_CLASSES = """    // The pad past the row's entries, and its classes (packed_rows.row_classes), its first side's then its second's
+    // (packed_rows.CLASS_SIDES): each side's seeds' endpoints and their union.
+    int side_class[2] = {-1, -1};
+    for (int side = 0; side < 2; ++side) {
+        const int art = sides[side];
+        if (art < 0 || (side == 1 && art == sides[0]) || LOAD_inputs(sink.response_dofs.data + art) <= 0) continue;
+$endpoints
+        if (seeds > 0) side_class[side] = CLASS_OF(sink.classes, e0, e1);
+    }
+    for (int r = 0; r < rows; ++r) {
         for (int e = count; e < S; ++e) STORE_rows(Z + r * S + e, 0.0f);
-    if (support.enabled == 0) {
-        int* const D = sink.row_dof.data + (size_t)row0 * S;
-        for (int side = 0; side < 2; ++side) {
-            if (masks[side] == 0ull) continue;
-            int e = bases[side];
-            const int offset = LOAD_inputs(sink.world_offset.data + (side == 0 ? art_a : art_b));
-            for (unsigned long long bits = masks[side]; bits != 0ull; bits &= bits - 1ull, ++e)
-                for (int r = 0; r < rows; ++r) STORE_rows(D + r * S + e, offset + LOW(bits));
-        }
-        for (int r = 0; r < rows; ++r)
-            for (int e = count; e < S; ++e) STORE_rows(D + r * S + e, -1);
-    } else {
-        int cls = 0;
-        if (covector) {
-            cls = LOAD_inputs(support.limit_class.data + (dof0 - LOAD_inputs(walk.dof_start.data + art_a)));
-        } else {
-            const auto side_of = [&](int body, int art) {
-                return body >= 0 && art >= 0 && LOAD_inputs(sink.response_dofs.data + art) > 0 && LOAD_inputs(sink.body_mask.data + body) != 0ull;
-            };
-            const bool a = side_of(body_a, art_a), b = side_of(body_b, art_b);
-            const int class_a = a ? LOAD_inputs(support.body_class.data + body_a) : 0;
-            const int class_b = b ? LOAD_inputs(support.body_class.data + body_b) : 0;
-            cls = LOAD_inputs(support.pair_class.data + (class_a * support.pair_class.shape[1] + class_b));
-        }
-        for (int r = 0; r < rows; ++r) STORE_rows(support.row_class.data + row0 + r, cls);
+        STORE_rows(sink.classes.row_class.data + row0 + r, CLASS_WORD(sink.classes, side_class[0], side_class[1]));
     }
 """
 
-
-@cache
-def _support_table(node: tuple[int, ...]) -> DevicePrelude:
-    """The class's factor coordinate of each tree coordinate, in constant memory (the memory toolkit's ``table``, after
-    the walk's prelude): the support mask's bit."""
-    text = f"    {table('SUPPORT_NODE', node)}"
-    return DevicePrelude(f"support_table_{len(node)}", text, cpu=text)
+_SUPPORT_CLOSE_SIDES = """    // By side the row's entries are its sides' coordinates: those off each side's support are zero, and so is every
+    // entry no side holds (by side the rest of the row; dense the world's other trees' coordinates).
+    int held = 0, spans[4] = {0, 0, 0, 0};
+    for (int side = 0; side < 2; ++side) {
+        const int art = sides[side];
+        if (art < 0 || (side == 1 && art == sides[0])) continue;
+        const int n = LOAD_inputs(sink.response_dofs.data + art);
+        if (n <= 0) continue;
+        const int base = $base;
+        spans[2 * side] = base;
+        spans[2 * side + 1] = base + n;
+        held += n;
+        for (unsigned long long bits = ~masks[side] & (n < 64 ? (1ull << n) - 1ull : ~0ull); bits != 0ull; bits &= bits - 1ull)
+            for (int r = 0; r < rows; ++r) STORE_rows(Z + r * S + base + LOW(bits), 0.0f);
+    }
+    if (held < S)
+        for (int e = 0; e < S; ++e)
+            if ((e < spans[0] || e >= spans[1]) && (e < spans[2] || e >= spans[3]))
+                for (int r = 0; r < rows; ++r) STORE_rows(Z + r * S + e, 0.0f);
+"""
 
 
 _RELEASE_HELD = """            // The side's entries held in the thread's own array while every slip's steps run over them: one load and
@@ -763,51 +759,20 @@ _RELEASE_HELD = """            // The side's entries held in the thread's own ar
             for (int r = 0; r < rows; ++r)
                 for (int e = 0; e < span; ++e) held[r * $coordinates + e] = LOAD_rows(Z + r * S + base + e);
             WALK_RELEASE_ON(release, art, held, rows, $coordinates, [&](const int c) -> int {
-                return ((mask >> SUPPORT_NODE[c]) & 1ull) != 0ull ? rank(c) - base : -1;
+                return ((mask >> c) & 1ull) != 0ull ? rank(c) - base : -1;
             });
             for (int r = 0; r < rows; ++r)
                 for (int e = 0; e < span; ++e) STORE_rows(Z + r * S + base + e, held[r * $coordinates + e]);"""
 _RELEASE_IN_PLACE = """            WALK_RELEASE_ON(release, art, Z, rows, S, [&](const int c) -> int {
-                return ((mask >> SUPPORT_NODE[c]) & 1ull) != 0ull ? rank(c) : -1;
+                return ((mask >> c) & 1ull) != 0ull ? rank(c) : -1;
             });"""
 
-
-_SUPPORT_SIDE = """        unsigned long long mask = 0ull;
-        int seeds = 0;
-        if (covector) {
-            mask = LOAD_inputs(sink.dof_mask.data + (dof0 - d0));
-            seeds = 1;
-            if (dof1 >= 0) {
-                mask |= LOAD_inputs(sink.dof_mask.data + (dof1 - d0));
-                seeds = 2;
-            }
-        } else {
-            if (body_a >= 0 && art_a == art) {
-                mask |= LOAD_inputs(sink.body_mask.data + body_a);
-                ++seeds;
-            }
-            if (body_b >= 0 && art_b == art) {
-                mask |= LOAD_inputs(sink.body_mask.data + body_b);
-                ++seeds;
-            }
-        }
-        if (mask == 0ull) continue;
-        const int base = count;
-        masks[side] = mask;
-        bases[side] = base;
-        count += POPC(mask);
-        // Two seeds on one tree add where their paths meet: their side is cleared, then re-read for the Gram.
-        const bool add = seeds > 1;
-        if (add) {
-            reread = true;
-            for (int r = 0; r < rows; ++r)
-                for (int e = base; e < count; ++e) STORE_rows(Z + r * S + e, 0.0f);
-        }"""
 
 _HEADER_DIAG = "norm[r] + sink.cfm"
 
 _SUPPORT_BELOW = """                if (!add)
-                    for (int e = base; e < rank(c); ++e) STORE_rows(Z + e, 0.0f);
+                    for (unsigned long long bits = mask & (~0ull << (c + 1)); bits != 0ull; bits &= bits - 1ull)
+                        STORE_rows(Z + rank(LOW(bits)), 0.0f);
 """
 
 _SUPPORT_WRENCH = """                    const auto& at = r == 0 ? unit.point : unit.friction_point;
@@ -815,10 +780,26 @@ _SUPPORT_WRENCH = """                    const auto& at = r == 0 ? unit.point : 
                                 $spin && r == 3);"""
 
 
-def _support_snippet(parent, first, node, rows: int, spin: bool, half: int, registers: int) -> str:
+def _support_snippet(parent, first, rows: int, spin: bool, half: int, registers: int, layout: str) -> str:
+    """The support writer's walker text (:data:`_SUPPORT`) into the packed rows in their ``layout``
+    (:func:`support_rows_kernel`): ``"classes"``, each side's entries its support class's, a footprint at its mask rank;
+    ``"dense"``, entry ``e`` at world coordinate ``e``; ``"sides"``, the first side's coordinates, then the second's."""
     # A unit's held side, its at most four rows over the class's coordinates, fits the writer's registers (_RELEASE_HELD).
     held = held_fits(4 * first[-1], registers)
     release = substitute(_RELEASE_HELD, rows=rows, coordinates=first[-1]) if held else _RELEASE_IN_PLACE
+    classes = layout == "classes"
+    if classes:
+        base, advance, rank = "count", "count += POPC(mask)", "base + POPC(mask & ((1ull << c) - 1ull))"
+        clear = """            for (int r = 0; r < rows; ++r)
+                for (int e = base; e < count; ++e) STORE_rows(Z + r * S + e, 0.0f);"""
+        close = substitute(_SUPPORT_CLOSE_CLASSES, endpoints=_CLASS_ENDPOINTS)
+    else:
+        offset = "LOAD_inputs(sink.layout.offset.data + art)"
+        base = offset if layout == "dense" else "art == sides[0] ? 0 : LOAD_inputs(sink.layout.dofs.data + sides[0])"
+        advance, rank = "count = base + LOAD_inputs(sink.response_dofs.data + art)", "base + c"
+        clear = """            for (unsigned long long bits = mask; bits != 0ull; bits &= bits - 1ull)
+                for (int r = 0; r < rows; ++r) STORE_rows(Z + r * S + base + LOW(bits), 0.0f);"""
+        close = substitute(_SUPPORT_CLOSE_SIDES, base=base)
     body = substitute(
         _SUPPORT,
         rows=rows,
@@ -827,34 +808,33 @@ def _support_snippet(parent, first, node, rows: int, spin: bool, half: int, regi
         coordinate=WALK_COORDINATE,
         link=WALK_LINK,
         frame=WALK_FRAME,
-        start="",
-        art=_UNIT_ART,
-        first="art_a",
-        side=_SUPPORT_SIDE,
-        rank="base + POPC(mask & ((1ull << SUPPORT_NODE[c]) - 1ull))",
+        start=_ROW_SIDES,
+        art="sides[side]",
+        first="sides[0]",
+        side=substitute(_SUPPORT_SIDE, base=base, advance=advance, clear=clear),
+        rank=rank,
         below=_SUPPORT_BELOW,
         wrench=substitute(_SUPPORT_WRENCH, spin=int(spin)),
-        close=_SUPPORT_CLOSE,
-        entries_end="count",
+        close=close,
+        entries_end="count" if classes else "S",
         zrow="row0",
         diag=_HEADER_DIAG,
     )
     walk = walk_prelude(((parent, first),), rows, half)
     words = memory_words(_INPUTS, _ROWS)
-    return dual_native(body, preludes=(walk, walk_row_prelude(rows), _support_table(node), words))
+    return dual_native(body, preludes=(walk, walk_row_prelude(rows), *((class_rank(),) if classes else ()), words))
 
 
 @wp.struct
 class RowSink:
     """What a placement's writer reads and writes besides a unit's seeds, every placement's (:data:`_SUPPORT`): the walk
     and its release, each articulation's response coordinates, the predictor ``v_hat``, and the rows' ``cfm``, entries,
-    incident velocities and diagonals; the support placement's (case K1, :func:`support_rows_kernel`) support table,
-    each body's and coordinate's support mask (factor coordinates), each articulation's first world coordinate, and the
-    rows' coordinates; the packed rows' layout, where each side's entries sit in a packed row
-    (:class:`.dense_rows.RowSupport`, :func:`packed_walker`), the star's coordinates (the sparse diagonal's), the
-    free bodies' first row in the store's line (``base``: their slots count from it), and the rows' support classes
-    where the packed rows are stored by them (``classes``, :func:`.packed_rows.row_classes`). A placement binds what
-    its writer reads."""
+    incident velocities and diagonals; the support placement's (case K1, :func:`support_rows_kernel`) support masks of
+    each body and coordinate (its root path, a bit a tree coordinate); the packed rows' layout, where each side's entries
+    sit in a packed row (:class:`.dense_rows.RowSupport`, :func:`packed_walker`), the star's coordinates (the sparse
+    diagonal's), the free bodies' first row in the store's line (``base``: their slots count from it), and the rows'
+    support classes where the packed rows are stored by them (``classes``, :func:`.packed_rows.row_classes`). A
+    placement binds what its writer reads."""
 
     walk: WalkTrees
     release: WalkRelease
@@ -864,11 +844,8 @@ class RowSink:
     entries: wp.array3d[float]
     row_incident: wp.array2d[float]
     diag: wp.array2d[float]
-    support: _SparseRowSupport
     body_mask: wp.array[wp.uint64]
     dof_mask: wp.array[wp.uint64]
-    world_offset: wp.array[int]
-    row_dof: wp.array3d[int]
     layout: RowSupport
     star: int
     base: int
@@ -1007,16 +984,27 @@ _CLASS_TREE = """        // The tree's class: its path from the classes' tables 
 
 _UNIT_ART = "side == 0 ? art_a : art_b"
 
-_CLASS_START = """    // The unit's packed rows cleared: each side's walk stores its class's entries, the rest of the row stays zero.
+_SIDES_LOAD = """    const wp::vec2i sides = LOAD_rows(sink.layout.sides.data + ((size_t)unit.line * sink.layout.sides.shape[1] + unit.slot));
+"""
+
+_ROW_SIDES = (
+    """    // The row's sides in their order (row_records.row_sides): the first side's entries, then the second's.
+"""
+    + _SIDES_LOAD
+)
+
+_CLASS_START = (
+    """    // The unit's packed rows cleared: each side's walk stores its class's entries, the rest of the row stays zero.
     for (int r = 0; r < rows; ++r)
         for (int e = 0; e < S; ++e) STORE_rows(Z + r * S + e, 0.0f);
     // The row's sides in their order (row_records.row_sides): the first side's class's entries, then the second's.
-    const wp::vec2i sides = LOAD_rows(sink.layout.sides.data + ((size_t)unit.line * sink.layout.sides.shape[1] + unit.slot));
-    int side_class[2] = {-1, -1};
 """
+    + _SIDES_LOAD
+    + """    int side_class[2] = {-1, -1};
+"""
+)
 
-_CLASS_SIDE = """$tree
-        // The side's support class (packed_rows.row_classes): its seeds' endpoints (their root paths) and their union.
+_CLASS_ENDPOINTS = """        // The side's support class (packed_rows.row_classes): its seeds' endpoints (their root paths) and their union.
         int seeds = 0, e0 = -1, e1 = -1;
         if (covector) {
             e0 = e1 = LOAD_inputs(sink.classes.limit_class.data + dof0);
@@ -1034,7 +1022,44 @@ _CLASS_SIDE = """$tree
                 e1 = LOAD_inputs(sink.classes.body_class.data + body_b);
                 if (seeds++ == 0) e0 = e1;
             }
+        }"""
+
+_SUPPORT_SIDE = """        // The side's support: its seeds' root paths, a bit a tree coordinate.
+        unsigned long long mask = 0ull;
+        int seeds = 0;
+        if (covector) {
+            mask = LOAD_inputs(sink.dof_mask.data + (dof0 - d0));
+            seeds = 1;
+            if (dof1 >= 0) {
+                mask |= LOAD_inputs(sink.dof_mask.data + (dof1 - d0));
+                seeds = 2;
+            }
+        } else {
+            if (body_a >= 0 && art_a == art) {
+                mask |= LOAD_inputs(sink.body_mask.data + body_a);
+                ++seeds;
+            }
+            if (body_b >= 0 && art_b == art) {
+                mask |= LOAD_inputs(sink.body_mask.data + body_b);
+                ++seeds;
+            }
         }
+        if (mask == 0ull) continue;
+        const int base = $base;
+        masks[side] = mask;
+        bases[side] = base;
+        $advance;
+        // Two seeds on one tree add where their paths meet: their side is cleared, then re-read for the Gram.
+        const bool add = seeds > 1;
+        if (add) {
+            reread = true;
+$clear
+        }"""
+
+_CLASS_SIDE = (
+    "$tree\n"
+    + _CLASS_ENDPOINTS
+    + """
         if (seeds == 0) continue;
         const int cls = CLASS_OF(sink.classes, e0, e1), base = count;
         count += LOAD_inputs(sink.classes.class_count.data + cls);
@@ -1043,6 +1068,7 @@ _CLASS_SIDE = """$tree
         // Two seeds on one tree add where their paths meet, then the rows are re-read for their norms.
         const bool add = seeds > 1;
         if (add) reread = true;"""
+)
 
 _CLASS_RELEASE = """            WALK_RELEASE_ON(release, art, Z, rows, S, [&](const int c) -> int {
                 const int e = CLASS_RANK(sink.classes, cls, c);
@@ -1434,7 +1460,7 @@ def contact_record(rows: DenseRows, sink: RowSink, records: wp.array3d[float], l
 def support_rows_kernel(
     parent: tuple[int, ...],
     first: tuple[int, ...],
-    node: tuple[int, ...],
+    layout: str,
     *,
     torsion: bool,
     half: int = WALK_BOTH,
@@ -1445,13 +1471,14 @@ def support_rows_kernel(
     three, then of one, so a warp runs one walker. A lane walks a unit: a contact's rows from its first, a joint row
     alone.
 
-    The class's tree (``parent``, ``first``: :func:`.factor.walk.walk_prelude`'s table) and each coordinate's factor
-    coordinate ``node`` (the support masks' bit) are baked into constant memory. A contact unit of three rows (four
+    The class's tree (``parent``, ``first``: :func:`.factor.walk.walk_prelude`'s table) is baked into constant memory;
+    the rows go into the one store, the packed rows, in their ``layout`` (:func:`_support_snippet`). A contact unit of
+    three rows (four
     with its spin row, where ``torsion`` lets spin rows appear; each count its own walker) is walked together; a unit
     of one row (a normal alone, a limit, a mimic) by the one-row walker. The
     contact rows' records are the first launch's; a joint row's records and unit source are its producer's (the limit
-    and mimic producers). The walker stores its footprints at their ranks in its support
-    (``row_factor``, with the coordinates ``row_dof`` or the support class ``row_class``), its diagonal ``|z|^2 + cfm``,
+    and mimic producers). The walker stores its footprints at their entries in the packed rows (``packed_Z``; by class at
+    their ranks in its sides' masks, with the row's classes), its diagonal ``|z|^2 + cfm``,
     its incident ``J v_hat`` and its rhs by the row law (:func:`.row_kernels.row_bias`). ``half`` is the class's records'
     half (:func:`.tree_scan.classes_half`), compiled into its walks.
     """
@@ -1459,8 +1486,8 @@ def support_rows_kernel(
 
     def walker(rows: int):
         registers = WRITERS["support"].registers(device_arch)
-        snippet = _support_snippet(parent, first, node, rows, torsion and rows == 4, half, registers)
-        return unit_walker(f"support_walk_{rows}", snippet)
+        snippet = _support_snippet(parent, first, rows, torsion and rows == 4, half, registers, layout)
+        return unit_walker(f"support_walk_{rows}_{layout}", snippet)
 
     walk_one = walker(1)
     walk_unit = walker(unit_rows)
@@ -1501,7 +1528,7 @@ def support_rows_kernel(
                 row_bias(rows, bias, line, slot + r, incident)
             item += threads
 
-    name = f"support_rows_{len(node)}_{abs(hash((parent, first, node))) % (1 << 32):08x}"
+    name = f"support_rows_{first[-1]}_{layout}_{abs(hash((parent, first))) % (1 << 32):08x}"
     name += "_torsion" if torsion else ""
     # The writer's line, at which no walker spills.
     return python_kernel(kernel, name, launch_bounds=WRITERS["support"].bounds(device_arch))

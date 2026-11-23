@@ -22,10 +22,10 @@ solved, not that they are right.
 
 The rows' velocity terms are one kernel over the one ``Z`` operator's ``dot`` (:func:`rows_kernel`), a thread a world,
 each row's entries summed in order (:data:`ONE`); a support class is its data (:class:`RowClass`). Packed rows
-(:func:`packed_class`) and the sparse diagonal's (:func:`slot_class`) read ``Z_i^T u+`` with ``u+`` the walk's
-coordinates of ``v+`` (:func:`.factor.walk.walk_enter_kernel`), so a defect in leaving factor coordinates shows too, and
-corrected rows and targets agree on a closure; native sparse rows (:func:`sparse_class`) hold no dense factor and read
-their own ``J_i v_hat + Z_i^T du``; the free bodies' (:func:`free_class`) are the 6 + 6 class over the walk's
+(:func:`packed_class`, native sparse factors' too) and the sparse diagonal's (:func:`slot_class`) read ``Z_i^T u+`` with
+``u+`` the walk's coordinates of ``v+`` (:func:`.factor.walk.walk_enter_kernel`), so a defect in leaving factor
+coordinates shows too, and corrected rows and targets agree on a closure; the free bodies' (:func:`free_class`) are the
+6 + 6 class over the walk's
 coordinates, summed as the sweep's one thread sums them; a tier's walked rows by the tier's text (:func:`seeded_class`).
 One law kernel (:func:`audit_world`) then adds each contact normal's ``eps_i lambda_i``; the sparse diagonal's fused
 limits, which no store holds, read their law in place (:func:`fused_limits`).
@@ -56,7 +56,6 @@ from .row_laws import (
 )
 from .row_records import DenseRows
 from .row_records import bind as bind_dense_rows
-from .sparse_mass_matrix import _SparseRowSupport
 from .sweep_routes import free_body_rows, packed_operator
 from .sweep_routes_diag import slot_rows
 from .sweep_routes_tiers import _seeded_row, _stored_row
@@ -133,10 +132,6 @@ OPERANDS = FieldGroup(
     Field("dof_start", int, ("art",), owner="forest", attr="articulation_dof_start"),
     Field("base", int, owner="placement", attr="body_base"),
     Field("v", float, ("dof",), owner="step"),
-    Field("support", _SparseRowSupport, owner="placement", attr="sparse_row_support"),
-    Field("row_dof", int, ("line", "row", "support"), owner="placement", attr="sparse_row_dof"),
-    Field("row_factor", float, ("line", "row", "support"), owner="placement", attr="sparse_row_factor"),
-    Field("delta", float, ("world", "world_dof"), owner="placement", attr="sparse_factor_velocity_delta"),
     Field("dense_offsets", int, ("world",), owner="placement", attr="sparse_diagonal_dense_offsets"),
     Field("dense_groups", int, ("world",), owner="placement", attr="sparse_diagonal_dense_groups"),
     Field("dense_Z", float, ("line", "row", "dof"), owner="step"),
@@ -267,29 +262,6 @@ def packed_class(support: int, wide: bool, classes: bool = False) -> RowClass:
             term = incident.data[(size_t)line * incident.shape[1] + i] + zu - zhat;
         }""",
         (PACKED_SIDES, *((CLASS_SIDES,) if classes else ())),
-    )
-
-
-def sparse_class(support: int, table: bool) -> RowClass:
-    """Native sparse factors' rows (case K1, :func:`.sweep_routes_sparse.factor_operator`): ``J_i v_hat + Z_i^T du``,
-    summed from the incident, entries through the support table or explicit coordinates."""
-
-    def index(row, entry):
-        if table:
-            return f"support.class_dof.data[support.row_class.data[offset + {row}] * {support} + {entry}]"
-        return f"row_dof.data[row_base + {row} * {support} + {entry}]"
-
-    def factor(row, entry):
-        return f"row_factor.data[row_base + {row} * {support} + {entry}]"
-
-    operator = SparseFactor(support, index, factor, ONE, velocity=Velocity("du"))
-    return RowClass(
-        f"sparse{support}{'_table' if table else ''}",
-        OPERANDS.select("support", "row_dof", "row_factor", "row_incident", "delta"),
-        """    const int offset = line * support.row_class.shape[1];
-    const int row_base = line * row_factor.shape[1] * row_factor.shape[2];
-    const float* du = delta.data + (size_t)world * delta.shape[1];""",
-        _sum(operator, "term", "row_incident.data[(size_t)line * row_incident.shape[1] + i]"),
     )
 
 
@@ -585,8 +557,6 @@ class Audit:
         solver = self.solver
         placement = solver.placement
         route = solver._plan.solve.name
-        if route == "sparse_pgs":
-            return sparse_class(int(placement.sparse_row_factor.shape[2]), bool(placement.sparse_row_support.enabled))
         if route == "sparse_diagonal":
             size = solver.spec.classes.dense_size
             return slot_class(int(size), int(placement.J_by_size[size].shape[1]))
@@ -625,7 +595,7 @@ class Audit:
         first, capacity, acts = placement.dense_first, placement.dense_max_constraints, placement.world_acts
         # The walked rows (walk_rows) are in the walk's coordinates: their trees' coordinates are the walk's too.
         route = solver._plan.solve.name
-        if route != "sparse_pgs" and placement.walks:
+        if placement.walks:
             self._walk_coordinates(v, self.coordinates)
             if route != "sparse_diagonal":
                 self._walk_coordinates(solver.v_hat, self.coordinates_hat)

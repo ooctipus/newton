@@ -7,6 +7,7 @@ import os
 import unittest
 from itertools import product
 from pathlib import Path
+from types import MappingProxyType
 from unittest import mock
 
 import numpy as np
@@ -14,9 +15,10 @@ import warp as wp
 
 from newton._src.core.memory import arch_budget
 from newton._src.solvers.feather_pgs import class_plan
+from newton._src.solvers.feather_pgs.factor.walk import WalkTrees
+from newton._src.solvers.feather_pgs.packed_rows import NO_CLASS
 from newton._src.solvers.feather_pgs.row_laws import ROW_CONTACT as CONTACT
 from newton._src.solvers.feather_pgs.row_laws import ROW_FRICTION as FRICTION
-from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseRowSupport
 from newton._src.solvers.feather_pgs.sweep import FRICTION_METRIC_FLOATS, sweep_kernel
 from newton._src.solvers.feather_pgs.sweep_routes_sparse import SparseSweep
 from newton.solvers import SolverFeatherPGS
@@ -29,7 +31,8 @@ CANDIDATE_OPTIONS = {"contact_triplets": True}
 
 
 def factory(capacity, dofs, width, *, candidate=True, active=True, linked=False):
-    """Return the sparse sweep of the triplet tests: with contact units (``candidate``) or the ordinary one."""
+    """Return the sparse sweep of the triplet tests: with contact units (``candidate``) or the ordinary one, its rows by
+    class (a world's one tree at coordinate 0)."""
     options = dict(CANDIDATE_OPTIONS) if candidate else {}
     return sweep_kernel(
         SparseSweep(
@@ -37,11 +40,17 @@ def factory(capacity, dofs, width, *, candidate=True, active=True, linked=False)
             dofs,
             width,
             active_rows=active,
-            use_support_table=True,
+            layout="classes",
             linked_rows=linked,
             **options,
         )
     )
+
+
+def class_words(row_class, class_dof):
+    """Each row's word in the one store (:data:`.packed_rows.CLASS_SIDES`): its class, no second side, and its first
+    side's entries, the class table's width (a padded entry reads coordinate -1)."""
+    return (np.asarray(row_class, np.int64) | (NO_CLASS << 13) | (class_dof.shape[1] << 26)).astype(np.int32)
 
 
 def pair_metric(a, c, d):
@@ -166,20 +175,34 @@ def fixture(*, offset=0, activity=None, seeded=False, omega=1.0, linked=False):
     return data, physical
 
 
+# A fixture's data key and the sweep's argument it is (DeviceSolve.assign).
+_ARGUMENTS = MappingProxyType(
+    {
+        "world_constraint_count": "world_constraint_count",
+        "diagonal": "world_diag",
+        "row_factor": "packed_Z",
+        "row_incident": "row_incident",
+    }
+)
+
+
 class DeviceSolve:
-    """One ABI adapter shared by synthetic and preserved actual-input tests.
+    """One ABI adapter shared by synthetic and preserved actual-input tests: the rows (``row_factor``) as the one store's
+    packed rows by class (``support_row_class``, ``support_class_dof``), or ``layout="dense"`` with entry ``e`` at
+    coordinate ``e``; the sweep's change read back from the walk's ``du`` it adds into (cleared before each launch).
 
     A kernel with contact units also reads its triplets' records (:func:`record_array`), which follow the scalar
     inputs.
     """
 
-    def __init__(self, data, *, candidate, device="cuda:0", active=True, linked=False):
+    def __init__(self, data, *, candidate, device="cuda:0", active=True, linked=False, kernel=None, lanes=32):
         self.device = wp.get_device(device)
         self.data = data
         self.linked = linked
         self.worlds, self.capacity, self.width = data["row_factor"].shape
         self.dofs = data["reference_factor_delta"].shape[1]
-        self.kernel = factory(
+        self.groups = 64 // lanes
+        self.kernel = kernel or factory(
             self.capacity,
             self.dofs,
             self.width,
@@ -195,33 +218,44 @@ class DeviceSolve:
         def zeros(shape, dtype=float):
             return wp.zeros(shape, dtype=dtype, device=self.device)
 
-        self.support = _SparseRowSupport()
-        self.support.enabled = 1
-        self.support.row_class = array(data["support_row_class"], int)
-        self.support.class_dof = array(data["support_class_dof"], int)
         self.impulses = array(data["initial_impulses"])
-        self.delta = wp.full((self.worlds, self.dofs), float("nan"), device=self.device)
-        self.inputs = [
-            self.worlds,
-            array(data["world_constraint_count"], int),
-            row_lines(self.device),
-            array(data["rhs_bias"]),
-            array(data["diagonal"]),
-            self.impulses,
-            wp.full((1, 1, 1), -9, dtype=int, device=self.device),
-            array(data["row_factor"]),
-            array(data["row_incident"]),
-            array(data["row_type"], int),
-            array(data["row_parent"], int),
-            array(data["row_mu"]),
-            array(np.arange(self.worlds * self.dofs).reshape(self.worlds, self.dofs), int),
-            zeros(self.worlds * self.dofs),
-            int(data["iterations"]),
-            float(data["omega"]),
-        ]
+        self.walk = WalkTrees()
+        self.walk.du = zeros(self.worlds * self.dofs)
+        self.named = {
+            "world_count": self.worlds,
+            "world_constraint_count": array(data["world_constraint_count"], int),
+            "dense_first": row_lines(self.device),
+            "rhs_bias": array(data["rhs_bias"]),
+            "world_diag": array(data["diagonal"]),
+            "world_impulses": self.impulses,
+            "packed_Z": array(data["row_factor"]),
+            "row_sides": zeros((1, 1), wp.vec2i),
+            "row_classes": array(class_words(data["support_row_class"], data["support_class_dof"]), int),
+            "class_dof": array(data["support_class_dof"], int),
+            "response_dofs": zeros(1, int),
+            "articulation_world_dof_offset": zeros(1, int),
+            "row_incident": array(data["row_incident"]),
+            "world_row_type": array(data["row_type"], int),
+            "world_row_parent": array(data["row_parent"], int),
+            "world_row_mu": array(data["row_mu"]),
+            "world_dof_indices": array(np.arange(self.worlds * self.dofs).reshape(self.worlds, self.dofs), int),
+            "v_hat": zeros(self.worlds * self.dofs),
+            "iterations": int(data["iterations"]),
+            "omega": float(data["omega"]),
+            "walk": self.walk,
+        }
         if "friction_metric" in self.kernel.adj.arg_types:
             self.records = array(record_array(data))
-            self.inputs.append(self.records)
+            self.named["friction_metric"] = self.records
+
+    @property
+    def inputs(self):
+        """The kernel's arguments by name, in its order."""
+        return [self.named[arg.label] for arg in self.kernel.adj.args]
+
+    def assign(self, key, value):
+        """Write ``data[key]``'s new value into its argument (captured launches read it)."""
+        self.named[_ARGUMENTS[key]].assign(value)
 
     @property
     def units(self):
@@ -234,11 +268,11 @@ class DeviceSolve:
             self.records.assign(record_array(data))
 
     def launch(self):
+        self.walk.du.zero_()
         wp.launch_tiled(
             self.kernel,
-            dim=[(self.worlds + 1) // 2],
+            dim=[(self.worlds + self.groups - 1) // self.groups],
             inputs=self.inputs,
-            outputs=[self.delta, self.support],
             block_dim=64,
             device=self.device,
         )
@@ -247,7 +281,7 @@ class DeviceSolve:
         self.impulses.assign(self.data["initial_impulses"])
 
     def result(self):
-        return self.delta.numpy(), self.impulses.numpy()
+        return self.walk.du.numpy().reshape(self.worlds, self.dofs), self.impulses.numpy()
 
 
 def assert_output(test, data, delta, impulses, *, physical=None, reference=None):
@@ -433,7 +467,6 @@ class TestSparseContactTriplets(unittest.TestCase):
                 12,
                 **{
                     "active_rows": False,
-                    "use_support_table": True,
                     "contact_triplets": True,
                     "linked_rows": True,
                     "torsion": True,  # The law gives a friction region with a footprint its spin row.
@@ -445,24 +478,11 @@ class TestSparseContactTriplets(unittest.TestCase):
         while high - low > 1:
             middle = (low + high) // 2
             low, high = (middle, high) if staging(middle).fits(budget) else (low, middle)
-        # The tiny batch: the largest capacity whose support table (its classes, and a class a row) costs at least the
-        # explicit indices (a coordinate an entry), the admission's rule, from this tree's classes.
-        probe = SolverFeatherPGS(
-            model,
-            pgs_warmstart=False,
-            dense_max_constraints=192,
-        )
-        support = probe.placement.sparse_row_support
-        classes = sum(
-            getattr(support, name).numpy().nbytes for name in ("body_class", "pair_class", "class_dof", "limit_class")
-        )
-        tiny = classes // (4 * model.world_count * (int(probe.spec.classes.packed.max_support) - 1))
         cases = (
             (192, {"contact_units": None}, False),
             (192, {}, True),
-            (tiny, {}, False),  # The tiny batch's support table costs more than explicit indices.
             (192, {"active_rows": False}, True),  # The law's units pool their rings in the full sweep too.
-            (192, {"row_support": False}, False),
+            (192, {"row_support": False}, True),  # Rows by side share a contact's coordinates as well.
             (low, {}, True),
             (high, {}, False),
         )
@@ -657,13 +677,8 @@ class TestSparseContactTriplets(unittest.TestCase):
             data["row_incident"] = original["row_incident"] * factor_scale
             data["diagonal"] = (original["diagonal"] - 1e-6) * factor_scale**2 + cfm
             for runner in (control, candidate):
-                for slot, key in (
-                    (1, "world_constraint_count"),
-                    (4, "diagonal"),
-                    (7, "row_factor"),
-                    (8, "row_incident"),
-                ):
-                    runner.inputs[slot].assign(data[key])
+                for key in ("world_constraint_count", "diagonal", "row_factor", "row_incident"):
+                    runner.assign(key, data[key])
                 # The support writer forms the records with the rows each step.
                 runner.rebuild_records(data)
                 runner.reset_impulses()
@@ -677,17 +692,17 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
 
     def test_linked_factory_cpu(self):
         """Admit ring-linked normals to contact units in either sweep, and keep point variants unlinked."""
-        options = {"use_support_table": True, "contact_triplets": True}
+        options = {"layout": "classes", "contact_triplets": True}
         active = sweep_kernel(SparseSweep(192, 12, 12, active_rows=True, linked_rows=True, **options))
         full = sweep_kernel(SparseSweep(192, 12, 12, linked_rows=True, **options))
         point = sweep_kernel(SparseSweep(192, 12, 12, active_rows=True, **options))
-        self.assertTrue(active.key.endswith("_active_support_table_contact_triplets_linked"))
-        self.assertTrue(full.key.endswith("_12_12_support_table_contact_triplets_linked"), full.key)
-        self.assertTrue(point.key.endswith("_active_support_table_contact_triplets"))
+        self.assertTrue(active.key.endswith("_active_classes_contact_triplets_linked"))
+        self.assertTrue(full.key.endswith("_12_12_classes_contact_triplets_linked"), full.key)
+        self.assertTrue(point.key.endswith("_active_classes_contact_triplets"))
         for kernel in (active, full, point):
             self.assertIn("friction_metric", kernel.adj.arg_types)
-        # Point friction fuses only in the active sweep, and nothing fuses without support tables.
-        for unfused in ({"use_support_table": True}, {"active_rows": True, "linked_rows": True}):
+        # Point friction fuses only in the active sweep.
+        for unfused in ({"layout": "classes"}, {"layout": "dense"}):
             with self.subTest(options=unfused):
                 kernel = sweep_kernel(SparseSweep(192, 12, 12, contact_triplets=True, **unfused))
                 self.assertNotIn("contact_triplets", kernel.key)
@@ -695,20 +710,18 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
     def test_patch_triplet_admission_cpu(self):
         """Fuse patch triplets in the linked active scan or the full sweep; never in packed sweeps."""
         cases = (
-            # Probe changes, active rows, support table, lanes, fits; admitted, reason.
-            ({}, True, True, 32, True, True, "active-row scan"),
-            ({}, False, True, 32, True, True, "full ordered sweep"),
-            ({}, False, True, 16, True, False, "16-lane"),
-            ({}, True, False, 32, True, False, "support table"),
-            ({}, True, True, 32, False, False, "room for contact units"),
-            ({"pins": {"contact_units": None}}, True, True, 32, True, False, "contact_units=None"),
+            # Probe changes, active rows, lanes, fits; admitted, reason.
+            ({}, True, 32, True, True, "active-row scan"),
+            ({}, False, 32, True, True, "full ordered sweep"),
+            ({}, False, 16, True, False, "16-lane"),
+            ({}, True, 32, False, False, "room for contact units"),
+            ({"pins": {"contact_units": None}}, True, 32, True, False, "contact_units=None"),
         )
-        for changes, active, table, lanes, fits, admitted, phrase in cases:
-            with self.subTest(changes=changes, active=active, table=table, lanes=lanes, fits=fits):
+        for changes, active, lanes, fits, admitted, phrase in cases:
+            with self.subTest(changes=changes, active=active, lanes=lanes, fits=fits):
                 decision, reason = class_plan.contact_triplets_rule(
                     SolverFeatherPGS.Pins(**changes.get("pins", {})),
                     active_rows=active,
-                    use_support_table=table,
                     lanes=lanes,
                     fits=lambda fits=fits: fits,
                 )
@@ -779,10 +792,10 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
         """Build the linked triplet sweep the patch policy selects, and keep a small world's packed sweep."""
         model = equal_dof_trees(4, 3, "cuda:0")
         for pins, suffix in (
-            ({}, "_active_support_table_contact_triplets_linked"),
-            ({"active_rows": False}, "_18_12_support_table_contact_triplets_linked"),
-            ({"contact_units": None}, "_active_support_table_linked"),
-            ({"active_rows": False, "contact_units": None}, "_18_12_support_table"),
+            ({}, "_active_classes_contact_triplets_linked"),
+            ({"active_rows": False}, "_18_12_classes_contact_triplets_linked"),
+            ({"contact_units": None}, "_active_classes_linked"),
+            ({"active_rows": False, "contact_units": None}, "_18_12_classes"),
         ):
             with (
                 self.subTest(pins=pins),

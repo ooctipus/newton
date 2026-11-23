@@ -356,8 +356,8 @@ class Placement:
     Built in the solver's construction order: the capacities and placeholders here, then
     :meth:`allocate_size_groups`, :meth:`allocate_contact_rows`, :meth:`allocate_world_rows`,
     :meth:`allocate_sparse_diagonal_rows`, :meth:`allocate_packed_rows`,
-    :meth:`allocate_placeholders`, :meth:`allocate_status` and :meth:`place_dense_response`. The native sparse route
-    allocates its rows on :attr:`arrays` as it admits them.
+    :meth:`allocate_placeholders`, :meth:`allocate_status` and :meth:`place_dense_response`. Every class that writes
+    rows by the walk but the sparse diagonal holds them in the one store, the packed rows (:attr:`packs_rows`).
 
     Args:
         spec: The step's spec: the forest and the row capacities.
@@ -665,10 +665,16 @@ class Placement:
         else:
             self.arrays.allocate(SPARSE_CONTACT_SERIAL, world=1, serial=1)
 
+    @property
+    def packs_rows(self) -> bool:
+        """Whether the dense rows live in the packed rows (:mod:`.packed_rows`): the matrix-free sweeps' and native
+        sparse factors' (case K1)."""
+        return bool(self.classes.mf_sweeps or self.classes.packed is not None)
+
     def allocate_packed_rows(self) -> None:
-        """The matrix-free sweeps' rows, packed (:mod:`.packed_rows`): every row of the world's line, by side or by
-        support class; a placeholder without those sweeps."""
-        if self.classes.mf_sweeps:
+        """The packed rows (:mod:`.packed_rows`, :attr:`packs_rows`): every row of the world's line, by side or by
+        support class; a placeholder without them."""
+        if self.packs_rows:
             sizes, worlds = self.forest.articulation_response_dof_count.numpy(), self.forest.art_to_world.numpy()
             offsets = self.forest.articulation_world_dof_offset.numpy()
             # A row's sides follow articulation indices (row_records.row_sides); they follow the world's coordinates
@@ -691,7 +697,7 @@ class Placement:
         else:
             self.packed_support, self.packed_dense = 1, 0
             self.row_classes = packed_rows.RowClasses()
-            self.row_classes_reason = "No matrix-free sweep reads packed rows."
+            self.row_classes_reason = "No sweep reads packed rows."
             sizes = {"world": 1, "row": 1, "support": 1}
         self.arrays.allocate(packed_rows.PACKED_ROWS, **sizes)
 
@@ -700,10 +706,11 @@ class Placement:
         return self.row_classes_reason is None
 
     def place_row_classes(self) -> None:
-        """The rows by their support classes (:func:`.packed_rows.row_classes`, ``row_classes``) where only the general
-        sweep reads them and a lane of its warp holds fewer of a row's entries (the classes' table loads cost more than
-        narrower rows save at the same entries a lane: measured); ``row_classes_reason`` says why not (``None``: they
-        do)."""
+        """The rows by their support classes (:func:`.packed_rows.row_classes`, ``row_classes``) where they save the bytes
+        that cost: for the general sweep, where a lane of its warp holds fewer of a row's entries (the classes' table
+        loads cost more than narrower rows save at the same entries a lane: measured); for native sparse factors (case
+        K1), whose unit writer stores and whose records and sweep read every entry of a row, wherever a row by class is
+        narrower. ``row_classes_reason`` says why not (``None``: they do)."""
         self.row_classes = packed_rows.RowClasses()
         model, forest, factor = self.model, self.forest, self.factor
         self.row_classes_reason = first_failed(
@@ -739,6 +746,14 @@ class Placement:
         )
         if table is None or table.width >= 64:
             self.row_classes_reason = "The support classes exceed a row word's class ids or first side's entries."
+        elif self.classes.packed is not None:
+            # Native sparse factors' unit writer stores every entry of a row and their records and sweep read it: a
+            # narrower row saves its bytes whatever the lanes (measured: anymald-rough's rows of 12 by class, 1.2% of a
+            # step faster than 18 by side).
+            if table.width >= self.packed_support:
+                self.row_classes_reason = (
+                    f"Rows of {table.width} entries by class are no narrower than {self.packed_support} by side."
+                )
         elif (table.width - 1) // _WARP >= (self.packed_support - 1) // _WARP:
             self.row_classes_reason = (
                 f"Rows of {table.width} entries by class take as many entries a lane of a warp as {self.packed_support}"
@@ -999,9 +1014,7 @@ class Placement:
         support = RowSupport()
         support.sides = self.row_sides
         support.dofs = self.forest.articulation_response_dof_count
-        support.offset = (
-            self.forest.articulation_world_dof_offset if self.classes.mf_sweeps else self.dummy_is_free_rigid
-        )
+        support.offset = self.forest.articulation_world_dof_offset if self.packs_rows else self.dummy_is_free_rigid
         support.dense = int(self.packed_dense)
         support.first = self.dense_first
         support.units = self.unit_source if self.walks else self.dummy_units

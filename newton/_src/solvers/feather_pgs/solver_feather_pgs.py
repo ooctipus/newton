@@ -494,9 +494,9 @@ class SolverFeatherPGS(SolverBase):
         self._bind_contact_material(None)
         self._allocate_common_buffers(model)
         self.sweep.place_packed(classes.packed)
-        # The matrix-free sweeps read the dense rows packed (packed_rows): every class but native sparse factors (case
-        # K1) and the sparse diagonal (case K2). Decided before the buffers, since that placement allocates no size
-        # group's Jacobian.
+        # The dense rows live packed (packed_rows) in every class but the sparse diagonal (case K2): the matrix-free
+        # sweeps and native sparse factors (case K1) read them there. Decided before the buffers, since that placement
+        # allocates no size group's Jacobian.
         self.placement.allocate_size_groups()
         if model.articulation_count:
             self.placement.allocate_contact_rows(model)
@@ -518,7 +518,7 @@ class SolverFeatherPGS(SolverBase):
         # data for every responding tree, a free rigid body's six coordinates included, and the one writer, the free
         # bodies' writer and the sweeps' leaves read it. The Jacobi tiers (case K4, FL3.7) read the one writer's rows,
         # or walk the seeds its EMIT sink keeps in their prologue, and leave by the walk.
-        # The support placement (case K1, FL3.4) whitens and leaves its rows by the walk too, into its support sink.
+        # The support placement (case K1, FL3.4) whitens and leaves its rows by the walk too, into the packed rows.
         general = support == "factor" or bool(
             support == "dense" and self.spec.classes.mf_sweeps and np.any(self.forest.response_dof_count > 0)
         )

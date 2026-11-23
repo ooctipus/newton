@@ -192,10 +192,10 @@ class TestFeatherPGSSparsePatchRowsCuda(unittest.TestCase):
             if triplets == "0":
                 pins["contact_units"] = None
             solvers[triplets] = _make_solver(model, True, pins=pins, **options)
-        # The full ordered sweep: no "_active" between the support width and the table; patch friction's sweeps read
+        # The full ordered sweep: no "_active" between the rows' width and their layout; patch friction's sweeps read
         # spin rows (``_torsion``).
-        self.assertRegex(solvers["1"].sweep.sparse_kernel.key, r"_\d+_support_table_contact_triplets_linked_torsion$")
-        self.assertRegex(solvers["0"].sweep.sparse_kernel.key, r"_\d+_support_table_torsion$")
+        self.assertRegex(solvers["1"].sweep.sparse_kernel.key, r"_\d+_[a-z]+_contact_triplets_linked_torsion$")
+        self.assertRegex(solvers["0"].sweep.sparse_kernel.key, r"_\d+_[a-z]+_torsion$")
         self.assertFalse(solvers["1"].spec.classes.packed.sweep["active_rows"])
         runs = {name: _rollout(solver, model, steps=120, slide_world=1, speed=0.6) for name, solver in solvers.items()}
         anchors, ordinary_anchors = runs["1"][0], runs["0"][0]

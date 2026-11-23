@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Dense rows stored packed by support: the matrix-free sweeps' placement of whitened rows.
+"""Dense rows stored packed by support: the one store of whitened rows, which the matrix-free sweeps and native sparse
+factors' sweep (case K1) read.
 
 A dense row touches at most two articulations, its sides (:func:`.row_records.row_sides`), the first by index. The one
 writer stores its whitened form ``Z = L^-1 P J^T`` (``packed_Z``), walked from its seeds (:mod:`.walk_rows`), with its
@@ -15,7 +16,8 @@ An entry's world coordinate is not stored; it follows from the layout, chosen fr
   (:func:`support_width`); ``dense`` where that is the widest world's, entry ``e`` at coordinate ``e`` (the form the
   routes that hold a world's coordinates on lanes read); :data:`WIDE` where bilateral elimination corrects a row past
   its sides (:mod:`.factor.closure`);
-- by support class (:func:`row_classes`): each side its seeds' root paths, where only the general sweep reads the rows.
+- by support class (:func:`row_classes`): each side its seeds' root paths, where a lane of the sweep that reads the
+  rows holds fewer of a row's entries (:meth:`.placement.Placement.place_row_classes`).
 
 Entries ascend with the world's coordinates in every layout; the rows are never cleared (a tier that walks its
 worlds' rows reads their seeds).
@@ -43,6 +45,7 @@ __all__ = [
     "RowClasses",
     "SupportTable",
     "class_rank",
+    "path_masks",
     "row_classes",
     "support_width",
 ]
@@ -205,6 +208,19 @@ class SupportTable:
     @property
     def nbytes(self) -> int:
         return sum(getattr(self, f.name).nbytes for f in ROW_CLASSES[:-1])
+
+
+def path_masks(parent, first) -> np.ndarray:
+    """Each node's root path (its ancestors' coordinates and its own, node ``b``'s from ``first[b]`` to ``first[b + 1]``)
+    as a mask, a bit a tree coordinate, of a walking class's tree of at most 64 coordinates (``parent``, ``first``:
+    its path table, parents first): a row side's support, the same coordinates as its class's (:func:`row_classes`)."""
+    if first[-1] > 64:
+        raise ValueError("Path masks hold at most 64 coordinates")
+    masks = np.zeros(len(parent), dtype=np.uint64)
+    for b, up in enumerate(parent):
+        own = sum(1 << c for c in range(first[b], first[b + 1]))
+        masks[b] = np.uint64(own) | (masks[up] if up >= 0 else np.uint64(0))
+    return masks
 
 
 def row_classes(walks, art_class, art_world, world_count, joints, contact_body, mimic_dofs=None) -> SupportTable | None:

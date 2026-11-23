@@ -61,7 +61,6 @@ __all__ = [
     "RowLaw",
     "WorldClass",
     "joint_forest",
-    "row_support",
 ]
 
 
@@ -960,52 +959,3 @@ def _class_shape(plan):
         offsets.append(int(offset[0]) if np.all(offset == offset[0]) else None)
     free = tuple(size in plan.free_body_inertia_sizes for size in sizes)
     plan.shape = ClassShape(sizes, free, arts, groups, tuple(offsets), int(plan.max_world_dofs))
-
-
-def row_support(
-    forest: ForestPlan, model: Model, factor, articulated: np.ndarray, several: bool, mimic_dofs=None
-) -> tuple[np.ndarray, int]:
-    """Each body's support and the widest row's on the native sparse factors of one articulated size.
-
-    A body's support is its joint's ancestor mask in factor coordinates. The widest row covers a contact between any
-    two bodies' supports, a mimic pair, two articulations of one world, and at most the widest world.
-
-    Args:
-        forest: The forest plan.
-        model: The model.
-        factor: The size's fill-free factor pattern (:meth:`.tree_plan.TreePlan.factor`).
-        articulated: The articulated (not free-body) responding articulations.
-        several: Whether a world holds several of them.
-        mimic_dofs: Each mimic's two coordinates, local to its articulation, or ``None`` without mimic rows.
-
-    Returns:
-        ``(body_masks, width)``.
-    """
-    articulation_start = model.articulation_start.numpy()
-    joint_child = model.joint_child.numpy()
-    joint_masks = factor.joint_ancestor_mask
-    body_masks = np.zeros(model.body_count, dtype=np.uint64)
-    first_joint = articulation_start[articulated]
-    art, local_joint = host_index.expand(forest.articulation_joint_end_host[articulated] - first_joint)
-    children = joint_child[first_joint[art] + local_joint]
-    valid = children >= 0
-    body_masks[children[valid]] = joint_masks[local_joint[valid]]
-    shape_body = model.shape_body.numpy()
-    contact_masks = np.unique(body_masks[shape_body[shape_body >= 0]])
-    max_support = max((int(mask).bit_count() for mask in joint_masks), default=0)
-    for first in contact_masks:
-        for second in contact_masks:
-            max_support = max(max_support, int(first | second).bit_count())
-    if mimic_dofs is not None:
-        # Coefficients and enable bits stay live, so retain both endpoint
-        # supports even when a coupling is initially disabled or zero.
-        first_dofs, second_dofs = mimic_dofs
-        masks = factor.ancestor_mask[first_dofs] | factor.ancestor_mask[second_dofs]
-        max_support = max(max_support, max((int(mask).bit_count() for mask in masks), default=0))
-    if several:
-        # Different articulations have disjoint coordinate blocks, even
-        # when they share the same topology and local ancestor indices.
-        max_support = max(max_support, 2 * max(int(mask).bit_count() for mask in joint_masks))
-    # Response groups need not coexist in every world. No row can contain
-    # more distinct coordinates than the largest world's response vector.
-    return body_masks, min(max_support, forest.max_world_dofs)

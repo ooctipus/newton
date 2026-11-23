@@ -581,7 +581,7 @@ def assert_sparse_rows_consistent(solver):
 
     recover = TestFeatherPGSSparseSolver()._sparse_rows_physical
     impulses, incident = solver.placement.impulses.numpy(), solver.placement.row_incident.numpy()
-    delta, dofs = solver.placement.sparse_factor_velocity_delta.numpy(), solver.forest.world_dof_indices.numpy()
+    du, dofs = solver.factor.walk_view().du.numpy(), solver.forest.world_dof_indices.numpy()
     v_hat, v_out = solver.v_hat.numpy(), solver.v_out.numpy()
     checked = 0
     for world, live in enumerate(solver.placement.constraint_count.numpy()):
@@ -593,7 +593,8 @@ def assert_sparse_rows_consistent(solver):
             jacobian,
             impulses[world, :count],
             incident[world, :count],
-            delta[world],
+            # The sweep's change, which it added into the walk's du at the world's coordinates.
+            np.where(velocity >= 0, du[velocity], 0.0),
             v_hat[velocity],
             v_out[velocity],
             label=f"world {world}",

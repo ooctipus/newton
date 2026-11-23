@@ -85,7 +85,7 @@ def _factory_calls():
             "sparse",
             built(SparseSweep),
             (48, 18, 12),
-            {"active_rows": True, "use_support_table": True, "contact_triplets": True},
+            {"active_rows": True, "layout": "classes", "contact_triplets": True},
         ),
         ("sparse_lanes", built(SparseSweep), (16, 6, 6), {"lanes_per_world": 8}),
         (
@@ -123,7 +123,7 @@ def _vote_census():
             (48, 18, 12),
             (
                 _axis("active_rows"),
-                _axis("use_support_table"),
+                ({"layout": "classes"}, {"layout": "sides", "sides": True}),
                 _axis("contact_triplets"),
                 _axis("local_factors"),
                 _axis("warm_start"),

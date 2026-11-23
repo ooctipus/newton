@@ -27,8 +27,9 @@ from newton.tests.feather_pgs_law_harness import built
 
 EMITTER = built(routes.SparseSweep)
 
-_TABLE = {"use_support_table": True}
-_ACTIVE = {"active_rows": True, "use_support_table": True}
+_TABLE = {"layout": "classes"}
+_SIDES = {"layout": "sides", "sides": True}
+_ACTIVE = {"active_rows": True, "layout": "classes"}
 _TRIPLETS = {**_ACTIVE, "contact_triplets": True}
 _PATCH = {**_TRIPLETS, "linked_rows": True}
 _SMALL = {"lanes_per_world": 8, "local_factors": True}
@@ -46,8 +47,8 @@ CONFIGURATIONS = (
     ("patch_units_48", 48, 18, 18, _PATCH, None),
     ("point_units", 112, 18, 12, _TRIPLETS, None),
     ("lanes_16", 64, 9, 9, {"lanes_per_world": 16}, None),
-    ("explicit_rows_patch", 128, 43, 18, {"active_rows": True, "linked_rows": True}, None),
-    ("explicit_rows_point", 56, 43, 18, {"active_rows": True}, None),
+    ("sides_rows_patch", 128, 43, 18, {**_SIDES, "active_rows": True, "linked_rows": True}, None),
+    ("sides_rows_point", 56, 43, 18, {**_SIDES, "active_rows": True}, None),
     ("full_sweep_table", 128, 27, 21, _TABLE, None),
     ("small_table", 16, 6, 6, {**_TABLE, **_SMALL}, None),
     ("small_world_table", 32, 2, 2, {**_TABLE, **_SMALL}, None),
@@ -59,7 +60,7 @@ CONFIGURATIONS = (
     ("patch_warm_start", 48, 18, 12, {**_PATCH, "warm_start": True}, None),
     # Readouts.
     ("point_units_sweeps", 112, 18, 12, _TRIPLETS, {"readout": "sweeps"}),
-    ("explicit_rows_trace", 128, 43, 18, {"active_rows": True}, {"readout": "trace"}),
+    ("sides_rows_trace", 128, 43, 18, {**_SIDES, "active_rows": True}, {"readout": "trace"}),
     ("patch_trace", 112, 18, 12, _PATCH, {"readout": "trace"}),
     ("lanes_16_sweeps", 64, 9, 9, {"lanes_per_world": 16}, {"readout": "sweeps"}),
     ("small_trace", 16, 6, 6, {**_TABLE, **_SMALL}, {"readout": "trace"}),
@@ -103,22 +104,23 @@ class TestSparseSweepConfiguration(unittest.TestCase):
     def test_variants_resolve(self):
         """Raise for an invalid combination; otherwise build a composed variant of the declared ABI and dispatch.
 
-        Triplets need the support table and three rows; linked rows take part only in the active scan or a contact
-        unit; every variant states launch bounds of 64 threads.
+        Triplets need three rows; linked rows take part only in the active scan or a contact unit; dense rows of one
+        tree hold every coordinate; every variant states launch bounds of 64 threads.
         """
         grid = itertools.product(
             (False, True),  # active_rows
-            (False, True),  # use_support_table
+            ("classes", "dense", "sides"),  # layout
             (False, True),  # contact_triplets
             (False, True),  # linked_rows
             (8, 32),  # lanes_per_world
             (False, True),  # local_factors
         )
         checked = 0
-        for active, table, triplets, linked, lanes, local in grid:
+        for active, layout, triplets, linked, lanes, local in grid:
             options = {
                 "active_rows": active,
-                "use_support_table": table,
+                "layout": layout,
+                "sides": layout == "sides",
                 "contact_triplets": triplets,
                 "linked_rows": linked,
                 "lanes_per_world": lanes,
@@ -140,7 +142,8 @@ class TestSparseSweepConfiguration(unittest.TestCase):
         cases = (
             ((0, 6, 4), {}),
             ((16, 6, 7), {}),
-            ((16, 72, 4), {"use_support_table": True}),
+            ((16, 6, 4), {"layout": "sides"}),
+            ((16, 6, 4), {"layout": "dense"}),
             ((16, 6, 4), {"lanes_per_world": 4}),
         )
         for args, options in cases:
@@ -151,17 +154,17 @@ class TestSparseSweepConfiguration(unittest.TestCase):
         """An active sweep with or without contact units, a group of fewer lanes than the world's coordinates or with the
         active scan and units, and local factors of any size the working set fits: each a sweep."""
         cases = (
-            ((16, 6, 4), {"active_rows": True}),
-            ((16, 6, 4), {"active_rows": True, "use_support_table": True, "contact_triplets": True}),
-            ((16, 18, 4), {"lanes_per_world": 16}),
+            ((16, 6, 4), {**_SIDES, "active_rows": True}),
+            ((16, 6, 4), {"active_rows": True, "layout": "classes", "contact_triplets": True}),
+            ((16, 18, 4), {**_SIDES, "lanes_per_world": 16}),
             (
                 (64, 18, 4),
-                {"lanes_per_world": 8, "active_rows": True, "use_support_table": True, "contact_triplets": True},
+                {"lanes_per_world": 8, "active_rows": True, "layout": "classes", "contact_triplets": True},
             ),
-            ((96, 6, 4), {"local_factors": True}),
+            ((96, 6, 4), {**_SIDES, "local_factors": True}),
             (
                 (64, 24, 12),
-                {"local_factors": True, "active_rows": True, "use_support_table": True, "contact_triplets": True},
+                {"local_factors": True, "active_rows": True, "layout": "classes", "contact_triplets": True},
             ),
         )
         for args, options in cases:
@@ -171,7 +174,7 @@ class TestSparseSweepConfiguration(unittest.TestCase):
                 self.assertGreater(staging.bytes, 0)
                 self.assertTrue(EMITTER(*args, **options).key.startswith(f"sweep_sparse_{args[0]}_{args[1]}_{args[2]}"))
         # A group of 8 lanes fills each 32-row word of the active scan's bitsets 8 bits at a time.
-        body, _ = routes.SparseSweep(64, 18, 4, lanes_per_world=8, active_rows=True).source()
+        body, _ = routes.SparseSweep(64, 18, 4, **_SIDES, lanes_per_world=8, active_rows=True).source()
         self.assertIn("for (int first = 0; first < count; first += 8) {", body)
         self.assertIn(
             "s_normal_words[first / 32] = ((first & 31) != 0 ? s_normal_words[first / 32] : 0u) | (mask << (first & 31));",

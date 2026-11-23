@@ -904,24 +904,17 @@ class TestRowSink(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# The support placement (case K1, CUDA): its rows from the support sink, one frame with its leave, the release
+# The support placement (case K1, CUDA): its rows in the one store, one frame with its leave, the release
 # ---------------------------------------------------------------------------------------------------------------------
 
 
 def support_rows(solver) -> dict:
-    """Case K1's rows from its support sink, by ``(world, row)``: each side's footprints by tree coordinate
-    ``{art: z}``, read through the support table or the explicit coordinates (factor coordinates, the plan's
-    ``permutation`` back to the tree's)."""
-    forest, placement, factor = solver.forest, solver.placement, solver.factor
-    perm = np.asarray(factor.sparse_pattern.permutation)
+    """Case K1's rows from the one store (the packed rows, :func:`.feather_pgs_law_harness.packed_coordinates`), by
+    ``(world, row)``: each side's footprints by tree coordinate ``{art: z}``."""
+    forest, placement = solver.forest, solver.placement
     size = int(solver.spec.classes.packed_size)
-    Z = placement.sparse_row_factor.numpy().astype(np.float64)
-    table = bool(placement.sparse_row_support.enabled)
-    if table:
-        row_class = placement.sparse_row_support.row_class.numpy()
-        class_dof = placement.sparse_row_support.class_dof.numpy()
-    else:
-        row_dof = placement.sparse_row_dof.numpy()
+    Z = placement.packed_Z.numpy().astype(np.float64)
+    dof = packed_coordinates(solver)
     offsets = forest.articulation_world_dof_offset.numpy()
     art_world = forest.art_to_world.numpy()
     arts = forest.group_to_art_host[size]
@@ -933,13 +926,13 @@ def support_rows(solver) -> dict:
         for row in range(min(int(counts[world]), Z.shape[1])):
             sides = {}
             for e in range(Z.shape[2]):
-                coordinate = int(class_dof[row_class[line, row], e] if table else row_dof[line, row, e])
+                coordinate = int(dof[line, row, e])
                 if coordinate < 0:
                     continue
                 for art in mine:
                     local = coordinate - int(offsets[art])
                     if 0 <= local < size:
-                        sides.setdefault(art, np.zeros(size))[perm[local]] = Z[line, row, e]
+                        sides.setdefault(art, np.zeros(size))[local] = Z[line, row, e]
             out[(world, row)] = sides
     return out
 

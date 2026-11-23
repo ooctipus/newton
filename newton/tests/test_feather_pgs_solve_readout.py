@@ -20,6 +20,8 @@ import unittest
 import numpy as np
 import warp as wp
 
+from newton._src.solvers.feather_pgs.factor.walk import WalkTrees
+from newton._src.solvers.feather_pgs.packed_rows import NO_CLASS
 from newton._src.solvers.feather_pgs.solve_policy import (
     TRACE_GRID,
     TRACE_KINDS,
@@ -28,7 +30,6 @@ from newton._src.solvers.feather_pgs.solve_policy import (
     SolveReadout,
     SolveTrace,
 )
-from newton._src.solvers.feather_pgs.sparse_mass_matrix import _SparseRowSupport
 from newton._src.solvers.feather_pgs.sweep import sweep_kernel
 from newton._src.solvers.feather_pgs.sweep_routes_sparse import SparseSweep
 from newton.tests.feather_pgs_law_harness import row_lines
@@ -99,7 +100,8 @@ def _assert_counts(test, operand, allowed, solved, *, repeats=1):
 
 
 class _SparseCase:
-    """One sparse sweep problem in three worlds (the middle one without rows) and its launch buffers."""
+    """One sparse sweep problem in three worlds (the middle one without rows) and its launch buffers: the rows by
+    their one support class in the one store, the change read back from the walk's ``du``."""
 
     def __init__(self, device, problem, options, omega):
         _, indices, rows, _, bias, types, parents, mu, impulses, _, _, incident, diagonal = problem
@@ -107,56 +109,66 @@ class _SparseCase:
             parents[types == 0] = -1  # A linked normal keeps the full sweep.
         count, worlds, dofs, support = len(types), 3, rows.shape[1], len(indices)
         capacity = count + 2
-        self.shape, self.options, self.device = (capacity, dofs, support), options, device
+        self.shape, self.options, self.device = (capacity, dofs, support), {**options, "layout": "classes"}, device
 
         def padded(values, dtype=np.float32):
             result = np.zeros((worlds, capacity), dtype=dtype)
             result[:, : len(values)] = values
             return wp.array(result, device=device)
 
-        row_dof = np.full((worlds, capacity, support), -1, dtype=np.int32)
-        row_dof[:, :count] = indices
         row_factor = np.zeros((worlds, capacity, support), dtype=np.float32)
         row_factor[:, :count] = rows[:, indices]
         self.initial = padded(impulses)
         self.impulses = wp.clone(self.initial)
-        self.delta = wp.full((worlds, dofs), float("nan"), device=device)
-        counts = wp.array([count, 0, count], dtype=int, device=device)
-        self.head = [worlds, counts, row_lines(device), padded(bias), padded(diagonal)]
-        self.tail = [
-            wp.array(row_dof, device=device),
-            wp.array(row_factor, device=device),
-            padded(incident),
-            padded(types, np.int32),
-            padded(parents, np.int32),
-            padded(mu),
-            wp.array(np.arange(worlds * dofs).reshape(worlds, dofs), dtype=int, device=device),
-            wp.zeros(worlds * dofs, device=device),
-        ]
-        self.omega = omega
+        self.walk = WalkTrees()
+        self.walk.du = wp.zeros(worlds * dofs, device=device)
+        self.named = {
+            "world_count": worlds,
+            "world_constraint_count": wp.array([count, 0, count], dtype=int, device=device),
+            "dense_first": row_lines(device),
+            "rhs_bias": padded(bias),
+            "world_diag": padded(diagonal),
+            "world_impulses": self.impulses,
+            "packed_Z": wp.array(row_factor, device=device),
+            "row_sides": wp.zeros((1, 1), dtype=wp.vec2i, device=device),
+            "row_classes": wp.full((worlds, capacity), int(NO_CLASS << 13 | support << 26), dtype=int, device=device),
+            "class_dof": wp.array(np.asarray(indices, np.int32)[None], dtype=int, device=device),
+            "response_dofs": wp.zeros(1, dtype=int, device=device),
+            "articulation_world_dof_offset": wp.zeros(1, dtype=int, device=device),
+            "row_incident": padded(incident),
+            "world_row_type": padded(types, np.int32),
+            "world_row_parent": padded(parents, np.int32),
+            "world_row_mu": padded(mu),
+            "world_dof_indices": wp.array(np.arange(worlds * dofs).reshape(worlds, dofs), dtype=int, device=device),
+            "v_hat": wp.zeros(worlds * dofs, device=device),
+            "omega": omega,
+            "walk": self.walk,
+        }
         worlds_per_block = 64 // options.get("lanes_per_world", 32)
         self.blocks = (worlds + worlds_per_block - 1) // worlds_per_block
-        self.worlds = worlds
+        self.worlds, self.dofs = worlds, dofs
 
     def kernel(self, policy=None):
         options = self.options if policy is None else {**self.options, "solve_policy": policy}
         return sweep_kernel(SparseSweep(*self.shape, **options))
 
     def run(self, kernel, iterations, *extra):
-        """Restore the initial impulses and sweep; capturable."""
+        """Restore the initial impulses and sweep; capturable. ``extra``: the readout's arguments, the kernel's last."""
         wp.copy(self.impulses, self.initial)
+        self.walk.du.zero_()
+        named = {**self.named, "iterations": iterations}
+        args = kernel.adj.args[: len(kernel.adj.args) - len(extra)]
         wp.launch_tiled(
             kernel,
             dim=[self.blocks],
-            inputs=[*self.head, self.impulses, *self.tail, iterations, self.omega],
-            outputs=[self.delta, _SparseRowSupport(), *extra],
+            inputs=[*(named[arg.label] for arg in args), *extra],
             block_dim=64,
             device=self.device,
         )
 
     def read(self):
-        """Per-world outputs: the factor velocity change and the impulses."""
-        return list(zip(self.delta.numpy(), self.impulses.numpy(), strict=True))
+        """Per-world outputs: the velocity change and the impulses."""
+        return list(zip(self.walk.du.numpy().reshape(self.worlds, self.dofs), self.impulses.numpy(), strict=True))
 
 
 def _assert_bitwise(actual, expected):

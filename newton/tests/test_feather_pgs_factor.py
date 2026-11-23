@@ -261,32 +261,6 @@ class TestTreePlan(unittest.TestCase):
             np.testing.assert_array_equal(factor.joint_ancestor_mask, expected)
             np.testing.assert_array_equal(factor.ancestor_mask, expected[factor.dof_joint])
 
-            def coordinates(mask, n=n):
-                return [f for f in range(n) if int(mask) >> f & 1]
-
-            body_masks = factor.joint_ancestor_mask[rng.integers(0, parent.size, parent.size)]
-            for width in (min(4, n), n):
-                classes = plan.support_classes(body_masks, width)
-                unions = [int(a | b) for a in (0, *body_masks) for b in (0, *body_masks)] + list(factor.ancestor_mask)
-                self.assertEqual(classes is None, max(int(m).bit_count() for m in unions) > width)
-                if classes is None:
-                    continue
-
-                def pattern_of(index, classes=classes):
-                    """A class's coordinates, checked ascending and padded with -1."""
-                    row = classes.class_dof[index]
-                    used = int(np.count_nonzero(row >= 0))
-                    self.assertTrue(np.all(np.diff(row[:used]) > 0) and np.all(row[used:] == -1))
-                    return row[:used].tolist()
-
-                for a, mask_a in enumerate(body_masks):
-                    self.assertEqual(pattern_of(classes.pair_class[classes.body_class[a], 0]), coordinates(mask_a))
-                    for b, mask_b in enumerate(body_masks):
-                        pair = classes.pair_class[classes.body_class[a], classes.body_class[b]]
-                        self.assertEqual(pattern_of(pair), coordinates(mask_a | mask_b))
-                for dof, mask in enumerate(factor.ancestor_mask):
-                    self.assertEqual(pattern_of(classes.limit_class[dof]), coordinates(mask))
-
     def test_local_parents(self):
         """The held operators' and the solver's local-parent remaps (one function, both spellings)."""
         rng = np.random.default_rng(2)

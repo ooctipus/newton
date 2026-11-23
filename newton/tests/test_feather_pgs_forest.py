@@ -16,7 +16,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.solvers.feather_pgs import body_cut, host_index
+from newton._src.solvers.feather_pgs import body_cut, host_index, packed_rows
 from newton._src.solvers.feather_pgs.body_cut import BodyCut
 from newton._src.solvers.feather_pgs.body_mapping import build_body_maps
 from newton._src.solvers.feather_pgs.forest_plan import MimicRelations, RowLaw
@@ -513,37 +513,17 @@ def _branched_humanoid_topology():
 
 
 class TestSparseMassMatrix(unittest.TestCase):
-    def test_row_support_catalogue(self):
-        """Preserve ordered endpoint unions and full multi-DOF limit support."""
-        for parents, counts in (([-1, 0, 0, 1], [3, 2, 1, 0]), ([-1], [64])):
-            tree = TreePlan.build(parents, counts)
-            plan = tree.factor
-            body_masks = np.concatenate((np.zeros(1, dtype=np.uint64), plan.joint_ancestor_mask))
-            support = tree.support_classes(body_masks, plan.dof_count)
-            self.assertIsNotNone(support)
-            self.assertEqual(support.body_class[0], 0)
-            for first, first_mask in enumerate(body_masks):
-                for second, second_mask in enumerate(body_masks):
-                    index = support.pair_class[support.body_class[first], support.body_class[second]]
-                    mask = int(first_mask | second_mask)
-                    expected = [dof for dof in range(plan.dof_count) if mask & (1 << dof)]
-                    expected += [-1] * (plan.dof_count - len(expected))
-                    np.testing.assert_array_equal(support.class_dof[index], expected)
-            for dof, mask in enumerate(plan.ancestor_mask):
-                expected = [i for i in range(plan.dof_count) if int(mask) & (1 << i)]
-                expected += [-1] * (plan.dof_count - len(expected))
-                np.testing.assert_array_equal(support.class_dof[support.limit_class[dof]], expected)
-        tree = TreePlan.build([-1, 0, 0, 1], [3, 2, 1, 0])
-        plan = tree.factor
-        support = tree.support_classes(plan.joint_ancestor_mask, 6)
-        np.testing.assert_array_equal(support.class_dof[support.limit_class[0]], [3, 4, 5, -1, -1, -1])
-        # Structurally zero coefficients inside a joint block must retain their slots.
+    def test_factor_keeps_joint_block_slots(self):
+        """Structurally zero coefficients inside a joint block retain their slots."""
+        plan = TreePlan.build([-1, 0, 0, 1], [3, 2, 1, 0]).factor
         np.testing.assert_array_equal(np.flatnonzero(plan.lookup[:, plan.inverse_permutation[0]] >= 0), [5])
 
-    def test_row_support_rejects_oversized_union(self):
-        """Decline a catalogue that would truncate a non-colliding body's union."""
-        tree = TreePlan.build([-1, 0, 0], [6, 3, 3])
-        self.assertIsNone(tree.support_classes(tree.factor.joint_ancestor_mask, 9))
+    def test_path_masks_hold_root_paths(self):
+        """A node's support mask is its root path's tree coordinates, a node without coordinates its parent's."""
+        masks = packed_rows.path_masks((-1, 0, 0, 1), (0, 3, 5, 6, 6))
+        np.testing.assert_array_equal(masks, np.array([0b111, 0b11111, 0b100111, 0b11111], dtype=np.uint64))
+        with self.assertRaises(ValueError):
+            packed_rows.path_masks((-1,), (0, 65))
 
     def test_factor_schedules_follow_dependencies(self):
         """Cover each packed factor entry once and schedule independent branch pivots together."""

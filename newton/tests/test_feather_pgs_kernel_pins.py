@@ -79,29 +79,36 @@ def _emit_tier_kwargs(*, linked):
 
 
 def _suite_sparse_sweeps():
-    """Native sparse sweeps at the shapes the benchmark suite builds: ``(size, kwargs)``."""
+    """Native sparse sweeps at the shapes the benchmark suite builds: ``(size, kwargs)``. A row narrower by class than by
+    side is stored by class, else by side at the world's coordinates (the placement's rule)."""
+
+    def layout(size):
+        return {"layout": "classes" if size[2] < size[1] else "dense"}
+
     active = {"active_rows": True}
-    triplets = {"active_rows": True, "use_support_table": True, "contact_triplets": True}
+    triplets = {"active_rows": True, "contact_triplets": True}
     for size, kwargs in (
         ((100, 43, 18), active),
         ((112, 18, 12), triplets),
         ((128, 25, 16), triplets),
-        ((128, 27, 21), {"use_support_table": True}),
-        ((16, 6, 6), {"use_support_table": True, "lanes_per_world": 8, "local_factors": True}),
+        ((128, 27, 21), {}),
+        ((16, 6, 6), {"lanes_per_world": 8, "local_factors": True}),
+        ((192, 49, 29), triplets),
         ((256, 18, 12), triplets),
         ((48, 18, 18), triplets),
         ((48, 25, 16), triplets),
         ((56, 43, 18), active),
-        ((64, 14, 10), {"use_support_table": True, "lanes_per_world": 16}),
+        ((64, 14, 10), {"lanes_per_world": 16}),
         ((64, 9, 9), {"lanes_per_world": 16}),
         ((80, 18, 18), triplets),
     ):
-        yield size, kwargs
+        yield size, {**layout(size), **kwargs}
     # The friction law links the patch rings of the active sweeps.
     for size, kwargs in (
         ((100, 43, 18), active),
         ((112, 18, 12), triplets),
         ((128, 25, 16), triplets),
+        ((192, 49, 29), triplets),
         ((256, 18, 12), triplets),
         ((48, 18, 18), triplets),
         ((48, 25, 16), triplets),
@@ -109,7 +116,7 @@ def _suite_sparse_sweeps():
         ((72, 18, 12), triplets),
         ((80, 18, 18), triplets),
     ):
-        yield size, {**kwargs, "linked_rows": True}
+        yield size, {**layout(size), **kwargs, "linked_rows": True}
 
 
 def _suite_diagonal_sweeps():
@@ -127,8 +134,8 @@ def _audit_calls():
 
     for support, wide in ((12, False), (18, False), (25, True)):
         yield "audit.packed_class", kernel(audit.packed_class), (support, wide), {}
-    for support, table in ((12, False), (12, True), (16, True)):
-        yield "audit.sparse_class", kernel(audit.sparse_class), (support, table), {}
+    for support in (18, 29):
+        yield "audit.packed_class", kernel(audit.packed_class), (support, False, True), {}
     yield "audit.slot_class", kernel(audit.slot_class), (6, 1024), {}
     yield "audit.free_class", kernel(audit.free_class), (), {}
     # The rows the tiers walk from their seeds, at the seeded tiers' 16+6 coordinate world (_emit_tier_kwargs).
@@ -150,7 +157,7 @@ def _readout_calls():
     from newton._src.solvers.feather_pgs.solve_policy import SolvePolicy  # noqa: PLC0415
 
     readout = {"solve_policy": SolvePolicy(readout="sweeps")}
-    triplets = {"active_rows": True, "use_support_table": True, "contact_triplets": True}
+    triplets = {"layout": "classes", "active_rows": True, "contact_triplets": True}
     factory = built(sweep_routes_sparse.SparseSweep)
     for size in ((112, 18, 12), (128, 25, 16), (256, 18, 12)):
         yield "sweep_routes_sparse.SparseSweep", factory, size, {**triplets, **readout}
@@ -186,15 +193,20 @@ def _sparse_sweep_calls():
     from newton._src.solvers.feather_pgs.sweep_routes_sparse import SparseSweep  # noqa: PLC0415
 
     factory = built(SparseSweep)
-    for size, flags in itertools.product(((32, 8, 8), (48, 18, 12)), itertools.product((False, True), repeat=5)):
-        active, table, triplets, local, warm = flags
-        # The factory folds unsatisfiable requests into another variant; pin each variant once.
-        if triplets and not (active and table):
+    layouts = ("classes", "dense", "sides")
+    for size, layout, flags in itertools.product(
+        ((32, 8, 8), (48, 18, 12)), layouts, itertools.product((False, True), repeat=4)
+    ):
+        active, triplets, local, warm = flags
+        # The factory folds unsatisfiable requests into another variant, and dense rows of one tree hold every
+        # coordinate; pin each variant once.
+        if (triplets and not active) or (layout == "dense" and size[1] != size[2]):
             continue
         for lanes in (8, 16, 32):
             kwargs = {
                 "active_rows": active,
-                "use_support_table": table,
+                "layout": layout,
+                "sides": layout == "sides",
                 "contact_triplets": triplets,
                 "lanes_per_world": lanes,
                 "local_factors": local,
@@ -208,13 +220,13 @@ def _linked_sweep_calls():
     from newton._src.solvers.feather_pgs.sweep_routes_sparse import SparseSweep  # noqa: PLC0415
 
     factory = built(SparseSweep)
-    for table, warm in itertools.product((False, True), repeat=2):
-        kwargs = {"active_rows": True, "use_support_table": table, "warm_start": warm, "linked_rows": True}
-        yield "sweep_routes_sparse.SparseSweep", factory, (48, 18, 12), kwargs
+    for layout, warm in itertools.product(("classes", "sides"), (False, True)):
+        kwargs = {"active_rows": True, "layout": layout, "sides": layout == "sides", "warm_start": warm}
+        yield "sweep_routes_sparse.SparseSweep", factory, (48, 18, 12), {**kwargs, "linked_rows": True}
     for active, warm in itertools.product((False, True), repeat=2):
         kwargs = {
             "active_rows": active,
-            "use_support_table": True,
+            "layout": "classes",
             "contact_triplets": True,
             "warm_start": warm,
             "linked_rows": True,
@@ -227,10 +239,10 @@ def _support_writer_calls():
     each torsion law, and the step's one leave of that tree's class (factor/walk.py)."""
     from newton._src.solvers.feather_pgs import walk_rows  # noqa: PLC0415
 
-    tree = ((-1, 0, 1, 0, 3, 0), (0, 6, 7, 8, 9, 10, 11), tuple(range(10, -1, -1)))
-    for torsion in (False, True):
+    tree = ((-1, 0, 1, 0, 3, 0), (0, 6, 7, 8, 9, 10, 11))
+    for layout, torsion in itertools.product(("classes", "dense", "sides"), (False, True)):
         kwargs = {"torsion": torsion, "device_arch": _ARCH}
-        yield "walk_rows.support_rows_kernel", walk_rows.support_rows_kernel.__wrapped__, tree, kwargs
+        yield "walk_rows.support_rows_kernel", walk_rows.support_rows_kernel.__wrapped__, (*tree, layout), kwargs
     for unit_rows in (3, 4):
         yield "walk_rows.support_units_kernel", walk_rows.support_units_kernel.__wrapped__, (unit_rows, 16, _ARCH), {}
     from newton._src.solvers.feather_pgs import tree_scan  # noqa: PLC0415

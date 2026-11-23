@@ -13,7 +13,7 @@ from newton._src.core.memory import arch_budget
 from newton._src.solvers.feather_pgs import sweep_routes_sparse
 from newton._src.solvers.feather_pgs.row_laws import ROW_CONTACT, ROW_JOINT_LIMIT
 from newton.solvers import SolverFeatherPGS
-from newton.tests.feather_pgs_law_harness import unpacked_rows, walk_inverse
+from newton.tests.feather_pgs_law_harness import packed_coordinates, unpacked_rows
 
 DT = 1.0 / 400.0
 STATE_FIELDS = ("joint_q", "joint_qd", "body_q", "body_qd")
@@ -174,7 +174,7 @@ def _over_budget_rows(model) -> int:
         return sweep_routes_sparse.SparseSweep(
             rows,
             probe.forest.max_world_dofs,
-            probe.spec.classes.packed.max_support,
+            probe.forest.max_world_dofs,
             active_rows=probe.spec.classes.packed.sweep["active_rows"],
             linked_rows=True,
         ).staging
@@ -238,15 +238,14 @@ def _tree(case, group: int, records: np.ndarray) -> np.ndarray:
 
 @unittest.skipUnless(wp.is_cuda_available(), "Sparse integrated solve requires CUDA")
 class TestFeatherPGSSparseSolver(unittest.TestCase):
-    def test_shared_row_support_matches_explicit_indices(self):
-        """Remove per-world indices while preserving contacts, limits and reset behavior."""
-        explicit = _case(True, pins={"row_support": False})
-        shared = _case(True)
-        self.assertFalse(explicit[1].placement.sparse_row_support.enabled)
-        self.assertTrue(shared[1].placement.sparse_row_support.enabled)
-        self.assertEqual(shared[1].placement.sparse_row_dof.shape, (1, 1, 1))
+    def test_rows_are_the_general_placements(self):
+        """Native sparse factors' rows are the one store's: the general placement's packed rows bit for bit on the same
+        state, and the two placements step alike through contacts, limits and a reset."""
+        general = _case(False)
+        sparse = _case(True)
+        self.assertIsNone(general[1].spec.classes.packed_size)
         for step in range(8):
-            for case in (explicit, shared):
+            for case in (general, sparse):
                 if step == 4:
                     model, solver, state, *_ = case
                     q = state.joint_q.numpy()
@@ -255,16 +254,15 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
                     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
                     solver.reset(state, wp.array([True, False], dtype=bool, device=model.device))
                 _step(case)
-            self.assert_states_close(explicit[2], shared[2])
-            self.assert_sparse_state(shared)
-            counts = explicit[1].placement.constraint_count.numpy()
-            np.testing.assert_array_equal(counts, shared[1].placement.constraint_count.numpy())
-            support = shared[1].placement.sparse_row_support
-            classes, indices = support.row_class.numpy(), support.class_dof.numpy()
-            for world, count in enumerate(counts):
-                np.testing.assert_array_equal(
-                    indices[classes[world, :count]], explicit[1].placement.sparse_row_dof.numpy()[world, :count]
-                )
+            if step == 0:
+                counts = sparse[1].placement.constraint_count.numpy()
+                np.testing.assert_array_equal(counts, general[1].placement.constraint_count.numpy())
+                for world, count in enumerate(counts):
+                    np.testing.assert_array_equal(
+                        self._rows(sparse[1], world, count), self._rows(general[1], world, count)
+                    )
+            self.assert_states_close(general[2], sparse[2])
+            self.assert_sparse_state(sparse)
 
     def test_moving_prescribed_supports_keep_dense_factors(self):
         """Keep moving prescribed supports on dense factors: native sparse factors are the held tree's, whose
@@ -305,48 +303,32 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
             z, physical_j = self._sparse_rows_physical(solver, world, count)
             velocity = solver.forest.world_dof_indices.numpy()[world]
             np.testing.assert_allclose(physical_j @ v_hat[velocity], incidence[world, :count], atol=2.0e-5, rtol=2.0e-5)
-            factor_residual = (
-                z @ solver.placement.sparse_factor_velocity_delta.numpy()[world]
-                + incidence[world, :count]
-                + rhs[world, :count]
-            )
+            # The sweep's change, which it added into the walk's du at the world's coordinates.
+            change = np.where(velocity >= 0, solver.factor.walk_view().du.numpy()[velocity], 0.0)
+            factor_residual = z @ change + incidence[world, :count] + rhs[world, :count]
             np.testing.assert_allclose(
                 physical_j @ v_out[velocity] + rhs[world, :count], factor_residual, atol=3.0e-5, rtol=3.0e-5
             )
 
-    def _sparse_rows_physical(self, solver, world, count):
-        """Recover physical Jacobians independently from the stored inverse factors."""
-        plan = solver.factor.sparse_pattern
-        size = plan.dof_count
-        row_dof, values = solver.placement.sparse_row_dof.numpy(), solver.placement.sparse_row_factor.numpy()
-        shared = solver.placement.sparse_row_support
-        if shared.enabled:
-            row_dof = shared.class_dof.numpy()[shared.row_class.numpy()[world, :count]][None, :, :]
-        z = np.zeros((count, solver.forest.max_world_dofs))
+    @staticmethod
+    def _rows(solver, world, count):
+        """World ``world``'s rows from the one store, each over the world's coordinates."""
+        dof, values = packed_coordinates(solver)[world, :count], solver.placement.packed_Z.numpy()[world, :count]
+        z = np.zeros((count, solver.forest.max_world_dofs), dtype=np.float32)
         for row in range(count):
-            support = row_dof[0 if shared.enabled else world, row]
-            valid = support >= 0
-            self.assertTrue(np.all(support[valid] < solver.forest.max_world_dofs))
-            self.assertEqual(len(set(support[valid])), int(valid.sum()))
-            z[row, support[valid]] = values[world, row, valid]
-        physical_j = np.zeros_like(z)
-        for art in solver.forest.group_to_art[size].numpy():
-            if solver.forest.art_to_world.numpy()[art] != world:
-                continue
-            inverse = walk_inverse(solver, int(art))[np.ix_(plan.permutation, plan.permutation)]
-            offset = int(solver.forest.articulation_world_dof_offset.numpy()[art])
-            physical_j[:, offset + plan.permutation] = np.linalg.solve(inverse, z[:, offset : offset + size].T).T
-        if solver.forest.has_free_rigid_bodies:
-            for art in solver.forest.group_to_art[6].numpy():
-                if solver.forest.art_to_world.numpy()[art] == world:
-                    offset = int(solver.forest.articulation_world_dof_offset.numpy()[art])
-                    physical_j[:, offset : offset + 6] = z[:, offset : offset + 6]
-        return z, physical_j
+            valid = dof[row] >= 0
+            np.testing.assert_array_equal(values[row, ~valid], 0.0)
+            z[row, dof[row, valid]] = values[row, valid]
+        return z
+
+    def _sparse_rows_physical(self, solver, world, count):
+        """The rows over the world's coordinates and their Jacobians, recovered from the one store through each side's
+        walk (:func:`.feather_pgs_law_harness.unpacked_rows`)."""
+        return self._rows(solver, world, count).astype(np.float64), unpacked_rows(solver)[0][world, :count]
 
     def _order_multi_articulation_rows(self, case):
         """Give this fixture identical semantic row order without changing production allocation."""
         _, solver, _, _, _, _, contacts = case
-        sparse = solver.spec.classes.packed_size is not None
         names = [
             "rhs",
             "diag",
@@ -360,15 +342,14 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
             "row_restitution",
             "row_incident",
         ]
-        # The dense route's rows are packed (packed_rows): they move with their row slots.
-        packed = ["packed_Z", "row_sides"]
-        names += ["sparse_row_dof", "sparse_row_factor"] if sparse else packed
+        # The rows are packed (packed_rows), every class's: they move with their row slots.
+        names += ["packed_Z", "row_sides"]
         stores = {name: getattr(solver.placement, name) for name in names}
-        if not sparse and solver.placement.classed:
+        if solver.placement.classed:
             # Rows by their support classes (packed_rows.row_classes) carry their classes with them too.
             stores["row_class"] = solver.placement.row_classes.row_class
         arrays = {name: store.numpy() for name, store in stores.items()}
-        dense_jacobian = None if sparse else unpacked_rows(solver)[0]
+        dense_jacobian = unpacked_rows(solver)[0]
         worlds, slots, needed = (
             getattr(solver.placement, name).numpy()
             for name in ("contact_world", "contact_slot", "contact_slots_needed")
@@ -377,7 +358,7 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
         shape_a, shape_b = contacts.rigid_contact_shape0.numpy()[frame], contacts.rigid_contact_shape1.numpy()[frame]
         identities = []
         for world, count in enumerate(solver.placement.constraint_count.numpy()):
-            jacobian = self._sparse_rows_physical(solver, world, count)[1] if sparse else dense_jacobian[world, :count]
+            jacobian = dense_jacobian[world, :count]
             bundles = []
             prefix = arrays["row_type"][world, :count] == ROW_JOINT_LIMIT
             for row in np.flatnonzero(prefix):
@@ -408,13 +389,13 @@ class TestFeatherPGSSparseSolver(unittest.TestCase):
     def test_two_articulations_share_contact_solve(self):
         """Distinguish factor groups from worlds when two branched robots contact each other.
 
-        Both arms keep patch friction's full ordered sweep, so the comparison isolates
-        the representation. On this fixture the active-row law alone moves joint
-        velocities by up to 0.07 for either friction law (test_feather_pgs_sparse_patch_rows
+        Both arms keep patch friction's full ordered sweep with unfused contact rows, so the comparison isolates
+        the representation (and the rows' reordering below moves no contact's record). On this fixture the active-row
+        law alone moves joint velocities by up to 0.07 for either friction law (test_feather_pgs_sparse_patch_rows
         covers it).
         """
         dense = _case(False, robot_count=2, pins={"active_rows": False})
-        sparse = _case(True, robot_count=2, pins={"active_rows": False})
+        sparse = _case(True, robot_count=2, pins={"active_rows": False, "contact_units": None})
         self.assertFalse(sparse[1].spec.classes.packed.sweep["active_rows"])
         self.assertEqual(sparse[1].spec.classes.packed_size, 9)
         self.assertEqual(sparse[1].forest.group_to_art[9].shape[0], 4)

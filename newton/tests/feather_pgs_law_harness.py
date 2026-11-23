@@ -1078,8 +1078,6 @@ def leave_walk(walk: WalkTrees, velocity, device) -> None:
             lanes,
             walk,
             wp.array(np.asarray(index, dtype=np.int32), device=device),
-            walk.du,
-            walk.dof_start,
             velocity,
         ],
         device=device,

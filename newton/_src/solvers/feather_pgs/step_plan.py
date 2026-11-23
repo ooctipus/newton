@@ -261,7 +261,7 @@ def _response(row: RouteRow, forest) -> dict[int, Route]:
     routes = {}
     for size in forest.size_groups:
         if row.support == "factor":
-            routes[size] = Route("owner", "Native sparse factors' writer whitens every row into its support.")
+            routes[size] = Route("owner", "Native sparse factors' writer whitens every row into the packed rows.")
         elif row.support == "diagonal" and size in (row.sizes["diagonal"], row.sizes["dense"]):
             routes[size] = Route(
                 "sparse_diagonal", "The sparse-diagonal owner whitens its rows in place: no size builds a response."

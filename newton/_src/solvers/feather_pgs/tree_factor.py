@@ -617,12 +617,6 @@ class TreeFactor:
 
         arrays.allocate(ARTICULATION_ORIGIN, articulation=model.articulation_count)
 
-    def allocate_sparse(self, plan) -> None:
-        """The sparse class's pattern ``plan`` and its coordinates' ancestor masks (the support writer's): the walk is
-        its factor (Z4.3), so it holds no factor array."""
-        self.sparse_pattern = plan
-        self.sparse_ancestor_mask = wp.array(plan.ancestor_mask, dtype=wp.uint64, device=self.model.device)
-
     def scatter_armature(self) -> None:
         """Copy the effective armature (DOF-ordered) to the coordinates' (:attr:`dof_armature`)."""
         if self.armature is not None and self.armature.size:
@@ -646,10 +640,9 @@ class TreeFactor:
                 "diagonal_mass_dofs": sorted(int(size) for size in forest.diagonal_mass_sizes),
                 # The rows' graph's vertices: how many coordinate trees hold each number of coordinates.
                 "tree_sizes": {str(size): int(n) for size, n in enumerate(np.bincount(forest.tree_size)) if n},
-                # The matrix-free sweeps' dense rows packed by support (packed_rows), and whether they serve the step
-                # alone.
+                # The dense rows packed by support (packed_rows), and whether they serve the step alone.
                 "packed_rows": {
-                    "support": int(placement.packed_support) if classes.mf_sweeps else None,
+                    "support": int(placement.packed_support) if placement.packs_rows else None,
                     "dense": bool(placement.packed_dense),
                     "response_only": bool(placement.packed_response),
                     "reason": placement.packed_response_reason,
@@ -1011,20 +1004,18 @@ class TreeFactor:
         self.walk_trees = view
         self.plan_leave()
 
-    def plan_leave(self, nodes: tuple[tuple[int, ...], ...] | None = None) -> None:
+    def plan_leave(self) -> None:
         """The step's one leave of every walking tree (:func:`.factor.walk.walk_leave_kernel`), the release compiled where a tree
-        can slip, reading each class's coordinate ``c`` at ``node(c)`` of its tree's changes: ``nodes`` (each class's,
-        a sweep's own layout), or the walk's own coordinates."""
+        can slip, reading its tree's changes in the walk's coordinates."""
         classes = getattr(self, "walk_classes", ())
-        self.walk_leave = walk_leave_kernel(classes, self.walk_slip_capacity > 0, nodes) if classes else None
+        self.walk_leave = walk_leave_kernel(classes, self.walk_slip_capacity > 0) if classes else None
         if classes:
             self.leave_shape = execution.shape(leave_work(self.walk_arts.shape[0]), memory.device(self.model.device))
 
-    def leave(self, v_out: wp.array, du: wp.array | None = None, du_base: wp.array | None = None) -> None:
+    def leave(self, v_out: wp.array) -> None:
         """The step's one leave (:func:`.factor.walk.walk_leave_kernel`): every walking tree's velocity change walked down onto
-        ``v_out`` (``v += P^T L^-T R^T du``): coordinate ``c``'s change is ``du[du_base[art] + node(c)]``, by default
-        the walk's own :attr:`WalkTrees.du` at the tree's coordinates, which the sweeps add into from zero each
-        step."""
+        ``v_out`` (``v += P^T L^-T R^T du``): the walk's own :attr:`WalkTrees.du` at the tree's coordinates, which the
+        sweeps add into from zero each step."""
         if self.walk_leave is None:
             return
         lanes = self.leave_shape.lanes
@@ -1036,8 +1027,6 @@ class TreeFactor:
                 lanes,
                 self.walk_trees,
                 self.walk_class,
-                self.walk_trees.du if du is None else du,
-                self.walk_trees.dof_start if du_base is None else du_base,
                 v_out,
             ],
             block_dim=self.leave_shape.block,

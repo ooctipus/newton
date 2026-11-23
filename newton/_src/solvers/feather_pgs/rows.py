@@ -922,12 +922,12 @@ class RowLaws:
 
     def write_support(self, solver, state_in, contact_input: ContactInput, dt: float) -> None:
         """Case K1's writer in two launches: the step's units listed, with the contact rows' records
-        (:func:`.walk_rows.support_units_kernel`), then the walkers over the list into the support sink, a lane a unit
+        (:func:`.walk_rows.support_units_kernel`), then the walkers over the list into the packed rows, a lane a unit
         (:func:`.walk_rows.support_rows_kernel`), each row of a slipping tree released by the predictor's border, and
         each contact's friction record formed after its walk."""
         placement, model, sweep = solver.placement, solver.model, solver.sweep
         dense_rows, law = bind_dense_rows(placement), patch_row_law(solver)
-        sink = sweep.support_sink(solver.v_hat)
+        sink = sweep.support_sink(solver)
         units = sweep.support_units
         units.start()
         wp.launch(
@@ -1079,8 +1079,8 @@ class RowLaws:
             marker = () if solver.sweep.sparse_contact_marker is None else (solver.sweep.sparse_contact_marker,)
         if method == "walk":
             # The allocator writes the contact rows' unit sources; the one writer writes every contact row's records and
-            # walks every row (walk_rows): the general placement's into its packed rows, the support placement's (K1)
-            # into its support sink, the sparse diagonal's (K2) into its slots sink.
+            # walks every row (walk_rows): the general placement's and the support placement's (K1) into the packed
+            # rows, the sparse diagonal's (K2) into its slots sink.
             kernels = (*(kernel for kernel, _block in RowLaws.writer_launches(solver)), *marker)
         else:
             raise ValueError(f"No contact-row builder kernels are known for the method {method!r}.")

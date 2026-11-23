@@ -47,7 +47,7 @@ class Pins:
     mf_storage: str | None = None
     """``"streamed"``: streamed matrix-free impulses, the free bodies'; ``"line"``: every row's, the line's too."""
     row_support: bool = True
-    """``False``: sparse rows on explicit indices; packed rows on their sides, not their support classes."""
+    """``False``: packed rows on their sides, not their support classes."""
     placement: str | None = None
     """``"general"``: every class keeps the general placement, case K6 (:func:`.class_plan.general_reason`)."""
     tiers: int | None = None
