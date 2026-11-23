@@ -102,12 +102,13 @@ sized from the substep's own bound (:func:`_load_unit`), two bits below int64's 
 _LOAD_CEILING = wp.constant(float(2**LOAD_BITS))
 
 
-@wp.kernel
-def _load_unit(count: wp.array[int], load_bound: wp.array[float], load_unit: wp.array[float]):
-    """The substep's load unit ``2**e`` [N] and its inverse (``load_unit``), one thread: no tree's sum of its
-    contacts' loads exceeds ``count`` (the substep's contacts) times ``load_bound`` (the largest load one contact
-    carries, :func:`_contact_load`), so ``e``, the least exponent with that product under ``2**LOAD_BITS`` units,
-    keeps every sum in range whatever the order the contacts add it in. Powers of two scale a float exactly."""
+@wp.func
+def _load_unit(count: wp.array[int], load_bound: wp.array[float]) -> wp.vec2:
+    """The substep's load unit ``2**e`` [N] and its inverse: no tree's sum of its contacts' loads exceeds ``count``
+    (the substep's contacts) times ``load_bound`` (the largest load one contact carries, :func:`_contact_load`), so
+    ``e``, the least exponent with that product under ``2**LOAD_BITS`` units, keeps every sum in range whatever the
+    order the contacts add it in. Powers of two scale a float exactly, and every thread that forms it forms the same
+    bits."""
     total = float(wp.max(count[0], 1)) * load_bound[0]
     unit = float(1.0)
     inverse = float(1.0)
@@ -121,8 +122,7 @@ def _load_unit(count: wp.array[int], load_bound: wp.array[float], load_unit: wp.
             inverse *= 0.5
         else:
             break
-    load_unit[0] = unit
-    load_unit[1] = inverse
+    return wp.vec2(unit, inverse)
 
 
 @wp.func
@@ -244,15 +244,20 @@ def _lump_contact_load(
     trees: int,
     tree_asleep: wp.array2d[wp.int32],
     rigid_contact_force: wp.array[wp.vec3],
+    load_bound: wp.array[float],
     load_unit: wp.array[float],
     load_n: wp.array[wp.int64],
     load_t: wp.array2d[wp.int64],
 ):
     """Lump each finite contact load (:func:`_contact_load`) on its trees that can count: each tree's cone capacity
-    ``sum mu f_n`` and its friction force ``sum f_t``, in whole units of the substep's bound (:func:`_load_unit`).
-    Integer sums are exact, so a tree's load is the same whatever the order its contacts add in, and they cannot
-    overflow."""
+    ``sum mu f_n`` and its friction force ``sum f_t``, in whole units of the substep's bound (:func:`_load_unit`, which
+    each lumping thread forms and the first publishes in ``load_unit`` for :func:`_rest_test`). Integer sums are exact,
+    so a tree's load is the same whatever the order its contacts add in, and they cannot overflow."""
     c = wp.tid()
+    if c == 0:
+        unit = _load_unit(routes.count, load_bound)
+        load_unit[0] = unit[0]
+        load_unit[1] = unit[1]
     if c >= routes.count[0]:
         return
     _body_a, _body_b, a, b = _contact_trees(c, shape0, shape1, shape_body, body_slot, trees, tree_asleep)
@@ -261,7 +266,7 @@ def _lump_contact_load(
     capacity, f_t = _contact_cone(c, routes, shape0, shape1, shape_mu, rigid_contact_force)
     if not (wp.isfinite(capacity) and wp.isfinite(f_t)):
         return
-    scale = load_unit[1]
+    scale = _load_unit(routes.count, load_bound)[1]
     q_n = wp.int64(wp.round(capacity * scale))
     for k in range(3):
         q_t = wp.int64(wp.round(f_t[k] * scale))
@@ -590,13 +595,6 @@ class Sleep:
                 extent=contacts.rigid_contact_count,
                 max_blocks=placement.contact_capacity_blocks,
             )
-            wp.launch(
-                _load_unit,
-                dim=1,
-                inputs=[contacts.rigid_contact_count, self.load_bound],
-                outputs=[self.load_unit],
-                device=device,
-            )
             pool.launch(
                 _lump_contact_load,
                 pool.launch_rows(),
@@ -610,9 +608,9 @@ class Sleep:
                     self.trees,
                     self.tree_asleep,
                     contacts.rigid_contact_force,
-                    self.load_unit,
+                    self.load_bound,
                 ],
-                outputs=[self.load_n, self.load_t],
+                outputs=[self.load_unit, self.load_n, self.load_t],
                 extent=contacts.rigid_contact_count,
                 max_blocks=placement.contact_capacity_blocks,
             )
