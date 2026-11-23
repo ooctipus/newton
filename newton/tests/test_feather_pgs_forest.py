@@ -789,16 +789,18 @@ class TestForestLayout(unittest.TestCase):
         self.assertEqual(forest.joint_parent.numpy().tolist(), [-1, -1])
         np.testing.assert_allclose(forest.joint_X_p.numpy()[1, :3], [1.0, 0.0, 0.5], atol=1e-6)
 
-    def test_a_joint_outside_every_tree_stays_outside(self):
+    def test_a_joint_on_the_world_outside_every_tree_roots_its_own(self):
+        """A joint on the world outside every articulation roots a tree of its own (the loose bodies), after the
+        model's trees."""
         builder, _ = _two_roots()
         standalone = builder.add_link()
         builder.add_shape_box(standalone, hx=0.05, hy=0.05, hz=0.1)
         builder.add_joint_revolute(parent=-1, child=standalone, axis=newton.Axis.Y)
         model = builder.finalize(device="cpu")
         forest = BodyCut.of(model).model
-        self.assertEqual(forest.joint_articulation.numpy().tolist(), [0, 0, 1, -1])
-        self.assertEqual(forest.articulation_start.numpy().tolist(), [0, 2, 4])
-        self.assertEqual(forest.articulation_end.numpy().tolist(), [2, 3])
+        self.assertEqual(forest.joint_articulation.numpy().tolist(), [0, 0, 1, 2])
+        self.assertEqual(forest.articulation_start.numpy().tolist(), [0, 2, 3, 4])
+        self.assertEqual(forest.articulation_end.numpy().tolist(), [2, 3, 4])
 
     def test_mimic_joints_follow_the_layout(self):
         builder, _ = _two_roots()
@@ -1032,21 +1034,24 @@ class TestBoundary(unittest.TestCase):
         dofs = cut._orders[newton.Model.AttributeFrequency.JOINT_DOF]
         np.testing.assert_array_equal(mirror.joint_f.numpy(), force[dofs])
 
-    def test_the_output_leaves_a_joint_outside_every_tree_alone(self):
+    def test_the_output_publishes_a_rooted_loose_joint(self):
+        """A joint on the world outside every articulation is a tree's root (the loose bodies): the leave publishes its
+        coordinate as any tree joint's."""
         builder, _ = _two_roots()
         standalone = builder.add_link()
         builder.add_shape_box(standalone, hx=0.05, hy=0.05, hz=0.1)
-        builder.add_joint_revolute(parent=-1, child=standalone, axis=newton.Axis.Y)
+        joint = builder.add_joint_revolute(parent=-1, child=standalone, axis=newton.Axis.Y)
         model = builder.finalize(device="cpu")
         cut = BodyCut.of(model)
         state_in, state_out = model.state(), model.state()
-        q = state_out.joint_q.numpy()
-        q[-1] = 0.25
-        state_out.joint_q.assign(q)
         valid = wp.ones(cut.model.articulation_count, dtype=wp.int32, device="cpu")
         cut.enter(state_in, state_out, None, valid)
+        forest_out = cut.mirror(state_out)
+        q = forest_out.joint_q.numpy()
+        q[cut.model.joint_q_start.numpy()[cut._position[joint]]] = 0.25
+        forest_out.joint_q.assign(q)
         cut.leave(state_in, state_out)
-        self.assertEqual(float(state_out.joint_q.numpy()[-1]), 0.25)
+        self.assertEqual(float(state_out.joint_q.numpy()[model.joint_q_start.numpy()[joint]]), 0.25)
 
 
 class TestSeating(unittest.TestCase):

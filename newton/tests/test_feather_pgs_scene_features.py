@@ -15,10 +15,15 @@ Kinematic bodies prescribed by their body state (``body_q``/``body_qd``, as maxi
 kinematic pusher written that way pushes a box as one written through its joint state does, and a kinematic root carries
 its jointed children.
 
+Jointed bodies without a root joint or an articulation (``add_link`` and ``add_joint_*`` alone, as maximal-coordinate
+scenes build ragdolls and bridges): a figure falls freely, lands and rests with every joint closed; a bridge of hinged
+planks hangs between its two world hinges, a closed loop.
+
 Joint reaction wrenches (Newton's ``BODY_PARENT_F`` observable): a hinge carries a hanging bob's weight, a released
 level rod's pivot a quarter of its weight, and a fixed platform its own weight and that of a box resting on it.
 """
 
+import itertools
 import unittest
 
 import numpy as np
@@ -322,6 +327,132 @@ class TestFeatherPGSKinematicBodyState(unittest.TestCase):
     pass
 
 
+def _anchor(q, frame):
+    """The world point of a body frame ``frame`` ([x, y, z]) under the body pose ``q`` (7 floats)."""
+    return np.asarray(
+        wp.transform_point(wp.transform(wp.vec3(*q[:3]), wp.quat(*q[3:])), wp.vec3(*frame)), dtype=np.float64
+    )
+
+
+def _joint_gaps(model, body_q):
+    """Each joint's gap between its two frames' origins [m] (a joint on the world anchors at its parent frame)."""
+    parents, children = model.joint_parent.numpy(), model.joint_child.numpy()
+    frames_p, frames_c = model.joint_X_p.numpy(), model.joint_X_c.numpy()
+    gaps = []
+    for j in range(model.joint_count):
+        at_parent = frames_p[j][:3] if parents[j] < 0 else _anchor(body_q[parents[j]], frames_p[j][:3])
+        gaps.append(np.linalg.norm(at_parent - _anchor(body_q[children[j]], frames_c[j][:3])))
+    return np.array(gaps)
+
+
+# A figure of six boxes: (name, centre [m], half extents [m]); its limbs hang on ball joints at the anchors.
+_FIGURE = (
+    ("torso", (0.0, 0.0, 1.0), (0.15, 0.1, 0.25)),
+    ("head", (0.0, 0.0, 1.35), (0.08, 0.08, 0.08)),
+    ("arm_l", (-0.3, 0.0, 1.1), (0.12, 0.05, 0.05)),
+    ("arm_r", (0.3, 0.0, 1.1), (0.12, 0.05, 0.05)),
+    ("leg_l", (-0.08, 0.0, 0.45), (0.06, 0.06, 0.2)),
+    ("leg_r", (0.08, 0.0, 0.45), (0.06, 0.06, 0.2)),
+)
+_PIVOTS = (
+    (1, (0.0, 0.0, 1.27)),
+    (2, (-0.17, 0.0, 1.1)),
+    (3, (0.17, 0.0, 1.1)),
+    (4, (-0.08, 0.0, 0.7)),
+    (5, (0.08, 0.0, 0.7)),
+)
+
+
+def test_loose_figure_falls_and_its_joints_hold(test, device):
+    """Six boxes joined by ball joints without an articulation or a root joint (as a maximal-coordinate ragdoll is
+    built) fall freely together and land standing on their legs, every joint closed throughout (its frictionless arms
+    swing on), on a floor held by a kinematic link without a joint, which stays where it stands; the caller's model
+    keeps its layout."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -_G))
+    ground = builder.add_link(is_kinematic=True)
+    builder.add_shape_plane(
+        body=ground, width=0.0, length=0.0, cfg=newton.ModelBuilder.ShapeConfig(density=0.0, mu=_MU)
+    )
+    cfg = newton.ModelBuilder.ShapeConfig(mu=_MU, collision_group=-1)
+    bodies = []
+    for _name, centre, half in _FIGURE:
+        bodies.append(builder.add_link(xform=wp.transform(wp.vec3(*centre), wp.quat_identity())))
+        builder.add_shape_box(bodies[-1], hx=half[0], hy=half[1], hz=half[2], cfg=cfg)
+    for limb, pivot in _PIVOTS:
+        builder.add_joint_ball(
+            bodies[0],
+            bodies[limb],
+            parent_xform=wp.transform(wp.vec3(*np.subtract(pivot, _FIGURE[0][1])), wp.quat_identity()),
+            child_xform=wp.transform(wp.vec3(*np.subtract(pivot, _FIGURE[limb][1])), wp.quat_identity()),
+        )
+    model = builder.finalize(device=device, skip_validation_joints=True)
+    articulation = model.joint_articulation.numpy().copy()
+    solver = newton.solvers.SolverFeatherPGS(model, dense_max_constraints=64)
+    pipeline = newton.CollisionPipeline(model)
+    contacts = pipeline.contacts()
+    state_in, state_out, control = model.state(), model.state(), model.control()
+    torso, gaps, lowest = [], [], []
+    steps = 200
+    for _ in range(steps):
+        pipeline.collide(state_in, contacts)
+        solver.step(state_in, state_out, control, contacts, _DT)
+        state_in, state_out = state_out, state_in
+        body_q = state_in.body_q.numpy()
+        torso.append(body_q[bodies[0]][2])
+        gaps.append(_joint_gaps(model, body_q).max())
+        lowest.append(body_q[bodies, 2].min())
+        np.testing.assert_array_equal(
+            body_q[ground], np.array(wp.transform_identity()), "the floor's link stands still"
+        )
+    np.testing.assert_array_equal(model.joint_articulation.numpy(), articulation)
+    test.assertEqual(state_in.joint_q.shape[0], model.joint_coord_count)
+    n = np.arange(1, steps + 1)
+    falling = n * _DT < 0.2
+    np.testing.assert_allclose(np.array(torso)[falling], (1.0 - _G * _DT**2 * n * (n + 1) / 2)[falling], atol=1.0e-4)
+    test.assertLess(max(gaps), 1.0e-4, "every joint stays closed")
+    test.assertGreater(min(lowest), 0.04, "no box sinks into the floor")
+    # Landed on its legs (their feet at the floor puts the torso's centre at 0.75 m), and standing.
+    np.testing.assert_allclose(np.array(torso)[n * _DT > 0.4], 0.75, atol=0.01)
+    test.assertTrue(np.isfinite(state_in.joint_q.numpy()).all())
+
+
+def test_loose_bridge_hangs_on_its_end_hinges(test, device):
+    """Four planks hinged in a row between two hinges on the world, without an articulation: a closed loop the
+    solver roots at its first world hinge and closes at the other. It spans its gap under gravity, every hinge closed."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -_G))
+    planks = [
+        builder.add_link(xform=wp.transform(wp.vec3(-0.75 + 0.5 * k, 0.0, 1.0), wp.quat_identity())) for k in range(4)
+    ]
+    for plank in planks:
+        builder.add_shape_box(plank, hx=0.25, hy=0.2, hz=0.02)
+    edge = wp.transform(wp.vec3(-0.25, 0.0, 0.0), wp.quat_identity())
+    far_edge = wp.transform(wp.vec3(0.25, 0.0, 0.0), wp.quat_identity())
+    builder.add_joint_revolute(
+        -1, planks[0], parent_xform=wp.transform(wp.vec3(-1.0, 0.0, 1.0), wp.quat_identity()), child_xform=edge,
+        axis=newton.Axis.Y,
+    )  # fmt: skip
+    for left, right in itertools.pairwise(planks):
+        builder.add_joint_revolute(left, right, parent_xform=far_edge, child_xform=edge, axis=newton.Axis.Y)
+    builder.add_joint_revolute(
+        -1, planks[3], parent_xform=wp.transform(wp.vec3(1.0, 0.0, 1.0), wp.quat_identity()), child_xform=far_edge,
+        axis=newton.Axis.Y,
+    )  # fmt: skip
+    model = builder.finalize(device=device, skip_validation_joints=True)
+    solver = newton.solvers.SolverFeatherPGS(model, pgs_iterations=32)
+    state_in, state_out, control = model.state(), model.state(), model.control()
+    gaps, heights = [], []
+    for _ in range(200):
+        solver.step(state_in, state_out, control, None, _DT)
+        state_in, state_out = state_out, state_in
+        body_q = state_in.body_q.numpy()
+        gaps.append(_joint_gaps(model, body_q).max())
+        heights.append(body_q[planks, 2].min())
+    test.assertLess(max(gaps), 1.0e-4, "every hinge stays closed, the loop's too")
+    test.assertGreater(min(heights), 1.0 - 5.0e-3, "the taut bridge holds its span")
+
+
+class TestFeatherPGSLooseBodies(unittest.TestCase):
+    pass
 
 
 def _wrenches(model, steps: int, dt: float, contacts_on: bool = False, **options):
@@ -419,6 +550,8 @@ for _fn in (test_box_falls_through_a_tracking_volume, test_sensor_shape_neither_
     add_function_test(TestFeatherPGSTrackingVolumes, _fn.__name__, _fn, devices=devices)
 for _fn in (test_body_state_drives_a_kinematic_pusher, test_body_state_drives_a_kinematic_root_and_its_children):
     add_function_test(TestFeatherPGSKinematicBodyState, _fn.__name__, _fn, devices=devices)
+for _fn in (test_loose_figure_falls_and_its_joints_hold, test_loose_bridge_hangs_on_its_end_hinges):
+    add_function_test(TestFeatherPGSLooseBodies, _fn.__name__, _fn, devices=devices)
 for _fn in (
     test_hinge_carries_a_hanging_load,
     test_hinge_wrench_of_a_released_rod,

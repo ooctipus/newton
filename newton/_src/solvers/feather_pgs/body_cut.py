@@ -35,6 +35,14 @@ raises, as the held tree's proof does on a pure forest.
 kinematics reads the loop joint's coordinates from that pose. Steady stepping seats nothing, so a coordinate stays
 continuous past a full turn. The test is the device's, so it holds in a captured graph.
 
+**Loose bodies.** Bodies that joints join outside every articulation (``add_link`` and ``add_joint_*`` with no
+``add_articulation``) form trees here, so they move: each group of them joined through such joints is rooted at its
+joint to the world, else at a free joint the cut adds on its first body that no such joint enters, and its joints become
+the tree's from the root; a joint that would give a body a second parent is a loop joint, as above. A group's state is
+its bodies' (``body_q``, ``body_qd``): an added free root takes its body's pose and twist at every step, and the group's
+joint coordinates follow its bodies wherever the step re-derives its kinematics (the first step, a reset, a
+notification). The caller's model and state keep their layout; the added roots' coordinates live in the mirrors only.
+
 **Disabled links.** A disabled link leaves its shadow massless and kinematic: its share returns to the primary piece,
 which is then the whole body again, and the shadow's coordinates, under the kinematic armature, cost the tree nothing.
 """
@@ -44,6 +52,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import weakref
+from collections import deque
 from types import SimpleNamespace
 from typing import Any
 
@@ -52,8 +61,8 @@ import warp as wp
 
 from ...core import memory
 from ...core.execution import Shape, Work, launch, shape
-from ...sim import BodyFlags, Control, Model, State
-from ...sim.articulation import eval_fk, eval_ik
+from ...sim import BodyFlags, Control, Model, ModelBuilder, State
+from ...sim.articulation import eval_articulation_ik, eval_fk, eval_ik
 from . import host_index
 from .tree_plan import TreePlan
 
@@ -140,10 +149,11 @@ def _gather_frames(
     that body stands."""
     i = wp.tid()
     if i < items.count:
-        j = items.outof[i]
-        target[i] = source[j]
-        if anchor[i] >= 0:
-            target[i] = wp.transform_multiply(body_q[anchor[i]], source[j])
+        if items.active[i]:
+            j = items.outof[i]
+            target[i] = source[j]
+            if anchor[i] >= 0:
+                target[i] = wp.transform_multiply(body_q[anchor[i]], source[j])
 
 
 @wp.kernel(enable_backward=False)
@@ -171,6 +181,36 @@ def _gather_bodies(
             forest_flags[i] = _DYNAMIC
         else:
             forest_flags[i] = _KINEMATIC
+
+
+@wp.kernel(enable_backward=False)
+def _take_roots(
+    bodies: wp.array[int],
+    q_start: wp.array[int],
+    qd_start: wp.array[int],
+    body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+    joint_q: wp.array[float],
+    joint_qd: wp.array[float],
+):
+    """Each added free root's coordinates, its body's pose and twist (``(v_com, omega)`` in the world, the free joint's
+    as the solver holds it): the joint's frames are the identity on the world."""
+    r = wp.tid()
+    body = bodies[r]
+    pose = body_q[body]
+    twist = body_qd[body]
+    for k in range(7):
+        joint_q[q_start[r] + k] = pose[k]
+    for k in range(6):
+        joint_qd[qd_start[r] + k] = twist[k]
+
+
+@wp.kernel(enable_backward=False)
+def _loose_rederived(trees: wp.array[int], valid: wp.array[int], rederived: wp.array[wp.bool]):
+    """Each loose tree whose kinematics the step re-derives (its cache bit cleared): its joints then follow its
+    bodies."""
+    k = wp.tid()
+    rederived[trees[k]] = valid[trees[k]] == 0
 
 
 @wp.kernel(enable_backward=False)
@@ -227,7 +267,160 @@ def _components(count: int, first: np.ndarray, second: np.ndarray) -> np.ndarray
             return labels
 
 
-def _topology(model: Model) -> SimpleNamespace | None:
+def _loose_trees(model: Model) -> SimpleNamespace | None:
+    """The trees of the bodies joints join outside every articulation (the module docstring), or ``None`` where no
+    such joint has a child no tree holds and a parent that is the world or a body no tree holds, or where no such group
+    has a coordinate (a body fixed to the world without an articulation stays outside the solver).
+
+    Each group is rooted at its first joint on the world, else at an added free root on its first body no such joint
+    enters (else its first body), and grows from the root along its joints' directions, breadth first in joint order.
+
+    Returns:
+        ``order`` (the tree joints in their trees' parent-first order, an added root ``joint_count + r``), ``tree``
+        (each one's new tree), ``ancestor`` (each one's tree joint above it, -1 at a root), ``roots`` (each added
+        root's body), ``trees`` (the new trees' count) and ``root_body`` (each new tree's root body).
+    """
+    if not (model.joint_count and model.body_count):
+        return None
+    articulation = model.joint_articulation.numpy()
+    parent, child = model.joint_parent.numpy(), model.joint_child.numpy()
+    owned = (articulation >= 0) & (child >= 0)
+    held = np.zeros(model.body_count, dtype=bool)
+    held[child[owned]] = True
+    on_free = parent < 0
+    on_free[~on_free] = ~held[parent[~on_free]]
+    loose = np.flatnonzero(~owned & (child >= 0) & ~held[np.maximum(child, 0)] & on_free)
+    if not loose.size:
+        return None
+    on_world, between = loose[parent[loose] < 0], loose[parent[loose] >= 0]
+    below: dict[int, list[int]] = {}
+    for j in between:
+        below.setdefault(int(parent[j]), []).append(int(j))
+    entered = np.zeros(model.body_count, dtype=bool)
+    entered[child[between]] = True
+    tree_of_body = np.full(model.body_count, -1, dtype=np.int64)
+    joint_of_body = np.full(model.body_count, -1, dtype=np.int64)
+    order, roots, root_body = [], [], []
+
+    def plant(body: int, joint: int) -> None:
+        tree_of_body[body], joint_of_body[body] = len(root_body), joint
+        root_body.append(body)
+        order.append(joint)
+        queue = deque([body])
+        while queue:
+            above = queue.popleft()
+            for j in below.get(above, ()):
+                c = int(child[j])
+                if tree_of_body[c] < 0:
+                    tree_of_body[c], joint_of_body[c] = tree_of_body[above], j
+                    order.append(j)
+                    queue.append(c)
+
+    for j in on_world:
+        if tree_of_body[child[j]] < 0:
+            plant(int(child[j]), int(j))
+    members = np.unique(np.concatenate((child[loose], parent[between])))
+    for body in members[np.lexsort((members, entered[members]))]:
+        if tree_of_body[body] < 0:
+            plant(int(body), model.joint_count + len(roots))
+            roots.append(int(body))
+    order = np.asarray(order, dtype=np.int64)
+    added = order >= model.joint_count
+    bodies = np.empty(order.size, dtype=np.int64)
+    bodies[added] = np.asarray(roots, dtype=np.int64)[order[added] - model.joint_count]
+    bodies[~added] = child[order[~added]]
+    # A tree joint's ancestor is its parent body's tree joint; a root's (on the world, or added) is none.
+    above = np.full(order.size, -1, dtype=np.int64)
+    on_body = np.flatnonzero(~added)
+    on_body = on_body[parent[order[on_body]] >= 0]
+    above[on_body] = joint_of_body[parent[order[on_body]]]
+    # A group that cannot move (rooted on the world through joints without coordinates) stays outside the solver, as a
+    # body fixed to the world does: only groups with a coordinate become trees.
+    tree = tree_of_body[bodies]
+    widths = np.where(added, 6, np.diff(model.joint_qd_start.numpy())[np.where(added, 0, order)])
+    moving = np.bincount(tree, weights=widths, minlength=len(root_body)) > 0
+    if not moving.any():
+        return None
+    keep = moving[tree]
+    renumber = np.cumsum(moving) - 1
+    return SimpleNamespace(
+        order=order[keep],
+        tree=renumber[tree[keep]],
+        ancestor=above[keep],
+        roots=np.asarray(roots, dtype=np.int64),
+        trees=int(moving.sum()),
+        root_body=np.asarray(root_body, dtype=np.int64)[moving],
+    )
+
+
+def _rooted(model: Model, loose: SimpleNamespace) -> Model:
+    """``model`` with its loose trees (:func:`_loose_trees`): their joints in new articulations past the model's, each
+    added root a free joint (as :meth:`~newton.ModelBuilder.add_joint_free` makes it, on the world with identity
+    frames) past the model's joints, its coordinates past theirs."""
+    builder = ModelBuilder()
+    builder.add_body()
+    template = builder.finalize(device="cpu")
+    added, device = loose.roots.size, model.device
+    widths = {_F.JOINT: 1, _F.JOINT_DOF: 6, _F.JOINT_COORD: 7, _F.ARTICULATION: 1}
+    rows = {_F.JOINT: added, _F.JOINT_DOF: 6 * added, _F.JOINT_COORD: 7 * added, _F.ARTICULATION: loose.trees}
+    starts = ("joint_q_start", "joint_qd_start", "articulation_start", "articulation_end")
+    rooted = copy.copy(model)
+    for name, spec in model.attribute_specs.items():
+        if spec.frequency not in rows or name in starts:
+            continue
+        value = getattr(model, name, None)
+        if value is None:
+            continue
+        if len(value) != model.attribute_frequency_count(spec.frequency):
+            continue
+        width, extra = widths[spec.frequency], rows[spec.frequency]
+        stencil = getattr(template, name, None)
+        if isinstance(value, list):
+            fill = stencil if isinstance(stencil, list) and len(stencil) == width else [None] * width
+            setattr(rooted, name, [*value, *(fill[k % width] for k in range(extra))])
+            continue
+        host = value.numpy()
+        if isinstance(stencil, wp.array) and len(stencil) == width and stencil.dtype == value.dtype:
+            stencil = stencil.numpy()
+            tail = np.tile(stencil, (extra // width,) + (1,) * (stencil.ndim - 1))
+        else:
+            tail = np.zeros((extra, *host.shape[1:]), dtype=host.dtype)
+        setattr(rooted, name, wp.array(np.concatenate((host, tail)), dtype=value.dtype, device=device))
+
+    joints, trees = model.joint_count, model.articulation_count
+    count = joints + added
+
+    def edit(name, rows, values, dtype=wp.int32):
+        host = getattr(rooted, name).numpy()
+        host[rows] = values
+        setattr(rooted, name, wp.array(host, dtype=dtype, device=device))
+
+    added_rows = np.arange(joints, count)
+    edit("joint_child", added_rows, loose.roots)
+    edit("joint_parent", added_rows, -1)
+    edit("joint_articulation", loose.order, trees + loose.tree)
+    edit("joint_ancestor", loose.order, loose.ancestor)
+    identity = np.array(wp.transform_identity(), dtype=np.float32)
+    edit("joint_X_p", added_rows, identity, wp.transform)
+    edit("joint_X_c", added_rows, identity, wp.transform)
+    body_world = model.body_world.numpy()
+    edit("joint_world", added_rows, body_world[loose.roots])
+    edit("articulation_world", np.arange(trees, trees + loose.trees), body_world[loose.root_body])
+    for name, width, total in (
+        ("joint_q_start", 7, model.joint_coord_count),
+        ("joint_qd_start", 6, model.joint_dof_count),
+    ):
+        host = getattr(model, name).numpy()
+        tail = total + width * np.arange(added + 1, dtype=host.dtype)
+        setattr(rooted, name, wp.array(np.concatenate((host[:-1], tail)), dtype=wp.int32, device=device))
+    rooted.joint_count = count
+    rooted.joint_dof_count = model.joint_dof_count + 6 * added
+    rooted.joint_coord_count = model.joint_coord_count + 7 * added
+    rooted.articulation_count = trees + loose.trees
+    return rooted
+
+
+def _topology(model: Model, loose: SimpleNamespace | None = None) -> SimpleNamespace | None:
     """The forest of ``model``'s trees and loop joints, or ``None`` when ``model`` already is one.
 
     A loop joint is a joint outside every tree whose child a tree holds (any other such joint stands outside the
@@ -250,7 +443,11 @@ def _topology(model: Model) -> SimpleNamespace | None:
     body_joint[child[owned]] = joints[owned]
     loops = np.flatnonzero(~owned & (child >= 0))
     loops = loops[body_joint[child[loops]] >= 0]
-    if not loops.size and not np.any(np.bincount(articulation[owned & (ancestor < 0)], minlength=1) > 1):
+    if (
+        loose is None
+        and not loops.size
+        and not np.any(np.bincount(articulation[owned & (ancestor < 0)], minlength=1) > 1)
+    ):
         return None
 
     root = TreePlan.build(np.where(owned, ancestor, -1)).root_of
@@ -268,7 +465,11 @@ def _topology(model: Model) -> SimpleNamespace | None:
     rank = np.zeros(model.joint_count, dtype=np.int64)
     rank[heads] = np.arange(heads.size)
     tree = np.where(tree >= 0, rank[np.maximum(tree, 0)], heads.size)
-    order = np.lexsort((joints, ~owned, tree))
+    # A tree keeps its joints' order, parent-first: the model's, or a loose tree's growth (:func:`_loose_trees`).
+    place = joints.copy()
+    if loose is not None:
+        place[loose.order] = np.arange(loose.order.size)
+    order = np.lexsort((place, ~owned, tree))
     position = np.empty(order.size, dtype=np.int64)
     position[order] = joints
     forest_child = child.copy()
@@ -329,9 +530,11 @@ class BodyCut:
     def of(cls, model: Model) -> BodyCut:
         """The cut of ``model`` (the module docstring)."""
         cut = cls(model)
-        topology = _topology(model) if model.joint_count else None
+        loose = _loose_trees(model)
+        rooted = model if loose is None else _rooted(model, loose)
+        topology = _topology(rooted, loose) if model.joint_count else None
         if topology is not None:
-            cut._cut(topology)
+            cut._cut(topology, rooted, loose)
         return cut
 
     @property
@@ -347,8 +550,10 @@ class BodyCut:
         linked[self.tree_shadow] = True
         return linked
 
-    def _cut(self, topology: SimpleNamespace) -> None:
-        source = self.source
+    def _cut(self, topology: SimpleNamespace, source: Model, loose: SimpleNamespace | None) -> None:
+        """Build the forest of ``topology`` from ``source``: the caller's model, or it with its loose trees rooted
+        (:func:`_rooted`), whose added joints' items the step's gathers and publications skip."""
+        caller = self.source
         device = source.device
         loops, order, position = topology.loops, topology.order, topology.position
         self.joints = loops
@@ -417,7 +622,7 @@ class BodyCut:
         reference = source.joint_mimic_joint.numpy()[order]
         forest.joint_mimic_joint = indices(np.where(reference >= 0, position[reference], -1))
         self.model = forest
-        self._topology = {name: getattr(source, name).numpy().copy() for name in _TOPOLOGY}
+        self._topology = {name: getattr(caller, name).numpy().copy() for name in _TOPOLOGY}
 
         # The links' trees and components.
         body_tree = np.full(bodies.size, -1, dtype=np.int64)
@@ -439,13 +644,36 @@ class BodyCut:
             items.count, items.active, items.outof, items.into = int(count), active, outof, into
             return _Map(items, shape(Work(int(count)), memory.device(device)))
 
-        self._joint_map = mapped(order.size, indices(order), identity)
+        # An added root's items have no counterpart in the caller's layout: its joint's frames and gains stay the
+        # free joint's, its coordinates the mirrors' own (taken from its body at each step).
+        def caller_items(values, count):
+            return wp.array(np.asarray(values) < count, dtype=wp.bool, device=device)
+
+        in_joints = caller_items(order, caller.joint_count)
+        in_dofs, in_coords = (
+            caller_items(dofs.numpy(), caller.joint_dof_count),
+            caller_items(coords.numpy(), caller.joint_coord_count),
+        )
+        self._joint_map = mapped(order.size, indices(order), identity, in_joints)
         self._body_map = mapped(bodies.size, indices(bodies), identity)
-        self._dof_map = mapped(dofs.shape[0], dofs, identity)
-        self._coord_map = mapped(coords.shape[0], coords, identity)
-        self._publish_q = mapped(q_start[bounds[-1]], identity, coords)
-        self._publish_qd = mapped(qd_start[bounds[-1]], identity, dofs)
+        self._dof_map = mapped(dofs.shape[0], dofs, identity, in_dofs)
+        self._coord_map = mapped(coords.shape[0], coords, identity, in_coords)
+        self._publish_q = mapped(q_start[bounds[-1]], identity, coords, in_coords)
+        self._publish_qd = mapped(qd_start[bounds[-1]], identity, dofs, in_dofs)
+        # The loose trees: the added roots (their bodies, their coordinates' starts in the forest) and every loose
+        # tree, whose joints follow its bodies where the step re-derives its kinematics.
+        self._roots = None
+        if loose is not None:
+            forest_joint = position[caller.joint_count + np.arange(loose.roots.size)]
+            self._roots = (indices(loose.roots), indices(q_start[forest_joint]), indices(qd_start[forest_joint]))
+            loose_trees = np.unique(topology.tree[np.isin(order, loose.order)])
+            self._loose = indices(loose_trees)
+            self._rederived = wp.zeros(topology.trees, dtype=wp.bool, device=device)
         self._seat_map = mapped(loops.size, indices(self.primary), indices(self.shadow), self._seated_links)
+        # The bodies no tree holds stand outside the solver: the step passes their pose and twist through (no finish
+        # writes them), so the output's mirror takes the input's at the enter.
+        outside = np.flatnonzero(body_tree[: caller.body_count] < 0)
+        self._outside = mapped(outside.size, indices(outside), indices(outside)) if outside.size else None
         anchor = np.full(order.size, -1, dtype=np.int32)
         anchor[position[self._anchored]] = source.joint_parent.numpy()[self._anchored]
         self._anchor = indices(anchor)
@@ -582,8 +810,8 @@ class BodyCut:
             mirror.body_qd = wp.empty(count, dtype=wp.spatial_vector, device=device)
             mirror.body_f = wp.empty(count, dtype=wp.spatial_vector, device=device)
             mirror.body_f.zero_()
-            mirror.joint_q = wp.empty_like(state.joint_q)
-            mirror.joint_qd = wp.empty_like(state.joint_qd)
+            mirror.joint_q = wp.empty(self.model.joint_coord_count, dtype=state.joint_q.dtype, device=device)
+            mirror.joint_qd = wp.empty(self.model.joint_dof_count, dtype=state.joint_qd.dtype, device=device)
             self._states[state] = mirror
         return mirror
 
@@ -598,9 +826,17 @@ class BodyCut:
         mirror = self._controls.get(control)
         if mirror is None:
             mirror = copy.copy(control)
-            for name in ("joint_f", "joint_target_q", "joint_target_qd", "joint_act"):
+            # An added root's entries hold zero: no force, no target.
+            for name, count in (
+                ("joint_f", self.model.joint_dof_count),
+                ("joint_target_q", self.model.joint_coord_count),
+                ("joint_target_qd", self.model.joint_dof_count),
+                ("joint_act", self.model.joint_dof_count),
+            ):
                 value = getattr(control, name)
-                setattr(mirror, name, None if value is None else wp.empty_like(value))
+                setattr(
+                    mirror, name, None if value is None else wp.zeros(count, dtype=value.dtype, device=value.device)
+                )
             self._controls[control] = mirror
         for name, map_ in (
             ("joint_f", self._dof_map),
@@ -633,6 +869,9 @@ class BodyCut:
         wp.copy(forest_in.body_q, state_in.body_q, count=count)
         wp.copy(forest_in.body_qd, state_in.body_qd, count=count)
         wp.copy(forest_in.body_f, state_in.body_f, count=count)
+        if self._outside is not None:
+            self._outside.move(state_in.body_q, forest_out.body_q)
+            self._outside.move(state_in.body_qd, forest_out.body_qd)
 
         launch(
             _seat,
@@ -642,11 +881,60 @@ class BodyCut:
             device=device,
             tiled=False,
         )
+        if self._roots is not None:
+            self._follow_loose(forest_in, cache_valid)
         eval_fk(self.model, forest_in.joint_q, forest_in.joint_qd, forest_in, mask=self._seated_trees)
         self._seat_map.move(forest_in.body_q, forest_in.body_q)
         self._seat_map.move(forest_in.body_qd, forest_in.body_qd)
         eval_ik(self._seats, forest_in, forest_in.joint_q, forest_in.joint_qd, mask=self._seated_links)
         return forest_in, forest_out, self._control(control)
+
+    def _follow_loose(self, forest_in: State, cache_valid: wp.array) -> None:
+        """The loose trees' state is their bodies': each added root takes its body's pose and twist, and a loose tree
+        whose kinematics the step re-derives takes its joints' coordinates from its bodies (inverse kinematics)."""
+        forest, device = self.model, self.model.device
+        bodies, q_start, qd_start = self._roots
+        wp.launch(
+            _take_roots,
+            dim=bodies.shape[0],
+            inputs=[bodies, q_start, qd_start, forest_in.body_q, forest_in.body_qd],
+            outputs=[forest_in.joint_q, forest_in.joint_qd],
+            device=device,
+        )
+        wp.launch(
+            _loose_rederived,
+            dim=self._loose.shape[0],
+            inputs=[self._loose, cache_valid],
+            outputs=[self._rederived],
+            device=device,
+        )
+        wp.launch(
+            eval_articulation_ik,
+            dim=(self._loose.shape[0], forest.max_joints_per_articulation),
+            inputs=[
+                forest.articulation_start,
+                forest.articulation_end,
+                forest.articulation_count,
+                self._rederived,
+                self._loose,
+                forest_in.body_q,
+                forest_in.body_qd,
+                forest.body_com,
+                forest.joint_type,
+                forest.joint_parent,
+                forest.joint_child,
+                forest.joint_X_p,
+                forest.joint_X_c,
+                forest.joint_axis,
+                forest.joint_dof_dim,
+                forest.joint_q_start,
+                forest.joint_qd_start,
+                forest.body_flags,
+                int(BodyFlags.ALL),
+            ],
+            outputs=[forest_in.joint_q, forest_in.joint_qd],
+            device=device,
+        )
 
     def leave(self, state_in: State, state_out: State) -> None:
         """Publish the step: the output's coordinates, and both states' bodies (the step's primary pieces, the model's

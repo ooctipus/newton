@@ -86,7 +86,10 @@ class SolverFeatherPGS(SolverBase):
         Unlike :class:`~newton.solvers.SolverSemiImplicit` and :class:`~newton.solvers.SolverXPBD`, :class:`~newton.solvers.SolverFeatherPGS`
         does not simulate rigid bodies with nonzero mass as floating bodies if they are not connected through any joints.
         Floating-base systems require an explicit free joint with which the body is connected to the world,
-        see :meth:`newton.ModelBuilder.add_joint_free`.
+        see :meth:`newton.ModelBuilder.add_joint_free`. Bodies that joints join outside every articulation
+        (``add_link`` and ``add_joint_*`` without ``add_articulation``, as maximal-coordinate scenes build ragdolls and
+        bridges) are simulated: each group of them is rooted at its joint to the world, else at a free root the solver
+        adds on its first body, and its state is its bodies' (``body_q``, ``body_qd``); see :mod:`.body_cut`.
 
     Semi-implicit integration is not unconditionally stable. Accuracy and
     stability depend on the timestep, inertia conditioning and constraint
