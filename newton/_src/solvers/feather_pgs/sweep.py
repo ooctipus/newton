@@ -1762,15 +1762,18 @@ class LiveOrder:
     def wrap(self, visit: str, pad: str) -> str:
         rows, lanes = self.rows, self.rows.lanes
         lane = lanes.lane if lanes.parallel else "0"
-        acts = f"live_always || !({self.reach} <= live_key)"
+        # A lane past the loop's end holds no row: it never votes, whatever the bound (a NaN bound, which a
+        # relaxation that is not positive gives, passes every key).
+        acts = f"live_row && (live_always || !({self.reach} <= live_key))"
         test = indent(self.test(), pad + "            ")
         record = indent(rows.visit("i"), pad + "        ") + "\n" if rows.record else ""
         return f"""{pad}for (int live_first = 0; live_first < {self.end}; live_first += {lanes.width}) {{
+{pad}    const bool live_row = live_first + {lane} < {self.end};
 {pad}    bool live_always = false;
 {pad}    float live_key = __int_as_float(0x7f800000);
 {pad}    {{
 {pad}        const int t = live_first + {lane};
-{pad}        if (t < {self.end}) {{
+{pad}        if (live_row) {{
 {test}
 {pad}        }}
 {pad}    }}

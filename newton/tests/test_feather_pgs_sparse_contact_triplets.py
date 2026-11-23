@@ -323,6 +323,19 @@ _LINKED_LAYOUTS = {
 }
 
 
+SHARED_FILL_FLOATS = wp.constant(12288)
+"""Floats of shared memory each block of :func:`fill_shared` writes: the 48 KiB a block holds without opting in."""
+
+
+@wp.kernel(enable_backward=False)
+def fill_shared(value: float, out: wp.array[float]):
+    """Leave ``value`` in the shared memory of the multiprocessors that run it."""
+    tile = wp.tile_full(shape=(SHARED_FILL_FLOATS,), value=value, dtype=float, storage="shared")
+    total = wp.tile_sum(tile)
+    if wp.tid() == 0:
+        out[0] = total[0]
+
+
 def linked_fixture(layout, *, pad=0, seeded=False, omega=1.0, active=True):
     """Build ring-linked patch rows in the DeviceSolve layout, with their physical sweep.
 
@@ -738,6 +751,28 @@ class TestSparseContactTripletsPatch(unittest.TestCase):
                 # The oracle pools each ring as the ordinary update does; a fused radius
                 # without the ring would leave it.
                 assert_output(self, data, delta, impulses, physical=physical)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "Requires CUDA")
+    def test_full_sweep_reads_rows_inside_count_cuda(self):
+        """Give the full sweep's result whatever the shared memory held before it.
+
+        A relaxation that is not positive leaves the live order's bound NaN, which every key passes: the lanes past a
+        world's count must still not vote, or the sweep visits rows nobody staged and their stale values reach the
+        velocity (a NaN through a zero factor row).
+        """
+        data, _ = linked_fixture(_LINKED_LAYOUTS["two_member_ring"], pad=30, seeded=True, omega=-0.5, active=False)
+        device = wp.get_device("cuda:0")
+        out = wp.zeros(1, dtype=float, device=device)
+        results = []
+        for value in (0.0, float("nan")):
+            solve = DeviceSolve(data, candidate=False, active=False, linked=True)
+            wp.launch_tiled(fill_shared, dim=[8 * device.sm_count], inputs=[value, out], block_dim=256, device=device)
+            solve.launch()
+            results.append(solve.result())
+        (delta, impulses), (nan_delta, nan_impulses) = results
+        self.assertTrue(np.isfinite(nan_delta).all() and np.isfinite(nan_impulses).all())
+        np.testing.assert_array_equal(nan_delta, delta)
+        np.testing.assert_array_equal(nan_impulses, impulses)
 
     @unittest.skipUnless(wp.is_cuda_available(), "Sparse construction requires CUDA")
     def test_patch_host_admission_cuda(self):
