@@ -353,8 +353,8 @@ class TestRegionStream(unittest.TestCase):
 
     def test_a_held_frame_keeps_the_listing_a_new_one_would_make(self):
         """List a contact frame's regions once and hold them through its later steps: a held step's listing (its
-        bodies' places and marks, each region's candidates by contact, the order and its levels) is the one a new
-        listing of that step's rows makes.
+        bodies' places and marks, each region's candidates by contact, the order) is the one a new listing of that
+        step's rows makes. The walk of the order and its levels are each step's (:func:`.region_sweep.level_acting`).
 
         A stack of three boxes and a tilted pair of boxes on the ground, colliding once every four steps: the steps
         between hold the frame (the patch builder carries its regions, every candidate is admitted again and no
@@ -378,15 +378,14 @@ class TestRegionStream(unittest.TestCase):
         state, out, control = model.state(), model.state(), model.control()
         dt = 1.0 / 480.0
         names = (
-            "cursor", "body_open", "body_regions", "body_cand", "world_regions", "world_levels", "lanes", "reg_cand",
-            "reg_kind", "reg_order", "reg_level", "cand_contact", "level_end", "level_region",
+            "cursor", "body_open", "body_regions", "body_cand", "world_regions", "world_order_end", "lanes", "reg_cand",
+            "reg_kind", "reg_order", "cand_contact",
         )  # fmt: skip
 
         def listing():
             count = int(regions.cursor.numpy()[0])
             candidates = int(regions.reg_cand.numpy()[:count, 1].max()) if count else 0
-            sizes = {"reg_cand": count, "reg_kind": count, "reg_order": count, "reg_level": count}
-            sizes.update({"cand_contact": candidates, "level_end": count, "level_region": count})
+            sizes = {"reg_cand": count, "reg_kind": count, "reg_order": count, "cand_contact": candidates}
             return {name: getattr(regions, name).numpy()[: sizes.get(name, None)].copy() for name in names}
 
         held = 0
@@ -407,6 +406,68 @@ class TestRegionStream(unittest.TestCase):
             for name in names:
                 np.testing.assert_array_equal(kept[name], made[name], err_msg=f"step {step}: {name}")
         self.assertGreaterEqual(held, 6)
+
+    def test_the_walk_levels_the_order_over_the_regions_that_act(self):
+        """Each step's walk (:func:`.region_sweep.level_acting`) holds the order's regions that can act, in the
+        order's sequence, then its left-out ones; its levels are the exact levels of the order on the acting regions
+        (a region's level one past the last of an earlier one on either body), and its tail none of them.
+
+        A few stacks and a leaning pair of boxes on the ground, colliding every step: the speculative pairs between
+        the stacks are left out (none of their contacts can close), so the order holds both kinds.
+        """
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()
+        for x in (0.0, 0.16, 0.32):
+            for k in range(3):
+                body = builder.add_body(xform=wp.transform((x, 0.0, 0.05 + 0.0999 * k), wp.quat_identity()))
+                builder.add_shape_box(body, hx=0.05, hy=0.05, hz=0.05)
+        tilt = wp.quat_from_axis_angle(wp.vec3(1.0, 0.3, 0.0), 0.2)
+        for k in range(2):
+            body = builder.add_body(xform=wp.transform((0.6, 0.1 * k, 0.04 + 0.075 * k), tilt))
+            builder.add_shape_box(body, hx=0.04, hy=0.04, hz=0.04)
+        model = builder.finalize(device="cpu")
+        solver = SolverFeatherPGS(model, pgs_iterations=8)
+        regions = solver.sweep.regions
+        self.assertIsNotNone(regions)
+        pipeline = newton.CollisionPipeline(model, rigid_contact_max=1024)
+        contacts = pipeline.contacts()
+        state, out, control = model.state(), model.state(), model.control()
+        left_seen = acting_seen = 0
+        for _ in range(40):
+            pipeline.collide(state, contacts)
+            # The walk of this step's fill: list the step's regions, as the step does before its sweeps.
+            regions.list(solver, state, contacts, 1.0 / 480.0)
+            span = regions.world_regions.numpy()[0]
+            s, end = int(span[0]), int(regions.world_order_end.numpy()[0])
+            order = regions.reg_order.numpy()[s:end]
+            state_of = regions.reg_state.numpy()
+            body = regions.reg_body.numpy()
+            acting = [int(g) for g in order if state_of[g] != int(region_sweep.REGION_LEFT)]
+            left = [int(g) for g in order if state_of[g] == int(region_sweep.REGION_LEFT)]
+            np.testing.assert_array_equal(regions.reg_walk.numpy()[s:end], np.asarray(acting + left, dtype=np.int32))
+            last, want = {}, []
+            for g in acting:
+                sides = [int(v) for v in body[g] if v >= 0]
+                level = max((last.get(v, 0) for v in sides), default=0)
+                want.append(level)
+                for v in sides:
+                    last[v] = level + 1
+            levels = int(regions.world_levels.numpy()[0])
+            self.assertEqual(levels, max(want, default=-1) + 1)
+            level_end = regions.level_end.numpy()[s : s + levels]
+            level_region = regions.level_region.numpy()
+            first = s
+            for level in range(levels):
+                got = sorted(int(g) for g in level_region[first : int(level_end[level])])
+                self.assertEqual(got, sorted(g for g, k in zip(acting, want, strict=True) if k == level))
+                first = int(level_end[level])
+            self.assertEqual(first, s + len(acting))
+            left_seen += len(left)
+            acting_seen += len(acting)
+            solver.step(state, out, control, contacts, 1.0 / 480.0)
+            state, out = out, state
+        self.assertGreater(left_seen, 0)
+        self.assertGreater(acting_seen, 0)
 
 
 if __name__ == "__main__":

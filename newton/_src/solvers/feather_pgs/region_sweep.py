@@ -1897,12 +1897,12 @@ def level_regions(
     reg_level: wp.array[int],
     reg_order: wp.array[int],
     level_end: wp.array[int],
-    level_region: wp.array[int],
-    world_levels: wp.array[int],
+    world_order_end: wp.array[int],
     blk_members: wp.array[wp.vec2i],
 ):
-    """A world's open regions in their order from the free end down (the contact graph's), by the exact levels of
-    that order, a world a lane group (:data:`_WORLD_LANES`).
+    """A world's open regions in their order from the free end down (the contact graph's), a world a lane group
+    (:data:`_WORLD_LANES`); each step takes the exact levels of that order over the regions that can act
+    (:func:`level_acting`).
 
     The order: a body's depth is its distance on the contact graph from the immovable partners (one for a body
     with a region against one, one more for each region between two movable bodies on the way), a region's the
@@ -1910,18 +1910,13 @@ def level_regions(
     first), in their stream order within a depth: a cold sweep then carries a pile's weight down to its supports
     within the sweep, where the order up from the supports carries it one interface a sweep.
 
-    The levels: a region's level is one past the last level of a region before it on either of its bodies, so a
-    level's regions share no body and a sweep that takes the levels in turn, a level's regions at once, is the
-    sequential sweep of the order itself. The world's span ``[s, e)`` of the stream holds the regions by level
-    (``level_region``) and, at ``s + L``, the end of level ``L`` (``level_end``); ``world_levels`` the count.
-
-    The levels are the contact frame's: they are made where the step lists its regions anew, whose listing then
-    stands for the frame's later steps if it fit (``relist[1]``).
+    The order is the contact frame's (``reg_order``, the world's span ``[s, world_order_end)``, the pair blocks'
+    members after it): it is made where the step lists its regions anew, whose listing then stands for the frame's
+    later steps if it fit (``relist[1]``).
 
     The lanes take the world's regions a stride at a time: the depths are the relaxation's fixpoint (each body's
-    distance on the contact graph, whatever order relaxes it), the counting sorts keep the stream's order (a chunk's
-    lanes of one key take their places in lane order) and the levels of the order are one lane's pass, as the
-    sequential sweep is.
+    distance on the contact graph, whatever order relaxes it) and the counting sort keeps the stream's order (a
+    chunk's lanes of one key take their places in lane order; ``level_end`` holds the depths' counts).
     """
     if relist[0] == 0:
         return
@@ -1939,7 +1934,7 @@ def level_regions(
         blk_members[world * PAIR_BLOCKS + k] = wp.vec2i(0, 0)
     if e <= s:
         if lane == 0:
-            world_levels[world] = 0
+            world_order_end[world] = s
         return
     far = int(1 << 29)
     f0 = world_free_start[world]
@@ -2025,15 +2020,92 @@ def level_regions(
         if lane == 0:
             blk_members[world * PAIR_BLOCKS + k] = wp.vec2i(m0, at)
     lane_sync(_WORLD_LANES)
-    # The levels of that order: one lane's pass, a region's level one past the last level of a region before it on
-    # either of its bodies.
+    if lane == 0:
+        world_order_end[world] = s + kept
+
+
+@wp.kernel(enable_backward=False, module="unique")
+def level_acting(
+    world_regions: wp.array[wp.vec2i],
+    world_order_end: wp.array[int],
+    world_free_start: wp.array[int],
+    world_free: wp.array[int],
+    reg_body: wp.array[wp.vec2i],
+    reg_state: wp.array[int],
+    reg_order: wp.array[int],
+    body_level: wp.array[int],
+    reg_level: wp.array[int],
+    reg_walk: wp.array[int],
+    level_end: wp.array[int],
+    level_region: wp.array[int],
+    world_levels: wp.array[int],
+):
+    """Each step, a world's walk of its regions' order (:func:`level_regions`) at the step's fill: the regions that
+    can act by the exact levels of the order, the left-out ones (:data:`REGION_LEFT`) after them, a world a lane
+    group (:data:`_WORLD_LANES`).
+
+    A sweep passes a left-out region (its turn writes nothing) and its end tests it (:func:`.sweep_routes
+    .region_verify`), so a level of theirs would cost every sweep a level's turn and barrier for nothing; in a pile
+    they are most of the regions (speculative pairs none of whose contacts can close) and most of the order's levels.
+    The walk (``reg_walk``, the world's span ``[s, world_order_end)``) holds the acting regions first and the left-out
+    ones after them, each in the order's sequence; the acting ones' levels are the order's own on them, so the sweeps
+    take the order exactly on the regions that act. Where the verify opens a left-out region it makes the walk and its
+    levels anew with these statements (:func:`.sweep_routes.region_verify`), so the opened region takes its place.
+
+    The levels: a region's level is one past the last level of a region before it on either of its bodies, so a
+    level's regions share no body and a sweep that takes the levels in turn, a level's regions at once, is the
+    sequential sweep of the order itself. The span ``[s, t)`` holds the acting regions by level (``level_region``) and,
+    at ``s + L``, the end of level ``L`` (``level_end``); ``world_levels`` the count. The lanes split the walk a
+    stride at a time in lane order (stable) and count the levels' places; the levels themselves are one lane's pass,
+    as the sequential sweep is.
+    """
+    lanes = lane_stride(_WORLD_LANES)
+    lane = lane_index(_WORLD_LANES)
+    world = wp.tid() // lanes
+    if world >= world_regions.shape[0]:
+        return
+    s = world_regions[world][0]
+    end = world_order_end[world]
+    if end <= s:
+        if lane == 0:
+            world_levels[world] = 0
+        return
+    # The walk: the acting regions, then the left-out ones, each in the order's sequence.
+    acting = int(0)
+    for base in range(s, end, lanes):
+        p = base + lane
+        g = int(-1)
+        act = bool(False)
+        if p < end:
+            g = reg_order[p]
+            act = reg_state[g] != REGION_LEFT
+        votes = lane_ballot(act, _WORLD_LANES)
+        if act:
+            reg_walk[s + acting + lane_below(votes, _WORLD_LANES)] = g
+        acting += lane_count(votes, _WORLD_LANES)
+    placed = acting
+    for base in range(s, end, lanes):
+        p = base + lane
+        g = int(-1)
+        out = bool(False)
+        if p < end:
+            g = reg_order[p]
+            out = reg_state[g] == REGION_LEFT
+        votes = lane_ballot(out, _WORLD_LANES)
+        if out:
+            reg_walk[s + placed + lane_below(votes, _WORLD_LANES)] = g
+        placed += lane_count(votes, _WORLD_LANES)
+    f0 = world_free_start[world]
+    f1 = world_free_start[world + 1]
     for i in range(f0 + lane, f1, lanes):
         body_level[world_free[i]] = 0
     lane_sync(_WORLD_LANES)
+    # The levels of the acting regions' order: one lane's pass, a region's level one past the last level of a region
+    # before it on either of its bodies.
     levels = int(0)
     if lane == 0:
-        for p in range(s, s + kept):
-            g = reg_order[p]
+        for p in range(s, s + acting):
+            g = reg_walk[p]
             sides = reg_body[g]
             level = body_level[sides[0]]
             if sides[1] >= 0:
@@ -2048,16 +2120,16 @@ def level_regions(
     for k in range(lane, levels, lanes):
         level_end[s + k] = 0
     lane_sync(_WORLD_LANES)
-    for p in range(s + lane, s + kept, lanes):
-        wp.atomic_add(level_end, s + reg_level[reg_order[p]], 1)
+    for p in range(s + lane, s + acting, lanes):
+        wp.atomic_add(level_end, s + reg_level[reg_walk[p]], 1)
     lane_sync(_WORLD_LANES)
     _level_starts(level_end, s, levels, lane, lanes)
-    for base in range(s, s + kept, lanes):
+    for base in range(s, s + acting, lanes):
         p = base + lane
         key = int(-1)
         g = int(0)
-        if p < s + kept:
-            g = reg_order[p]
+        if p < s + acting:
+            g = reg_walk[p]
             key = reg_level[g]
         _place_by_key(level_end, s, key, g, level_region, lane)
     if lane == 0:
@@ -2104,6 +2176,7 @@ _REGION_FIELDS = (
     ("reg_bound", wp.vec2, 1),
     ("reg_level", wp.int32, 1),
     ("reg_order", wp.int32, 1),
+    ("reg_walk", wp.int32, 1),
     ("level_region", wp.int32, 1),
     ("level_end", wp.int32, 1),
     ("reg_stage", wp.vec3i, 1),
@@ -2177,6 +2250,8 @@ class Regions:
         self.no_hold = wp.zeros(1, dtype=wp.int32, device=device)
         self.world_regions = wp.zeros(worlds, dtype=wp.vec2i, device=device)
         self.world_levels = wp.zeros(worlds, dtype=wp.int32, device=device)
+        # Each world's end of its regions' order (level_regions), which each step's walk takes (level_acting).
+        self.world_order_end = wp.zeros(worlds, dtype=wp.int32, device=device)
         self.body_level = wp.zeros(max(count, 1), dtype=wp.int32, device=device)
         blocks = worlds * int(PAIR_BLOCKS)
         self.blk_pair = wp.full(blocks, wp.vec2i(-1, -1), dtype=wp.vec2i, device=device)
@@ -2337,7 +2412,13 @@ class Regions:
         pool = placement.contact_pool
         if contacts is None or contacts.rigid_contact_count is None or contacts._rigid_contact_rows <= 0:
             # No region: the stream empty, and the next step with contacts lists anew.
-            for array in (self.cursor, self.body_regions, self.world_regions, self.world_levels):
+            for array in (
+                self.cursor,
+                self.body_regions,
+                self.world_regions,
+                self.world_levels,
+                self.world_order_end,
+            ):
                 array.zero_()
             wp.launch(
                 begin_listing,
@@ -2565,9 +2646,32 @@ class Regions:
                 self.reg_level,
                 self.reg_order,
                 self.level_end,
+                self.world_order_end,
+                self.blk_members,
+            ],
+            device=device,
+            block_dim=_WORLD_BLOCK,
+        )
+        # Every step: the walk of the order at the step's fill, the acting regions by their levels.
+        wp.launch(
+            level_acting,
+            dim=world_threads,
+            inputs=[
+                self.world_regions,
+                self.world_order_end,
+                self.world_free_start,
+                self.world_free,
+                self.reg_body,
+                self.reg_state,
+                self.reg_order,
+            ],
+            outputs=[
+                self.body_level,
+                self.reg_level,
+                self.reg_walk,
+                self.level_end,
                 self.level_region,
                 self.world_levels,
-                self.blk_members,
             ],
             device=device,
             block_dim=_WORLD_BLOCK,
@@ -2708,7 +2812,8 @@ class Regions:
 
     def operands(self) -> dict:
         """The stream as the general sweep's region phase takes it (:data:`.sweep_routes.REGION_OPERANDS`)."""
-        names = "world_regions world_levels level_end level_region reg_order body_first body_basis"
+        names = "world_regions world_levels world_order_end level_end level_region reg_order reg_walk reg_level"
+        names += " body_level body_first body_basis"
         names += " reg_frame reg_arm reg_arm_b reg_body reg_cand reg_law reg_wnn reg_wnf reg_wff reg_ball_values"
         names += " reg_ball_vectors reg_ginv reg_k reg_lk reg_lw"
         names += " reg_bf reg_kind reg_row cand cand_floor cand_row reg_wrench reg_phi reg_set reg_spring reg_state reg_stamp"

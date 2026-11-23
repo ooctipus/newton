@@ -829,9 +829,13 @@ stands for the exit law's floor."""
 REGION_OPERANDS = (
     ("world_regions", wp.array[wp.vec2i]),
     ("world_levels", wp.array[int]),
+    ("world_order_end", wp.array[int]),
     ("level_end", wp.array[int]),
     ("level_region", wp.array[int]),
     ("reg_order", wp.array[int]),
+    ("reg_walk", wp.array[int]),
+    ("reg_level", wp.array[int]),
+    ("body_level", wp.array[int]),
     ("body_first", wp.array[int]),
     ("body_basis", wp.array2d[wp.spatial_vector]),
     ("reg_frame", wp.array[wp.mat33]),
@@ -887,11 +891,13 @@ def region_phase(pad: str = "        ") -> str:
     their order, each by the one visit (:func:`.region_laws.region_visit`), on the world's velocity change in walk
     coordinates (``s_v``).
 
-    The order is taken by its exact levels (:func:`.region_sweep.level_regions`): a level's regions share no body,
-    so the world's lanes visit them at once, and a barrier ends a level; that is the sequential sweep itself. A
+    The order is taken by its exact levels over the regions that can act (:func:`.region_sweep.level_acting`): a
+    level's regions share no body, so the world's lanes visit them at once, and a barrier ends a level; that is the
+    sequential sweep itself. The left-out regions follow them in the walk and take no level: a sweep passes them
+    anyway, and one the verify opens takes its place in the levels made anew (:func:`region_verify`). A
     world whose levels hold fewer regions than the colored rule's parallelism (a chain: a tangled pair's regions
     share both bodies, one a level) is walked by its lanes together in the order the levels were made from
-    (``reg_order``: a body's regions together within a depth), a first body's twist kept from one of its regions to
+    (``reg_walk``: a body's regions together within a depth), a first body's twist kept from one of its regions to
     the next, as a sequential walk does; the result is the same either way. The walk reads its order's states a
     lanes' width at a time and takes the regions that are not left out (a left-out region's turn writes nothing). A pair block (:func:`.region_sweep.form_blocks`)
     takes every lane of its world either way: its member batches and candidate passes split over them, so its sums
@@ -959,7 +965,7 @@ if (moved) {{
     wp::spatial_vector u;
     wp::vec3 v, w;
     const wp::spatial_vector* basis = body_basis.data;
-    // A chain world walks its order itself (reg_order: a body's regions together, so its twist stays kept), as one
+    // A chain world walks its order itself (reg_walk: a body's regions together, so its twist stays kept), as one
     // span; the others take the levels.
     const int spans = alone ? 1 : levels;
     for (int level = 0; level < spans; ++level) {{
@@ -971,7 +977,7 @@ if (moved) {{
     // A pair block takes every lane (teamed): the lanes visit a chunk's blocks together, one after another, then each
     // lane its own other region; a level's regions share no body, so its order inside the level is the same sweep.
     const unsigned blocks = alone ? BALLOT(chunk + lane < level_last
-        && reg_state.data[reg_order.data[chunk + lane]] != {int(REGION_LEFT)}) : !holds_block ? 0u
+        && reg_state.data[reg_walk.data[chunk + lane]] != {int(REGION_LEFT)}) : !holds_block ? 0u
         : BALLOT(chunk + lane < level_last && (reg_kind.data[level_region.data[chunk + lane]] & {int(KIND_BLOCK)}) != 0);
     unsigned left = blocks;
     const int turns = alone ? COUNT(blocks) : COUNT(blocks) + 1;
@@ -983,7 +989,7 @@ if (moved) {{
         left &= left - 1u;
         if (!teamed && (place >= level_last || ((blocks >> lane) & 1u) != 0u)) continue;
         if (teamed) WARP_SYNC();
-        const int g = alone ? reg_order.data[place] : level_region.data[place];
+        const int g = alone ? reg_walk.data[place] : level_region.data[place];
         // A left-out region waits for the sweeps' end (region_verify).
         const int state = reg_state.data[g];
         if (state == {int(REGION_LEFT)}) continue;
@@ -1130,8 +1136,10 @@ def region_verify(iteration: str = ITERATION, budget: str = "sweep_budget", pad:
     bodies' twists as the sweep leaves them (their walk coordinates ``s_v`` through their bases) by the phase's own
     test of a region that holds nothing (its closing bound, then the closing test where the bound cannot rule it
     out). One that
-    closes joins the next sweep as a region that holds nothing (:data:`.region_sweep.REGION_IDLE`) and the sweeps may
-    not stop; a sweep more where ``budget`` ends at ``iteration``. So every region still left out at the end holds
+    closes joins the next sweep as a region that holds nothing (:data:`.region_sweep.REGION_IDLE`) at its place in
+    the order: where one joins, the world's walk and its levels are made anew over the regions that can act (the
+    statements of :func:`.region_sweep.level_acting`), and the sweeps may not stop; a sweep more where ``budget`` ends
+    at ``iteration``. So every region still left out at the end holds
     nothing at a motion where none of its candidates closes."""
     twist = """const int first{s} = body_first.data[{f}];
 const wp::spatial_vector* const basis{s} = body_basis.data + (size_t){f} * 6;
@@ -1178,6 +1186,61 @@ const wp::vec3 w{s}(wp::dot(basis{s}[3], u{s}), wp::dot(basis{s}[4], u{s}), wp::
     if (BALLOT(joined != 0) != 0u) {{
         iteration_changed = 1;
         if ({iteration} + 1 == {budget}) {budget} += 1;
+        // The opened regions take their places in the order: the walk and its levels anew (region_sweep.level_acting's
+        // statements), so the next sweep takes the order on every region that can act, as it stands.
+        SYNC();
+        const int s0 = left_span[0], order_end = world_order_end.data[world];
+        int acting = 0;
+        for (int base = s0; base < order_end; base += STRIDE) {{
+            const int p = base + lane;
+            const int g = p < order_end ? reg_order.data[p] : -1;
+            const bool act = g >= 0 && reg_state.data[g] != {int(REGION_LEFT)};
+            const unsigned votes = BALLOT(act);
+            if (act) reg_walk.data[s0 + acting + BELOW(votes)] = g;
+            acting += COUNT(votes);
+        }}
+        int placed = acting;
+        for (int base = s0; base < order_end; base += STRIDE) {{
+            const int p = base + lane;
+            const int g = p < order_end ? reg_order.data[p] : -1;
+            const bool out = g >= 0 && reg_state.data[g] == {int(REGION_LEFT)};
+            const unsigned votes = BALLOT(out);
+            if (out) reg_walk.data[s0 + placed + BELOW(votes)] = g;
+            placed += COUNT(votes);
+        }}
+        SYNC();
+        for (int p = s0 + lane; p < s0 + acting; p += STRIDE) {{
+            const wp::vec2i sides = reg_body.data[reg_walk.data[p]];
+            body_level.data[sides[0]] = 0;
+            if (sides[1] >= 0) body_level.data[sides[1]] = 0;
+        }}
+        SYNC();
+        if (lane == 0) {{
+            int count = 0;
+            for (int p = s0; p < s0 + acting; ++p) {{
+                const int g = reg_walk.data[p];
+                const wp::vec2i sides = reg_body.data[g];
+                int level = body_level.data[sides[0]];
+                if (sides[1] >= 0) level = wp::max(level, body_level.data[sides[1]]);
+                reg_level.data[g] = level;
+                body_level.data[sides[0]] = level + 1;
+                if (sides[1] >= 0) body_level.data[sides[1]] = level + 1;
+                count = wp::max(count, level + 1);
+            }}
+            for (int k = 0; k < count; ++k) level_end.data[s0 + k] = 0;
+            for (int p = s0; p < s0 + acting; ++p) level_end.data[s0 + reg_level.data[reg_walk.data[p]]] += 1;
+            for (int k = 0, start = s0; k < count; ++k) {{
+                const int n = level_end.data[s0 + k];
+                level_end.data[s0 + k] = start;
+                start += n;
+            }}
+            for (int p = s0; p < s0 + acting; ++p) {{
+                const int g = reg_walk.data[p];
+                level_region.data[level_end.data[s0 + reg_level.data[g]]++] = g;
+            }}
+            world_levels.data[world] = count;
+        }}
+        SYNC();
     }}
 }}"""
     return indent(text, pad)
