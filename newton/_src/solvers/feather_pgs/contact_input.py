@@ -78,6 +78,8 @@ CONTACT_INPUT = (
     # contacts take its and its partner's stiffness and damping by MuJoCo's rule (row_laws.authored_contact_law).
     Field("authored", wp.int32, owner="laws", attr="authored_materials"),
     Field("shape_flags", wp.int32, ("shape",), owner="laws"),
+    # Each shape's tracking word (tracking_volumes): 1 where its contacts take no rows; empty where no shape tracks.
+    Field("tracking", wp.int32, ("shape",), owner="laws", attr="shape_tracking"),
     Field("material_ke", wp.float32, ("shape",), owner="laws", attr="shape_material_ke"),
     Field("material_kd", wp.float32, ("shape",), owner="laws", attr="shape_material_kd"),
     # Contact torsion: 1 gives every friction contact the authored torsional coefficient, 0 none.

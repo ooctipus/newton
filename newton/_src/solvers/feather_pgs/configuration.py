@@ -157,5 +157,6 @@ def check_options(init, options: Mapping[str, Any]):
     elif not isinstance(diagnostics, Diagnostics):
         raise TypeError(f"diagnostics must be None or a SolverFeatherPGS.Diagnostics, got {type(diagnostics).__name__}")
     checked["diagnostics"] = diagnostics
+    checked["tracking_volumes"] = tuple(sorted({int(shape) for shape in options["tracking_volumes"] or ()}))
     names = tuple(declared_options(init))
     return _record(names)(**{name: checked.get(name, options[name]) for name in names})

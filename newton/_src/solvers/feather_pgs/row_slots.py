@@ -16,6 +16,7 @@ from .contact_laws import (
     contact_materials,
     contact_points,
     contact_responds,
+    contact_tracked,
     jacobian_entry,
 )
 from .device_preludes import (
@@ -104,7 +105,8 @@ def _admit_contact(
 
     A contact needs an endpoint that responds to its impulses, one world (not
     two, nor none without an articulation) and a gap within the normal gap limit. A contact without a responding
-    endpoint has no world (-1): its body pair never takes rows.
+    endpoint has no world (-1): its body pair never takes rows. Nor does a contact on a tracking volume
+    (:func:`.contact_laws.contact_tracked`): it is made and reported, and exerts nothing.
     Its normal row separates where its residual at the predictor (the body ``twists`` it publishes; none: never) does
     (:func:`.row_laws.separates`), and its friction and spin rows, bounded by a finite non-negative coefficient of
     its ring's load, keep zero with it. The residual's bias is the row's law: an authored material's rhs
@@ -116,7 +118,7 @@ def _admit_contact(
     responds_a = contact_responds(art_a, body_a, data.response_dofs, body_has_response_dofs, body_flags)
     responds_b = contact_responds(art_b, body_b, data.response_dofs, body_has_response_dofs, body_flags)
     phi = float(0.0)
-    if not (responds_a or responds_b):
+    if not (responds_a or responds_b) or contact_tracked(data.shape0[c], data.shape1[c], data.tracking):
         world = -1
     admitted = world >= 0
     separating = False

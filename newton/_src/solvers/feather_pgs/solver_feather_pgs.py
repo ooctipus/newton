@@ -16,6 +16,7 @@
 import copy
 import dataclasses
 import sys
+from collections.abc import Sequence
 
 import numpy as np
 import warp as wp
@@ -236,6 +237,7 @@ class SolverFeatherPGS(SolverBase):
         friction_anchor_beta: float | None = None,
         contact_torsion: bool = False,
         contact_compliance: bool = False,
+        tracking_volumes: Sequence[int] | None = None,
         diagnostics: Diagnostics | None = None,
         pins: Pins | None = None,
     ):
@@ -396,6 +398,11 @@ class SolverFeatherPGS(SolverBase):
                 Restitution coefficients are averaged across the two shapes after clamping finite values to
                 ``[0, 1]``; non-finite values are treated as zero. Set the threshold to zero to apply restitution
                 to every closing impact. Defaults to 0.5 m/s.
+            tracking_volumes: Shapes that detect overlaps without a contact response, such as trigger or scanner
+                volumes. The collision pipeline makes their contacts as usual and the solver builds no row from them:
+                read the overlaps from the :class:`~newton.Contacts` buffer (their solved force is zero). A contact on
+                a volume overlaps where its separation, the distance between its world points along the normal less
+                both margins, is at most zero. ``None`` names none.
             diagnostics: What the solver reads out beside the step (:class:`Diagnostics`): NVTX ranges, stage-3
                 snapshots, row watermarks, the overflow warning, the sweep readout, the audit and synchronized
                 timings. None changes a computed value. ``None`` takes the defaults (only the

@@ -68,7 +68,7 @@ from ...geometry.contact_sort import body_pair_codes, pair_key_stride
 from ...sim.contacts import GENERATION_SENTINEL
 from . import field_group
 from .contact_filters import contact_normal_gap_limit
-from .contact_laws import contact_bodies, contact_point, contact_points, contact_tangent_basis
+from .contact_laws import contact_bodies, contact_point, contact_points, contact_tangent_basis, contact_tracked
 from .device_preludes import (
     lane_ballot,
     lane_below,
@@ -364,6 +364,9 @@ class _PatchContacts:
     articulation_pair_gap_gate: float
     friction_gap: float
     key_stride: int
+    # Each shape's tracking word (:func:`.contact_laws.contact_tracked`), empty where no shape tracks: a contact on a
+    # tracking volume takes no rows, so it neither joins a region's friction nor carries it.
+    tracking: wp.array[int]
 
 
 @wp.func
@@ -447,7 +450,7 @@ def _prepare_contact_fields(
         inputs.articulation_pair_gap_gate,
         inputs.same_articulation_gap_gate,
     )
-    eligible = gap <= normal_gap_limit and gap <= inputs.friction_gap
+    eligible = gap <= normal_gap_limit and gap <= inputs.friction_gap and not contact_tracked(sa, sb, inputs.tracking)
     # Friction-only filters suppress rows without ending contact support;
     # filtered regions must still be able to carry their anchor history.
     if kept == 0:
@@ -2197,9 +2200,10 @@ class _FrictionPatchState:
         same_articulation_gap_gate=0.0,
         articulation_pair_gap_gate=0.0,
         friction_gap=float("inf"),
+        tracking=None,
     ):
         """Build the current patch frame from ``contacts``, in the collision pipeline's order (see
-        :class:`_FrictionPatchState`)."""
+        :class:`_FrictionPatchState`); ``tracking`` is each shape's tracking word (``None`` where no shape tracks)."""
         bodies = 0 if state.body_q is None else state.body_q.shape[0]
         if pair_key_stride(bodies, model.shape_body.shape[0]) != self.key_stride:
             raise ValueError(
@@ -2219,6 +2223,7 @@ class _FrictionPatchState:
             same_articulation_gap_gate=same_articulation_gap_gate,
             articulation_pair_gap_gate=articulation_pair_gap_gate,
             friction_gap=friction_gap,
+            tracking=tracking,
         )
         generation = getattr(contacts, "contact_generation", None)
         if generation is None:
@@ -2340,6 +2345,7 @@ class _FrictionPatchState:
         same_articulation_gap_gate=0.0,
         articulation_pair_gap_gate=0.0,
         friction_gap=float("inf"),
+        tracking=None,
     ):
         """Return the inputs of :func:`_prepare` that ``contacts`` and :meth:`build`'s gates give."""
         inputs = _PatchContacts()
@@ -2359,6 +2365,7 @@ class _FrictionPatchState:
         inputs.articulation_pair_gap_gate = articulation_pair_gap_gate
         inputs.friction_gap = friction_gap
         inputs.key_stride = self.key_stride
+        inputs.tracking = tracking
         return [
             contacts.rigid_contact_count,
             inputs,

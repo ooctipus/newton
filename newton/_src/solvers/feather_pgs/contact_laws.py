@@ -106,6 +106,20 @@ def contact_endpoints(
     return body_a, body_b, art_a, art_b, world
 
 
+@wp.func
+def contact_tracked(shape_a: int, shape_b: int, tracking: wp.array[int]) -> bool:
+    """Return whether a contact touches a tracking volume (``SolverFeatherPGS(tracking_volumes=...)``, ``tracking``
+    one word a shape, empty where the model has none): its contact is made and reported, and takes no rows."""
+    if tracking.shape[0] == 0:
+        return False
+    tracked = False
+    if shape_a >= 0:
+        tracked = tracking[shape_a] != 0
+    if shape_b >= 0:
+        tracked = tracked or tracking[shape_b] != 0
+    return tracked
+
+
 @CONTACT_LAW.law
 def contact_responds(
     art: int,

@@ -293,6 +293,7 @@ class RowLaws:
         else:
             laws.shape_material_restitution = wp.zeros((1,), dtype=wp.float32, device=model.device)
         laws._authored_materials(model)
+        laws._tracking_volumes(model, options)
         laws.friction_patches = None
         return laws
 
@@ -338,6 +339,19 @@ class RowLaws:
             placeholder = wp.zeros((1,), dtype=wp.float32, device=model.device)
             self.shape_flags = wp.zeros((1,), dtype=wp.int32, device=model.device)
             self.shape_material_ke = self.shape_material_kd = placeholder
+
+    def _tracking_volumes(self, model, options) -> None:
+        """Tracking volumes (``tracking_volumes``): each shape's tracking word, 1 where its contacts take no rows, which
+        the admission and the friction patches read (:func:`.contact_laws.contact_tracked`); ``None`` (an empty
+        operand) where no shape tracks, so a model without one admits its contacts as before."""
+        volumes = np.asarray(options.tracking_volumes, dtype=np.int64)
+        if volumes.size and (volumes.min() < 0 or volumes.max() >= model.shape_count):
+            raise ValueError(f"tracking_volumes must name shapes of the model (0 to {model.shape_count - 1})")
+        self.shape_tracking = None
+        if volumes.size:
+            tracking = np.zeros(model.shape_count, dtype=np.int32)
+            tracking[volumes] = 1
+            self.shape_tracking = wp.array(tracking, dtype=wp.int32, device=model.device)
 
     def decide(self, *, preelimination: bool) -> None:
         """Read the route table's laws axis (:attr:`set`) once the bilateral pre-elimination is decided."""
@@ -995,6 +1009,7 @@ class RowLaws:
                 same_articulation_gap_gate=solver.options.same_articulation_contact_gap_gate,
                 articulation_pair_gap_gate=solver.options.articulation_pair_contact_gap_gate,
                 friction_gap=solver.options.contact_friction_gap_threshold,
+                tracking=self.shape_tracking,
             )
 
     def link_regions(self, solver, contacts):
