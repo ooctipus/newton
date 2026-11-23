@@ -61,8 +61,14 @@ import warp as wp
 
 from ...core import memory
 from ...core.execution import Shape, Work, launch, shape
-from ...sim import BodyFlags, Control, Model, ModelBuilder, State
-from ...sim.articulation import eval_articulation_ik, eval_fk, eval_ik
+from ...sim import BodyFlags, Control, JointType, Model, ModelBuilder, State
+from ...sim.articulation import (
+    compute_3d_rotational_dofs,
+    eval_articulation_ik,
+    eval_fk,
+    eval_ik,
+    invert_3d_rotational_dofs,
+)
 from . import host_index
 from .tree_plan import TreePlan
 
@@ -203,6 +209,94 @@ def _take_roots(
         joint_q[q_start[r] + k] = pose[k]
     for k in range(6):
         joint_qd[qd_start[r] + k] = twist[k]
+
+
+@wp.struct
+class _Spheres:
+    """The free spheres (:func:`_free_spheres`): each one's forest joint and tree, whether its tree is loose, and its
+    coordinates' and speeds' starts in the caller's layout (three Euler angles and rates) and the forest's (a ball's
+    quaternion and spin)."""
+
+    joint: wp.array[int]
+    tree: wp.array[int]
+    loose: wp.array[int]
+    caller_q: wp.array[int]
+    caller_qd: wp.array[int]
+    forest_q: wp.array[int]
+    forest_qd: wp.array[int]
+
+
+@wp.kernel(enable_backward=False)
+def _spheres_in(
+    spheres: _Spheres,
+    valid: wp.array[int],
+    joint_parent: wp.array[int],
+    joint_child: wp.array[int],
+    joint_X_p: wp.array[wp.transform],
+    joint_X_c: wp.array[wp.transform],
+    joint_axis: wp.array[wp.vec3],
+    body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+    caller_q: wp.array[float],
+    caller_qd: wp.array[float],
+    joint_q: wp.array[float],
+    joint_qd: wp.array[float],
+):
+    """Each free sphere's ball coordinates and spin (in its parent frame) at the enter: where the step re-derives its
+    tree's kinematics, from the caller's Euler angles and rates (Newton's D6 forward kinematics, smooth everywhere);
+    else from its bodies, as a ball joint's inverse kinematics reads them (a loose tree's always: its state is its
+    bodies')."""
+    k = wp.tid()
+    j = spheres.joint[k]
+    rotation = wp.quat_identity()
+    spin = wp.vec3(0.0)
+    if spheres.loose[k] == 0 and valid[spheres.tree[k]] == 0:
+        a = spheres.forest_qd[k]
+        q = spheres.caller_q[k]
+        qd = spheres.caller_qd[k]
+        rotation, spin = compute_3d_rotational_dofs(
+            joint_axis[a], joint_axis[a + 1], joint_axis[a + 2],
+            caller_q[q], caller_q[q + 1], caller_q[q + 2], caller_qd[qd], caller_qd[qd + 1], caller_qd[qd + 2],
+        )  # fmt: skip
+    else:
+        parent = joint_parent[j]
+        frame = joint_X_p[j]
+        parent_spin = wp.vec3(0.0)
+        if parent >= 0:
+            frame = body_q[parent] * frame
+            parent_spin = wp.spatial_bottom(body_qd[parent])
+        child = joint_child[j]
+        q_p = wp.transform_get_rotation(frame)
+        rotation = wp.quat_inverse(q_p) * wp.transform_get_rotation(body_q[child] * joint_X_c[j])
+        spin = wp.quat_rotate_inv(q_p, wp.spatial_bottom(body_qd[child]) - parent_spin)
+    for i in range(4):
+        joint_q[spheres.forest_q[k] + i] = rotation[i]
+    for i in range(3):
+        joint_qd[spheres.forest_qd[k] + i] = spin[i]
+
+
+@wp.kernel(enable_backward=False)
+def _spheres_out(
+    spheres: _Spheres,
+    joint_axis: wp.array[wp.vec3],
+    joint_q: wp.array[float],
+    joint_qd: wp.array[float],
+    caller_q: wp.array[float],
+    caller_qd: wp.array[float],
+):
+    """Each free sphere's Euler angles and rates for the caller, from its ball coordinates and spin (Newton's D6
+    inverse kinematics): the caller's readout, singular where the middle angle is at a right angle (its rates there)."""
+    k = wp.tid()
+    q = spheres.forest_q[k]
+    qd = spheres.forest_qd[k]
+    rotation = wp.quat(joint_q[q], joint_q[q + 1], joint_q[q + 2], joint_q[q + 3])
+    spin = wp.vec3(joint_qd[qd], joint_qd[qd + 1], joint_qd[qd + 2])
+    angles, rates = invert_3d_rotational_dofs(
+        joint_axis[qd], joint_axis[qd + 1], joint_axis[qd + 2], wp.quat_identity(), rotation, spin
+    )
+    for i in range(3):
+        caller_q[spheres.caller_q[k] + i] = angles[i]
+        caller_qd[spheres.caller_qd[k] + i] = rates[i]
 
 
 @wp.kernel(enable_backward=False)
@@ -353,41 +447,81 @@ def _loose_trees(model: Model) -> SimpleNamespace | None:
     )
 
 
-def _rooted(model: Model, loose: SimpleNamespace) -> Model:
-    """``model`` with its loose trees (:func:`_loose_trees`): their joints in new articulations past the model's, each
-    added root a free joint (as :meth:`~newton.ModelBuilder.add_joint_free` makes it, on the world with identity
-    frames) past the model's joints, its coordinates past theirs."""
+_FREE_LIMIT = 1.0e6
+"""A coordinate limit at or past this magnitude bounds nothing: the coordinate is free."""
+
+
+def _free_spheres(model: Model) -> np.ndarray:
+    """The model's D6 joints that are ball joints: no linear axis and three angular axes, each free (no limit, no drive
+    target gain, no passive spring or damper). Their Euler coordinates have a singular configuration (the middle angle
+    at a right angle) that the joint does not: the forest holds them as ball joints (a quaternion), and the Euler
+    coordinates are the caller's readout only (:meth:`BodyCut.enter`, :meth:`BodyCut.leave`)."""
+    if not model.joint_count:
+        return np.zeros(0, dtype=np.int64)
+    dims = model.joint_dof_dim.numpy()
+    candidates = np.flatnonzero((model.joint_type.numpy() == int(JointType.D6)) & (dims[:, 0] == 0) & (dims[:, 1] == 3))
+    if not candidates.size:
+        return candidates
+    dofs = model.joint_qd_start.numpy()[candidates][:, None] + np.arange(3)
+    free = (model.joint_limit_lower.numpy()[dofs] <= -_FREE_LIMIT) & (
+        model.joint_limit_upper.numpy()[dofs] >= _FREE_LIMIT
+    )
+    for name in ("joint_target_ke", "joint_target_kd", "joint_stiffness", "joint_damping"):
+        values = getattr(model, name, None)
+        if values is not None:
+            free &= values.numpy()[dofs] == 0.0
+    return candidates[np.all(free, axis=1)]
+
+
+def _restructured(model: Model, loose: SimpleNamespace | None, spheres: np.ndarray) -> Model:
+    """``model`` as the cut reads it: its loose trees rooted (:func:`_loose_trees`: their joints in new articulations
+    past the model's, each added root a free joint, as :meth:`~newton.ModelBuilder.add_joint_free` makes it, on the
+    world with identity frames, past the model's joints, its coordinates past theirs), and its free spheres
+    (:func:`_free_spheres`) ball joints, their four coordinates past those. A joint's coordinates are then
+    ``_coord_first`` and ``_coord_width`` (an added or a sphere's need not follow its neighbour's)."""
     builder = ModelBuilder()
     builder.add_body()
+    link = builder.add_link()
+    builder.add_articulation([builder.add_joint_ball(-1, link)])
     template = builder.finalize(device="cpu")
-    added, device = loose.roots.size, model.device
-    widths = {_F.JOINT: 1, _F.JOINT_DOF: 6, _F.JOINT_COORD: 7, _F.ARTICULATION: 1}
-    rows = {_F.JOINT: added, _F.JOINT_DOF: 6 * added, _F.JOINT_COORD: 7 * added, _F.ARTICULATION: loose.trees}
+    added = 0 if loose is None else loose.roots.size
+    trees = 0 if loose is None else loose.trees
+    device = model.device
+    # Each frequency's appended rows and the template's rows that fill them (the free joint's, then the ball's).
+    stencils = {
+        _F.JOINT: ((0, 1, added),),
+        _F.JOINT_DOF: ((0, 6, added),),
+        _F.JOINT_COORD: ((0, 7, added), (7, 11, spheres.size)),
+        _F.ARTICULATION: ((0, 1, trees),),
+    }
     starts = ("joint_q_start", "joint_qd_start", "articulation_start", "articulation_end")
     rooted = copy.copy(model)
     for name, spec in model.attribute_specs.items():
-        if spec.frequency not in rows or name in starts:
+        if spec.frequency not in stencils or name in starts:
             continue
         value = getattr(model, name, None)
-        if value is None:
+        if value is None or len(value) != model.attribute_frequency_count(spec.frequency):
             continue
-        if len(value) != model.attribute_frequency_count(spec.frequency):
-            continue
-        width, extra = widths[spec.frequency], rows[spec.frequency]
         stencil = getattr(template, name, None)
         if isinstance(value, list):
-            fill = stencil if isinstance(stencil, list) and len(stencil) == width else [None] * width
-            setattr(rooted, name, [*value, *(fill[k % width] for k in range(extra))])
+            tail = [
+                stencil[first + k % (stop - first)] if isinstance(stencil, list) and len(stencil) >= stop else None
+                for first, stop, copies in stencils[spec.frequency]
+                for k in range(copies * (stop - first))
+            ]
+            setattr(rooted, name, [*value, *tail])
             continue
         host = value.numpy()
-        if isinstance(stencil, wp.array) and len(stencil) == width and stencil.dtype == value.dtype:
-            stencil = stencil.numpy()
-            tail = np.tile(stencil, (extra // width,) + (1,) * (stencil.ndim - 1))
-        else:
-            tail = np.zeros((extra, *host.shape[1:]), dtype=host.dtype)
-        setattr(rooted, name, wp.array(np.concatenate((host, tail)), dtype=value.dtype, device=device))
+        tails = []
+        for first, stop, copies in stencils[spec.frequency]:
+            if isinstance(stencil, wp.array) and len(stencil) >= stop and stencil.dtype == value.dtype:
+                rows = stencil.numpy()[first:stop]
+                tails.append(np.tile(rows, (copies,) + (1,) * (rows.ndim - 1)))
+            else:
+                tails.append(np.zeros((copies * (stop - first), *host.shape[1:]), dtype=host.dtype))
+        setattr(rooted, name, wp.array(np.concatenate((host, *tails)), dtype=value.dtype, device=device))
 
-    joints, trees = model.joint_count, model.articulation_count
+    joints, articulations = model.joint_count, model.articulation_count
     count = joints + added
 
     def edit(name, rows, values, dtype=wp.int32):
@@ -395,32 +529,36 @@ def _rooted(model: Model, loose: SimpleNamespace) -> Model:
         host[rows] = values
         setattr(rooted, name, wp.array(host, dtype=dtype, device=device))
 
-    added_rows = np.arange(joints, count)
-    edit("joint_child", added_rows, loose.roots)
-    edit("joint_parent", added_rows, -1)
-    edit("joint_articulation", loose.order, trees + loose.tree)
-    edit("joint_ancestor", loose.order, loose.ancestor)
-    identity = np.array(wp.transform_identity(), dtype=np.float32)
-    edit("joint_X_p", added_rows, identity, wp.transform)
-    edit("joint_X_c", added_rows, identity, wp.transform)
-    body_world = model.body_world.numpy()
-    edit("joint_world", added_rows, body_world[loose.roots])
-    edit("articulation_world", np.arange(trees, trees + loose.trees), body_world[loose.root_body])
-    for name, width, total in (
-        ("joint_q_start", 7, model.joint_coord_count),
-        ("joint_qd_start", 6, model.joint_dof_count),
-    ):
-        host = getattr(model, name).numpy()
-        tail = total + width * np.arange(added + 1, dtype=host.dtype)
-        setattr(rooted, name, wp.array(np.concatenate((host[:-1], tail)), dtype=wp.int32, device=device))
+    q_start, qd_start = model.joint_q_start.numpy(), model.joint_qd_start.numpy()
+    first = np.concatenate((q_start[:-1], model.joint_coord_count + 7 * np.arange(added)))
+    width = np.concatenate((np.diff(q_start), np.full(added, 7)))
+    if spheres.size:
+        edit("joint_type", spheres, int(JointType.BALL))
+        first[spheres] = model.joint_coord_count + 7 * added + 4 * np.arange(spheres.size)
+        width[spheres] = 4
+    rooted._coord_first, rooted._coord_width = first.astype(np.int64), width.astype(np.int64)
+    if loose is not None:
+        added_rows = np.arange(joints, count)
+        edit("joint_child", added_rows, loose.roots)
+        edit("joint_parent", added_rows, -1)
+        edit("joint_articulation", loose.order, articulations + loose.tree)
+        edit("joint_ancestor", loose.order, loose.ancestor)
+        identity = np.array(wp.transform_identity(), dtype=np.float32)
+        edit("joint_X_p", added_rows, identity, wp.transform)
+        edit("joint_X_c", added_rows, identity, wp.transform)
+        body_world = model.body_world.numpy()
+        edit("joint_world", added_rows, body_world[loose.roots])
+        edit("articulation_world", np.arange(articulations, articulations + trees), body_world[loose.root_body])
+        dof_tail = model.joint_dof_count + 6 * np.arange(added + 1)
+        rooted.joint_qd_start = wp.array(np.concatenate((qd_start[:-1], dof_tail)), dtype=wp.int32, device=device)
     rooted.joint_count = count
     rooted.joint_dof_count = model.joint_dof_count + 6 * added
-    rooted.joint_coord_count = model.joint_coord_count + 7 * added
-    rooted.articulation_count = trees + loose.trees
+    rooted.joint_coord_count = model.joint_coord_count + 7 * added + 4 * spheres.size
+    rooted.articulation_count = articulations + trees
     return rooted
 
 
-def _topology(model: Model, loose: SimpleNamespace | None = None) -> SimpleNamespace | None:
+def _topology(model: Model, loose: SimpleNamespace | None = None, forced: bool = False) -> SimpleNamespace | None:
     """The forest of ``model``'s trees and loop joints, or ``None`` when ``model`` already is one.
 
     A loop joint is a joint outside every tree whose child a tree holds (any other such joint stands outside the
@@ -443,11 +581,7 @@ def _topology(model: Model, loose: SimpleNamespace | None = None) -> SimpleNames
     body_joint[child[owned]] = joints[owned]
     loops = np.flatnonzero(~owned & (child >= 0))
     loops = loops[body_joint[child[loops]] >= 0]
-    if (
-        loose is None
-        and not loops.size
-        and not np.any(np.bincount(articulation[owned & (ancestor < 0)], minlength=1) > 1)
-    ):
+    if not forced and not loops.size and not np.any(np.bincount(articulation[owned & (ancestor < 0)], minlength=1) > 1):
         return None
 
     root = TreePlan.build(np.where(owned, ancestor, -1)).root_of
@@ -488,11 +622,12 @@ def _topology(model: Model, loose: SimpleNamespace | None = None) -> SimpleNames
     )
 
 
-def _coordinates(starts: np.ndarray, order: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """The coordinates of the joints ``order``, in that order, and their joints' starts among them."""
-    widths = np.diff(starts)[order]
+def _coordinates(first: np.ndarray, width: np.ndarray, order: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """The coordinates of the joints ``order`` (each joint's ``width`` from its ``first``), in that order, and their
+    joints' starts among them."""
+    widths = np.asarray(width)[order]
     joint, rank = host_index.expand(widths)
-    return (starts[order][joint] + rank).astype(np.int32), host_index.offsets(widths, np.int32)
+    return (np.asarray(first)[order][joint] + rank).astype(np.int32), host_index.offsets(widths, np.int32)
 
 
 def _gathered(value, order: np.ndarray):
@@ -531,10 +666,11 @@ class BodyCut:
         """The cut of ``model`` (the module docstring)."""
         cut = cls(model)
         loose = _loose_trees(model)
-        rooted = model if loose is None else _rooted(model, loose)
-        topology = _topology(rooted, loose) if model.joint_count else None
+        spheres = _free_spheres(model)
+        rooted = model if loose is None and not spheres.size else _restructured(model, loose, spheres)
+        topology = _topology(rooted, loose, forced=rooted is not model) if model.joint_count else None
         if topology is not None:
-            cut._cut(topology, rooted, loose)
+            cut._cut(topology, rooted, loose, spheres)
         return cut
 
     @property
@@ -550,9 +686,12 @@ class BodyCut:
         linked[self.tree_shadow] = True
         return linked
 
-    def _cut(self, topology: SimpleNamespace, source: Model, loose: SimpleNamespace | None) -> None:
-        """Build the forest of ``topology`` from ``source``: the caller's model, or it with its loose trees rooted
-        (:func:`_rooted`), whose added joints' items the step's gathers and publications skip."""
+    def _cut(
+        self, topology: SimpleNamespace, source: Model, loose: SimpleNamespace | None, spheres: np.ndarray
+    ) -> None:
+        """Build the forest of ``topology`` from ``source``: the caller's model, or it restructured
+        (:func:`_restructured`: its loose trees rooted, its free spheres ball joints), whose added joints' items and
+        spheres' state the step's gathers and publications skip (the spheres' state crosses by its conversion)."""
         caller = self.source
         device = source.device
         loops, order, position = topology.loops, topology.order, topology.position
@@ -563,8 +702,12 @@ class BodyCut:
         self._position = position
         self._anchored = loops[~topology.on_tree & (source.joint_parent.numpy()[loops] >= 0)]
 
-        coords, q_start = _coordinates(source.joint_q_start.numpy(), order)
-        dofs, qd_start = _coordinates(source.joint_qd_start.numpy(), order)
+        q_starts = source.joint_q_start.numpy()
+        coords, q_start = _coordinates(
+            getattr(source, "_coord_first", q_starts[:-1]), getattr(source, "_coord_width", np.diff(q_starts)), order
+        )
+        qd_starts = source.joint_qd_start.numpy()
+        dofs, qd_start = _coordinates(qd_starts[:-1], np.diff(qd_starts), order)
         bodies = np.concatenate((np.arange(source.body_count), self.primary))
         self._orders = {
             _F.BODY: bodies,
@@ -650,10 +793,18 @@ class BodyCut:
             return wp.array(np.asarray(values) < count, dtype=wp.bool, device=device)
 
         in_joints = caller_items(order, caller.joint_count)
-        in_dofs, in_coords = (
-            caller_items(dofs.numpy(), caller.joint_dof_count),
-            caller_items(coords.numpy(), caller.joint_coord_count),
+        # A free sphere's speeds are its spin as a ball joint's, its Euler rates the caller's: they cross converted.
+        sphere_dofs = np.zeros(caller.joint_dof_count + 1, dtype=bool)
+        caller_qd = caller.joint_qd_start.numpy()
+        for joint in spheres:
+            sphere_dofs[caller_qd[joint] : caller_qd[joint + 1]] = True
+        forest_dofs = dofs.numpy()
+        in_dofs = wp.array(
+            (forest_dofs < caller.joint_dof_count) & ~sphere_dofs[np.minimum(forest_dofs, caller.joint_dof_count)],
+            dtype=wp.bool,
+            device=device,
         )
+        in_coords = caller_items(coords.numpy(), caller.joint_coord_count)
         self._joint_map = mapped(order.size, indices(order), identity, in_joints)
         self._body_map = mapped(bodies.size, indices(bodies), identity)
         self._dof_map = mapped(dofs.shape[0], dofs, identity, in_dofs)
@@ -662,6 +813,19 @@ class BodyCut:
         self._publish_qd = mapped(qd_start[bounds[-1]], identity, dofs, in_dofs)
         # The loose trees: the added roots (their bodies, their coordinates' starts in the forest) and every loose
         # tree, whose joints follow its bodies where the step re-derives its kinematics.
+        self._spheres = None
+        if spheres.size:
+            sphere_joint = position[spheres]
+            loose_tree = np.zeros(topology.trees + 1, dtype=np.int32)
+            if loose is not None:
+                loose_tree[np.unique(topology.tree[np.isin(order, loose.order)])] = 1
+            record = _Spheres()
+            record.joint, record.tree = indices(sphere_joint), indices(topology.tree[sphere_joint])
+            record.loose = indices(loose_tree[topology.tree[sphere_joint]])
+            record.caller_q = indices(caller.joint_q_start.numpy()[spheres])
+            record.caller_qd = indices(caller_qd[spheres])
+            record.forest_q, record.forest_qd = indices(q_start[sphere_joint]), indices(qd_start[sphere_joint])
+            self._spheres = record
         self._roots = None
         if loose is not None:
             forest_joint = position[caller.joint_count + np.arange(loose.roots.size)]
@@ -881,6 +1045,27 @@ class BodyCut:
             device=device,
             tiled=False,
         )
+        if self._spheres is not None:
+            forest = self.model
+            wp.launch(
+                _spheres_in,
+                dim=self._spheres.joint.shape[0],
+                inputs=[
+                    self._spheres,
+                    cache_valid,
+                    forest.joint_parent,
+                    forest.joint_child,
+                    forest.joint_X_p,
+                    forest.joint_X_c,
+                    forest.joint_axis,
+                    forest_in.body_q,
+                    forest_in.body_qd,
+                    state_in.joint_q,
+                    state_in.joint_qd,
+                ],
+                outputs=[forest_in.joint_q, forest_in.joint_qd],
+                device=device,
+            )
         if self._roots is not None:
             self._follow_loose(forest_in, cache_valid)
         eval_fk(self.model, forest_in.joint_q, forest_in.joint_qd, forest_in, mask=self._seated_trees)
@@ -943,6 +1128,14 @@ class BodyCut:
         forest_in, forest_out = self.mirror(state_in), self.mirror(state_out)
         self._publish_q.move(forest_out.joint_q, state_out.joint_q)
         self._publish_qd.move(forest_out.joint_qd, state_out.joint_qd)
+        if self._spheres is not None:
+            wp.launch(
+                _spheres_out,
+                dim=self._spheres.joint.shape[0],
+                inputs=[self._spheres, self.model.joint_axis, forest_out.joint_q, forest_out.joint_qd],
+                outputs=[state_out.joint_q, state_out.joint_qd],
+                device=self.model.device,
+            )
         for state, mirror in ((state_in, forest_in), (state_out, forest_out)):
             wp.copy(state.body_q, mirror.body_q, count=count)
             wp.copy(state.body_qd, mirror.body_qd, count=count)

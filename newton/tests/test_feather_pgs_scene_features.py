@@ -17,7 +17,9 @@ its jointed children.
 
 Jointed bodies without a root joint or an articulation (``add_link`` and ``add_joint_*`` alone, as maximal-coordinate
 scenes build ragdolls and bridges): a figure falls freely, lands and rests with every joint closed; a bridge of hinged
-planks hangs between its two world hinges, a closed loop.
+planks hangs between its two world hinges, a closed loop. A D6 joint whose three angular axes are free is a ball joint,
+held as one: a pendulum on it swings through the Euler chart's singular configuration as on a ball joint, and a pile of
+D6 ragdolls follows the pile of ball-jointed ones.
 
 Joint reaction wrenches (Newton's ``BODY_PARENT_F`` observable): a hinge carries a hanging bob's weight, a released
 level rod's pivot a quarter of its weight, and a fixed platform its own weight and that of a box resting on it.
@@ -418,7 +420,8 @@ def test_loose_figure_falls_and_its_joints_hold(test, device):
 
 def test_loose_bridge_hangs_on_its_end_hinges(test, device):
     """Four planks hinged in a row between two hinges on the world, without an articulation: a closed loop the
-    solver roots at its first world hinge and closes at the other. It spans its gap under gravity, every hinge closed."""
+    solver roots at its first world hinge and closes at the other. It spans its gap under gravity, every hinge
+    closed."""
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, -_G))
     planks = [
         builder.add_link(xform=wp.transform(wp.vec3(-0.75 + 0.5 * k, 0.0, 1.0), wp.quat_identity())) for k in range(4)
@@ -449,6 +452,99 @@ def test_loose_bridge_hangs_on_its_end_hinges(test, device):
         heights.append(body_q[planks, 2].min())
     test.assertLess(max(gaps), 1.0e-4, "every hinge stays closed, the loop's too")
     test.assertGreater(min(heights), 1.0 - 5.0e-3, "the taut bridge holds its span")
+
+
+def _sphere_pendulum(device, kind: str):
+    """A pendulum released level on a D6 joint with three free angular axes (``"d6"``) or on a ball joint
+    (``"ball"``) at its pivot: its swing about the y axis reaches 90 degrees, the D6's middle Euler angle, at the
+    bottom."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -_G))
+    bob = builder.add_link(xform=wp.transform(wp.vec3(0.5, 0.0, 1.0), wp.quat_identity()))
+    builder.add_shape_sphere(bob, radius=0.05)
+    frames = {
+        "parent_xform": wp.transform(wp.vec3(0.0, 0.0, 1.0), wp.quat_identity()),
+        "child_xform": wp.transform(wp.vec3(-0.5, 0.0, 0.0), wp.quat_identity()),
+    }
+    if kind == "ball":
+        joint = builder.add_joint_ball(-1, bob, **frames)
+    else:
+        axes = [newton.ModelBuilder.JointDofConfig.create_unlimited(axis) for axis in newton.Axis]
+        joint = builder.add_joint_d6(-1, bob, angular_axes=axes, **frames)
+    builder.add_articulation([joint])
+    return builder.finalize(device=device), bob
+
+
+def test_free_d6_swings_through_its_singular_angles(test, device):
+    """A pendulum on a D6 with three free angular axes swings through the bottom (its middle Euler angle at 90
+    degrees, where the Euler chart is singular) exactly as on a ball joint, its length kept; its published Euler angles
+    give the pendulum's pose by Newton's D6 forward kinematics."""
+    poses = {}
+    for kind in ("d6", "ball"):
+        model, bob = _sphere_pendulum(device, kind)
+        solver = newton.solvers.SolverFeatherPGS(model)
+        state_in, state_out, control = model.state(), model.state(), model.control()
+        poses[kind] = []
+        for _ in range(300):
+            solver.step(state_in, state_out, control, None, _DT)
+            state_in, state_out = state_out, state_in
+            poses[kind].append(state_in.body_q.numpy()[bob].copy())
+        if kind == "d6":
+            published = model.state()
+            newton.eval_fk(model, state_in.joint_q, state_in.joint_qd, published)
+            np.testing.assert_allclose(published.body_q.numpy()[bob], state_in.body_q.numpy()[bob], atol=1.0e-5)
+    d6, ball = np.array(poses["d6"]), np.array(poses["ball"])
+    test.assertTrue(np.isfinite(d6).all())
+    test.assertLess(d6[:, 2].min(), 0.5 + 1.0e-3, "the bob swings through the bottom")
+    np.testing.assert_allclose(np.linalg.norm(d6[:, :3] - [0.0, 0.0, 1.0], axis=1), 0.5, atol=1.0e-5)
+    np.testing.assert_allclose(d6, ball, atol=1.0e-6)
+
+
+def test_pile_of_d6_figures_follows_the_ball_jointed_pile(test, device):
+    """Two layers of figures whose limbs hang on D6 joints with three free angular axes (as maximal-coordinate
+    ragdoll piles build them, without an articulation) land on each other and on the floor as the same figures on ball
+    joints do:
+    the same motion until their contacts amplify the two holds' rounding (a pile is chaotic: the gap grows from 2e-7 m
+    at 0.05 s past 1e-4 m after 0.5 s), then finite, every joint closed, nothing sunk into the floor."""
+    piles, closure = {}, {}
+    angular = [newton.ModelBuilder.JointDofConfig.create_unlimited(axis) for axis in newton.Axis]
+    for kind in ("d6", "ball"):
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -_G))
+        builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=_MU))
+        for figure in range(4):
+            offset = np.array([0.6 * (figure % 2), 0.0, 1.6 * (figure // 2)])
+            cfg = newton.ModelBuilder.ShapeConfig(mu=_MU, collision_group=-(figure + 1))
+            bodies = []
+            for _name, centre, half in _FIGURE:
+                bodies.append(
+                    builder.add_link(xform=wp.transform(wp.vec3(*(np.add(centre, offset))), wp.quat_identity()))
+                )
+                builder.add_shape_box(bodies[-1], hx=half[0], hy=half[1], hz=half[2], cfg=cfg)
+            for limb, pivot in _PIVOTS:
+                frames = {
+                    "parent_xform": wp.transform(wp.vec3(*np.subtract(pivot, _FIGURE[0][1])), wp.quat_identity()),
+                    "child_xform": wp.transform(wp.vec3(*np.subtract(pivot, _FIGURE[limb][1])), wp.quat_identity()),
+                }
+                if kind == "d6":
+                    builder.add_joint_d6(bodies[0], bodies[limb], angular_axes=angular, **frames)
+                else:
+                    builder.add_joint_ball(bodies[0], bodies[limb], **frames)
+        model = builder.finalize(device=device, skip_validation_joints=True)
+        solver = newton.solvers.SolverFeatherPGS(model, dense_max_constraints=1024)
+        pipeline = newton.CollisionPipeline(model)
+        contacts = pipeline.contacts()
+        state_in, state_out, control = model.state(), model.state(), model.control()
+        poses, gaps = [], []
+        for _ in range(240):
+            pipeline.collide(state_in, contacts)
+            solver.step(state_in, state_out, control, contacts, _DT)
+            state_in, state_out = state_out, state_in
+            poses.append(state_in.body_q.numpy().copy())
+            gaps.append(_joint_gaps(model, poses[-1]).max())
+        piles[kind], closure[kind] = np.array(poses), max(gaps)
+    test.assertTrue(np.isfinite(piles["d6"]).all())
+    test.assertGreater(piles["d6"][:, :, 2].min(), 0.04, "no box sinks into the floor")
+    test.assertLess(closure["d6"], 1.0e-4, "every joint stays closed")
+    np.testing.assert_allclose(piles["d6"][:90], piles["ball"][:90], atol=1.0e-4)
 
 
 class TestFeatherPGSLooseBodies(unittest.TestCase):
@@ -550,7 +646,12 @@ for _fn in (test_box_falls_through_a_tracking_volume, test_sensor_shape_neither_
     add_function_test(TestFeatherPGSTrackingVolumes, _fn.__name__, _fn, devices=devices)
 for _fn in (test_body_state_drives_a_kinematic_pusher, test_body_state_drives_a_kinematic_root_and_its_children):
     add_function_test(TestFeatherPGSKinematicBodyState, _fn.__name__, _fn, devices=devices)
-for _fn in (test_loose_figure_falls_and_its_joints_hold, test_loose_bridge_hangs_on_its_end_hinges):
+for _fn in (
+    test_loose_figure_falls_and_its_joints_hold,
+    test_loose_bridge_hangs_on_its_end_hinges,
+    test_free_d6_swings_through_its_singular_angles,
+    test_pile_of_d6_figures_follows_the_ball_jointed_pile,
+):
     add_function_test(TestFeatherPGSLooseBodies, _fn.__name__, _fn, devices=devices)
 for _fn in (
     test_hinge_carries_a_hanging_load,
