@@ -449,10 +449,9 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
     # The rows a world's topology fixes (links, mimics, limits) are known once their families are written, before the
     # contacts: where the one writer walks the general placement's rows, it walks them beside the contact pass (Beside)
     # and the rest after it, the two parts joined before the rest (where a tier walks a world's rows, only a few:
-    # walk_rows.TOPOLOGY_BESIDE). Their diagonals start from zero before them.
+    # walk_rows.TOPOLOGY_BESIDE). Their diagonals start from zero before them: the topology rows' bound clears them.
     split = holds and route.support == "dense"
     topology = Beside(device) if split else None
-    clear = ((placement, "diagonals"),) if placement.clears_diagonals else ()
     walk = (laws, "write_walked", solver, STATE_IN, CONTACTS, DT)
     join = ((topology, "join"),) if topology is not None else ()
     rest_part = WRITE_ROWS if topology is None else WRITE_REST
@@ -506,7 +505,7 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
         (dynamics, "snapshots", "snapshots" in diagnostics, *snapshots),
         (dynamics, "wait_for_collision", not particles, (STEP, "wait_for_collision", device)),
         # Stage 4: the rows. The row pass (each family's slots and seeds, and each world's acts word), the status and the
-        # overflow warning; then the diagonals, the one writer (every walking class's: it walks the rows into their
+        # overflow warning; then the one writer (every walking class's: it walks the rows into their
         # placement's sink after the row pass, each row's rhs by the row law; the free bodies' writer runs in the row
         # pass, after their families' slots, beside the topology part), the patches' link once every contact row's
         # records are written, and the sweep's claims, which read the rows.
@@ -516,7 +515,7 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
         (s4, "prepare_fused_limits", spec.classes.fused_sizes, (laws, "prepare_fused_limits", solver, STATE_IN, DT)),
         (s4, "write_limits", limit_sizes, (laws, "write_limits", solver, STATE_IN, DT, limit_sizes)),
         (s4, "bound_topology", True, (laws, "bound_topology", solver)),
-        (s4, "write_topology_rows", topology is not None, *clear, (STEP, "beside", topology, *walk, WRITE_TOPOLOGY)),
+        (s4, "write_topology_rows", topology is not None, (STEP, "beside", topology, *walk, WRITE_TOPOLOGY)),
         (s4, "write_contacts", True, (laws, "write_contacts", solver, STATE_IN, factor, CONTACTS, DT, route.producer)),
         # The free bodies' run (their contacts) where a colored world holds one.
         (s4, "bound_free_body_contacts", run, (laws, "bound_free_body_contacts", solver)),
@@ -536,7 +535,6 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
         # kind and each row's streamed record once the row is final; only the free bodies' regions, whose rows their
         # fill writes, are linked here, before their listing reads the rings. The sparse diagonal's schedule reads the
         # rows the writer wrote and the marks of their slots.
-        (s4r, "diagonals", placement.clears_diagonals and topology is None, (placement, "diagonals")),
         (s4r, "write_walked", holds and not beside_rest, *join, (*walk, rest_part)),
         (s4r, "write_walked_beside", beside_rest, (STEP, "beside", topology, *walk, WRITE_REST)),
         (s4r, "link_regions", regions, (laws, "link_regions", solver, CONTACTS)),

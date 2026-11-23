@@ -64,7 +64,6 @@ from .row_slots import (
     RESERVE_LANES,
     admit_world_contacts,
     reserve_world_rows,
-    snapshot_topology_rows,
 )
 from .sweep_plan import FREE_ROUTE
 
@@ -660,14 +659,9 @@ class RowLaws:
 
     def bound_topology(self, solver) -> None:
         """Snapshot where each world's topology rows (mimics, links, limits) end and its contacts start
-        (``topology_rows``), where the row pass holds the dense rows' order."""
-        wp.launch(
-            snapshot_topology_rows,
-            dim=solver.forest.world_count,
-            inputs=[solver.placement.slot_counter],
-            outputs=[solver.placement.topology_rows],
-            device=solver.model.device,
-        )
+        (``topology_rows``), where the row pass holds the dense rows' order; the placement clears the dense rows'
+        diagonals in the same launch (:meth:`.placement.Placement.bound_topology`)."""
+        solver.placement.bound_topology()
 
     def write_contacts(
         self, solver, state_in: State, state_aug: State, contacts: Contacts, dt: float, producer: str

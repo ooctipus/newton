@@ -196,10 +196,25 @@ def _accumulate_row_capacity_telemetry(
 
 
 @wp.kernel
-def _clear_dense_diagonals(diag: wp.array2d[float]):
-    """Zero the dense rows' diagonals, ``dim = (lines, body_base)``: the free bodies' after them stay their writers'."""
-    line, row = wp.tid()
-    diag[line, row] = 0.0
+def _bound_topology(
+    slot_counter: wp.array[int],
+    cleared: int,
+    # outputs
+    topology_rows: wp.array[int],
+    diag: wp.array2d[float],
+):
+    """Record where each world's topology rows (mimics, links, joint limits) end and its contacts start, and zero its
+    first ``cleared`` dense rows' diagonals, ``dim = (worlds, max(cleared, 1))``: the free bodies' after them stay their
+    writers'.
+
+    Launched right after the joint-limit allocation, so the sweeps' and writers' contact phases loop only their own
+    contiguous row range. The raw counter is stored; consumers clamp against the per-world constraint count.
+    """
+    world, row = wp.tid()
+    if row == 0:
+        topology_rows[world] = slot_counter[world]
+    if row < cleared:
+        diag[world, row] = 0.0
 
 
 @wp.kernel
@@ -999,18 +1014,25 @@ class Placement:
         rows = self.dense_max_constraints
         self.unit_source = wp.full((self.forest.world_count, rows), 0, dtype=wp.int32, device=self.model.device)
 
-    def diagonals(self) -> None:
-        """The dense rows' diagonals, by the placement that holds them (:attr:`.step_plan.StepPlan.response`): the packed
-        rows' start from zero for the one writer's ``|Z|^2 + cfm``; the sparse diagonal's and native sparse factors'
+    def bound_topology(self) -> None:
+        """Snapshot where each world's topology rows end (:meth:`.rows.RowLaws.bound_topology`) and, where the packed
+        rows hold the response (:attr:`clears_diagonals`), zero the dense rows' diagonals for the one writer's
+        ``|Z|^2 + cfm``, in one launch (:func:`_bound_topology`). The sparse diagonal's and native sparse factors'
         writers store theirs with its CFM. The free bodies' rows, from ``body_base``, keep theirs: their writers stored
-        them in the row pass (:mod:`.walk_rows`). The stage list runs it where the packed rows hold the response
-        (:attr:`clears_diagonals`)."""
-        dim = (self.diag.shape[0], self.body_base)
-        wp.launch(_clear_dense_diagonals, dim=dim, outputs=[self.diag], device=self.model.device)
+        them in the row pass (:mod:`.walk_rows`). No producer between the topology rows and the one writer reads or
+        writes the dense rows' diagonals."""
+        cleared = int(self.body_base) if self.clears_diagonals else 0
+        wp.launch(
+            _bound_topology,
+            dim=(self.forest.world_count, max(cleared, 1)),
+            inputs=[self.slot_counter, cleared],
+            outputs=[self.topology_rows, self.diag],
+            device=self.model.device,
+        )
 
     @property
     def clears_diagonals(self) -> bool:
-        """Whether the dense rows' diagonals start from zero each step (:meth:`diagonals`): the packed rows hold the
+        """Whether the dense rows' diagonals start from zero each step (:meth:`bound_topology`): the packed rows hold the
         response."""
         return bool(self.packed_response)
 
