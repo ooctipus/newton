@@ -2275,13 +2275,14 @@ class _FrictionPatchState:
             clamp=True,
             block_dim=self.build_block_dim,
         )
-        # A new frame's regions in the frame's order, a warp a chunk of positions (a held frame keeps its build's list).
+        # A new frame's regions in the frame's order, a warp a chunk of positions: their launches follow the build's
+        # work, as the build's own, so a held frame, which keeps its build's list, runs neither.
         self.pool.launch(
             _count_regions,
             self.warp_threads,
             inputs=[self.extent, self.warp_threads, self.current],
             outputs=[self.chunks],
-            extent=self.extent[0:1],
+            extent=self.extent[_BUILD_EXTENT : _BUILD_EXTENT + 1],
             clamp=True,
         )
         self.pool.launch(
@@ -2289,7 +2290,7 @@ class _FrictionPatchState:
             self.warp_threads,
             inputs=[self.extent, self.warp_threads, self.current, self.chunks],
             outputs=[self.regions],
-            extent=self.extent[0:1],
+            extent=self.extent[_BUILD_EXTENT : _BUILD_EXTENT + 1],
             clamp=True,
         )
         # The placement's steps: the first over every frame's regions, the others over a new frame's only.
