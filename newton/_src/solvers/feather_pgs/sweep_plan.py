@@ -445,6 +445,7 @@ class Sweep:
                 contact_units=self.pins.contact_units == "triplets" and not small,
                 free_rows=bool(self.placement.free_contact_rows),
                 one_tree=self._one_tree(),
+                split=self.placement.split_records,
                 **self.law_fields,
             )
             active_rows, self.general_active_reason = class_plan.active_rows_rule(
@@ -470,9 +471,10 @@ class Sweep:
             # storage slot each, for those worlds only, it runs beside the one-warp mapping. More of them than the
             # device holds colored blocks run in waves, which scales the rule (ColoredRule.at_scale).
             rule = sweep_units.COLORED_RULE
-            # The colored mapping sweeps the free bodies' run, which exists only where a world can take it.
+            # The colored mapping sweeps the free bodies' run, which exists only where a world can take it; its unit
+            # builder reads packed records, so a split line (a world past a block's reach) takes none.
             capable = np.zeros(0, dtype=np.int32)
-            if self.placement.free_contact_rows:
+            if self.placement.free_contact_rows and not self.placement.split_records:
                 capable = sweep_units.capable_worlds(
                     self.forest.free_rigid_per_world, self.placement.mf_max_constraints, rule
                 )

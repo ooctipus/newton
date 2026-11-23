@@ -14,7 +14,7 @@ import warp as wp
 from .device_preludes import CPU_MATH, CPU_WORDS, dual_native
 from .projection_laws import idle_key, idle_root
 from .row_laws import ROW_CONTACT, ROW_JOINT_LIMIT, ROW_TORSION
-from .row_metadata import HEADER_WORDS, RECORD_WORDS, pack_row_record
+from .row_metadata import HEADER_WORDS, RECORD_WORDS, SPLIT_WORDS, pack_row_record
 from .row_records import DenseRows
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -34,12 +34,14 @@ class RowRecords:
     """Where a line's rows' records sit (:func:`.row_metadata.record_layout`: ``record`` from row ``first``, the free
     rows' headers from row ``base`` at word ``free``) and each articulation's first world coordinate and coordinates
     (``offset``, ``dofs``), or where the rows take support classes (``classed``) each row's word (``classes``,
-    :func:`.packed_rows.row_classes`), which its record holds in place of its sides' widths."""
+    :func:`.packed_rows.row_classes`), which its record holds in place of its sides' widths; ``split`` whether the
+    records are split (:func:`.row_metadata.split_records`)."""
 
     record: wp.array2d[wp.int32]
     first: int
     base: int
     free: int
+    split: int
     offset: wp.array[int]
     dofs: wp.array[int]
     classed: int
@@ -47,13 +49,15 @@ class RowRecords:
 
 
 _RECORD_WORDS, _HEADER_WORDS = wp.constant(RECORD_WORDS), wp.constant(HEADER_WORDS)
+_SPLIT_WORDS = wp.constant(SPLIT_WORDS)
 
 
-@wp.func_native(dual_native(pack_row_record("&record.data[at]"), preludes=(CPU_MATH, CPU_WORDS)))
+@wp.func_native(dual_native(pack_row_record("&record.data[at]", split="split"), preludes=(CPU_MATH, CPU_WORDS)))
 def store_row_record(
     record: wp.array2d[wp.int32],
     at: int,
     words: int,
+    split: int,
     dof_a: int,
     dof_b: int,
     n_a: int,
@@ -71,13 +75,14 @@ def store_row_record(
 @wp.func
 def record_at(records: RowRecords, line: int, slot: int) -> int:
     """The flat index of row ``slot``'s record in line ``line``'s records (-1 for a row without one): a dense row's of
-    :data:`.row_metadata.RECORD_WORDS` words, a free row's header from ``free``."""
+    :data:`.row_metadata.RECORD_WORDS` words, a free row's header from ``free`` (a split record's
+    :data:`.row_metadata.SPLIT_WORDS` more each)."""
     if slot < records.first:
         return -1
     at = line * records.record.shape[1]
     if slot >= records.base:
-        return at + records.free + (slot - records.base) * HEADER_WORDS
-    return at + (slot - records.first) * RECORD_WORDS
+        return at + records.free + (slot - records.base) * (_HEADER_WORDS + records.split * _SPLIT_WORDS)
+    return at + (slot - records.first) * (_RECORD_WORDS + records.split * _SPLIT_WORDS)
 
 
 @wp.func
@@ -144,7 +149,21 @@ def write_row_record(records: RowRecords, rows: DenseRows, incident: float, line
         key = row_idle_key(kind, rhs, diagonal)
         root = idle_root(diagonal)
     store_row_record(
-        records.record, at, words, firsts[0], firsts[1], n_a, n_b, diagonal, rhs, kind, parent, mu, key, root
+        records.record,
+        at,
+        words + records.split * _SPLIT_WORDS,
+        records.split,
+        firsts[0],
+        firsts[1],
+        n_a,
+        n_b,
+        diagonal,
+        rhs,
+        kind,
+        parent,
+        mu,
+        key,
+        root,
     )
 
 
@@ -167,6 +186,7 @@ def bind_row_records(placement) -> RowRecords:
     records.first = int(placement.record_first) if placement.writes_records else int(placement.row_pitch)
     records.base = int(placement.body_base)
     records.free = int(placement.free_records)
+    records.split = int(placement.split_records)
     records.offset = placement.forest.articulation_world_dof_offset
     records.dofs = placement.forest.articulation_response_dof_count
     records.classed = int(placement.classed)

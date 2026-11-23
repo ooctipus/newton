@@ -38,7 +38,7 @@ from .region_sweep import (
 from .response_operator import Lanes, SparseFactor, Velocity
 from .row_inputs import RowArgument
 from .row_laws import ROW_CONTACT, ROW_FRICTION, ROW_JOINT_LIMIT, ROW_TORSION
-from .row_metadata import record_layout, unpack_mf_header, validate_record_coordinates
+from .row_metadata import record_layout
 from .solve_policy import QUIET_LITERAL, block_argmax, sweep_exit
 from .sweep import (
     EXACT,
@@ -204,6 +204,15 @@ def packed_operator(
         if wide:
             return f"(world_dof_indices.data[dof_map_base + ({entry})] >= 0 ? ({entry}) : -1)"
         if rows is not None and (rows.record or rows.sides):
+            split = rows.sides_of(row)
+            if split is not None:
+                # A split record's sides take a word each (row_metadata.split_records).
+                if classes:
+                    return f"CLASS_ENTRY({split[0]}, {split[1]}, {rows.word(row, 4)}, {entry})"
+                widths = rows.word(row, 4)
+                return (
+                    f"SIDES_COORDINATE({split[0]}, {widths} & 0xFFFF, {split[1]}, ({widths} >> 16) & 0xFFFF, {entry})"
+                )
             prefix = "CLASS_RECORD" if classes else "RECORD"
             return f"{prefix}_COORDINATE({rows.word(row, 0)}, {rows.word(row, 4)}, {entry})"
         if classes:
@@ -1182,6 +1191,7 @@ def mf_gs_staging(
     coordinate_levels: bool = False,
     groups: int = 1,
     lanes: int = 32,
+    split: bool = False,
 ) -> Staging:
     """The shared working set of a world's matrix-free sweep block (:func:`mf_gs_source` declares it), in order of
     reuse: the world's velocity, its dense rows' and the free bodies' run's (``free_rows``) impulses at ``places``, the
@@ -1190,9 +1200,15 @@ def mf_gs_staging(
     lanes."""
     # A packed row's sides stage with its metadata (the classes' word takes the widths' place).
     sides = None if wide_rows else "widths"
-    dense = WorldRows(max_constraints, places.metadata, stream=places.dense_impulses is Place.GLOBAL, sides=sides)
+    dense = WorldRows(
+        max_constraints, places.metadata, stream=places.dense_impulses is Place.GLOBAL, sides=sides, split=split
+    )
     free = WorldRows(
-        mf_max_constraints, Place.STREAMED, free=True, stream=places.impulses is Place.GLOBAL or not free_rows
+        mf_max_constraints,
+        Place.STREAMED,
+        free=True,
+        stream=places.impulses is Place.GLOBAL or not free_rows,
+        split=split,
     )
     # The impulses each visit reads and writes, then the record words it only reads (streamed where declined).
     rows = sorted((*dense.buffers(), *free.buffers()), key=lambda buffer: buffer.alternative is not Place.GLOBAL)
@@ -1243,8 +1259,13 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     laws = sweep.laws
     # A packed row's coordinates decode from its staged sides, as a streamed record's do.
     sides = None if wide_rows else "classes" if sweep.support_classes else "widths"
-    dense = WorldRows(M_D, places.metadata, stream=places.dense_impulses is Place.GLOBAL, lanes=row_lanes, sides=sides)
-    free = WorldRows(M_MF, Place.STREAMED, free=True, stream=places.impulses is Place.GLOBAL, lanes=row_lanes)
+    split = sweep.split
+    dense = WorldRows(
+        M_D, places.metadata, stream=places.dense_impulses is Place.GLOBAL, lanes=row_lanes, sides=sides, split=split
+    )
+    free = WorldRows(
+        M_MF, Place.STREAMED, free=True, stream=places.impulses is Place.GLOBAL, lanes=row_lanes, split=split
+    )
     dense_op = packed_operator(max_row_dofs, row_lanes, wide=wide_rows, rows=dense, classes=sweep.support_classes)
     free_op = free_body_rows(row_lanes, max_row_dofs)
     staging = sweep.staging()
@@ -1263,7 +1284,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     metric = dense_record = free_record = None
     friction_laws = metric_stage = ""
     # A free row's coordinates are its sides', from its header.
-    sides = free.visit("normal") + "\n" + unpack_mf_header("rec_a", "")
+    sides = free.visit("normal") + "\n" + free.unpack_header("")
     if contact_torsion:
         metric = "FRICTION"
 
@@ -1370,8 +1391,14 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
                     row_lanes.sync(),
                     declare=(
                         *free.visit("i").split("\n"),
-                        "const int packed_dofs = rec_a.x;",
-                        "const int dof_a = packed_dofs >> 16, dof_b = (packed_dofs << 16) >> 16;",
+                        *(
+                            ("const int dof_a = rec_a.x, dof_b = rec_b.x;",)
+                            if split
+                            else (
+                                "const int packed_dofs = rec_a.x;",
+                                "const int dof_a = packed_dofs >> 16, dof_b = (packed_dofs << 16) >> 16;",
+                            )
+                        ),
                     ),
                 ),
             )
@@ -1467,7 +1494,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         budget=budget,
     )
     # The streamed rows' records (row_record, row_metadata.record_layout).
-    free_records, line_records = record_layout(sweep.record_rows, M_D, P)
+    free_records, line_records = record_layout(sweep.record_rows, M_D, P, split)
     records = f"    const int off_rec_mf = line * {line_records} + {free_records};"
     if dense.record:
         records = f"    const int off_rec_dense = line * {line_records};\n" + records
@@ -1585,6 +1612,7 @@ class GeneralSweep(SweepConfig):
     free_rows: bool = True
     one_tree: bool = False
     records: int | None = None
+    split: bool = False
     regions: bool = False
     formed: str = "inline"
 
@@ -1597,7 +1625,8 @@ class GeneralSweep(SweepConfig):
             raise ValueError("the general sweep's free bodies step in order or by exact levels (colored)")
         if self.colored and not self.free_rows:
             raise ValueError("the colored mapping sweeps the free bodies' run: it needs free_rows")
-        validate_record_coordinates(self.max_world_dofs)
+        if self.split and self.colored:
+            raise ValueError("the colored mapping's unit builder reads packed records, not split ones")
         if self.material and not self.weighted:
             raise ValueError("material contacts step by their weights: their sweeps are weighted")
         if self.formed not in ("inline", "ahead", "stage"):
@@ -1679,6 +1708,7 @@ class GeneralSweep(SweepConfig):
             + ("_regions" if self.regions else "")
             + {"inline": "", "ahead": "_formed", "stage": "_records"}[self.formed]
             + ("_tree" if self.one_tree else "")
+            + ("_split" if self.split else "")
             + "_walk"
             + self.solve_policy.suffix
         )
@@ -1700,6 +1730,7 @@ class GeneralSweep(SweepConfig):
             coordinate_levels=self.coordinate_levels,
             groups=self.groups,
             lanes=self.lanes,
+            split=self.split,
         )
 
     def dispatch(self, staging: Staging) -> Dispatch:

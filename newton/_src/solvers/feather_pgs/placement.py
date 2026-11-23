@@ -36,7 +36,7 @@ from .field_group import Field, FieldGroup, SolverArrays, fields_of
 from .forest_plan import RowLaw
 from .route_table import first_failed
 from .row_laws import LINK_ROWS
-from .row_metadata import record_layout
+from .row_metadata import record_layout, split_records
 from .row_records import DENSE_ROWS, ROW_RECORDS, RowSupport
 from .row_slots import RowOrder
 from .warm_start import PREPARE_LANES, ContactCarry, prepare_world_impulses
@@ -781,6 +781,12 @@ class Placement:
         else:
             self.arrays.release(ROW_WATERMARKS)
 
+    @property
+    def split_records(self) -> bool:
+        """Whether the line's records are split (:func:`.row_metadata.split_records`): a world past a packed record's
+        coordinates or a class past its rows."""
+        return split_records(self.forest.max_world_dofs, max(self.dense_max_constraints, self.mf_max_constraints))
+
     def allocate_row_records(self, first: int) -> None:
         """Allocate the streamed rows' records (:data:`.row_records.ROW_RECORDS`, :func:`.row_metadata.record_layout`)
         from the line's row ``first``; the rows' writers store them (:func:`.response_builds_rows.write_row_record`)."""
@@ -788,7 +794,7 @@ class Placement:
         rows = self.row_pitch - self.record_first
         free_rows = self.mf_max_constraints if self.free_contact_rows else 0
         self.writes_records = bool(rows > 0 and (self.record_first < self.body_base or free_rows > 0))
-        self.free_records, words = record_layout(self.record_first, self.body_base, self.row_pitch)
+        self.free_records, words = record_layout(self.record_first, self.body_base, self.row_pitch, self.split_records)
         self.arrays.allocate(ROW_RECORDS, world=self.forest.world_count, record=max(words, 1))
 
     def hold_acts(self, solver) -> None:

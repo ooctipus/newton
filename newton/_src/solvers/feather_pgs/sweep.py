@@ -56,6 +56,7 @@ from .row_metadata import (
     record_parent,
     record_word,
     record_words,
+    split_word,
     unpack_mf_header,
     validate_record_rows,
 )
@@ -104,12 +105,15 @@ class WorldRows:
     sides: str | None = None
     """A staged row's sides staged too, its record's two words (first coordinates, then ``"widths"`` or the support
     ``"classes"``): a visit's coordinates decode from the stage, as a streamed record's do."""
+    split: bool = False
+    """The line's records are split (:func:`.row_metadata.split_records`): each side's first world coordinate and the
+    row's parent in a word of their own, the record's last quad."""
 
     VISITED: ClassVar[str] = "i"
     """The row a row loop visits, whose record the loop holds in registers."""
 
     def __post_init__(self):
-        validate_record_rows(self.capacity)
+        validate_record_rows(self.capacity, self.split)
         if self.metadata not in (Place.SHARED, Place.STREAMED) or (self.free and not self.record):
             raise ValueError(f"a row's metadata is staged or streams (the free bodies' streams), got {self.metadata}")
         if self.stream and self.every_lane:
@@ -123,7 +127,20 @@ class WorldRows:
     def staged_words(self) -> tuple[int, ...]:
         """The record words a staged row reads, in their stage's order: right-hand side, diagonal, kind and parent,
         friction coefficient, and with :attr:`sides` its sides' words."""
+        if self.split:
+            return (2, 1, 3, 5, self.parent_word, *((0, 4, self.side_b_word) if self.sides else ()))
         return (2, 1, 3, 5, 0, 4) if self.sides else (2, 1, 3, 5)
+
+    @property
+    def side_b_word(self) -> int:
+        """The word of a split record that holds its second side's first world coordinate
+        (:func:`.row_metadata.split_word`)."""
+        return split_word(self.words, 0)
+
+    @property
+    def parent_word(self) -> int:
+        """The word of a split record that holds its parent (:func:`.row_metadata.split_word`)."""
+        return split_word(self.words, 1)
 
     @property
     def own_stores(self) -> bool:
@@ -154,12 +171,12 @@ class WorldRows:
     @property
     def words(self) -> int:
         """Words of a row's record (:func:`.row_metadata.record_words`): a free row's header, a dense row's two."""
-        return record_words(self.free)
+        return record_words(self.free, self.split)
 
     @property
     def registers(self) -> tuple[str, ...]:
-        """The visited row's record registers: ``rec_a`` (the header), and ``rec_b`` past it."""
-        return ("rec_a",) if self.free else ("rec_a", "rec_b")
+        """The visited row's record registers, a quad each: ``rec_a`` (the header), then ``rec_b`` and ``rec_c``."""
+        return tuple(f"rec_{'abc'[q]}" for q in range(self.words // 4))
 
     def word(self, row: str, word: int) -> str:
         """Word ``word`` of row ``row``'s record: a staged row's from the stage, the visited row's from its registers."""
@@ -168,12 +185,12 @@ class WorldRows:
         if row == self.VISITED:
             if word >= self.words:
                 raise ValueError(f"a record of {self.words} words has no word {word}")
-            return f"rec_{'ab'[word // 4]}.{'xyzw'[word % 4]}"
+            return f"rec_{'abc'[word // 4]}.{'xyzw'[word % 4]}"
         return record_word(row, word, self.records, self.words)
 
     def load_record(self, names: tuple[str, ...], row: str, indent: str) -> str:
         """Load row ``row``'s record into the ``int4`` locals ``names`` (one a header's, two a dense record's)."""
-        return load_row_record(names[0], names[1] if len(names) > 1 else None, row, self.records, indent, self.words)
+        return load_row_record(names, row, self.records, indent, self.words)
 
     def visit(self, row: str = "i") -> str:
         """Declare the visited row's record registers for a loop that does not load them a row ahead."""
@@ -223,8 +240,17 @@ class WorldRows:
         return f"({self.word(row, 3)} & 0xFFFF)"
 
     def parent(self, row: str, *, enclosed: bool = False) -> str:
+        if self.split:
+            return self.word(row, self.parent_word)
         decoded = self.parent_of(self.word(row, 3))
         return f"({decoded})" if enclosed else decoded
+
+    def sides_of(self, row: str) -> tuple[str, str] | None:
+        """Row ``row``'s sides' first world coordinates as a split record or its stage holds them (each a word); None
+        where they share the packed word (word 0's halves)."""
+        if not self.split:
+            return None
+        return self.word(row, 0), self.word(row, self.side_b_word)
 
     def parent_of(self, packed: str) -> str:
         """A row's parent from its record's packed ``kind | parent << 16`` word."""
@@ -233,7 +259,17 @@ class WorldRows:
     def live_head(self, row: str) -> tuple[str, str, str, str]:
         """Row ``row``'s kind, diagonal, parent and right-hand side as the live order's test reads them, from its
         words (:func:`record_head`)."""
-        return record_head(lambda k: self.word(row, k), self.parent_of)
+        kind, diagonal, _, rhs = record_head(lambda k: self.word(row, k), self.parent_of)
+        return kind, diagonal, self.parent(row), rhs
+
+    def visited_parent(self) -> str:
+        """The visited free row's parent: from its kind word ``packed_tp`` (:meth:`unpack_header`), or a split
+        record's word."""
+        return self.parent(self.VISITED) if self.split else self.parent_of("packed_tp")
+
+    def unpack_header(self, indent: str) -> str:
+        """Declare the visited free row's fields from its record's registers (:func:`.row_metadata.unpack_mf_header`)."""
+        return unpack_mf_header("rec_a", indent, self.registers[-1] if self.split else None)
 
     def scan(self) -> tuple[Callable[[str], str], Callable[[str], str]]:
         """A row's kind and parent as a scan over the rows reads them (:func:`friction_metric_stage`)."""
@@ -299,19 +335,26 @@ class WorldRows:
         lines = [] if self.stream else [f"{self.impulses}[{row}] = world_impulses.data[{self.base} + {row}];"]
         if not self.record:
             at = f"off_dense + ({row})"
-            kind = record_kind(f"world_row_type.data[{at}]", f"world_row_parent.data[{at}]")
+            # The staged words mirror the record's (row_metadata.pack_row_record): a split one's parent in a word.
+            parent = f"world_row_parent.data[{at}]"
+            kind = record_kind(f"world_row_type.data[{at}]", "-1" if self.split else parent)
             words = {
                 1: f"__float_as_int(world_diag.data[{at}])",
                 2: f"__float_as_int(rhs_bias.data[{at}] + row_incident.data[{at}])",
                 3: kind,
                 5: f"__float_as_int(world_row_mu.data[{at}])",
             }
+            if self.split:
+                words[self.parent_word] = parent
             if self.sides:
                 # The record's words (row_metadata.pack_row_record): each side's first world coordinate, -1 for none,
                 # then the sides' widths or the row's classes.
                 lines.append(f"const wp::vec2i sides = row_sides.data[{at}];")
                 first = "(sides[{0}] >= 0 ? articulation_world_dof_offset.data[sides[{0}]] : -1)"
-                words[0] = f"({first.format(0)} << 16) | ({first.format(1)} & 0xFFFF)"
+                if self.split:
+                    words[0], words[self.side_b_word] = first.format(0), first.format(1)
+                else:
+                    words[0] = f"({first.format(0)} << 16) | ({first.format(1)} & 0xFFFF)"
                 width = "(sides[{0}] >= 0 ? response_dofs.data[sides[{0}]] : 0)"
                 words[4] = (
                     f"row_classes.data[{at}]"
@@ -1708,6 +1751,8 @@ class LiveOrder:
                 f"const int4 ta = *reinterpret_cast<const int4*>(&row_record.data[{rows.records} + t * {rows.words}]);"
             ]
             kind, diagonal, parent, rhs = record_head({1: "ta.y", 2: "ta.z", 3: "ta.w"}.__getitem__, rows.parent_of)
+            if rows.split:
+                parent = rows.parent("t")
         else:
             kind, diagonal, parent, rhs = rows.live_head("t")
         never = (ROW_TORSION,) if self.torsion else ()
@@ -2269,7 +2314,7 @@ def _record_consume(rows: WorldRows, op, row: str, end: str, indent: str) -> str
         f"{indent}}}",
     ]
     if rows.free:
-        lines.append(unpack_mf_header("rec_a", indent))
+        lines.append(rows.unpack_header(indent))
     return "\n".join(lines)
 
 
@@ -2442,7 +2487,7 @@ def rows_block(
         # A spin row is solved with its friction pair (torsion).
         f"{inner}if (mf_rt == {ROW_TORSION}) continue;" if laws.torsion else "",
         indent(admission, inner) if admission else "",
-        row_visit(ctx, laws, parent=rows.parent_of("packed_tp"), check="mf_diag", declare="", pad=inner),
+        row_visit(ctx, laws, parent=rows.visited_parent(), check="mf_diag", declare="", pad=inner),
     ]
     return f"{pad}{{\n{_record_pipeline(rows, op, end).wrap(chr(10).join(line for line in body if line), pad)}\n{pad}}}"
 

@@ -6,15 +6,20 @@ by the dynamics' mass matrix, and the records the rows' writers store.
 """
 
 import unittest
+from unittest import mock
 
 import numpy as np
 import warp as wp
 
 from newton._src.core.memory import Place
+from newton._src.solvers.feather_pgs import row_metadata
 from newton._src.solvers.feather_pgs.row_metadata import (
     HEADER_WORDS,
+    RECORD_WORDS,
+    SPLIT_WORDS,
     pack_row_record,
     record_views,
+    split_word,
     unpack_mf_header,
     validate_record_rows,
 )
@@ -92,6 +97,81 @@ class TestFreeBodyRowsBuild(unittest.TestCase):
         np.testing.assert_array_equal(record[:, 3] & 0xFFFF, p.row_type.numpy()[line, rows_at])
         np.testing.assert_array_equal(record[:, 3] >> 16, p.row_parent.numpy()[line, rows_at])
         np.testing.assert_array_equal(record[:, 5].view(np.float32), p.row_mu.numpy()[line, rows_at])
+
+    def test_split_records_hold_the_rows(self):
+        """A split record (:func:`.row_metadata.split_records`, here forced on a small world) holds each side's first
+        coordinate and the row's parent in a word of their own, its kind word no parent."""
+        with mock.patch.object(row_metadata, "_RECORD_MAX_DOFS", -1):
+            solver = self._box_step(pins={"mf_storage": "line"})
+            p = solver.placement
+            self.assertTrue(p.split_records)
+            rows = int(p.constraint_count.numpy()[0])
+            self.assertGreater(rows, 0, "the box must touch the ground")
+            line = int(p.dense_first.numpy()[0])
+            record = record_views(p.row_record.numpy(), p.free_records, split=True)[0][line][: rows - p.record_first]
+        self.assertEqual(record.shape[1], RECORD_WORDS + SPLIT_WORDS)
+        offset = p.forest.articulation_world_dof_offset.numpy()
+        sides = p.row_sides.numpy()[line, p.record_first : rows]
+        first_a = np.where(sides[:, 0] >= 0, offset[np.maximum(sides[:, 0], 0)], -1)
+        first_b = np.where(sides[:, 1] >= 0, offset[np.maximum(sides[:, 1], 0)], -1)
+        rows_at = slice(p.record_first, rows)
+        np.testing.assert_array_equal(record[:, 0], first_a)
+        np.testing.assert_array_equal(record[:, split_word(record.shape[1], 0)], first_b)
+        np.testing.assert_array_equal(record[:, split_word(record.shape[1], 1)], p.row_parent.numpy()[line, rows_at])
+        np.testing.assert_array_equal(record[:, 3] & 0xFFFF, p.row_type.numpy()[line, rows_at])
+        np.testing.assert_array_equal((record[:, 3] >> 16) & 0xFFFF, 0xFFFF)
+
+    def test_split_records_step_as_packed(self):
+        """The split record is a move: a stack of boxes on a two-link arm's links steps to the same bits as with the
+        packed record, the rows streamed or staged."""
+        import newton  # noqa: PLC0415
+
+        def run(pins):
+            builder = newton.ModelBuilder()
+            link_cfg = newton.ModelBuilder.ShapeConfig(density=500.0)
+            parent, joints = -1, []
+            for k in range(2):
+                link = builder.add_link(xform=wp.transform(wp.vec3(0.3 * k, 0.0, 0.06), wp.quat_identity()))
+                builder.add_shape_box(link, hx=0.15, hy=0.05, hz=0.05, cfg=link_cfg)
+                if parent < 0:
+                    joint = builder.add_joint_free(link)
+                else:
+                    joint = builder.add_joint_revolute(
+                        parent,
+                        link,
+                        parent_xform=wp.transform(wp.vec3(0.15, 0.0, 0.0), wp.quat_identity()),
+                        child_xform=wp.transform(wp.vec3(-0.15, 0.0, 0.0), wp.quat_identity()),
+                        axis=wp.vec3(0.0, 1.0, 0.0),
+                        limit_lower=-0.5,
+                        limit_upper=0.5,
+                    )
+                joints.append(joint)
+                parent = link
+            builder.add_articulation(joints)
+            for k in range(3):
+                body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.16 + 0.1 * k), wp.quat_identity()))
+                builder.add_shape_box(body, hx=0.04, hy=0.04, hz=0.04)
+            builder.add_ground_plane()
+            model = builder.finalize(device=DEVICE)
+            solver = newton.solvers.SolverFeatherPGS(model, pins=newton.solvers.SolverFeatherPGS.Pins(**pins))
+            pipeline = newton.CollisionPipeline(model, growable_contacts=True)
+            contacts = pipeline.contacts()
+            state, out = model.state(), model.state()
+            for _ in range(8):
+                pipeline.collide(state, contacts)
+                solver.step(state, out, model.control(), contacts, 1.0 / 240.0)
+                state, out = out, state
+            return solver.placement.split_records, state.body_q.numpy(), state.body_qd.numpy()
+
+        for pins in ({}, {"mf_storage": "line"}):
+            with self.subTest(pins=pins):
+                packed = run(pins)
+                with mock.patch.object(row_metadata, "_RECORD_MAX_DOFS", -1):
+                    split = run(pins)
+                self.assertFalse(packed[0])
+                self.assertTrue(split[0])
+                np.testing.assert_array_equal(split[1], packed[1])
+                np.testing.assert_array_equal(split[2], packed[2])
 
     def test_rows_see_the_dynamics_mass_matrix(self):
         """Whiten a free box's contact rows by the factor of its dynamics' mass matrix, armature included.
