@@ -15,6 +15,7 @@ step after step along the stance's indeterminate force modes until the feet reac
 
 import warp as wp
 
+from ...core.execution import fill_lanes
 from . import field_group
 from .contact_input import ContactRoutes
 from .factor.kernels import Clock, clock_dt_ratio
@@ -26,7 +27,15 @@ wp.set_module_options({"enable_backward": False})
 
 
 PREPARE_LANES = 32
-"""Lanes a world of :func:`prepare_world_impulses`: they stride over the world's rows, so its stores coalesce."""
+"""Lanes a world of :func:`prepare_world_impulses` at least: they stride over the world's rows, so its stores coalesce."""
+
+
+def row_lanes(worlds: int, rows: int, device) -> int:
+    """Lanes a world of a launch whose lanes stride over the world's ``rows`` rows, a row each (:func:`prepare_world_impulses`,
+    :func:`reset_world_impulses`): :data:`PREPARE_LANES`, at most the rows, and where a few worlds of many rows would idle
+    the GPU, the lanes that fill it (:func:`.core.execution.fill_lanes`, up to the rows)."""
+    least = 1 << (max(min(PREPARE_LANES, int(rows)), 1) - 1).bit_length()
+    return fill_lanes(worlds, device, least=least, most=max(1 << (max(int(rows), 1) - 1).bit_length(), least))
 
 
 @wp.kernel
@@ -127,13 +136,14 @@ def forget_carried_contacts(world: wp.array[int], world_mask: wp.array[wp.bool],
 
 
 @wp.kernel
-def reset_world_impulses(first: wp.array[int], world_mask: wp.array[wp.bool], impulses: wp.array2d[float]):
-    """Clear the selected worlds' lines of the row store, both classes' rows."""
-    world = wp.tid()
+def reset_world_impulses(first: wp.array[int], world_mask: wp.array[wp.bool], lanes: int, impulses: wp.array2d[float]):
+    """Clear the selected worlds' lines of the row store, both classes' rows, ``lanes`` lanes a world striding over
+    them (:func:`row_lanes`)."""
+    world, lane = wp.tid()
     if world_mask and not world_mask[world]:
         return
     line = first[world]
-    for row in range(impulses.shape[1]):
+    for row in range(lane, impulses.shape[1], lanes):
         impulses[line, row] = 0.0
 
 

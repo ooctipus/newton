@@ -62,6 +62,7 @@ from .warm_start import (
     forget_carried_contacts,
     gather_carried_normals,
     reset_world_impulses,
+    row_lanes,
 )
 
 _COLORED = {
@@ -1089,10 +1090,11 @@ class Sweep:
         if self.forest.world_count == 0 or not self.options.pgs_warmstart:
             return
         placement = self.placement
+        lanes = row_lanes(self.forest.world_count, placement.impulses.shape[1], self.model.device)
         wp.launch(
             reset_world_impulses,
-            dim=self.forest.world_count,
-            inputs=[placement.dense_first, world_mask],
+            dim=(self.forest.world_count, lanes),
+            inputs=[placement.dense_first, world_mask, lanes],
             outputs=[placement.impulses],
             device=self.model.device,
         )

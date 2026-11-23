@@ -39,7 +39,7 @@ from .row_laws import LINK_ROWS
 from .row_metadata import record_layout, split_records
 from .row_records import DENSE_ROWS, ROW_RECORDS, RowSupport
 from .row_slots import RowOrder
-from .warm_start import PREPARE_LANES, ContactCarry, prepare_world_impulses
+from .warm_start import ContactCarry, prepare_world_impulses, row_lanes
 
 # FeatherPGS takes no gradients: its kernels compile no adjoints.
 wp.set_module_options({"enable_backward": False})
@@ -1048,8 +1048,11 @@ class Placement:
         start."""
         warmstart_flag = 1 if self.options.pgs_warmstart else 0
         free_max = self.mf_max_constraints if self.forest.has_free_rigid_bodies else 0
-        # No more lanes a world than its rows' capacity: a world of a few rows takes as few.
-        lanes = max(min(PREPARE_LANES, max(int(self.dense_max_constraints), int(free_max))), 1)
+        # No more lanes a world than its rows' capacity: a world of a few rows takes as few; a few worlds of many rows
+        # spread them over the GPU (row_lanes).
+        lanes = row_lanes(
+            self.forest.world_count, max(int(self.dense_max_constraints), int(free_max)), self.model.device
+        )
         wp.launch(
             prepare_world_impulses,
             dim=(self.forest.world_count, lanes),
