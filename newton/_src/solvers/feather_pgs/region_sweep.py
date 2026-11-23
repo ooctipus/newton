@@ -824,6 +824,7 @@ def place_bodies(
     body_pair: wp.array[int],
     capacity: wp.array[int],
     body_count: wp.array2d[int],
+    group: int,
     cursor: wp.array[int],
     body_open: wp.array[int],
     body_regions: wp.array[wp.vec2i],
@@ -831,8 +832,9 @@ def place_bodies(
     lanes: wp.array[int],
     world_regions: wp.array[wp.vec2i],
 ):
-    """Where the step lists its regions anew, a world's bodies placed in the regions' stream, a thread a world (it
-    reads its free bodies' counts only).
+    """Where the step lists its regions anew, a world's bodies placed in the regions' stream, a group of ``group`` lanes
+    a world (:attr:`Regions.place_lanes`; one thread on the CPU) striding over its free bodies (it reads their counts
+    only), each body's places the group's scans over the bodies before it.
 
     A free body is *open* when a dense row (``body_touch``, :func:`check_bodies`) or a region between
     two movable bodies (``body_pair``, :func:`mark_regions`) touches it, else *closed*. The stream holds the world's
@@ -840,50 +842,75 @@ def place_bodies(
     ``cursor[2]``; one whose regions outnumber a warp's lanes, :data:`CLOSED_WARP`, from its end, in ``cursor[4]``), then
     its open
     bodies' (``world_regions``): each body takes its regions' places (``body_regions``) and its candidates' first
-    (``body_cand``). The places are taken from ``cursor`` as worlds arrive: they decide no result. A world whose
-    regions do not fit the stream (``capacity``: the contact pool's ready rows) lists none and sets ``cursor[3]``."""
+    (``body_cand``). The places are taken from ``cursor`` as worlds arrive, and the ``lanes`` as bodies arrive: they
+    decide no result. A world whose regions do not fit the stream (``capacity``: the contact pool's ready rows) lists
+    none and sets ``cursor[3]``."""
     if relist[0] == 0:
         return
-    world = wp.tid()
-    world_regions[world] = wp.vec2i(0, 0)
+    stride = lane_stride(group)
+    lane = lane_index(group)
+    world = wp.tid() // stride
+    if lane == 0:
+        world_regions[world] = wp.vec2i(0, 0)
     f_begin = world_free_start[world]
     f_end = world_free_start[world + 1]
     regions = int(0)
     candidates = int(0)
-    for k in range(f_begin, f_end):
-        f = world_free[k]
-        body_open[f] = int(body_touch[f] != 0 or body_pair[f] != 0)
-        regions += body_count[f, 0]
-        candidates += body_count[f, 1]
+    for base in range(f_begin, f_end, stride):
+        k = base + lane
+        count = int(0)
+        held = int(0)
+        if k < f_end:
+            f = world_free[k]
+            body_open[f] = int(body_touch[f] != 0 or body_pair[f] != 0)
+            count = body_count[f, 0]
+            held = body_count[f, 1]
+        regions += lane_sum(count, group)
+        candidates += lane_sum(held, group)
     if regions == 0:
         return
-    region_at = wp.atomic_add(cursor, 0, regions)
-    candidate_at = wp.atomic_add(cursor, 1, candidates)
-    if region_at + regions > capacity[0] or candidate_at + candidates > capacity[0]:
-        cursor[3] = 1
+    region_at = int(0)
+    candidate_at = int(0)
+    fits = int(1)
+    if lane == 0:
+        region_at = wp.atomic_add(cursor, 0, regions)
+        candidate_at = wp.atomic_add(cursor, 1, candidates)
+        if region_at + regions > capacity[0] or candidate_at + candidates > capacity[0]:
+            cursor[3] = 1
+            fits = 0
+    region_at = lane_read(region_at, 0, group)
+    candidate_at = lane_read(candidate_at, 0, group)
+    if lane_read(fits, 0, group) == 0:
         return
-    for k in range(f_begin, f_end):
-        f = world_free[k]
-        count = body_count[f, 0]
-        if body_open[f] == 0 and count > 0:
-            body_regions[f] = wp.vec2i(region_at, region_at + count)
-            body_cand[f] = candidate_at
-            if count > CLOSED_WARP:
-                lanes[lanes.shape[0] - 1 - wp.atomic_add(cursor, 4, 1)] = f
-            else:
-                lanes[wp.atomic_add(cursor, 2, 1)] = f
-            region_at += count
-            candidate_at += body_count[f, 1]
+    # The closed bodies' regions, then the open bodies': each lane's body reads the open word its own lane wrote.
     first = region_at
-    for k in range(f_begin, f_end):
-        f = world_free[k]
-        count = body_count[f, 0]
-        if body_open[f] != 0 and count > 0:
-            body_regions[f] = wp.vec2i(region_at, region_at + count)
-            body_cand[f] = candidate_at
-            region_at += count
-            candidate_at += body_count[f, 1]
-    world_regions[world] = wp.vec2i(first, region_at)
+    for side in range(2):
+        if side == 1:
+            first = region_at
+        for base in range(f_begin, f_end, stride):
+            k = base + lane
+            f = int(-1)
+            count = int(0)
+            held = int(0)
+            if k < f_end:
+                f = world_free[k]
+                if body_open[f] == side and body_count[f, 0] > 0:
+                    count = body_count[f, 0]
+                    held = body_count[f, 1]
+            at = region_at + lane_scan(count, group)
+            held_at = candidate_at + lane_scan(held, group)
+            if count > 0:
+                body_regions[f] = wp.vec2i(at, at + count)
+                body_cand[f] = held_at
+                if side == 0:
+                    if count > CLOSED_WARP:
+                        lanes[lanes.shape[0] - 1 - wp.atomic_add(cursor, 4, 1)] = f
+                    else:
+                        lanes[wp.atomic_add(cursor, 2, 1)] = f
+            region_at += lane_sum(count, group)
+            candidate_at += lane_sum(held, group)
+    if lane == 0:
+        world_regions[world] = wp.vec2i(first, region_at)
 
 
 @wp.kernel(enable_backward=False, module="unique")
@@ -2122,6 +2149,9 @@ class Regions:
         self.art_free = wp.array(art_free, dtype=wp.int32, device=device)
         self.world_free = wp.array(order if count else np.zeros(1, dtype=np.int32), dtype=wp.int32, device=device)
         self.world_free_start = wp.array(start, dtype=wp.int32, device=device)
+        # The listing's lane group a world (place_bodies): a lane a free body, at most a warp; one thread on the CPU.
+        most = max(int(np.diff(start).max()) if count else 1, 1)
+        self.place_lanes = min(1 << (most - 1).bit_length(), 32) if device.is_cuda else 1
         self.body_world = wp.array(world if count else np.zeros(0, dtype=np.int32), dtype=wp.int32, device=device)
         self.body_first = wp.array(offsets[free_art], dtype=wp.int32, device=device)
         self.body_dof = wp.array(
@@ -2362,7 +2392,7 @@ class Regions:
         )
         wp.launch(
             place_bodies,
-            dim=forest.world_count,
+            dim=forest.world_count * self.place_lanes,
             inputs=[
                 self.relist,
                 self.world_free_start,
@@ -2371,6 +2401,7 @@ class Regions:
                 self.body_pair,
                 self.ready,
                 self.body_count,
+                self.place_lanes,
             ],
             outputs=[self.cursor, self.body_open, self.body_regions, self.body_cand, self.lanes, self.world_regions],
             device=device,
