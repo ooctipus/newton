@@ -1777,7 +1777,9 @@ def _store_contact(
     previous_q: wp.array[wp.transform],
 ):
     """Carry contact history and input poses, independent of solver velocity passes. A ``carried`` build (a held
-    frame's) kept the frame's sorted index, which the store after the frame's earlier build already holds.
+    frame's) kept the frame's sorted index, which the store after the frame's earlier build already holds. It also
+    kept the record's fixed part (bodies, shapes, owner, friction coefficients: a held frame never rewrites them), which
+    the last store holds where it kept the slot's anchor (``prev.valid``), so a held slot stores it only otherwise.
 
     The slot's record is read whole before any of it is written: a read after a write to an array that may alias it
     waits for its own load, so a copy that interleaves them pays a memory latency a field."""
@@ -1785,9 +1787,12 @@ def _store_contact(
     pressured = frame.pressured[c]
     key = wp.int64(0)
     index = int(0)
+    fixed = int(0)
     if carried == 0:
         key = frame.keys[c]
         index = frame.indices[c]
+    elif valid != 0:
+        fixed = prev.valid[c]
     pressure = wp.vec3(0.0)
     if pressured != 0:
         pressure = frame.pressure[c]
@@ -1808,10 +1813,15 @@ def _store_contact(
     b = frame.body_b[c]
     normal = frame.normal[c]
     displacement = frame.displacement[c]
-    mu = frame.mu[c]
-    owner = frame.owner[c]
-    shape_a = frame.shape_a[c]
-    shape_b = frame.shape_b[c]
+    mu = wp.vec2(0.0)
+    owner = int(0)
+    shape_a = int(0)
+    shape_b = int(0)
+    if fixed == 0:
+        mu = frame.mu[c]
+        owner = frame.owner[c]
+        shape_a = frame.shape_a[c]
+        shape_b = frame.shape_b[c]
     anchor_a = frame.anchor_a[c]
     anchor_b = frame.anchor_b[c]
     surface_a = frame.surface_a[c]
@@ -1838,12 +1848,13 @@ def _store_contact(
         normal = wp.transform_vector(wp.transform_inverse(pose_a), normal)
     prev.normal[c] = normal
     prev.displacement[c] = displacement
-    prev.mu[c] = mu
-    prev.body_a[c] = a
-    prev.body_b[c] = b
-    prev.owner[c] = owner
-    prev.shape_a[c] = shape_a
-    prev.shape_b[c] = shape_b
+    if fixed == 0:
+        prev.mu[c] = mu
+        prev.body_a[c] = a
+        prev.body_b[c] = b
+        prev.owner[c] = owner
+        prev.shape_a[c] = shape_a
+        prev.shape_b[c] = shape_b
     prev.anchor_a[c] = anchor_a
     prev.anchor_b[c] = anchor_b
     prev.surface_a[c] = surface_a
