@@ -130,6 +130,30 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
             wp.capture_launch(capture.graph)
             self.assertEqual(solver.constraint_capacity_status()["dense"], expected)
 
+    def test_dropped_contacts_fail_the_step(self):
+        """A fixed contact buffer whose pass drops contacts fails the step; growable rows take every contact."""
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()
+        for z in (0.05, 0.149):
+            body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, z), wp.quat_identity()))
+            builder.add_shape_box(body, hx=0.05, hy=0.05, hz=0.05)
+        model = builder.finalize(device="cpu")
+        for growable in (False, True):
+            pipeline = newton.CollisionPipeline(
+                model, rigid_contact_max=None if growable else 2, growable_contacts=growable, publish_capacity=False
+            )
+            contacts = pipeline.contacts()
+            solver = SolverFeatherPGS(model)
+            state_0, state_1, control = model.state(), model.state(), model.control()
+            pipeline.collide(state_0, contacts)
+            if growable:
+                solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
+                self.assertEqual(pipeline.contact_drops().passes, 0)
+                self.assertGreater(int(contacts.rigid_contact_count.numpy()[0]), 2)
+            else:
+                with self.assertRaisesRegex(RuntimeError, "growable_contacts=True"):
+                    solver.step(state_0, state_1, control, contacts, 1.0 / 240.0)
+
     def test_status_without_articulations_reads_clear_flags(self):
         """Read, clear and check capacity status of a solver whose model has no articulation.
 

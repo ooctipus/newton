@@ -597,11 +597,17 @@ class Placement:
     def follow_contacts(self, contacts: Contacts) -> None:
         """Hold at least ``contacts``' rigid rows, and grow with the pool of a pipeline's buffer from now on (staged where
         the model holds articulations, whose rows own a contact pool). A fixed buffer's count, which keeps every contact
-        its pass found, is clamped to its rows first: the solver reads every row below the count."""
+        its pass found, is clamped to its rows first: the solver reads every row below the count.
+
+        Fails closed on lost contacts: outside capture, once the buffer's pool records a collision pass that dropped
+        contacts for want of rows (its pinned record, read without synchronizing, so on CUDA up to the passes still in
+        flight later), the step raises instead of solving without them. A growable buffer grows before a pass outside
+        capture writes, so this is a fixed buffer's overflow; in graph replays the pipeline's
+        :meth:`~newton.CollisionPipeline.service_capacity` warns of a drop."""
         pool = self.contact_pool
         rows = contacts._rigid_contact_rows
+        source = getattr(contacts, "_rigid_contact_pool", None)
         try:
-            source = getattr(contacts, "_rigid_contact_pool", None)
             if source is not None:
                 source.clamp_count(contacts.rigid_contact_count)
                 source.follow(pool)
@@ -612,6 +618,15 @@ class Placement:
                 f"FeatherPGS received {rows} contact rows during CUDA graph capture, but its per-contact scratch "
                 f"holds {pool.ready}: step once outside capture first."
             ) from error
+        if source is not None and not wp.get_device(pool.device).is_capturing:
+            drops = source.drops()
+            if drops.passes:
+                raise RuntimeError(
+                    f"FeatherPGS: {drops.passes} collision pass(es), the last pass {drops.last_pass}, dropped "
+                    f"{drops.contacts} rigid contacts past the contact buffer's {source.ready} rows; the solver does "
+                    "not step without them. Build the CollisionPipeline with growable_contacts=True, whose rows grow "
+                    "from the measured demand."
+                )
 
     def allocate_world_rows(self, model):
         """Allocate the row store and each row class's status."""
