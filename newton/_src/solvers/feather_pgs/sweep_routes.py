@@ -148,22 +148,35 @@ class RowPlaces:
         velocity: The world's velocity change (``s_v``, and ``s_sweep_v`` where rows are wide): staged, or a line of
             global memory a world (``sweep_velocity``) where a block cannot hold it beside every other operand at its
             alternative place (a world past a block's reach; :meth:`.sweep_plan.Sweep.build`).
+        free_slots: Where the free bodies' impulses are staged but a block cannot hold every row's, the rows staged
+            (fixed slots, the stage's head: :attr:`.memory.Staging.heads`): a world whose live rows fit them stages
+            them, a world past them keeps every impulse in place (the spill). ``0``: every row's at ``impulses``.
     """
 
     metadata: Place = Place.SHARED
     impulses: Place = Place.SHARED
     dense_impulses: Place = Place.SHARED
     velocity: Place = Place.SHARED
+    free_slots: int = 0
+
+    def __post_init__(self):
+        if self.free_slots and self.impulses is not Place.SHARED:
+            raise ValueError("the free bodies' impulses spill past their staged slots: they are staged")
 
     def __repr__(self) -> str:
         dense = f", {self.dense_impulses.name}" if self.dense_impulses is not Place.SHARED else ""
         velocity = f", velocity {self.velocity.name}" if self.velocity is not Place.SHARED else ""
-        return f"RowPlaces({self.metadata.name}, {self.impulses.name}{dense}{velocity})"
+        slots = f", {self.free_slots} slots" if self.free_slots else ""
+        return f"RowPlaces({self.metadata.name}, {self.impulses.name}{slots}{dense}{velocity})"
 
     def placed(self, staging: Staging) -> RowPlaces:
-        """These places, each operand the stage held (:meth:`.memory.Staging.place`) at the place it got."""
+        """These places, each operand the stage held (:meth:`.memory.Staging.place`) at the place it got, and the free
+        bodies' impulses' slots where the stage kept their head."""
         held = {buffer.name for buffer in (*staging.buffers, *staging.declined)}
         moved = {field: staging.place(name) for field, name in _ROW_BUFFERS.items() if name in held}
+        impulses = _ROW_BUFFERS["impulses"]
+        if impulses in staging.heads:
+            moved["free_slots"] = next(buffer.count for buffer in staging.buffers if buffer.name == impulses)
         return dataclasses.replace(self, **moved)
 
     @property
@@ -172,6 +185,7 @@ class RowPlaces:
         return (
             ("" if self.metadata is Place.SHARED else "_gmeta")
             + ("" if self.impulses is Place.SHARED else "_glambda")
+            + (f"_slots{self.free_slots}" if self.free_slots else "")
             + ("" if self.dense_impulses is Place.SHARED else "_gline")
             + ("" if self.velocity is Place.SHARED else "_gv")
         )
@@ -416,7 +430,7 @@ def _colored_units(free: WorldRows, laws: RowLaws, M_MF: int, units: int, record
     units a unit waits for sit at earlier places, a warp takes its rounds in order and polls until its lanes ran, so
     the earliest unit not yet run always runs. A sweep's turns follow the last sweep's (``turn``, the sweep's index
     times the colors), so ``s_ran`` needs no clearing between sweeps."""
-    unit_rows = WorldRows(M_MF, Place.STREAMED, free=True, stream=free.stream, lanes=Lanes(1))
+    unit_rows = WorldRows(M_MF, Place.STREAMED, free=True, stream=free.stream, lanes=Lanes(1), slots=free.slots)
     torsion = laws.torsion
     layout = sweep_units.slot_layout(torsion)
 
@@ -1285,6 +1299,7 @@ def mf_gs_staging(
         free=True,
         stream=places.impulses is Place.GLOBAL or not free_rows,
         split=split,
+        slots=places.free_slots,
     )
     # The impulses each visit reads and writes, then the record words it only reads (streamed where declined).
     rows = sorted((*dense.buffers(), *free.buffers()), key=lambda buffer: buffer.alternative is not Place.GLOBAL)
@@ -1348,7 +1363,13 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         M_D, places.metadata, stream=places.dense_impulses is Place.GLOBAL, lanes=row_lanes, sides=sides, split=split
     )
     free = WorldRows(
-        M_MF, Place.STREAMED, free=True, stream=places.impulses is Place.GLOBAL, lanes=row_lanes, split=split
+        M_MF,
+        Place.STREAMED,
+        free=True,
+        stream=places.impulses is Place.GLOBAL,
+        lanes=row_lanes,
+        split=split,
+        slots=places.free_slots,
     )
     dense_op = packed_operator(max_row_dofs, row_lanes, wide=wide_rows, rows=dense, classes=sweep.support_classes)
     free_op = free_body_rows(row_lanes, max_row_dofs)

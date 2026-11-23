@@ -565,6 +565,8 @@ class Buffer:
         count: Its element count (a compile-time constant).
         align: Byte alignment of the array (default: its element type's).
         alternative: The place the body reads it at where the stage declines it (:func:`stage`); ``None``: staged.
+        spill: Whether the stage may keep its first elements where it cannot keep them all (fixed slots), the rest
+            at ``alternative`` (the spill): :func:`stage` names such a head in :attr:`Staging.heads`.
     """
 
     name: str
@@ -572,6 +574,7 @@ class Buffer:
     count: int
     align: int | None = None
     alternative: Place | None = None
+    spill: bool = False
 
     def __post_init__(self):
         if self.ctype not in _SIZES:
@@ -633,6 +636,8 @@ class Staging:
             ``"arrays"``, one array per buffer that holds every group's copy in group order (a buffer's
             elements of the groups that share a warp then fall in distinct banks).
         declined: The buffers :func:`stage` left at their alternative place.
+        heads: The buffers :func:`stage` kept only the first elements of (their count here), the rest at their
+            alternative place (:attr:`Buffer.spill`).
     """
 
     buffers: tuple[Buffer, ...] = ()
@@ -641,6 +646,7 @@ class Staging:
     name: str = "Scratch"
     layout: str = "struct"
     declined: tuple[Buffer, ...] = ()
+    heads: tuple[str, ...] = ()
 
     def __post_init__(self):
         names = [buffer.name for buffer in self.buffers]
@@ -808,18 +814,63 @@ HIDING_WARPS = 4
 (g1, kuka, franka-reach, go2-flat, allegro on the GB300), costs at 4 to 14 (franka-cabinet, keyboard, PRO allegro)."""
 
 
+SPILL_SLOTS = 32
+"""The granule of a spilling buffer's staged head (:attr:`Buffer.spill`): a warp's elements."""
+
+
 def stage(staging: Staging, warps: Callable[[int], int], budget: int, hiding: int, filled: Callable) -> Staging:
     """The staging rule: buffers without an alternative place, then each with one in order of reuse while the stage fits
     ``budget`` [B] and leaves (``warps(bytes)``) at least the fewer of the warps without it and ``hiding`` a scheduler;
-    one that streams otherwise pays only in throughput: only where the live items fill them (``filled``)."""
+    one that streams otherwise pays only in throughput: only where the live items fill them (``filled``). A buffer that
+    spills (:attr:`Buffer.spill`) and does not fit whole yields to the buffers after it, then keeps the longest head of
+    :data:`SPILL_SLOTS` granules that costs no resident warp and stays within the static stage
+    (:data:`STATIC_SHARED_BYTES`), its rest at its alternative place: a head never takes the multiprocessor's L1 for
+    shared memory, which the spill and the streamed operands read through (a 230 KB head on the GB300 cost the house of
+    cards 8% against a 10 KB stage), nor warps that hide the sweep's chain. A head is one lane group's: where a block
+    holds several groups, its stage is their worlds in flight, and a head there trades them for rows a world may not
+    have (a 1,216-row head cost NIST's general sweep, four worlds a block, 2.2% on the GB300)."""
     names = {buffer.name for buffer in staging if buffer.alternative is None}
-    kept = staging.only(names)
+    kept, spills = staging.only(names), None
+
+    def admits(trial: Staging) -> bool:
+        return trial.fits(budget) and warps(trial.bytes) >= min(warps(kept.bytes), hiding * REGISTER_PARTITIONS)
+
     for buffer in (buffer for buffer in staging if buffer.alternative is not None):
         trial = staging.only(names | {buffer.name})
-        if not trial.fits(budget) or warps(trial.bytes) < min(warps(kept.bytes), hiding * REGISTER_PARTITIONS):
+        if not admits(trial):
+            if buffer.spill and spills is None:
+                spills = buffer
+                continue
             break
         if buffer.alternative is Place.STREAMED and not filled(trial.bytes):
             break
         names.add(buffer.name)
         kept = trial
-    return kept
+    if spills is None or staging.groups > 1:
+        return kept
+    ceiling, resident = max(STATIC_SHARED_BYTES, kept.bytes), warps(kept.bytes)
+
+    def head_admits(trial: Staging) -> bool:
+        return trial.bytes <= ceiling and trial.fits(budget) and warps(trial.bytes) >= resident
+
+    return _spill_head(staging, names, spills, head_admits) or kept
+
+
+def _spill_head(staging: Staging, names: set, buffer: Buffer, admits: Callable[[Staging], bool]) -> Staging | None:
+    """``staging`` with ``names`` and the longest head of ``buffer`` that ``admits`` takes (a bisection over its
+    :data:`SPILL_SLOTS` granules), or ``None`` where not one granule fits."""
+
+    def with_head(count: int) -> Staging:
+        head = dataclasses.replace(buffer, count=count, spill=False)
+        buffers = tuple(head if other.name == buffer.name else other for other in staging.buffers)
+        trial = dataclasses.replace(staging, buffers=buffers).only(names | {buffer.name})
+        return dataclasses.replace(trial, heads=(*trial.heads, buffer.name))
+
+    low, high = 0, (buffer.count - 1) // SPILL_SLOTS
+    while low < high:
+        middle = (low + high + 1) // 2
+        if admits(with_head(middle * SPILL_SLOTS)):
+            low = middle
+        else:
+            high = middle - 1
+    return with_head(low * SPILL_SLOTS) if low else None

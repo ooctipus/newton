@@ -1247,6 +1247,8 @@ class Sweep:
         places = self.general_sweep.places
         names = {"metadata": places.metadata, "mf_impulses": places.impulses, "dense_impulses": places.dense_impulses}
         record = {name: "resident" if place is Place.SHARED else "streamed" for name, place in names.items()}
+        if places.free_slots:
+            record["mf_impulse_slots"] = int(places.free_slots)
         return {**record, "reason": "The stage rule (memory.stage) on the sweep's launch."}
 
     def _record_colored(self, plan) -> dict | None:

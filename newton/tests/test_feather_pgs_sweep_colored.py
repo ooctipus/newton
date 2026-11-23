@@ -431,6 +431,47 @@ class TestColoredSweep(unittest.TestCase):
         self.assertTrue(np.isfinite(thin.body_q).all())
 
 
+class TestSpilledImpulses(unittest.TestCase):
+    """The free rows' impulses past the block's staged slots, in place (:attr:`.sweep_routes.RowPlaces.free_slots`)."""
+
+    def test_spilled_impulses_hold_the_staged_values(self):
+        """The tray's free impulses with staged slots, the form a block that cannot hold every row's takes, step bit
+        for bit as with every impulse staged: in place where the world's rows outgrow four slots, staged where they
+        fit 256, on the CPU's sweep, and on CUDA on the colored mapping and the warp's."""
+        for slots in (4, 256):
+            with self.subTest(slots=slots):
+                self._spilled(slots)
+
+    def _spilled(self, slots: int):
+        original = sweep_plan.Sweep._staged
+
+        def spilled(plan, config, items):
+            staged = original(plan, config, items)
+            if not config.free_rows or staged.places.impulses is not Place.SHARED:
+                return staged
+            return dataclasses.replace(staged, places=dataclasses.replace(staged.places, free_slots=slots))
+
+        devices = ["cpu"] + (["cuda:0"] if wp.is_cuda_available() else [])
+        physics = conf._physics(tray(), "patch", 32)
+        for device in devices:
+            route = conf.REFERENCE_CPU if device == "cpu" else _ROUTE
+            with self.subTest(device=device):
+                runs, solvers = [], []
+                for stage in (original, spilled):
+                    with mock.patch.object(sweep_plan.Sweep, "_staged", stage), colored(1, solvers):
+                        runs.append(conf.simulate(physics.scene, route, device, options=physics.options(32)))
+                sweeps = [solvers[-1].sweep.general_sweep]
+                if device != "cpu":
+                    sweeps.append(solvers[-1].sweep.colored_sweep)
+                for sweep in sweeps:
+                    self.assertEqual(sweep.places.free_slots, slots, sweep.name)
+                    self.assertIn(f"_slots{slots}", sweep.name)
+                rows = int(solvers[-1].placement.mf_constraint_count.numpy().max())
+                self.assertTrue(4 < rows <= 256, "the tray's rows outgrow four slots and fit 256")
+                for name in ("body_q", "body_qd"):
+                    np.testing.assert_array_equal(getattr(runs[0], name), getattr(runs[1], name), err_msg=name)
+
+
 def _conformance_tests():
     """One conformance check per (scene, law, contact torsion): the gate's laws and the distance to its converged
     reference; and the compliant stack's material contacts, whose units step by the weights their slots stage."""

@@ -73,6 +73,14 @@ def indent(text: str, prefix: str) -> str:
 # ---------------------------------------------------------------------------------------------------------------------
 
 
+SPILL = "lam_mf"
+"""The free rows' impulses where they have slots (:attr:`WorldRows.slots`): the staged ones where the world's live rows
+fit them, else the world's in place, chosen once a world."""
+
+STAGED_RUN = "mf_staged"
+"""Whether the world's live free rows fit their staged slots (:attr:`WorldRows.slots`)."""
+
+
 @dataclasses.dataclass(frozen=True)
 class WorldRows:
     """A world's rows of one class in the row store's line: the dense class's from ``off_dense``, the free bodies'
@@ -93,7 +101,9 @@ class WorldRows:
     Impulses are staged (``s_lam_dense``, ``s_lam_mf``) or, with ``stream``, in place (``g_lam_dense``, ``g_lam_mf``).
     A dense row's first lane stores its impulse after every lane's reads, which read it directly; a staged free row's
     every lane (every row's with ``every_lane``) stores what it computed and reads its own stores; a streamed free row's
-    first lane stores without a barrier, and every lane reads it by broadcast.
+    first lane stores without a barrier, and every lane reads it by broadcast. With ``slots``, a world whose live free
+    rows fit ``slots`` stages their impulses and a world past them keeps every one in place (the spill), read and
+    stored through one pointer (``lam_mf``) as a staged row's: the same values at either place.
     """
 
     capacity: int
@@ -108,6 +118,9 @@ class WorldRows:
     split: bool = False
     """The line's records are split (:func:`.row_metadata.split_records`): each side's first world coordinate and the
     row's parent in a word of their own, the record's last quad."""
+    slots: int = 0
+    """The staged impulses' count where a world past it keeps its impulses in place
+    (:attr:`.sweep_routes.RowPlaces.free_slots`); ``0``: every row's at its place."""
 
     VISITED: ClassVar[str] = "i"
     """The row a row loop visits, whose record the loop holds in registers."""
@@ -118,6 +131,8 @@ class WorldRows:
             raise ValueError(f"a row's metadata is staged or streams (the free bodies' streams), got {self.metadata}")
         if self.stream and self.every_lane:
             raise ValueError("a class whose every lane reads its own stores stages its impulses")
+        if self.slots and (self.stream or not self.free):
+            raise ValueError("the free rows' staged impulses spill past their slots, no other class's")
 
     @property
     def record(self) -> bool:
@@ -287,10 +302,14 @@ class WorldRows:
         return self.lanes.broadcast(f"{self.impulses}[{row}]")
 
     def peek(self, row: str) -> str:
-        """Row ``row``'s impulse read directly (every lane reads the staged value)."""
+        """Row ``row``'s impulse read directly (every lane reads the staged value, or a spilled row's in place)."""
+        if self.slots:
+            return f"{SPILL}[{row}]"
         return f"{self.impulses}[{row}]"
 
     def store(self, row: str, value: str) -> str:
+        if self.slots:
+            return f"{SPILL}[{row}] = {value};"
         if self.own_stores:
             return f"{self.impulses}[{row}] = {value};"
         return self.lanes.first(f"{self.impulses}[{row}] = {value};")
@@ -320,19 +339,42 @@ class WorldRows:
 
     def buffers(self) -> tuple[Buffer, ...]:
         """The rows' stage, each buffer with its place where the stage declines it: impulses in place, records streamed."""
-        impulses = () if self.stream else (Buffer(self.impulses, "float", self.capacity, alternative=Place.GLOBAL),)
+        # The free rows' impulses may keep a head of their rows staged, the rest in place (memory.stage).
+        impulses = (
+            ()
+            if self.stream
+            else (
+                Buffer(
+                    self.impulses,
+                    "float",
+                    self.slots or self.capacity,
+                    alternative=Place.GLOBAL,
+                    spill=self.free and not self.slots,
+                ),
+            )
+        )
         staged = Buffer("s_rec_dense", "int", len(self.staged_words) * self.capacity, alternative=Place.STREAMED)
         return impulses if self.record else (*impulses, staged)
 
     def declaration(self) -> str:
-        """The streamed impulses' view of the world's line."""
+        """The streamed impulses' view of the world's line; with slots, the staged run's or the line's (the spill)."""
+        if self.slots:
+            return (
+                f"    const bool {STAGED_RUN} = m_mf <= {self.slots};\n"
+                f"    float* {SPILL} = {STAGED_RUN} ? {self.impulses} : &world_impulses.data[{self.base}];"
+            )
         if self.stream:
             return f"    volatile float* {self.impulses} = (volatile float*)(&world_impulses.data[{self.base}]);"
         return ""
 
+    def _staged(self, row: str, statement: str) -> str:
+        """``statement`` for row ``row`` where its impulse is staged (a world whose live rows fit the slots)."""
+        return f"if ({STAGED_RUN}) {statement}" if self.slots else statement
+
     def loads(self, row: str = "i") -> str:
         """Stage row ``row``'s impulse and metadata."""
-        lines = [] if self.stream else [f"{self.impulses}[{row}] = world_impulses.data[{self.base} + {row}];"]
+        staged = f"{self.impulses}[{row}] = world_impulses.data[{self.base} + {row}];"
+        lines = [] if self.stream else [self._staged(row, staged)]
         if not self.record:
             at = f"off_dense + ({row})"
             # The staged words mirror the record's (row_metadata.pack_row_record): a split one's parent in a word.
@@ -366,7 +408,9 @@ class WorldRows:
 
     def stores(self, row: str = "i") -> str:
         """Publish row ``row``'s staged impulse."""
-        return "" if self.stream else f"world_impulses.data[{self.base} + {row}] = {self.impulses}[{row}];"
+        if self.stream:
+            return ""
+        return self._staged(row, f"world_impulses.data[{self.base} + {row}] = {self.impulses}[{row}];")
 
 
 def spin_row(parent: str, end: str, kind: Callable[[str], str], *, spin: str = str(ROW_TORSION)) -> str:

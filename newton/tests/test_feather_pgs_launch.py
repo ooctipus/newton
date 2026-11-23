@@ -10,6 +10,7 @@ names it (the fill at 512-4,096 worlds, the writer's lanes at 16,384 worlds, the
 
 import ctypes
 import dataclasses
+import functools
 import types
 import unittest
 from typing import Any
@@ -24,6 +25,7 @@ from newton._src.core.memory import CPU, Buffer, Device, Place, Staging, carveou
 from newton._src.solvers.feather_pgs import kernel_template, sweep_routes, tree_kinetic_state, walk_rows
 from newton._src.solvers.feather_pgs.device_preludes import SHARED_STORAGE, DevicePrelude, dual_native, lane_group
 from newton._src.solvers.feather_pgs.factor import walk as factor_walk
+from newton._src.solvers.feather_pgs.sweep import EXACT, LevelLaw
 from newton._src.solvers.feather_pgs.tree_kinetic_layout import TreeLayout
 
 PRO = Device.of(120, 188, 101_376)
@@ -213,6 +215,39 @@ class TestShapeAgainstTodaysRules(unittest.TestCase):
             self.assertIs(placed(cabinet, device).metadata, Place.STREAMED)
         for config, device, worlds in ((g1, PRO, 16384), (cabinet, PRO, 128), (cabinet, CPU, 16384)):
             self.assertEqual(placed(config, device, worlds), sweep_routes.STAGED_ROWS)
+
+    def test_a_run_past_the_block_keeps_its_first_impulses_staged(self):
+        """The house of cards' colored world at 65,535 free rows: the block keeps the longest head of the free rows'
+        impulses its static stage holds (fixed slots, whole warps' worth) and the rest stay in place; at 2,048 rows
+        every impulse stages, as before. The CPU stages every row."""
+        cards = functools.partial(
+            sweep_routes.GeneralSweep, 32, max_world_dofs=162, device_arch="120", max_row_dofs=12, torsion=True
+        )
+        colored = {"levels": LevelLaw(EXACT)}
+
+        def placed(rows, device):
+            config = cards(mf_max_constraints=rows, **colored)
+            return config.places.placed(shape(config.work(1, config.staging()), device).staging)
+
+        for device in (PRO, GB300):
+            with self.subTest(arch=device.arch):
+                spilled = placed(65535, device)
+                self.assertIs(spilled.impulses, Place.SHARED)
+                self.assertGreater(spilled.free_slots, 2048)
+                self.assertEqual(spilled.free_slots % memory.SPILL_SLOTS, 0)
+                config = cards(mf_max_constraints=65535, places=spilled, **colored)
+                self.assertTrue(config.staging().fits(memory.STATIC_SHARED_BYTES))
+                self.assertIn(f"_slots{spilled.free_slots}", config.name)
+                self.assertEqual(placed(2048, device).free_slots, 0)
+        self.assertEqual(placed(65535, CPU).free_slots, 0)
+        # NIST's warp mapping holds four worlds a block: its stage is their worlds in flight, so it keeps no head and
+        # its impulses stay in place, as before.
+        nist = sweep_routes.GeneralSweep(
+            384, 4096, 69, "120", max_row_dofs=15, torsion=True, lanes_per_world=16, block_warps=2
+        )
+        for device in (PRO, GB300):
+            places = nist.places.placed(shape(nist.work(8192, nist.staging()), device).staging)
+            self.assertEqual((places.impulses, places.free_slots), (Place.GLOBAL, 0))
 
     def test_a_bucket_beside_the_tiers_streams_its_record(self):
         """allegro's record stages over every world on the GB300 and streams beside the tiers, sure of no live world."""
