@@ -124,52 +124,13 @@ class TestFreeBodyRowsBuild(unittest.TestCase):
     def test_split_records_step_as_packed(self):
         """The split record is a move: a stack of boxes on a two-link arm's links steps to the same bits as with the
         packed record, the rows streamed or staged."""
-        import newton  # noqa: PLC0415
-
-        def run(pins):
-            builder = newton.ModelBuilder()
-            link_cfg = newton.ModelBuilder.ShapeConfig(density=500.0)
-            parent, joints = -1, []
-            for k in range(2):
-                link = builder.add_link(xform=wp.transform(wp.vec3(0.3 * k, 0.0, 0.06), wp.quat_identity()))
-                builder.add_shape_box(link, hx=0.15, hy=0.05, hz=0.05, cfg=link_cfg)
-                if parent < 0:
-                    joint = builder.add_joint_free(link)
-                else:
-                    joint = builder.add_joint_revolute(
-                        parent,
-                        link,
-                        parent_xform=wp.transform(wp.vec3(0.15, 0.0, 0.0), wp.quat_identity()),
-                        child_xform=wp.transform(wp.vec3(-0.15, 0.0, 0.0), wp.quat_identity()),
-                        axis=wp.vec3(0.0, 1.0, 0.0),
-                        limit_lower=-0.5,
-                        limit_upper=0.5,
-                    )
-                joints.append(joint)
-                parent = link
-            builder.add_articulation(joints)
-            for k in range(3):
-                body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.16 + 0.1 * k), wp.quat_identity()))
-                builder.add_shape_box(body, hx=0.04, hy=0.04, hz=0.04)
-            builder.add_ground_plane()
-            model = builder.finalize(device=DEVICE)
-            solver = newton.solvers.SolverFeatherPGS(model, pins=newton.solvers.SolverFeatherPGS.Pins(**pins))
-            pipeline = newton.CollisionPipeline(model, growable_contacts=True)
-            contacts = pipeline.contacts()
-            state, out = model.state(), model.state()
-            for _ in range(8):
-                pipeline.collide(state, contacts)
-                solver.step(state, out, model.control(), contacts, 1.0 / 240.0)
-                state, out = out, state
-            return solver.placement.split_records, state.body_q.numpy(), state.body_qd.numpy()
-
         for pins in ({}, {"mf_storage": "line"}):
             with self.subTest(pins=pins):
-                packed = run(pins)
+                packed = _arm_stack_run(DEVICE, pins)
+                self.assertFalse(packed[0].placement.split_records)
                 with mock.patch.object(row_metadata, "_RECORD_MAX_DOFS", -1):
-                    split = run(pins)
-                self.assertFalse(packed[0])
-                self.assertTrue(split[0])
+                    split = _arm_stack_run(DEVICE, pins)
+                    self.assertTrue(split[0].placement.split_records)
                 np.testing.assert_array_equal(split[1], packed[1])
                 np.testing.assert_array_equal(split[2], packed[2])
 
@@ -220,6 +181,48 @@ class TestFreeBodyRowsBuild(unittest.TestCase):
         np.testing.assert_allclose(solver.placement.diag.numpy()[0, :rows], expected, rtol=1e-5)
 
 
+def _arm_stack_run(device, pins=None, steps: int = 8):
+    """A two-link arm on the ground with three boxes stacked on its links (dense and free rows), ``steps`` steps: the
+    solver and the bodies' state."""
+    import newton  # noqa: PLC0415
+
+    builder = newton.ModelBuilder()
+    link_cfg = newton.ModelBuilder.ShapeConfig(density=500.0)
+    parent, joints = -1, []
+    for k in range(2):
+        link = builder.add_link(xform=wp.transform(wp.vec3(0.3 * k, 0.0, 0.06), wp.quat_identity()))
+        builder.add_shape_box(link, hx=0.15, hy=0.05, hz=0.05, cfg=link_cfg)
+        if parent < 0:
+            joint = builder.add_joint_free(link)
+        else:
+            joint = builder.add_joint_revolute(
+                parent,
+                link,
+                parent_xform=wp.transform(wp.vec3(0.15, 0.0, 0.0), wp.quat_identity()),
+                child_xform=wp.transform(wp.vec3(-0.15, 0.0, 0.0), wp.quat_identity()),
+                axis=wp.vec3(0.0, 1.0, 0.0),
+                limit_lower=-0.5,
+                limit_upper=0.5,
+            )
+        joints.append(joint)
+        parent = link
+    builder.add_articulation(joints)
+    for k in range(3):
+        body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.16 + 0.1 * k), wp.quat_identity()))
+        builder.add_shape_box(body, hx=0.04, hy=0.04, hz=0.04)
+    builder.add_ground_plane()
+    model = builder.finalize(device=device)
+    solver = newton.solvers.SolverFeatherPGS(model, pins=newton.solvers.SolverFeatherPGS.Pins(**(pins or {})))
+    pipeline = newton.CollisionPipeline(model, growable_contacts=True)
+    contacts = pipeline.contacts()
+    state, out = model.state(), model.state()
+    for _ in range(steps):
+        pipeline.collide(state, contacts)
+        solver.step(state, out, model.control(), contacts, 1.0 / 240.0)
+        state, out = out, state
+    return solver, state.body_q.numpy(), state.body_qd.numpy()
+
+
 def _box_run(device, pins=None, steps: int = 12):
     """A tilted box on the ground (its lowest edge 5 mm into it), ``steps`` steps: the most rows of the line a step
     held, the solver and the box's state."""
@@ -260,6 +263,20 @@ class TestLineImpulses(unittest.TestCase):
                 self.assertGreater(rows, 0, "the box must touch the ground")
                 np.testing.assert_array_equal(q, q0)
                 np.testing.assert_array_equal(qd, qd0)
+
+    def test_velocity_in_global_memory_holds_the_staged_values(self):
+        """The general sweep's velocity change in global memory (the test pin ``velocity='global'``; a world past a
+        block's reach takes it there) steps bit for bit as the staged one, the rows staged or in place."""
+        devices = ["cpu"] + (["cuda:0"] if wp.get_cuda_device_count() > 0 else [])
+        for device in devices:
+            for pins in ({}, {"mf_storage": "line"}):
+                with self.subTest(device=device, pins=pins):
+                    solver, q, qd = _arm_stack_run(device, {**pins, "velocity": "global"})
+                    self.assertIs(solver.sweep.general_sweep.places.velocity, Place.GLOBAL)
+                    staged, q0, qd0 = _arm_stack_run(device, pins)
+                    self.assertIs(staged.sweep.general_sweep.places.velocity, Place.SHARED)
+                    np.testing.assert_array_equal(q, q0)
+                    np.testing.assert_array_equal(qd, qd0)
 
 
 if __name__ == "__main__":

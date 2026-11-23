@@ -145,15 +145,20 @@ class RowPlaces:
         metadata: The dense rows' metadata (with their sides): staged, or their records streamed.
         impulses: The free bodies' impulses: staged, or in place.
         dense_impulses: The dense rows' impulses (the line's): staged, or in place.
+        velocity: The world's velocity change (``s_v``, and ``s_sweep_v`` where rows are wide): staged, or a line of
+            global memory a world (``sweep_velocity``) where a block cannot hold it beside every other operand at its
+            alternative place (a world past a block's reach; :meth:`.sweep_plan.Sweep.build`).
     """
 
     metadata: Place = Place.SHARED
     impulses: Place = Place.SHARED
     dense_impulses: Place = Place.SHARED
+    velocity: Place = Place.SHARED
 
     def __repr__(self) -> str:
         dense = f", {self.dense_impulses.name}" if self.dense_impulses is not Place.SHARED else ""
-        return f"RowPlaces({self.metadata.name}, {self.impulses.name}{dense})"
+        velocity = f", velocity {self.velocity.name}" if self.velocity is not Place.SHARED else ""
+        return f"RowPlaces({self.metadata.name}, {self.impulses.name}{dense}{velocity})"
 
     def placed(self, staging: Staging) -> RowPlaces:
         """These places, each operand the stage held (:meth:`.memory.Staging.place`) at the place it got."""
@@ -168,11 +173,19 @@ class RowPlaces:
             ("" if self.metadata is Place.SHARED else "_gmeta")
             + ("" if self.impulses is Place.SHARED else "_glambda")
             + ("" if self.dense_impulses is Place.SHARED else "_gline")
+            + ("" if self.velocity is Place.SHARED else "_gv")
         )
 
 
 STAGED_ROWS = RowPlaces()
 """Every row operand in the block's shared stage, the default."""
+
+
+def velocity_fits(config, budget: int) -> bool:
+    """Whether a block holds ``config``'s velocity change in its stage beside every operand that has no alternative
+    place (each other at its alternative): where it does not, the world is past a block's reach."""
+    staging = config.staging()
+    return staging.only({buffer.name for buffer in staging if buffer.alternative is None}).fits(budget)
 
 
 def record_first(max_constraints: int, places: RowPlaces) -> int:
@@ -1218,10 +1231,18 @@ def mf_gs_staging(
         levels = (Buffer("s_ran", "int", ran_slots(max_world_dofs)),)
         if traces:
             levels += block_argmax(COLORED_THREADS // 32, warp="warp", lane="lane")[1]
-    return Staging(
+    # The world's velocity change, staged unless it lives in global memory (RowPlaces.velocity).
+    velocity = (
         (
             Buffer("s_v", "float", max_world_dofs),
             *((Buffer("s_sweep_v", "float", max_world_dofs),) if wide_rows else ()),
+        )
+        if places.velocity is Place.SHARED
+        else ()
+    )
+    return Staging(
+        (
+            *velocity,
             *rows,
             *levels,
             *(active_words(max_constraints) if active_rows else ()),
@@ -1517,6 +1538,13 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         {mf_store}
     }}"""
     dense_view = dense.declaration() + "\n" if dense.stream else ""
+    # A world past a block's reach keeps its velocity change in its line of global memory (RowPlaces.velocity), read
+    # and written as the stage's.
+    velocity_view = ""
+    if places.velocity is not Place.SHARED:
+        velocity_view = "\n    float* s_v = sweep_velocity.data + (size_t)world * sweep_velocity.shape[1];"
+        if wide_rows:
+            velocity_view += f"\n    float* s_sweep_v = s_v + {D};"
     # The sweeps and the way back; the stage launch (``formed == "stage"``) forms the dense records and leaves.
     budget_line = f"    int {budget} = iterations;\n" if budget != "iterations" else ""
     rest = f"""
@@ -1552,7 +1580,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     const size_t packed_base = (size_t)line * {P * int(max_row_dofs)};
     const size_t free_base = packed_base + {M_D * int(max_row_dofs)};{offsets}
 
-{staging.declarations("    ")}
+{staging.declarations("    ")}{velocity_view}
 {dense_view}{free_view}{trace_reduction}
 {friction_laws}
 {first_warp}    for (int i = lane; i < m_dense; i += STRIDE) {{
@@ -1770,6 +1798,12 @@ class GeneralSweep(SweepConfig):
             ),
             # Where the free bodies' contacts are regions, their stream.
             *((RowArgument(name, dtype, after="omega") for name, dtype in REGION_OPERANDS) if self.regions else ()),
+            # Where the world's velocity change lives in global memory, its line a world (RowPlaces.velocity).
+            *(
+                (RowArgument("sweep_velocity", wp.array2d[float], after="omega"),)
+                if self.places.velocity is not Place.SHARED
+                else ()
+            ),
             # The warp mapping's worlds' costs, which order its next call (sweep_levels.claim_worlds).
             *((RowArgument("world_cost", wp.array[wp.int32], after="omega"),) if not self.colored else ()),
             *self.law_operands(),

@@ -411,6 +411,8 @@ class Sweep:
         self.par_tiers = []
         # The claims' worlds (sweep_levels.claim_worlds): a bucket a tier, then the general sweep's.
         self.claims = None
+        # The general sweep's velocity lines where it keeps its velocity change in global memory (_velocity_lines).
+        self.sweep_velocity = None
         self.claims_beside = None
         # The one writer's EMIT sink (walk_rows.RowSeeds): none until a tier walks its rows.
         self.placement.row_seeds = walk_rows.row_seeds(self.placement, 0, 0, sweep_routes_tiers.TIER_ROWS)
@@ -449,6 +451,13 @@ class Sweep:
                 split=self.placement.split_records,
                 **self.law_fields,
             )
+            # The world's velocity change in the block's stage where the block holds it beside every other operand at
+            # its alternative place, else (a world past a block's reach) in a line of global memory a world, read and
+            # written as the stage's (RowPlaces.velocity); a test pin puts it there.
+            if self.pins.velocity == "global" or not sweep_routes.velocity_fits(general(), budget):
+                pinned = dataclasses.replace(pinned, velocity=Place.GLOBAL)
+                general = functools.partial(general, places=pinned)
+            self.sweep_velocity = self._velocity_lines(general())
             active_rows, self.general_active_reason = class_plan.active_rows_rule(
                 self.pins, small_world_lanes=small, fits=lambda: general(active_rows=True).staging().fits(budget)
             )
@@ -778,6 +787,14 @@ class Sweep:
             max_blocks=placement.contact_capacity_blocks,
         )
 
+    def _velocity_lines(self, config) -> wp.array:
+        """The worlds' lines of the velocity change where it lives in global memory (``config.places.velocity``): a
+        world's ``s_v``, then where rows are wide its ``s_sweep_v``; one element elsewhere."""
+        if config.places.velocity is Place.SHARED:
+            return wp.zeros((1, 1), dtype=float, device=self.model.device)
+        width = self.forest.max_world_dofs * (2 if config.wide_rows else 1)
+        return wp.zeros((self.forest.world_count, max(width, 1)), dtype=float, device=self.model.device)
+
     def list_regions(self, solver, state_in, contacts, dt: float) -> None:
         """The step's regions (:meth:`.region_sweep.Regions.list`), after the patch link."""
         self.regions.list(solver, state_in, contacts, dt)
@@ -816,6 +833,7 @@ class Sweep:
             "mf_contact_rows_end": placement.mf_contact_rows_end,
             # The streamed rows' records (the free bodies', and the dense rows' where they stream).
             "row_record": placement.row_record,
+            "sweep_velocity": self.sweep_velocity,
             "iterations": self.options.pgs_iterations,
             "omega": self.options.pgs_omega,
             "friction_metric": placement.friction_metric,

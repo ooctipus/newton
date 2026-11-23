@@ -60,6 +60,9 @@ class Pins:
     left_regions: bool = True
     """``False``: no region is left out of the sweeps until their end (:func:`.region_sweep.region_left`), so a test
     holds the published point to the sweep of every region from the start."""
+    velocity: str | None = None
+    """``"global"``: the general sweep's velocity change in global memory (:class:`.sweep_routes.RowPlaces`), where a
+    block would hold it."""
 
     def record(self) -> dict:
         """The pins in force (those off their defaults) as a JSON-compliant record."""
