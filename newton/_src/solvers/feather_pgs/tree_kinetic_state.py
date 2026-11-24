@@ -156,6 +156,7 @@ FORCE_INPUT = (
     Field("joint_qd", wp.float32, ("dof",), owner="state_in"),
     Field("joint_f", wp.float32, ("dof",), owner="control"),
     Field("body_f", wp.spatial_vector, ("body",), owner="state_in"),
+    Field("turn_tau", wp.float32, ("dof",), owner="factor"),
     Field("body_flags", wp.int32, ("body",), owner="model"),
     Field("stiffness", wp.float32, ("dof",), owner="factor", attr="passive_spring_stiffness"),
     Field("reference", wp.float32, ("coord",), owner="factor", attr="passive_spring_ref"),
@@ -178,8 +179,8 @@ FORCE_INPUT = (
     Field("row_dv", wp.float32, ("drive_row",), owner="factor", attr="aug_row_dv"),
     Field("frame_status", wp.int32, ("status",), owner="factor", attr="walk_release_status"),
 )
-"""The held-tree predictor's inputs: the step's state and control, the solver's passive and kinematic tables, the
-augmented state and the drive rows it writes, the border's status word (:func:`border_solve`), and the step's
+"""The held-tree predictor's inputs: the step's state and control, the turns' coordinate forces, the solver's passive
+and kinematic tables, the augmented state and the drive rows it writes, the border's status word (:func:`border_solve`), and the step's
 values."""
 
 ForceInput = field_group.struct("ForceInput", FORCE_INPUT, __name__)
@@ -589,7 +590,7 @@ _FORCE_HALF = r"""    if(lane==0){nonzero=0;$CLEAR_SLIPS}
 $CARRY
     for(int i=lane;i<$DOFS;i+=stride) {
         const int dof=ds+i,body=p.dof_joint.data[i];
-        float value=-cache.bias.data[group*$DOFS+i]+f.joint_f.data[dof]+f.u0.data[dof];
+        float value=-cache.bias.data[group*$DOFS+i]+f.joint_f.data[dof]+f.u0.data[dof]+f.turn_tau.data[dof];
         if(nonzero){$PROJECT}
         if($SPRING_GUARD)value+=$PASSIVE;
         trial.force.data[dof]=value;

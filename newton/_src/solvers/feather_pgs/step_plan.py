@@ -425,7 +425,7 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
     (the contacts and the collision event) or its owner's (``owners.tsv`` of the TG hand-back). Under the NVTX
     diagnostic a named group runs as one stage inside its range; under the timings each stage runs timed."""
     cut, factor, laws, placement, sweep = attrgetter("cut", "factor", "laws", "placement", "sweep")(solver)
-    model, options, forest, diagnostics = solver.model, solver.options, spec.forest, spec.diagnostics
+    model, options, diagnostics = solver.model, solver.options, spec.diagnostics
     articulated, particles, pure, warm = spec.articulated, spec.particles, spec.pure_forest, spec.laws.warm_start
     v_hat, v_out, colored, rest = solver.v_hat, solver.v_out, sweep.colored_units, solver.sleep
     device, preelimination = model.device, spec.laws.preelimination
@@ -436,7 +436,9 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
     drives = bool(factor.parallel_drives and factor.held.prepares_drives)
     forked = drives and overlap is not None
     drive = (factor, "prepare_drives", STATE_IN, CONTROL, DT, v_hat, v_out, factor.held.drive_dofs)
-    free_roots = bool(forest.free_root_joint_count and forest.free_rigid_body_count)
+    # The turns' gyroscopic forces read FK/ID's columns and the input state, and only the predictor reads them: they run
+    # beside the factor's and the walk's refreshes (Beside) and join before the prediction.
+    turning = factor.turning_joints.shape[0] > 0
     snapshots = ()
     if "snapshots" in diagnostics and articulated:
         qd, qdd, predicted = solver._debug_stage3_qd_work, solver._debug_stage3_joint_qdd, solver._debug_stage3_v_hat
@@ -495,17 +497,19 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
         (call, "wait_for_collision", particles, (STEP, "wait_for_collision", device)),
         (call, "particle_forces", particles, (solver, "_eval_particle_forces", STATE_IN, CONTROL, CONTACTS)),
         # Stages 1-3: the tree factor (the drives, FK/ID, the mass refresh and the factor's, the walk's refresh with the
-        # clock), then the predictor v_hat and the free roots' corrections.
+        # clock; the turns' gyroscopic coordinate forces beside the refreshes, from FK/ID's columns), then the predictor
+        # v_hat.
         (s1, "check_call", True, (cached_state_binding, "check_call", device, STATE_IN, STATE_OUT, DT)),
         (s1, "drives_on_stream", forked, (STEP, "beside", overlap, *drive)),
         (s1, "drives", drives and overlap is None, drive),
         (s1, "fk_id", True, (factor, "fk_id", STATE_IN, STATE_OUT, DT)),
         (s1, "join_drives", forked, (overlap, "join")),
+        (s1, "turn_forces", turning, (STEP, "beside", factor.turn_beside, factor, "turn_forces", STATE_IN, DT)),
         (s1, "refresh", True, (factor, "refresh", DT)),
         (s1, "advance_clock", factor.walk_arts is None, (factor, "advance_clock", DT)),
         (s1, "walk_step", factor.walk_arts is not None, (factor, "walk_step", STATE_IN, DT)),
+        (s3, "join_turn_forces", turning, (factor.turn_beside, "join")),
         (s3, "predict", True, (factor, "predict", STATE_IN, CONTROL, DT)),
-        (s3, "correct_free_roots", free_roots, (factor, "correct_free_roots", STATE_IN, DT, v_hat)),
         (s3, "damp_spin", options.angular_damping != 0.0, (factor, "damp_spin", DT, v_hat)),
         (s3, "free_body_bases", regions, (STEP, "beside", bases, sweep.regions, "bases", v_hat, CONTACTS)),
         (dynamics, "snapshots", "snapshots" in diagnostics, *snapshots),

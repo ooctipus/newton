@@ -511,12 +511,14 @@ class Beside:
 
     Args:
         device: The device of the work.
+        priority: The stream's priority: 0 (the default), or -1 for work the step joins soon after it starts, whose
+            blocks then go first wherever the work in between leaves a multiprocessor free.
     """
 
-    def __init__(self, device=None):
+    def __init__(self, device=None, priority: int = 0):
         cuda = wp.get_device(device).is_cuda
         self.device = device
-        self.stream = wp.Stream(device) if cuda else None
+        self.stream = wp.Stream(device, priority=priority) if cuda else None
         self.started = wp.Event(device) if cuda else None
         self.done = wp.Event(device) if cuda else None
 

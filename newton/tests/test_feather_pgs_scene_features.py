@@ -499,52 +499,80 @@ def test_free_d6_swings_through_its_singular_angles(test, device):
     np.testing.assert_allclose(d6, ball, atol=1.0e-6)
 
 
-def test_pile_of_d6_figures_follows_the_ball_jointed_pile(test, device):
-    """Two layers of figures whose limbs hang on D6 joints with three free angular axes (as maximal-coordinate
-    ragdoll piles build them, without an articulation) land on each other and on the floor as the same figures on ball
-    joints do:
-    the same motion until their contacts amplify the two holds' rounding (a pile is chaotic: the gap grows from 2e-7 m
-    at 0.05 s past 1e-4 m after 0.5 s), then finite, every joint closed, nothing sunk into the floor."""
-    piles, closure = {}, {}
+def _four_figure_pile(device, kind: str, turn: float = 0.0):
+    """Two layers of four figures whose limbs hang on D6 joints with three free angular axes (``"d6"``) or on ball
+    joints (``"ball"``), built without an articulation (as maximal-coordinate ragdoll piles build them), the whole pile
+    turned by ``turn`` radians about the vertical through the origin; its body poses by step [m] over 240 steps, turned
+    back, and its largest joint gap."""
     angular = [newton.ModelBuilder.JointDofConfig.create_unlimited(axis) for axis in newton.Axis]
-    for kind in ("d6", "ball"):
-        builder = newton.ModelBuilder(gravity=(0.0, 0.0, -_G))
-        builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=_MU))
-        for figure in range(4):
-            offset = np.array([0.6 * (figure % 2), 0.0, 1.6 * (figure // 2)])
-            cfg = newton.ModelBuilder.ShapeConfig(mu=_MU, collision_group=-(figure + 1))
-            bodies = []
-            for _name, centre, half in _FIGURE:
-                bodies.append(
-                    builder.add_link(xform=wp.transform(wp.vec3(*(np.add(centre, offset))), wp.quat_identity()))
-                )
-                builder.add_shape_box(bodies[-1], hx=half[0], hy=half[1], hz=half[2], cfg=cfg)
-            for limb, pivot in _PIVOTS:
-                frames = {
-                    "parent_xform": wp.transform(wp.vec3(*np.subtract(pivot, _FIGURE[0][1])), wp.quat_identity()),
-                    "child_xform": wp.transform(wp.vec3(*np.subtract(pivot, _FIGURE[limb][1])), wp.quat_identity()),
-                }
-                if kind == "d6":
-                    builder.add_joint_d6(bodies[0], bodies[limb], angular_axes=angular, **frames)
-                else:
-                    builder.add_joint_ball(bodies[0], bodies[limb], **frames)
-        model = builder.finalize(device=device, skip_validation_joints=True)
-        solver = newton.solvers.SolverFeatherPGS(model, dense_max_constraints=1024)
-        pipeline = newton.CollisionPipeline(model)
-        contacts = pipeline.contacts()
-        state_in, state_out, control = model.state(), model.state(), model.control()
-        poses, gaps = [], []
-        for _ in range(240):
-            pipeline.collide(state_in, contacts)
-            solver.step(state_in, state_out, control, contacts, _DT)
-            state_in, state_out = state_out, state_in
-            poses.append(state_in.body_q.numpy().copy())
-            gaps.append(_joint_gaps(model, poses[-1]).max())
-        piles[kind], closure[kind] = np.array(poses), max(gaps)
+    c, s = np.cos(turn), np.sin(turn)
+    spin = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+    heading = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), float(turn))
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -_G))
+    builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=_MU))
+    for figure in range(4):
+        offset = np.array([0.6 * (figure % 2), 0.0, 1.6 * (figure // 2)])
+        cfg = newton.ModelBuilder.ShapeConfig(mu=_MU, collision_group=-(figure + 1))
+        bodies = []
+        for _name, centre, half in _FIGURE:
+            bodies.append(builder.add_link(xform=wp.transform(wp.vec3(*(spin @ np.add(centre, offset))), heading)))
+            builder.add_shape_box(bodies[-1], hx=half[0], hy=half[1], hz=half[2], cfg=cfg)
+        for limb, pivot in _PIVOTS:
+            frames = {
+                "parent_xform": wp.transform(wp.vec3(*np.subtract(pivot, _FIGURE[0][1])), wp.quat_identity()),
+                "child_xform": wp.transform(wp.vec3(*np.subtract(pivot, _FIGURE[limb][1])), wp.quat_identity()),
+            }
+            if kind == "d6":
+                builder.add_joint_d6(bodies[0], bodies[limb], angular_axes=angular, **frames)
+            else:
+                builder.add_joint_ball(bodies[0], bodies[limb], **frames)
+    model = builder.finalize(device=device, skip_validation_joints=True)
+    solver = newton.solvers.SolverFeatherPGS(model, dense_max_constraints=1024)
+    pipeline = newton.CollisionPipeline(model)
+    contacts = pipeline.contacts()
+    state_in, state_out, control = model.state(), model.state(), model.control()
+    poses, gaps = [], []
+    for _ in range(240):
+        pipeline.collide(state_in, contacts)
+        solver.step(state_in, state_out, control, contacts, _DT)
+        state_in, state_out = state_out, state_in
+        body_q = state_in.body_q.numpy()
+        poses.append(body_q[:, :3].astype(np.float64) @ spin)
+        gaps.append(_joint_gaps(model, body_q).max())
+    return np.array(poses), max(gaps)
+
+
+def test_pile_of_d6_figures_follows_the_ball_jointed_pile(test, device):
+    """Figures whose limbs hang on D6 joints with three free angular axes land on each other and on the floor as the
+    same figures on ball joints do: the same motion until the pile's contacts amplify the two joints' rounding, then
+    finite, every joint closed, nothing sunk into the floor.
+
+    A pile is chaotic: any rounding difference grows from about 1e-7 m to past 1e-4 m in about half a second. The D6
+    pile is held to what a rounding twin of the ball pile does, the same ball pile turned 30 degrees about the vertical
+    (the same physics; every axis, frame and quaternion rounds differently). The D6 pile parts from the ball pile by
+    1e-4 m no sooner than the turned pile does, less half the turned pile's climb from 1e-6 to 1e-4 m: a D6 may round
+    up to ten times further from a ball joint a step than the turned copy does (two renderings of the same joint), which
+    the chaos's growth turns into half that climb. Measured on the CPU, the first steps past 1e-6 and 1e-4 m: before the
+    turns' energy-keeping step D6 46, 114 and turned 49, 114 (bound 81.5); with it D6 45, 108 and turned 46, 108
+    (bound 77)."""
+    piles, closure = {}, {}
+    for kind, turn in (("d6", 0.0), ("ball", 0.0), ("turned", np.radians(30.0))):
+        piles[kind], closure[kind] = _four_figure_pile(device, "d6" if kind == "d6" else "ball", turn)
     test.assertTrue(np.isfinite(piles["d6"]).all())
     test.assertGreater(piles["d6"][:, :, 2].min(), 0.04, "no box sinks into the floor")
     test.assertLess(closure["d6"], 1.0e-4, "every joint stays closed")
-    np.testing.assert_allclose(piles["d6"][:90], piles["ball"][:90], atol=1.0e-4)
+
+    def parting(kind, gap):
+        apart = np.abs(piles[kind] - piles["ball"]).max(axis=(1, 2)) > gap
+        return int(np.argmax(apart)) if apart.any() else len(apart)
+
+    twin_start, twin_end = parting("turned", 1.0e-6), parting("turned", 1.0e-4)
+    test.assertGreater(twin_end, twin_start, "the turned pile parts from the ball pile by rounding, then by chaos")
+    test.assertGreaterEqual(
+        parting("d6", 1.0e-4),
+        (twin_start + twin_end) / 2,
+        f"the D6 pile parts from the ball pile no sooner than a rounding twin does (turned: {twin_start}..{twin_end})",
+    )
 
 
 def _figure_pile(device, **options):

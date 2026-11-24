@@ -3,14 +3,15 @@
 
 """The factor's kernels outside the walk.
 
-The free roots' prediction corrections (gyroscopic velocity, spin damping, the transport the integrator adds), the
-joint integrator, and the flags of the mass matrices' and the FK/ID cache's refresh.
+The turns' gyroscopic moments and the coordinate forces they make, the free roots' prediction corrections (spin
+damping, the transport the integrator adds), the joint integrator, and the flags of the mass matrices' and the FK/ID
+cache's refresh.
 """
 
 import warp as wp
 
 from ....sim import JointType
-from ..spatial_laws import free_root_transport
+from ..spatial_laws import free_root_transport, turn_moment
 
 # FeatherPGS takes no gradients: its kernels compile no adjoints.
 wp.set_module_options({"enable_backward": False})
@@ -199,153 +200,129 @@ def _active_free_root_dof_start(
     return joint_qd_start[joint]
 
 
-@wp.func
-def _gyro_skew(v: wp.vec3):
-    return wp.mat33(0.0, -v[2], v[1], v[2], 0.0, -v[0], -v[1], v[0], 0.0)
+TURN_BLOCK = 64
+"""Threads a block of :func:`turn_forces`: a thread's law is a long serial chain, so small blocks spread the trees over
+every multiprocessor."""
 
 
 @wp.func
-def _gyroscopic_velocity(inertia: wp.mat33, effective_inertia: wp.mat33, omega: wp.vec3, predicted: wp.vec3, dt: float):
-    """Replace the explicit gyroscopic kick with energy-preserving Cayley updates.
-
-    Every solve has the form ``(A-S) w = (A+S) u``, with symmetric positive
-    definite ``A`` and skew ``S``. Thus ``w.T A w == u.T A u`` independently
-    of fixed-point convergence. Updating S from the midpoint approximates
-    implicit midpoint without an unconverged Newton step injecting energy.
-    External torque remains in u; only the gyroscopic kick is replaced.
-    """
-    scale = wp.max(effective_inertia[0, 0], wp.max(effective_inertia[1, 1], effective_inertia[2, 2]))
-    a = effective_inertia / scale
-    physical = inertia / scale
-    inverse = wp.inverse(a)
-    u = predicted + dt * (inverse * wp.cross(omega, physical * omega))
-    # An energy bound on angular speed chooses inexpensive local gyro
-    # microsteps. Geometry and the constraint solver still run once per step.
-    # The fixed cap bounds work; energy preservation does not depend on it.
-    speed_bound = wp.sqrt(wp.max(wp.dot(u, a * u) * wp.trace(inverse), 0.0))
-    microsteps = wp.int32(wp.clamp(wp.ceil(2.0 * wp.abs(dt) * speed_bound), 1.0, 32.0))
-    h = dt / float(microsteps)
-    w = u
-    for _ in range(microsteps):
-        u = w
-        energy = wp.dot(u, a * u)
-        for _iteration in range(8):
-            s = (0.5 * h) * _gyro_skew(physical * (0.5 * (u + w)))
-            candidate = wp.inverse(a - s) * ((a + s) * u)
-            delta = candidate - w
-            w = candidate
-            if wp.dot(delta, a * delta) <= 1.0e-12 * energy:
-                break
-    return w
-
-
-@wp.func
-def _light_apply_free_root_velocity_corrections(
-    root_index: int,
-    free_root_joint_indices: wp.array[int],
-    joint_qd_start: wp.array[int],
-    joint_child: wp.array[int],
-    body_to_articulation: wp.array[int],
-    is_free_rigid: wp.array[int],
-    kinematic_joint_mask: wp.array[int],
+def _turn_moment(
+    joint: int,
+    body: int,
+    start: int,
+    turns: int,
+    linear: int,
+    joint_X_c: wp.array[wp.transform],
     body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+    body_com: wp.array[wp.vec3],
+    body_mass: wp.array[float],
     body_inertia: wp.array[wp.mat33],
-    walk: wp.array2d[float],
+    joint_S_s: wp.array[wp.spatial_vector],
     joint_qd: wp.array[float],
+    armature: wp.array[float],
     dt: float,
-    v_hat: wp.array[float],
 ):
-    """The isolated rigid-body gyroscopic update of a free root's predicted velocity. Its effective angular inertia is
-    the angular block of the body's walk, ``L_aa L_aa^T`` (armature included), with ``L_aa`` from the walk's records
-    of the body's coordinates (``walk``, :data:`.tree_factor.WALK_COORDINATE` floats a global coordinate, each column by
-    its non-zero half at 0..2, ``ut`` at 4..9, ``1 / ell`` signed at 3). A free root's turns are its class's angular
-    half (:data:`.tree_scan.WALK_ANGULAR`: no side, the record's other half zero), so ``s_i . ut_k`` reads the stored
-    half against ``ut_k``'s angular part. The walk eliminates the angular coordinates first, last first, so
-    ``L(i, i) = ell_i`` and ``L(i, k) = s_i . ut_k`` for the coordinate ``k > i`` eliminated before ``i``."""
-    d = _active_free_root_dof_start(free_root_joint_indices, joint_qd_start, kinematic_joint_mask, root_index)
-    if d < 0:
-        return
-    w = wp.vec3(joint_qd[d + 3], joint_qd[d + 4], joint_qd[d + 5])
-    body = joint_child[free_root_joint_indices[root_index]]
-    art = body_to_articulation[body]
-    if is_free_rigid[art] == 0:
-        return
-    predicted_world = wp.vec3(v_hat[d + 3], v_hat[d + 4], v_hat[d + 5])
-    if (
-        w[0] == 0.0
-        and w[1] == 0.0
-        and (w[2] == 0.0)
-        and (predicted_world[0] == 0.0)
-        and (predicted_world[1] == 0.0)
-        and (predicted_world[2] == 0.0)
-    ):
-        return
-    inertia = body_inertia[body]
-    if (
-        inertia[0, 0] == inertia[1, 1]
-        and inertia[1, 1] == inertia[2, 2]
-        and (inertia[0, 1] == 0.0)
-        and (inertia[0, 2] == 0.0)
-        and (inertia[1, 0] == 0.0)
-        and (inertia[1, 2] == 0.0)
-        and (inertia[2, 0] == 0.0)
-        and (inertia[2, 1] == 0.0)
-    ):
-        return
-    # The angular block of the walk's leaf-first factor P H P^T = L L^T: row r is physical coordinate 3 + r, column c
-    # the coordinate 5 - c eliminated c-th, so the block is ``lower lower^T``.
-    lower = wp.mat33(0.0)
-    for r in range(3):
-        i = d + 3 + r
-        for c in range(3 - r):
-            k = d + 5 - c
-            if k == i:
-                lower[r, c] = 1.0 / wp.abs(walk[i, 3])
-            else:
-                value = float(0.0)
-                for m in range(3):
-                    value += walk[i, m] * walk[k, 7 + m]
-                lower[r, c] = value
+    """A joint of two or more turns' gyroscopic moment on its body (world; the negative of
+    :func:`.spatial_laws.turn_moment`, the body's external moment), from the step's input state: the turns' columns and
+    velocities (coordinates ``start`` on), the joint's angular armature and the point it pins (its anchor, or the
+    body's centre of mass where the joint has a linear axis)."""
     rotation = wp.transform_get_rotation(body_q[body])
-    basis = wp.quat_to_matrix(rotation)
-    effective = wp.transpose(basis) * (lower * wp.transpose(lower)) * basis
-    omega = wp.quat_rotate_inv(rotation, w)
-    predicted = wp.quat_rotate_inv(rotation, predicted_world)
-    corrected = wp.quat_rotate(rotation, _gyroscopic_velocity(inertia, effective, omega, predicted, dt))
-    for k in range(3):
-        v_hat[d + 3 + k] = corrected[k]
+    lever = wp.vec3(0.0)
+    if linear == 0:
+        lever = wp.quat_rotate(rotation, body_com[body] - wp.transform_get_translation(joint_X_c[joint]))
+    rotors = wp.mat33(0.0)
+    axes = wp.mat33(0.0)
+    coordinates = wp.vec3(0.0)
+    for k in range(turns):
+        axis = wp.quat_rotate_inv(rotation, wp.spatial_bottom(joint_S_s[start + k]))
+        rotors += armature[start + k] * wp.outer(axis, axis)
+        for i in range(3):
+            axes[i, k] = axis[i]
+        coordinates[k] = joint_qd[start + k]
+    moment = turn_moment(
+        body_mass[body],
+        rotation,
+        body_inertia[body],
+        wp.spatial_bottom(body_qd[body]),
+        lever,
+        rotors,
+        axes,
+        coordinates,
+        dt,
+    )
+    return -moment
 
 
 @wp.kernel
-def apply_free_root_velocity_corrections(
-    free_root_joint_indices: wp.array[int],
+def turn_forces(
+    tree_start: wp.array[int],
+    turning_joints: wp.array[int],
+    turn_body: wp.array[int],
+    turn_dofs: wp.array[wp.vec3i],
+    parent_joint: wp.array[int],
+    joint_dof_dim: wp.array2d[int],
     joint_qd_start: wp.array[int],
-    joint_child: wp.array[int],
-    body_to_articulation: wp.array[int],
-    is_free_rigid: wp.array[int],
+    joint_X_c: wp.array[wp.transform],
     kinematic_joint_mask: wp.array[int],
     body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+    body_com: wp.array[wp.vec3],
+    body_mass: wp.array[float],
     body_inertia: wp.array[wp.mat33],
-    walk: wp.array2d[float],
+    joint_S_s: wp.array[wp.spatial_vector],
     joint_qd: wp.array[float],
+    armature: wp.array[float],
     dt: float,
-    v_hat: wp.array[float],
+    turn_tau: wp.array[float],
 ):
-    _light_apply_free_root_velocity_corrections(
-        wp.tid(),
-        free_root_joint_indices,
-        joint_qd_start,
-        joint_child,
-        body_to_articulation,
-        is_free_rigid,
-        kinematic_joint_mask,
-        body_q,
-        body_inertia,
-        walk,
-        joint_qd,
-        dt,
-        v_hat,
-    )
+    """One tree's turning joints' gyroscopic moments (:func:`_turn_moment`; its joints
+    ``turning_joints[tree_start[t]:tree_start[t + 1]]``, each one's body and its turns' first coordinate, count and the
+    joint's linear axes in ``turn_body`` / ``turn_dofs``) as coordinate forces, ``J^T`` of each pure moment: the turn
+    coordinates of the joint and of its ancestors (``parent_joint``) take their axis against it, summed in that fixed
+    order. A moment has no lever, so no wrench is carried. A kinematic joint's body takes none."""
+    tree = wp.tid()
+    first, last = tree_start[tree], tree_start[tree + 1]
+    for k in range(first, last):
+        dofs = turn_dofs[k]
+        for dof in range(dofs[0], dofs[0] + dofs[1]):
+            turn_tau[dof] = 0.0
+        up = parent_joint[turning_joints[k]]
+        while up >= 0:
+            start = joint_qd_start[up] + joint_dof_dim[up, 0]
+            for dof in range(start, start + joint_dof_dim[up, 1]):
+                turn_tau[dof] = 0.0
+            up = parent_joint[up]
+    for k in range(first, last):
+        joint = turning_joints[k]
+        if kinematic_joint_mask[joint] != 0:
+            continue
+        dofs = turn_dofs[k]
+        moment = _turn_moment(
+            joint,
+            turn_body[k],
+            dofs[0],
+            dofs[1],
+            dofs[2],
+            joint_X_c,
+            body_q,
+            body_qd,
+            body_com,
+            body_mass,
+            body_inertia,
+            joint_S_s,
+            joint_qd,
+            armature,
+            dt,
+        )
+        for dof in range(dofs[0], dofs[0] + dofs[1]):
+            turn_tau[dof] += wp.dot(wp.spatial_bottom(joint_S_s[dof]), moment)
+        up = parent_joint[joint]
+        while up >= 0:
+            start = joint_qd_start[up] + joint_dof_dim[up, 0]
+            for dof in range(start, start + joint_dof_dim[up, 1]):
+                turn_tau[dof] += wp.dot(wp.spatial_bottom(joint_S_s[dof]), moment)
+            up = parent_joint[up]
 
 
 @wp.kernel

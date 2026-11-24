@@ -583,11 +583,47 @@ class TestQ09Gyroscopic(unittest.TestCase):
                 self.assertGreater(abs(coarse / fine), 1.5)
                 self.assertLess(abs(coarse / fine), 3.0)
 
-    @known_failure(LIMIT, "gyroscopic trees are first order: the approved path is small steps (decision 10-27)")
     def test_trees_keep_their_energy(self):
-        """A tumbling tree keeps its energy at a task's step."""
-        drifts = {kind: self._drift(kind, 0.1) for kind in ("tree", "d6")}
-        self.assertLess(max(abs(drift) for drift in drifts.values()), 1.0e-2, drifts)
+        """A tumbling tree (a free root with a hinged link) keeps its energy at a task's step: the root's turns take
+        their gyroscopic step energy-keeping, the hinge's coupling stays first order (7.9e-2 with every turn explicit)."""
+        self.assertLess(abs(self._drift("tree", 0.1)), 1.0e-2)
+
+    @known_failure(
+        LIMIT,
+        "a D6's turns are angles about axes that move with them: that curvature stays explicit and first order; the "
+        "approved path is small steps (decision 10-27)",
+    )
+    def test_d6_keeps_its_energy(self):
+        """A body tumbling on a six-axis D6 keeps its energy at a task's step."""
+        self.assertLess(abs(self._drift("d6", 0.1)), 1.0e-2)
+
+    def test_spinning_link_keeps_its_energy(self):
+        """A link spun fast about its own long axis on a ball joint (68 rad/s, w h = 0.34) keeps its figure's energy:
+        it turns about its pivot by the energy-keeping step. The explicit gyroscopic step grew it x3.7 in 0.25 s."""
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        torso = builder.add_link(xform=wp.transform((0.0, 0.0, 1.0), wp.quat_identity()))
+        builder.add_shape_box(torso, hx=0.15, hy=0.1, hz=0.25, cfg=newton.ModelBuilder.ShapeConfig(collision_group=-1))
+        arm = builder.add_link(xform=wp.transform((0.3, 0.0, 1.1), wp.quat_identity()))
+        builder.add_shape_box(arm, hx=0.12, hy=0.05, hz=0.05, cfg=newton.ModelBuilder.ShapeConfig(collision_group=-1))
+        root = builder.add_joint_free(torso)
+        ball = builder.add_joint_ball(
+            torso,
+            arm,
+            parent_xform=wp.transform((0.17, 0.0, 0.1), wp.quat_identity()),
+            child_xform=wp.transform((-0.13, 0.0, 0.0), wp.quat_identity()),
+        )
+        builder.add_articulation([root, ball])
+        model = builder.finalize(device=DEVICE)
+        state, out = model.state(), model.state()
+        _set_qd(state, {6: 68.0, 7: 3.4})
+        newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+        start = self._energy(model, state)
+        solver = SolverFeatherPGS(model, angular_damping=0.0)
+        control = model.control()
+        for _step in range(100):
+            solver.step(state, out, control, None, 1.0 / 200.0)
+            state, out = out, state
+        self.assertLess(abs(self._energy(model, state) - start) / start, 3.0e-2)
 
 
 class TestQ10MassRatio(unittest.TestCase):

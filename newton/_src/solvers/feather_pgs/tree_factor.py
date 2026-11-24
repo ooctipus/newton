@@ -46,9 +46,9 @@ from .factor.fields import (
     hold_drive_row,
 )
 from .factor.kernels import (
+    TURN_BLOCK,
     Clock,
     advance_clock,
-    apply_free_root_velocity_corrections,
     build_mass_update_mask,
     damp_free_root_spin,
     follow_prescribed_bodies,
@@ -58,6 +58,7 @@ from .factor.kernels import (
     invalidate_fk_id_cache_for_gravity,
     publish_prescribed_bodies,
     take_gravity,
+    turn_forces,
 )
 from .factor.walk import (
     RELEASE_SLIPS,
@@ -192,6 +193,10 @@ class TreeFactor:
         self.held_gravity = wp.clone(model.gravity)
         self.gravity_changed = wp.zeros(model.gravity.shape[0], dtype=wp.int32, device=model.device)
         self.kinematic_joint_mask = wp.zeros(model.joint_count, dtype=wp.int32, device=model.device)
+        # The articulated joints of two or more turns (free, ball, universal, a D6's) by tree: each one's gyroscopic
+        # moment on its body as coordinate forces (turn_forces, J^T of the moment) on the turn coordinates of the joint
+        # and of its ancestors. The predictor adds turn_tau to each coordinate's force; it stays zero on every other.
+        self._turn_trees(model)
         self.kinematic_dof_mask = wp.zeros(model.joint_dof_count, dtype=wp.int32, device=model.device)
         self.kinematic_dof_mask_host = None
         self.armature = None
@@ -842,29 +847,69 @@ class TreeFactor:
         for a factor."""
         self.held.predict(state_in, self, control, dt)
 
-    def correct_free_roots(self, state_in, dt: float, v_hat: wp.array) -> None:
-        """Apply canonical gyro physics to the free roots after the held prediction, where a free root and a free
-        rigid body exist."""
-        model, forest = self.model, self.forest
-        # Keep v_hat on jcalc_integrate's free-root convention. The compact launch excludes every non-root joint; a
-        # live device mask handles runtime kinematic changes without changing graph topology.
+    def _turn_trees(self, model) -> None:
+        """The trees holding a joint of two or more turns, each one's turning joints in joint order with their bodies,
+        their turns' first coordinate and count and their linear axes (:func:`.factor.kernels.turn_forces`), each tree
+        joint's parent joint, and the stream the turns' forces run on beside the factor refresh."""
+        turning = np.zeros(0, dtype=np.int32)
+        starts = np.zeros(1, dtype=np.int32)
+        parent_joint = np.full(max(1, int(model.joint_count)), -1, dtype=np.int32)
+        if model.joint_count:
+            dof_dim = model.joint_dof_dim.numpy()
+            parent = model.joint_parent.numpy()
+            tree = model.joint_articulation.numpy()
+            articulated = tree >= 0
+            child_joint = np.full(max(1, int(model.body_count)), -1, dtype=np.int32)
+            child_joint[model.joint_child.numpy()[articulated]] = np.flatnonzero(articulated)
+            parent_joint[: model.joint_count] = np.where(
+                articulated & (parent >= 0), child_joint[np.maximum(parent, 0)], -1
+            )
+            turning = np.flatnonzero(articulated & (dof_dim[:, 1] > 1)).astype(np.int32)
+            turning = turning[np.argsort(tree[turning], kind="stable")]
+            _trees, first = np.unique(tree[turning], return_index=True)
+            starts = np.append(first, turning.size).astype(np.int32)
+        lin, ang = (dof_dim[turning, 0], dof_dim[turning, 1]) if turning.size else (turning, turning)
+        dofs = np.stack([model.joint_qd_start.numpy()[turning] + lin, ang, lin], axis=1) if turning.size else turning
+        device = model.device
+        self.turning_joints = wp.array(turning, dtype=wp.int32, device=device)
+        self.turn_body = wp.array(
+            model.joint_child.numpy()[turning] if turning.size else turning, dtype=wp.int32, device=device
+        )
+        self.turn_dofs = wp.array(np.asarray(dofs, dtype=np.int32).reshape(-1, 3), dtype=wp.vec3i, device=device)
+        self.turn_tree_start = wp.array(starts, dtype=wp.int32, device=device)
+        self.turn_parent_joint = wp.array(parent_joint, dtype=wp.int32, device=device)
+        self.turn_tau = wp.zeros(max(1, int(model.joint_dof_count)), dtype=wp.float32, device=device)
+        # The prediction waits for the turns' forces: their stream goes first beside the refreshes.
+        self.turn_beside = execution.Beside(device, priority=-1)
+
+    def turn_forces(self, state_in, dt: float) -> None:
+        """The turning joints' gyroscopic moments as coordinate forces (from FK/ID's columns, for the prediction)."""
+        model = self.model
         wp.launch(
-            apply_free_root_velocity_corrections,
-            dim=forest.free_root_joint_count,
+            turn_forces,
+            dim=self.turn_tree_start.shape[0] - 1,
             inputs=[
-                forest.free_root_joint_indices,
+                self.turn_tree_start,
+                self.turning_joints,
+                self.turn_body,
+                self.turn_dofs,
+                self.turn_parent_joint,
+                model.joint_dof_dim,
                 model.joint_qd_start,
-                model.joint_child,
-                forest.body_to_articulation,
-                forest.is_free_rigid,
+                model.joint_X_c,
                 self.kinematic_joint_mask,
                 state_in.body_q,
+                state_in.body_qd,
+                model.body_com,
+                model.body_mass,
                 model.body_inertia,
-                self.walk_data,
+                self.joint_S_s,
                 state_in.joint_qd,
+                self.dof_armature,
                 dt,
             ],
-            outputs=[v_hat],
+            outputs=[self.turn_tau],
+            block_dim=TURN_BLOCK,
             device=model.device,
         )
 

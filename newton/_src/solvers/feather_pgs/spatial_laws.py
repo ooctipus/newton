@@ -37,7 +37,8 @@ channels, the tree scans' add combine). :func:`inertia_at` places a body's
 inertia, :func:`inertia_apply` maps a twist to the momentum wrench,
 :func:`inertia_matrix` packs the dense 6x6 matrix for consumers that read one
 and :func:`body_wrench` is a body's inverse-dynamics wrench, Newton-Euler at
-its center of mass moved to the origin.
+its center of mass moved to the origin; :func:`turn_moment` is a joint's
+turns' own gyroscopic step, energy-keeping (:func:`gyroscopic_impulse`).
 
 **Joints.** :func:`joint_transform` is a joint's transform for every joint
 type, :func:`axis_transform` its one-axis case and :func:`motion_axis` one
@@ -255,6 +256,75 @@ def weight_fraction(compensation: float) -> float:
     return 1.0 - compensation
 
 
+@SPATIAL.law(cuda=False)
+def gyroscopic_impulse(
+    inertia: wp.mat33, rotors: wp.mat33, axes: wp.mat33, coordinates: wp.vec3, spin: wp.vec3, dt: float
+) -> wp.vec3:
+    """Return the body-frame impulse that turns a joint's explicit gyroscopic step into an energy-keeping one.
+
+    A body of ``inertia`` about the point its joint pins, spinning at ``spin``, turns its joint's angular
+    ``coordinates`` along ``axes`` (``S``, a column a turn, zero past them) with its rotors (the joint's angular
+    armature, ``rotors``); ``A = S^T (I + R) S`` is the turns' mass. The gyroscopic moment ``(I w) x w`` gives the
+    turns ``K z + S^T ((I w) x w_p)``, ``K = S^T [I w]x S`` skew and ``w_p = w - S z`` the parent's spin. The step
+    takes the parent's share explicitly and ``K z`` by the implicit midpoint in Cayley form:
+    ``(A - K_m h / 2) z' = (A + K_m h / 2) z`` with ``K_m`` at the midpoint, ``z'.T A z' = z.T A z`` at every iterate,
+    so the turns' own gyroscopic motion keeps their energy at any step (where the parent is still: a free body, a
+    link on a resting parent); microsteps of ``h <= 1 / (2 |w|)``, ``|w|`` bounded by the turns' energy in the body
+    (whatever the joint's coordinates), keep the fixed point contracting (32 at most).
+    The impulse is ``(I + R) S (z' - z_e)``, ``z_e = z + dt A^-1 K z`` the explicit step it corrects (``O(dt^2)``;
+    :func:`turn_moment` takes it as a rate). Only Warp kernels call it (``factor.kernels.turn_moments``), so it has no CUDA form. The step depends on the turns' span only, so it runs in an orthonormal
+    basis of it (three turns span every direction: the body frame; fewer: Gram-Schmidt of ``S``; the turns' velocity
+    ``S z`` in it), whatever the joint's coordinates (a D6's angles near their singularity included). A hinge's ``K`` is zero (no impulse), and an isotropic body's moment
+    vanishes.
+    """
+    if (
+        inertia[0, 0] == inertia[1, 1]
+        and inertia[1, 1] == inertia[2, 2]
+        and inertia[0, 1] == 0.0
+        and inertia[0, 2] == 0.0
+        and inertia[1, 0] == 0.0
+        and inertia[1, 2] == 0.0
+        and inertia[2, 0] == 0.0
+        and inertia[2, 1] == 0.0
+    ):
+        return wp.vec3(0.0)
+    turns = axes * coordinates
+    parent = spin - turns
+    basis = wp.identity(n=3, dtype=float)
+    if axes[0, 2] == 0.0 and axes[1, 2] == 0.0 and axes[2, 2] == 0.0:
+        first = wp.normalize(wp.vec3(axes[0, 0], axes[1, 0], axes[2, 0]))
+        second = wp.vec3(axes[0, 1], axes[1, 1], axes[2, 1])
+        if second[0] != 0.0 or second[1] != 0.0 or second[2] != 0.0:
+            second = wp.normalize(second - wp.dot(first, second) * first)
+        basis = wp.mat33(first[0], second[0], 0.0, first[1], second[1], 0.0, first[2], second[2], 0.0)
+    total = inertia + rotors
+    metric = wp.transpose(basis) * total * basis
+    for k in range(3):
+        if basis[0, k] == 0.0 and basis[1, k] == 0.0 and basis[2, k] == 0.0:
+            metric[k, k] = 1.0
+    scale = wp.max(metric[0, 0], wp.max(metric[1, 1], metric[2, 2]))
+    a = metric / scale
+    physical = inertia / scale
+    own = wp.transpose(basis) * turns
+    explicit = own + dt * (wp.inverse(a) * (wp.transpose(basis) * wp.cross(physical * spin, turns)))
+    speed_bound = wp.sqrt(wp.max(wp.dot(turns, total * turns) * wp.trace(wp.inverse(total)), 0.0))
+    microsteps = int(wp.clamp(wp.ceil(2.0 * wp.abs(dt) * speed_bound), 1.0, 32.0))
+    h = dt / float(microsteps)
+    w = own
+    for _microstep in range(microsteps):
+        u = w
+        energy = wp.dot(u, a * u)
+        for _iteration in range(8):
+            midpoint = parent + basis * (0.5 * (u + w))
+            s = (0.5 * h) * (wp.transpose(basis) * wp.skew(physical * midpoint) * basis)
+            candidate = wp.inverse(a - s) * ((a + s) * u)
+            delta = candidate - w
+            w = candidate
+            if wp.dot(delta, a * delta) <= 1.0e-12 * energy:
+                break
+    return total * (basis * (w - explicit))
+
+
 @SPATIAL.law
 def body_wrench(
     mass: float,
@@ -282,6 +352,38 @@ def body_wrench(
         angular, inertia_action(rotation, inertia, angular)
     )
     return wrench_shift(wp.spatial_vector(force, torque), offset)
+
+
+@SPATIAL.law(cuda=False)
+def turn_moment(
+    mass: float,
+    rotation: wp.quat,
+    inertia: wp.mat33,
+    angular: wp.vec3,
+    lever: wp.vec3,
+    rotors: wp.mat33,
+    axes: wp.mat33,
+    coordinates: wp.vec3,
+    dt: float,
+) -> wp.vec3:
+    """Return the moment a joint of two or more turns adds to its body's :func:`body_wrench` over a step ``dt`` (its
+    negative is the body's external moment, which ``factor.kernels.turn_forces`` maps to coordinate forces): its
+    :func:`gyroscopic_impulse` as a rate, less ``R impulse / dt`` (the bias is subtracted), so the turns' own
+    gyroscopic step keeps their energy instead of the explicit ``w x (I w)``, which grows a fast spin about the
+    joint's pivot by ``sqrt(1 + (w h)^2)`` a step. A pure moment, the same about every point.
+
+    ``inertia`` is the body-frame inertia about the center of mass, ``rotation`` the body's orientation and
+    ``angular`` its spin (world), ``lever`` the center of mass less the point the joint pins (its anchor; zero, the
+    center of mass itself, for a joint with a linear axis, a free one included), about which the turns take the
+    inertia; ``rotors`` the joint's angular armature, ``axes`` its turns' columns (zero past them) and
+    ``coordinates`` their velocities, all in the body frame.
+    """
+    arm = wp.quat_rotate_inv(rotation, lever)
+    d = mass * wp.dot(arm, arm)
+    pinned = inertia + wp.mat33(d, 0.0, 0.0, 0.0, d, 0.0, 0.0, 0.0, d) - mass * wp.outer(arm, arm)
+    spin = wp.quat_rotate_inv(rotation, angular)
+    impulse = gyroscopic_impulse(pinned, rotors, axes, coordinates, spin, dt)
+    return -wp.quat_rotate(rotation, impulse) / dt
 
 
 INERTIA_CHANNELS = 13

@@ -145,10 +145,12 @@ class SolverFeatherPGS(SolverBase):
     :meth:`check_constraint_capacity` outside capture at an observation boundary
     to reject incomplete physics. Ordinary stepping does not synchronize it.
 
-    Single-body FREE-joint articulations use an energy-preserving local
-    gyroscopic update to prevent explicit angular-bias runaway. Fast rotation
-    can trigger bounded gyro microsteps inside the velocity predictor, without
-    additional collision or contact-solver passes. Pose integration remains
+    A joint of two or more turns (free, ball, universal, D6) takes its own
+    gyroscopic motion by an energy-keeping implicit midpoint (bounded
+    microsteps at fast spin) instead of the explicit ``w x (I w)``, about the
+    point the joint pins: a free body or a fast link on a still parent keeps
+    its rotational energy at any step. Hinges and slides keep the explicit
+    form (a hinge's own gyroscopic power is zero). Pose integration remains
     first-order; accurate rotational trajectories still require a suitable
     simulation timestep.
 

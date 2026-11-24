@@ -109,9 +109,12 @@ def test_spatial_twins_agree(test, device):
 
 class TestSpatialLawSource(unittest.TestCase):
     def test_every_law_but_the_matrix_pack_and_joint_laws_renders(self):
-        """Native code reaches every law but the three whose consumers are Warp only."""
+        """Native code reaches every law but the five whose consumers are Warp only."""
         names = {law_source.law_signature(law).name for law in CUDA_LAWS}
-        self.assertEqual(set(spatial_laws.SPATIAL.laws) - names, {"inertia_matrix", "joint_transform", "joint_motion"})
+        self.assertEqual(
+            set(spatial_laws.SPATIAL.laws) - names,
+            {"inertia_matrix", "joint_transform", "joint_motion", "gyroscopic_impulse", "turn_moment"},
+        )
         source = spatial_laws.SPATIAL.prelude().source
         self.assertIn("return wp::transform_multiply(parent, child);", source)
 
@@ -316,6 +319,127 @@ def test_inertia_laws(test, device):
     # The terms' size: the inertia times the acceleration, the velocity squared and gravity.
     terms = np.abs(acceleration).max(axis=1) + (1.0 + np.abs(twist).max(axis=1)) ** 2 + np.abs(gravity).max(axis=1)
     _close(test, got, expected, np.abs(spatial).max(axis=(1, 2))[:, None] * terms[:, None], 16.0, "body_wrench")
+    # Three turns about a pinned point add their gyroscopic impulse as a rate, less R impulse / dt.
+    lever = (0.5 * rng.standard_normal((N, 3))).astype(np.float32)
+    rotors = (0.5 * _inertias(rng, N)).astype(np.float32)
+    axes = _quat_matrix(_quaternions(rng, N)).astype(np.float32)
+    coordinates = rng.standard_normal((N, 3)).astype(np.float32)
+    dt = np.full(N, 0.005, dtype=np.float32)
+    turn_inputs = [
+        m,
+        q,
+        i3,
+        wp.array(twist[:, 3:].copy(), dtype=wp.vec3, device=device),
+        wp.array(lever, dtype=wp.vec3, device=device),
+        wp.array(rotors, dtype=wp.mat33, device=device),
+        wp.array(axes, dtype=wp.mat33, device=device),
+        wp.array(coordinates, dtype=wp.vec3, device=device),
+        wp.array(dt, dtype=float, device=device),
+    ]
+    (got,) = _kernel("turn_moment", spatial_laws.turn_moment, turn_inputs, [wp.vec3], device)
+    arm = np.einsum("nji,nj->ni", R, lever)
+    pinned = inertia + mass[:, None, None] * (
+        np.einsum("ni,ni->n", arm, arm)[:, None, None] * np.eye(3) - np.einsum("ni,nj->nij", arm, arm)
+    )
+    spin = np.einsum("nji,nj->ni", R, twist[:, 3:].astype(np.float64))
+    expected = -np.einsum("nij,nj->ni", R, _impulse(pinned, rotors, axes, coordinates, spin, dt)) / dt[:, None]
+    total = pinned + rotors
+    rate = np.abs(total).max(axis=(1, 2)) * np.linalg.cond(total.astype(np.float64)) * (1.0 + np.abs(twist).max(axis=1))
+    _close(test, got, expected, (rate / dt)[:, None], 16.0, "turn_moment")
+
+
+def _impulse(inertia, rotors, axes, coordinates, spin, dt):
+    """The gyroscopic impulse in float64: the turns' implicit midpoint ``A dz/dt = S^T ((I m) x S z_m)``, ``m = w_p +
+    S z_m``, solved to convergence over the law's microsteps, less the explicit step, through ``(I + R) S``."""
+    out = np.zeros((coordinates.shape[0], 3))
+    for n in range(coordinates.shape[0]):
+        inertia_n, total = inertia[n].astype(np.float64), (inertia[n] + rotors[n]).astype(np.float64)
+        if np.allclose(inertia_n, inertia_n[0, 0] * np.eye(3), rtol=0.0, atol=0.0):
+            continue
+        S, z = axes[n].astype(np.float64), coordinates[n].astype(np.float64)
+        metric = S.T @ total @ S
+        for k in range(3):
+            if not S[:, k].any():
+                metric[k, k] = 1.0
+        scale = np.max(np.diag(metric))
+        a, physical = metric / scale, inertia_n / scale
+        parent = spin[n] - S @ z
+        explicit = z + dt[n] * np.linalg.solve(a, S.T @ np.cross(physical @ spin[n], S @ z))
+        bound = np.sqrt(max(z @ a @ z * np.trace(np.linalg.inv(a)), 0.0))
+        steps = int(np.clip(np.ceil(2.0 * abs(float(dt[n])) * bound), 1, 32))
+        h = float(dt[n]) / steps
+        w = z.copy()
+        for _ in range(steps):
+            u = w.copy()
+            for _ in range(200):
+                middle = 0.5 * (u + w)
+                w = u + h * np.linalg.solve(a, S.T @ np.cross(physical @ (parent + S @ middle), S @ middle))
+        out[n] = total @ (S @ (w - explicit))
+    return out
+
+
+def test_gyroscopic_impulse(test, device):
+    """A joint's gyroscopic impulse: with a still parent its turns' energy is kept at any step (every iterate a
+    Cayley map), at a resolved step it is the converged implicit midpoint less the explicit step, two turns move only
+    their own span, and a hinge (one turn) takes none."""
+    rng = np.random.default_rng(6)
+    inertia = _inertias(rng, N)
+    rotors = (0.5 * _inertias(rng, N)).astype(np.float32)
+    axes = _quat_matrix(_quaternions(rng, N)).astype(np.float32)
+    coordinates = (5.0 * rng.standard_normal((N, 3))).astype(np.float32)
+    still = np.einsum("nij,nj->ni", axes, coordinates).astype(np.float32)
+    total = (inertia + rotors).astype(np.float64)
+    conditioning = np.linalg.cond(total)
+
+    def run(axes, spin, dt):
+        steps = np.full(N, dt, dtype=np.float32)
+        arrays = [
+            wp.array(inertia, dtype=wp.mat33, device=device),
+            wp.array(rotors, dtype=wp.mat33, device=device),
+            wp.array(axes, dtype=wp.mat33, device=device),
+            wp.array(coordinates, dtype=wp.vec3, device=device),
+            wp.array(spin, dtype=wp.vec3, device=device),
+            wp.array(steps, dtype=float, device=device),
+        ]
+        (got,) = _kernel("gyroscopic_impulse", spatial_laws.gyroscopic_impulse, arrays, [wp.vec3], device)
+        return got.astype(np.float64), steps
+
+    S = axes.astype(np.float64)
+    z = coordinates.astype(np.float64)
+    metric = np.einsum("nji,njk,nkl->nil", S, total, S)
+    for tag, dt in (("small", 1.0e-3), ("large", 0.5)):
+        got, steps = run(axes, still, dt)
+        with test.subTest(step=tag):
+            # The turned coordinates the impulse encodes: z' = z_e + (S^T (I + R) S)^-1 S^T impulse.
+            explicit = (
+                z
+                + steps[:, None]
+                * np.linalg.solve(
+                    metric,
+                    np.einsum("nji,nj->ni", S, np.cross(np.einsum("nij,nj->ni", inertia, still), still))[..., None],
+                )[..., 0]
+            )
+            turned = explicit + np.linalg.solve(metric, np.einsum("nji,nj->ni", S, got)[..., None])[..., 0]
+            energy = np.einsum("ni,nij,nj->n", z, metric, z)
+            kept = np.abs(np.einsum("ni,nij,nj->n", turned, metric, turned) - energy) / energy
+            test.assertLess(float((kept / conditioning).max()), 16.0 * EPS)
+            if tag == "small":
+                reference = _impulse(inertia, rotors, axes, coordinates, still, steps)
+                size = np.abs(total).max(axis=(1, 2)) * conditioning * np.abs(z).max(axis=1)
+                test.assertLess(float((np.abs(got - reference).max(axis=1) / size).max()), 64.0 * EPS)
+    two = axes.copy()
+    two[:, :, 2] = 0.0
+    got, _ = run(two, (5.0 * rng.standard_normal((N, 3))).astype(np.float32), 0.01)
+    span = np.einsum("nij,njk->nik", total, two[:, :, :2].astype(np.float64))
+    test.assertTrue(np.isfinite(got).all())
+    for n in range(N):
+        coefficients = np.linalg.lstsq(span[n], got[n], rcond=None)[0]
+        test.assertLess(float(np.abs(span[n] @ coefficients - got[n]).max()), 1.0e-4 * (1.0 + np.abs(got[n]).max()))
+    hinge = axes.copy()
+    hinge[:, :, 1:] = 0.0
+    got, _ = run(hinge, (5.0 * rng.standard_normal((N, 3))).astype(np.float32), 0.01)
+    size = np.abs(total).max(axis=(1, 2)) * conditioning * np.abs(z).max(axis=1)
+    test.assertLess(float((np.abs(got).max(axis=1) / size).max()), 64.0 * EPS)
 
 
 @wp.kernel(enable_backward=False)
