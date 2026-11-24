@@ -683,7 +683,8 @@ def build_units_kernel(
 
 
 PLACE_THREADS = 256
-"""Threads of a block that counts a world's units, and of the one block that places the slots (:func:`place_slots`)."""
+"""Threads of a block that counts as many of a world's rows, and of the one block that places the slots
+(:func:`place_slots`)."""
 
 
 @wp.kernel(enable_backward=False, module="unique")
@@ -701,25 +702,27 @@ def count_units(
     slot_need: wp.array[wp.int32],
 ):
     """Each candidate world's units, as the unit builder counts them (a contact normal row among its free rows before
-    their contact rows' end; none under ``min_units`` such rows), and one more: its entries of the pool, at its slot
-    (``slot_need``, zero beforehand). A block of :data:`PLACE_THREADS` a candidate (launch tiled over the slots)."""
-    item, t = wp.tid()
+    their contact rows' end; none under ``min_units`` such rows), and one more: its entries of the pool, added at its
+    slot (``slot_need``, zero beforehand). A block of :data:`PLACE_THREADS` takes as many of a candidate's rows, a
+    thread a row, and adds its count once (launch tiled over the slots and the row capacity's blocks), so a world of
+    many rows counts them over the device, not on one block."""
+    item, chunk, t = wp.tid()
     if item >= candidate_count[0]:
         return
     world = candidate_worlds[item]
     end = wp.min(mf_contact_rows_end[world], wp.min(mf_constraint_count[world], mf_rows))
-    if end < min_units:
+    first = chunk * wp.block_dim()
+    if end < min_units or first >= end:
         return
-    mf_line = mf_first[world]
-    heads = int(0)
-    row = t
-    while row < end:
-        if (row_record[mf_line, free_records + row * _HEADER_WORDS + 3] & 0xFFFF) == _ROW_CONTACT:
-            heads += 1
-        row += wp.block_dim()
-    total = wp.tile_sum(wp.tile(heads))
+    row = first + t
+    head = int(0)
+    if row < end:
+        if (row_record[mf_first[world], free_records + row * _HEADER_WORDS + 3] & 0xFFFF) == _ROW_CONTACT:
+            head = 1
+    total = wp.tile_sum(wp.tile(head))
     if t == 0:
-        slot_need[world_slot[world]] = wp.int32(wp.tile_extract(total, 0) + 1)
+        # The first block adds the world's colors' one more.
+        wp.atomic_add(slot_need, world_slot[world], wp.int32(wp.tile_extract(total, 0) + wp.where(chunk == 0, 1, 0)))
 
 
 @wp.kernel(enable_backward=False, module="unique")
@@ -842,7 +845,7 @@ class ColoredUnits:
         units["slot_need"].zero_()
         wp.launch_tiled(
             count_units,
-            dim=[self.slot_count],
+            dim=[self.slot_count, -(-self.mf_rows // PLACE_THREADS)],
             inputs=[
                 candidates,
                 candidate_worlds,

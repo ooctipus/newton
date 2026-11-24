@@ -358,7 +358,7 @@
   "sweep_routes_tiers.TierSweep[emit](192, 64, 22, '120', inkernel_response=(16, 6, 0, 16), levels=LevelLaw(law='split', budget=24), rows=96)": "b88269a048dd5977ef1d6250221ed28b2b19514572628ff6364bbe4b76b5b2b0",
   "sweep_routes_tiers.TierSweep[emit](72, 32, 18, '120', inkernel_response=(18, 0, 0, 0), levels=LevelLaw(law='split', budget=24), rows=32)": "0ce691d708e44da335740a1abba1a5bc1bbffe9aeda0d472990ebe162d9426e3",
   "sweep_routes_tiers.TierSweep[emit](72, 32, 18, '120', inkernel_response=(18, 0, 0, 0), levels=LevelLaw(law='split', budget=24), rows=48)": "93db7b5ad2802c95ec9273f52a5f98d8aa20d20de76f02a204c86337497bf2d6",
-  "sweep_units.count_units": "6abac5027c1788c94f05bad543cb67a7eee6d35f0407603c4e8d17049c1f055d",
+  "sweep_units.count_units": "5eeeec2db59f95cc8ea2b44a2a2e4d1498dfd5b2e0c26377ce41fe66a1340436",
   "sweep_units.place_slots": "d4394cf9a0b9bad1d24c2645bc0035e9d3990d9a2992685f2b62db983d0e579c",
   "sweep_units.stage_slots(False)": "0c5216321bf4e873453d1b2bdf0760484cc469668419f15a821d419356f3493a",
   "sweep_units.stage_slots(True)": "83d2f0bdc02f465e2936bd7b776705970b1256907e81b703c3a6ce741f71955a",
