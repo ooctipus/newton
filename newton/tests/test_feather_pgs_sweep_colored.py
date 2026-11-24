@@ -10,8 +10,8 @@ units that share one keep their row order. The unit builder gives the colored ma
 check
 
 - the unit builder against a host reference of the same rules (units, row-order levels, the slot records), that a
-  color never shares a body or a patch, that the colors keep the row order, and that a world past its slot's units
-  keeps the one-warp mapping and sets the capacity status;
+  color never shares a body or a patch, that the colors keep the row order, that a world past its slot's share keeps
+  its units in the pool, and that a world past the pool's end keeps the one-warp mapping and sets the capacity status;
 - that a world's result repeats bitwise and that the warp's worlds and the colored worlds split the batch;
 - the physics: the colored mapping is the reference's row-order Gauss-Seidel sweep, so it meets the conformance
   gate's laws and its distance to the converged reference on a tray carrying a grid of boxes (a hub body) and on
@@ -197,19 +197,30 @@ class TestStageSlots(unittest.TestCase):
                     meta[world, r, 3] = kind | (row << 16)
         meta = meta.astype(np.uint32).view(np.int32).reshape(self.WORLDS, HEADER_WORDS * self.ROWS)
         mu = rng.uniform(0.1, 1.0, (self.WORLDS, self.ROWS)).astype(np.float32)
-        slot_data = wp.zeros((self.WORLDS, layout.fields, records.shape[1]), dtype=float, device=device)
-        slot_words = wp.zeros((self.WORLDS, layout.words, records.shape[1]), dtype=wp.int32, device=device)
+        # The pool: each world's entries (its units and one more) from its slot's first entry, a world's place after
+        # the other's; its block holds its fields field-major over its entries; the launch's one thread a world
+        # strides its units.
+        need = np.array([len(world) + 1 for world in units])
+        firsts = np.concatenate([[0], np.cumsum(need)[:-1]])
+        pool = int(need.sum())
+        slot_data = wp.zeros(layout.fields * pool, dtype=float, device=device)
+        slot_words = wp.zeros(layout.words * pool, dtype=wp.int32, device=device)
+        color_slots = np.zeros((pool, 4), dtype=np.int32)
+        for world, first in enumerate(firsts):
+            color_slots[first : first + len(units[world])] = records[world, : len(units[world])]
         wp.launch(
             sweep_units.stage_slots(weighted),
-            dim=records.shape[:2],
+            dim=(self.WORLDS, 1),
             inputs=[
                 row_lines(device),
                 # Every world in the colored bucket, each in the slot of its index.
                 wp.array([self.WORLDS], dtype=int, device=device),
                 wp.array(np.arange(self.WORLDS), dtype=int, device=device),
                 wp.array(np.arange(self.WORLDS), dtype=wp.int32, device=device),
+                wp.array(firsts, dtype=wp.int32, device=device),
+                wp.array(need, dtype=wp.int32, device=device),
                 wp.array([len(world) for world in units], dtype=wp.int32, device=device),
-                wp.array(records, dtype=wp.int32, device=device),
+                wp.array(color_slots, dtype=wp.int32, device=device),
                 wp.array(meta, dtype=wp.int32, device=device),
                 0,
                 wp.array(rng.standard_normal((self.WORLDS, self.ROWS, 12)), dtype=float, device=device),
@@ -217,6 +228,9 @@ class TestStageSlots(unittest.TestCase):
                 weights,
                 0,
                 layout.rows,
+                layout.fields,
+                layout.words,
+                1,
             ],
             outputs=[slot_data, slot_words],
             device=device,
@@ -226,7 +240,15 @@ class TestStageSlots(unittest.TestCase):
             for world, world_units in enumerate(units)
             for p, (row, rows) in enumerate(world_units)
         ]
-        return staged, slot_data.numpy(), layout, mu
+        # By world, field and unit, as the assertions read them.
+        flat, width = slot_data.numpy(), records.shape[1]
+        data = np.zeros((self.WORLDS, layout.fields, width), dtype=np.float32)
+        for world, first in enumerate(firsts):
+            block = flat[layout.fields * first : layout.fields * (first + need[world])].reshape(
+                layout.fields, need[world]
+            )
+            data[world, :, : len(units[world])] = block[:, : len(units[world])]
+        return staged, data, layout, mu
 
     def test_unweighted_rows_never_index_the_weights(self):
         """An unweighted row law binds a one-element stand-in for the row weights, as the solver does. It sits at the
@@ -287,19 +309,24 @@ class TestColoredSweep(unittest.TestCase):
         counts, ends = solver.placement.mf_constraint_count.numpy(), solver.placement.mf_contact_rows_end.numpy()
         for world in range(solver.forest.world_count):
             want = reference_units(metas[world], int(counts[world]), int(ends[world]))
-            slot = int(host["world_slot"][world])
+            first = int(host["slot_first"][int(host["world_slot"][world])])
             units = int(host["unit_count"][world])
             self.assertGreater(units, 0)
             self.assertEqual(units, want["unit_count"])
-            np.testing.assert_array_equal(host["unit_color"][slot, :units], want["unit_color"])
+            # The world's entries of the pool: its units and its colors' offsets, one more.
+            self.assertEqual(int(host["slot_need"][int(host["world_slot"][world])]), units + 1)
+            np.testing.assert_array_equal(host["unit_color"][first : first + units], want["unit_color"])
             colors = int(host["color_count"][world])
             self.assertEqual(colors, want["color_count"])
-            np.testing.assert_array_equal(host["color_offset"][slot, : colors + 1], want["color_offset"])
-            np.testing.assert_array_equal(host["color_slot"][slot, :units], want["color_slot"])
-            np.testing.assert_array_equal(host["color_after"][slot, :units], want["color_after"])
+            np.testing.assert_array_equal(host["color_offset"][first : first + colors + 1], want["color_offset"])
+            np.testing.assert_array_equal(host["color_slot"][first : first + units], want["color_slot"])
+            np.testing.assert_array_equal(host["color_after"][first : first + units], want["color_after"])
             # A unit's color is one past its bodies' latest earlier colors: its place's color.
             place_color = np.repeat(np.arange(colors), np.diff(want["color_offset"]))
-            np.testing.assert_array_equal(host["color_after"][slot, :units].max(axis=1) + 1, place_color)
+            np.testing.assert_array_equal(host["color_after"][first : first + units].max(axis=1) + 1, place_color)
+        # The slots take their entries in slot order, one after another.
+        need = host["slot_need"]
+        np.testing.assert_array_equal(host["slot_first"], np.concatenate([[0], np.cumsum(need)[:-1]]))
         stats = solver.sweep.colored_units.stats()
         self.assertEqual(len(stats), solver.forest.world_count)
         self.assertTrue(all(world["largest_color"] <= world["units"] for world in stats))
@@ -315,19 +342,23 @@ class TestColoredSweep(unittest.TestCase):
         arrays = (*units.units.values(), *units.slots.values(), units.status)
         self.assertEqual(record["storage_bytes"], sum(array.capacity for array in arrays))
         self.assertGreater(record["storage_bytes"], 0)
-        # A slot holds a unit for every three rows of the row capacity.
-        capacity = sweep_units.unit_capacity(solver.placement.mf_max_constraints)
-        self.assertEqual(units.slots["slot_data"].shape, (units.slot_count, units.layout.fields, capacity))
+        # The pool holds every slot's share (a unit for every three rows of the row capacity) and its colors' one more,
+        # and one world's every row past its share.
+        rows = solver.placement.mf_max_constraints
+        share = sweep_units.unit_capacity(rows)
+        pool = units.slot_count * (share + 1) + rows - share
+        self.assertEqual(sweep_units.pool_capacity(units.slot_count, rows), pool)
+        self.assertEqual(units.slots["slot_data"].shape, (units.layout.fields, pool))
 
     def test_a_color_never_shares_a_body_or_a_patch(self):
         """No two units of a color touch the same body, and a patch's contacts never share a color."""
         solver, host, metas = self._built()
         parents = metas[:, :, 3] >> 16
         for world in range(solver.forest.world_count):
-            slot = int(host["world_slot"][world])
-            offsets = host["color_offset"][slot]
+            first = int(host["slot_first"][int(host["world_slot"][world])])
+            offsets = host["color_offset"][first:]
             for color in range(int(host["color_count"][world])):
-                records = host["color_slot"][slot, offsets[color] : offsets[color + 1]]
+                records = host["color_slot"][first + offsets[color] : first + offsets[color + 1]]
                 bodies = [dof for record in records for dof in set(record[2:]) if dof >= 0]
                 self.assertEqual(len(bodies), len(set(bodies)), f"color {color} shares a body")
                 rows = {int(record[0]) for record in records}
@@ -341,10 +372,10 @@ class TestColoredSweep(unittest.TestCase):
         """Units that share a body run in row order: the earlier one takes the lower color."""
         solver, host, _ = self._built()
         for world in range(solver.forest.world_count):
-            slot, last = int(host["world_slot"][world]), {}
+            first, last = int(host["slot_first"][int(host["world_slot"][world])]), {}
             for unit in range(int(host["unit_count"][world])):
-                color = int(host["unit_color"][slot, unit])
-                dofs = int(host["unit_dofs"][slot, unit])
+                color = int(host["unit_color"][first + unit])
+                dofs = int(host["unit_dofs"][first + unit])
                 for dof in {dofs >> 16, _signed(dofs, 16)}:
                     if dof < 0:
                         continue
@@ -352,26 +383,53 @@ class TestColoredSweep(unittest.TestCase):
                         self.assertGreater(color, last[dof], f"unit {unit} on body {dof}")
                     last[dof] = color
 
-    def test_a_world_past_its_slot_keeps_the_warp(self):
-        """A world of more units than its slot holds keeps the one-warp mapping and sets the status: bitwise the
-        world the rule refuses (both are the one-warp mapping beside a built colored one, today's rows). A model
-        with no colored mapping solves its free bodies' contacts as regions, another law, until the colored route's
-        unit is the region too."""
-        # The tray's 76 units in slots of one unit each.
+    def test_a_world_past_the_pool_keeps_the_warp(self):
+        """A world of more units than the pool holds from its first entry keeps the one-warp mapping and sets the
+        status: bitwise the world the rule refuses (both are the one-warp mapping beside a built colored one, today's
+        rows). A model with no colored mapping solves its free bodies' contacts as regions, another law, until the
+        colored route's unit is the region too."""
+        # The tray's 76 units in a pool of one entry a slot.
         solvers = []
-        with mock.patch.object(sweep_units, "UNIT_ROWS", 1024):
+        with mock.patch.object(sweep_units, "pool_capacity", lambda slots, rows: slots):
             over = self._simulate(tray(), "patch", solvers)
         units = solvers[-1].sweep.colored_units
         self.assertIsNotNone(units)
         self.assertTrue(units.capacity_status())
         stats = units.stats()
         self.assertTrue(stats and not any(world["colored"] for world in stats), stats)
-        self.assertTrue(all(world["units"] > units.unit_capacity for world in stats), stats)
+        self.assertTrue(all(world["units"] + 1 > units.slot_count for world in stats), stats)
         refused = []
         thin = self._simulate(tray(), "patch", refused, parallelism=5.0)
         self.assertIsNotNone(refused[-1].sweep.colored_units)
         for name in ("body_q", "body_qd"):
             np.testing.assert_array_equal(getattr(over, name), getattr(thin, name), err_msg=name)
+
+    def test_a_world_past_its_share_keeps_its_units_in_the_pool(self):
+        """A world of more units than its slot's share (a unit is a contact's normal row; under friction patches most
+        contacts carry no friction pair) keeps its units where the pool has room: it takes the colored mapping and
+        steps bitwise as with a share that holds it (the same units, colors and records, elsewhere in memory). The
+        worlds take their entries in world order; one past the pool's end keeps the one-warp mapping."""
+        # The tray's 76 units a world against a share of one unit: the pool holds one world's every row past it.
+        default, solvers = [], []
+        held = self._simulate(tray(), "patch", default)
+        with mock.patch.object(sweep_units, "UNIT_ROWS", 1024):
+            shared = self._simulate(tray(), "patch", solvers)
+        units = solvers[-1].sweep.colored_units
+        self.assertEqual(units.unit_capacity, max(solvers[-1].placement.mf_max_constraints // 1024, 1))
+        stats = units.stats()
+        colored_worlds = [world["world"] for world in stats if world["colored"]]
+        self.assertTrue(colored_worlds, stats)
+        self.assertTrue(all(world["units"] > units.unit_capacity for world in stats), stats)
+        # Entries in world order: the colored worlds are the first ones, and a world past the end sets the status.
+        self.assertEqual(colored_worlds, list(range(len(colored_worlds))))
+        self.assertEqual(units.capacity_status(), len(colored_worlds) < len(stats))
+        bodies = held.body_q.shape[0] // solvers[-1].forest.world_count
+        for name in ("body_q", "body_qd"):
+            for world in colored_worlds:
+                span = slice(world * bodies, (world + 1) * bodies)
+                np.testing.assert_array_equal(
+                    getattr(shared, name)[span], getattr(held, name)[span], err_msg=f"{name} world {world}"
+                )
 
     def test_repeats_bitwise_and_splits_the_worlds(self):
         """A repeat gives the same trajectory bitwise; a rule past the row capacity builds no colored mapping."""
@@ -413,7 +471,7 @@ class TestColoredSweep(unittest.TestCase):
         """A world under the rule's units per color keeps the one-warp mapping beside a built colored one; the
         same model with no colored mapping (a rule past the row capacity) solves its free bodies' contacts as regions
         (the known gap of the colored route, which keeps today's rows: the two are compared where both run rows,
-        :meth:`test_a_world_past_its_slot_keeps_the_warp`)."""
+        :meth:`test_a_world_past_the_pool_keeps_the_warp`)."""
         # Five units per color: the tray's 19 free bodies admit it, its 76 units in 44 colors do not take it.
         solvers = []
         thin = self._simulate(tray(), "patch", solvers, parallelism=5.0)

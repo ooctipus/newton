@@ -2231,7 +2231,7 @@ def friction_record_stage(
     end: str,
     record: Callable[[str], str],
     declare: str = "",
-    units: tuple[str, str, int] | None = None,
+    units: tuple[str, str, str] | None = None,
     pad: str,
 ) -> str:
     """Before the sweeps, form the record of every friction contact of a class's rows ``[0, end)`` at

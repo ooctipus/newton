@@ -323,15 +323,19 @@ COLOR_AFTER = "LOAD_slots(reinterpret_cast<const int2*>(&color_after.data[(off_u
 COLORED_ABI = kernel_template.params(
     *MF_GS_ABI,
     ("world_slot", wp.array[int]),
+    ("slot_first", wp.array[int]),
+    ("slot_need", wp.array[int]),
     ("color_count", wp.array[int]),
-    ("color_offset", wp.array2d[int]),
-    ("color_slot", wp.array3d[int]),
-    ("color_after", wp.array3d[int]),
-    ("slot_data", wp.array3d[float]),
-    ("slot_words", wp.array3d[int]),
+    ("color_offset", wp.array[int]),
+    ("color_slot", wp.array2d[int]),
+    ("color_after", wp.array2d[int]),
+    ("slot_data", wp.array2d[float]),
+    ("slot_words", wp.array2d[int]),
     ("v_out", wp.array[float]),
 )
-"""The colored mapping's native ABI: the matrix-free sweep's, then each world's storage slot, the worlds' color counts, their slots' colors and staged units (:data:`.sweep_units.WORLD_FIELDS`, :data:`.sweep_units.UNIT_FIELDS`,
+"""The colored mapping's native ABI: the matrix-free sweep's, then each world's storage slot and its slot's first entry
+and entries of the unit pool, the worlds' color counts, and the pool's colors, staged units and friction records
+(:data:`.sweep_units.WORLD_FIELDS`, :data:`.sweep_units.SLOT_PLACES`, :data:`.sweep_units.UNIT_FIELDS`,
 :data:`.sweep_units.SLOT_FIELDS`) before ``v_out``."""
 
 
@@ -414,10 +418,12 @@ def _unit_apply(pad: str, *, torsion: bool = False) -> str:
 _SLOTS = Operand("slots")
 
 
-def _colored_units(free: WorldRows, laws: RowLaws, M_MF: int, units: int, record: Callable[[str], str]) -> str:
+def _colored_units(
+    free: WorldRows, laws: RowLaws, M_MF: int, units: str, record: Callable[[str], str], record_stride: str
+) -> str:
     """A sweep of the world's units in color order, each when its turn comes. The block takes the places in rounds of
-    ``blockDim.x``, a thread a place; a unit loads its slot's fields at once (:data:`.sweep_units.SLOT_FIELDS`, field by
-    field across the ``units`` slots) and its contact's ``record`` (:func:`.sweep.friction_record_stage`), then its
+    ``blockDim.x``, a thread a place; a unit loads its fields at once (:data:`.sweep_units.SLOT_FIELDS`, field by field
+    across the pool's ``units`` entries) and its contact's ``record`` (:func:`.sweep.friction_record_stage`), then its
     warp polls: each pass runs together the lanes whose turn came, where the latest earlier unit on each of their bodies
     ran (:data:`COLOR_AFTER`: those units' colors, which they published in ``s_ran`` at their bodies' slots,
     :data:`RAN_SLOT`). A unit runs the free-body row law, unrolled over its rows, on the world's staged velocity, and
@@ -527,20 +533,19 @@ const float mf_diag = __int_as_float(meta.y);"""
     visit = f"""                    const int4 slot = {COLOR_SLOT.format("place")};
                     const int unit_row = slot.x, rows = slot.y, dof_a = slot.z, dof_b = slot.w;
                     const int2 after = {COLOR_AFTER.format("place")};
-                    const int slot_base = unit_slot * {fields * units} + place;
-                    const int word_base = unit_slot * {words * units} + place;
-                    // Every field of the slot at once, beside the slot's own load: one round of memory latency per
-                    // unit. A unit without a friction pair never reads its pair's fields.
+                    // Every field of the unit at once, beside its slot's own load: one round of memory latency per
+                    // unit. A unit without a friction pair never reads its pair's fields. The world's block from its
+                    // first entry, field-major over its entries.
                     float E[{fields}];
                     int W[{words}];
 #pragma unroll
-                    for (int f = 0; f < {fields}; ++f) E[f] = slot_data.data[slot_base + f * {units}];
+                    for (int f = 0; f < {fields}; ++f) E[f] = slot_data.data[{fields} * off_unit + f * {units} + place];
 #pragma unroll
-                    for (int f = 0; f < {words}; ++f) W[f] = slot_words.data[word_base + f * {units}];
+                    for (int f = 0; f < {words}; ++f) W[f] = slot_words.data[{words} * off_unit + f * {units} + place];
                     // Its contact's record by place, beside the slot (sweep.friction_record_stage): the friction
                     // metric, then the normal's couplings with its friction rows; unread without a friction pair.
                     const float* const unit_record = {record("place")};
-                    const float4 {", ".join(f"{name} = make_float4({', '.join('0.0f' if 4 * k + c == 3 else f'unit_record[{(4 * k + c) * units}]' for c in range(4))})" for k, name in enumerate(FORMED_RECORD))};
+                    const float4 {", ".join(f"{name} = make_float4({', '.join('0.0f' if 4 * k + c == 3 else f'unit_record[{4 * k + c} * {record_stride}]' for c in range(4))})" for k, name in enumerate(FORMED_RECORD))};
 {indent(laws_text, " " * 20)}"""
     turn_text = f"""                    // Its warp's rounds: each round its units whose turn came run (the latest earlier unit on each
                     // of their bodies ran: their colors in s_ran), together.
@@ -1424,33 +1429,56 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         )
         head = "    const int lane = LANE;\n    const int tid = (int)threadIdx.x;\n    const int warp = tid >> 5;"
         first_warp, end_first_warp, barrier = "    if (warp == 0) {\n", "    }\n", "__syncthreads();"
-        units = sweep_units.unit_capacity(M_MF)
+        # The world's entries of the pool: the stride of its units' staged fields and words in its block
+        # (sweep_units.SLOT_FIELDS).
+        units = "unit_entries"
+        share = sweep_units.unit_capacity(M_MF)
 
-        def unit_metric(place: str) -> str:
-            # A unit's record by its place in the colors' order, slot-major from the free rows' first record (every
-            # dense contact's normal precedes row M_D - 2): its visit's loads do not wait for its color slot, and a
-            # color's units read each float together.
+        def unit_metric(row: str) -> Callable[[str], str]:
+            # A unit's record in its world's line: by its place in the colors' order, field-major at the share's stride
+            # from the free rows' first record (every dense contact's normal precedes row M_D - 2), where the world's
+            # units fit its share: its visit's loads do not wait for its color slot, and a color's units read each float
+            # together. A world past its share keeps them where the warp sweep keeps its free rows' records, by its
+            # normal row (a friction unit's rows are three apart at least), each record's floats together: the line
+            # holds a record for every three rows either way, so the records take no memory of their own.
             first = M_D // 3 * FRICTION_METRIC_FLOATS
-            return f"(friction_metric.data + static_cast<size_t>(line) * friction_metric.shape[1] * {FRICTION_METRIC_FLOATS} + {first} + ({place}))"
+            return lambda place: (
+                f"(unit_record_line + (records_by_row ? (({M_D} + ({row})) / 3) * {FRICTION_METRIC_FLOATS} "
+                f": {first} + ({place})))"
+            )
 
-        free_phase = _colored_units(free, laws, M_MF, units, unit_metric)
-        # The units' records at the block's stride, with the normal's couplings a unit moves its rows' terms by.
-        listed = ("color_offset.data[off_color + color_count.data[world]]", COLOR_SLOT, units)
+        free_phase = _colored_units(free, laws, M_MF, units, unit_metric("unit_row"), "record_stride")
+        # The units' records at the line's stride, with the normal's couplings a unit moves its rows' terms by.
+        listed = ("color_offset.data[off_color + color_count.data[world]]", COLOR_SLOT, "record_stride")
         # No unit ran yet (turns are at least zero), before the records' barrier.
         metric_build = (
             f"    for (int d = tid; d < {ran_slots(D)}; d += blockDim.x) s_ran[d] = -1;\n"
             + friction_record_stage(
-                free, free_op, end="mf_contact_end", record=unit_metric, declare=sides, units=listed, pad="    "
+                free,
+                free_op,
+                end="mf_contact_end",
+                record=unit_metric("unit.x"),
+                declare=sides,
+                units=listed,
+                pad="    ",
             )
         )
         trace_reduction = ""
         if solve_policy.traces:
             trace_reduction = block_argmax(COLORED_THREADS // 32, warp="warp", lane="lane")[0]
-        # The world's storage slot (a colored world has one): its colors and staged units.
+        # The world's storage slot (a colored world has one): its first entry of the pool holds its colors' offsets and
+        # its staged units.
         offsets = (
             "\n    const int unit_slot = world_slot.data[world];"
-            f"\n    const int off_unit = unit_slot * {units};"
-            f"\n    const int off_color = unit_slot * {units + 1};"
+            "\n    const int off_unit = slot_first.data[unit_slot];"
+            "\n    const int off_color = off_unit;"
+            "\n    const int unit_entries = slot_need.data[unit_slot];"
+            # Its units' records in its line: by place where its units fit its share, else by normal row (unit_metric).
+            "\n    const bool records_by_row = color_offset.data[off_color + color_count.data[world]] > "
+            f"{share};"
+            f"\n    const int record_stride = records_by_row ? 1 : {share};"
+            "\n    float* const unit_record_line = friction_metric.data + static_cast<size_t>(line) * "
+            f"friction_metric.shape[1] * {FRICTION_METRIC_FLOATS};"
         )
     else:
         violation = active_violation(dense, dense_op, count="m_dense") if sweep.active_rows else None
