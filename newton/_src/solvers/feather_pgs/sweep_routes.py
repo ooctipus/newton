@@ -18,7 +18,7 @@ import warp as wp
 
 from ...core.execution import Work, device_lanes
 from ...core.memory import REGISTERS_PER_THREAD, Buffer, Operand, Place, Staging
-from . import kernel_template, sweep_levels, sweep_units
+from . import kernel_template, sweep_units
 from .device_preludes import LANE_WORDS, memory_words
 from .factor.walk import WalkTrees
 from .kernel_template import Dispatch
@@ -34,6 +34,7 @@ from .region_sweep import (
     REGION_IDLE,
     REGION_LEFT,
     REGION_LOOSE,
+    walk_levels,
 )
 from .response_operator import Lanes, SparseFactor, Velocity
 from .row_inputs import RowArgument
@@ -1174,13 +1175,6 @@ if (moved) {{
     return indent(text, pad)
 
 
-_REMAKE_RESOURCES = """            const int region = valid ? reg_walk.data[s0 + unit] : -1;
-            const wp::vec2i sides = valid ? reg_body.data[region] : wp::vec2i(-1, -1);
-            const int node_a = sides[0];
-            const int node_b = sides[1];"""
-"""A walk's region's resources in the sweeps' end remake (:func:`region_verify`): its bodies."""
-
-
 # A world's job words where it takes a group of blocks (region_phase): the generation of its last post, the level's
 # first and last places, the world's end, the blocks that joined, their exit votes.
 WIDE_JOB = 8
@@ -1263,13 +1257,7 @@ def region_verify(
     statements of :func:`.region_sweep.level_acting`), and the sweeps may not stop; a sweep more where ``budget`` ends
     at ``iteration``. So every region still left out at the end holds
     nothing at a motion where none of its candidates closes."""
-    remake_levels = sweep_levels.level_pass(
-        units="acting",
-        resources=_REMAKE_RESOURCES,
-        counts="level_end.data[s0 + {}]",
-        store="reg_level.data[region] = level;\n                reg_rank.data[region] = rank;",
-        lanes="STRIDE",
-    )
+    remake_levels = walk_levels()
     twist = """const int first{s} = body_first.data[{f}];
 const wp::spatial_vector* const basis{s} = body_basis.data + (size_t){f} * 6;
 wp::spatial_vector u{s};
@@ -1348,37 +1336,7 @@ const wp::vec3 w{s}(wp::dot(basis{s}[3], u{s}), wp::dot(basis{s}[4], u{s}), wp::
             body_level.data[sides[0]] = -1;
             if (sides[1] >= 0) body_level.data[sides[1]] = -1;
         }}
-        for (int k = lane; k < acting; k += STRIDE) level_end.data[s0 + k] = 0;
-        SYNC();
-        // The walk's levels by the lane group's batches (sweep_levels.level_pass, a body a resource): each region's
-        // level and its rank among its level's regions in the walk's order, as one lane's pass in that order gives.
-        int* const node_owner = body_owner.data;
-        int* const node_level = body_level.data;
 {remake_levels}
-        // Each level's first place from the world's first (an exclusive scan of the counts), each region at its
-        // level's first plus its rank, then each level's end (the next level's first; the last's, the walk's acting end).
-        int carry = s0;
-        for (int base = 0; base < levels; base += STRIDE) {{
-            const int k = base + lane;
-            const int n = k < levels ? level_end.data[s0 + k] : 0;
-            const int below = SCAN(n);
-            if (k < levels) level_end.data[s0 + k] = carry + below;
-            carry += READ(below + n, STRIDE - 1);
-        }}
-        SYNC();
-        for (int p = s0 + lane; p < s0 + acting; p += STRIDE) {{
-            const int g = reg_walk.data[p];
-            level_region.data[level_end.data[s0 + reg_level.data[g]] + reg_rank.data[g]] = g;
-        }}
-        SYNC();
-        for (int base = 0; base < levels; base += STRIDE) {{
-            const int k = base + lane;
-            const int next = k + 1 < levels ? level_end.data[s0 + k + 1] : s0 + acting;
-            SYNC();
-            if (k < levels) level_end.data[s0 + k] = next;
-            SYNC();
-        }}
-        if (lane == 0) world_levels.data[world] = levels;
         {remade}
     }}
 }}"""

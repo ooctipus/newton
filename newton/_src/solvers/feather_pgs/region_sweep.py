@@ -36,6 +36,7 @@ nothing at a twist where none of its candidates closes.
 
 import dataclasses
 import warnings
+from textwrap import dedent, indent
 
 import numpy as np
 import warp as wp
@@ -56,12 +57,17 @@ from ...core.ordered_reserve import OrderedTiles, ordered_scan, ordered_tile
 from ...geometry.flags import ShapeFlags
 from .contact_input import ContactFrame, ContactInput, contact_frame
 from .device_preludes import (
+    CPU_MATH,
+    CPU_WORDS,
+    LANE_WORDS,
+    device_branches,
     dual_native,
     lane_any,
     lane_ballot,
     lane_below,
     lane_count,
     lane_first,
+    lane_group,
     lane_index,
     lane_read,
     lane_scan,
@@ -90,6 +96,7 @@ from .row_build import contact_gap_rate, member_contact_row, member_row_law
 from .row_kernels import RowBias, row_bias_words
 from .row_laws import ROW_CONTACT, ROW_TORSION, contact_restitution_rhs
 from .row_records import DenseRows, row_sides
+from .sweep_levels import level_pass
 from .tree_scan import indent_text
 
 REGION_IDLE = wp.constant(-2)
@@ -2038,25 +2045,196 @@ def level_regions(
         world_order_end[world] = s + kept
 
 
-@wp.kernel(enable_backward=False, module="unique")
-def level_acting(
+WALK_RESOURCES = """            const int region = valid ? reg_walk.data[s0 + unit] : -1;
+            const wp::vec2i sides = valid ? reg_body.data[region] : wp::vec2i(-1, -1);
+            const int node_a = sides[0];
+            const int node_b = sides[1];"""
+"""A walk's region's resources in its levels (:func:`walk_levels`): its bodies."""
+
+
+def walk_levels(pad: str = "        ") -> str:
+    """Return the CUDA statements that level a world's walk (:func:`level_acting`): its ``acting`` regions from
+    ``reg_walk[s0]``, whose bodies' ``body_level`` is -1 and ``body_owner`` 32, by the lane group's batches.
+
+    The levels are the level builder's pass (:func:`.sweep_levels.level_pass`, a body a resource): each region's level
+    is one past the last level of a region before it on either of its bodies, with its rank among its level's regions
+    in the walk's order, as one lane's pass in that order gives. Each level's first place is a scan of the levels'
+    counts and each region sits at its level's first plus its rank (``level_region``); then ``level_end[s0 + L]`` holds
+    level ``L``'s end and ``world_levels[world]`` the count. The statements run on every lane of the group (``lane``,
+    ``STRIDE``, ``SYNC``, the lane group's words); the step's walk (:func:`level_acting`) and the sweeps' end remake
+    (:func:`.sweep_routes.region_verify`) take them."""
+    levels = level_pass(
+        units="acting",
+        resources=WALK_RESOURCES,
+        counts="level_end.data[s0 + {}]",
+        store="reg_level.data[region] = level;\n                reg_rank.data[region] = rank;",
+        lanes="STRIDE",
+    )
+    text = f"""for (int k = lane; k < acting; k += STRIDE) level_end.data[s0 + k] = 0;
+SYNC();
+// The walk's levels by the lane group's batches (sweep_levels.level_pass, a body a resource): each region's
+// level and its rank among its level's regions in the walk's order, as one lane's pass in that order gives.
+int* const node_owner = body_owner.data;
+int* const node_level = body_level.data;
+{dedent(levels)}
+// Each level's first place from the world's first (an exclusive scan of the counts), each region at its
+// level's first plus its rank, then each level's end (the next level's first; the last's, the walk's acting end).
+int carry = s0;
+for (int base = 0; base < levels; base += STRIDE) {{
+    const int k = base + lane;
+    const int n = k < levels ? level_end.data[s0 + k] : 0;
+    const int below = SCAN(n);
+    if (k < levels) level_end.data[s0 + k] = carry + below;
+    carry += READ(below + n, STRIDE - 1);
+}}
+SYNC();
+for (int p = s0 + lane; p < s0 + acting; p += STRIDE) {{
+    const int g = reg_walk.data[p];
+    level_region.data[level_end.data[s0 + reg_level.data[g]] + reg_rank.data[g]] = g;
+}}
+SYNC();
+for (int base = 0; base < levels; base += STRIDE) {{
+    const int k = base + lane;
+    const int next = k + 1 < levels ? level_end.data[s0 + k + 1] : s0 + acting;
+    SYNC();
+    if (k < levels) level_end.data[s0 + k] = next;
+    SYNC();
+}}
+if (lane == 0) world_levels.data[world] = levels;"""
+    return indent(text, pad)
+
+
+_ACTING_BLOCK = 256
+"""The walk's block (:func:`level_acting`): eight worlds' warps, and a world wider than a turn of its lanes takes them
+all for its walk."""
+
+_ACTING = f"""    const int lane = LANE, world = tid / LANES, worlds = world_regions.shape[0];
+    // A world's listed regions in its order, [s, end) (none past the worlds).
+    const auto span = [&](int w, int& s, int& end) {{
+        s = 0;
+        end = 0;
+        if (w < worlds) {{
+            s = world_regions.data[w][0];
+            end = world_order_end.data[w];
+        }}
+    }};
+    // A world wider than a turn of its block's lanes is walked by every warp of the block, a part each (GROUPS: the
+    // block's warps, SUB: this warp's; one on the CPU, whose one thread walks a world).
+    const auto wide = [&](int n) {{ return GROUPS > 1 && n > STRIDE * GROUPS; }};
+    // The acting regions of the order's places [a, b).
+    const auto count_part = [&](int a, int b) {{
+        int count = 0;
+        for (int base = a; base < b; base += STRIDE) {{
+            const int p = base + lane;
+            count += COUNT(BALLOT(p < b && reg_state.data[reg_order.data[p]] != {int(REGION_LEFT)}));
+        }}
+        return count;
+    }};
+    // The places [a, b) into the walk: an acting region at the acting ones' ``in`` (its acting predecessors in the
+    // order), a left-out one after every acting one at ``out``; an acting region's bodies unleveled (body_level -1).
+    const auto place_part = [&](int s, int a, int b, int in, int acting) {{
+        int out = acting + (a - s) - in;
+        for (int base = a; base < b; base += STRIDE) {{
+            const int p = base + lane;
+            const int g = p < b ? reg_order.data[p] : -1;
+            const bool act = g >= 0 && reg_state.data[g] != {int(REGION_LEFT)};
+            const unsigned votes = BALLOT(act), outs = BALLOT(g >= 0 && !act);
+            if (act) {{
+                reg_walk.data[s + in + BELOW(votes)] = g;
+                const wp::vec2i sides = reg_body.data[g];
+                body_level.data[sides[0]] = -1;
+                if (sides[1] >= 0) body_level.data[sides[1]] = -1;
+            }} else if (g >= 0) {{
+                reg_walk.data[s + out + BELOW(outs)] = g;
+            }}
+            in += COUNT(votes);
+            out += COUNT(outs);
+        }}
+    }};
+    int s0, end;
+    span(world, s0, end);
+    int acting = 0;
+    if (end > s0 && !wide(end - s0)) {{
+        acting = count_part(s0, end);
+        place_part(s0, s0, end, 0, acting);
+    }}
+    // The block's wide worlds in turn, a part a warp: the parts' counts (level_end[s + part] as scratch), then their
+    // places from the counts of the parts before.
+    for (int k = 0; k < GROUPS; ++k) {{
+        int s, e;
+        span(world - SUB + k, s, e);
+        if (!wide(e - s)) continue;
+        const int part = (((e - s) + GROUPS - 1) / GROUPS + STRIDE - 1) / STRIDE * STRIDE;
+        const int a = wp::min(s + SUB * part, e), b = wp::min(a + part, e);
+        const int count = count_part(a, b);
+        if (lane == 0) level_end.data[s + SUB] = count;
+        BLOCK_SYNC();
+        int in = 0, total = 0;
+        for (int q = 0; q < GROUPS; ++q) {{
+            const int c = level_end.data[s + q];
+            in += q < SUB ? c : 0;
+            total += c;
+        }}
+        place_part(s, a, b, in, total);
+        if (k == SUB) acting = total;
+        BLOCK_SYNC();
+    }}
+    if (end <= s0) {{
+        if (world < worlds && lane == 0) world_levels.data[world] = 0;
+        return;
+    }}
+    SYNC();
+{walk_levels("    ")}
+"""
+"""The step's walk and its levels (:func:`level_acting`), a world a warp of a block of :data:`_ACTING_BLOCK`."""
+
+
+@wp.func_native(
+    dual_native(
+        device_branches(
+            "    const auto BLOCK_SYNC = []() { __syncthreads(); };\n", "    const auto BLOCK_SYNC = []() {};\n"
+        )
+        + _ACTING,
+        preludes=(lane_group(int(_WORLD_LANES)), LANE_WORDS, CPU_MATH, CPU_WORDS),
+    )
+)
+def _walk_acting(
+    tid: int,
     world_regions: wp.array[wp.vec2i],
     world_order_end: wp.array[int],
-    world_free_start: wp.array[int],
-    world_free: wp.array[int],
     reg_body: wp.array[wp.vec2i],
     reg_state: wp.array[int],
     reg_order: wp.array[int],
     body_level: wp.array[int],
+    body_owner: wp.array[int],
     reg_level: wp.array[int],
+    reg_rank: wp.array[int],
+    reg_walk: wp.array[int],
+    level_end: wp.array[int],
+    level_region: wp.array[int],
+    world_levels: wp.array[int],
+): ...
+
+
+@wp.kernel(enable_backward=False, module="unique")
+def level_acting(
+    world_regions: wp.array[wp.vec2i],
+    world_order_end: wp.array[int],
+    reg_body: wp.array[wp.vec2i],
+    reg_state: wp.array[int],
+    reg_order: wp.array[int],
+    body_level: wp.array[int],
+    body_owner: wp.array[int],
+    reg_level: wp.array[int],
+    reg_rank: wp.array[int],
     reg_walk: wp.array[int],
     level_end: wp.array[int],
     level_region: wp.array[int],
     world_levels: wp.array[int],
 ):
     """Each step, a world's walk of its regions' order (:func:`level_regions`) at the step's fill: the regions that
-    can act by the exact levels of the order, the left-out ones (:data:`REGION_LEFT`) after them, a world a lane
-    group (:data:`_WORLD_LANES`).
+    can act by the exact levels of the order, the left-out ones (:data:`REGION_LEFT`) after them, a world a warp of a
+    block of :data:`_ACTING_BLOCK` threads (one thread on the CPU).
 
     A sweep passes a left-out region (its turn writes nothing) and its end tests it (:func:`.sweep_routes
     .region_verify`), so a level of theirs would cost every sweep a level's turn and barrier for nothing; in a pile
@@ -2064,90 +2242,32 @@ def level_acting(
     The walk (``reg_walk``, the world's span ``[s, world_order_end)``) holds the acting regions first and the left-out
     ones after them, each in the order's sequence; the acting ones' levels are the order's own on them, so the sweeps
     take the order exactly on the regions that act. Where the verify opens a left-out region it makes the walk and its
-    levels anew with these statements (:func:`.sweep_routes.region_verify`), so the opened region takes its place.
+    levels anew (:func:`.sweep_routes.region_verify`), so the opened region takes its place.
 
-    The levels: a region's level is one past the last level of a region before it on either of its bodies, so a
-    level's regions share no body and a sweep that takes the levels in turn, a level's regions at once, is the
-    sequential sweep of the order itself. The span ``[s, t)`` holds the acting regions by level (``level_region``) and,
-    at ``s + L``, the end of level ``L`` (``level_end``); ``world_levels`` the count. The lanes split the walk a
-    stride at a time in lane order (stable) and count the levels' places; the levels themselves are one lane's pass,
-    as the sequential sweep is.
+    The walk: a world's warp counts the acting regions of its order, then places each region by its lane ballots; a
+    world wider than a turn of the block's lanes takes every warp of the block, a part of its order each, the parts'
+    counts giving each part's first places, so a big world's walk is spread over the block. The levels: a region's
+    level is one past the last level of a region before it on either of its bodies, so a level's regions share no body
+    and a sweep that takes the levels in turn, a level's regions at once, is the sequential sweep of the order itself;
+    the world's warp takes them by its batches (:func:`walk_levels`). The span ``[s, t)`` holds the acting regions by
+    level (``level_region``) and, at ``s + L``, the end of level ``L`` (``level_end``); ``world_levels`` the count.
     """
-    lanes = lane_stride(_WORLD_LANES)
-    lane = lane_index(_WORLD_LANES)
-    world = wp.tid() // lanes
-    if world >= world_regions.shape[0]:
-        return
-    s = world_regions[world][0]
-    end = world_order_end[world]
-    if end <= s:
-        if lane == 0:
-            world_levels[world] = 0
-        return
-    # The walk: the acting regions, then the left-out ones, each in the order's sequence.
-    acting = int(0)
-    for base in range(s, end, lanes):
-        p = base + lane
-        g = int(-1)
-        act = bool(False)
-        if p < end:
-            g = reg_order[p]
-            act = reg_state[g] != REGION_LEFT
-        votes = lane_ballot(act, _WORLD_LANES)
-        if act:
-            reg_walk[s + acting + lane_below(votes, _WORLD_LANES)] = g
-        acting += lane_count(votes, _WORLD_LANES)
-    placed = acting
-    for base in range(s, end, lanes):
-        p = base + lane
-        g = int(-1)
-        out = bool(False)
-        if p < end:
-            g = reg_order[p]
-            out = reg_state[g] == REGION_LEFT
-        votes = lane_ballot(out, _WORLD_LANES)
-        if out:
-            reg_walk[s + placed + lane_below(votes, _WORLD_LANES)] = g
-        placed += lane_count(votes, _WORLD_LANES)
-    f0 = world_free_start[world]
-    f1 = world_free_start[world + 1]
-    for i in range(f0 + lane, f1, lanes):
-        body_level[world_free[i]] = 0
-    lane_sync(_WORLD_LANES)
-    # The levels of the acting regions' order: one lane's pass, a region's level one past the last level of a region
-    # before it on either of its bodies.
-    levels = int(0)
-    if lane == 0:
-        for p in range(s, s + acting):
-            g = reg_walk[p]
-            sides = reg_body[g]
-            level = body_level[sides[0]]
-            if sides[1] >= 0:
-                level = wp.max(level, body_level[sides[1]])
-            reg_level[g] = level
-            body_level[sides[0]] = level + 1
-            if sides[1] >= 0:
-                body_level[sides[1]] = level + 1
-            levels = wp.max(levels, level + 1)
-    levels = lane_read(levels, 0, _WORLD_LANES)
-    lane_sync(_WORLD_LANES)
-    for k in range(lane, levels, lanes):
-        level_end[s + k] = 0
-    lane_sync(_WORLD_LANES)
-    for p in range(s + lane, s + acting, lanes):
-        wp.atomic_add(level_end, s + reg_level[reg_walk[p]], 1)
-    lane_sync(_WORLD_LANES)
-    _level_starts(level_end, s, levels, lane, lanes)
-    for base in range(s, s + acting, lanes):
-        p = base + lane
-        key = int(-1)
-        g = int(0)
-        if p < s + acting:
-            g = reg_walk[p]
-            key = reg_level[g]
-        _place_by_key(level_end, s, key, g, level_region, lane)
-    if lane == 0:
-        world_levels[world] = levels
+    _walk_acting(
+        wp.tid(),
+        world_regions,
+        world_order_end,
+        reg_body,
+        reg_state,
+        reg_order,
+        body_level,
+        body_owner,
+        reg_level,
+        reg_rank,
+        reg_walk,
+        level_end,
+        level_region,
+        world_levels,
+    )
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -2288,6 +2408,8 @@ class Regions:
         self.world_threads = worlds * (int(_WORLD_LANES) if device.is_cuda else 1)
         self.tile_threads = _WORLD_BLOCK if device.is_cuda else 1
         self.tiles = -(-self.world_threads // self.tile_threads)
+        # The walk's whole blocks (level_acting: a block's warps meet where a world is wider than a turn of them).
+        self.acting_threads = -(-self.world_threads // _ACTING_BLOCK) * _ACTING_BLOCK if device.is_cuda else worlds
         # The blocks' staged records (stage_blocks) in an arena that follows the listings' demand (serve_arena): the
         # listing's words (blk_words), the words mapped (arena_words, on the device) and the record form_blocks keeps
         # (the demand's high-water mark and the listings the arena was short of), in pinned memory the device writes
@@ -2681,26 +2803,20 @@ class Regions:
         # Every step: the walk of the order at the step's fill, the acting regions by their levels.
         wp.launch(
             level_acting,
-            dim=world_threads,
-            inputs=[
-                self.world_regions,
-                self.world_order_end,
-                self.world_free_start,
-                self.world_free,
-                self.reg_body,
-                self.reg_state,
-                self.reg_order,
-            ],
+            dim=self.acting_threads,
+            inputs=[self.world_regions, self.world_order_end, self.reg_body, self.reg_state, self.reg_order],
             outputs=[
                 self.body_level,
+                self.body_owner,
                 self.reg_level,
+                self.reg_rank,
                 self.reg_walk,
                 self.level_end,
                 self.level_region,
                 self.world_levels,
             ],
             device=device,
-            block_dim=_WORLD_BLOCK,
+            block_dim=_ACTING_BLOCK,
         )
         if self.blocks:
             pool.launch(
