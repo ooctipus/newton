@@ -2189,6 +2189,7 @@ _REGION_FIELDS = (
     ("reg_stamp", wp.int32, 1),
     ("reg_bound", wp.vec2, 1),
     ("reg_level", wp.int32, 1),
+    ("reg_rank", wp.int32, 1),
     ("reg_order", wp.int32, 1),
     ("reg_walk", wp.int32, 1),
     ("level_region", wp.int32, 1),
@@ -2268,6 +2269,8 @@ class Regions:
         # Each world's end of its regions' order (level_regions), which each step's walk takes (level_acting).
         self.world_order_end = wp.zeros(worlds, dtype=wp.int32, device=device)
         self.body_level = wp.zeros(max(count, 1), dtype=wp.int32, device=device)
+        # A body's claim in the sweeps' end remake of the levels (sweep_levels.level_pass's owner word): no lane.
+        self.body_owner = wp.full(max(count, 1), 32, dtype=wp.int32, device=device)
         blocks = worlds * int(PAIR_BLOCKS)
         self.blk_pair = wp.full(blocks, wp.vec2i(-1, -1), dtype=wp.vec2i, device=device)
         self.blk_members = wp.zeros(blocks, dtype=wp.vec2i, device=device)
@@ -2836,7 +2839,7 @@ class Regions:
     def operands(self) -> dict:
         """The stream as the general sweep's region phase takes it (:data:`.sweep_routes.REGION_OPERANDS`)."""
         names = "world_regions world_levels world_order_end level_end level_region reg_order reg_walk reg_level"
-        names += " body_level body_first body_basis"
+        names += " reg_rank body_level body_owner body_first body_basis"
         names += " reg_frame reg_arm reg_arm_b reg_body reg_cand reg_law reg_wnn reg_wnf reg_wff reg_ball_values"
         names += " reg_ball_vectors reg_ginv reg_k reg_lk reg_lw"
         names += " reg_bf reg_kind reg_row cand cand_floor cand_row reg_wrench reg_phi reg_set reg_spring reg_state reg_stamp"

@@ -39,7 +39,9 @@ from .row_laws import ROW_CONTACT, ROW_FRICTION, ROW_JOINT_LIMIT, ROW_TORSION
 wp.set_module_options({"enable_backward": False})
 
 
-def level_pass(*, units: str, resources: str, counts: str, store: str, lanes: int = 32, after: bool = False) -> str:
+def level_pass(
+    *, units: str, resources: str, counts: str, store: str, lanes: int | str = 32, after: bool = False
+) -> str:
     """Return CUDA source that levels a world's ``units`` units in row order (Cartier-Foata), by one warp, a batch of
     32 at a time.
 
@@ -58,8 +60,9 @@ def level_pass(*, units: str, resources: str, counts: str, store: str, lanes: in
     also read ``after_a`` and ``after_b``, the levels its resources held before it (its latest earlier unit's on each,
     -1 for none or no resource). The fragment runs on
     every lane of the warp, uses the lane group, ``lane`` and the names ``resources`` and ``store`` read, and declares
-    ``levels``, the world's level count, on every lane. ``lanes`` is the group: a warp, or the CPU's one thread, a batch
-    of one unit, whose words are the lane group's (``MATCH``, ``BELOW``, ``COUNT``; :data:`.device_preludes.LANE_WORDS`).
+    ``levels``, the world's level count, on every lane. ``lanes`` is the group: a warp, the CPU's one thread (a batch
+    of one unit), or a lane group of a native expression's lanes (``STRIDE``), whose words are the lane group's
+    (``MATCH``, ``BELOW``, ``COUNT``; :data:`.device_preludes.LANE_WORDS`).
     """
     if lanes == 32:
         same, below, count = (
@@ -67,10 +70,11 @@ def level_pass(*, units: str, resources: str, counts: str, store: str, lanes: in
             "__popc(same & ((1u << lane) - 1u))",
             "__popc(same)",
         )
-    elif lanes == 1:
+    elif lanes == 1 or isinstance(lanes, str):
+        # A lane group's words (the CPU's one thread, or a group of a native expression's lanes, ``STRIDE``).
         same, below, count = "MATCH(level)", "BELOW(same)", "COUNT(same)"
     else:
-        raise ValueError(f"the level pass runs a warp or one thread, got {lanes}")
+        raise ValueError(f"the level pass runs a warp, a lane group or one thread, got {lanes}")
     held = (
         "\n                    if (node_a >= 0) after_a = node_level[node_a];"
         "\n                    if (node_b >= 0) after_b = node_level[node_b];"

@@ -18,8 +18,8 @@ import warp as wp
 
 from ...core.execution import Work, device_lanes
 from ...core.memory import REGISTERS_PER_THREAD, Buffer, Operand, Place, Staging
-from . import kernel_template, sweep_units
-from .device_preludes import memory_words
+from . import kernel_template, sweep_levels, sweep_units
+from .device_preludes import LANE_WORDS, memory_words
 from .factor.walk import WalkTrees
 from .kernel_template import Dispatch
 from .packed_rows import CLASS_SIDES, PACKED_SIDES_BY_SIDE, PACKED_SIDES_DENSE
@@ -854,7 +854,9 @@ REGION_OPERANDS = (
     ("reg_order", wp.array[int]),
     ("reg_walk", wp.array[int]),
     ("reg_level", wp.array[int]),
+    ("reg_rank", wp.array[int]),
     ("body_level", wp.array[int]),
+    ("body_owner", wp.array[int]),
     ("body_first", wp.array[int]),
     ("body_basis", wp.array2d[wp.spatial_vector]),
     ("reg_frame", wp.array[wp.mat33]),
@@ -1156,6 +1158,13 @@ if (moved) {{
     return indent(text, pad)
 
 
+_REMAKE_RESOURCES = """            const int region = valid ? reg_walk.data[s0 + unit] : -1;
+            const wp::vec2i sides = valid ? reg_body.data[region] : wp::vec2i(-1, -1);
+            const int node_a = sides[0];
+            const int node_b = sides[1];"""
+"""A walk's region's resources in the sweeps' end remake (:func:`region_verify`): its bodies."""
+
+
 def region_verify(
     iteration: str = ITERATION, budget: str = "sweep_budget", pad: str = "        ", *, block: bool = False
 ) -> str:
@@ -1169,6 +1178,13 @@ def region_verify(
     statements of :func:`.region_sweep.level_acting`), and the sweeps may not stop; a sweep more where ``budget`` ends
     at ``iteration``. So every region still left out at the end holds
     nothing at a motion where none of its candidates closes."""
+    remake_levels = sweep_levels.level_pass(
+        units="acting",
+        resources=_REMAKE_RESOURCES,
+        counts="level_end.data[s0 + {}]",
+        store="reg_level.data[region] = level;\n                reg_rank.data[region] = rank;",
+        lanes="STRIDE",
+    )
     twist = """const int first{s} = body_first.data[{f}];
 const wp::spatial_vector* const basis{s} = body_basis.data + (size_t){f} * 6;
 wp::spatial_vector u{s};
@@ -1244,35 +1260,40 @@ const wp::vec3 w{s}(wp::dot(basis{s}[3], u{s}), wp::dot(basis{s}[4], u{s}), wp::
         SYNC();
         for (int p = s0 + lane; p < s0 + acting; p += STRIDE) {{
             const wp::vec2i sides = reg_body.data[reg_walk.data[p]];
-            body_level.data[sides[0]] = 0;
-            if (sides[1] >= 0) body_level.data[sides[1]] = 0;
+            body_level.data[sides[0]] = -1;
+            if (sides[1] >= 0) body_level.data[sides[1]] = -1;
+        }}
+        for (int k = lane; k < acting; k += STRIDE) level_end.data[s0 + k] = 0;
+        SYNC();
+        // The walk's levels by the lane group's batches (sweep_levels.level_pass, a body a resource): each region's
+        // level and its rank among its level's regions in the walk's order, as one lane's pass in that order gives.
+        int* const node_owner = body_owner.data;
+        int* const node_level = body_level.data;
+{remake_levels}
+        // Each level's first place from the world's first (an exclusive scan of the counts), each region at its
+        // level's first plus its rank, then each level's end (the next level's first; the last's, the walk's acting end).
+        int carry = s0;
+        for (int base = 0; base < levels; base += STRIDE) {{
+            const int k = base + lane;
+            const int n = k < levels ? level_end.data[s0 + k] : 0;
+            const int below = SCAN(n);
+            if (k < levels) level_end.data[s0 + k] = carry + below;
+            carry += READ(below + n, STRIDE - 1);
         }}
         SYNC();
-        if (lane == 0) {{
-            int count = 0;
-            for (int p = s0; p < s0 + acting; ++p) {{
-                const int g = reg_walk.data[p];
-                const wp::vec2i sides = reg_body.data[g];
-                int level = body_level.data[sides[0]];
-                if (sides[1] >= 0) level = wp::max(level, body_level.data[sides[1]]);
-                reg_level.data[g] = level;
-                body_level.data[sides[0]] = level + 1;
-                if (sides[1] >= 0) body_level.data[sides[1]] = level + 1;
-                count = wp::max(count, level + 1);
-            }}
-            for (int k = 0; k < count; ++k) level_end.data[s0 + k] = 0;
-            for (int p = s0; p < s0 + acting; ++p) level_end.data[s0 + reg_level.data[reg_walk.data[p]]] += 1;
-            for (int k = 0, start = s0; k < count; ++k) {{
-                const int n = level_end.data[s0 + k];
-                level_end.data[s0 + k] = start;
-                start += n;
-            }}
-            for (int p = s0; p < s0 + acting; ++p) {{
-                const int g = reg_walk.data[p];
-                level_region.data[level_end.data[s0 + reg_level.data[g]]++] = g;
-            }}
-            world_levels.data[world] = count;
+        for (int p = s0 + lane; p < s0 + acting; p += STRIDE) {{
+            const int g = reg_walk.data[p];
+            level_region.data[level_end.data[s0 + reg_level.data[g]] + reg_rank.data[g]] = g;
         }}
+        SYNC();
+        for (int base = 0; base < levels; base += STRIDE) {{
+            const int k = base + lane;
+            const int next = k + 1 < levels ? level_end.data[s0 + k + 1] : s0 + acting;
+            SYNC();
+            if (k < levels) level_end.data[s0 + k] = next;
+            SYNC();
+        }}
+        if (lane == 0) world_levels.data[world] = levels;
         {remade}
     }}
 }}"""
@@ -1733,7 +1754,13 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     # The rows' layout is the configuration's: rows as wide as the world (and no classes) sit at their coordinates.
     packed = PACKED_SIDES_DENSE if not sweep.support_classes and max_row_dofs == D else PACKED_SIDES_BY_SIDE
     units_ = colored and not sweep.regions
-    sides = (packed, *((CLASS_SIDES,) if sweep.support_classes else ()), *((memory_words(_SLOTS),) if units_ else ()))
+    # The regions' remake of the walk's levels reads the lane group's words (MATCH, region_verify).
+    sides = (
+        packed,
+        *((CLASS_SIDES,) if sweep.support_classes else ()),
+        *((memory_words(_SLOTS),) if units_ else ()),
+        *((LANE_WORDS,) if sweep.regions else ()),
+    )
     records = bool(contact_torsion or units_)
     families = ((REGION_LAW,) if sweep.regions else ()) + ((IDLE_LAW,) if live is not None else ())
     return sweep.native(body, lanes=lanes, rows=sides, records=records, laws=families), staging
