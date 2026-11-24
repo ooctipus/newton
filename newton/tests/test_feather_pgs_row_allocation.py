@@ -171,6 +171,9 @@ def _step_tripods(device, *, steps=4, sorted_contacts=False, substeps=1, **optio
         }
         record["pair_keys"] = solver.laws.friction_patches.current.keys.numpy()[:live].copy()
         record["kept"] = int(solver.laws.friction_patches.kept_frame().numpy()[0])
+        # Whether the step kept the collision pass's contact set, and which worlds kept their contacts' slots.
+        record["pass_kept"] = int(solver.placement.pass_words.numpy()[0])
+        record["held"] = solver.placement.world_held.numpy().copy()
         # Each contact's trees with response coordinates (row_records.row_sides), which join its world's islands.
         responds = solver.forest.articulation_response_dof_count.numpy() > 0
         arts = np.stack(
@@ -382,6 +385,36 @@ class TestFeatherPGSRowIslands(unittest.TestCase):
                 for world in np.unique(record["world"][record["path"] == path]):
                     slots = record["slot"][_family_contacts(record, path, world)]
                     self.assertTrue(np.all(np.diff(slots) > 0), f"step {step}, path {path}, world {world}: {slots}")
+
+    def _check_pass_keeps_its_rows(self, device):
+        """Three solver steps a collision pass: the contact set's work (admission, reservation, units) is the pass's.
+        The later steps keep the frame, and each world whose topology rows did not move keeps every contact's path and
+        slot and its rows; the rows then follow the reference order as on the pass's first step."""
+        substeps = 3
+        records = _step_tripods(device, steps=3, substeps=substeps)
+        self.assertEqual([record["pass_kept"] for record in records], [0, 1, 1] * 3)
+        held = 0
+        for step, record in enumerate(records):
+            if not record["pass_kept"]:
+                self.assertFalse(record["held"].any(), f"step {step}")
+                continue
+            first = records[step - step % substeps]
+            for world in np.flatnonzero(record["held"]):
+                held += 1
+                mine = first["world"] == world
+                for name in ("path", "slot"):
+                    np.testing.assert_array_equal(record[name][mine], first[name][mine], f"step {step}, {name}")
+                for family in range(2):
+                    self.assertEqual(record["counts"][family][world], first["counts"][family][world])
+                    self.assertEqual(record["starts"][family][world], first["starts"][family][world])
+        self.assertGreater(held, 0)
+
+    def test_a_collision_pass_keeps_its_rows_cpu(self):
+        self._check_pass_keeps_its_rows(wp.get_device("cpu"))
+
+    @unittest.skipUnless(wp.is_cuda_available(), "CUDA")
+    def test_a_collision_pass_keeps_its_rows_cuda(self):
+        self._check_pass_keeps_its_rows(wp.get_device("cuda:0"))
 
     def test_a_kept_frame_keeps_its_islands_order_cpu(self):
         self._check_kept_frame(wp.get_device("cpu"))

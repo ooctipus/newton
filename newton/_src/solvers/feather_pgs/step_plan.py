@@ -468,7 +468,8 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
     # writers published, over the claims' candidates.
     seeds = (factor, "seed_blocks", placement.dense_first, placement.rhs, placement.impulses) if preelimination else ()
     built = (
-        "mf_constraint_count dense_first mf_contact_rows_end row_record free_records packed_Z row_mu row_w body_base"
+        "mf_constraint_count dense_first mf_contact_rows_end row_record free_records packed_Z row_mu row_w body_base "
+        "world_acts pass_words"
     )
     build = () if colored is None else (colored, "build", *attrgetter(*built.split())(placement))
 
@@ -516,7 +517,7 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
         (s4, "write_links", laws.link_count > 0 and holds, (laws, "write_links", solver, STATE_IN)),
         (s4, "prepare_fused_limits", spec.classes.fused_sizes, (laws, "prepare_fused_limits", solver, STATE_IN, DT)),
         (s4, "write_limits", limit_sizes, (laws, "write_limits", solver, STATE_IN, DT, limit_sizes)),
-        (s4, "bound_topology", True, (laws, "bound_topology", solver)),
+        (s4, "bound_topology", True, (laws, "bound_topology", solver, CONTACTS)),
         (s4, "write_topology_rows", topology is not None, (STEP, "beside", topology, *walk, WRITE_TOPOLOGY)),
         (s4, "write_contacts", True, (laws, "write_contacts", solver, STATE_IN, factor, CONTACTS, DT, route.producer)),
         # The free bodies' run (their contacts) where a colored world holds one.

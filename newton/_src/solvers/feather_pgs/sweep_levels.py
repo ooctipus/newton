@@ -201,8 +201,9 @@ def claim_worlds(
     builder walks and splits into the colored bucket and the general one (``candidate`` negative: no colored mapping,
     and ``slot`` is not read); the rest into the general sweep's cost classes from ``general`` on, by the bits of its
     own cycles in the sweep's last call (``world_cost``, :func:`cost_bucket`). A world without rows takes none, nor one
-    none of whose rows can act (its ``acts`` word, :data:`.placement.WORLD_ACTS`). A free
-    body's rows in the free bodies' run (``free_body_rows``) are not dense only.
+    none of whose rows can act (its ``acts`` word, :data:`.placement.WORLD_ACTS`) but a candidate: the unit builder
+    builds every candidate's units, a function of the collision pass's contact set alone, and claims only those that
+    act (:func:`.sweep_units.build_units_kernel`). A free body's rows in the free bodies' run (``free_body_rows``) are not dense only.
 
     A claim's worlds share nothing with another's, so each is a component of its own and the order inside a bucket is
     free (:func:`~newton._src.core.execution.append`'s, an atomic a warp a bucket); tier ``t`` serves
@@ -213,7 +214,7 @@ def claim_worlds(
     world = wp.tid()
     m = rows[world]
     mf = free_body_rows[world]
-    if (m <= 0 and mf <= 0) or (acts.shape[0] > 0 and acts[world] == 0):
+    if m <= 0 and mf <= 0:
         return
     bucket = int(-1)
     if tier_world(m, mf, bound):
@@ -221,6 +222,8 @@ def claim_worlds(
     elif candidate >= 0:
         if slot[world] >= 0:
             bucket = candidate
+    if (candidate < 0 or bucket != candidate) and acts.shape[0] > 0 and acts[world] == 0:
+        return
     if bucket < 0:
         bucket = cost_bucket(general, world_cost[world])
     append(items, count, bucket, region, world)

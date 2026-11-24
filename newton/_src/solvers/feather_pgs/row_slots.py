@@ -99,9 +99,11 @@ def _admit_contact(
     same_articulation_contact_gap_gate: float,
     articulation_pair_contact_gap_gate: float,
     twists: wp.array[wp.spatial_vector],
+    kept: int,
 ):
     """Return whether a contact gets rows, whether its rows keep zero impulse at the predictor, and its articulations,
-    world and gap: ``(admitted, separates, art_a, art_b, world, phi)``.
+    world and gap: ``(admitted, separates, art_a, art_b, world, phi)``. A contact its collision pass admitted
+    (``kept``: a later step of the pass, :func:`admit_world_contacts`) stays admitted whatever its gap.
 
     A contact needs an endpoint that responds to its impulses, one world (not
     two, nor none without an articulation) and a gap within the normal gap limit. A contact without a responding
@@ -143,7 +145,7 @@ def _admit_contact(
             articulation_pair_contact_gap_gate,
             same_articulation_contact_gap_gate,
         )
-        admitted = not (phi > normal_gap_limit)
+        admitted = kept != 0 or not (phi > normal_gap_limit)
         if admitted and twists.shape[0] > 0:
             # The free bodies' law where neither side has coordinates of a tree that is not a free body.
             free = (not (art_a >= 0 and data.response_dofs[art_a] > 0) or not a_non_free) and (
@@ -250,11 +252,18 @@ def _admit_world_contact(
     contact_friction_gap_threshold: float,
     friction_patches: FrictionPatches,
     twists: wp.array[wp.spatial_vector],
+    kept: int,
     # outputs
     acts: wp.array[int],
 ) -> int:
     """Admit, classify and size contact ``c`` (:func:`admit_world_contacts`); returns its world (-1 for none:
-    :func:`_admit_contact`), written for every contact, admitted or not."""
+    :func:`_admit_contact`), written for every contact, admitted or not. On a later step of its collision pass
+    (``kept``) the pass's admission, class and size stand, and only the verdict is the step's."""
+    if kept != 0:
+        if data.path[c] < 0:
+            if data.acts.shape[0] > 0:
+                data.acts[c] = 0
+            return data.world[c]
     admitted, separating, art_a, art_b, world, phi = _admit_contact(
         c,
         data,
@@ -267,9 +276,14 @@ def _admit_world_contact(
         same_articulation_contact_gap_gate,
         articulation_pair_contact_gap_gate,
         twists,
+        kept,
     )
     if data.acts.shape[0] > 0:
         data.acts[c] = wp.where(admitted and not separating, 1, 0)
+    if kept != 0:
+        if not separating and acts.shape[0] > 0:
+            acts[world] = 1
+        return world
     # Its articulations, admitted or not: its body pair's trees join the world's islands (reserve_world_rows).
     data.art0[c] = art_a
     data.art1[c] = art_b
@@ -318,6 +332,8 @@ def admit_world_contacts(
     contact_friction_gap_threshold: float,
     friction_patches: FrictionPatches,
     twists: wp.array[wp.spatial_vector],
+    pass_words: wp.array[int],
+    world_held: wp.array[int],
     # outputs
     acts: wp.array[int],
     world_contact_first: wp.array[int],
@@ -342,9 +358,15 @@ def admit_world_contacts(
     Each contact's verdict (``data.acts``) is 1 where it is admitted and its rows may act at the predictor (its normal
     does not separate, :func:`.row_laws.separates`, or the predictor publishes no twist), else 0 (empty: no verdict);
     such a contact marks its world's ``acts`` word (:data:`.placement.WORLD_ACTS`; empty: no word).
+
+    The contact set is a collision pass's: on a later step of the pass (``pass_words[0]``,
+    :data:`.placement.CONTACT_PASS`) each contact keeps the pass's admission, class and size, and only its verdict is
+    the step's (a contact the pass gated out waits for the next pass); only the worlds that do not keep their rows
+    (``world_held``) list their span for the reservation.
     """
     c = wp.tid()
     world = int(-1)
+    kept = pass_words[0]
     if c < data.count[0]:
         world = _admit_world_contact(
             c,
@@ -362,8 +384,12 @@ def admit_world_contacts(
             contact_friction_gap_threshold,
             friction_patches,
             twists,
+            kept,
             acts,
         )
+        if kept != 0 and world >= 0:
+            if world_held[world] != 0:
+                world = -1
     # The world's range of frame positions, whose rows reserve_world_rows reserves in order: one atomic pair
     # per world and warp.
     _record_world_span(world, c, world_contact_first, world_contact_last, contact_worlds, contact_worlds_listed)
@@ -378,6 +404,9 @@ def _immovable_side(data: ContactInput, c: int) -> bool:
         return True
     return data.shape_body[s0] < 0 or data.shape_body[s1] < 0
 
+
+ROW_SLOT_UNBOUNDED = wp.constant(2**31 - 1)
+"""First rejected slot of a row family that rejected none this step."""
 
 # A world's first contact position before it held any.
 _NO_CONTACT = wp.constant(2**31 - 1)
@@ -587,6 +616,7 @@ def reserve_world_rows(
     dense_first_rejected_slot: wp.array[int],
     mf_first_rejected_slot: wp.array[int],
     units: wp.array2d[int],
+    contact_rows_kept: wp.array2d[int],
 ):
     """Reserve the rows of every admitted contact (:func:`admit_world_contacts`) in its world's row order, so a world's
     rows follow its contacts' geometry (the frame's pair and contact keys), never the order the collision's threads
@@ -627,6 +657,11 @@ def reserve_world_rows(
     truncate the row count there; such a contact has no rows (``slot`` and ``path`` -1). Where the one writer takes the
     rows (``units`` holds the placement's unit sources; empty otherwise), each dense row's unit source is written with
     its slot.
+
+    Each listed world records the rows its contacts added by class (``contact_rows_kept``; -1 in the dense class where
+    a row was rejected), which a later step of the collision pass that keeps the world's slots adds instead
+    (:func:`.placement._bound_topology`): only the worlds that do not keep them are listed, and a step where none
+    reserves launches none (its extent is zero).
     """
     lanes = lane_stride(RESERVE_LANES)
     lane = lane_index(RESERVE_LANES)
@@ -742,6 +777,12 @@ def reserve_world_rows(
         # to finish clears the list (every listed world read its count before).
         world_slot_counter[world] += rows[0] + rows[2]
         mf_slot_counter[world] += rows[1] + rows[3]
+        dense = rows[0] + rows[2]
+        rejected = dense_first_rejected_slot[world] != ROW_SLOT_UNBOUNDED
+        if rejected or mf_first_rejected_slot[world] != ROW_SLOT_UNBOUNDED:
+            dense = -1
+        contact_rows_kept[0, world] = dense
+        contact_rows_kept[1, world] = rows[1] + rows[3]
         order.world_contact_first[world] = _NO_CONTACT
         order.world_contact_last[world] = -1
         if wp.atomic_add(contact_worlds_listed, 1, 1) == listed - 1:

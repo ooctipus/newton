@@ -225,7 +225,8 @@ class TestWorldLists(unittest.TestCase):
         rows = rng.integers(0, 140, worlds).astype(np.int32)
         free = (rng.random(worlds) < 0.2).astype(np.int32) * rng.integers(1, 9, worlds).astype(np.int32)
         slot = np.where(rng.random(worlds) < 0.3, np.arange(worlds), -1).astype(np.int32)
-        # The worlds' acts words: a world none of whose rows can act takes no bucket (empty: every world acts).
+        # The worlds' acts words: a world none of whose rows can act takes no bucket but a candidate's (empty: every
+        # world acts).
         words = (rng.random(worlds) < 0.8).astype(np.int32)
         tiers = -(-bound // width)
         # Each world's cost: the bits of its own cycles in the general sweep's last call (0: none yet), some past the
@@ -254,10 +255,12 @@ class TestWorldLists(unittest.TestCase):
                     outputs=[claims.items, claims.count],
                     device=device,
                 )
+                # A candidate takes its bucket whether it acts or not: the unit builder claims only those that act.
                 acting = acts != 0 if acts.size else np.ones(worlds, dtype=bool)
                 tiered = (rows > 0) & (rows <= bound) & (free == 0) & acting
-                rest = ~tiered & ((rows > 0) | (free > 0)) & acting
+                untiered = ~((rows > 0) & (rows <= bound) & (free == 0)) & ((rows > 0) | (free > 0))
                 slotted = (slot >= 0) & candidates
+                rest = untiered & (acting | slotted)
                 for bucket in range(buckets):
                     count, items = (array.numpy() for array in claims.bucket(bucket))
                     if bucket < tiers:

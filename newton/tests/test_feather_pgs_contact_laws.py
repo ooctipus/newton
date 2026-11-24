@@ -184,6 +184,9 @@ def test_contact_endpoints_match_row_allocation(test, device):
         friction_patches=_patches(rng, contacts, device, 0),
         twists=np.zeros((0, 6), dtype=np.float32),
         acts=np.zeros(0, dtype=np.int32),
+        # A collision pass's first step: every contact is admitted afresh.
+        pass_words=np.zeros(2, dtype=np.int32),
+        world_held=np.zeros(3, dtype=np.int32),
         units=np.zeros((0, 0), dtype=np.int32),
         contact_world=np.full(contacts, -7, dtype=np.int32),
         contact_slot=np.full(contacts, -7, dtype=np.int32),

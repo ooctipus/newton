@@ -671,11 +671,16 @@ class RowLaws:
         for size in sizes:
             self._launch_prefix_warp(solver, self.joint_limit_warp_kernels[size], size, law, support)
 
-    def bound_topology(self, solver) -> None:
+    def bound_topology(self, solver, contacts: Contacts | None) -> None:
         """Snapshot where each world's topology rows (mimics, links, limits) end and its contacts start
-        (``topology_rows``), where the row pass holds the dense rows' order; the placement clears the dense rows'
-        diagonals in the same launch (:meth:`.placement.Placement.bound_topology`)."""
-        solver.placement.bound_topology()
+        (``topology_rows``), where the row pass holds the dense rows' order, and decide which worlds keep their
+        contacts' rows (the contact set is a collision pass's); the placement clears the dense rows' diagonals in the
+        same launch (:meth:`.placement.Placement.bound_topology`)."""
+        patches, placement = self.friction_patches, solver.placement
+        holds = _holds_contact_rows(contacts)
+        generation, stream = patches.frame_of(contacts if holds else None)
+        count = contacts.rigid_contact_count if holds else placement.dummy_contact_count
+        placement.bound_topology(count, generation, stream, patches.built_frame)
 
     def write_contacts(
         self, solver, state_in: State, state_aug: State, contacts: Contacts, dt: float, producer: str
@@ -740,6 +745,8 @@ class RowLaws:
                     solver.options.contact_friction_gap_threshold,
                     self.friction_patches.view,
                     solver.placement.acts_twists,
+                    solver.placement.pass_words,
+                    solver.placement.world_held,
                 ],
                 outputs=[
                     solver.placement.world_acts,
@@ -761,8 +768,10 @@ class RowLaws:
             placement = solver.placement
             lanes = int(RESERVE_LANES) if model.device.is_cuda else 1
             # A replay runs a lane group a contact, at most a world's (the contact count, known at the pass's
-            # updater, bounds the worlds the admission lists after it): none on a step without contacts. The listed
-            # worlds' count itself is written after the updater, so it cannot size the launch.
+            # updater, bounds the worlds the admission lists after it): none on a step without contacts, nor on a
+            # later step of a collision pass where every world keeps its contacts' slots (the placement's
+            # pass_words[1], Placement.bound_topology). The listed worlds' count itself is written after the updater,
+            # so it cannot size the launch.
             pool.launch(
                 reserve_world_rows,
                 solver.forest.world_count * lanes,
@@ -783,8 +792,9 @@ class RowLaws:
                     placement.dense_first_rejected_slot,
                     mf_first_rejected_slot,
                     units,
+                    placement.contact_rows_kept,
                 ],
-                extent=count,
+                extent=placement.pass_words[1:2],
                 scale=lanes,
                 clamp=True,
                 block_dim=RESERVE_BLOCK,

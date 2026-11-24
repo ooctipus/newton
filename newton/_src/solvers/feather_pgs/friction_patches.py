@@ -515,6 +515,23 @@ def _publish_extent(extent: wp.array[int], end: int, live: int, build: int, carr
     extent[_PLACE_EXTENT] = build + carry
 
 
+@wp.func
+def frame_kept(generation: wp.array[wp.int32], live: int, stream: wp.int64, built_frame: wp.array[wp.int64]) -> int:
+    """1 where the contact frame (the stream ``stream`` at ``generation[0]`` with ``live`` contacts) is the one the last
+    build recorded (``built_frame``, :func:`_build`): no collision pass wrote the contacts since; else 0. Read before
+    a step's build, it is the step's word "the contact set is the last step's" (:func:`_prepare`, and the row pass's
+    :func:`.placement._bound_topology`)."""
+    kept = int(0)
+    if (
+        generation[0] != _NO_GENERATION
+        and built_frame[0] == wp.int64(generation[0])
+        and built_frame[1] == wp.int64(live)
+        and built_frame[2] == stream
+    ):
+        kept = 1
+    return kept
+
+
 @wp.kernel(enable_backward=False)
 def _prepare(
     count: wp.array[int],
@@ -555,14 +572,7 @@ def _prepare(
     if live < 0:
         live = 0
     end = wp.max(live, wp.max(stored[0], built[0]))
-    kept = int(0)
-    if (
-        generation[0] != _NO_GENERATION
-        and built_frame[0] == wp.int64(generation[0])
-        and built_frame[1] == wp.int64(live)
-        and built_frame[2] == stream
-    ):
-        kept = 1
+    kept = frame_kept(generation, live, stream, built_frame)
     held = kept * fresh[0]
     if thread == 0:
         _publish_extent(extent, end, live, end * (1 - held), (regions[0] + regions[1]) * held)
@@ -2090,6 +2100,15 @@ class _FrictionPatchState:
         :func:`_publish_extent`)."""
         return self.extent[_CARRY_EXTENT : _CARRY_EXTENT + 1]
 
+    def frame_of(self, contacts) -> tuple[wp.array, int]:
+        """The words that name ``contacts``' frame (:func:`frame_kept`): its generation counter (a sentinel word where it
+        has none, which no record matches) and the token of its contact stream, which also identifies it across graphs
+        captured with other Contacts instances."""
+        generation = getattr(contacts, "contact_generation", None)
+        if generation is None:
+            generation = self._no_generation
+        return generation, self.stream_token(generation)
+
     def kept_frame(self) -> wp.array:
         """Whether the last build kept the frame of the build before it (one word on the device, :func:`_prepare`)."""
         return self.extent[_KEPT_EXTENT : _KEPT_EXTENT + 1]
@@ -2209,11 +2228,7 @@ class _FrictionPatchState:
             friction_gap=friction_gap,
             tracking=tracking,
         )
-        generation = getattr(contacts, "contact_generation", None)
-        if generation is None:
-            generation = self._no_generation
-        # The token identifies the contact stream, also across graphs captured with other Contacts instances.
-        stream = self.stream_token(generation)
+        generation, stream = self.frame_of(contacts)
         self._launch_prepare([*prepare_inputs, generation, stream, self.built_frame])
         self._launch_build(model, state, generation, stream)
 

@@ -346,6 +346,10 @@ class SolverFeatherPGS(SolverBase):
                 world-space gap exceeds this distance before allocating any dense or matrix-free
                 rows. A value of 0.0 disables the gate and preserves all
                 collision-generated contacts. Must be finite and non-negative. Defaults to 0.0.
+                The gates and the friction gap threshold are read on the first step after a
+                collision pass: the contact set is the pass's, so a contact it admits keeps its
+                rows (inert once it separates) on every step that shares the pass, and one it
+                gates out waits for the next pass.
             same_articulation_contact_gap_gate (float, optional): If positive, skip only
                 contacts between two links of the same non-free articulation whose world-space
                 gap exceeds this distance. This can retain a long predictive horizon for fast

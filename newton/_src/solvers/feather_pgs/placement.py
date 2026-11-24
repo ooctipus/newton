@@ -34,18 +34,17 @@ from .device_preludes import reserved_count
 from .factor.walk import walk_tables
 from .field_group import Field, FieldGroup, SolverArrays, fields_of
 from .forest_plan import RowLaw
+from .friction_patches import frame_kept
 from .route_table import first_failed
 from .row_laws import LINK_ROWS
 from .row_metadata import record_layout, split_records
 from .row_records import DENSE_ROWS, ROW_RECORDS, RowSupport
-from .row_slots import RowOrder
+from .row_slots import ROW_SLOT_UNBOUNDED, RowOrder
 from .warm_start import ContactCarry, prepare_world_impulses, row_lanes
 
 # FeatherPGS takes no gradients: its kernels compile no adjoints.
 wp.set_module_options({"enable_backward": False})
 
-ROW_SLOT_UNBOUNDED = 2**31 - 1
-"""First rejected slot of a row family that rejected none this step."""
 
 SIZE_JACOBIAN = FieldGroup(Field("J", wp.float32, ("response_art", "response_row", "response_size")))
 """One size group's Jacobian. The matrix-free sweeps' producers write the packed rows instead (:mod:`.packed_rows`):
@@ -106,6 +105,17 @@ WORLD_CONTACTS = FieldGroup(
 """The frame positions each world's contacts span (``admit_world_contacts``), and the worlds whose span starts (listed
 in ``contact_worlds``, counted in ``contact_worlds_listed[0]``), from which their rows are reserved in the row order
 (``reserve_world_rows``), which resets the spans and the list."""
+
+CONTACT_PASS = FieldGroup(
+    Field("contact_rows_kept", wp.int32, (ROW_CLASSES, "world"), owner="placement"),
+    Field("world_held", wp.int32, ("world",), owner="placement"),
+    Field("pass_words", wp.int32, (2,), owner="placement"),
+)
+"""The contact set's work once a collision pass (:func:`_bound_topology`): each world's contact rows by class that its
+last reservation added (``contact_rows_kept``; -1 in the dense class where it rejected a row), whether the step keeps
+the world's contact rows (``world_held``), and two words: whether the step's contact frame is the last step's
+(``pass_words[0]``: no collision pass since) and the reservation's launch extent (``pass_words[1]``: the contact count
+where a world reserves, else zero, which skips the bound launch)."""
 
 ROW_WATERMARKS = FieldGroup(
     *(
@@ -197,24 +207,63 @@ def _accumulate_row_capacity_telemetry(
 
 @wp.kernel
 def _bound_topology(
-    slot_counter: wp.array[int],
+    slot_counter: wp.array2d[int],
     cleared: int,
+    count: wp.array[wp.int32],
+    generation: wp.array[wp.int32],
+    stream: wp.int64,
+    built_frame: wp.array[wp.int64],
     # outputs
     topology_rows: wp.array[int],
     diag: wp.array2d[float],
+    contact_rows_kept: wp.array2d[int],
+    world_held: wp.array[int],
+    pass_words: wp.array[int],
 ):
-    """Record where each world's topology rows (mimics, links, joint limits) end and its contacts start, and zero its
-    first ``cleared`` dense rows' diagonals, ``dim = (worlds, max(cleared, 1))``: the free bodies' after them stay their
-    writers'.
+    """Record where each world's topology rows (mimics, links, joint limits) end and its contacts start, decide whether
+    the step keeps the world's contact rows, and zero its first ``cleared`` dense rows' diagonals: the free bodies'
+    after them stay their writers'.
 
     Launched right after the joint-limit allocation, so the sweeps' and writers' contact phases loop only their own
     contiguous row range. The raw counter is stored; consumers clamp against the per-world constraint count.
+
+    The contact set changes only at a collision pass, so its admission, the rows' reservation and their units are a
+    pass's (:data:`CONTACT_PASS`): where the frame is the last step's (:func:`.friction_patches.frame_kept`, read
+    before this step's patch build), a world whose topology rows end where they ended last step and whose last
+    reservation fit keeps its contacts' slots, and its counters advance by the rows that reservation added. Any other
+    world reserves (``reserve_world_rows``), which the reservation's extent follows.
+
+    One linear launch of ``worlds * max(cleared, 1)`` threads: thread ``t`` below the worlds decides world ``t`` (whole
+    warps of worlds), and every thread clears ``diag[t // cleared, t % cleared]`` (a world's row after row).
     """
-    world, row = wp.tid()
-    if row == 0:
-        topology_rows[world] = slot_counter[world]
-    if row < cleared:
-        diag[world, row] = 0.0
+    t = wp.tid()
+    worlds = topology_rows.shape[0]
+    if t < worlds:
+        world = t
+        live = wp.max(count[0], 0)
+        kept = frame_kept(generation, live, stream, built_frame)
+        dense = slot_counter[0, world]
+        held = int(0)
+        if kept != 0 and topology_rows[world] == dense and contact_rows_kept[0, world] >= 0:
+            held = 1
+        world_held[world] = held
+        topology_rows[world] = dense
+        if held != 0:
+            slot_counter[0, world] = dense + contact_rows_kept[0, world]
+            slot_counter[1, world] = slot_counter[1, world] + contact_rows_kept[1, world]
+        else:
+            # The reservation writes a listed world's rows; a world without contacts adds none.
+            contact_rows_kept[0, world] = 0
+            contact_rows_kept[1, world] = 0
+        # The words, once: on a new frame every world reserves; on a kept frame only a world that does not keep its
+        # slots (rare) stores the extent.
+        if world == 0:
+            pass_words[0] = kept
+        if (kept == 0 and world == 0) or (kept != 0 and held == 0):
+            pass_words[1] = live
+    if cleared > 0:
+        if t < worlds * cleared:
+            diag[t // cleared, t % cleared] = 0.0
 
 
 @wp.kernel
@@ -224,6 +273,7 @@ def _clear_dense_row_state(
     count: wp.array2d[int],
     dropped: wp.array2d[int],
     acts: wp.array[int],
+    pass_words: wp.array[int],
 ):
     """Clear each row class's allocation state and row-loss counters (by class and world), the free bodies' row count
     and the world's acts word, in one launch. The dense rows' count stands until their producers' finalize: the last
@@ -237,6 +287,9 @@ def _clear_dense_row_state(
     count[1, world] = 0
     if acts.shape[0] > 0:
         acts[world] = 0
+    if world == 0:
+        # No world reserves until _bound_topology finds one.
+        pass_words[1] = 0
 
 
 @wp.func
@@ -542,6 +595,7 @@ class Placement:
         # Allocated once here: per-step allocation is forbidden under CUDA graph capture.
         arrays.allocate(WORLD_ROW_STATE, world=self.forest.world_count)
         arrays.allocate(WORLD_CONTACTS, world=self.forest.world_count)
+        arrays.allocate(CONTACT_PASS, world=self.forest.world_count)
 
     def allocate_size_groups(self) -> None:
         """Each size group's Jacobian: the sparse diagonal's dense part (case K2); a placeholder elsewhere."""
@@ -873,7 +927,7 @@ class Placement:
             _clear_dense_row_state,
             dim=self.forest.world_count,
             inputs=[self.row_slot_counter, self.row_first_rejected, self.row_count, self.row_dropped_all],
-            outputs=[self.world_acts],
+            outputs=[self.world_acts, self.pass_words],
             device=self.model.device,
         )
 
@@ -1048,19 +1102,21 @@ class Placement:
         rows = self.dense_max_constraints
         self.unit_source = wp.full((self.forest.world_count, rows), 0, dtype=wp.int32, device=self.model.device)
 
-    def bound_topology(self) -> None:
+    def bound_topology(self, count, generation, stream: int, built_frame) -> None:
         """Snapshot where each world's topology rows end (:meth:`.rows.RowLaws.bound_topology`) and, where the packed
         rows hold the response (:attr:`clears_diagonals`), zero the dense rows' diagonals for the one writer's
         ``|Z|^2 + cfm``, in one launch (:func:`_bound_topology`). The sparse diagonal's and native sparse factors'
         writers store theirs with its CFM. The free bodies' rows, from ``body_base``, keep theirs: their writers stored
         them in the row pass (:mod:`.walk_rows`). No producer between the topology rows and the one writer reads or
-        writes the dense rows' diagonals."""
+        writes the dense rows' diagonals. The same launch decides which worlds keep their contacts' rows this step
+        (``count``, ``generation``, ``stream`` and ``built_frame`` name the step's contact frame and the last build's,
+        :func:`.friction_patches.frame_kept`)."""
         cleared = int(self.body_base) if self.clears_diagonals else 0
         wp.launch(
             _bound_topology,
-            dim=(self.forest.world_count, max(cleared, 1)),
-            inputs=[self.slot_counter, cleared],
-            outputs=[self.topology_rows, self.diag],
+            dim=self.forest.world_count * max(cleared, 1),
+            inputs=[self.row_slot_counter, cleared, count, generation, stream, built_frame],
+            outputs=[self.topology_rows, self.diag, self.contact_rows_kept, self.world_held, self.pass_words],
             device=self.model.device,
         )
 

@@ -1531,6 +1531,10 @@ def allocate_contacts(operands, device) -> None:
         "world_contact_last": wp.full(worlds, -1, dtype=wp.int32, device=device),
         "contact_worlds": wp.zeros(worlds, dtype=wp.int32, device=device),
         "contact_worlds_listed": wp.zeros(2, dtype=wp.int32, device=device),
+        # A collision pass's first step: every world reserves.
+        "pass_words": wp.zeros(2, dtype=wp.int32, device=device),
+        "world_held": wp.zeros(worlds, dtype=wp.int32, device=device),
+        "contact_rows_kept": wp.zeros((2, worlds), dtype=wp.int32, device=device),
     }
 
     # Each contact its own body pair: the scenes' contacts carry no frame.

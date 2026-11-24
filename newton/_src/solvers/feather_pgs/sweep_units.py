@@ -425,6 +425,15 @@ SHARED_DECLARATIONS
     const int off_color = off_mf;
     // The pool's entries from the world's first: its units and its colors' offsets, one more.
     const int room = unit_row.shape[0] - off_mf - 1;
+    if (pass_words.data[0] != 0) {
+        // A later step of the collision pass: the world's units and colors are the pass's (its rows' slots are), and
+        // only its claim is the step's, as the build below claims it.
+        if (tid == 0) {
+            const int units = unit_count.data[world];
+            APPEND_CLAIM(end >= MIN_UNITS && units <= room && COLORED(units, color_count.data[world]) ? colored_bucket : GENERAL_CLAIM)
+        }
+        return;
+    }
     if (end < MIN_UNITS) {
         if (tid == 0) {
             unit_count.data[world] = 0;
@@ -599,7 +608,9 @@ def _append_claim(match: re.Match) -> str:
     inner = "\n".join(
         f"{pad}    {line.strip()}" if not line.startswith("#") else line for line in statements.splitlines()
     )
-    return f"{pad}{{\n{pad}    const int claim = {match.group(2)};\n{inner}\n{pad}}}\n"
+    # Only a world a row of which can act is claimed (its acts word; none: every world).
+    acting = "acts.shape[0] == 0 || acts.data[world] != 0"
+    return f"{pad}if ({acting}) {{\n{pad}    const int claim = {match.group(2)};\n{inner}\n{pad}}}\n"
 
 
 def build_units_kernel(
@@ -669,6 +680,8 @@ def build_units_kernel(
         ("colored_bucket", int),
         ("general_bucket", int),
         ("world_cost", wp.array[wp.int32]),
+        ("acts", wp.array[wp.int32]),
+        ("pass_words", wp.array[wp.int32]),
     )
     return KernelTemplate(
         f"sweep_units_{mf_rows}_{dofs}_{rule.name}_w{BUILD_WARPS}" + ("_torsion" if torsion else ""),
@@ -699,15 +712,17 @@ def count_units(
     free_records: int,
     mf_rows: int,
     min_units: int,
+    pass_words: wp.array[wp.int32],
     slot_need: wp.array[wp.int32],
 ):
     """Each candidate world's units, as the unit builder counts them (a contact normal row among its free rows before
     their contact rows' end; none under ``min_units`` such rows), and one more: its entries of the pool, added at its
     slot (``slot_need``, zero beforehand). A block of :data:`PLACE_THREADS` takes as many of a candidate's rows, a
     thread a row, and adds its count once (launch tiled over the slots and the row capacity's blocks), so a world of
-    many rows counts them over the device, not on one block."""
+    many rows counts them over the device, not on one block. A later step of the collision pass keeps the pass's
+    counts (``pass_words[0]``, :data:`.placement.CONTACT_PASS`)."""
     item, chunk, t = wp.tid()
-    if item >= candidate_count[0]:
+    if item >= candidate_count[0] or pass_words[0] != 0:
         return
     world = candidate_worlds[item]
     end = wp.min(mf_contact_rows_end[world], wp.min(mf_constraint_count[world], mf_rows))
@@ -726,11 +741,24 @@ def count_units(
 
 
 @wp.kernel(enable_backward=False, module="unique")
-def place_slots(slot_count: int, slot_need: wp.array[wp.int32], slot_first: wp.array[wp.int32]):
+def clear_need(pass_words: wp.array[wp.int32], slot_need: wp.array[wp.int32]):
+    """Zero each slot's entries before a collision pass's first step counts them (:func:`count_units`); a later step
+    of the pass keeps them, which the sweeps read."""
+    if pass_words[0] == 0:
+        slot_need[wp.tid()] = 0
+
+
+@wp.kernel(enable_backward=False, module="unique")
+def place_slots(
+    slot_count: int, pass_words: wp.array[wp.int32], slot_need: wp.array[wp.int32], slot_first: wp.array[wp.int32]
+):
     """Each slot's first entry of the pool: the exclusive scan of the slots' entries in slot order, the worlds' order
     (one block of :data:`PLACE_THREADS`, launch tiled over one item). A world thus keeps its units wherever lighter
-    worlds before it leave room, and the same counts place it the same way on every run."""
+    worlds before it leave room, and the same counts place it the same way on every run. A later step of the
+    collision pass keeps the pass's places."""
     _item, t = wp.tid()
+    if pass_words[0] != 0:
+        return
     carry = int(0)
     chunk = int(0)
     while chunk < slot_count:
@@ -834,15 +862,21 @@ class ColoredUnits:
         mf_row_mu,
         mf_row_w,
         body_base: int,
+        world_acts,
+        pass_words,
     ) -> None:
-        """Build each candidate world's units and colors, claim it for the colored mapping or the general one, and
-        stage the colored worlds' rows by color slot (the row weights ``mf_row_w`` only where the laws are weighted:
-        :func:`stage_slots`). Both launches walk their bucket on a grid of its capacity, the slots."""
+        """Build each candidate world's units and colors, claim it for the colored mapping or the general one where a
+        row of it can act (``world_acts``), and stage the colored worlds' rows by color slot (the row weights
+        ``mf_row_w`` only where the laws are weighted: :func:`stage_slots`). Both launches walk their bucket on a grid
+        of its capacity, the slots. The units and colors are a function of the contact set, a collision pass's: a later
+        step of the pass (``pass_words[0]``, :data:`.placement.CONTACT_PASS`) keeps them and only claims and stages."""
         units, claims = self.units, self.claims
         candidates, candidate_worlds = claims.bucket(self.candidate)
         colored, colored_worlds = claims.bucket(self.colored)
         # Each candidate world's entries of the pool, then each slot's first entry (in slot order: the worlds').
-        units["slot_need"].zero_()
+        wp.launch(
+            clear_need, dim=self.slot_count, inputs=[pass_words], outputs=[units["slot_need"]], device=self.device
+        )
         wp.launch_tiled(
             count_units,
             dim=[self.slot_count, -(-self.mf_rows // PLACE_THREADS)],
@@ -857,6 +891,7 @@ class ColoredUnits:
                 int(free_records),
                 self.mf_rows,
                 int(self.rule.min_units),
+                pass_words,
             ],
             outputs=[units["slot_need"]],
             block_dim=PLACE_THREADS,
@@ -865,7 +900,7 @@ class ColoredUnits:
         wp.launch_tiled(
             place_slots,
             dim=[1],
-            inputs=[self.slot_count, units["slot_need"]],
+            inputs=[self.slot_count, pass_words, units["slot_need"]],
             outputs=[units["slot_first"]],
             block_dim=PLACE_THREADS,
             device=self.device,
@@ -894,6 +929,8 @@ class ColoredUnits:
                 self.colored,
                 self.general,
                 self.world_cost,
+                world_acts,
+                pass_words,
             ],
             block_dim=32 * BUILD_WARPS,
             device=self.device,
