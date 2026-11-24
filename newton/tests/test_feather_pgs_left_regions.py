@@ -182,6 +182,21 @@ def _falling_spheres(device, worlds: int, spheres_a_world: int, drop: float):
     return builder.finalize(device=device), np.array(spheres)
 
 
+def _columns(device, columns: int = 4, height: int = 3):
+    """One world of ``columns`` x ``columns`` columns of ``height`` boxes resting on the ground (more free bodies than a
+    pair block's table, :data:`.region_sweep.PAIR_SIDE`)."""
+    builder = newton.ModelBuilder()
+    builder.add_ground_plane()
+    for i in range(columns):
+        for j in range(columns):
+            for k in range(height):
+                body = builder.add_body(
+                    xform=wp.transform((0.3 * i, 0.3 * j, HALF + 2.0 * HALF * k + 0.0005 * k), wp.quat_identity())
+                )
+                builder.add_shape_box(body, hx=HALF, hy=HALF, hz=HALF)
+    return builder.finalize(device=device)
+
+
 class TestFeatherPGSLeftRegions(unittest.TestCase):
     def _check(self, device, worlds: int, capture: bool = False):
         model, pairs, sunk_boxes = _lifted_pairs(device, worlds)
@@ -255,6 +270,37 @@ class TestFeatherPGSLeftRegions(unittest.TestCase):
         self.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), 5200)
         self.assertLess(spin, 1.0e-3)
         self.assertGreater(low, RADIUS - 1.0e-3)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "CUDA")
+    def test_split_records_take_the_colored_block(self):
+        # A line past 65,535 rows makes split records, which the colored mapping's unit builder cannot read: the
+        # world's contacts are regions, and its regions take the colored mapping's block by their levels rather than
+        # one warp. Both mappings sweep the order by its levels (a level's regions share no body), so the published
+        # motion is the warp's to its rounding.
+        model = _columns("cuda:0")
+        poses = []
+        for region_block in (True, False):
+            solver = SolverFeatherPGS(
+                model, pins=SolverFeatherPGS.Pins(region_block=region_block), mf_max_constraints=65_536
+            )
+            self.assertTrue(solver.placement.split_records)
+            self.assertIsNotNone(solver.sweep.regions)
+            self.assertEqual(solver.sweep.region_slot is not None, region_block)
+            self.assertEqual(solver.sweep.mf_colored_kernel is not None, region_block)
+            pipeline = newton.CollisionPipeline(model)
+            contacts = pipeline.contacts()
+            states = [model.state(), model.state()]
+            newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+            control = model.control()
+            for i in range(40):
+                src, dst = states[i % 2], states[(i + 1) % 2]
+                pipeline.collide(src, contacts)
+                src.clear_forces()
+                solver.step(src, dst, control, contacts, 1.0 / 240.0)
+            poses.append(states[0].body_q.numpy())
+        np.testing.assert_allclose(poses[0], poses[1], rtol=0.0, atol=1.0e-5)
+        # The columns stand: no box sank into the ground or into the box below.
+        self.assertGreater(float(poses[0][:, 2].min()), HALF - 1.0e-3)
 
 
 if __name__ == "__main__":

@@ -904,7 +904,7 @@ pass rule's; ``reg_stamp`` a region's second body's version at its last settled 
 regularization."""
 
 
-def region_phase(pad: str = "        ") -> str:
+def region_phase(pad: str = "        ", *, block: bool = False) -> str:
     """Native statements of a sweep's region phase: the world's open regions (those of a free body that a dense row,
     or a region between two movable bodies touches; :func:`.region_sweep.fill_regions`), body by body in
     their order, each by the one visit (:func:`.region_laws.region_visit`), on the world's velocity change in walk
@@ -967,8 +967,15 @@ if (moved) {{
         "            ",
     )
     parallelism = repr(float(sweep_units.COLORED_RULE.parallelism))
-    pair_block = indent(_PAIR_BLOCK.replace("QUIET_", QUIET_LITERAL), "        ")
-    text = f"""SYNC();
+    pair_block = "" if block else indent(_PAIR_BLOCK.replace("QUIET_", QUIET_LITERAL), "        ")
+    # Over a block (the colored mapping's, a world whose levels hold the colored rule's parallelism and that forms no
+    # pair block: its claim's rule), a level's regions take every thread at the block's stride and a block barrier
+    # ends a level; no world there is a chain and no turn is teamed.
+    sync, me, stride = ("__syncthreads();", "tid", "(int)blockDim.x") if block else ("SYNC();", "lane", "STRIDE")
+    alone = "false" if block else f"(float)(kept_end - region_span[0]) < {parallelism}f * (float)levels"
+    holds = "false" if block else f"blk_pair.data[world * {int(PAIR_BLOCKS)}][0] >= 0"
+    passed = "place >= level_last" if block else "(place >= level_last || ((blocks >> lane) & 1u) != 0u)"
+    text = f"""{sync}
 {{
     const wp::vec2i region_span = world_regions.data[world];
     const int levels = world_levels.data[world];
@@ -976,9 +983,9 @@ if (moved) {{
     // parallelism, a chain, is walked by its first lane in the order the levels were made from, a body's twist kept
     // from one region to the next of the same body; the others' levels take the lanes. Both are the same sweep.
     const int kept_end = levels > 0 ? level_end.data[region_span[0] + levels - 1] : region_span[0];
-    const bool alone = (float)(kept_end - region_span[0]) < {parallelism}f * (float)levels;
+    const bool alone = {alone};
     // Whether the world holds a pair block: its first is listed first (region_sweep.form_blocks).
-    const bool holds_block = blk_pair.data[world * {int(PAIR_BLOCKS)}][0] >= 0;
+    const bool holds_block = {holds};
     int level_first = region_span[0];
     int body = -1, first = 0, version = 0;
     wp::spatial_vector u;
@@ -989,7 +996,7 @@ if (moved) {{
     const int spans = alone ? 1 : levels;
     for (int level = 0; level < spans; ++level) {{
     const int level_last = alone ? kept_end : level_end.data[region_span[0] + level];
-    for (int chunk = level_first; chunk < level_last; chunk += STRIDE) {{
+    for (int chunk = level_first; chunk < level_last; chunk += {stride}) {{
     // A chain world's lanes all walk its order, each doing the same work (a block's candidate passes split over them),
     // a chunk of the lanes' width at a time: each lane reads one place's state, and the chunk's turns are its regions
     // that are not left out, in order (a left-out region stays so until the sweeps' end and its turn writes nothing).
@@ -1004,9 +1011,9 @@ if (moved) {{
     #pragma unroll 1
     for (int turn = 0; turn < turns; ++turn) {{
         const bool teamed = alone || left != 0u;
-        const int place = chunk + (left != 0u ? FIRST(left) : lane);
+        const int place = chunk + (left != 0u ? FIRST(left) : {me});
         left &= left - 1u;
-        if (!teamed && (place >= level_last || ((blocks >> lane) & 1u) != 0u)) continue;
+        if (!teamed && {passed}) continue;
         if (teamed) WARP_SYNC();
         const int g = alone ? reg_walk.data[place] : level_region.data[place];
         // A left-out region waits for the sweeps' end (region_verify).
@@ -1142,14 +1149,16 @@ if (moved) {{
     }}
     }}
     level_first = level_last;
-    if (!alone) SYNC();
+    if (!alone) {sync}
     }}
 }}
-SYNC();"""
+{sync}"""
     return indent(text, pad)
 
 
-def region_verify(iteration: str = ITERATION, budget: str = "sweep_budget", pad: str = "        ") -> str:
+def region_verify(
+    iteration: str = ITERATION, budget: str = "sweep_budget", pad: str = "        ", *, block: bool = False
+) -> str:
     """Native statements of a sweep's end that test the world's left-out regions (:data:`.region_sweep.REGION_LEFT`:
     none of their candidates closed at the predictor): the world's lanes take its regions, each left-out one at its
     bodies' twists as the sweep leaves them (their walk coordinates ``s_v`` through their bases) by the phase's own
@@ -1166,11 +1175,16 @@ wp::spatial_vector u{s};
 for (int k = 0; k < 6; ++k) u{s}[k] = s_v[first{s} + k];
 const wp::vec3 v{s}(wp::dot(basis{s}[0], u{s}), wp::dot(basis{s}[1], u{s}), wp::dot(basis{s}[2], u{s}));
 const wp::vec3 w{s}(wp::dot(basis{s}[3], u{s}), wp::dot(basis{s}[4], u{s}), wp::dot(basis{s}[5], u{s}));"""
+    # Over a block (:func:`region_phase`): the left-out regions over every thread, the join voted by the block, the
+    # walk and its levels made anew by the first warp's lanes, as the warp makes them.
+    sync, me, stride = ("__syncthreads();", "tid", "(int)blockDim.x") if block else ("SYNC();", "lane", "STRIDE")
+    voted = "__syncthreads_or(joined != 0)" if block else "BALLOT(joined != 0) != 0u"
+    remake, remade = ("if (warp == 0) {", "}\n        __syncthreads();") if block else ("SYNC();", "SYNC();")
     text = f"""{{
-    SYNC();
+    {sync}
     const wp::vec2i left_span = world_regions.data[world];
     int joined = 0;
-    for (int g = left_span[0] + lane; g < left_span[1]; g += STRIDE) {{
+    for (int g = left_span[0] + {me}; g < left_span[1]; g += {stride}) {{
         if (reg_state.data[g] != {int(REGION_LEFT)}) continue;
         const wp::vec2i sides = reg_body.data[g];
 {indent(twist.format(s="", f="sides[0]"), "        ")}
@@ -1202,12 +1216,12 @@ const wp::vec3 w{s}(wp::dot(basis{s}[3], u{s}), wp::dot(basis{s}[4], u{s}), wp::
             joined = 1;
         }}
     }}
-    if (BALLOT(joined != 0) != 0u) {{
+    if ({voted}) {{
         iteration_changed = 1;
         if ({iteration} + 1 == {budget}) {budget} += 1;
         // The opened regions take their places in the order: the walk and its levels anew (region_sweep.level_acting's
         // statements), so the next sweep takes the order on every region that can act, as it stands.
-        SYNC();
+        {remake}
         const int s0 = left_span[0], order_end = world_order_end.data[world];
         int acting = 0;
         for (int base = s0; base < order_end; base += STRIDE) {{
@@ -1259,7 +1273,7 @@ const wp::vec3 w{s}(wp::dot(basis{s}[3], u{s}), wp::dot(basis{s}[4], u{s}), wp::
             }}
             world_levels.data[world] = count;
         }}
-        SYNC();
+        {remade}
     }}
 }}"""
     return indent(text, pad)
@@ -1278,6 +1292,7 @@ def mf_gs_staging(
     max_world_dofs: int,
     *,
     colored: bool = False,
+    regions: bool = False,
     places: RowPlaces = STAGED_ROWS,
     traces: bool = False,
     wide_rows: bool = False,
@@ -1310,8 +1325,8 @@ def mf_gs_staging(
     rows = sorted((*dense.buffers(), *free.buffers()), key=lambda buffer: buffer.alternative is not Place.GLOBAL)
     levels = ()
     if colored:
-        # Each body's latest unit's turn, at its first coordinate (_colored_units).
-        levels = (Buffer("s_ran", "int", ran_slots(max_world_dofs)),)
+        # Each body's latest unit's turn, at its first coordinate (_colored_units); regions take no turns.
+        levels = () if regions else (Buffer("s_ran", "int", ran_slots(max_world_dofs)),)
         if traces:
             levels += block_argmax(COLORED_THREADS // 32, warp="warp", lane="lane")[1]
     # The world's velocity change, staged unless it lives in global memory (RowPlaces.velocity).
@@ -1420,15 +1435,28 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     if colored:
         # The block's vote: every warp's rows and units (a barrier); the first thread records the solve.
         quiet = "!__syncthreads_or(iteration_changed != 0)"
+        # Under regions a join where the budget ends takes a sweep more (region_verify).
+        budget = "sweep_budget" if sweep.regions else "iterations"
         sweep_end = sweep_exit(
             solve_policy,
             quiet=quiet,
             iteration=ITERATION,
+            iterations=budget,
             lane="tid",
             argmax="BLOCK_ARGMAX",
         )
         head = "    const int lane = LANE;\n    const int tid = (int)threadIdx.x;\n    const int warp = tid >> 5;"
         first_warp, end_first_warp, barrier = "    if (warp == 0) {\n", "    }\n", "__syncthreads();"
+    if colored and sweep.regions:
+        # The free bodies' contacts are regions: the world's open ones by their levels over the block, the sweeps' end
+        # tests the left-out ones over it.
+        free_phase = region_phase("    ", block=True)
+        left_verify = region_verify(budget=budget, block=True) + "\n"
+        trace_reduction = ""
+        if solve_policy.traces:
+            trace_reduction = block_argmax(COLORED_THREADS // 32, warp="warp", lane="lane")[0]
+        offsets = metric_build = ""
+    elif colored:
         # The world's entries of the pool: the stride of its units' staged fields and words in its block
         # (sweep_units.SLOT_FIELDS).
         units = "unit_entries"
@@ -1704,8 +1732,9 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
 {rest}"""
     # The rows' layout is the configuration's: rows as wide as the world (and no classes) sit at their coordinates.
     packed = PACKED_SIDES_DENSE if not sweep.support_classes and max_row_dofs == D else PACKED_SIDES_BY_SIDE
-    sides = (packed, *((CLASS_SIDES,) if sweep.support_classes else ()), *((memory_words(_SLOTS),) if colored else ()))
-    records = bool(contact_torsion or colored)
+    units_ = colored and not sweep.regions
+    sides = (packed, *((CLASS_SIDES,) if sweep.support_classes else ()), *((memory_words(_SLOTS),) if units_ else ()))
+    records = bool(contact_torsion or units_)
     families = ((REGION_LAW,) if sweep.regions else ()) + ((IDLE_LAW,) if live is not None else ())
     return sweep.native(body, lanes=lanes, rows=sides, records=records, laws=families), staging
 
@@ -1720,7 +1749,8 @@ class GeneralSweep(SweepConfig):
     Its switches, each the plan's from the class's shape, the placement and the laws (:meth:`.sweep_plan.Sweep.build`):
 
     - the free bodies' level law (``levels``): sequential, or exact (colored: a block a world, a color's units at once,
-      the worlds :class:`.sweep_units.ColoredRule` picks);
+      the worlds :class:`.sweep_units.ColoredRule` picks; where the free bodies' contacts are ``regions``, a level's
+      regions at once, :func:`region_phase`);
     - the row record: ``places`` (:class:`RowPlaces`, the plan's storage choice): the dense rows' metadata staged or
       their records streamed; the free rows' always stream; all at the placement's layout (``records``, its first row);
     - the enumeration: ``active_rows`` (:func:`.sweep.active_scan`), else slot order (``coordinate_levels`` first);
@@ -1757,15 +1787,15 @@ class GeneralSweep(SweepConfig):
     formed: str = "inline"
 
     def __post_init__(self):
-        if self.regions and (self.levels.law == EXACT or not self.free_rows):
-            raise ValueError("regions are the free bodies' run's units in the one-warp mapping")
+        if self.regions and not self.free_rows:
+            raise ValueError("regions are the free bodies' run's units")
         if self.places.metadata is Place.STREAMED and self.record_rows:
             raise ValueError("a sweep that streams its dense rows' records reads them from the line's first row")
         if self.levels.law not in (SEQUENTIAL, EXACT):
             raise ValueError("the general sweep's free bodies step in order or by exact levels (colored)")
         if self.colored and not self.free_rows:
             raise ValueError("the colored mapping sweeps the free bodies' run: it needs free_rows")
-        if self.split and self.colored:
+        if self.split and self.colored and not self.regions:
             raise ValueError("the colored mapping's unit builder reads packed records, not split ones")
         if self.material and not self.weighted:
             raise ValueError("material contacts step by their weights: their sweeps are weighted")
@@ -1815,7 +1845,7 @@ class GeneralSweep(SweepConfig):
 
     @property
     def ABI(self) -> tuple:
-        return COLORED_ABI if self.colored else MF_GS_ABI
+        return COLORED_ABI if self.colored and not self.regions else MF_GS_ABI
 
     @property
     def NATIVE(self) -> str:
@@ -1862,6 +1892,7 @@ class GeneralSweep(SweepConfig):
             self.mf_max_constraints,
             self.max_world_dofs,
             colored=self.colored,
+            regions=self.regions,
             places=self.places,
             traces=self.solve_policy.traces,
             wide_rows=self.wide_rows,

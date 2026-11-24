@@ -140,6 +140,9 @@ KIND_MEMBER = wp.constant(32)
 BLOCK_SHIFT = wp.constant(8)
 """A block region's kind holds its block's place among its world's blocks from this bit on."""
 PAIR_BLOCKS = wp.constant(2)
+PAIR_SIDE = wp.constant(16)
+"""The free bodies a world holds at most to form pair blocks (:func:`form_blocks`'s table of 16 x 16 cells): a world of
+more takes none."""
 """Blocks a world holds at most (its table's slots); a group past them keeps its regions."""
 STAGE_UNIT = wp.constant(44)
 """Words of a block member's staged record (:func:`stage_blocks`): its unit's whitened rows (18), right-hand sides
@@ -1536,7 +1539,7 @@ def form_blocks(
         # The table's side is the world's free bodies (at most 16, the table's row of 256 cells): its cells in order
         # are the pairs of places in order, whatever the side.
         side = world_free_start[world + 1] - f0
-        if e - s > least and side <= 16:
+        if e - s > least and side <= PAIR_SIDE:
             for i in range(f0 + lane, world_free_start[world + 1], lanes):
                 body_level[world_free[i]] = i - f0
             for c in range(lane, side * side, lanes):

@@ -47,7 +47,7 @@ from .field_group import Field, FieldGroup
 from .friction_patches import patch_routes
 from .path_selection import json_value, kernel_key
 from .placement import SPARSE_CONTACT_LEVELS
-from .region_sweep import Regions
+from .region_sweep import PAIR_SIDE, Regions
 from .solve_policy import QUIET_UNITS, UNIT_ROUNDOFF, SolvePolicy, SolveReadoutRecord
 from .sweep import EXACT, FRICTION_METRIC_FLOATS, LevelLaw, SweepConfig, sweep_kernel
 from .sweep_levels import (
@@ -377,6 +377,7 @@ class Sweep:
         # The colored mapping of the matrix-free sweep and its units, when a world can take it.
         self.mf_colored_kernel = None
         self.colored_units = None
+        self.region_slot = None
         self.general_active_reason = None
         # The Jacobi tiers ahead of the matrix-free sweep (their SweepLaunch each).
         self.tiers = []
@@ -461,25 +462,27 @@ class Sweep:
             # storage slot each, for those worlds only, it runs beside the one-warp mapping. More of them than the
             # device holds colored blocks run in waves, which scales the rule (ColoredRule.at_scale).
             rule = sweep_units.COLORED_RULE
-            # The colored mapping sweeps the free bodies' run, which exists only where a world can take it; its unit
-            # builder reads packed records, so a split line (a world past a block's reach) takes none.
+            # The colored mapping sweeps the free bodies' run, which exists only where a world can take it.
             capable = np.zeros(0, dtype=np.int32)
-            if self.placement.free_contact_rows and not self.placement.split_records:
+            if self.placement.free_contact_rows:
                 capable = sweep_units.capable_worlds(
                     self.forest.free_rigid_per_world, self.placement.mf_max_constraints, rule
                 )
             if model.device.is_cuda and capable.size > 0:
                 found = device(model.device)
-                colored_work = dataclasses.replace(self.general_sweep, **_COLORED).work()
+                # The block's shape (a split line's block takes regions, the unit builder reading packed records).
+                colored_work = dataclasses.replace(
+                    self.general_sweep, regions=bool(self.placement.split_records), **_COLORED
+                ).work()
                 rule = rule.at_scale(capable.size, shape(colored_work, found).blocks_per_sm * found.sms)
                 capable = sweep_units.capable_worlds(
                     self.forest.free_rigid_per_world, self.placement.mf_max_constraints, rule
                 )
-            colored = bool(model.device.is_cuda and capable.size > 0)
-            colored_sweep = self._staged(dataclasses.replace(declared, **_COLORED), capable.size) if colored else None
-            # The free bodies' contacts are regions where no world can take the colored mapping, whose units are
-            # rows until that route's unit is the region too; the sweeps then start from rest (the warm start by
-            # contact identity seeds rows).
+            # Its contact units' builder reads packed records, so a split line (a world past a block's reach) takes
+            # none: those worlds' contacts are regions.
+            colored = bool(model.device.is_cuda and capable.size > 0 and not self.placement.split_records)
+            # The free bodies' contacts are regions where no world can take the colored mapping's contact units; the
+            # sweeps then start from rest (the warm start by contact identity seeds rows).
             if (
                 self.placement.free_contact_rows
                 and not colored
@@ -494,6 +497,22 @@ class Sweep:
                 # The region visit holds more values than the register line of two warps a block keeps in registers
                 # (sweep_routes.WARP_LINE): a sweep that visits regions takes one warp a block and no line.
                 self.general_sweep = self._staged(dataclasses.replace(declared, regions=True, block_warps=1), worlds)
+            # The colored mapping's block takes its worlds' regions where their contacts are regions (a world that
+            # forms pair blocks keeps the warp, whose lanes team on them, region_sweep.PAIR_SIDE).
+            self.region_slot = None
+            if self.regions is not None and model.device.is_cuda and self.pins.region_block:
+                capable = capable[np.asarray(self.forest.free_rigid_per_world)[capable] > int(PAIR_SIDE)]
+                capable = capable.astype(np.int32)
+                colored = capable.size > 0
+                if colored:
+                    slot = np.full(self.forest.world_count, -1, dtype=np.int32)
+                    slot[capable] = np.arange(capable.size, dtype=np.int32)
+                    self.region_slot = wp.array(slot, dtype=wp.int32, device=model.device)
+            colored_sweep = (
+                self._staged(dataclasses.replace(declared, regions=self.regions is not None, **_COLORED), capable.size)
+                if colored
+                else None
+            )
             # The streamed rows' records, in the worlds the sweeps and the unit builder read: one layout, which every
             # sweep reads whatever its own stage holds, with the dense rows' where any sweep streams theirs.
             staged = [sweep for sweep in (self.general_sweep, colored_sweep) if sweep is not None]
@@ -574,7 +593,7 @@ class Sweep:
             self.world_cost = wp.zeros(worlds, dtype=wp.int32, device=model.device)
             # The claim stage runs beside the step's stream until its first reader (claim_worlds).
             self.claims_beside = Beside(model.device)
-            if colored:
+            if colored and self.region_slot is None:
                 self.colored_units = sweep_units.ColoredUnits(
                     self.forest.world_count,
                     self.placement.mf_max_constraints,
@@ -602,7 +621,7 @@ class Sweep:
                 )
                 mapped = (records, general)
             if colored:
-                slots = self.colored_units.slot_count
+                slots = self.colored_units.slot_count if self.colored_units is not None else int(capable.size)
                 mapped += (self._claim_launch(self.colored_sweep, self.mf_colored_kernel, slots, self.claim_colored),)
             # In line, the tiers and then the general sweep; on the claims' streams (open_streams) the first tier in
             # line and the general sweep and the other tiers beside it.
@@ -682,12 +701,17 @@ class Sweep:
             inputs=[
                 self.placement.constraint_count,
                 self.placement.mf_constraint_count,
-                units.units["world_slot"] if units is not None else self.placement.dummy_is_free_rigid,
+                units.units["world_slot"]
+                if units is not None
+                else self.region_slot
+                if self.region_slot is not None
+                else self.placement.dummy_is_free_rigid,
                 self.world_cost,
                 self.par_tiers[-1][0] if self.par_tiers else 0,
                 sweep_routes_tiers.TIER_ROWS,
                 self.claim_general,
-                self.claim_candidate,
+                self.claim_candidate if self.region_slot is None else self.claim_colored,
+                int(units is not None),
                 claims.region,
                 self.placement.world_acts,
             ],
@@ -875,7 +899,7 @@ class Sweep:
 
     def _mapped_operands(self, bucket: int, buckets: int, grid: int) -> dict:
         """A matrix-free mapping's operands: its buckets, the worlds' costs and the colored storage's units."""
-        colored = {} if self.mf_colored_kernel is None else self.colored_units.operands()
+        colored = {} if self.colored_units is None else self.colored_units.operands()
         return {**self._walk(), **colored, **self._queued(bucket, buckets, grid), "world_cost": self.world_cost}
 
     def _sparse_operands(self) -> dict:
@@ -1253,7 +1277,7 @@ class Sweep:
 
     def _record_colored(self, plan) -> dict | None:
         """The colored mapping of the matrix-free sweep: its kernel and the worlds it takes, or ``None`` unbuilt."""
-        if self.mf_colored_kernel is None:
+        if self.colored_units is None:
             return None
         units = self.colored_units
         rule = units.rule

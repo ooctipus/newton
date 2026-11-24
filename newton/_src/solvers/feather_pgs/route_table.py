@@ -60,6 +60,9 @@ class Pins:
     left_regions: bool = True
     """``False``: no region is left out of the sweeps until their end (:func:`.region_sweep.region_left`), so a test
     holds the published point to the sweep of every region from the start."""
+    region_block: bool = True
+    """``False``: a world whose contacts are regions keeps the warp where the colored mapping's block would take them
+    (:attr:`.sweep_plan.Sweep.region_slot`), so a test solves one state on both mappings."""
     velocity: str | None = None
     """``"global"``: the general sweep's velocity change in global memory (:class:`.sweep_routes.RowPlaces`), where a
     block would hold it."""

@@ -189,6 +189,7 @@ def claim_worlds(
     width: int,
     general: int,
     candidate: int,
+    built: int,
     region: int,
     acts: wp.array[int],
     # outputs: a Queue's (execution.Queue), a bucket a tier, then the general sweep's and the colored candidates'
@@ -222,7 +223,7 @@ def claim_worlds(
     elif candidate >= 0:
         if slot[world] >= 0:
             bucket = candidate
-    if (candidate < 0 or bucket != candidate) and acts.shape[0] > 0 and acts[world] == 0:
+    if (built == 0 or bucket != candidate) and acts.shape[0] > 0 and acts[world] == 0:
         return
     if bucket < 0:
         bucket = cost_bucket(general, world_cost[world])
