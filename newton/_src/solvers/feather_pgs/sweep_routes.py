@@ -34,6 +34,7 @@ from .region_sweep import (
     REGION_IDLE,
     REGION_LEFT,
     REGION_LOOSE,
+    WALK_PARTS,
     walk_levels,
 )
 from .response_operator import Lanes, SparseFactor, Velocity
@@ -1265,10 +1266,37 @@ for (int k = 0; k < 6; ++k) u{s}[k] = s_v[first{s} + k];
 const wp::vec3 v{s}(wp::dot(basis{s}[0], u{s}), wp::dot(basis{s}[1], u{s}), wp::dot(basis{s}[2], u{s}));
 const wp::vec3 w{s}(wp::dot(basis{s}[3], u{s}), wp::dot(basis{s}[4], u{s}), wp::dot(basis{s}[5], u{s}));"""
     # Over a block (:func:`region_phase`): the left-out regions over every thread, the join voted by the block, the
-    # walk and its levels made anew by the first warp's lanes, as the warp makes them.
+    # walk made anew over the block's warps (a narrow world's by the first warp) and its levels by the first warp.
     sync, me, stride = ("__syncthreads();", "tid", "(int)blockDim.x") if block else ("SYNC();", "lane", "STRIDE")
     voted = "__syncthreads_or(joined != 0)" if block else "BALLOT(joined != 0) != 0u"
-    remake, remade = ("if (warp == 0) {", "}\n        __syncthreads();") if block else ("SYNC();", "SYNC();")
+    parts = indent(WALK_PARTS, "    ")
+    if block:
+        # A world wider than the block's lanes is walked by every warp of the block, a part each; the first warp
+        # walks a narrower one, and levels the walk.
+        remake = f"""        const int s0 = left_span[0], order_end = world_order_end.data[world];
+        const auto BLOCK_SYNC = [&]() {{ __syncthreads(); }};
+{parts}
+        const bool wide = order_end - s0 > (int)blockDim.x;
+        int acting = wide ? walk_wide(s0, order_end, (int)blockDim.x >> 5, warp) : 0;
+        if (warp == 0) {{
+            if (!wide) {{
+                acting = count_part(s0, order_end);
+                place_part(s0, s0, order_end, 0, acting);
+            }}
+            SYNC();
+{indent(remake_levels, "    ")}
+        }}
+        __syncthreads();"""
+    else:
+        remake = f"""        SYNC();
+        const int s0 = left_span[0], order_end = world_order_end.data[world];
+        const auto BLOCK_SYNC = [&]() {{ SYNC(); }};
+{parts}
+        int acting = count_part(s0, order_end);
+        place_part(s0, s0, order_end, 0, acting);
+        SYNC();
+{remake_levels}
+        SYNC();"""
     text = f"""{{
     {sync}
     const wp::vec2i left_span = world_regions.data[world];
@@ -1310,34 +1338,7 @@ const wp::vec3 w{s}(wp::dot(basis{s}[3], u{s}), wp::dot(basis{s}[4], u{s}), wp::
         if ({iteration} + 1 == {budget}) {budget} += 1;
         // The opened regions take their places in the order: the walk and its levels anew (region_sweep.level_acting's
         // statements), so the next sweep takes the order on every region that can act, as it stands.
-        {remake}
-        const int s0 = left_span[0], order_end = world_order_end.data[world];
-        int acting = 0;
-        for (int base = s0; base < order_end; base += STRIDE) {{
-            const int p = base + lane;
-            const int g = p < order_end ? reg_order.data[p] : -1;
-            const bool act = g >= 0 && reg_state.data[g] != {int(REGION_LEFT)};
-            const unsigned votes = BALLOT(act);
-            if (act) reg_walk.data[s0 + acting + BELOW(votes)] = g;
-            acting += COUNT(votes);
-        }}
-        int placed = acting;
-        for (int base = s0; base < order_end; base += STRIDE) {{
-            const int p = base + lane;
-            const int g = p < order_end ? reg_order.data[p] : -1;
-            const bool out = g >= 0 && reg_state.data[g] == {int(REGION_LEFT)};
-            const unsigned votes = BALLOT(out);
-            if (out) reg_walk.data[s0 + placed + BELOW(votes)] = g;
-            placed += COUNT(votes);
-        }}
-        SYNC();
-        for (int p = s0 + lane; p < s0 + acting; p += STRIDE) {{
-            const wp::vec2i sides = reg_body.data[reg_walk.data[p]];
-            body_level.data[sides[0]] = -1;
-            if (sides[1] >= 0) body_level.data[sides[1]] = -1;
-        }}
-{remake_levels}
-        {remade}
+{remake}
     }}
 }}"""
     return indent(text, pad)

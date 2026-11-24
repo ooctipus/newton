@@ -2115,20 +2115,7 @@ flight together, not a turn's latency each. A hardware choice that changes no re
 (measured on the region visit's hops); at the walk's occupancy (a warp a world, a few warps a multiprocessor) eight
 turns in flight cover one round trip."""
 
-_ACTING = f"""    const int lane = LANE, world = tid / LANES, worlds = world_regions.shape[0];
-    // A world's listed regions in its order, [s, end) (none past the worlds).
-    const auto span = [&](int w, int& s, int& end) {{
-        s = 0;
-        end = 0;
-        if (w < worlds) {{
-            s = world_regions.data[w][0];
-            end = world_order_end.data[w];
-        }}
-    }};
-    // A world wider than a turn of its block's lanes is walked by every warp of the block, a part each (GROUPS: the
-    // block's warps, SUB: this warp's; one on the CPU, whose one thread walks a world).
-    const auto wide = [&](int n) {{ return GROUPS > 1 && n > STRIDE * GROUPS; }};
-    // The acting regions of the order's places [a, b).
+WALK_PARTS = f"""    // The acting regions of the order's places [a, b).
     const auto count_part = [&](int a, int b) {{
         int count = 0;
         for (int base = a; base < b; base += {_WALK_TURNS} * STRIDE) {{
@@ -2171,6 +2158,44 @@ _ACTING = f"""    const int lane = LANE, world = tid / LANES, worlds = world_reg
             }}
         }}
     }};
+    // A world's walk of its order's places [s, e) by ``parts`` warps of a block, warp ``part`` a part: the parts'
+    // counts (level_end[s + part] as scratch, a wide world's), then each part's places from the counts of the parts
+    // before; returns the world's acting regions on every warp.
+    const auto walk_wide = [&](int s, int e, int parts, int part) {{
+        const int size = ((e - s + parts - 1) / parts + STRIDE - 1) / STRIDE * STRIDE;
+        const int a = wp::min(s + part * size, e), b = wp::min(a + size, e);
+        const int count = count_part(a, b);
+        if (lane == 0) level_end.data[s + part] = count;
+        BLOCK_SYNC();
+        int in = 0, total = 0;
+        for (int q = 0; q < parts; ++q) {{
+            const int c = level_end.data[s + q];
+            in += q < part ? c : 0;
+            total += c;
+        }}
+        place_part(s, a, b, in, total);
+        BLOCK_SYNC();
+        return total;
+    }};"""
+"""A world's walk (:func:`level_acting`, :func:`.sweep_routes.region_verify`): ``count_part`` and ``place_part``, a
+lane group's count and places of the acting and left-out regions of a part of its order (each lane a few turns'
+loads in flight, :data:`_WALK_TURNS`), and ``walk_wide``, the walk of a world over a block's warps (``BLOCK_SYNC``),
+a part each."""
+
+_ACTING = f"""    const int lane = LANE, world = tid / LANES, worlds = world_regions.shape[0];
+    // A world's listed regions in its order, [s, end) (none past the worlds).
+    const auto span = [&](int w, int& s, int& end) {{
+        s = 0;
+        end = 0;
+        if (w < worlds) {{
+            s = world_regions.data[w][0];
+            end = world_order_end.data[w];
+        }}
+    }};
+    // A world wider than a turn of its block's lanes is walked by every warp of the block, a part each (GROUPS: the
+    // block's warps, SUB: this warp's; one on the CPU, whose one thread walks a world).
+    const auto wide = [&](int n) {{ return GROUPS > 1 && n > STRIDE * GROUPS; }};
+{WALK_PARTS}
     int s0, end;
     span(world, s0, end);
     int acting = 0;
@@ -2178,26 +2203,13 @@ _ACTING = f"""    const int lane = LANE, world = tid / LANES, worlds = world_reg
         acting = count_part(s0, end);
         place_part(s0, s0, end, 0, acting);
     }}
-    // The block's wide worlds in turn, a part a warp: the parts' counts (level_end[s + part] as scratch), then their
-    // places from the counts of the parts before.
+    // The block's wide worlds in turn, a part a warp.
     for (int k = 0; k < GROUPS; ++k) {{
         int s, e;
         span(world - SUB + k, s, e);
         if (!wide(e - s)) continue;
-        const int part = (((e - s) + GROUPS - 1) / GROUPS + STRIDE - 1) / STRIDE * STRIDE;
-        const int a = wp::min(s + SUB * part, e), b = wp::min(a + part, e);
-        const int count = count_part(a, b);
-        if (lane == 0) level_end.data[s + SUB] = count;
-        BLOCK_SYNC();
-        int in = 0, total = 0;
-        for (int q = 0; q < GROUPS; ++q) {{
-            const int c = level_end.data[s + q];
-            in += q < SUB ? c : 0;
-            total += c;
-        }}
-        place_part(s, a, b, in, total);
+        const int total = walk_wide(s, e, GROUPS, SUB);
         if (k == SUB) acting = total;
-        BLOCK_SYNC();
     }}
     if (end <= s0) {{
         if (world < worlds && lane == 0) world_levels.data[world] = 0;
