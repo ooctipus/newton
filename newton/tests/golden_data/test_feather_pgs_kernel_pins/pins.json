@@ -83,6 +83,7 @@
   "region_sweep.order_regions": "21a1bff72347a13ee830f28cc6ea442e0c033969f742c62de5f5dd7f16c14985",
   "region_sweep.place_bodies": "6c9f87304fbdf3a8e431cf7bdb6d40d537054e96cca44d360b0b45368e93732c",
   "region_sweep.place_regions": "6c64519e251cc8c775eb6780de5debda10a65c45475a8fe0c0fcb10b156ff16e",
+  "region_sweep.publish_fill_extent": "f939eb932b7d161d8c760398fb69ad12a3d6765b8a4cdbe44494334cbca267fd",
   "region_sweep.stage_blocks": "15981339dc3bb2acd28bfed66823ab9a2d74fca8a26865ea5920d83febac7ad2",
   "region_sweep.sweep_closed_bodies": "9327321ee8c6de56337b3987295bd2f6c8597e4a50289f90d443331a699e08ec",
   "row_kernels.allocate_link_slots": "486e985b17405adbd3051190872d26f2d534932c4b2ecd98f50d915c769c8337",

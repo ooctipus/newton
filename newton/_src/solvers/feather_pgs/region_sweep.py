@@ -1281,6 +1281,17 @@ def fill_region_member(
     return eps != 0.0
 
 
+@wp.kernel(enable_backward=False, module="unique")
+def publish_fill_extent(cursor: wp.array[int], lanes: int, fill_extent: wp.array[int]):
+    """The fill's work (:func:`fill_regions`) in lane groups: the step's regions over whole groups of ``lanes``, none
+    where it lists none (``cursor[3]``). The fill's lanes deal their regions' candidates across their group, so a
+    replay runs whole groups: a group cut short by the live count reads lanes that do not run."""
+    groups = (cursor[0] + lanes - 1) // lanes
+    if cursor[3] != 0:
+        groups = 0
+    fill_extent[0] = groups
+
+
 @wp.kernel(enable_backward=False, launch_bounds=_FILL_SHAPE.bounds, module="unique")
 def fill_regions(
     rows: DenseRows,
@@ -2245,6 +2256,7 @@ class Regions:
         self.lanes = wp.zeros(count, dtype=wp.int32, device=device)
         self.lane_change = wp.zeros(count, dtype=wp.spatial_vector, device=device)
         self.cursor = wp.zeros(5, dtype=wp.int32, device=device)
+        self.fill_extent = wp.zeros(1, dtype=wp.int32, device=device)
         # Whether a step lists its regions anew ([0]) and whether the last listing fit the stream ([1]: none yet).
         self.relist = wp.array([1, 0], dtype=wp.int32, device=device)
         self.no_hold = wp.zeros(1, dtype=wp.int32, device=device)
@@ -2511,9 +2523,15 @@ class Regions:
             outputs=[self.reg_head, self.reg_cand, self.reg_kind, self.cand_contact, self.listed],
             **live,
         )
+        # The fill runs whole lane groups over the step's regions (publish_fill_extent), published after the listing
+        # placed them: a replay follows them through a new updater.
+        lanes = int(_FILL_LANES) if device.is_cuda else 1
+        fill_threads = -(-threads // lanes) * lanes
+        wp.launch(publish_fill_extent, dim=1, inputs=[self.cursor, lanes], outputs=[self.fill_extent], device=device)
+        pool.begin_updates()
         pool.launch(
             fill_regions,
-            threads,
+            fill_threads,
             inputs=[
                 rows,
                 bias,
@@ -2530,7 +2548,7 @@ class Regions:
                 self.body_inertia,
                 float(self.options.pgs_cfm),
                 self.cursor,
-                threads,
+                fill_threads,
                 self.reg_head,
                 self.reg_cand,
                 int(self.leave_out),
@@ -2566,7 +2584,9 @@ class Regions:
                 self.reg_bound,
             ],
             block_dim=_FILL_SHAPE.block,
-            **live,
+            extent=self.fill_extent,
+            scale=lanes,
+            clamp=True,
         )
         world_threads = self.world_threads
         if self.blocks:
