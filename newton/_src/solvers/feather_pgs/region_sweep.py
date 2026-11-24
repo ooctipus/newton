@@ -2058,23 +2058,26 @@ def level_regions(
 WALK_RESOURCES = """            const int region = ahead_region;
             const wp::vec2i sides = ahead_sides;
             const int node_a = sides[0];
-            const int node_b = sides[1];
-            ahead_region = unit + STRIDE < acting ? reg_walk.data[s0 + unit + STRIDE] : -1;"""
+            const int node_b = sides[1];"""
 """A walk's region's resources in its levels (:func:`walk_levels`): its bodies, loaded a batch ahead
-(:data:`WALK_AHEAD`)."""
+(:data:`WALK_AHEAD`, :data:`WALK_NEXT`)."""
+
+WALK_NEXT = """            ahead_region = unit + {step} < acting ? reg_walk.data[s0 + unit + {step}] : -1;
+"""
+"""The lane's next batch's region, ``{step}`` units on: with a batch's resources, or after a turn's release."""
 
 WALK_AHEAD = (
-    """        int ahead_region = lane < acting ? reg_walk.data[s0 + lane] : -1;
+    """        int ahead_region = {unit} < acting ? reg_walk.data[s0 + {unit}] : -1;
         wp::vec2i ahead_sides = ahead_region >= 0 ? reg_body.data[ahead_region] : wp::vec2i(-1, -1);
 """,
     """            ahead_sides = ahead_region >= 0 ? reg_body.data[ahead_region] : wp::vec2i(-1, -1);
 """,
 )
 """The walk's resources a batch ahead (:func:`.sweep_levels.level_pass`'s ``ahead``): the next batch's regions load as a
-batch begins, their bodies once the batch's held levels are read."""
+batch begins, their bodies once the batch's held levels are read; the lane's first unit ``{unit}``."""
 
 
-def walk_levels(pad: str = "        ") -> str:
+def walk_levels(pad: str = "        ", *, turns: str = "") -> str:
     """Return the CUDA statements that level a world's walk (:func:`level_acting`): its ``acting`` regions from
     ``reg_walk[s0]``, whose bodies' ``body_level`` is -1, by the lane group's batches.
 
@@ -2084,17 +2087,41 @@ def walk_levels(pad: str = "        ") -> str:
     counts and each region sits at its level's first plus its rank (``level_region``); then ``level_end[s0 + L]`` holds
     level ``L``'s end and ``world_levels[world]`` the count. The statements run on every lane of the group (``lane``,
     ``STRIDE``, ``SYNC``, the lane group's words); the step's walk (:func:`level_acting`) and the sweeps' end remake
-    (:func:`.sweep_routes.region_verify`) take them."""
+    (:func:`.sweep_routes.region_verify`) take them.
+
+    With ``turns`` (a block's shared word; the lane group a warp) the statements run on every thread of the block:
+    its warps take the batches in turn (the pass's ``turns``), and the places and the levels' ends take every thread;
+    the first warp scans the counts. The levels, places and ends are the lane group's."""
+    me, stride, sync = (
+        ("(int)threadIdx.x", "(int)blockDim.x", "__syncthreads()") if turns else ("lane", "STRIDE", "SYNC()")
+    )
+    # A warp's next batch's region loads with its resources; a turn's after its hand-off (the pass's ``ahead``).
+    after = WALK_NEXT.format(step=stride)
+    resources, during = (
+        (WALK_RESOURCES, after + WALK_AHEAD[1]) if turns else (WALK_RESOURCES + "\n" + after.rstrip(), WALK_AHEAD[1])
+    )
     levels = level_pass(
         units="acting",
-        resources=WALK_RESOURCES,
-        ahead=WALK_AHEAD,
+        resources=resources,
+        ahead=(WALK_AHEAD[0].format(unit=me), during),
         counts="level_end.data[s0 + {}]",
         store="reg_level.data[region] = level;\n                reg_rank.data[region] = rank;",
-        lanes="STRIDE",
+        lanes=32 if turns else "STRIDE",
+        turns=turns,
     )
-    text = f"""for (int k = lane; k < acting; k += STRIDE) level_end.data[s0 + k] = 0;
-SYNC();
+    # The pass's own barrier (with turns) follows the counts' clearing.
+    clear = "" if turns else "\nSYNC();"
+    scan = """int carry = s0;
+for (int base = 0; base < levels; base += STRIDE) {
+    const int k = base + lane;
+    const int n = k < levels ? level_end.data[s0 + k] : 0;
+    const int below = SCAN(n);
+    if (k < levels) level_end.data[s0 + k] = carry + below;
+    carry += READ(below + n, STRIDE - 1);
+}"""
+    if turns:
+        scan = f"if (threadIdx.x < 32) {{\n{indent(scan, '    ')}\n}}"
+    text = f"""for (int k = {me}; k < acting; k += {stride}) level_end.data[s0 + k] = 0;{clear}
 // The walk's levels by the lane group's batches (sweep_levels.level_pass, a body a resource): each region's
 // level and its rank among its level's regions in the walk's order, as one lane's pass in that order gives.
 int* const node_level = body_level.data;
@@ -2102,19 +2129,12 @@ int* const node_level = body_level.data;
 // Each level's first place from the world's first (an exclusive scan of the counts), each region at its
 // level's first plus its rank (a few turns' loads in flight, _WALK_TURNS), then each level's end (the next level's
 // first; the last's, the walk's acting end).
-int carry = s0;
-for (int base = 0; base < levels; base += STRIDE) {{
-    const int k = base + lane;
-    const int n = k < levels ? level_end.data[s0 + k] : 0;
-    const int below = SCAN(n);
-    if (k < levels) level_end.data[s0 + k] = carry + below;
-    carry += READ(below + n, STRIDE - 1);
-}}
-SYNC();
-for (int base = s0; base < s0 + acting; base += {_WALK_TURNS} * STRIDE) {{
+{scan}
+{sync};
+for (int base = s0; base < s0 + acting; base += {_WALK_TURNS} * {stride}) {{
     int g[{_WALK_TURNS}], level[{_WALK_TURNS}], rank[{_WALK_TURNS}];
     for (int u = 0; u < {_WALK_TURNS}; ++u) {{
-        const int p = base + u * STRIDE + lane;
+        const int p = base + u * {stride} + {me};
         g[u] = p < s0 + acting ? reg_walk.data[p] : -1;
     }}
     for (int u = 0; u < {_WALK_TURNS}; ++u) {{
@@ -2124,15 +2144,15 @@ for (int base = s0; base < s0 + acting; base += {_WALK_TURNS} * STRIDE) {{
     for (int u = 0; u < {_WALK_TURNS}; ++u) level[u] = g[u] >= 0 ? level_end.data[s0 + level[u]] : 0;
     for (int u = 0; u < {_WALK_TURNS}; ++u) if (g[u] >= 0) level_region.data[level[u] + rank[u]] = g[u];
 }}
-SYNC();
-for (int base = 0; base < levels; base += STRIDE) {{
-    const int k = base + lane;
+{sync};
+for (int base = 0; base < levels; base += {stride}) {{
+    const int k = base + {me};
     const int next = k + 1 < levels ? level_end.data[s0 + k + 1] : s0 + acting;
-    SYNC();
+    {sync};
     if (k < levels) level_end.data[s0 + k] = next;
-    SYNC();
+    {sync};
 }}
-if (lane == 0) world_levels.data[world] = levels;"""
+if ({me} == 0) world_levels.data[world] = levels;"""
     return indent(text, pad)
 
 

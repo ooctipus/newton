@@ -1275,7 +1275,6 @@ def region_verify(
     statements of :func:`.region_sweep.level_acting`), and the sweeps may not stop; a sweep more where ``budget`` ends
     at ``iteration``. So every region still left out at the end holds
     nothing at a motion where none of its candidates closes."""
-    remake_levels = walk_levels()
     twist = """const int first{s} = body_first.data[{f}];
 const wp::spatial_vector* const basis{s} = body_basis.data + (size_t){f} * 6;
 wp::spatial_vector u{s};
@@ -1283,26 +1282,29 @@ for (int k = 0; k < 6; ++k) u{s}[k] = s_v[first{s} + k];
 const wp::vec3 v{s}(wp::dot(basis{s}[0], u{s}), wp::dot(basis{s}[1], u{s}), wp::dot(basis{s}[2], u{s}));
 const wp::vec3 w{s}(wp::dot(basis{s}[3], u{s}), wp::dot(basis{s}[4], u{s}), wp::dot(basis{s}[5], u{s}));"""
     # Over a block (:func:`region_phase`): the left-out regions over every thread, the join voted by the block, the
-    # walk made anew over the block's warps (a narrow world's by the first warp) and its levels by the first warp.
+    # walk made anew over the block's warps (a narrow world's by the first warp) and its levels by the block's warps
+    # in turn (region_sweep.walk_levels' turns).
     sync, me, stride = ("__syncthreads();", "tid", "(int)blockDim.x") if block else ("SYNC();", "lane", "STRIDE")
     voted = "__syncthreads_or(joined != 0)" if block else "BALLOT(joined != 0) != 0u"
     parts = indent(WALK_PARTS, "    ")
     if block:
         # A world wider than the block's lanes is walked by every warp of the block, a part each; the first warp
-        # walks a narrower one, and levels the walk.
+        # walks a narrower one (its acting count to the block by the turns' second word). The block levels the walk.
         remake = f"""        const int s0 = left_span[0], order_end = world_order_end.data[world];
         const auto BLOCK_SYNC = [&]() {{ __syncthreads(); }};
 {parts}
         const bool wide = order_end - s0 > (int)blockDim.x;
         int acting = wide ? walk_wide(s0, order_end, (int)blockDim.x >> 5, warp) : 0;
-        if (warp == 0) {{
-            if (!wide) {{
+        if (!wide) {{
+            if (warp == 0) {{
                 acting = count_part(s0, order_end);
                 place_part(s0, s0, order_end, 0, acting);
+                if (lane == 0) s_level_turn[1] = acting;
             }}
-            SYNC();
-{indent(remake_levels, "    ")}
+            __syncthreads();
+            acting = s_level_turn[1];
         }}
+{walk_levels(turns="s_level_turn[0]")}
         __syncthreads();"""
     else:
         remake = f"""        SYNC();
@@ -1312,7 +1314,7 @@ const wp::vec3 w{s}(wp::dot(basis{s}[3], u{s}), wp::dot(basis{s}[4], u{s}), wp::
         int acting = count_part(s0, order_end);
         place_part(s0, s0, order_end, 0, acting);
         SYNC();
-{remake_levels}
+{walk_levels()}
         SYNC();"""
     text = f"""{{
     {sync}
@@ -1408,8 +1410,11 @@ def mf_gs_staging(
     rows = sorted((*dense.buffers(), *free.buffers()), key=lambda buffer: buffer.alternative is not Place.GLOBAL)
     levels = ()
     if colored:
-        # Each body's latest unit's turn, at its first coordinate (_colored_units); regions take no turns.
-        levels = () if regions else (Buffer("s_ran", "int", ran_slots(max_world_dofs)),)
+        # Each body's latest unit's turn, at its first coordinate (_colored_units); under regions the remake's turn
+        # words (region_verify: the level count, a narrow walk's acting count).
+        levels = (
+            (Buffer("s_level_turn", "int", 2),) if regions else (Buffer("s_ran", "int", ran_slots(max_world_dofs)),)
+        )
         if traces:
             levels += block_argmax(COLORED_THREADS // 32, warp="warp", lane="lane")[1]
     elif grouped and traces:

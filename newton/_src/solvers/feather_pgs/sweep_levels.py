@@ -48,6 +48,7 @@ def level_pass(
     lanes: int | str = 32,
     after: bool = False,
     ahead: tuple[str, str] = ("", ""),
+    turns: str = "",
 ) -> str:
     """Return CUDA source that levels a world's ``units`` units in row order (Cartier-Foata), by one warp, a batch of
     32 at a time.
@@ -73,6 +74,15 @@ def level_pass(
     ``COUNT``, ``READ``; :data:`.device_preludes.LANE_WORDS`). ``ahead`` is a caller's pipeline of its resources'
     loads: statements before the batches, and statements each batch runs once its held levels are read, so the next
     batch's loads are in flight while the batch levels.
+
+    With ``turns`` (a block's shared word, CUDA's warps; at most 15 warps) the block's warps take the batches in turn,
+    warp ``w`` the batches ``w``, ``w + WARPS``, ...: a batch's resources and in-batch predecessors are its own, so its
+    warp finds them while earlier batches level; then its turn (the warp before it arrives at its named barrier, ``1
+    + w``, once its levels and counts are fenced) reads the held levels and the counts, runs the rounds, leaves its
+    resources' levels and the counts, and passes the turn on; its ranks, stores and ``ahead``'s loads follow. A
+    waiting warp issues nothing (a polled word would take the shuffle pipe from the turn). The batches level in row
+    order, so the levels and ranks are the one warp's. ``units`` and ``node_level`` are the block's, ``levels`` its
+    count on every thread (``turns``; a block barrier at each end).
     """
     if lanes == 32:
         same, below, count = (
@@ -95,6 +105,8 @@ def level_pass(
 
     else:
         raise ValueError(f"the level pass runs a warp, a lane group or one thread, got {lanes}")
+    if turns and lanes != 32:
+        raise ValueError(f"the block's turns take warps of 32 lanes, got {lanes}")
     held = (
         """
             const int after_a = prev_a >= 0 ? via_a : held_a, after_b = prev_b >= 0 ? via_b : held_b;"""
@@ -102,16 +114,67 @@ def level_pass(
         else ""
     )
     before, during = ahead
-    return f"""{before}        int levels = 0;
-        for (int base = 0; base < {units}; base += {lanes}) {{
+    count_at = counts.format("level")
+    if turns:
+        # The block's warps in turn: a batch's warp finds its predecessors, then takes its turn from the warp before
+        # it by a named barrier of the two warps (1 + its warp; 0 is the block's); the held levels and the counts are
+        # the turns' (relaxed at the block's scope), ordered by the producer's block fence before the barrier.
+        begin, step = "(int)(threadIdx.x & ~31u)", "(int)blockDim.x"
+        start = f"""        const auto TURN_LOAD = [](const int* at) {{
+            int value;
+            asm volatile("ld.relaxed.cta.s32 %0, [%1];" : "=r"(value) : "l"(at) : "memory");
+            return value;
+        }};
+        const auto TURN_STORE = [](int* at, int value) {{
+            asm volatile("st.relaxed.cta.s32 [%0], %1;" ::"l"(at), "r"(value) : "memory");
+        }};
+        if (threadIdx.x == 0) {turns} = 0;
+        __syncthreads();
+"""
+        wait = """            // The batch's turn: the warp before it has left its levels and counts and arrived at this warp's barrier.
+            if (base != 0) asm volatile("bar.sync %0, 64;" ::"r"(1 + (int)(threadIdx.x >> 5)) : "memory");
+"""
+        release = f"""
+            // The next batch's turn: the levels and counts before the next warp's barrier (a block fence).
+            __threadfence_block();
+            if (base + 32 < {units})
+                asm volatile("bar.arrive %0, 64;" ::"r"(1 + (int)((threadIdx.x >> 5) + 1) % (int)(blockDim.x >> 5)) : "memory");
+{during.rstrip()}"""
+        end = f"""        MAXIMUM(levels);
+        if (lane == 0) atomicMax(&{turns}, levels);
+        __syncthreads();
+        levels = {turns};"""
+
+        def load(at: str) -> str:
+            return f"TURN_LOAD(&{at})"
+
+        def put(at: str, value: str) -> str:
+            return f"TURN_STORE(&{at}, {value})"
+
+    else:
+        begin, step, start, wait, end = "0", f"{lanes}", "", "", "        MAXIMUM(levels);"
+        release = "\n            SYNC();"
+
+        def load(at: str) -> str:
+            return at
+
+        def put(at: str, value: str) -> str:
+            return f"{at} = {value}"
+
+    held_levels = f"""            // The levels the unit's resources hold from earlier batches.
+            const int held_a = res_a >= 0 ? {load("node_level[res_a]")} : -1;
+            const int held_b = res_b >= 0 ? {load("node_level[res_b]")} : -1;
+"""
+    # One warp reads the held levels first (their loads in flight with the batch's own work); a turn reads them last.
+    # A turn's next loads follow its hand-off: the hand-off's fence would wait for a load in flight.
+    early, late = ("", wait + held_levels) if turns else (held_levels + during, "")
+    return f"""{start}{before}        int levels = 0;
+        for (int base = {begin}; base < {units}; base += {step}) {{
             const int unit = base + lane;
             bool valid = unit < {units};
 {resources}
             const int res_a = valid ? node_a : -1, res_b = valid ? node_b : -1;
-            // The levels the unit's resources hold from earlier batches.
-            const int held_a = res_a >= 0 ? node_level[res_a] : -1;
-            const int held_b = res_b >= 0 ? node_level[res_b] : -1;
-{during}            // On each resource, the batch's latest earlier unit that shares it and whether a later one does.
+{early}            // On each resource, the batch's latest earlier unit that shares it and whether a later one does.
             int prev_a = -1, prev_b = -1;
             bool last_a = true, last_b = true;
             for (int j = 0; j < {width}; ++j) {{
@@ -123,7 +186,7 @@ def level_pass(
                 if (j > lane && on_a) last_a = false;
                 if (j > lane && on_b) last_b = false;
             }}
-            // One past the held levels and the predecessors' levels, by rounds until no level moves.
+{late}            // One past the held levels and the predecessors' levels, by rounds until no level moves.
             const int first = valid ? max(held_a, held_b) + 1 : -1;
             int level = first, via_a = -1, via_b = -1;
             for (bool moved = true; {moved};) {{
@@ -135,21 +198,20 @@ def level_pass(
                 moved = next != level;
                 level = next;
             }}{held}
-            if (res_a >= 0 && last_a) node_level[res_a] = level;
-            if (res_b >= 0 && last_b) node_level[res_b] = level;
+            if (res_a >= 0 && last_a) {put("node_level[res_a]", "level")};
+            if (res_b >= 0 && last_b) {put("node_level[res_b]", "level")};
             const unsigned same = {same};
             const int below = {below};
-            const int earlier = valid ? {counts.format("level")} : 0;
+            const int earlier = valid ? {load(count_at)} : 0;
             SYNC();
-            if (valid && below == 0) {counts.format("level")} = earlier + {count};
-            SYNC();
+            if (valid && below == 0) {put(count_at, f"earlier + {count}")};{release}
             if (valid) {{
                 const int rank = earlier + below;
                 {store}
             }}
             levels = max(levels, level + 1);
         }}
-        MAXIMUM(levels);"""
+{end}"""
 
 
 def level_offsets(*, levels: str, counts: str, lanes: int = 32, sync: str = "__syncthreads()") -> str:
