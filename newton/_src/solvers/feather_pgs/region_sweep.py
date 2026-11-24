@@ -853,8 +853,8 @@ def place_bodies(
     its open
     bodies' (``world_regions``): each body takes its regions' places (``body_regions``) and its candidates' first
     (``body_cand``). The places are taken from ``cursor`` as worlds arrive, and the ``lanes`` as bodies arrive: they
-    decide no result. A world whose regions do not fit the stream (``capacity``: the contact pool's ready rows) lists
-    none and sets ``cursor[3]``."""
+    decide no result. A world whose regions do not fit the stream (``capacity``: the contact pool's ready rows) sets
+    ``cursor[3]``, and the step then lists no region in any world (:func:`publish_listing`)."""
     if relist[0] == 0:
         return
     stride = lane_stride(group)
@@ -1292,14 +1292,24 @@ def fill_region_member(
 
 
 @wp.kernel(enable_backward=False, module="unique")
-def publish_fill_extent(cursor: wp.array[int], lanes: int, fill_extent: wp.array[int]):
-    """The fill's work (:func:`fill_regions`) in lane groups: the step's regions over whole groups of ``lanes``, none
-    where it lists none (``cursor[3]``). The fill's lanes deal their regions' candidates across their group, so a
-    replay runs whole groups: a group cut short by the live count reads lanes that do not run."""
-    groups = (cursor[0] + lanes - 1) // lanes
+def publish_listing(lanes: int, cursor: wp.array[int], fill_extent: wp.array[int], world_regions: wp.array[wp.vec2i]):
+    """The listing's extent, a thread a world: the fill's work (:func:`fill_regions`) in lane groups, the step's regions
+    over whole groups of ``lanes``. The fill's lanes deal their regions' candidates across their group, so a replay runs
+    whole groups: a group cut short by the live count reads lanes that do not run.
+
+    A listing that did not fit the stream (``cursor[3]``, :func:`place_bodies`) lists no region: the worlds that took
+    their places before it ran out hold an older listing's regions there (another world's, where the places fell
+    otherwise), so every world's span is emptied, no closed body is listed and the fill has no work."""
+    world = wp.tid()
+    if world == 0:
+        groups = (cursor[0] + lanes - 1) // lanes
+        if cursor[3] != 0:
+            groups = 0
+            cursor[2] = 0
+            cursor[4] = 0
+        fill_extent[0] = groups
     if cursor[3] != 0:
-        groups = 0
-    fill_extent[0] = groups
+        world_regions[world] = wp.vec2i(0, 0)
 
 
 @wp.kernel(enable_backward=False, launch_bounds=_FILL_SHAPE.bounds, module="unique")
@@ -2683,11 +2693,17 @@ class Regions:
             outputs=[self.reg_head, self.reg_cand, self.reg_kind, self.cand_contact, self.listed],
             **live,
         )
-        # The fill runs whole lane groups over the step's regions (publish_fill_extent), published after the listing
+        # The fill runs whole lane groups over the step's regions (publish_listing), published after the listing
         # placed them: a replay follows them through a new updater.
         lanes = int(_FILL_LANES) if device.is_cuda else 1
         fill_threads = -(-threads // lanes) * lanes
-        wp.launch(publish_fill_extent, dim=1, inputs=[self.cursor, lanes], outputs=[self.fill_extent], device=device)
+        wp.launch(
+            publish_listing,
+            dim=self.world_regions.shape[0],
+            inputs=[lanes],
+            outputs=[self.cursor, self.fill_extent, self.world_regions],
+            device=device,
+        )
         pool.begin_updates()
         pool.launch(
             fill_regions,
