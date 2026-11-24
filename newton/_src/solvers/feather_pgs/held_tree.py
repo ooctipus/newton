@@ -20,11 +20,13 @@ compact diagonal's refresh forms its inverse mass. :func:`decline` names why a r
 import dataclasses
 import itertools
 from dataclasses import dataclass
+from functools import partial
 from types import SimpleNamespace
 
 import numpy as np
 import warp as wp
 
+from ...core.execution import Beside
 from ...core.host_unique import distinct
 from . import coordinate_trees, field_group, host_index
 from .device_proof import DeviceProof
@@ -603,6 +605,9 @@ class HeldTree:
             )
             operator.kinetic_state = state
             self.groups.append(state)
+        # The groups own disjoint trees, so a phase's launches of different groups commute: every group after the first
+        # runs beside the step's stream on its own (:meth:`_each`), and a phase lasts its longest group's chain.
+        self.besides = tuple(Beside(solver.model.device) for _ in self.groups[1:])
 
     @property
     def reasons(self) -> tuple:
@@ -681,26 +686,38 @@ class HeldTree:
         for group in self.groups:
             group.invalidate(world_mask)
 
+    def _each(self, phase) -> None:
+        """``phase(group)`` for every group, side by side: the first group's launches on the step's stream, every other
+        group's beside it on a stream of its own (:class:`~newton._src.core.execution.Beside`: event edges in a
+        captured graph), each forked where the phase starts and joined before its readers. A model of one group
+        launches as it did; the CPU runs the groups in line, in their order. No group reads a word another group's
+        phase writes (each owns its trees' coordinates, bodies and caches; the walk's status word is raised
+        atomically), so the groups' order is free and the result the same."""
+        for beside in self.besides:
+            beside.fork()
+        for group in self.groups[:1]:
+            phase(group)
+        for beside, group in zip(self.besides, self.groups[1:], strict=True):
+            beside.run(partial(phase, group))
+        for beside in self.besides:
+            beside.join()
+
     def begin(self, state, augmented, dt, *, state_out=None):
         """Repair every current component before any factor or force consumer (see :meth:`TreeKineticState.begin`):
         each group's device decides which of its trees recompute."""
-        for group in self.groups:
-            group.begin(state, augmented, dt, state_out=state_out)
+        self._each(lambda group: group.begin(state, augmented, dt, state_out=state_out))
 
     def refresh(self, augmented):
         """Preserve independent factor masks and numerical representations."""
-        for group in self.groups:
-            group.sparse.refresh(augmented)
+        self._each(lambda group: group.sparse.refresh(augmented))
 
     def predict(self, state, augmented, control, dt):
         """Project current forces and apply each original held response."""
-        for group in self.groups:
-            group.predict(state, augmented, control, dt)
+        self._each(lambda group: group.predict(state, augmented, control, dt))
 
     def finish(self, state, augmented, output, dt):
         """Integrate and publish each physical coordinate and body once."""
-        for group in self.groups:
-            group.finish(state, augmented, output, dt)
+        self._each(lambda group: group.finish(state, augmented, output, dt))
 
 
 def install(solver) -> HeldTree:

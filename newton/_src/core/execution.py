@@ -499,11 +499,21 @@ class Beside:
 
     def start(self, work) -> None:
         """Run ``work()`` (its launches) beside the current stream, after what the current stream queued so far."""
+        self.fork()
+        self.run(work)
+
+    def fork(self) -> None:
+        """Start the work beside here: what :meth:`run` launches later follows what the current stream queued so far,
+        and nothing the current stream queues after this."""
+        if self.stream is not None:
+            wp.get_stream(self.device).record_event(self.started)
+            self.stream.wait_event(self.started)
+
+    def run(self, work) -> None:
+        """Run ``work()`` (its launches) beside the current stream, from where :meth:`fork` started it."""
         if self.stream is None:
             work()
             return
-        wp.get_stream(self.device).record_event(self.started)
-        self.stream.wait_event(self.started)
         with wp.ScopedStream(self.stream, sync_enter=False):
             work()
         self.stream.record_event(self.done)
