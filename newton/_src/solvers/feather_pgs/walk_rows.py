@@ -288,7 +288,8 @@ takes the architecture its build is for (``device_arch``), its launch bound the 
 - **The step's unit list**, two waves of the line over the GPU (:func:`support_threads`): the support writer
   (:func:`support_rows_kernel`) at 168, where its four-row walker and the friction triple's metric hold without
   spilling.
-- **The free bodies' units**, their contacts, a unit a thread, two waves of the line: the free-body writer (:func:`write_free_body_rows`) at 128.
+- **The free bodies' units**, their contacts, a unit a thread (its rows on up to four lanes where the contacts leave
+  the threads idle), two waves of the line: the free-body writer (:func:`write_free_body_rows`) at 128.
 """
 
 
@@ -1791,20 +1792,33 @@ walk_body_row = packed_walker(1, False, True, walk_tables((FREE_BODY_WALK,)))
 a row's sides in its ``a``/``b`` order, six entries each."""
 
 
+CONTACT_ROW_LANES = wp.constant(4)
+"""The most lanes a contact's rows take in the free-body writer: its normal, friction pair and spin row."""
+
+
 @cache
 def free_body_contact_rows(split: bool = False) -> wp.Function:
     """The free bodies' contact rows' writer (``free_body_contact_rows``) for a line of packed or ``split`` records
     (:func:`.response_builds_rows.record_writers`).
 
-    Contact ``c``'s rows where the allocation routed it to the free bodies (``path`` 1): the contact's front end formed
-    once (:func:`.contact_input.contact_frame`), then each row's records by the contact law and the row as its own unit
+    Contact ``c``'s rows ``first, first + lanes, ...`` where the allocation routed it to the free bodies (``path`` 1):
+    the contact's front end formed once by each of its lanes (:func:`.contact_input.contact_frame`), then each row's
+    records by the contact law and the row as its own unit
     (:func:`contact_row_unit`), walked by the one unit walker into the free bodies' rows (:data:`walk_body_row`; the
     spin row a torque), with its diagonal ``|z|^2 + cfm``, its incident velocity and its rhs by the row law
     (:func:`.row_kernels.row_bias`), as every writer's, then its streamed record."""
     write_row_record = record_writers(split)[0]
 
     def free_body_contact_rows(
-        sink: RowSink, rows: DenseRows, data: ContactInput, law: PatchRowLaw, bias: RowBias, records: RowRecords, c: int
+        sink: RowSink,
+        rows: DenseRows,
+        data: ContactInput,
+        law: PatchRowLaw,
+        bias: RowBias,
+        records: RowRecords,
+        c: int,
+        first: int,
+        lanes: int,
     ):
         slot = data.slot[c]
         if data.path[c] != 1 or slot < 0:
@@ -1814,8 +1828,10 @@ def free_body_contact_rows(split: bool = False) -> wp.Function:
         count = int(1)
         if data.slots_needed[c] >= 3:
             count = data.slots_needed[c]
+        if first >= count:
+            return
         frame = contact_frame(data, law, c)
-        for row in range(count):
+        for row in range(first, count, lanes):
             walk_body_row(sink, contact_row_unit(data, law, frame, c, row, line, slot + row))
             incident = sink.row_incident[line, slot + row]
             row_bias(rows, bias, line, slot + row, incident)
@@ -1831,8 +1847,9 @@ def write_free_body_rows(device_arch, split: bool = False) -> wp.Kernel:
     """The free bodies' contact rows (the line's packed rows from ``body_base``), once their slots are reserved, built
     for the architecture ``device_arch`` and the line's record form (``split``, :func:`.row_metadata.split_records`):
     ``threads`` lanes stride over the step's contacts (:func:`free_body_contact_rows`, those the allocation routed to
-    the free bodies). Every unit's seeds walk into the free-body sink with the row law after the walk; a unit's rows
-    are its own, so the stride changes no row."""
+    the free bodies), a contact's rows on up to :data:`CONTACT_ROW_LANES` lanes where the contacts leave the threads
+    idle. Every unit's seeds walk into the free-body sink with the row law after the walk; a unit's rows are its own, so
+    neither the stride nor the lanes change a row."""
     contact_rows = free_body_contact_rows(split)
 
     def kernel(
@@ -1844,8 +1861,13 @@ def write_free_body_rows(device_arch, split: bool = False) -> wp.Kernel:
         bias: RowBias,
         records: RowRecords,
     ):
-        for item in range(wp.tid(), data.count[0], threads):
-            contact_rows(sink, rows, data, law, bias, records, item)
+        contacts = data.count[0]
+        # A contact's lanes: as many of its rows as the threads leave each contact (a row a lane at a few contacts,
+        # whose one-thread chain of four rows is the launch's time), one where the contacts fill the threads.
+        lanes = wp.clamp(threads // wp.max(contacts, 1), 1, CONTACT_ROW_LANES)
+        for item in range(wp.tid(), lanes * contacts, threads):
+            part = item // contacts
+            contact_rows(sink, rows, data, law, bias, records, item - part * contacts, part, lanes)
 
     name = "write_free_body_rows" + ("_split" if split else "")
     return python_kernel(kernel, name, launch_bounds=WRITERS["free_body"].bounds(device_arch))

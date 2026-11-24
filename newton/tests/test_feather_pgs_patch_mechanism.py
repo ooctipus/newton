@@ -1529,7 +1529,6 @@ class TestPatchLaunchShapes(unittest.TestCase):
             launched,
             {
                 ("_prepare", 1536, 1536, None),
-                ("_prepare_contacts", 1536, 1536, None),
                 ("_build", 2048, 2048, 32),
                 ("_count_regions", 1536, 1536, None),
                 ("_list_regions", 1536, 1536, None),
