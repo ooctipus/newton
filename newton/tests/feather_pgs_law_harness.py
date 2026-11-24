@@ -51,7 +51,7 @@ from newton._src.solvers.feather_pgs.row_slots import (
     RESERVE_LANES,
     RowOrder,
     admit_world_contacts,
-    reserve_world_rows,
+    reserve_world_rows_kernel,
     row_groups,
 )
 from newton._src.solvers.feather_pgs.tree_scan import WalkClass
@@ -1564,6 +1564,7 @@ def allocate_contacts(operands, device) -> None:
 
     lanes = int(RESERVE_LANES) if device.is_cuda else 1
     wp.launch(admit_world_contacts, dim=n, inputs=args(admit_world_contacts), device=device)
+    reserve_world_rows = reserve_world_rows_kernel(False)
     wp.launch(
         reserve_world_rows,
         dim=worlds * lanes,

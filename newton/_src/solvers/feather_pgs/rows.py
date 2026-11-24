@@ -63,7 +63,7 @@ from .row_slots import (
     RESERVE_BLOCK,
     RESERVE_LANES,
     admit_world_contacts,
-    reserve_world_rows,
+    reserve_world_rows_kernel,
 )
 from .sweep_plan import FREE_ROUTE
 
@@ -773,7 +773,7 @@ class RowLaws:
             # pass_words[1], Placement.bound_topology). The listed worlds' count itself is written after the updater,
             # so it cannot size the launch.
             pool.launch(
-                reserve_world_rows,
+                reserve_world_rows_kernel(placement.row_groups.colors.shape[0] > 0),
                 solver.forest.world_count * lanes,
                 inputs=[
                     contact_input,

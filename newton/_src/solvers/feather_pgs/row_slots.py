@@ -4,6 +4,8 @@
 """The row store's slots: each contact's admission and its rows' reservation, the contact runs that order a
 world's rows under sorted contacts, and the counts with their capacity status."""
 
+from functools import cache
+
 import numpy as np
 import warp as wp
 
@@ -913,197 +915,206 @@ def _group_rows(
     lane_sync(RESERVE_LANES)
 
 
-@wp.kernel(enable_backward=False, module="unique")
-def reserve_world_rows(
-    data: ContactInput,
-    max_constraints: int,
-    mf_max_constraints: int,
-    row_capacity_telemetry: int,
-    order: RowOrder,
-    groups: RowGroups,
-    world_slot_counter: wp.array[int],
-    mf_slot_counter: wp.array[int],
-    contact_worlds: wp.array[int],
-    # outputs
-    contact_worlds_listed: wp.array[int],
-    dense_dropped_contact_rows: wp.array[int],
-    mf_dropped_contact_rows: wp.array[int],
-    dense_first_rejected_slot: wp.array[int],
-    mf_first_rejected_slot: wp.array[int],
-    units: wp.array2d[int],
-    contact_rows_kept: wp.array2d[int],
-):
-    """Reserve the rows of every admitted contact (:func:`admit_world_contacts`) in its world's row order, so a world's
-    rows follow its contacts' geometry (the frame's pair and contact keys), never the order the collision's threads
-    wrote them in: a listed world (``contact_worlds``, the admission's, counted in ``contact_worlds_listed[0]``) a lane
-    group (:data:`RESERVE_LANES`), one launch, which a replay runs at the contact count's lane groups, at most a
-    world's (none on a step without contacts): every listed world holds a contact, and the list's own count is written
-    after the replay's updater, so it cannot size the launch. The groups past the list return; the last listed group to
-    finish clears the list for the next step (``contact_worlds_listed[1]`` counts them).
+@cache
+def reserve_world_rows_kernel(grouped: bool):
+    """The reservation kernel (:func:`reserve_world_rows`, its body below): ``grouped`` where the model holds worlds
+    that can take the dense line by colors of groups (a slot of :class:`RowGroups`), whose reservations group them;
+    without, the kernel holds none of the grouping's code (a one-warp walk over a world's pairs that the others never
+    take, whose code alone cost the cube pile's one-world reservation 70% more time)."""
 
-    A world's contacts lie in one run of the frame's positions (``order.world_contact_first`` to
-    ``order.world_contact_last``, which the admission recorded; a contact of no world may lie between them). The
-    lanes take it in passes. In the frame's order, each contact's rows of the four lists before it and its body pair
-    (a pair heads at the run's first position or at a change of the frame's pair key, admitted or not: a pair's
-    contacts share their bodies, so they respond alike), each pair's head, which joins the trees it touches. Then the
-    world's islands (:func:`_order_islands`), each island's pairs at a golden-ratio stride over their own ranks. In
-    that row order, each pair's rows before it (each pair's contacts together in frame order). Then each contact's
-    slot, each pair's head restoring its trees. The islands' order is a function of the frame's pairs alone, so a
-    build that keeps the last build's frame (``order.frame_kept``) reads the order the last reservation left and
-    joins no trees.
+    @wp.kernel(enable_backward=False, module="unique")
+    def reserve_world_rows(
+        data: ContactInput,
+        max_constraints: int,
+        mf_max_constraints: int,
+        row_capacity_telemetry: int,
+        order: RowOrder,
+        groups: RowGroups,
+        world_slot_counter: wp.array[int],
+        mf_slot_counter: wp.array[int],
+        contact_worlds: wp.array[int],
+        # outputs
+        contact_worlds_listed: wp.array[int],
+        dense_dropped_contact_rows: wp.array[int],
+        mf_dropped_contact_rows: wp.array[int],
+        dense_first_rejected_slot: wp.array[int],
+        mf_first_rejected_slot: wp.array[int],
+        units: wp.array2d[int],
+        contact_rows_kept: wp.array2d[int],
+    ):
+        """Reserve the rows of every admitted contact (:func:`admit_world_contacts`) in its world's row order, so a world's
+        rows follow its contacts' geometry (the frame's pair and contact keys), never the order the collision's threads
+        wrote them in: a listed world (``contact_worlds``, the admission's, counted in ``contact_worlds_listed[0]``) a lane
+        group (:data:`RESERVE_LANES`), one launch, which a replay runs at the contact count's lane groups, at most a
+        world's (none on a step without contacts): every listed world holds a contact, and the list's own count is written
+        after the replay's updater, so it cannot size the launch. The groups past the list return; the last listed group to
+        finish clears the list for the next step (``contact_worlds_listed[1]`` counts them).
 
-    The row order is the Gauss-Seidel order, so a body's rows must not move with rows it does not share an island
-    with: two bodies that never touch must not change each other's motion. An island's order is a function of its own
-    pairs' keys alone, and pairs of different islands share no tree, so whatever else the world holds leaves every
-    island's sweep as it was. Within an island the stride spreads the pairs: a sorted frame lays a body's pairs side
-    by side, and their rows in that order chain through shared bodies into a deep trace for the colored sweeps, while
-    a pair's own contacts, which share both bodies, chain whatever their order and converge best together. It reads
-    only the frame's keys and the bodies' response, so a contact's admission moves no other's rows, and nor does a
-    contact that can never take rows.
+        A world's contacts lie in one run of the frame's positions (``order.world_contact_first`` to
+        ``order.world_contact_last``, which the admission recorded; a contact of no world may lie between them). The
+        lanes take it in passes. In the frame's order, each contact's rows of the four lists before it and its body pair
+        (a pair heads at the run's first position or at a change of the frame's pair key, admitted or not: a pair's
+        contacts share their bodies, so they respond alike), each pair's head, which joins the trees it touches. Then the
+        world's islands (:func:`_order_islands`), each island's pairs at a golden-ratio stride over their own ranks. In
+        that row order, each pair's rows before it (each pair's contacts together in frame order). Then each contact's
+        slot, each pair's head restoring its trees. The islands' order is a function of the frame's pairs alone, so a
+        build that keeps the last build's frame (``order.frame_kept``) reads the order the last reservation left and
+        joins no trees.
 
-    A contact takes the next rows of its family in its world's line: the dense rows, or the free bodies' (``path`` 1),
-    which follow the dense class's (one row index for both classes); the contacts with an immovable side first
-    (:func:`_immovable_side`), then the others, each in the world's row order. Supports first is the order a sweep
-    propagates a stack's load in from the ground up. A contact's slot is its first row. A world of many trees with a
-    slot of ``groups`` places its dense contact rows by colors of groups instead where its groups meet the rule
-    (:class:`RowGroups`, :func:`_group_rows`), each pair's rows still together.
+        The row order is the Gauss-Seidel order, so a body's rows must not move with rows it does not share an island
+        with: two bodies that never touch must not change each other's motion. An island's order is a function of its own
+        pairs' keys alone, and pairs of different islands share no tree, so whatever else the world holds leaves every
+        island's sweep as it was. Within an island the stride spreads the pairs: a sorted frame lays a body's pairs side
+        by side, and their rows in that order chain through shared bodies into a deep trace for the colored sweeps, while
+        a pair's own contacts, which share both bodies, chain whatever their order and converge best together. It reads
+        only the frame's keys and the bodies' response, so a contact's admission moves no other's rows, and nor does a
+        contact that can never take rows.
 
-    Counters only grow (each world's lane 0 adds every contact's rows once its slots are taken, and clears the world's
-    run for the next step): a contact whose rows do not fit records its slot in the family's ``*_first_rejected_slot``
-    (per world, preset to a large value), and every later contact's rows start past it, so the finalize kernels
-    truncate the row count there; such a contact has no rows (``slot`` and ``path`` -1). Where the one writer takes the
-    rows (``units`` holds the placement's unit sources; empty otherwise), each dense row's unit source is written with
-    its slot.
+        A contact takes the next rows of its family in its world's line: the dense rows, or the free bodies' (``path`` 1),
+        which follow the dense class's (one row index for both classes); the contacts with an immovable side first
+        (:func:`_immovable_side`), then the others, each in the world's row order. Supports first is the order a sweep
+        propagates a stack's load in from the ground up. A contact's slot is its first row. A world of many trees with a
+        slot of ``groups`` places its dense contact rows by colors of groups instead where its groups meet the rule
+        (:class:`RowGroups`, :func:`_group_rows`), each pair's rows still together.
 
-    Each listed world records the rows its contacts added by class (``contact_rows_kept``; -1 in the dense class where
-    a row was rejected), which a later step of the collision pass that keeps the world's slots adds instead
-    (:func:`.placement._bound_topology`): only the worlds that do not keep them are listed, and a step where none
-    reserves launches none (its extent is zero).
-    """
-    lanes = lane_stride(RESERVE_LANES)
-    lane = lane_index(RESERVE_LANES)
-    listed = contact_worlds_listed[0]
-    item = wp.tid() // lanes
-    if item >= listed:
-        return
-    world = contact_worlds[item]
-    # A kept frame's islands are ordered: the last reservation, of the same frame, left their order in row_pairs.
-    kept = order.frame_kept[0]
-    first = order.world_contact_first[world]
-    end = wp.min(order.world_contact_last[world] + 1, data.count[0])
-    # The frame's order: each contact's rows before it and its pair, each pair's head.
-    rows = wp.vec4i(0)
-    pairs = int(0)
-    for base in range(first, end, lanes):
-        c = base + lane
-        mine = bool(False)
-        heads = bool(False)
-        own = wp.vec4i(0)
-        if c < end:
-            if data.world[c] == world:
-                mine = True
-                heads = c == first or order.pair_keys[c] != order.pair_keys[c - 1]
-                own = _contact_rows(data, c)
-        votes = lane_ballot(heads, RESERVE_LANES)
-        lower = _lane_scan4(own)
-        if mine:
-            pair = pairs + lane_below(votes, RESERVE_LANES) + wp.where(heads, 1, 0) - 1
-            order.pairs_before[c] = pair
-            order.rows_frame[c] = rows + lower
-            if heads:
-                order.pairs[first + pair] = c
-                if kept == 0:
-                    # The pair joins its trees' islands (_order_islands).
-                    sides = row_sides(data.art0[c], data.art1[c], data.response_dofs)
-                    order.pair_sides[first + pair] = sides
-                    if sides[1] >= 0:
-                        union_find.union(order.island_parent, sides[0], sides[1])
-        rows = rows + _lane_sum4(own)
-        pairs += lane_count(votes, RESERVE_LANES)
-    lane_sync(RESERVE_LANES)
-    if kept == 0:
-        _order_islands(data, order, first, pairs, lanes, lane)
-    # The row order: each pair's rows before it.
-    seen = wp.vec4i(0)
-    for base in range(0, pairs, lanes):
-        q = base + lane
-        own = wp.vec4i(0)
-        head = int(-1)
-        if q < pairs:
-            j = order.row_pairs[first + q]
-            head = order.pairs[first + j]
-            own = _pair_rows(order, first, pairs, rows, j)
-        before = seen + _lane_scan4(own)
-        if head >= 0:
-            order.rows_before[head] = before
-        seen = seen + _lane_sum4(own)
-    lane_sync(RESERVE_LANES)
-    # A world of many trees: its dense contact rows by colors of groups, where it takes them (RowGroups).
-    if groups.slot.shape[0] > 0:
-        group_slot = groups.slot[world]
-        if group_slot >= 0:
-            _group_rows(order, groups, group_slot, first, pairs, rows, world_slot_counter[world], lanes, lane)
-    # Each admitted contact's slot; each pair's head restores its trees (_order_islands' starting state).
-    for c in range(first + lane, end, lanes):
-        if data.world[c] != world:
-            continue
-        pair = first + order.pairs_before[c]
-        head = order.pairs[pair]
-        if kept == 0 and head == c:
-            sides = order.pair_sides[pair]
-            for side in range(2):
-                if sides[side] >= 0:
-                    order.island_parent[sides[side]] = sides[side]
-                    order.island_size[sides[side]] = 0
-        path = data.path[c]
-        if path < 0:
-            continue
-        before = order.rows_before[head] + order.rows_frame[c] - order.rows_frame[head]
-        k = int(0)
-        if path != 0:
-            k = 1
-        offset = before[k]
-        if not _immovable_side(data, c):
-            # Past the world's rows of the family with an immovable side.
-            offset = rows[k] + before[k + 2]
-        n = data.slots_needed[c]
-        if path != 0:
-            slot = mf_slot_counter[world] + offset
-            if slot + n > mf_max_constraints:
-                wp.atomic_min(mf_first_rejected_slot, world, slot)
-                if row_capacity_telemetry != 0:
-                    wp.atomic_add(mf_dropped_contact_rows, world, n)
-                data.slot[c] = -1
-                data.path[c] = -1
+        Counters only grow (each world's lane 0 adds every contact's rows once its slots are taken, and clears the world's
+        run for the next step): a contact whose rows do not fit records its slot in the family's ``*_first_rejected_slot``
+        (per world, preset to a large value), and every later contact's rows start past it, so the finalize kernels
+        truncate the row count there; such a contact has no rows (``slot`` and ``path`` -1). Where the one writer takes the
+        rows (``units`` holds the placement's unit sources; empty otherwise), each dense row's unit source is written with
+        its slot.
+
+        Each listed world records the rows its contacts added by class (``contact_rows_kept``; -1 in the dense class where
+        a row was rejected), which a later step of the collision pass that keeps the world's slots adds instead
+        (:func:`.placement._bound_topology`): only the worlds that do not keep them are listed, and a step where none
+        reserves launches none (its extent is zero).
+        """
+        lanes = lane_stride(RESERVE_LANES)
+        lane = lane_index(RESERVE_LANES)
+        listed = contact_worlds_listed[0]
+        item = wp.tid() // lanes
+        if item >= listed:
+            return
+        world = contact_worlds[item]
+        # A kept frame's islands are ordered: the last reservation, of the same frame, left their order in row_pairs.
+        kept = order.frame_kept[0]
+        first = order.world_contact_first[world]
+        end = wp.min(order.world_contact_last[world] + 1, data.count[0])
+        # The frame's order: each contact's rows before it and its pair, each pair's head.
+        rows = wp.vec4i(0)
+        pairs = int(0)
+        for base in range(first, end, lanes):
+            c = base + lane
+            mine = bool(False)
+            heads = bool(False)
+            own = wp.vec4i(0)
+            if c < end:
+                if data.world[c] == world:
+                    mine = True
+                    heads = c == first or order.pair_keys[c] != order.pair_keys[c - 1]
+                    own = _contact_rows(data, c)
+            votes = lane_ballot(heads, RESERVE_LANES)
+            lower = _lane_scan4(own)
+            if mine:
+                pair = pairs + lane_below(votes, RESERVE_LANES) + wp.where(heads, 1, 0) - 1
+                order.pairs_before[c] = pair
+                order.rows_frame[c] = rows + lower
+                if heads:
+                    order.pairs[first + pair] = c
+                    if kept == 0:
+                        # The pair joins its trees' islands (_order_islands).
+                        sides = row_sides(data.art0[c], data.art1[c], data.response_dofs)
+                        order.pair_sides[first + pair] = sides
+                        if sides[1] >= 0:
+                            union_find.union(order.island_parent, sides[0], sides[1])
+            rows = rows + _lane_sum4(own)
+            pairs += lane_count(votes, RESERVE_LANES)
+        lane_sync(RESERVE_LANES)
+        if kept == 0:
+            _order_islands(data, order, first, pairs, lanes, lane)
+        # The row order: each pair's rows before it.
+        seen = wp.vec4i(0)
+        for base in range(0, pairs, lanes):
+            q = base + lane
+            own = wp.vec4i(0)
+            head = int(-1)
+            if q < pairs:
+                j = order.row_pairs[first + q]
+                head = order.pairs[first + j]
+                own = _pair_rows(order, first, pairs, rows, j)
+            before = seen + _lane_scan4(own)
+            if head >= 0:
+                order.rows_before[head] = before
+            seen = seen + _lane_sum4(own)
+        lane_sync(RESERVE_LANES)
+        # A world of many trees: its dense contact rows by colors of groups, where it takes them (RowGroups).
+        if wp.static(grouped):
+            group_slot = groups.slot[world]
+            if group_slot >= 0:
+                _group_rows(order, groups, group_slot, first, pairs, rows, world_slot_counter[world], lanes, lane)
+        # Each admitted contact's slot; each pair's head restores its trees (_order_islands' starting state).
+        for c in range(first + lane, end, lanes):
+            if data.world[c] != world:
+                continue
+            pair = first + order.pairs_before[c]
+            head = order.pairs[pair]
+            if kept == 0 and head == c:
+                sides = order.pair_sides[pair]
+                for side in range(2):
+                    if sides[side] >= 0:
+                        order.island_parent[sides[side]] = sides[side]
+                        order.island_size[sides[side]] = 0
+            path = data.path[c]
+            if path < 0:
+                continue
+            before = order.rows_before[head] + order.rows_frame[c] - order.rows_frame[head]
+            k = int(0)
+            if path != 0:
+                k = 1
+            offset = before[k]
+            if not _immovable_side(data, c):
+                # Past the world's rows of the family with an immovable side.
+                offset = rows[k] + before[k + 2]
+            n = data.slots_needed[c]
+            if path != 0:
+                slot = mf_slot_counter[world] + offset
+                if slot + n > mf_max_constraints:
+                    wp.atomic_min(mf_first_rejected_slot, world, slot)
+                    if row_capacity_telemetry != 0:
+                        wp.atomic_add(mf_dropped_contact_rows, world, n)
+                    data.slot[c] = -1
+                    data.path[c] = -1
+                else:
+                    data.slot[c] = slot + max_constraints
             else:
-                data.slot[c] = slot + max_constraints
-        else:
-            slot = world_slot_counter[world] + offset
-            if slot + n > max_constraints:
-                wp.atomic_min(dense_first_rejected_slot, world, slot)
-                if row_capacity_telemetry != 0:
-                    wp.atomic_add(dense_dropped_contact_rows, world, n)
-                data.slot[c] = -1
-                data.path[c] = -1
-            else:
-                data.slot[c] = slot
-                if units.shape[0] > 0:
-                    for r in range(n):
-                        units[data.first[world], slot + r] = unit_source(UNIT_CONTACT, 4 * c + r)
-    lane_sync(RESERVE_LANES)
-    if lane == 0:
-        # The world's counters, rejected rows included, and its run cleared for the next step; the last listed world
-        # to finish clears the list (every listed world read its count before).
-        world_slot_counter[world] += rows[0] + rows[2]
-        mf_slot_counter[world] += rows[1] + rows[3]
-        dense = rows[0] + rows[2]
-        rejected = dense_first_rejected_slot[world] != ROW_SLOT_UNBOUNDED
-        if rejected or mf_first_rejected_slot[world] != ROW_SLOT_UNBOUNDED:
-            dense = -1
-        contact_rows_kept[0, world] = dense
-        contact_rows_kept[1, world] = rows[1] + rows[3]
-        order.world_contact_first[world] = _NO_CONTACT
-        order.world_contact_last[world] = -1
-        if wp.atomic_add(contact_worlds_listed, 1, 1) == listed - 1:
-            contact_worlds_listed[0] = 0
-            contact_worlds_listed[1] = 0
+                slot = world_slot_counter[world] + offset
+                if slot + n > max_constraints:
+                    wp.atomic_min(dense_first_rejected_slot, world, slot)
+                    if row_capacity_telemetry != 0:
+                        wp.atomic_add(dense_dropped_contact_rows, world, n)
+                    data.slot[c] = -1
+                    data.path[c] = -1
+                else:
+                    data.slot[c] = slot
+                    if units.shape[0] > 0:
+                        for r in range(n):
+                            units[data.first[world], slot + r] = unit_source(UNIT_CONTACT, 4 * c + r)
+        lane_sync(RESERVE_LANES)
+        if lane == 0:
+            # The world's counters, rejected rows included, and its run cleared for the next step; the last listed world
+            # to finish clears the list (every listed world read its count before).
+            world_slot_counter[world] += rows[0] + rows[2]
+            mf_slot_counter[world] += rows[1] + rows[3]
+            dense = rows[0] + rows[2]
+            rejected = dense_first_rejected_slot[world] != ROW_SLOT_UNBOUNDED
+            if rejected or mf_first_rejected_slot[world] != ROW_SLOT_UNBOUNDED:
+                dense = -1
+            contact_rows_kept[0, world] = dense
+            contact_rows_kept[1, world] = rows[1] + rows[3]
+            order.world_contact_first[world] = _NO_CONTACT
+            order.world_contact_last[world] = -1
+            if wp.atomic_add(contact_worlds_listed, 1, 1) == listed - 1:
+                contact_worlds_listed[0] = 0
+                contact_worlds_listed[1] = 0
+
+    return reserve_world_rows

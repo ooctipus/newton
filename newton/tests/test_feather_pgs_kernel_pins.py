@@ -344,6 +344,11 @@ def _solver_factory_calls():
     # The colored units' slot staging, under each law (the weights a constant of the plan).
     for weighted in (False, True):
         yield "sweep_units.stage_slots", sweep_units.stage_slots.__wrapped__, (weighted,), {}
+    # The reservation, with and without the grouping of many-tree worlds' dense lines.
+    from newton._src.solvers.feather_pgs import row_slots  # noqa: PLC0415
+
+    for grouped in (False, True):
+        yield "row_slots.reserve_world_rows_kernel", row_slots.reserve_world_rows_kernel.__wrapped__, (grouped,), {}
 
     # Parallel tiers: one articulation per world, its response formed in-kernel.
     for rows in (32, 48):
@@ -549,7 +554,7 @@ class TestFeatherPGSKernelPins(unittest.TestCase):
             "sweep_levels._get_mark_independent_sparse_contact_candidates_kernel",
             "sweep_routes_tiers.TierSweep",
             "sweep_routes_tiers.TierSweep[emit]",
-            "row_slots.reserve_world_rows",
+            "row_slots.reserve_world_rows_kernel",
             "walk_rows.slot_rows_kernel",
             "walk_rows.walked_rows_kernel",
         ):
