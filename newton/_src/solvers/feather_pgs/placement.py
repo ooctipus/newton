@@ -39,7 +39,7 @@ from .route_table import first_failed
 from .row_laws import LINK_ROWS
 from .row_metadata import record_layout, split_records
 from .row_records import DENSE_ROWS, ROW_RECORDS, RowSupport
-from .row_slots import ROW_SLOT_UNBOUNDED, RowOrder
+from .row_slots import ROW_SLOT_UNBOUNDED, RowGroups, RowOrder, row_groups
 from .warm_start import ContactCarry, prepare_world_impulses, row_lanes
 
 # FeatherPGS takes no gradients: its kernels compile no adjoints.
@@ -592,6 +592,8 @@ class Placement:
         self.island_parent = wp.array(np.arange(trees, dtype=np.int32), dtype=wp.int32, device=device)
         self.island_size = wp.zeros(trees, dtype=wp.int32, device=device)
         self.island_base = wp.zeros(trees, dtype=wp.vec2i, device=device)
+        # No world's dense line by colors of groups until the sweep takes them (allocate_row_groups).
+        self.row_groups = self._row_groups(np.full(0, -1, dtype=np.int32), 0, 0, 0.0)
         # Allocated once here: per-step allocation is forbidden under CUDA graph capture.
         arrays.allocate(WORLD_ROW_STATE, world=self.forest.world_count)
         arrays.allocate(WORLD_CONTACTS, world=self.forest.world_count)
@@ -639,6 +641,18 @@ class Placement:
         for name in ("island_parent", "island_size", "island_base"):
             setattr(order, name, getattr(self, name))
         return order
+
+    def allocate_row_groups(self, worlds: np.ndarray, min_units: int, need: float) -> None:
+        """The dense line by colors of groups (:class:`.row_slots.RowGroups`) for ``worlds``, a slot each at the
+        line's capacity, by the rule's ``min_units`` and ``need`` (groups a color)."""
+        slot = np.full(self.forest.world_count, -1, dtype=np.int32)
+        slot[worlds] = np.arange(len(worlds), dtype=np.int32)
+        self.row_groups = self._row_groups(slot, len(worlds), min_units, need)
+
+    def _row_groups(self, slot: np.ndarray, slots: int, min_units: int, need: float) -> RowGroups:
+        trees = max(int(self.forest.articulation_response_dof_count.shape[0]), 1) if slots else 0
+        rows = int(self.dense_max_constraints) if slots else 0
+        return row_groups(slot, slots, rows, trees, min_units, need, self.model.device)
 
     def _on_contact_rows(self, rows) -> None:
         """Assign the per-contact buffers at the contact pool's ready rows, on creation and after each growth."""

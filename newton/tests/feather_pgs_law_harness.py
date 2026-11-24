@@ -52,6 +52,7 @@ from newton._src.solvers.feather_pgs.row_slots import (
     RowOrder,
     admit_world_contacts,
     reserve_world_rows,
+    row_groups,
 )
 from newton._src.solvers.feather_pgs.tree_scan import WalkClass
 from newton.tests.unittest_utils import add_function_test, get_test_devices
@@ -1555,6 +1556,8 @@ def allocate_contacts(operands, device) -> None:
     order.island_base = wp.zeros(trees, dtype=wp.vec2i, device=device)
     order.frame_kept = wp.zeros(1, dtype=int, device=device)
     values["order"] = order
+    # No world's dense line by colors of groups (row_slots.RowGroups: the sweep plan's grouped worlds).
+    values["groups"] = row_groups(np.zeros(0, dtype=np.int32), 0, 0, 0, 0, 0.0, device)
 
     def args(kernel):
         return [values[name] for name in inspect.signature(kernel.func).parameters]

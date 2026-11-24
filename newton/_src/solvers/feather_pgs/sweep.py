@@ -1726,17 +1726,18 @@ def end_sweep(
 
 @dataclasses.dataclass(frozen=True)
 class SlotOrder:
-    """A phase's rows ``[0, end)`` in slot order, row ``i`` at a time (the matrix-free sweep's dense rows, the sparse
-    sweep without its active subword, the sparse-diagonal sweep's coupled rows)."""
+    """A phase's rows ``[begin, end)`` in slot order, row ``i`` at a time (the matrix-free sweep's dense rows, the
+    sparse sweep without its active subword, the sparse-diagonal sweep's coupled rows)."""
 
     end: str
+    begin: str = "0"
 
     def inner(self, pad: str) -> str:
         """The visit's indentation inside the loop at ``pad``."""
         return pad + "    "
 
     def wrap(self, visit: str, pad: str) -> str:
-        return f"{pad}for (int i = 0; i < {self.end}; ++i) {{\n{visit}\n{pad}}}"
+        return f"{pad}for (int i = {self.begin}; i < {self.end}; ++i) {{\n{visit}\n{pad}}}"
 
 
 def record_head(word: Callable[[int], str], parent_of: Callable[[str], str]) -> tuple[str, str, str, str]:
@@ -2097,13 +2098,14 @@ class Pipelined:
     end: str
     prologue: Callable[[str], str]
     consume: Callable[[str, str], str]
+    begin: str = "0"
 
     def inner(self, pad: str) -> str:
         return pad + "    "
 
     def wrap(self, visit: str, pad: str) -> str:
         return (
-            f"{self.prologue(pad)}\n{pad}for (int i = 0; i < {self.end}; ++i) {{\n"
+            f"{self.prologue(pad)}\n{pad}for (int i = {self.begin}; i < {self.end}; ++i) {{\n"
             f"{self.consume('i', pad + '    ')}\n{visit}\n{pad}}}"
         )
 
@@ -2232,6 +2234,7 @@ def friction_record_stage(
     record: Callable[[str], str],
     declare: str = "",
     units: tuple[str, str, str] | None = None,
+    block: bool = False,
     pad: str,
 ) -> str:
     """Before the sweeps, form the record of every friction contact of a class's rows ``[0, end)`` at
@@ -2241,7 +2244,8 @@ def friction_record_stage(
     (:func:`formed_friction_laws`). ``declare`` declares what the operator's coordinates read. The colored mapping's
     ``units`` (their count, the ``int4`` of the unit at place ``{}``: its normal row and rows first, and the stride of
     a record's floats) form theirs a thread a unit at ``record(place)``, slot-major, a triple's whenever it has a spin
-    row, with ``W_nt1, W_nt2, W_ns`` last: a unit moves its rows' terms by its normal's change (:class:`UnitZ`)."""
+    row, with ``W_nt1, W_nt2, W_ns`` last: a unit moves its rows' terms by its normal's change (:class:`UnitZ`).
+    A ``block``'s threads (a world a block) form a contact each, else the world's lanes."""
     kind, parent = rows.scan()
     serial = dataclasses.replace(op, lanes=Lanes(1, "0"))
     sums = (
@@ -2291,14 +2295,17 @@ def friction_record_stage(
         ]
         text = f"for (int first = 0; first < {count}; first += (int)blockDim.x) " + _block(head, "")
         return indent(f"{text}\n__syncthreads();", pad)
+    thread, stride, sync = (
+        ("(int)threadIdx.x", "(int)blockDim.x", "__syncthreads();") if block else ("LANE", "STRIDE", "SYNC();")
+    )
     head = [
-        "const int head = first + LANE;",
+        f"const int head = first + {thread};",
         f"if (head < {end} && {kind('head')} == {ROW_FRICTION} && ({parent('head')}) + 1 == head) {{",
         contact,
         "}",
     ]
-    text = f"for (int first = 0; first < {end}; first += STRIDE) " + _block(head, "")
-    return indent(text + "\nSYNC();", pad)
+    text = f"for (int first = 0; first < {end}; first += {stride}) " + _block(head, "")
+    return indent(f"{text}\n{sync}", pad)
 
 
 def formed_friction_laws(name: str, pad: str) -> str:
@@ -2362,16 +2369,17 @@ def _record_consume(rows: WorldRows, op, row: str, end: str, indent: str) -> str
     return "\n".join(lines)
 
 
-def _record_pipeline(rows: WorldRows, op, end: str) -> Pipelined:
-    """A record store's rows ``[0, end)`` in slot order, each row's record loaded a row ahead."""
+def _record_pipeline(rows: WorldRows, op, end: str, begin: str = "0") -> Pipelined:
+    """A record store's rows ``[begin, end)`` in slot order, each row's record loaded a row ahead."""
     z = "float pre_z = 0.0f;\n{pad}" if op.registers else ""
     return Pipelined(
         end,
         lambda pad: (
             f"{pad}int4 {', '.join(f'pre_{name[-1]}' for name in rows.registers)};\n{pad}{z.format(pad=pad)}"
-            f"if ({end} > 0) {{\n{_record_load(rows, op, '0', pad + '    ')}\n{pad}}}"
+            f"if ({end} > {begin}) {{\n{_record_load(rows, op, begin, pad + '    ')}\n{pad}}}"
         ),
         lambda row, pad: _record_consume(rows, op, row, end, pad),
+        begin,
     )
 
 
@@ -2460,9 +2468,10 @@ def rows_block(
     unit: str = "",
     triple_phase: bool = False,
     live: tuple[Velocity, str] | None = None,
+    begin: str = "0",
     pad: str = "        ",
 ) -> str:
-    """The Gauss-Seidel loop over a world's rows of one class ``[0, end)`` in slot order (:class:`WorldRows`): the
+    """The Gauss-Seidel loop over a world's rows of one class ``[begin, end)`` in slot order (:class:`WorldRows`): the
     dense rows on packed rows (:class:`.response_operator.SparseFactor`, to ``m_dense``), each by the row step
     (:func:`row_step`), the free bodies' on their ``Z`` (:func:`.sweep_routes.free_body_rows`, to
     ``mf_contact_end``). Where the rows' records stream, the loop is software-pipelined: each row's record (and, for
@@ -2491,6 +2500,8 @@ def rows_block(
     step = {"end": end, "admission": admission, "metric": metric, "formed": formed, "triple_phase": triple_phase}
     if live is not None and (selected or unit or rows.free or not rows.owned):
         raise ValueError("the live order bounds a dense loop whose own row applies are the only ones inside it")
+    if begin != "0" and (live is not None or selected or rows.free):
+        raise ValueError("a run of rows from a row past the first is a dense loop in slot order")
     if live is not None:
         order = LiveOrder(end, rows, "idle_reach", laws.torsion)
         visit = row_step(rows, op, laws, **step, reach="idle_reach", pad=order.inner(pad + "    "))
@@ -2506,8 +2517,8 @@ def rows_block(
         visit = row_step(rows, op, laws, **step, pad=inner)
         visit = f"{indent(unit, inner)}\n{visit}" if unit else visit
         if rows.record:
-            return f"{pad}{{\n{_record_pipeline(rows, op, end).wrap(visit, pad)}\n{pad}}}"
-        return SlotOrder(end).wrap(visit, pad)
+            return f"{pad}{{\n{_record_pipeline(rows, op, end, begin).wrap(visit, pad)}\n{pad}}}"
+        return SlotOrder(end, begin).wrap(visit, pad)
     ctx = RowContext(
         row="i",
         kind="mf_rt",
@@ -2644,6 +2655,7 @@ def impulse_seed(
     sync: str,
     *,
     declare: tuple[str, ...] = (),
+    begin: str = "0",
     pad: str = "    ",
 ) -> str:
     """Give the velocity change the response of the impulses a sweep starts from, ``du = sum_i Z_i lambda_i``, row by
@@ -2651,15 +2663,16 @@ def impulse_seed(
     ``sync`` serializes the rows.
 
     Args:
-        count: The rows.
+        count: The rows' end.
         impulse: Row ``i``'s impulse.
         apply: ``du += Z_i seed`` (the operator's ``axpy`` of row ``i``, indented for this block).
         sync: The lanes' barrier after a row.
         declare: Statements row ``i``'s ``apply`` needs.
+        begin: The rows' first.
         pad: Indentation of the emitted statements.
     """
     lines = [
-        f"for (int i = 0; i < {count}; ++i) {{",
+        f"for (int i = {begin}; i < {count}; ++i) {{",
         *(f"    {line}" for line in declare),
         f"    const float seed = {impulse};",
         "    if (seed != 0.0f) {",

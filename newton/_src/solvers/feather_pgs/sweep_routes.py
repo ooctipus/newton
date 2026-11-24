@@ -1398,6 +1398,7 @@ def mf_gs_staging(
     max_world_dofs: int,
     *,
     colored: bool = False,
+    grouped: bool = False,
     regions: bool = False,
     places: RowPlaces = STAGED_ROWS,
     traces: bool = False,
@@ -1413,7 +1414,7 @@ def mf_gs_staging(
     reuse: the world's velocity, its dense rows' and the free bodies' run's (``free_rows``) impulses at ``places``, the
     dense rows' staged metadata, ``colored`` the colors' staged offsets (and its trace's warp maxima), ``active_rows``
     the active enumeration's bitsets, ``coordinate_levels`` the leveled units' marks, for ``groups`` worlds of ``lanes``
-    lanes."""
+    lanes; ``grouped`` a block a world as ``colored``, its trace's warp maxima."""
     # A packed row's sides stage with its metadata (the classes' word takes the widths' place).
     sides = None if wide_rows else "widths"
     dense = WorldRows(
@@ -1435,6 +1436,8 @@ def mf_gs_staging(
         levels = () if regions else (Buffer("s_ran", "int", ran_slots(max_world_dofs)),)
         if traces:
             levels += block_argmax(COLORED_THREADS // 32, warp="warp", lane="lane")[1]
+    elif grouped and traces:
+        levels = block_argmax(COLORED_THREADS // 32, warp="warp", lane="lane")[1]
     # The world's velocity change, staged unless it lives in global memory (RowPlaces.velocity).
     velocity = (
         (
@@ -1452,7 +1455,7 @@ def mf_gs_staging(
             *(active_words(max_constraints) if active_rows else ()),
             *((Buffer("s_level_mark", "int", (max_constraints + 31) // 32),) if coordinate_levels else ()),
         ),
-        **({"threads": COLORED_THREADS} if colored else {"threads": lanes * groups}),
+        **({"threads": COLORED_THREADS} if colored or grouped else {"threads": lanes * groups}),
         **({"groups": groups, "layout": "arrays"} if groups > 1 else {}),
     )
 
@@ -1466,6 +1469,38 @@ a world wait for the warp-mate it shares lanes with), so only its start's 32-bit
 one thread keeps no cost: its worlds run one at a time."""
 
 
+GROUP_WARPS = sweep_units.GROUP_WARPS
+"""The warps of a grouped world's block (:func:`group_rows`), its :data:`COLORED_THREADS`: a group each at once."""
+if COLORED_THREADS != 32 * GROUP_WARPS:
+    raise ValueError("a grouped world's block holds the colored mapping's threads, a warp a group")
+
+
+def group_rows(loop: Callable[[str, str, str], str], pad: str) -> str:
+    """A grouped world's dense rows (:class:`.row_slots.RowGroups`) by its block: the rows before its first group (the
+    topology's: limits, links, mimics) in order on the first warp, then its colors in turn, a color's groups a warp
+    each, its rows in order (``loop(begin, end, pad)``: the rows ``[begin, end)``), a barrier after each. A color's
+    groups share no tree, so they write no coordinate another reads: the colors' order is the sweep's."""
+    inner = "        "
+    text = f"""{{
+    if (warp == 0) {{
+        const int row_begin = 0;
+        const int row_end = min(group_rows[group_offsets[0]], m_dense);
+{loop("row_begin", "row_end", inner)}
+    }}
+    __syncthreads();
+    for (int color = 0; color < group_colors; ++color) {{
+        const int color_end = group_offsets[color + 1];
+        for (int group = group_offsets[color] + warp; group < color_end; group += {GROUP_WARPS}) {{
+            const int row_begin = min(group_rows[group], m_dense);
+            const int row_end = min(group_rows[group + 1], m_dense);
+{loop("row_begin", "row_end", inner + "    ")}
+        }}
+        __syncthreads();
+    }}
+}}"""
+    return indent(text, pad)
+
+
 def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     """The native body of the matrix-free Gauss-Seidel sweep and its staging: a world's dense rows
     (:func:`packed_operator`) and free-body rows (:func:`free_body_rows`), then its end-of-sweep passes, on the world's
@@ -1475,7 +1510,9 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     places, solve_policy = sweep.places, sweep.solve_policy
     contact_torsion, seeded, wide_rows = sweep.torsion, sweep.seeded, sweep.wide_rows
     free_rows, max_row_dofs = sweep.free_rows, sweep.max_row_dofs
-    colored = sweep.colored
+    colored, grouped = sweep.colored, sweep.grouped
+    # A world a block: the colored mapping's, or the dense line by colors of groups (group_rows).
+    block = colored or grouped
     lanes = sweep.lanes
     M_D, M_MF, D = sweep.max_constraints, sweep.mf_max_constraints, sweep.max_world_dofs
     # The row store's line: the dense rows, then the free bodies' from M_D (:mod:`.row_records`).
@@ -1526,7 +1563,10 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         # The dense contacts' records: formed here, or by the stage launch that runs this text without its sweeps
         # ahead of it (``formed``), so the sweep's own code holds none of the formation.
         if sweep.formed != "ahead":
-            metric_stage = friction_record_stage(dense, dense_op, end="m_dense", record=dense_record, pad="    ") + "\n"
+            metric_stage = (
+                friction_record_stage(dense, dense_op, end="m_dense", record=dense_record, block=grouped, pad="    ")
+                + "\n"
+            )
         if free_rows and not colored and not sweep.regions and sweep.formed != "stage":
 
             def free_record(row: str) -> str:
@@ -1538,7 +1578,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
             )
             metric_stage += stage + "\n"
 
-    if colored:
+    if block:
         # The block's vote: every warp's rows and units (a barrier); the first thread records the solve.
         quiet = "!__syncthreads_or(iteration_changed != 0)"
         # Under regions a join where the budget ends takes a sweep more (region_verify).
@@ -1631,6 +1671,20 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
             "\n    float* const unit_record_line = friction_metric.data + static_cast<size_t>(line) * "
             f"friction_metric.shape[1] * {FRICTION_METRIC_FLOATS};"
         )
+    elif grouped:
+        # The world's groups (sweep_routes.group_rows): its colors' first groups and its groups' first rows.
+        free_phase = ""
+        metric_build = ""
+        trace_reduction = ""
+        if solve_policy.traces:
+            trace_reduction = block_argmax(COLORED_THREADS // 32, warp="warp", lane="lane")[0]
+        offsets = (
+            "\n    const int group_slot = row_group_slot.data[world];"
+            "\n    const int group_colors = row_group_colors.data[group_slot];"
+            "\n    const int* const group_offsets = row_group_offsets.data + "
+            "(size_t)group_slot * row_group_offsets.shape[1];"
+            "\n    const int* const group_rows = row_group_rows.data + (size_t)group_slot * row_group_rows.shape[1];"
+        )
     else:
         violation = active_violation(dense, dense_op, count="m_dense") if sweep.active_rows else None
         # The world's own cycles (its cost class, sweep_levels.COST_CLASSES): read at each sweep's end inside the
@@ -1654,18 +1708,22 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
             free_phase = rows_block(free, free_op, laws, metric=metric, formed=free_record, pad="    ")
         offsets = trace_reduction = metric_build = ""
 
-    thread, threads = ("tid", "(int)blockDim.x") if colored else ("lane", "STRIDE")
+    thread, threads = ("tid", "(int)blockDim.x") if block else ("lane", "STRIDE")
     seed = ""
     if seeded:
-        seeds = (
-            impulse_seed(
-                "m_dense",
+
+        def dense_seed(begin: str, end: str, pad: str) -> str:
+            return impulse_seed(
+                end,
                 dense.peek("i"),
                 dense_op.axpy((("row", "seed"),), "        ", row="i"),
                 row_lanes.sync(),
                 declare=tuple(line for line in dense.visit("i").split("\n") if line),
-            ),
-        )
+                begin=begin,
+                pad=pad,
+            )
+
+        seeds = (group_rows(dense_seed, "    ") if grouped else dense_seed("0", "m_dense", "    "),)
         seeds += (
             (
                 impulse_seed(
@@ -1689,7 +1747,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
             if free_rows and not sweep.regions
             else ()
         )
-        seed = f"{first_warp}{chr(10).join(seeds)}\n{end_first_warp}    {barrier}\n"
+        seed = f"{seeds[0]}\n" if grouped else f"{first_warp}{chr(10).join(seeds)}\n{end_first_warp}    {barrier}\n"
     # Wide rows, which the bilateral block corrected, can be collinear (a jammed loop), and collinear rows can trade
     # impulses forever with no effect on the velocity, each loud alone. The velocity is the solve's answer, so a wide
     # sweep also ends when no coordinate moved past the exit law's floor of the largest one: factor coordinates share
@@ -1712,7 +1770,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
 """
     admission = ""
     triples = ""
-    if contact_torsion and sweep.one_tree and not colored:
+    if contact_torsion and sweep.one_tree and not block:
         # Every world holds one tree: K1's order. The row loop solves every contact's normal and every other row, then
         # the friction triples follow in the shared phase (sweep.triple_phase), each on its contact's record.
         spin = dense.spin_of(dense.parent("i", enclosed=True), "m_dense")
@@ -1741,7 +1799,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     # The warp mapping's dense rows step to the rows that can act (sweep.LiveOrder) where their applies are the only
     # ones inside their loop.
     live = None
-    if dense.owned and not (units or sweep.active_rows or colored):
+    if dense.owned and not (units or sweep.active_rows or block):
         live = (dense_op.velocity, str(D))
     dense_phase = rows_block(
         dense,
@@ -1756,6 +1814,22 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         live=live,
         pad="        ",
     )
+    if grouped:
+        # A run of the world's rows: the topology rows on the first warp, then each group's on its warp.
+        dense_phase = group_rows(
+            lambda begin, end, pad: rows_block(
+                dense,
+                dense_op,
+                laws,
+                metric=metric,
+                formed=dense_record,
+                unit=units,
+                end=end,
+                begin=begin,
+                pad=pad,
+            ),
+            "        ",
+        )
     if units and sweep.contact_units:
         dense_phase = f"        int consumed_tangent = -1;\n{dense_phase}"
     if sweep.active_rows:
@@ -1767,10 +1841,15 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         )
         dense_phase = f"        SYNC();\n{indent(scan, '        ')}\n{dense_phase}"
         metric_build += "\n" + active_selection(dense, count="m_dense", linked=True, pad="    ")
+    dense_sweep = (
+        dense_phase
+        if grouped
+        else f"{first_warp}{level_phase}{chr(10) if level_phase else ''}{dense_phase}\n{end_first_warp}"
+        + ("        __syncthreads();" if colored else "")
+    )
     sweeps = level_loop(
         (
-            f"{first_warp}{level_phase}{chr(10) if level_phase else ''}{dense_phase}\n{end_first_warp}"
-            + ("        __syncthreads();" if colored else ""),
+            dense_sweep,
             triples,
             indent(free_phase, "    "),
         ),
@@ -1851,7 +1930,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     }}{free_loads}
     for (int d = lane; d < {D}; d += STRIDE) s_v[d] = 0.0f;
 {end_first_warp}    {barrier}
-{seed}{first_warp}{metric_stage}{end_first_warp}{metric_build}{chr(10) if level_marks else ""}{level_marks}
+{seed}{metric_stage if grouped else first_warp + metric_stage + end_first_warp}{metric_build}{chr(10) if level_marks else ""}{level_marks}
 {rest}"""
     # The rows' layout is the configuration's: rows as wide as the world (and no classes) sit at their coordinates.
     packed = PACKED_SIDES_DENSE if not sweep.support_classes and max_row_dofs == D else PACKED_SIDES_BY_SIDE
@@ -1890,7 +1969,9 @@ class GeneralSweep(SweepConfig):
     - ``seeded``: the seed; ``pitch``: the line.
 
     The warp mapping: ``lanes_per_world`` lanes a world in blocks of ``block_warps`` warps (one thread on the CPU); the
-    colored one a block of :data:`COLORED_THREADS`. Each walks its claim's bucket (:func:`worlds`).
+    colored one a block of :data:`COLORED_THREADS`; the ``grouped`` one (a world of many trees whose reservation placed
+    its dense line by colors of groups, :class:`.row_slots.RowGroups`) a block of as many threads, a color's groups a
+    warp each (:func:`group_rows`). Each walks its claim's bucket (:func:`worlds`).
     """
 
     max_constraints: int
@@ -1915,6 +1996,7 @@ class GeneralSweep(SweepConfig):
     regions: bool = False
     formed: str = "inline"
     world_blocks: bool = False
+    grouped: bool = False
 
     def __post_init__(self):
         if self.regions and not self.free_rows:
@@ -1945,6 +2027,20 @@ class GeneralSweep(SweepConfig):
             raise ValueError(
                 "the colored mapping visits every dense row in turn, a world a block: its exit votes over it"
             )
+        if self.grouped and (
+            self.colored
+            or self.free_rows
+            or self.active_rows
+            or self.coordinate_levels
+            or self.one_tree
+            or self.block_warps != 1
+            or self.lanes_per_world != 32
+            or self.formed != "inline"
+        ):
+            raise ValueError(
+                "the grouped mapping sweeps the dense line of a world of many trees, a world a block, its colors' "
+                "groups a warp each in slot order, forming its records itself"
+            )
         if self.coordinate_levels and (self.colored or self.active_rows or not self.support_classes):
             raise ValueError("the coordinate levels read the rows' support classes and precede every row in order")
         if self.block_warps not in (1, BLOCK_WARPS):
@@ -1969,7 +2065,7 @@ class GeneralSweep(SweepConfig):
     def lanes(self) -> int:
         """A world's lanes: the colored mapping's block of warps, the warp mapping's ``lanes_per_world`` on CUDA and one
         thread on the CPU (:func:`.execution.device_lanes`), which runs the world on either device."""
-        return 32 if self.colored else device_lanes(self.device_arch, self.lanes_per_world)
+        return 32 if self.colored or self.grouped else device_lanes(self.device_arch, self.lanes_per_world)
 
     @property
     def groups(self) -> int:
@@ -2014,6 +2110,7 @@ class GeneralSweep(SweepConfig):
             + ("_regions" if self.regions else "")
             + {"inline": "", "ahead": "_formed", "stage": "_records"}[self.formed]
             + ("_tree" if self.one_tree else "")
+            + ("_grouped" if self.grouped else "")
             + ("_split" if self.split else "")
             + ("_group" if self.world_blocks else "")
             + "_walk"
@@ -2029,6 +2126,7 @@ class GeneralSweep(SweepConfig):
             self.mf_max_constraints,
             self.max_world_dofs,
             colored=self.colored,
+            grouped=self.grouped,
             regions=self.regions,
             places=self.places,
             traces=self.solve_policy.traces,
@@ -2043,7 +2141,7 @@ class GeneralSweep(SweepConfig):
 
     def dispatch(self, staging: Staging) -> Dispatch:
         # The warp mapping walks the general sweep's cost classes (sweep_levels.COST_CLASSES), the colored one its bucket.
-        classes = not self.colored
+        classes = not (self.colored or self.grouped)
         if self.world_blocks:
             return worlds(lanes=self.lanes, ranks="world_blocks")
         return (
@@ -2080,6 +2178,17 @@ class GeneralSweep(SweepConfig):
             ),
             # Where the free bodies' contacts are regions, their stream.
             *((RowArgument(name, dtype, after="omega") for name, dtype in REGION_OPERANDS) if self.regions else ()),
+            # A grouped world's tables (row_slots.RowGroups).
+            *(
+                (
+                    RowArgument("row_group_slot", wp.array[int], after="omega"),
+                    RowArgument("row_group_colors", wp.array[int], after="omega"),
+                    RowArgument("row_group_offsets", wp.array2d[int], after="omega"),
+                    RowArgument("row_group_rows", wp.array2d[int], after="omega"),
+                )
+                if self.grouped
+                else ()
+            ),
             # Where the world's velocity change lives in global memory, its line a world (RowPlaces.velocity).
             *(
                 (RowArgument("sweep_velocity", wp.array2d[float], after="omega"),)
@@ -2089,7 +2198,11 @@ class GeneralSweep(SweepConfig):
             # Where a world takes a group of blocks, its job words (WIDE_JOB a world, region_phase).
             *((RowArgument("wide_jobs", wp.array[int], after="omega"),) if self.world_blocks else ()),
             # The warp mapping's worlds' costs, which order its next call (sweep_levels.claim_worlds).
-            *((RowArgument("world_cost", wp.array[wp.int32], after="omega"),) if not self.colored else ()),
+            *(
+                (RowArgument("world_cost", wp.array[wp.int32], after="omega"),)
+                if not (self.colored or self.grouped)
+                else ()
+            ),
             *self.law_operands(),
         )
 
@@ -2097,7 +2210,7 @@ class GeneralSweep(SweepConfig):
         """The colored mapping: a block a world of :data:`COLORED_THREADS`, every register a thread may hold (one block
         a multiprocessor). The warp mapping: ``lanes_per_world`` lanes a world on a persistent grid, at the register
         line :data:`WARP_LINE` in blocks of :data:`BLOCK_WARPS` warps."""
-        if self.colored:
+        if self.colored or self.grouped:
             return Work(
                 int(items), lanes=COLORED_THREADS, block=COLORED_THREADS, registers=REGISTERS_PER_THREAD, shared=shared
             )

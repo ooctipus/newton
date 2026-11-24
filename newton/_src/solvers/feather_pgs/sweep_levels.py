@@ -196,6 +196,12 @@ def claim_worlds(
     built: int,
     region: int,
     acts: wp.array[int],
+    group_slot: wp.array[int],
+    group_colors: wp.array[int],
+    group_offsets: wp.array2d[int],
+    group_rows: wp.array2d[int],
+    topology_rows: wp.array[int],
+    grouped: int,
     # outputs: a Queue's (execution.Queue), a bucket a tier, then the general sweep's and the colored candidates'
     items: wp.array[int],
     count: wp.array[int],
@@ -204,7 +210,10 @@ def claim_worlds(
     are dense only and at most ``bound`` into its Jacobi tier's, ``(rows - 1) // width``; any other world with a colored
     storage ``slot`` (``slot[world] >= 0``, :class:`.sweep_units.ColoredUnits`) into ``candidate``, which the unit
     builder walks and splits into the colored bucket and the general one (``candidate`` negative: no colored mapping,
-    and ``slot`` is not read); the rest into the general sweep's cost classes from ``general`` on, by the bits of its
+    and ``slot`` is not read); a world whose dense line its last reservation placed by colors of groups (its
+    ``group_slot``'s ``group_colors``, :class:`.row_slots.RowGroups`) and holds them still (its topology rows end at
+    its first group's row and its rows at its last group's end: a world with no contacts reserves none) into
+    ``grouped``; the rest into the general sweep's cost classes from ``general`` on, by the bits of its
     own cycles in the sweep's last call (``world_cost``, :func:`cost_bucket`). A world without rows takes none, nor one
     none of whose rows can act (its ``acts`` word, :data:`.placement.WORLD_ACTS`) but a candidate: the unit builder
     builds every candidate's units, a function of the collision pass's contact set alone, and claims only those that
@@ -222,7 +231,17 @@ def claim_worlds(
     if m <= 0 and mf <= 0:
         return
     bucket = int(-1)
-    if tier_world(m, mf, bound):
+    group = int(-1)
+    if group_slot.shape[0] > 0:
+        group = group_slot[world]
+    held = False
+    if group >= 0:
+        colors = group_colors[group]
+        if colors > 0:
+            held = group_rows[group, 0] == topology_rows[world] and group_rows[group, group_offsets[group, colors]] == m
+    if held:
+        bucket = grouped
+    elif tier_world(m, mf, bound):
         bucket = (m - 1) // width
     elif candidate >= 0:
         if slot[world] >= 0:

@@ -227,6 +227,7 @@ class StepPlan:
                     "sparse_diagonal": kernel_key(sweep.sparse_diagonal_kernel),
                     "mf_gs": kernel_key(sweep.mf_gs_kernel),
                     "mf_colored": kernel_key(sweep.mf_colored_kernel),
+                    "mf_grouped": kernel_key(sweep.mf_grouped_kernel),
                 }
             ),
             streams=tuple(name for name, stream in streams if stream is not None),

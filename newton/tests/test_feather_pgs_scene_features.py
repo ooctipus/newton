@@ -547,6 +547,49 @@ def test_pile_of_d6_figures_follows_the_ball_jointed_pile(test, device):
     np.testing.assert_allclose(piles["d6"][:90], piles["ball"][:90], atol=1.0e-4)
 
 
+def test_pile_of_figures_sweeps_by_colors_of_groups(test, device):
+    """Forty-eight figures on ball joints (a tree each) dropped in two layers onto the floor: a world of many trees
+    sweeps its dense line by colors of groups (row_slots.RowGroups: up to four body pairs between the same trees,
+    first-fit colors, a warp a group in the world's block), which its reservation takes once the pile holds enough
+    groups; the pile lands finite, every joint closed, nothing sunk into the floor."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -_G))
+    builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=_MU))
+    for figure in range(48):
+        # A metre apart in x (a figure's arms span 0.84 m) and 0.5 m in y (its depth 0.2 m): no figure starts inside
+        # another; the upper layer lands on the lower.
+        offset = np.array([1.0 * (figure % 6), 0.5 * (figure // 6 % 4), 1.6 * (figure // 24)])
+        cfg = newton.ModelBuilder.ShapeConfig(mu=_MU, collision_group=-(figure + 1))
+        bodies = []
+        for _name, centre, half in _FIGURE:
+            bodies.append(builder.add_link(xform=wp.transform(wp.vec3(*(np.add(centre, offset))), wp.quat_identity())))
+            builder.add_shape_box(bodies[-1], hx=half[0], hy=half[1], hz=half[2], cfg=cfg)
+        for limb, pivot in _PIVOTS:
+            builder.add_joint_ball(
+                bodies[0],
+                bodies[limb],
+                parent_xform=wp.transform(wp.vec3(*np.subtract(pivot, _FIGURE[0][1])), wp.quat_identity()),
+                child_xform=wp.transform(wp.vec3(*np.subtract(pivot, _FIGURE[limb][1])), wp.quat_identity()),
+            )
+    model = builder.finalize(device=device, skip_validation_joints=True)
+    solver = newton.solvers.SolverFeatherPGS(model, dense_max_constraints=8192)
+    test.assertIsNotNone(solver.sweep.mf_grouped_kernel, "a world of many trees builds the grouped sweep")
+    pipeline = newton.CollisionPipeline(model)
+    contacts = pipeline.contacts()
+    state_in, state_out, control = model.state(), model.state(), model.control()
+    grouped, gaps = 0, []
+    for _ in range(300):
+        pipeline.collide(state_in, contacts)
+        solver.step(state_in, state_out, control, contacts, _DT)
+        state_in, state_out = state_out, state_in
+        grouped += int(solver.placement.row_groups.colors.numpy()[0] > 0)
+        gaps.append(_joint_gaps(model, state_in.body_q.numpy()).max())
+    poses = state_in.body_q.numpy()
+    test.assertGreater(grouped, 0, "the pile's reservation takes the colors of groups")
+    test.assertTrue(np.isfinite(poses).all())
+    test.assertGreater(poses[:, 2].min(), 0.04, "no box sinks into the floor")
+    test.assertLess(max(gaps), 1.0e-4, "every joint stays closed")
+
+
 class TestFeatherPGSLooseBodies(unittest.TestCase):
     pass
 
@@ -653,6 +696,12 @@ for _fn in (
     test_pile_of_d6_figures_follows_the_ball_jointed_pile,
 ):
     add_function_test(TestFeatherPGSLooseBodies, _fn.__name__, _fn, devices=devices)
+add_function_test(
+    TestFeatherPGSLooseBodies,
+    test_pile_of_figures_sweeps_by_colors_of_groups.__name__,
+    test_pile_of_figures_sweeps_by_colors_of_groups,
+    devices=[device for device in devices if wp.get_device(device).is_cuda],
+)
 for _fn in (
     test_hinge_carries_a_hanging_load,
     test_hinge_wrench_of_a_released_rod,

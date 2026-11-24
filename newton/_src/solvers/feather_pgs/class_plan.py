@@ -23,7 +23,7 @@ from types import MappingProxyType
 import numpy as np
 
 from ...core.memory import arch_budget
-from . import held_tree, host_index, sweep_routes_sparse
+from . import held_tree, host_index, sweep_routes_sparse, sweep_units
 from .route_table import Pins, first_failed
 from .sweep_routes_sparse import _SPARSE_LOCAL_WORKSPACE_BYTES
 from .sweep_routes_tiers import TIER_MAX_ROWS
@@ -337,6 +337,10 @@ def packed_rule(inputs: ClassInputs) -> tuple[Packed | None, str]:
         # A free body beside a tree is a hub, the tiers' (measured: Kuka lift 12.7 ms on the paired response, since
         # retired for the tiers, against 15.5 on sparse factors).
         return None, "Worlds with free rigid bodies keep the dense route for the held-tree owner and the tiers."
+    if sweep_units.grouped_worlds(model, forest, dense_rows)[0].size > 0:
+        # A world of many trees sweeps its groups a color at once (the general sweep's grouped block) where K1 walks
+        # its rows on one warp.
+        return None, "Worlds of many trees take the dense line by colors of groups (sweep_units.grouped_worlds)."
     if shape.blocks != 1:
         return None, "Native sparse factors require one articulated response DOF size."
     size = shape.sizes[0]

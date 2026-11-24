@@ -47,7 +47,7 @@ import numpy as np
 import warp as wp
 
 from ...core.execution import Queue, appended
-from ...core.memory import REFERENCE_ARCH, Buffer, Staging, arch_budget
+from ...core.memory import REFERENCE_ARCH, Buffer, Staging, arch_budget, device
 from . import kernel_template, sweep_levels
 from .device_preludes import SHARED_STORAGE, cuda_native, lane_group
 from .field_group import Field, FieldGroup
@@ -58,6 +58,10 @@ from .sweep_levels import COST_CLASSES
 
 BUILD_WARPS = 8
 """Warps of a world's unit builder block: they share the parallel passes; the first levels the units."""
+
+GROUP_WARPS = 8
+"""Warps of a grouped world's block (:func:`.sweep_routes.group_rows`, the colored mapping's block of
+:data:`.sweep_routes.COLORED_THREADS`): a color's groups a warp each at once."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -382,6 +386,28 @@ class UnitPlan:
             "slot_field": layout.fields,
             "slot_word": layout.words,
         }
+
+
+def grouped_worlds(model, forest, rows: int) -> tuple[np.ndarray, ColoredRule]:
+    """The worlds that can take the dense line by colors of groups (:class:`.row_slots.RowGroups`) and their rule: on
+    CUDA, a world of ``rows`` dense rows a line, no free rigid body (whose resting stacks rock under first-fit colors)
+    and trees with coordinates that fill the grouped block: a color holds at most a group a tree, so a world needs
+    a tree for each of the block's warps (:data:`GROUP_WARPS`; with fewer, every color leaves warps idle
+    and one warp walking its rows serves it) and the colored mapping's units a color (:func:`capable_worlds`), the
+    rule scaled by the waves of grouped blocks, one a multiprocessor (a block of :data:`.sweep_routes.COLORED_THREADS`
+    at every register a thread may hold)."""
+    rule = COLORED_RULE
+    if not model.device.is_cuda:
+        return np.zeros(0, dtype=np.int32), rule
+    worlds = max(int(forest.world_count), 1)
+    trees = np.bincount(forest.articulation_world[forest.response_dof_count > 0], minlength=worlds)[:worlds]
+    free = np.asarray(forest.free_rigid_per_world)[:worlds]
+    trees = np.where((free > 0) | (trees < GROUP_WARPS), 0, trees)
+    capable = capable_worlds(trees, rows, rule)
+    if capable.size > 0:
+        rule = rule.at_scale(capable.size, device(model.device).sms)
+        capable = capable_worlds(trees, rows, rule)
+    return capable, rule
 
 
 def capable_worlds(free_bodies, mf_rows: int, rule: ColoredRule = COLORED_RULE):

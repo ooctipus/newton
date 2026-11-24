@@ -4,6 +4,7 @@
 """The row store's slots: each contact's admission and its rows' reservation, the contact runs that order a
 world's rows under sorted contacts, and the counts with their capacity status."""
 
+import numpy as np
 import warp as wp
 
 from ...core import union_find
@@ -20,12 +21,16 @@ from .contact_laws import (
     jacobian_entry,
 )
 from .device_preludes import (
+    lane_any,
     lane_ballot,
     lane_below,
     lane_count,
+    lane_first,
     lane_index,
     lane_last,
     lane_match,
+    lane_maximum,
+    lane_read,
     lane_scan,
     lane_stride,
     lane_sum,
@@ -451,6 +456,71 @@ class RowOrder:
     frame_kept: wp.array[int]
 
 
+GROUP_MEMBERS = wp.constant(4)
+"""The body pairs of a group (:class:`RowGroups`) at most: a unit of rows between the same two trees."""
+
+GROUP_COLORS = wp.constant(64)
+"""A grouped world's colors at most (:class:`RowGroups`): a tree's used colors are one 64-bit word."""
+
+_NO_KEY = wp.constant(wp.int64(-1))
+
+
+@wp.struct
+class RowGroups:
+    """The dense line of a world of many trees by colors of groups (:func:`_group_rows`), each world's at its slot
+    (``slot``, -1 for a world that cannot take it; the slots' tables row-major at their capacities).
+
+    A group is up to :data:`GROUP_MEMBERS` body pairs of one list (with an immovable side, or the others) that touch
+    the same trees, their rows together; its color the first-fit color at its leader (its first pair) in the row order
+    (the lists in turn, each in the row order): the least color no earlier leader on one of its trees holds. Groups
+    of one color share no tree, so a sweep steps them at once, a warp a group, their rows in order; the colors in
+    turn. A world takes it at a reservation where its groups meet the rule (``min_units`` groups and ``need`` groups a
+    color, the colored mapping's :class:`.sweep_units.ColoredRule`) and its colors fit a word: its contact rows are
+    then placed color-major (each color's groups in their leaders' order, each group's pairs in the row order), else
+    as the row order places them.
+
+    The tables a grouped world's sweep reads: its colors (``colors``, 0 where it is not grouped), each color's first
+    group (``offsets``, the colors' count after), each group's first row (``rows``, its end after the last), rows of
+    the line. The reservation's scratch: each pair of the sequence's head, list, leader and place among its group's
+    (``pairs``), each leader's members' rows (``members``) and its color with its place in it (``places``), each
+    color's groups and rows (``totals``), a key table over the groups' trees and lists (``keys``, ``open``: the pairs
+    counted and the open group's leader), and each tree's colors in use (``used``, zero between reservations)."""
+
+    slot: wp.array[int]
+    colors: wp.array[int]
+    offsets: wp.array2d[int]
+    rows: wp.array2d[int]
+    pairs: wp.array2d[wp.vec4i]
+    members: wp.array2d[int]
+    places: wp.array2d[wp.vec4i]
+    totals: wp.array2d[wp.vec2i]
+    keys: wp.array2d[wp.int64]
+    open: wp.array2d[wp.vec2i]
+    used: wp.array[wp.int64]
+    min_units: int
+    need: float
+
+
+def row_groups(slot, slots: int, rows: int, trees: int, min_units: int, need: float, device) -> RowGroups:
+    """The tables of :class:`RowGroups` for ``slots`` worlds (``slot``: each world's, -1 for none) of ``rows`` dense
+    rows a line and ``trees`` trees, by the rule's ``min_units`` and ``need``; none for no slots."""
+    groups = RowGroups()
+    groups.slot = wp.array(np.asarray(slot, dtype=np.int32), dtype=int, device=device)
+    groups.colors = wp.zeros(slots, dtype=int, device=device)
+    groups.offsets = wp.zeros((slots, int(GROUP_COLORS) + 1), dtype=int, device=device)
+    groups.rows = wp.zeros((slots, rows + 1), dtype=int, device=device)
+    groups.pairs = wp.zeros((slots, rows), dtype=wp.vec4i, device=device)
+    groups.members = wp.zeros((slots, int(GROUP_MEMBERS) * rows), dtype=int, device=device)
+    groups.places = wp.zeros((slots, rows), dtype=wp.vec4i, device=device)
+    groups.totals = wp.zeros((slots, int(GROUP_COLORS)), dtype=wp.vec2i, device=device)
+    groups.keys = wp.zeros((slots, 2 * rows), dtype=wp.int64, device=device)
+    groups.open = wp.zeros((slots, 2 * rows), dtype=wp.vec2i, device=device)
+    groups.used = wp.zeros(trees, dtype=wp.int64, device=device)
+    groups.min_units = int(min_units)
+    groups.need = float(need)
+    return groups
+
+
 @wp.func
 def _contact_rows(data: ContactInput, c: int) -> wp.vec4i:
     """World contact ``c``'s rows in the reservation's four lists: (dense, free bodies') with an immovable side
@@ -600,6 +670,249 @@ def _order_islands(data: ContactInput, order: RowOrder, first: int, pairs: int, 
     lane_sync(RESERVE_LANES)
 
 
+@wp.func
+def _pair_rows(order: RowOrder, first: int, pairs: int, rows: wp.vec4i, j: int) -> wp.vec4i:
+    """Pair ``j``'s rows in the four lists: its contacts' (frame order), to the next pair's head or the world's end."""
+    after = rows
+    if j + 1 < pairs:
+        after = order.rows_frame[order.pairs[first + j + 1]]
+    return after - order.rows_frame[order.pairs[first + j]]
+
+
+@wp.func
+def _group_key_place(groups: RowGroups, slot: int, key: wp.int64, size: int) -> int:
+    """The place of ``key`` in the slot's key table of ``size`` places, claimed where it is new (open addressing; the
+    table holds at least twice the keys, so it never fills)."""
+    mixed = wp.uint64(key) * wp.uint64(11400714819323198485)
+    place = int(wp.int64(mixed >> wp.uint64(33)) % wp.int64(size))
+    while True:
+        held = groups.keys[slot, place]
+        if held == key:
+            return place
+        if held == _NO_KEY:
+            old = wp.atomic_cas(groups.keys, slot, place, _NO_KEY, key)
+            if old == _NO_KEY or old == key:
+                return place
+        place += 1
+        if place == size:
+            place = 0
+    return -1
+
+
+@wp.func
+def _first_free_color(used: wp.int64) -> int:
+    """The least color ``used`` does not hold, :data:`GROUP_COLORS` where it holds every one."""
+    color = int(0)
+    while color < GROUP_COLORS:
+        if (used >> wp.int64(color)) & wp.int64(1) == wp.int64(0):
+            break
+        color += 1
+    return color
+
+
+@wp.func
+def _shares_tree(a: wp.vec2i, b: wp.vec2i) -> bool:
+    """Whether two pairs' sides (:func:`.row_records.row_sides`, the second -1 for none) share a tree."""
+    if a[0] == b[0] or a[0] == b[1]:
+        return True
+    return a[1] >= 0 and (a[1] == b[0] or a[1] == b[1])
+
+
+@wp.func
+def _group_rows(
+    order: RowOrder,
+    groups: RowGroups,
+    slot: int,
+    first: int,
+    pairs: int,
+    rows: wp.vec4i,
+    line_first: int,
+    lanes: int,
+    lane: int,
+):
+    """Group the world's dense pairs, color the groups, and where the world takes the colors (:class:`RowGroups`)
+    place its dense contact rows color-major (each pair's ``rows_before``) and write its tables; else its colors
+    are 0 and the row order's places stand. ``line_first`` is the line's row of the world's first contact row.
+
+    One pass over the sequence a batch of the lanes at a time forms the groups and colors their leaders; one over the
+    leaders places each group in its color and frees the trees' colors; one over the pairs places their rows."""
+    capacity = groups.pairs.shape[1]
+    # A key a pair at most (the pairs past the capacity take none): twice the keys' places.
+    keys = wp.min(2 * pairs, groups.keys.shape[1])
+    for h in range(lane, keys, lanes):
+        groups.keys[slot, h] = _NO_KEY
+        groups.open[slot, h] = wp.vec2i(0, -1)
+    lane_sync(RESERVE_LANES)
+    # The sequence: the pairs with dense rows, the list with an immovable side, then the others, each in the row order.
+    # Each pair's place among its key's (its trees and list) in the sequence, a group every GROUP_MEMBERS of them; each
+    # leader's first-fit color, a leader of the batch once no lower leader of the batch on one of its trees waits.
+    count = int(0)
+    leaders = int(0)
+    colors = int(0)
+    for half in range(2):
+        lst = int(half) * 2
+        for base in range(0, pairs, lanes):
+            q = base + lane
+            head = int(-1)
+            own = int(0)
+            key = wp.int64(-1)
+            sides = wp.vec2i(-1, -1)
+            if q < pairs:
+                j = order.row_pairs[first + q]
+                own = _pair_rows(order, first, pairs, rows, j)[lst]
+                if own > 0:
+                    head = order.pairs[first + j]
+                    sides = order.pair_sides[first + j]
+                    key = (wp.int64(half) << wp.int64(62)) | (wp.int64(sides[0]) << wp.int64(31))
+                    key = key | wp.int64(sides[1] + 1)
+            active = head >= 0
+            s = count + lane_scan(wp.where(active, 1, 0), RESERVE_LANES)
+            if s >= capacity:
+                active = False
+            place = int(-1 - lane)
+            if active:
+                place = _group_key_place(groups, slot, key, keys)
+            peers = lane_match(place, RESERVE_LANES)
+            held = wp.vec2i(0, -1)
+            if active:
+                held = groups.open[slot, place]
+            rank = held[0] + lane_below(peers, RESERVE_LANES)
+            member = rank % GROUP_MEMBERS
+            # A member's leader: the open group's (counted before this batch) or a peer of this batch.
+            source = int(lane)
+            if active and member > 0 and rank - member >= held[0]:
+                skip = rank - member - held[0]
+                rest = wp.uint32(peers)
+                while skip > 0:
+                    rest = rest & (rest - wp.uint32(1))
+                    skip -= 1
+                source = lane_first(rest, RESERVE_LANES)
+            peer = lane_read(s, source, RESERVE_LANES)
+            leader = int(s)
+            if active and member > 0:
+                leader = wp.where(rank - member >= held[0], peer, held[1])
+            waiting = active and member == 0
+            lane_sync(RESERVE_LANES)
+            if active:
+                groups.pairs[slot, s] = wp.vec4i(head, lst, leader, member)
+                if lane_last(peers, RESERVE_LANES) == lane:
+                    groups.open[slot, place] = wp.vec2i(rank + 1, leader)
+                if waiting:
+                    groups.members[slot, GROUP_MEMBERS * s] = own
+                    for m in range(1, GROUP_MEMBERS):
+                        groups.members[slot, GROUP_MEMBERS * s + m] = 0
+            lane_sync(RESERVE_LANES)
+            if active and member > 0:
+                groups.members[slot, GROUP_MEMBERS * leader + member] = own
+            # The batch's lower leaders that share a tree with this one.
+            lower = wp.uint32(0)
+            for k in range(lanes):
+                other = wp.vec2i(lane_read(sides[0], k, RESERVE_LANES), lane_read(sides[1], k, RESERVE_LANES))
+                other_leads = lane_read(wp.where(waiting, 1, 0), k, RESERVE_LANES)
+                if k < lane and waiting and other_leads != 0 and _shares_tree(sides, other):
+                    lower = lower | (wp.uint32(1) << wp.uint32(k))
+            while lane_any(waiting, RESERVE_LANES):
+                votes = lane_ballot(waiting, RESERVE_LANES)
+                if waiting and (votes & lower) == wp.uint32(0):
+                    used = groups.used[sides[0]]
+                    if sides[1] >= 0:
+                        used = used | groups.used[sides[1]]
+                    color = _first_free_color(used)
+                    if color < GROUP_COLORS:
+                        bit = wp.int64(1) << wp.int64(color)
+                        groups.used[sides[0]] = groups.used[sides[0]] | bit
+                        if sides[1] >= 0:
+                            groups.used[sides[1]] = groups.used[sides[1]] | bit
+                    # The leader's color and trees, until the leaders' pass places it.
+                    groups.places[slot, s] = wp.vec4i(color, sides[0], sides[1], 0)
+                    colors = wp.max(colors, color + 1)
+                    waiting = False
+                lane_sync(RESERVE_LANES)
+            count += lane_sum(wp.where(active, 1, 0), RESERVE_LANES)
+            leaders += lane_sum(wp.where(active and member == 0, 1, 0), RESERVE_LANES)
+    count = wp.min(count, capacity)
+    colors = int(lane_maximum(float(colors), RESERVE_LANES))
+    takes = (
+        colors <= GROUP_COLORS
+        and leaders >= groups.min_units
+        and float(leaders) >= groups.need * float(colors)
+        and line_first + rows[0] + rows[2] <= capacity
+    )
+    if takes:
+        for c in range(lane, colors, lanes):
+            groups.totals[slot, c] = wp.vec2i(0, 0)
+    lane_sync(RESERVE_LANES)
+    # The leaders in order: each tree's colors freed for the next reservation; where the world takes the colors, each
+    # group's place among its color's groups and rows (a batch at a time), and each color's groups and rows.
+    for base in range(0, count, lanes):
+        s = base + lane
+        color = int(-1 - lane)
+        size = int(0)
+        if s < count:
+            if groups.pairs[slot, s][3] == 0:
+                lead = groups.places[slot, s]
+                groups.used[lead[1]] = wp.int64(0)
+                if lead[2] >= 0:
+                    groups.used[lead[2]] = wp.int64(0)
+                color = lead[0]
+                for m in range(GROUP_MEMBERS):
+                    size += groups.members[slot, GROUP_MEMBERS * s + m]
+        if takes:
+            peers = lane_match(color, RESERVE_LANES)
+            below = int(0)
+            for k in range(lanes):
+                peer_size = lane_read(size, k, RESERVE_LANES)
+                if k < lane and (peers >> wp.uint32(k)) & wp.uint32(1) != wp.uint32(0):
+                    below += peer_size
+            held = wp.vec2i(0, 0)
+            if color >= 0:
+                held = groups.totals[slot, color]
+            lane_sync(RESERVE_LANES)
+            if color >= 0:
+                at = wp.vec4i(color, held[0] + lane_below(peers, RESERVE_LANES), held[1] + below, size)
+                groups.places[slot, s] = at
+                if lane_last(peers, RESERVE_LANES) == lane:
+                    groups.totals[slot, color] = wp.vec2i(
+                        held[0] + lane_count(peers, RESERVE_LANES), held[1] + below + size
+                    )
+        lane_sync(RESERVE_LANES)
+    if not takes:
+        if lane == 0:
+            groups.colors[slot] = 0
+        return
+    # The colors' first groups and rows.
+    if lane == 0:
+        start = wp.vec2i(0, 0)
+        for c in range(colors):
+            total = groups.totals[slot, c]
+            groups.totals[slot, c] = start
+            groups.offsets[slot, c] = start[0]
+            start = start + total
+        groups.offsets[slot, colors] = start[0]
+        groups.rows[slot, start[0]] = line_first + start[1]
+        groups.colors[slot] = colors
+    lane_sync(RESERVE_LANES)
+    # Each pair's rows before it in the line's contact rows (the slot pass adds the list with an immovable side's rows
+    # to the others'), each group's first row.
+    for s in range(lane, count, lanes):
+        pair = groups.pairs[slot, s]
+        lead = groups.places[slot, pair[2]]
+        start = groups.totals[slot, lead[0]]
+        offset = start[1] + lead[2]
+        for m in range(GROUP_MEMBERS):
+            if m < pair[3]:
+                offset += groups.members[slot, GROUP_MEMBERS * pair[2] + m]
+        if pair[3] == 0:
+            groups.rows[slot, start[0] + lead[1]] = line_first + offset
+        b = order.rows_before[pair[0]]
+        if pair[1] == 0:
+            b[0] = offset
+        else:
+            b[2] = offset - rows[0]
+        order.rows_before[pair[0]] = b
+    lane_sync(RESERVE_LANES)
+
+
 @wp.kernel(enable_backward=False, module="unique")
 def reserve_world_rows(
     data: ContactInput,
@@ -607,6 +920,7 @@ def reserve_world_rows(
     mf_max_constraints: int,
     row_capacity_telemetry: int,
     order: RowOrder,
+    groups: RowGroups,
     world_slot_counter: wp.array[int],
     mf_slot_counter: wp.array[int],
     contact_worlds: wp.array[int],
@@ -650,7 +964,9 @@ def reserve_world_rows(
     A contact takes the next rows of its family in its world's line: the dense rows, or the free bodies' (``path`` 1),
     which follow the dense class's (one row index for both classes); the contacts with an immovable side first
     (:func:`_immovable_side`), then the others, each in the world's row order. Supports first is the order a sweep
-    propagates a stack's load in from the ground up. A contact's slot is its first row.
+    propagates a stack's load in from the ground up. A contact's slot is its first row. A world of many trees with a
+    slot of ``groups`` places its dense contact rows by colors of groups instead where its groups meet the rule
+    (:class:`RowGroups`, :func:`_group_rows`), each pair's rows still together.
 
     Counters only grow (each world's lane 0 adds every contact's rows once its slots are taken, and clears the world's
     run for the next step): a contact whose rows do not fit records its slot in the family's ``*_first_rejected_slot``
@@ -716,15 +1032,17 @@ def reserve_world_rows(
         if q < pairs:
             j = order.row_pairs[first + q]
             head = order.pairs[first + j]
-            after = rows
-            if j + 1 < pairs:
-                after = order.rows_frame[order.pairs[first + j + 1]]
-            own = after - order.rows_frame[head]
+            own = _pair_rows(order, first, pairs, rows, j)
         before = seen + _lane_scan4(own)
         if head >= 0:
             order.rows_before[head] = before
         seen = seen + _lane_sum4(own)
     lane_sync(RESERVE_LANES)
+    # A world of many trees: its dense contact rows by colors of groups, where it takes them (RowGroups).
+    if groups.slot.shape[0] > 0:
+        group_slot = groups.slot[world]
+        if group_slot >= 0:
+            _group_rows(order, groups, group_slot, first, pairs, rows, world_slot_counter[world], lanes, lane)
     # Each admitted contact's slot; each pair's head restores its trees (_order_islands' starting state).
     for c in range(first + lane, end, lanes):
         if data.world[c] != world:

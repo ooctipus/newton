@@ -64,6 +64,18 @@ def rounds(resources) -> np.ndarray:
     return np.asarray(out, dtype=np.int64)
 
 
+def _no_groups(device):
+    """The claims' grouped-world inputs of a model without grouped worlds (:class:`.row_slots.RowGroups`)."""
+    return (
+        wp.zeros(0, dtype=int, device=device),
+        wp.zeros(0, dtype=int, device=device),
+        wp.zeros((0, 1), dtype=int, device=device),
+        wp.zeros((0, 1), dtype=int, device=device),
+        wp.zeros(0, dtype=int, device=device),
+        -1,
+    )
+
+
 class World:
     """A world of free bodies (``dofs`` coordinates each) whose units are scalar unilateral rows or contacts (a normal
     and a friction pair on the box of ``mu`` times its impulse), each on one or two bodies; float32 throughout."""
@@ -252,6 +264,7 @@ class TestWorldLists(unittest.TestCase):
                         int(candidates),
                         claims.region,
                         wp.array(acts, dtype=int, device=device),
+                        *_no_groups(device),
                     ],
                     outputs=[claims.items, claims.count],
                     device=device,
@@ -316,6 +329,7 @@ class TestWorldLists(unittest.TestCase):
                         0,
                         lists.region,
                         wp.zeros(0, dtype=int, device=device),
+                        *_no_groups(device),
                     ],
                     outputs=[lists.items, lists.count],
                     device=device,

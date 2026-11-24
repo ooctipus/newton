@@ -377,6 +377,10 @@ class Sweep:
         # The colored mapping of the matrix-free sweep and its units, when a world can take it.
         self.mf_colored_kernel = None
         self.colored_units = None
+        # The dense line by colors of groups (sweep_routes.group_rows), when a world of many trees can take it.
+        self.grouped_sweep = None
+        self.mf_grouped_kernel = None
+        self.claim_grouped = -1
         self.region_slot = None
         self.general_active_reason = None
         # The Jacobi tiers ahead of the matrix-free sweep (their SweepLaunch each).
@@ -534,9 +538,17 @@ class Sweep:
                         if self.sweep_velocity.size < self.forest.world_count * self.forest.max_world_dofs:
                             self.sweep_velocity = self._velocity_lines(colored_declared)
                 colored_sweep = self._staged(colored_declared, capable.size)
+            # A world of many trees on the dense line: its contact rows by colors of groups (row_slots.RowGroups), a
+            # block a world, a color's groups a warp each, for the worlds whose trees can meet the colored mapping's
+            # rule (a color holds a group of the busiest tree: at least groups / trees share one), each taking it at
+            # a reservation where its groups do; the others keep the warp mapping.
+            grouped_worlds = self._grouped_worlds()
+            grouped_sweep = None
+            if grouped_worlds.size > 0:
+                grouped_sweep = self._staged(self._grouped(declared), grouped_worlds.size)
             # The streamed rows' records, in the worlds the sweeps and the unit builder read: one layout, which every
             # sweep reads whatever its own stage holds, with the dense rows' where any sweep streams theirs.
-            staged = [sweep for sweep in (self.general_sweep, colored_sweep) if sweep is not None]
+            staged = [sweep for sweep in (self.general_sweep, colored_sweep, grouped_sweep) if sweep is not None]
             self.placement.allocate_row_records(
                 min(sweep_routes.record_first(self.placement.dense_max_constraints, sweep.places) for sweep in staged)
             )
@@ -566,6 +578,9 @@ class Sweep:
             if colored:
                 self.colored_sweep = dataclasses.replace(colored_sweep, records=self.placement.record_first)
                 self.mf_colored_kernel = self.sweep("mf_colored", self.colored_sweep)
+            if grouped_sweep is not None:
+                self.grouped_sweep = dataclasses.replace(grouped_sweep, records=self.placement.record_first)
+                self.mf_grouped_kernel = self.sweep("mf_grouped", self.grouped_sweep)
             if parallel_rows > 0:
                 # The producer's sink, a tier's by data and the device (sweep_routes_tiers.emits): a tier that takes EMIT
                 # walks its rows from their seeds in its prologue.
@@ -609,7 +624,8 @@ class Sweep:
             classes = self.claim_general + sweep_levels.COST_CLASSES
             self.claim_candidate = classes if colored else -1
             self.claim_colored = classes + 1 if colored else -1
-            buckets = classes + (2 if colored else 0)
+            self.claim_grouped = classes + (2 if colored else 0) if grouped_sweep is not None else -1
+            buckets = classes + (2 if colored else 0) + (1 if grouped_sweep is not None else 0)
             self.claims = Queue(buckets * worlds, model.device, buckets=buckets)
             self.world_cost = wp.zeros(worlds, dtype=wp.int32, device=model.device)
             # The claim stage runs beside the step's stream until its first reader (claim_worlds).
@@ -648,6 +664,11 @@ class Sweep:
                         self.colored_sweep, self.mf_colored_kernel, slots, self.claim_colored, ranks=self.world_blocks
                     ),
                 )
+            if grouped_sweep is not None:
+                launch = self._claim_launch(
+                    self.grouped_sweep, self.mf_grouped_kernel, int(grouped_worlds.size), self.claim_grouped
+                )
+                mapped += (launch,)
             # In line, the tiers and then the general sweep; on the claims' streams (open_streams) the first tier in
             # line and the general sweep and the other tiers beside it.
             self.launches = (*self.tiers, *mapped)
@@ -739,6 +760,12 @@ class Sweep:
                 int(units is not None),
                 claims.region,
                 self.placement.world_acts,
+                self.placement.row_groups.slot,
+                self.placement.row_groups.colors,
+                self.placement.row_groups.offsets,
+                self.placement.row_groups.rows,
+                self.placement.topology_rows,
+                self.claim_grouped,
             ],
             outputs=[claims.items, claims.count],
             device=self.model.device,
@@ -868,6 +895,24 @@ class Sweep:
         layout = shape(config.work(self.forest.world_count), device(self.model.device))
         return SweepLaunch(config, kernel, layout.grid, layout.block, named)
 
+    def _grouped(self, declared: SweepConfig) -> SweepConfig:
+        """The grouped mapping's configuration (:func:`.sweep_routes.group_rows`): the warp mapping's rows and laws, a
+        block a world, its records formed in its own launch, its rows in slot order."""
+        return dataclasses.replace(
+            declared, grouped=True, lanes_per_world=32, block_warps=1, active_rows=False, coordinate_levels=False
+        )
+
+    def _grouped_worlds(self) -> np.ndarray:
+        """The worlds that can take the dense line by colors of groups (:func:`.sweep_units.grouped_worlds`) where
+        the contact rows are the dense line's (no free bodies' run), with a slot each and the rule in the reservation's
+        tables (:meth:`.placement.Placement.allocate_row_groups`)."""
+        if self.placement.free_contact_rows or self._one_tree():
+            return np.zeros(0, dtype=np.int32)
+        capable, rule = sweep_units.grouped_worlds(self.model, self.forest, self.placement.dense_max_constraints)
+        if capable.size > 0:
+            self.placement.allocate_row_groups(capable, rule.min_units, rule.units_per_color)
+        return capable
+
     def _one_tree(self) -> bool:
         """Whether every world holds at most one tree with response coordinates: then every contact acts on one tree
         (against the world, a kinematic body or itself), and the general sweep takes K1's order whole."""
@@ -923,7 +968,20 @@ class Sweep:
     def _mapped_operands(self, bucket: int, buckets: int, grid: int) -> dict:
         """A matrix-free mapping's operands: its buckets, the worlds' costs and the colored storage's units."""
         colored = {} if self.colored_units is None else self.colored_units.operands()
-        return {**self._walk(), **colored, **self._queued(bucket, buckets, grid), "world_cost": self.world_cost}
+        groups = self.placement.row_groups
+        grouped = {
+            "row_group_slot": groups.slot,
+            "row_group_colors": groups.colors,
+            "row_group_offsets": groups.offsets,
+            "row_group_rows": groups.rows,
+        }
+        return {
+            **self._walk(),
+            **colored,
+            **grouped,
+            **self._queued(bucket, buckets, grid),
+            "world_cost": self.world_cost,
+        }
 
     def _sparse_operands(self) -> dict:
         """Case K1's operands: its worlds and the walk, whose ``du`` it adds its change into."""
