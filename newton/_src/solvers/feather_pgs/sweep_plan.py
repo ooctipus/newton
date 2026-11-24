@@ -393,6 +393,8 @@ class Sweep:
         # Blocks a world of the colored launch (sweep_routes.worlds' ranks) and their job words (region_phase), where a
         # world's region levels may outgrow its block.
         self.world_blocks = 1
+        # Blocks a world of the grouped launch, where a world's colors of groups may outgrow its block.
+        self.grouped_blocks = 1
         self.wide_jobs = None
         self.claims_beside = None
         # The one writer's EMIT sink (walk_rows.RowSeeds): none until a tier walks its rows.
@@ -527,7 +529,7 @@ class Sweep:
                     held = shape(colored_declared.work(), found).blocks_per_sm
                     group = held * found.sms // int(capable.size)
                     bodies = int(np.asarray(self.forest.free_rigid_per_world)[capable].max())
-                    if group > 1 and bodies > sweep_routes.COLORED_THREADS:
+                    if group > 1 and bodies > sweep_routes.COLORED_THREADS and self.pins.world_group:
                         self.world_blocks = group
                         places = dataclasses.replace(colored_declared.places, velocity=Place.GLOBAL)
                         colored_declared = dataclasses.replace(colored_declared, places=places, world_blocks=True)
@@ -545,7 +547,37 @@ class Sweep:
             grouped_worlds = self._grouped_worlds()
             grouped_sweep = None
             if grouped_worlds.size > 0:
-                grouped_sweep = self._staged(self._grouped(declared), grouped_worlds.size)
+                grouped_declared = self._grouped(declared)
+                # A color holds at most a group a tree, so a world holds a color wider than its block's warps only
+                # where its trees outnumber them: such worlds take the device's blocks beside their own, as many each
+                # as the device holds over the worlds and their widest color can use, with every operand the group's
+                # blocks read or write in global memory.
+                trees = np.bincount(
+                    self.forest.articulation_world[self.forest.response_dof_count > 0],
+                    minlength=self.forest.world_count,
+                )[grouped_worlds]
+                found = device(model.device)
+                held = shape(grouped_declared.work(), found).blocks_per_sm
+                group = min(
+                    held * found.sms // int(grouped_worlds.size),
+                    -(-int(trees.max()) // sweep_routes.GROUP_WARPS),
+                )
+                if group > 1 and self.pins.world_group:
+                    self.grouped_blocks = group
+                    places = dataclasses.replace(
+                        grouped_declared.places,
+                        metadata=Place.STREAMED,
+                        dense_impulses=Place.GLOBAL,
+                        velocity=Place.GLOBAL,
+                    )
+                    grouped_declared = dataclasses.replace(grouped_declared, places=places, world_blocks=True)
+                    if self.wide_jobs is None:
+                        self.wide_jobs = wp.zeros(
+                            self.forest.world_count * sweep_routes.WIDE_JOB, dtype=wp.int32, device=model.device
+                        )
+                    if self.sweep_velocity.size < self.forest.world_count * self.forest.max_world_dofs:
+                        self.sweep_velocity = self._velocity_lines(grouped_declared)
+                grouped_sweep = self._staged(grouped_declared, grouped_worlds.size)
             # The streamed rows' records, in the worlds the sweeps and the unit builder read: one layout, which every
             # sweep reads whatever its own stage holds, with the dense rows' where any sweep streams theirs.
             staged = [sweep for sweep in (self.general_sweep, colored_sweep, grouped_sweep) if sweep is not None]
@@ -666,7 +698,11 @@ class Sweep:
                 )
             if grouped_sweep is not None:
                 launch = self._claim_launch(
-                    self.grouped_sweep, self.mf_grouped_kernel, int(grouped_worlds.size), self.claim_grouped
+                    self.grouped_sweep,
+                    self.mf_grouped_kernel,
+                    int(grouped_worlds.size),
+                    self.claim_grouped,
+                    ranks=self.grouped_blocks,
                 )
                 mapped += (launch,)
             # In line, the tiers and then the general sweep; on the claims' streams (open_streams) the first tier in

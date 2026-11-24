@@ -547,11 +547,8 @@ def test_pile_of_d6_figures_follows_the_ball_jointed_pile(test, device):
     np.testing.assert_allclose(piles["d6"][:90], piles["ball"][:90], atol=1.0e-4)
 
 
-def test_pile_of_figures_sweeps_by_colors_of_groups(test, device):
-    """Forty-eight figures on ball joints (a tree each) dropped in two layers onto the floor: a world of many trees
-    sweeps its dense line by colors of groups (row_slots.RowGroups: up to four body pairs between the same trees,
-    first-fit colors, a warp a group in the world's block), which its reservation takes once the pile holds enough
-    groups; the pile lands finite, every joint closed, nothing sunk into the floor."""
+def _figure_pile(device, **options):
+    """Forty-eight figures on ball joints (a tree each) dropped in two layers onto the floor, and its solver."""
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, -_G))
     builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=_MU))
     for figure in range(48):
@@ -571,23 +568,49 @@ def test_pile_of_figures_sweeps_by_colors_of_groups(test, device):
                 child_xform=wp.transform(wp.vec3(*np.subtract(pivot, _FIGURE[limb][1])), wp.quat_identity()),
             )
     model = builder.finalize(device=device, skip_validation_joints=True)
-    solver = newton.solvers.SolverFeatherPGS(model, dense_max_constraints=8192)
-    test.assertIsNotNone(solver.sweep.mf_grouped_kernel, "a world of many trees builds the grouped sweep")
+    return model, newton.solvers.SolverFeatherPGS(model, dense_max_constraints=8192, **options)
+
+
+def _drop_pile(model, solver, steps: int):
+    """Step the pile ``steps`` times; return its last poses and velocities, the steps whose reservation took the colors
+    of groups, each step's largest joint gap and the most posts of the world's job words in a step (its colors wider
+    than its block and its end, sweep_routes.group_stage)."""
     pipeline = newton.CollisionPipeline(model)
     contacts = pipeline.contacts()
     state_in, state_out, control = model.state(), model.state(), model.control()
-    grouped, gaps = 0, []
-    for _ in range(300):
+    grouped, gaps, posts = 0, [], 0
+    for _ in range(steps):
         pipeline.collide(state_in, contacts)
         solver.step(state_in, state_out, control, contacts, _DT)
         state_in, state_out = state_out, state_in
         grouped += int(solver.placement.row_groups.colors.numpy()[0] > 0)
         gaps.append(_joint_gaps(model, state_in.body_q.numpy()).max())
-    poses = state_in.body_q.numpy()
+        if solver.sweep.wide_jobs is not None:
+            posts = max(posts, int(solver.sweep.wide_jobs.numpy()[0]))
+    return state_in.body_q.numpy(), state_in.body_qd.numpy(), grouped, gaps, posts
+
+
+def test_pile_of_figures_sweeps_by_colors_of_groups(test, device):
+    """Forty-eight figures on ball joints (a tree each) dropped in two layers onto the floor: a world of many trees
+    sweeps its dense line by colors of groups (row_slots.RowGroups: up to four body pairs between the same trees,
+    first-fit colors, a warp a group in the world's block), which its reservation takes once the pile holds enough
+    groups; the pile lands finite, every joint closed, nothing sunk into the floor. Its trees outnumber the block's
+    warps, so a color wider than the block takes the device's other blocks beside the world's
+    (sweep_routes.group_stage): the same visits, so the same bits as the world's block alone."""
+    model, solver = _figure_pile(device)
+    test.assertIsNotNone(solver.sweep.mf_grouped_kernel, "a world of many trees builds the grouped sweep")
+    test.assertGreater(solver.sweep.grouped_blocks, 1, "a world's colors may outgrow its block")
+    poses, velocities, grouped, gaps, posts = _drop_pile(model, solver, 300)
     test.assertGreater(grouped, 0, "the pile's reservation takes the colors of groups")
     test.assertTrue(np.isfinite(poses).all())
     test.assertGreater(poses[:, 2].min(), 0.04, "no box sinks into the floor")
     test.assertLess(max(gaps), 1.0e-4, "every joint stays closed")
+    test.assertGreater(posts, 1, "a color wider than the block takes the group")
+    model, alone = _figure_pile(device, pins=newton.solvers.SolverFeatherPGS.Pins(world_group=False))
+    test.assertEqual(alone.sweep.grouped_blocks, 1)
+    poses_alone, velocities_alone, _, _, _ = _drop_pile(model, alone, 300)
+    np.testing.assert_array_equal(poses, poses_alone)
+    np.testing.assert_array_equal(velocities, velocities_alone)
 
 
 class TestFeatherPGSLooseBodies(unittest.TestCase):
