@@ -11,6 +11,7 @@ import numpy as np
 import warp as wp
 
 import newton
+from newton._src.core.memory import Place
 from newton._src.solvers.feather_pgs.row_laws import ROW_CONTACT, ROW_LINK, ROW_MIMIC
 from newton.tests import feather_pgs_scenes as scenes
 from newton.tests.test_feather_pgs_contract_loops import (
@@ -423,6 +424,51 @@ class TestFeatherPGSPreeliminationCPU(unittest.TestCase):
         with wp.ScopedDevice("cpu"):
             _, _, _, gap = _run_four_bar(steps=240)
         self.assertLess(gap, 1.0e-5)
+
+
+def _closure_place_run(device, pin=None, steps: int = 48):
+    """The crank-driven four-bar with a mimic among its block's rows (pre-elimination on), ``steps`` steps on
+    ``device`` with the closure's staged rows where the test pin ``closure`` puts them: the solver and the bodies'
+    state."""
+    builder = _build_four_bar()
+    builder.add_constraint_mimic(joint0=1, joint1=0, coef0=0.0, coef1=1.0)
+    model = builder.finalize(device=device)
+    solver = newton.solvers.SolverFeatherPGS(
+        model,
+        pgs_iterations=4,
+        pgs_beta=0.1,
+        enable_bilateral_preelimination=True,
+        pins=newton.solvers.SolverFeatherPGS.Pins(closure=pin),
+    )
+    state_0, state_1 = model.state(), model.state()
+    control = model.control()
+    targets = model.joint_target_q.numpy().copy()
+    targets[0] = 0.6
+    control.joint_target_q.assign(targets)
+    for _ in range(steps):
+        state_0.clear_forces()
+        solver.step(state_0, state_1, control, None, 1.0 / 240.0)
+        state_0, state_1 = state_1, state_0
+    return solver, state_0.body_q.numpy(), state_0.body_qd.numpy()
+
+
+class TestClosurePlace(unittest.TestCase):
+    def test_closure_rows_in_global_memory_step_as_staged(self):
+        """The closure's staged rows in a line of global memory (the test pin ``closure='global'``; a block past the
+        writer's stage keeps them there) step bit for bit as the staged ones: both places hold the same values, read
+        and written in the same order."""
+        devices = ["cpu"] + (["cuda:0"] if wp.get_cuda_device_count() > 0 else [])
+        for device in devices:
+            with self.subTest(device=device):
+                solver, q, qd = _closure_place_run(device, "global")
+                self.assertTrue(solver.factor.eliminates)
+                self.assertIs(solver.factor.closure_place, Place.GLOBAL)
+                self.assertEqual(solver.factor.closure_lines.shape[0], solver.forest.world_count)
+                staged, q0, qd0 = _closure_place_run(device)
+                self.assertIs(staged.factor.closure_place, Place.SHARED)
+                self.assertTrue(np.isfinite(q).all())
+                np.testing.assert_array_equal(q, q0)
+                np.testing.assert_array_equal(qd, qd0)
 
 
 if __name__ == "__main__":

@@ -881,9 +881,11 @@ class RowLaws:
         else:
             rows = placement.dense_internal_max_rows
         # A world's rows without a closure are each their lane's alone: they spread over the GPU where few worlds
-        # would leave it idle (walk_rows.writer_lanes).
-        worlds = solver.forest.world_count if part != walk_rows.WRITE_TOPOLOGY and not blocks else 0
-        lanes = walk_rows.writer_lanes(rows, placement.dense_max_constraints, model.device, worlds)
+        # would leave it idle (walk_rows.writer_lanes); with one, its lanes hold a block's span.
+        rest = part != walk_rows.WRITE_TOPOLOGY
+        worlds = solver.forest.world_count if rest and not blocks else 0
+        entries = factor.block_entries if rest and blocks else 0
+        lanes = walk_rows.writer_lanes(rows, placement.dense_max_constraints, model.device, worlds, entries)
         law = (bind_dense_rows(placement), contact_input, patch_row_law(solver))
         law += (self.joint_seeds(solver, state_in), self.bias(solver.options, dt))
         inputs = [
@@ -894,6 +896,7 @@ class RowLaws:
             *law[1:3],
             walk_rows.packed_sink(solver),
             factor.blocks() if blocks else Preelim(),
+            factor.closure_lines,
             self.mimic_slot if blocks and self.mimic_slot is not None else dummy_int,
             self.link_slot if blocks and self.link_slot is not None else dummy_int,
             *law[3:],

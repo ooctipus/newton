@@ -256,17 +256,24 @@ def _support_writer_calls():
 def _dense_build_calls():
     """The dense rows' builds: the one writer's variants."""
     # The general placement's one writer: plain, and with blocks of up to eight rows (the closure), mimics among them.
+    from newton._src.core.memory import Place  # noqa: PLC0415
     from newton._src.solvers.feather_pgs import walk_rows  # noqa: PLC0415
 
     # Its trees' classes: a branched tree of a free root and three limbs, and a free body.
     tables = (((-1, 0, 1, 0, 3, 0), (0, 6, 7, 8, 9, 10, 11)), ((-1,), (0, 6)))
+    # The closure stages the widest block's span: twenty coordinates.
     arch = {"device_arch": _ARCH}
     for args in ((0, False), (8, False), (8, True)):
-        yield "walk_rows.walked_rows_kernel", walk_rows.walked_rows_kernel.__wrapped__, (*args, True, tables), arch
+        closes = {**arch, "entries": 20} if args[0] else arch
+        yield "walk_rows.walked_rows_kernel", walk_rows.walked_rows_kernel.__wrapped__, (*args, True, tables), closes
+    # The closure's staged rows in global memory, where the writer's stage declines them.
+    globally = {**arch, "entries": 20, "closure": Place.GLOBAL}
+    yield "walk_rows.walked_rows_kernel", walk_rows.walked_rows_kernel.__wrapped__, (8, False, True, tables), globally
     # Its topology part, the rows walked in blocks: plain and with blocks.
     for args in ((0, False), (8, True)):
         block = (*args, True, tables, walk_rows.WRITER_BLOCK_ROWS)
-        yield "walk_rows.walked_rows_kernel", walk_rows.walked_rows_kernel.__wrapped__, block, arch
+        closes = {**arch, "entries": 20} if args[0] else arch
+        yield "walk_rows.walked_rows_kernel", walk_rows.walked_rows_kernel.__wrapped__, block, closes
     # By the rows' support classes (packed_rows.row_classes): every row, and the topology part.
     for tail in ((0, True), (walk_rows.WRITER_BLOCK_ROWS, True)):
         yield (

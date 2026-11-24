@@ -31,7 +31,7 @@ from ...core import execution, memory
 from ...core.host_unique import row_ids
 from ...sim import BodyFlags, JointType, ModelBuilder, ModelFlags
 from ...sim.articulation import eval_articulation_ik
-from . import field_group, host_index
+from . import field_group, host_index, walk_rows
 from .factor.closure import seed_blocks_kernel
 from .factor.fields import (
     ARTICULATION_ORIGIN,
@@ -200,7 +200,11 @@ class TreeFactor:
         self.diagonal_inverse_mass = None
         self.eliminates = False
         self.block_capacity = 0
+        self.block_entries = 0
         self.block_count = 0
+        # Where the closure keeps a block's staged rows, and their lines where that is global memory (plan_blocks).
+        self.closure_place = memory.Place.SHARED
+        self.closure_lines = self._arrays.placeholder(wp.float32, (1, 1))
         self.held = None
         self.dynamics = None
         self.walk_arts = None
@@ -469,12 +473,15 @@ class TreeFactor:
         else:
             self.passive_joint_damping = damping
 
-    def plan_blocks(self, forest, laws) -> None:
-        """The bilateral blocks' tables (the closure, :func:`.factor.closure.close_block`).
+    def plan_blocks(self, forest, laws, pins) -> None:
+        """The bilateral blocks' tables (the closure, :func:`.factor.closure.close_world`).
 
         A block holds a linked component's constraints: its trees' mimics and its links' six rows each. Its buffers
         are sized once from the model's largest block (CUDA-graph-safe); its slots and its factor are rebuilt every
-        step on the device, since the rows' slots and ``J_B`` depend on the state.
+        step on the device, since the rows' slots and ``J_B`` depend on the state. Its rows' entries lie in its
+        trees' world coordinates, its span (the closure stages the widest span, :attr:`block_entries`), in the one
+        writer's block stage, or where that declines them (:func:`.walk_rows.closure_place`; the test pin
+        ``closure='global'``) in a line of global memory a world (:attr:`closure_lines`).
         """
         cut = forest.cut
         links = int(cut.primary.size)
@@ -509,12 +516,28 @@ class TreeFactor:
         self._preelim_art_to_idx = wp.array(art_to_block, dtype=wp.int32, device=model.device)
         self._arrays.allocate(PREELIMINATION, preelim=n, preelim_row=n * capacity)
         world_blocks = np.bincount(world_of, minlength=forest.world_count)
+        # Each block's span: the world coordinates of its trees that respond, first to end.
+        offset = forest.articulation_world_dof_offset.numpy()
+        responds = held & (forest.response_dof_count > 0)
+        first = np.full(n, np.iinfo(np.int32).max, dtype=np.int64)
+        end = np.zeros(n, dtype=np.int64)
+        np.minimum.at(first, art_to_block[responds], offset[responds])
+        np.maximum.at(end, art_to_block[responds], offset[responds] + forest.response_dof_count[responds])
+        first = np.minimum(first, end)
+        self.block_entries = max(int((end - first).max()), 1)
+        self.closure_place = walk_rows.closure_place(capacity, self.block_entries, model.device.arch)
+        if pins.closure == "global":
+            self.closure_place = memory.Place.GLOBAL
+        if self.closure_place is not memory.Place.SHARED:
+            lines = (forest.world_count, capacity * self.block_entries)
+            self.closure_lines = wp.zeros(lines, dtype=wp.float32, device=model.device)
         self._arrays.upload(
             PREELIMINATION_PLAN,
             _preelim_world=world_of[by_world],
             _preelim_start=bounds,
             _preelim_entry=entries[order],
             _preelim_world_start=host_index.offsets(world_blocks, dtype=np.int32),
+            _preelim_span=np.stack((first, end), axis=1).astype(np.int32),
         )
 
     def blocks(self):

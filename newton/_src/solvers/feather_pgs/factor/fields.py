@@ -141,9 +141,11 @@ PREELIMINATION_PLAN = FieldGroup(
     Field("_preelim_start", wp.int32, ("preelim_bound",), owner="factor"),
     Field("_preelim_entry", wp.int32, ("preelim_entry",), owner="factor"),
     Field("_preelim_world_start", wp.int32, ("preelim_world_bound",), owner="factor"),
+    Field("_preelim_span", wp.vec2i, ("preelim",), owner="factor"),
 )
 """Each block's world and constraints (CSR): a mimic ``m`` as ``m``, a link ``k`` as ``-k - 1``; each world's blocks
-(CSR, blocks ordered by world)."""
+(CSR, blocks ordered by world); each block's span, the world coordinates ``[first, end)`` of its trees, which hold
+every entry of its rows."""
 
 Preelim = field_group.struct(
     "Preelim",

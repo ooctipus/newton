@@ -359,7 +359,7 @@ class SolverFeatherPGS(SolverBase):
             enable_joint_limits (bool, optional): Enforce joint position limits as unilateral PGS
                 constraints. Each active limit side adds one constraint row. Defaults to False.
             enable_bilateral_preelimination (bool, optional): Eliminate mimic rows exactly, as a loop joint's rows
-                always are (:func:`.factor.closure.close_block`): every other row (contacts especially) takes
+                always are (:func:`.factor.closure.close_world`): every other row (contacts especially) takes
                 the closed-loop response, ``Z' = (I - Q Q^T) Z``, and the predictor velocity is projected onto the
                 closures once per step. Blocks are sized from the model; a row that depends on the others leaves
                 its block. Defaults to False.
@@ -456,14 +456,14 @@ class SolverFeatherPGS(SolverBase):
         # The row laws' tables: the contact law, the depenetration caps, the joint-limit tables, the mimic and link plans,
         # contact torsion and the materials.
         self.laws = RowLaws.build(model, self.forest, options)
+        pins = Pins() if pins is None else pins
         # The closure's bilateral blocks, which decide the pre-elimination.
-        self.factor.plan_blocks(self.forest, self.laws)
+        self.factor.plan_blocks(self.forest, self.laws, pins)
         # Axis 2 of the route table, the row laws (route_table.Laws).
         self.laws.decide(preelimination=self.factor.eliminates)
         laws = self.laws.set
         # The passive joint forces and the per-coordinate drive rows the class rules read (the held tree's admission).
         self.factor.plan(self.forest, self.laws)
-        pins = Pins() if pins is None else pins
         capacities = Capacities.build(options, self.forest, self.laws.link_rows_per_world)
         # The class plan, axis 3 of the route table: the placement case, decided by rules over the data above before
         # any owner of the class (class_plan.RULES, in precedence order).

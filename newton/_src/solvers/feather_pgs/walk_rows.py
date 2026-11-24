@@ -36,12 +36,21 @@ from typing import NamedTuple
 import warp as wp
 
 from ...core.execution import Buckets, Queue, Work, append, bucket_item, fill_lanes, shape
-from ...core.memory import Operand, Place, built_for
+from ...core.memory import (
+    CPU_STAGING_BYTES,
+    HIDING_WARPS,
+    STATIC_SHARED_BYTES,
+    Operand,
+    Place,
+    Staging,
+    built_for,
+    stage,
+)
 from . import field_group
 from .contact_input import ContactFrame, ContactInput, contact_frame
 from .contact_laws import CONTACT_SPIN_ROW, contact_row_entry, contact_seed, spin_seed
 from .device_preludes import dual_native, lane_group, memory_words, substitute
-from .factor.closure import close_block, close_row
+from .factor.closure import CLOSURE_ROWS, close_world, closure_lanes, closure_staging
 from .factor.fields import Preelim
 from .factor.walk import (
     FREE_BODY_WALK,
@@ -192,39 +201,30 @@ def emits(seeds: RowSeeds, world: int, rows: int) -> bool:
     return ((seeds.tiers >> ((rows - 1) // seeds.width)) & 1) != 0
 
 
-@wp.func
-def block_row(source: int, mimic_blocks: int) -> int:
-    """Whether a row of unit source ``source`` belongs to a bilateral block: a link's, or a mimic's where mimics are
-    eliminated (``enable_bilateral_preelimination``)."""
-    kind = source >> UNIT_SHIFT
-    if kind == UNIT_LINK:
-        return 1
-    if kind == UNIT_MIMIC and mimic_blocks != 0:
-        return 1
-    return 0
-
-
 @wp.func_native(dual_native("    SYNC();\n", preludes=(lane_group("lanes"),)))
 def world_sync(lanes: int):
     """Synchronize this thread's world group of ``lanes`` lanes (a power of two up to 32, within a warp; nothing on the
     CPU, where one thread runs the world)."""
 
 
-def writer_lanes(rows: int, capacity: int, device, worlds: int = 0) -> int:
+def writer_lanes(rows: int, capacity: int, device, worlds: int = 0, entries: int = 0) -> int:
     """A world's lane group in the one writer: the smallest power of two at or above the rows its topology fixes
     (``rows``: links, mimics and limits; contacts stride over it), at most the row capacity and a warp, so a world's
     lanes synchronize within their warp (:func:`world_sync`); one thread on the CPU.
+
+    ``entries``: where a closure follows the world's rows, the widest block's span, which its lanes hold a block's rows
+    over (:func:`.factor.closure.closure_lanes`): the group takes at least those lanes.
 
     ``worlds``: where a world's lanes never meet (no closure follows its rows), the worlds the launch holds. Each row
     is then its lane's alone, and a few worlds of many rows spread them over the GPU (:func:`.core.execution.fill_lanes`,
     up to the row capacity) instead of a warp each: one world of 64 figures, whose topology fixes no row, had one
     thread write its every row. Many worlds keep the topology's lanes.
 
-    A world's release and closure run serially on one of its lanes, so lanes beyond its rows idle there."""
+    A world's release runs serially on one of its lanes, so lanes beyond its rows idle there."""
     if not wp.get_device(device).is_cuda:
         return 1
     lanes = max(min(int(rows), int(capacity), 32), 1)
-    lanes = 1 << (lanes - 1).bit_length()
+    lanes = max(1 << (lanes - 1).bit_length(), closure_lanes(entries) if entries else 1)
     if worlds > 0:
         lanes = fill_lanes(worlds, device, least=lanes, most=1 << (max(int(capacity), 1) - 1).bit_length())
     return lanes
@@ -266,6 +266,19 @@ class WriterShape(NamedTuple):
         """The register budget a lane the bound leaves there."""
         return self._shape(device_arch).registers
 
+    def stage(self, staging: Staging, device_arch) -> Staging:
+        """``staging`` as the writer's block stages it (:func:`.core.memory.stage`): within the static shared memory a
+        Python kernel declares (the CPU's stack budget there), at no resident warp its walk needs, each buffer it
+        declines at its alternative place."""
+        device = built_for(device_arch)
+        budget = STATIC_SHARED_BYTES if device.cuda else CPU_STAGING_BYTES
+
+        def warps(size: int) -> int:
+            found = shape(Work(0, block=self.block, registers=self.line, shared=size), device)
+            return found.blocks_per_sm * (found.block // 32)
+
+        return stage(staging, warps, budget, HIDING_WARPS, lambda size: True)
+
 
 WRITERS = MappingProxyType(
     {
@@ -283,7 +296,8 @@ takes the architecture its build is for (``device_arch``), its launch bound the 
 - **World lanes**, a world's lane group striding over its rows, a row a lane: the general writer's packed rows
   (:func:`walked_rows_kernel`; a group of :func:`writer_lanes`, whole groups a block of 128) at the walker's line; with
   bilateral blocks (``packed_blocks``) at 96, since its link rows hold a second point across the walk and its closure
-  follows it; the star's slots (:func:`slot_rows_kernel`, a block a world) at the walker's line; the support
+  follows it (its stage as the block holds it, :func:`closure_place`); the star's slots
+  (:func:`slot_rows_kernel`, a block a world) at the walker's line; the support
   placement's unit lister (:func:`support_units_kernel`) at 64.
 - **The step's unit list**, two waves of the line over the GPU (:func:`support_threads`): the support writer
   (:func:`support_rows_kernel`) at 168, where its four-row walker and the friction triple's metric hold without
@@ -291,6 +305,14 @@ takes the architecture its build is for (``device_arch``), its launch bound the 
 - **The free bodies' units**, their contacts, a unit a thread (its rows on up to four lanes where the contacts leave
   the threads idle), two waves of the line: the free-body writer (:func:`write_free_body_rows`) at 128.
 """
+
+
+def closure_place(capacity: int, entries: int, device_arch) -> Place:
+    """Where the one writer's closure keeps a block's staged rows (:func:`.factor.closure.closure_staging`, at most
+    ``capacity`` rows over ``entries`` coordinates): the writer's block stage where it holds them
+    (:meth:`WriterShape.stage`), else a line of global memory a world, with the same values."""
+    writer = WRITERS["packed_blocks"]
+    return writer.stage(closure_staging(capacity, entries, writer.block), device_arch).place(CLOSURE_ROWS)
 
 
 @cache
@@ -387,6 +409,8 @@ def walked_rows_kernel(
     emit: bool = False,
     split: bool = False,
     *,
+    entries: int = 0,
+    closure: Place = Place.SHARED,
     device_arch,
 ) -> wp.Kernel:
     """The one writer of the general placement, world-major: a world's group of ``lanes`` lanes (:func:`writer_lanes`)
@@ -398,10 +422,10 @@ def walked_rows_kernel(
        predictor's border's ``R`` (:func:`.tree_kinetic_state.border_solve`), then its rhs by the row law
        (:func:`.row_kernels.row_bias`). A row a lane, not a contact a lane: the world's lanes stay busy (the support
        placement's unit list spreads a contact's unit over the GPU instead, :func:`support_rows_kernel`);
-    2. *closure* (``blocks``, the largest bilateral block's rows; 0 for none): the lanes close each of the world's
-       blocks (:func:`.factor.closure.close_block`; its rows are the links', and the mimics' with
-       ``mimic_blocks``), then correct every other row on the blocks its sides touch
-       (:func:`.factor.closure.close_row`);
+    2. *closure* (``blocks``, the largest bilateral block's rows; 0 for none): the lanes close the world's blocks in
+       turn (:func:`.factor.closure.close_world`; its rows are the links', and the mimics' with ``mimic_blocks``),
+       each staged once over the lanes, closed there and written back, then correct every other row on each block its
+       sides touch, a lane a row;
     3. *records*: each streamed row's record (:func:`.response_builds_rows.write_row_record`) where the row is final,
        each normal's ring parent included (formed with its kind): by its lane after its rhs, or, where the closure
        follows, by the world's lanes after it (:func:`.response_builds_rows.write_world_records`).
@@ -429,12 +453,16 @@ def walked_rows_kernel(
     its Jacobi tier runs their law and walks them in its prologue (:func:`emits`, the claims' predicate).
 
     ``split``: the line's records are split (:func:`.row_metadata.split_records`; their writers,
-    :func:`.response_builds_rows.record_writers`)."""
+    :func:`.response_builds_rows.record_writers`).
+
+    ``entries``: with blocks, the widest block's span (:attr:`.tree_factor.TreeFactor.block_entries`), which the
+    closure stages; ``closure``: where its staged rows live (:func:`closure_place`; at :data:`.core.memory.Place.GLOBAL`,
+    the world's line of ``closure_lines``)."""
     write_row_record, write_world_records = record_writers(split)
     has_blocks = blocks > 0
-    capacity = max(blocks, 1)
-    mimics = int(mimic_blocks)
-    # A link row is a block row (block_row; links plan blocks, TreeFactor.plan_blocks): the writer reads link rows
+    if has_blocks:
+        close = close_world(blocks, entries, mimic_blocks, WRITERS["packed_blocks"].block, closure)
+    # A link row is a block row (links plan blocks, TreeFactor.plan_blocks; the closure): the writer reads link rows
     # where it closes blocks. Elsewhere their seeds would hold a second point across every walk.
     read_unit = unit_reader(has_blocks, contacts=not block)
     walk = packed_walker(1, False, side, tables, classes=classes)
@@ -451,6 +479,7 @@ def walked_rows_kernel(
         law: PatchRowLaw,
         sink: RowSink,
         preelim: Preelim,
+        closure_lines: wp.array2d[float],
         mimic_slot: wp.array[int],
         link_slot: wp.array[int],
         seeds: JointSeeds,
@@ -533,24 +562,16 @@ def walked_rows_kernel(
             # The closure reads every row of the world: the launch that writes the last of them closes.
             if part != WRITE_TOPOLOGY:
                 world_sync(lanes)
-                for pe in range(preelim.world_start[world] + lane, preelim.world_start[world + 1], lanes):
-                    close_block(
-                        pe, wp.static(capacity), line, preelim, mimic_slot, link_slot, rows.cfm, sink.entries,
-                        rows.rhs, sink.row_incident, rows.diag,
-                    )  # fmt: skip
-                world_sync(lanes)
-                for slot in range(lane, count, lanes):
-                    if block_row(support.units[line, slot], wp.static(mimics)) == 0:
-                        close_row(
-                            line, slot, rows.sides[line, slot], wp.static(capacity), preelim, rows.cfm, sink.entries,
-                            rows.rhs, rows.diag,
-                        )  # fmt: skip
+                close(
+                    world, line, count, lanes, preelim, mimic_slot, link_slot, support.units, rows.sides, rows.cfm,
+                    sink.entries, rows.rhs, sink.row_incident, rows.diag, closure_lines,
+                )  # fmt: skip
                 # The closure changes the rows its blocks touch: every row's record after it, from what the world's
                 # lanes left, each normal's ring parent included.
-                world_sync(lanes)
                 write_world_records(records, rows, sink.row_incident, line, lane, lanes, counts[world])
 
-    name = "write_walked_rows" + (f"_blocks{blocks}" if has_blocks else "")
+    name = "write_walked_rows" + (f"_blocks{blocks}_{entries}" if has_blocks else "")
+    name += "_gclose" if has_blocks and closure is not Place.SHARED else ""
     name += "_mimics" if mimic_blocks else ""
     name += f"_topology{block}" if block else ""
     name += "_classes" if classes else ""
@@ -566,7 +587,8 @@ def writer_kernel(solver, part: int = WRITE_ROWS) -> wp.Kernel:
     where a walked joint can have two halves (:attr:`.tree_factor.TreeFactor.walk_side`), and the walking classes'
     paths (:attr:`.tree_factor.TreeFactor.walk_classes`); the topology ``part``'s, its rows walked in blocks of
     :data:`WRITER_BLOCK_ROWS`; each row by its support class where the placement stores them so
-    (:attr:`.placement.Placement.classed`)."""
+    (:attr:`.placement.Placement.classed`); with blocks, the widest block's span, which the closure stages, at the
+    place the factor planned (:attr:`.tree_factor.TreeFactor.closure_place`)."""
     factor = solver.factor
     blocks = factor.block_capacity if factor.eliminates else 0
     mimics = bool(blocks and solver.options.enable_bilateral_preelimination)
@@ -574,7 +596,20 @@ def writer_kernel(solver, part: int = WRITE_ROWS) -> wp.Kernel:
     tables = walk_tables(factor.walk_classes)
     placement, arch = solver.placement, solver.model.device.arch
     emit, classes, split = bool(placement.row_seeds.tiers), placement.classed, placement.split_records
-    return walked_rows_kernel(blocks, mimics, factor.walk_side, tables, block, classes, emit, split, device_arch=arch)
+    entries = factor.block_entries if blocks else 0
+    return walked_rows_kernel(
+        blocks,
+        mimics,
+        factor.walk_side,
+        tables,
+        block,
+        classes,
+        emit,
+        split,
+        entries=entries,
+        closure=factor.closure_place,
+        device_arch=arch,
+    )
 
 
 # ---------------------------------------------------------------------------------------------------------------------

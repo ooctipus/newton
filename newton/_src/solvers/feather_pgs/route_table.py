@@ -63,6 +63,9 @@ class Pins:
     velocity: str | None = None
     """``"global"``: the general sweep's velocity change in global memory (:class:`.sweep_routes.RowPlaces`), where a
     block would hold it."""
+    closure: str | None = None
+    """``"global"``: the closure's staged rows in a line of global memory a world (:func:`.walk_rows.closure_place`),
+    where the writer's block would stage them."""
 
     def record(self) -> dict:
         """The pins in force (those off their defaults) as a JSON-compliant record."""
