@@ -2055,11 +2055,23 @@ def level_regions(
         world_order_end[world] = s + kept
 
 
-WALK_RESOURCES = """            const int region = valid ? reg_walk.data[s0 + unit] : -1;
-            const wp::vec2i sides = valid ? reg_body.data[region] : wp::vec2i(-1, -1);
+WALK_RESOURCES = """            const int region = ahead_region;
+            const wp::vec2i sides = ahead_sides;
             const int node_a = sides[0];
-            const int node_b = sides[1];"""
-"""A walk's region's resources in its levels (:func:`walk_levels`): its bodies."""
+            const int node_b = sides[1];
+            ahead_region = unit + STRIDE < acting ? reg_walk.data[s0 + unit + STRIDE] : -1;"""
+"""A walk's region's resources in its levels (:func:`walk_levels`): its bodies, loaded a batch ahead
+(:data:`WALK_AHEAD`)."""
+
+WALK_AHEAD = (
+    """        int ahead_region = lane < acting ? reg_walk.data[s0 + lane] : -1;
+        wp::vec2i ahead_sides = ahead_region >= 0 ? reg_body.data[ahead_region] : wp::vec2i(-1, -1);
+""",
+    """            ahead_sides = ahead_region >= 0 ? reg_body.data[ahead_region] : wp::vec2i(-1, -1);
+""",
+)
+"""The walk's resources a batch ahead (:func:`.sweep_levels.level_pass`'s ``ahead``): the next batch's regions load as a
+batch begins, their bodies once the batch's held levels are read."""
 
 
 def walk_levels(pad: str = "        ") -> str:
@@ -2076,6 +2088,7 @@ def walk_levels(pad: str = "        ") -> str:
     levels = level_pass(
         units="acting",
         resources=WALK_RESOURCES,
+        ahead=WALK_AHEAD,
         counts="level_end.data[s0 + {}]",
         store="reg_level.data[region] = level;\n                reg_rank.data[region] = rank;",
         lanes="STRIDE",

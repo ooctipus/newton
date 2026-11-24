@@ -40,7 +40,14 @@ wp.set_module_options({"enable_backward": False})
 
 
 def level_pass(
-    *, units: str, resources: str, counts: str, store: str, lanes: int | str = 32, after: bool = False
+    *,
+    units: str,
+    resources: str,
+    counts: str,
+    store: str,
+    lanes: int | str = 32,
+    after: bool = False,
+    ahead: tuple[str, str] = ("", ""),
 ) -> str:
     """Return CUDA source that levels a world's ``units`` units in row order (Cartier-Foata), by one warp, a batch of
     32 at a time.
@@ -63,7 +70,9 @@ def level_pass(
     the warp, uses the lane group, ``lane`` and the names ``resources`` and ``store`` read, and declares ``levels``, the
     world's level count, on every lane. ``lanes`` is the group: a warp, the CPU's one thread (a batch of one unit), or a
     lane group of a native expression's lanes (``STRIDE``), whose words are the lane group's (``MATCH``, ``BELOW``,
-    ``COUNT``, ``READ``; :data:`.device_preludes.LANE_WORDS`).
+    ``COUNT``, ``READ``; :data:`.device_preludes.LANE_WORDS`). ``ahead`` is a caller's pipeline of its resources'
+    loads: statements before the batches, and statements each batch runs once its held levels are read, so the next
+    batch's loads are in flight while the batch levels.
     """
     if lanes == 32:
         same, below, count = (
@@ -92,7 +101,8 @@ def level_pass(
         if after
         else ""
     )
-    return f"""        int levels = 0;
+    before, during = ahead
+    return f"""{before}        int levels = 0;
         for (int base = 0; base < {units}; base += {lanes}) {{
             const int unit = base + lane;
             bool valid = unit < {units};
@@ -101,7 +111,7 @@ def level_pass(
             // The levels the unit's resources hold from earlier batches.
             const int held_a = res_a >= 0 ? node_level[res_a] : -1;
             const int held_b = res_b >= 0 ? node_level[res_b] : -1;
-            // On each resource, the batch's latest earlier unit that shares it and whether a later one does.
+{during}            // On each resource, the batch's latest earlier unit that shares it and whether a later one does.
             int prev_a = -1, prev_b = -1;
             bool last_a = true, last_b = true;
             for (int j = 0; j < {width}; ++j) {{
