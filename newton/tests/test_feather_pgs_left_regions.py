@@ -144,6 +144,44 @@ def _settle(model, *, left_regions: bool, steps: int, capture: bool = False):
     return solver, np.array(poses), counts
 
 
+RADIUS = 0.1
+
+
+def _falling_spheres(device, worlds: int, spheres_a_world: int, drop: float):
+    """Worlds of free spheres dropped ``drop`` onto the ground far from the origin beside an arm (the walk's tree): a
+    contact and a region a sphere, so a sphere count off whole warps leaves the fill's last lane group partial."""
+    builder = newton.ModelBuilder()
+    cfg = builder.default_shape_cfg.copy()
+    cfg.mu = 0.6
+    builder.add_ground_plane(cfg=cfg)
+    spheres = []
+    for _ in range(worlds):
+        builder.begin_world()
+        base = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3) * 0.01), lock_inertia=True)
+        builder.add_shape_box(base, hx=0.04, hy=0.04, hz=0.04, cfg=cfg)
+        joints = [builder.add_joint_fixed(-1, base, parent_xform=wp.transform((-1.0, 0.0, 1.0), wp.quat_identity()))]
+        link = builder.add_link(mass=0.5, inertia=wp.mat33(np.eye(3) * 0.004), lock_inertia=True)
+        builder.add_shape_capsule(link, radius=0.03, half_height=0.1, cfg=cfg)
+        joints.append(
+            builder.add_joint_revolute(
+                base,
+                link,
+                axis=(1.0, 0.0, 0.0),
+                parent_xform=wp.transform((0.0, 0.0, -0.08), wp.quat_identity()),
+                child_xform=wp.transform((0.0, 0.0, 0.1), wp.quat_identity()),
+            )
+        )
+        builder.add_articulation(joints)
+        for k in range(spheres_a_world):
+            sphere = builder.add_body(
+                xform=wp.transform((5.0 + 0.5 * k, 5.0, RADIUS - 0.002 + drop), wp.quat_identity())
+            )
+            builder.add_shape_sphere(sphere, radius=RADIUS, cfg=cfg)
+            spheres.append(sphere)
+        builder.end_world()
+    return builder.finalize(device=device), np.array(spheres)
+
+
 class TestFeatherPGSLeftRegions(unittest.TestCase):
     def _check(self, device, worlds: int, capture: bool = False):
         model, pairs, sunk_boxes = _lifted_pairs(device, worlds)
@@ -178,6 +216,45 @@ class TestFeatherPGSLeftRegions(unittest.TestCase):
     @unittest.skipUnless(wp.is_cuda_available(), "CUDA")
     def test_left_out_regions_join_at_the_sweeps_end_captured(self):
         self._check("cuda:0", worlds=1024, capture=True)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "CUDA")
+    def test_captured_fill_takes_whole_lane_groups(self):
+        # 5,200 one-contact regions once landed (from 1,024 worlds the free bodies' contacts are regions on the GPU):
+        # the fill's last lane group of the live contacts holds 16. A replay fills them as the first step did (a group
+        # cut short by the live count read lanes that do not run: every candidate's lever was its distance from the
+        # world origin, 7-9 m here, and landing spheres spun up and sank 7 mm).
+        model, spheres = _falling_spheres("cuda:0", worlds=1040, spheres_a_world=5, drop=0.3)
+        solver = SolverFeatherPGS(
+            model, pins=SolverFeatherPGS.Pins(**GENERAL), pgs_iterations=8, dense_max_constraints=64
+        )
+        self.assertIsNotNone(solver.sweep.regions)
+        pipeline = newton.CollisionPipeline(model)
+        contacts = pipeline.contacts()
+        states = [model.state(), model.state()]
+        newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+        control = model.control()
+
+        def step(src, dst):
+            pipeline.collide(src, contacts)
+            src.clear_forces()
+            solver.step(src, dst, control, contacts, 1.0 / 240.0)
+
+        step(states[0], states[1])
+        states.reverse()
+        graphs = []
+        for src, dst in ((states[0], states[1]), (states[1], states[0])):
+            with wp.ScopedCapture(device=model.device) as capture:
+                step(src, dst)
+            graphs.append(capture.graph)
+        spin, low = 0.0, np.inf
+        for i in range(120):
+            wp.capture_launch(graphs[i % 2])
+            state = states[(i + 1) % 2]
+            spin = max(spin, float(np.linalg.norm(state.body_qd.numpy()[spheres, 3:6], axis=1).max()))
+            low = min(low, float(state.body_q.numpy()[spheres, 2].min()))
+        self.assertEqual(int(contacts.rigid_contact_count.numpy()[0]), 5200)
+        self.assertLess(spin, 1.0e-3)
+        self.assertGreater(low, RADIUS - 1.0e-3)
 
 
 if __name__ == "__main__":
