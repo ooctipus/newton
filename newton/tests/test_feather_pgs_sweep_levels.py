@@ -10,8 +10,9 @@ share one. The tests check, on the CPU:
   levels (case K2: the levels of the one-coordinate contacts on coordinates no coupled contact holds, each level's
   contacts side by side, then the rest in row order) or by its components (a world's two trees apart) gives
   the row order's iterate bit for bit, and that an order putting one conflicting pair out of row order does not;
-- that the level pass's rounds (:func:`.sweep_levels.level_pass`: a batch of 32 units, a unit committing once it owns
-  both its resources) give the row-order levels (:func:`levels`, the rule the colored units' CUDA test compares the
+- that the level pass's batches (:func:`.sweep_levels.level_pass`: a batch of 32 units reading their resources'
+  levels from earlier batches, each unit one past the latest earlier unit of its batch on each resource, by rounds
+  until no level moves) give the row-order levels (:func:`levels`, the rule the colored units' CUDA test compares the
   device with);
 - that the claims write every world with rows into exactly its claim's bucket (:func:`.sweep_levels.claim_worlds`,
   one :class:`~newton._src.core.execution.Queue`, a bucket a Jacobi tier, then the general sweep's).
@@ -43,24 +44,31 @@ def levels(resources) -> np.ndarray:
     return np.asarray(out, dtype=np.int64)
 
 
-def rounds(resources) -> np.ndarray:
-    """The level pass's rounds (:func:`.sweep_levels.level_pass`) on the host: a batch of 32 units at a time, each round
-    every pending unit claims its resources (the lowest lane wins), and a unit that owns all of them commits its
-    level from the resources' latest levels."""
-    latest, out = {}, [-1] * len(resources)
+def batches(resources) -> np.ndarray:
+    """The level pass's batches (:func:`.sweep_levels.level_pass`) on the host: a batch of 32 units at a time, each
+    unit one past the levels its resources held before the batch and past the latest earlier unit of the batch on
+    each resource, by rounds until no level moves; each resource's last unit of the batch leaves its level."""
+    held, out = {}, [-1] * len(resources)
     for base in range(0, len(resources), 32):
-        pending = list(range(base, min(base + 32, len(resources))))
-        while pending:
-            owner = {}
-            for unit in pending:
-                for r in resources[unit]:
-                    owner.setdefault(r, unit)
-            ready = [unit for unit in pending if all(owner[r] == unit for r in resources[unit])]
-            for unit in ready:
-                out[unit] = max((latest.get(r, -1) + 1 for r in resources[unit]), default=0)
-                for r in resources[unit]:
-                    latest[r] = out[unit]
-            pending = [unit for unit in pending if unit not in ready]
+        batch = range(base, min(base + 32, len(resources)))
+        first = {u: max((held.get(r, -1) + 1 for r in resources[u]), default=0) for u in batch}
+        prev = {
+            u: [max((e for e in range(base, u) if r in resources[e]), default=-1) for r in resources[u]] for u in batch
+        }
+        level = dict(first)
+        moved = True
+        while moved:
+            reads = {u: [level[p] if p >= 0 else -1 for p in prev[u]] for u in batch}
+            moved = False
+            for u in batch:
+                nxt = max([first[u]] + [v + 1 for p, v in zip(prev[u], reads[u], strict=True) if p >= 0])
+                moved |= nxt != level[u]
+                level[u] = nxt
+        for u in batch:
+            out[u] = level[u]
+            for r in resources[u]:
+                if not any(r in resources[later] for later in range(u + 1, batch.stop)):
+                    held[r] = level[u]
     return np.asarray(out, dtype=np.int64)
 
 
@@ -140,12 +148,12 @@ def _same(test, a, b):
 class TestLevelsAreTheRowOrder(unittest.TestCase):
     """A sweep run by the builder's schedules is the row order's sweep, bit for bit."""
 
-    def test_the_rounds_give_the_row_order_levels(self):
-        """The level pass's rounds give each unit the row-order rule's level, a batch boundary or not."""
+    def test_the_batches_give_the_row_order_levels(self):
+        """The level pass's batches give each unit the row-order rule's level, a batch boundary or not."""
         rng = np.random.default_rng(1)
         for units, bodies, pair in itertools.product((5, 31, 32, 33, 97), (3, 8, 40), (0.0, 0.5, 1.0)):
             resources = _trace(rng, units, bodies, pair)
-            np.testing.assert_array_equal(rounds(resources), levels(resources))
+            np.testing.assert_array_equal(batches(resources), levels(resources))
 
     def test_a_level_s_units_share_no_resource(self):
         rng = np.random.default_rng(2)

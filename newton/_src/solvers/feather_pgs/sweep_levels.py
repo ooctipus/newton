@@ -46,23 +46,24 @@ def level_pass(
     32 at a time.
 
     A unit's ``level`` is one past the latest level of an earlier unit on either of its resources, so units that share
-    one keep their row order and a level's units share none. In each round every pending unit of the batch claims its
-    resources (the lowest lane wins), and a unit that owns both commits its level: no earlier pending unit shares a
-    resource with it, so it sees every earlier unit's level, as a pass in row order would. After its batch a unit takes
-    its ``rank``, its place among its level's units in row order: the level's units of earlier batches and the batch's
-    units of the level on lower lanes.
+    one keep their row order and a level's units share none. A batch's units read the levels their resources hold from
+    earlier batches and find, on each resource, the batch's latest earlier unit that shares it and whether a later one
+    does (one look at every lane of the batch). A unit's level is one past those units' and the held levels; the batch
+    takes it in rounds, each unit reading its two predecessors' levels, until no level moves: a round fixes one more
+    unit of every chain, so the levels are the pass's in row order. Each resource's last unit in the batch leaves its
+    level. After its batch a unit takes its ``rank``, its place among its level's units in row order: the level's units
+    of earlier batches and the batch's units of the level on lower lanes.
 
     ``resources`` declares, for lane's ``unit`` (``valid`` when it is below ``units``; ``resources`` may clear it for
-    a unit that takes no level), its resources ``node_a`` and ``node_b``: compact ids into the warp's shared
-    ``node_owner`` (32 at the start) and ``node_level`` (-1, or any other value no level overwrites), or -1 for
-    none. ``counts`` formats an index into the units of each level so far: zero at the start for levels ``[0,
-    units]``, and the batch's counts added. ``store`` keeps a valid unit's ``level`` and ``rank``; with ``after`` it may
-    also read ``after_a`` and ``after_b``, the levels its resources held before it (its latest earlier unit's on each,
-    -1 for none or no resource). The fragment runs on
-    every lane of the warp, uses the lane group, ``lane`` and the names ``resources`` and ``store`` read, and declares
-    ``levels``, the world's level count, on every lane. ``lanes`` is the group: a warp, the CPU's one thread (a batch
-    of one unit), or a lane group of a native expression's lanes (``STRIDE``), whose words are the lane group's
-    (``MATCH``, ``BELOW``, ``COUNT``; :data:`.device_preludes.LANE_WORDS`).
+    a unit that takes no level), its resources ``node_a`` and ``node_b``: compact ids into the warp's ``node_level``
+    (-1, or any other value no level overwrites), or -1 for none. ``counts`` formats an index into the units of each
+    level so far: zero at the start for levels ``[0, units]``, and the batch's counts added. ``store`` keeps a valid
+    unit's ``level`` and ``rank``; with ``after`` it may also read ``after_a`` and ``after_b``, the levels its resources
+    held before it (its latest earlier unit's on each, -1 for none or no resource). The fragment runs on every lane of
+    the warp, uses the lane group, ``lane`` and the names ``resources`` and ``store`` read, and declares ``levels``, the
+    world's level count, on every lane. ``lanes`` is the group: a warp, the CPU's one thread (a batch of one unit), or a
+    lane group of a native expression's lanes (``STRIDE``), whose words are the lane group's (``MATCH``, ``BELOW``,
+    ``COUNT``, ``READ``; :data:`.device_preludes.LANE_WORDS`).
     """
     if lanes == 32:
         same, below, count = (
@@ -70,14 +71,24 @@ def level_pass(
             "__popc(same & ((1u << lane) - 1u))",
             "__popc(same)",
         )
+        width, moved = "32", "__any_sync(0xffffffffu, moved)"
+
+        def read(value: str, source: str = "j") -> str:
+            return f"__shfl_sync(0xffffffffu, {value}, {source})"
+
     elif lanes == 1 or isinstance(lanes, str):
         # A lane group's words (the CPU's one thread, or a group of a native expression's lanes, ``STRIDE``).
         same, below, count = "MATCH(level)", "BELOW(same)", "COUNT(same)"
+        width, moved = str(lanes), "ANY(moved)"
+
+        def read(value: str, source: str = "j") -> str:
+            return f"READ({value}, {source})"
+
     else:
         raise ValueError(f"the level pass runs a warp, a lane group or one thread, got {lanes}")
     held = (
-        "\n                    if (node_a >= 0) after_a = node_level[node_a];"
-        "\n                    if (node_b >= 0) after_b = node_level[node_b];"
+        """
+            const int after_a = prev_a >= 0 ? via_a : held_a, after_b = prev_b >= 0 ? via_b : held_b;"""
         if after
         else ""
     )
@@ -86,32 +97,36 @@ def level_pass(
             const int unit = base + lane;
             bool valid = unit < {units};
 {resources}
-            unsigned pending = BALLOT(valid);
-            int level = -1{", after_a = -1, after_b = -1" if after else ""};
-            while (pending != 0u) {{
-                const bool mine = ((pending >> lane) & 1u) != 0u;
-                if (mine) {{
-                    if (node_a >= 0) atomicMin(&node_owner[node_a], lane);
-                    if (node_b >= 0) atomicMin(&node_owner[node_b], lane);
-                }}
-                SYNC();
-                const bool ready = mine && (node_a < 0 || node_owner[node_a] == lane)
-                    && (node_b < 0 || node_owner[node_b] == lane);
-                if (ready) {{{held}
-                    level = 0;
-                    if (node_a >= 0) level = max(level, node_level[node_a] + 1);
-                    if (node_b >= 0) level = max(level, node_level[node_b] + 1);
-                    if (node_a >= 0) node_level[node_a] = level;
-                    if (node_b >= 0) node_level[node_b] = level;
-                }}
-                SYNC();
-                if (mine) {{
-                    if (node_a >= 0) node_owner[node_a] = 32;
-                    if (node_b >= 0) node_owner[node_b] = 32;
-                }}
-                SYNC();
-                pending &= ~BALLOT(ready);
+            const int res_a = valid ? node_a : -1, res_b = valid ? node_b : -1;
+            // The levels the unit's resources hold from earlier batches.
+            const int held_a = res_a >= 0 ? node_level[res_a] : -1;
+            const int held_b = res_b >= 0 ? node_level[res_b] : -1;
+            // On each resource, the batch's latest earlier unit that shares it and whether a later one does.
+            int prev_a = -1, prev_b = -1;
+            bool last_a = true, last_b = true;
+            for (int j = 0; j < {width}; ++j) {{
+                const int other_a = {read("res_a")}, other_b = {read("res_b")};
+                const bool on_a = res_a >= 0 && (other_a == res_a || other_b == res_a);
+                const bool on_b = res_b >= 0 && (other_a == res_b || other_b == res_b);
+                if (j < lane && on_a) prev_a = j;
+                if (j < lane && on_b) prev_b = j;
+                if (j > lane && on_a) last_a = false;
+                if (j > lane && on_b) last_b = false;
             }}
+            // One past the held levels and the predecessors' levels, by rounds until no level moves.
+            const int first = valid ? max(held_a, held_b) + 1 : -1;
+            int level = first, via_a = -1, via_b = -1;
+            for (bool moved = true; {moved};) {{
+                via_a = {read("level", "prev_a >= 0 ? prev_a : lane")};
+                via_b = {read("level", "prev_b >= 0 ? prev_b : lane")};
+                int next = first;
+                if (prev_a >= 0) next = max(next, via_a + 1);
+                if (prev_b >= 0) next = max(next, via_b + 1);
+                moved = next != level;
+                level = next;
+            }}{held}
+            if (res_a >= 0 && last_a) node_level[res_a] = level;
+            if (res_b >= 0 && last_b) node_level[res_b] = level;
             const unsigned same = {same};
             const int below = {below};
             const int earlier = valid ? {counts.format("level")} : 0;
@@ -426,10 +441,7 @@ def _levels_kernel(
 {units}
 {staging.declarations("    ")}
     int unit_place[{-(-M // L)}];
-    for (int coordinate = lane; coordinate < {D}; coordinate += {L}) {{
-        node_owner[coordinate] = 32;
-        node_level[coordinate] = -1;
-    }}
+    for (int coordinate = lane; coordinate < {D}; coordinate += {L}) node_level[coordinate] = -1;
     for (int l = lane; l <= units; l += {L}) {counts.format("l")} = 0;
     SYNC();
 
@@ -574,7 +586,7 @@ def coordinate_levels_kernel(M: int, P: int, D: int, device_arch: str, *, torsio
     const int line = dense_first.data[world];
     __builtin_assume(line >= 0);
     const int row_base = line * {P};"""
-    # Each coordinate's first row of a unit no level holds (node_owner, reset for the level pass): a contact or joint
+    # Each coordinate's first row of a unit no level holds (node_owner, scratch of this rule): a contact or joint
     # limit of one entry before it on its coordinate keeps that coordinate for the pass (unit_coordinate, 0 for none).
     reserve = f"""    for (int c = lane; c < {D}; c += {L}) node_owner[c] = {M};
     SYNC();
@@ -600,8 +612,7 @@ def coordinate_levels_kernel(M: int, P: int, D: int, device_arch: str, *, torsio
         }}
         unit_coordinate[base / {L}] = leveled;
     }}
-    SYNC();
-    for (int c = lane; c < {D}; c += {L}) node_owner[c] = 32;"""
+    SYNC();"""
     resources = f"""            int node_a = -1;
             const int node_b = -1;
             if (valid) valid = unit_coordinate[base / {L}] > 0;

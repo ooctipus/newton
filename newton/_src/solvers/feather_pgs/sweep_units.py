@@ -470,10 +470,7 @@ SHARED_DECLARATIONS
     }
 
     for (int w = tid; w < WORDS; w += THREADS) used_bits[w] = 0u;
-    for (int n = tid; n < NODES; n += THREADS) {
-        node_owner[n] = 32;
-        node_level[n] = -1;
-    }
+    for (int n = tid; n < NODES; n += THREADS) node_level[n] = -1;
     __syncthreads();
 
     // Units in row order: a contact normal row and the friction rows after it whose parent it is. Each warp takes
@@ -606,7 +603,6 @@ def build_staging(dofs: int) -> Staging:
         (
             Buffer("used_bits", "unsigned", words),
             Buffer("used_prefix", "int", words),
-            Buffer("node_owner", "int", nodes),
             Buffer("node_level", "int", nodes),
             Buffer("warp_count", "int", BUILD_WARPS),
             Buffer("colors_s", "int", 1),

@@ -2064,7 +2064,7 @@ WALK_RESOURCES = """            const int region = valid ? reg_walk.data[s0 + un
 
 def walk_levels(pad: str = "        ") -> str:
     """Return the CUDA statements that level a world's walk (:func:`level_acting`): its ``acting`` regions from
-    ``reg_walk[s0]``, whose bodies' ``body_level`` is -1 and ``body_owner`` 32, by the lane group's batches.
+    ``reg_walk[s0]``, whose bodies' ``body_level`` is -1, by the lane group's batches.
 
     The levels are the level builder's pass (:func:`.sweep_levels.level_pass`, a body a resource): each region's level
     is one past the last level of a region before it on either of its bodies, with its rank among its level's regions
@@ -2084,7 +2084,6 @@ def walk_levels(pad: str = "        ") -> str:
 SYNC();
 // The walk's levels by the lane group's batches (sweep_levels.level_pass, a body a resource): each region's
 // level and its rank among its level's regions in the walk's order, as one lane's pass in that order gives.
-int* const node_owner = body_owner.data;
 int* const node_level = body_level.data;
 {dedent(levels)}
 // Each level's first place from the world's first (an exclusive scan of the counts), each region at its
@@ -2258,7 +2257,6 @@ def _walk_acting(
     reg_state: wp.array[int],
     reg_order: wp.array[int],
     body_level: wp.array[int],
-    body_owner: wp.array[int],
     reg_level: wp.array[int],
     reg_rank: wp.array[int],
     reg_walk: wp.array[int],
@@ -2276,7 +2274,6 @@ def level_acting(
     reg_state: wp.array[int],
     reg_order: wp.array[int],
     body_level: wp.array[int],
-    body_owner: wp.array[int],
     reg_level: wp.array[int],
     reg_rank: wp.array[int],
     reg_walk: wp.array[int],
@@ -2312,7 +2309,6 @@ def level_acting(
         reg_state,
         reg_order,
         body_level,
-        body_owner,
         reg_level,
         reg_rank,
         reg_walk,
@@ -2442,7 +2438,6 @@ class Regions:
         self.world_order_end = wp.zeros(worlds, dtype=wp.int32, device=device)
         self.body_level = wp.zeros(max(count, 1), dtype=wp.int32, device=device)
         # A body's claim in the sweeps' end remake of the levels (sweep_levels.level_pass's owner word): no lane.
-        self.body_owner = wp.full(max(count, 1), 32, dtype=wp.int32, device=device)
         blocks = worlds * int(PAIR_BLOCKS)
         self.blk_pair = wp.full(blocks, wp.vec2i(-1, -1), dtype=wp.vec2i, device=device)
         self.blk_members = wp.zeros(blocks, dtype=wp.vec2i, device=device)
@@ -2865,7 +2860,6 @@ class Regions:
             inputs=[self.world_regions, self.world_order_end, self.reg_body, self.reg_state, self.reg_order],
             outputs=[
                 self.body_level,
-                self.body_owner,
                 self.reg_level,
                 self.reg_rank,
                 self.reg_walk,
@@ -3013,7 +3007,7 @@ class Regions:
     def operands(self) -> dict:
         """The stream as the general sweep's region phase takes it (:data:`.sweep_routes.REGION_OPERANDS`)."""
         names = "world_regions world_levels world_order_end level_end level_region reg_order reg_walk reg_level"
-        names += " reg_rank body_level body_owner body_first body_basis"
+        names += " reg_rank body_level body_first body_basis"
         names += " reg_frame reg_arm reg_arm_b reg_body reg_cand reg_law reg_wnn reg_wnf reg_wff reg_ball_values"
         names += " reg_ball_vectors reg_ginv reg_k reg_lk reg_lw"
         names += " reg_bf reg_kind reg_row cand cand_floor cand_row reg_wrench reg_phi reg_set reg_spring reg_state reg_stamp"

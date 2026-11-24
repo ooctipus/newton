@@ -865,7 +865,6 @@ REGION_OPERANDS = (
     ("reg_level", wp.array[int]),
     ("reg_rank", wp.array[int]),
     ("body_level", wp.array[int]),
-    ("body_owner", wp.array[int]),
     ("body_first", wp.array[int]),
     ("body_basis", wp.array2d[wp.spatial_vector]),
     ("reg_frame", wp.array[wp.mat33]),
