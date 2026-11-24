@@ -2108,6 +2108,13 @@ _ACTING_BLOCK = 256
 """The walk's block (:func:`level_acting`): eight worlds' warps, and a world wider than a turn of its lanes takes them
 all for its walk."""
 
+_WALK_TURNS = 8
+"""The turns of its lanes a warp of the walk loads at once (:func:`level_acting`): their regions' states in
+flight together, not a turn's latency each. A hardware choice that changes no result: a turn is two dependent loads
+(the order's region, then its state) and a ballot, ~70-80 cycles of issue, against an L2 round trip of ~430-650 cycles
+(measured on the region visit's hops); at the walk's occupancy (a warp a world, a few warps a multiprocessor) eight
+turns in flight cover one round trip."""
+
 _ACTING = f"""    const int lane = LANE, world = tid / LANES, worlds = world_regions.shape[0];
     // A world's listed regions in its order, [s, end) (none past the worlds).
     const auto span = [&](int w, int& s, int& end) {{
@@ -2124,9 +2131,15 @@ _ACTING = f"""    const int lane = LANE, world = tid / LANES, worlds = world_reg
     // The acting regions of the order's places [a, b).
     const auto count_part = [&](int a, int b) {{
         int count = 0;
-        for (int base = a; base < b; base += STRIDE) {{
-            const int p = base + lane;
-            count += COUNT(BALLOT(p < b && reg_state.data[reg_order.data[p]] != {int(REGION_LEFT)}));
+        for (int base = a; base < b; base += {_WALK_TURNS} * STRIDE) {{
+            int g[{_WALK_TURNS}];
+            bool act[{_WALK_TURNS}];
+            for (int u = 0; u < {_WALK_TURNS}; ++u) {{
+                const int p = base + u * STRIDE + lane;
+                g[u] = p < b ? reg_order.data[p] : -1;
+            }}
+            for (int u = 0; u < {_WALK_TURNS}; ++u) act[u] = g[u] >= 0 && reg_state.data[g[u]] != {int(REGION_LEFT)};
+            for (int u = 0; u < {_WALK_TURNS}; ++u) count += COUNT(BALLOT(act[u]));
         }}
         return count;
     }};
@@ -2134,21 +2147,28 @@ _ACTING = f"""    const int lane = LANE, world = tid / LANES, worlds = world_reg
     // order), a left-out one after every acting one at ``out``; an acting region's bodies unleveled (body_level -1).
     const auto place_part = [&](int s, int a, int b, int in, int acting) {{
         int out = acting + (a - s) - in;
-        for (int base = a; base < b; base += STRIDE) {{
-            const int p = base + lane;
-            const int g = p < b ? reg_order.data[p] : -1;
-            const bool act = g >= 0 && reg_state.data[g] != {int(REGION_LEFT)};
-            const unsigned votes = BALLOT(act), outs = BALLOT(g >= 0 && !act);
-            if (act) {{
-                reg_walk.data[s + in + BELOW(votes)] = g;
-                const wp::vec2i sides = reg_body.data[g];
-                body_level.data[sides[0]] = -1;
-                if (sides[1] >= 0) body_level.data[sides[1]] = -1;
-            }} else if (g >= 0) {{
-                reg_walk.data[s + out + BELOW(outs)] = g;
+        for (int base = a; base < b; base += {_WALK_TURNS} * STRIDE) {{
+            int g[{_WALK_TURNS}];
+            bool act[{_WALK_TURNS}];
+            wp::vec2i sides[{_WALK_TURNS}];
+            for (int u = 0; u < {_WALK_TURNS}; ++u) {{
+                const int p = base + u * STRIDE + lane;
+                g[u] = p < b ? reg_order.data[p] : -1;
             }}
-            in += COUNT(votes);
-            out += COUNT(outs);
+            for (int u = 0; u < {_WALK_TURNS}; ++u) act[u] = g[u] >= 0 && reg_state.data[g[u]] != {int(REGION_LEFT)};
+            for (int u = 0; u < {_WALK_TURNS}; ++u) sides[u] = act[u] ? reg_body.data[g[u]] : wp::vec2i(-1, -1);
+            for (int u = 0; u < {_WALK_TURNS}; ++u) {{
+                const unsigned votes = BALLOT(act[u]), outs = BALLOT(g[u] >= 0 && !act[u]);
+                if (act[u]) {{
+                    reg_walk.data[s + in + BELOW(votes)] = g[u];
+                    body_level.data[sides[u][0]] = -1;
+                    if (sides[u][1] >= 0) body_level.data[sides[u][1]] = -1;
+                }} else if (g[u] >= 0) {{
+                    reg_walk.data[s + out + BELOW(outs)] = g[u];
+                }}
+                in += COUNT(votes);
+                out += COUNT(outs);
+            }}
         }}
     }};
     int s0, end;
