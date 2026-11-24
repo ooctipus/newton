@@ -323,12 +323,9 @@ class Example:
         )
         self.contacts = self.pipeline.contacts()
         if args.solver == "fpgs":
-            # Immediate MF uses world DOFs, avoiding split's 64-free-body map.
-            # Compound hardware benefits from patch reduction before the solve;
-            # raw collision storage must still fit all unreduced contacts.
-            self.mf_rows = args.mf_rows or (
-                max(256, 88 * self.object_count) if self.body_pair_reduction else 3 * self.contact_capacity
-            )
+            # The free bodies' rows hold every contact the pool holds a world, three rows each (a normal and its
+            # friction pair).
+            self.mf_rows = args.mf_rows or 3 * self.contact_capacity
             self.solver = newton.solvers.SolverFeatherPGS(
                 self.model,
                 pgs_iterations=args.iterations,
@@ -532,7 +529,12 @@ def create_parser():
     parser.add_argument(
         "--dense-rows", type=int, default=None, help="Articulated row storage: cube 2304, otherwise 256."
     )
-    parser.add_argument("--mf-rows", type=int, default=None, help="Free-body row storage, independent of raw contacts.")
+    parser.add_argument(
+        "--mf-rows",
+        type=int,
+        default=None,
+        help="Free-body row storage (default: three rows a contact of the per-world contact capacity).",
+    )
     parser.add_argument(
         "--body-pair-reduction",
         action=argparse.BooleanOptionalAction,
