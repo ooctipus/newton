@@ -197,7 +197,7 @@ class Sweep:
             # A row of one tree holds one side: its class's table holds the rows' width.
             raise RuntimeError("A world of one tree reads its rows' classes at the rows' width")
         torsion = bool(self.laws.spin_rows)
-        self.support_lanes = walk_rows.SUPPORT_UNIT_LANES if wp.get_device(model.device).is_cuda else 1
+        self.support_lanes = walk_rows.support_lanes(forest.world_count, placement.dense_max_constraints, model.device)
         arch = model.device.arch
         self.support_units_kernel = walk_rows.support_units_kernel(4 if torsion else 3, self.support_lanes, arch)
         self.support_rows = walk_rows.support_rows_kernel(

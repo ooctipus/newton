@@ -104,6 +104,7 @@ __all__ = [
     "row_sink",
     "slot_rows_kernel",
     "slot_writer",
+    "support_lanes",
     "support_rows_kernel",
     "support_threads",
     "support_units_kernel",
@@ -1320,8 +1321,20 @@ def block_walker(rows: int, side: bool, tables: tuple, classes: bool = False) ->
 
 SUPPORT_UNIT_LANES = 16
 SUPPORT_UNIT_LANES = 16
-"""A world's lane group in the support writer's first launch (:func:`support_units_kernel`): its rows' records and
-units, a lane a row; the walkers' lanes (:func:`support_threads`) do not depend on it."""
+"""A world's lane group in the support writer's first launch (:func:`support_units_kernel`) at many worlds: its rows'
+records and units, a lane a row; the walkers' lanes (:func:`support_threads`) do not depend on it."""
+
+
+def support_lanes(worlds: int, capacity: int, device) -> int:
+    """A world's lanes in the support writer's first launch: each row is its lane's alone, so where few worlds would
+    idle the device the lanes fill it (:func:`.core.execution.fill_lanes`, from :data:`SUPPORT_UNIT_LANES` up to the
+    row ``capacity``; one world of 64 figures wrote its every row on 16 lanes); many worlds keep
+    :data:`SUPPORT_UNIT_LANES`. One thread on the CPU."""
+    if not wp.get_device(device).is_cuda:
+        return 1
+    most = 1 << (max(int(capacity), 1) - 1).bit_length()
+    return fill_lanes(worlds, device, least=SUPPORT_UNIT_LANES, most=max(most, SUPPORT_UNIT_LANES))
+
 
 UNIT_BUCKETS = 16
 """The unit list's buckets (:class:`UnitList`): a world's units go to bucket ``world % UNIT_BUCKETS`` of their kind's
