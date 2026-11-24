@@ -74,7 +74,9 @@ from .sweep import (
 from .sweep_levels import COST_MATES
 
 
-def worlds(groups: int | None = None, lanes: int | None = None, classes: bool = False) -> kernel_template.Dispatch:
+def worlds(
+    groups: int | None = None, lanes: int | None = None, classes: bool = False, ranks: str | None = None
+) -> kernel_template.Dispatch:
     """The worlds a sweep launch covers: its claim's bucket of the claims' worlds (:func:`.sweep_levels.claim_worlds`),
     a device list (``general_worlds``, its count first) walked with the grid's stride (``groups`` worlds a block); the
     general sweep's (``classes``) its cost classes, heaviest first, read as one list (``general_claims``, by each
@@ -82,13 +84,15 @@ def worlds(groups: int | None = None, lanes: int | None = None, classes: bool = 
     (:data:`.sweep_levels.COST_MATES` classes above the middle world's), each warp's first world is the list's next
     from its head and its others the next from its tail (:func:`~newton._src.core.execution.warp_mates`): a heavy world
     starts first with the lightest mates. A list of like costs is walked in order, neighbours (of their own cost, near
-    their data) sharing a warp."""
+    their data) sharing a warp. With ``ranks`` (a launch operand), a world takes that many consecutive blocks: its
+    first (rank 0) runs the world, the others serve its levels wider than a block (:func:`region_phase`)."""
     if not classes:
         return kernel_template.items(
             "world",
             groups=groups,
             lanes=lanes,
             queue=("general_world_count", "general_world_grid_stride", "general_worlds"),
+            ranks=ranks,
         )
     mates = 32 // lanes if groups is not None and lanes is not None and lanes < 32 else 1
     return kernel_template.items(
@@ -315,6 +319,9 @@ def ran_slots(dofs: int) -> int:
     """Slots of ``s_ran`` for a world of ``dofs`` coordinates (:data:`RAN_SLOT`)."""
     return int(dofs) // RAN_SLOT + 1
 
+
+# A world's group of blocks (worlds' ranks): the block's rank among them and their count follow the world.
+GROUP_ABI = kernel_template.params(MF_GS_ABI[0], ("rank", int), ("group", int), *MF_GS_ABI[1:])
 
 COLOR_AFTER = "LOAD_slots(reinterpret_cast<const int2*>(&color_after.data[(off_unit + {}) * 2]))"
 """The colored unit's turn at a place: the colors of the latest earlier unit on each of its bodies
@@ -906,7 +913,7 @@ pass rule's; ``reg_stamp`` a region's second body's version at its last settled 
 regularization."""
 
 
-def region_phase(pad: str = "        ", *, block: bool = False) -> str:
+def region_phase(pad: str = "        ", *, block: bool = False, group: bool = False) -> str:
     """Native statements of a sweep's region phase: the world's open regions (those of a free body that a dense row,
     or a region between two movable bodies touches; :func:`.region_sweep.fill_regions`), body by body in
     their order, each by the one visit (:func:`.region_laws.region_visit`), on the world's velocity change in walk
@@ -932,7 +939,13 @@ def region_phase(pad: str = "        ", *, block: bool = False) -> str:
     its second's) and passed while both stand; one that holds nothing is opened only if a candidate closes at its
     bodies' twists. A visit votes for another sweep by the exit law: a coordinate of the region whose own change is
     past the floor (:data:`.solve_policy.QUIET`) of its terms. A left-out region
-    (:data:`.region_sweep.REGION_LEFT`) is passed: the sweeps' end tests it (:func:`region_verify`)."""
+    (:data:`.region_sweep.REGION_LEFT`) is passed: the sweeps' end tests it (:func:`region_verify`).
+
+    Over a world's ``group`` of blocks (:func:`worlds`' ranks), the world's block (rank 0) runs the phase as a block's,
+    and a level that holds more regions than the block has threads is the group's: the block posts the level's places
+    in the world's job words (:data:`WIDE_JOB`), every block of the group takes its regions (spread over the blocks,
+    ``tid * group + rank``), and the block joins them, with their exit votes, before its next level. The other blocks
+    take what it posts until the world's end. A level's regions share no body, so the order is the same sweep."""
     gather = """const wp::spatial_vector seen = body_seen.data[{f}];
 bool same = true;
 for (int k = 0; k < 6; ++k) {{
@@ -973,7 +986,11 @@ if (moved) {{
     # Over a block (the colored mapping's, a world whose levels hold the colored rule's parallelism and that forms no
     # pair block: its claim's rule), a level's regions take every thread at the block's stride and a block barrier
     # ends a level; no world there is a chain and no turn is teamed.
+    if group and not block:
+        raise ValueError("a world's group of blocks serves the block's levels")
     sync, me, stride = ("__syncthreads();", "tid", "(int)blockDim.x") if block else ("SYNC();", "lane", "STRIDE")
+    if group:
+        me, stride = "place_at", "place_step"
     alone = "false" if block else f"(float)(kept_end - region_span[0]) < {parallelism}f * (float)levels"
     holds = "false" if block else f"blk_pair.data[world * {int(PAIR_BLOCKS)}][0] >= 0"
     passed = "place >= level_last" if block else "(place >= level_last || ((blocks >> lane) & 1u) != 0u)"
@@ -996,8 +1013,7 @@ if (moved) {{
     // A chain world walks its order itself (reg_walk: a body's regions together, so its twist stays kept), as one
     // span; the others take the levels.
     const int spans = alone ? 1 : levels;
-    for (int level = 0; level < spans; ++level) {{
-    const int level_last = alone ? kept_end : level_end.data[region_span[0] + level];
+{_GROUP_STAGE if group else _LEVEL_STAGE}
     for (int chunk = level_first; chunk < level_last; chunk += {stride}) {{
     // A chain world's lanes all walk its order, each doing the same work (a block's candidate passes split over them),
     // a chunk of the lanes' width at a time: each lane reads one place's state, and the chunk's turns are its regions
@@ -1150,7 +1166,7 @@ if (moved) {{
         reg_stamp.data[g] = version_b;
     }}
     }}
-    level_first = level_last;
+{_GROUP_JOIN if group else ""}    level_first = level_last;
     if (!alone) {sync}
     }}
 }}
@@ -1163,6 +1179,75 @@ _REMAKE_RESOURCES = """            const int region = valid ? reg_walk.data[s0 +
             const int node_a = sides[0];
             const int node_b = sides[1];"""
 """A walk's region's resources in the sweeps' end remake (:func:`region_verify`): its bodies."""
+
+
+# A world's job words where it takes a group of blocks (region_phase): the generation of its last post, the level's
+# first and last places, the world's end, the blocks that joined, their exit votes.
+WIDE_JOB = 8
+
+_LEVEL_STAGE = """    for (int level = 0; level < spans; ++level) {
+    const int level_last = alone ? kept_end : level_end.data[region_span[0] + level];"""
+
+# The stage over a world's group of blocks: the world's block takes its next level and posts one wider than the block;
+# the others take what it posts, the world's end last (wide_gen counts the posts on every block of the group).
+_GROUP_STAGE = """    for (int level = 0; ; ++level) {
+    int level_last = level_first;
+    bool wide = true;
+    if (rank == 0) {
+        if (level >= spans) break;
+        level_last = level_end.data[region_span[0] + level];
+        wide = group > 1 && level_last - level_first > (int)blockDim.x;
+        if (wide) {
+            ++wide_gen;
+            if (tid == 0) {
+                volatile int* const job = wide_job;
+                job[1] = level_first;
+                job[2] = level_last;
+                __threadfence();
+                atomicExch(wide_job, wide_gen);
+            }
+        }
+    } else {
+        ++wide_gen;
+        if (tid == 0) {
+            const volatile int* const job = wide_job;
+            while (job[0] < wide_gen) { }
+            __threadfence();
+        }
+        __syncthreads();
+        const volatile int* const job = wide_job;
+        if (job[3] != 0) break;
+        level_first = job[1];
+        level_last = job[2];
+    }
+    const int place_at = wide ? tid * group + rank : tid;
+    const int place_step = wide ? (int)blockDim.x * group : (int)blockDim.x;"""
+
+# The join of a posted level: the world's block waits for the group's blocks and takes their exit votes; each of them
+# votes, then counts itself in.
+_GROUP_JOIN = """    if (wide) {
+        if (rank == 0) {
+            __syncthreads();
+            if (tid == 0) {
+                volatile int* const job = wide_job;
+                while (job[4] < wide_gen * (group - 1)) { }
+                __threadfence();
+                if (job[5] != 0) {
+                    job[5] = 0;
+                    iteration_changed = 1;
+                }
+            }
+        } else {
+            const bool voted = __syncthreads_or(iteration_changed != 0);
+            iteration_changed = 0;
+            if (tid == 0) {
+                if (voted) atomicOr(wide_job + 5, 1);
+                __threadfence();
+                atomicAdd(wide_job + 4, 1);
+            }
+        }
+    }
+"""
 
 
 def region_verify(
@@ -1468,11 +1553,28 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         )
         head = "    const int lane = LANE;\n    const int tid = (int)threadIdx.x;\n    const int warp = tid >> 5;"
         first_warp, end_first_warp, barrier = "    if (warp == 0) {\n", "    }\n", "__syncthreads();"
+    world_end = leave = ""
     if colored and sweep.regions:
         # The free bodies' contacts are regions: the world's open ones by their levels over the block, the sweeps' end
         # tests the left-out ones over it.
-        free_phase = region_phase("    ", block=True)
+        free_phase = region_phase("    ", block=True, group=sweep.world_blocks)
         left_verify = region_verify(budget=budget, block=True) + "\n"
+        if sweep.world_blocks:
+            # A world's group of blocks (region_phase): its block (rank 0) runs every phase, the others serve its wide
+            # levels and leave the sweeps at the world's end, which the block posts after its last sweep.
+            head += f"\n    int wide_gen = 0;\n    int* const wide_job = wide_jobs.data + (size_t)world * {WIDE_JOB};"
+            first_warp = "    if (warp == 0 && rank == 0) {\n"
+            leave = "        if (rank != 0) break;\n"
+            world_end = """
+    if (rank == 0 && group > 1) {
+        ++wide_gen;
+        if (tid == 0) {
+            volatile int* const job = wide_job;
+            job[3] = 1;
+            __threadfence();
+            atomicExch(wide_job, wide_gen);
+        }
+    }"""
         trace_reduction = ""
         if solve_policy.traces:
             trace_reduction = block_argmax(COLORED_THREADS // 32, warp="warp", lane="lane")[0]
@@ -1672,7 +1774,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
             triples,
             indent(free_phase, "    "),
         ),
-        exit=sweep_vote + left_verify + sweep_end,
+        exit=leave + sweep_vote + left_verify + sweep_end,
         budget=budget,
     )
     # The streamed rows' records (row_record, row_metadata.record_layout).
@@ -1709,7 +1811,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     # The sweeps and the way back; the stage launch (``formed == "stage"``) forms the dense records and leaves.
     budget_line = f"    int {budget} = iterations;\n" if budget != "iterations" else ""
     rest = f"""
-{budget_line}{sweeps}
+{budget_line}{sweeps}{world_end}
 
     {barrier}
 {first_warp}    for (int d = lane; d < {D}; d += STRIDE) {{
@@ -1812,10 +1914,15 @@ class GeneralSweep(SweepConfig):
     split: bool = False
     regions: bool = False
     formed: str = "inline"
+    world_blocks: bool = False
 
     def __post_init__(self):
         if self.regions and not self.free_rows:
             raise ValueError("regions are the free bodies' run's units")
+        if self.world_blocks and not (self.colored and self.regions and self.places.velocity is not Place.SHARED):
+            raise ValueError(
+                "a world's blocks serve its region levels past a block: the colored block's, the velocity global"
+            )
         if self.places.metadata is Place.STREAMED and self.record_rows:
             raise ValueError("a sweep that streams its dense rows' records reads them from the line's first row")
         if self.levels.law not in (SEQUENTIAL, EXACT):
@@ -1872,6 +1979,8 @@ class GeneralSweep(SweepConfig):
 
     @property
     def ABI(self) -> tuple:
+        if self.world_blocks:
+            return GROUP_ABI
         return COLORED_ABI if self.colored and not self.regions else MF_GS_ABI
 
     @property
@@ -1906,6 +2015,7 @@ class GeneralSweep(SweepConfig):
             + {"inline": "", "ahead": "_formed", "stage": "_records"}[self.formed]
             + ("_tree" if self.one_tree else "")
             + ("_split" if self.split else "")
+            + ("_group" if self.world_blocks else "")
             + "_walk"
             + self.solve_policy.suffix
         )
@@ -1934,6 +2044,8 @@ class GeneralSweep(SweepConfig):
     def dispatch(self, staging: Staging) -> Dispatch:
         # The warp mapping walks the general sweep's cost classes (sweep_levels.COST_CLASSES), the colored one its bucket.
         classes = not self.colored
+        if self.world_blocks:
+            return worlds(lanes=self.lanes, ranks="world_blocks")
         return (
             worlds(self.groups, self.lanes, classes) if self.groups > 1 else worlds(lanes=self.lanes, classes=classes)
         )
@@ -1974,6 +2086,8 @@ class GeneralSweep(SweepConfig):
                 if self.places.velocity is not Place.SHARED
                 else ()
             ),
+            # Where a world takes a group of blocks, its job words (WIDE_JOB a world, region_phase).
+            *((RowArgument("wide_jobs", wp.array[int], after="omega"),) if self.world_blocks else ()),
             # The warp mapping's worlds' costs, which order its next call (sweep_levels.claim_worlds).
             *((RowArgument("world_cost", wp.array[wp.int32], after="omega"),) if not self.colored else ()),
             *self.law_operands(),

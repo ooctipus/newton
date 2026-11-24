@@ -386,6 +386,10 @@ class Sweep:
         self.claims = None
         # The general sweep's velocity lines where it keeps its velocity change in global memory (_velocity_lines).
         self.sweep_velocity = None
+        # Blocks a world of the colored launch (sweep_routes.worlds' ranks) and their job words (region_phase), where a
+        # world's region levels may outgrow its block.
+        self.world_blocks = 1
+        self.wide_jobs = None
         self.claims_beside = None
         # The one writer's EMIT sink (walk_rows.RowSeeds): none until a tier walks its rows.
         self.placement.row_seeds = walk_rows.row_seeds(self.placement, 0, 0, sweep_routes_tiers.TIER_ROWS)
@@ -508,11 +512,28 @@ class Sweep:
                     slot = np.full(self.forest.world_count, -1, dtype=np.int32)
                     slot[capable] = np.arange(capable.size, dtype=np.int32)
                     self.region_slot = wp.array(slot, dtype=wp.int32, device=model.device)
-            colored_sweep = (
-                self._staged(dataclasses.replace(declared, regions=self.regions is not None, **_COLORED), capable.size)
-                if colored
-                else None
-            )
+            colored_sweep = None
+            if colored:
+                colored_declared = dataclasses.replace(declared, regions=self.regions is not None, **_COLORED)
+                if self.region_slot is not None:
+                    # A level's regions share no body, so a world holds a level wider than its block only where its
+                    # free bodies outnumber the block's threads: such worlds take the device's blocks beside their own,
+                    # as many each as the device holds over the worlds, with the velocity change in global memory.
+                    found = device(model.device)
+                    held = shape(colored_declared.work(), found).blocks_per_sm
+                    group = held * found.sms // int(capable.size)
+                    bodies = int(np.asarray(self.forest.free_rigid_per_world)[capable].max())
+                    if group > 1 and bodies > sweep_routes.COLORED_THREADS:
+                        self.world_blocks = group
+                        places = dataclasses.replace(colored_declared.places, velocity=Place.GLOBAL)
+                        colored_declared = dataclasses.replace(colored_declared, places=places, world_blocks=True)
+                        self.wide_jobs = wp.zeros(
+                            self.forest.world_count * sweep_routes.WIDE_JOB, dtype=wp.int32, device=model.device
+                        )
+                        # The general sweep's lines where it keeps its own there, else the colored block's.
+                        if self.sweep_velocity.size < self.forest.world_count * self.forest.max_world_dofs:
+                            self.sweep_velocity = self._velocity_lines(colored_declared)
+                colored_sweep = self._staged(colored_declared, capable.size)
             # The streamed rows' records, in the worlds the sweeps and the unit builder read: one layout, which every
             # sweep reads whatever its own stage holds, with the dense rows' where any sweep streams theirs.
             staged = [sweep for sweep in (self.general_sweep, colored_sweep) if sweep is not None]
@@ -622,7 +643,11 @@ class Sweep:
                 mapped = (records, general)
             if colored:
                 slots = self.colored_units.slot_count if self.colored_units is not None else int(capable.size)
-                mapped += (self._claim_launch(self.colored_sweep, self.mf_colored_kernel, slots, self.claim_colored),)
+                mapped += (
+                    self._claim_launch(
+                        self.colored_sweep, self.mf_colored_kernel, slots, self.claim_colored, ranks=self.world_blocks
+                    ),
+                )
             # In line, the tiers and then the general sweep; on the claims' streams (open_streams) the first tier in
             # line and the general sweep and the other tiers beside it.
             self.launches = (*self.tiers, *mapped)
@@ -830,6 +855,7 @@ class Sweep:
             # The streamed rows' records (the free bodies', and the dense rows' where they stream).
             "row_record": placement.row_record,
             "sweep_velocity": self.sweep_velocity,
+            "wide_jobs": self.wide_jobs,
             "iterations": self.options.pgs_iterations,
             "omega": self.options.pgs_omega,
             "friction_metric": placement.friction_metric,
@@ -863,18 +889,15 @@ class Sweep:
         return dataclasses.replace(config, places=config.places.placed(layout.staging))
 
     def _claim_launch(
-        self, config: SweepConfig, kernel: wp.Kernel, items: int, bucket: int, buckets: int = 1
+        self, config: SweepConfig, kernel: wp.Kernel, items: int, bucket: int, buckets: int = 1, ranks: int = 1
     ) -> SweepLaunch:
         """The launch of a matrix-free mapping over its claim's ``buckets`` from ``bucket``: the layer's shape of
-        :meth:`_launch_work`."""
+        :meth:`_launch_work`, each of its worlds ``ranks`` consecutive blocks (sweep_routes.worlds)."""
         layout = shape(self._launch_work(config, items), device(self.model.device))
-        return SweepLaunch(
-            config,
-            kernel,
-            layout.grid,
-            layout.block,
-            functools.partial(self._mapped_operands, bucket, buckets, layout.grid * layout.groups),
-        )
+        named = functools.partial(self._mapped_operands, bucket, buckets, layout.grid * layout.groups)
+        if ranks > 1:
+            named = functools.partial(lambda base: {**base(), "world_blocks": ranks}, named)
+        return SweepLaunch(config, kernel, layout.grid * ranks, layout.block, named)
 
     def _walk(self) -> dict:
         """The walk's view, where the sweeps leave by the walk and find a free body's tree in it."""
@@ -972,6 +995,9 @@ class Sweep:
         # The sweeps' change: into the walk's du, from zero.
         if self.leaves:
             self.factor.walk_view().du.zero_()
+        # A world's group of blocks counts its posts from zero (sweep_routes.region_phase).
+        if self.wide_jobs is not None:
+            self.wide_jobs.zero_()
         # Under a readout, count the worlds without rows of any family, which no sweep enters.
         self.readout.count_skipped(
             self.placement.constraint_count, self.placement.mf_constraint_count, self.placement.world_acts

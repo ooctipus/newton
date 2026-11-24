@@ -302,6 +302,42 @@ class TestFeatherPGSLeftRegions(unittest.TestCase):
         # The columns stand: no box sank into the ground or into the box below.
         self.assertGreater(float(poses[0][:, 2].min()), HALF - 1.0e-3)
 
+    @unittest.skipUnless(wp.is_cuda_available(), "the colored mapping's block runs on CUDA")
+    def test_wide_levels_take_the_world_group(self):
+        # A world of more free bodies than the colored block's threads holds levels wider than the block (the ground
+        # level: a region a bottom box): the device's other blocks join its block on those levels. Every mapping
+        # sweeps the order by its levels, so the published motion is the warp's to its rounding.
+        model = _columns("cuda:0", columns=18, height=2)
+        poses = []
+        for region_block in (True, False):
+            solver = SolverFeatherPGS(
+                model, pins=SolverFeatherPGS.Pins(region_block=region_block), mf_max_constraints=65_536
+            )
+            self.assertTrue(solver.placement.split_records)
+            self.assertEqual(solver.sweep.world_blocks > 1, region_block)
+            pipeline = newton.CollisionPipeline(model)
+            contacts = pipeline.contacts()
+            states = [model.state(), model.state()]
+            newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+            control = model.control()
+            widest = 0
+            for i in range(40):
+                src, dst = states[i % 2], states[(i + 1) % 2]
+                pipeline.collide(src, contacts)
+                src.clear_forces()
+                solver.step(src, dst, control, contacts, 1.0 / 240.0)
+                if region_block and i == 0:
+                    stream = solver.sweep.regions.operands()
+                    span = stream["world_regions"].numpy()[0]
+                    levels = int(stream["world_levels"].numpy()[0])
+                    ends = stream["level_end"].numpy()[span[0] : span[0] + levels]
+                    widest = int(np.diff(np.concatenate([[span[0]], ends])).max())
+            if region_block:
+                self.assertGreater(widest, 256)
+            poses.append(states[0].body_q.numpy())
+        np.testing.assert_allclose(poses[0], poses[1], rtol=0.0, atol=1.0e-5)
+        self.assertGreater(float(poses[0][:, 2].min()), HALF - 1.0e-3)
+
 
 if __name__ == "__main__":
     unittest.main()

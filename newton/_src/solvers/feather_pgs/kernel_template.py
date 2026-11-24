@@ -112,6 +112,7 @@ def items(
     above: int = 0,
     lane: bool = False,
     sub: str | None = None,
+    ranks: str | None = None,
 ) -> Dispatch:
     """The one dispatch: how a launch's threads reach their items, and how each item calls the body.
 
@@ -134,6 +135,9 @@ def items(
       heavy item light warp-mates; a list without one is walked in order, neighbours sharing a warp;
     - the body takes the item, then the thread's ``lane`` if asked, then each ``sub``-item ``sub`` the lanes share:
       ``for sub in range(lane, sub, lanes)`` (``sub`` names the item's width, as an expression of the operands).
+    - ``ranks`` (a wrapper operand: blocks an item) gives each item of a tiled launch that many consecutive blocks:
+      the position is ``block // ranks``, and the body takes the block's ``rank`` among them and their count
+      ``group`` (the queue's stride counts items, not blocks).
 
     A body is a native function (:class:`KernelTemplate`'s source) or a Warp function (its ``function``), so a
     Python kernel's item loop is this dispatch over a ``wp.func`` too.
@@ -150,6 +154,7 @@ def items(
         above: The buckets before its middle item's from which a ``span``'s items are its head.
         lane: Pass the thread's lane in its launch dimension to the body.
         sub: The item's width: the body runs for each sub-item its lanes share.
+        ranks: The wrapper operand holding the blocks an item, for a tiled launch without lane groups.
     """
     if flat and (groups is not None or lane or sub is not None):
         raise ValueError("a flat launch reads no block or lane")
@@ -157,6 +162,8 @@ def items(
         raise ValueError("lane groups and sub-items need their lanes")
     if queue is not None and span is not None:
         raise ValueError("a dispatch walks one device list: a queue or a span")
+    if ranks is not None and (flat or groups is not None):
+        raise ValueError("an item's blocks are a tiled launch's, without lane groups")
     count, stride, *listed = queue or (None, None)
     # The position: the item itself, or its place in a listed queue or span.
     at = f"{item}_at" if listed or span is not None else item
@@ -167,6 +174,13 @@ def items(
             head, at = [], "wp.tid()"
     elif groups is not None:
         head = ["block, lane = wp.tid()", f"{at} = block * {groups} + lane // {lanes}"]
+    elif ranks is not None:
+        head = [
+            f"block, {'lane' if lane or sub else '_lane'} = wp.tid()",
+            f"{at} = block // {ranks}",
+            f"rank = block - {at} * {ranks}",
+            f"group = {ranks}",
+        ]
     else:
         head = [f"{at}, {'lane' if lane or sub else '_lane'} = wp.tid()"]
     call = "$CALL"
@@ -187,11 +201,13 @@ def items(
         constants += (("warp_mates", warp_mates),)
     if guard is not None:
         call = f"if {at} < {guard}:\n{_indented(call)}"
-        extra = ((guard, int),)
+        extra = (*extra, (guard, int))
+    if ranks is not None:
+        extra = (*extra, (ranks, int))
     if queue is not None:
         head.insert(1, f"{item}_end = {count}[0]")
         call = f"while {at} < {item}_end:\n{_indented(call)}\n    {at} += {stride}"
-        extra = ((count, wp.array[int]), (stride, int), *((name, wp.array[int]) for name in listed))
+        extra = (*extra, (count, wp.array[int]), (stride, int), *((name, wp.array[int]) for name in listed))
     if span is not None:
         if mates > 1:
             # One read gives the list's items and whether it has a heavy head: a list with one pairs its two ends warp
@@ -204,8 +220,13 @@ def items(
         else:
             head.insert(1, f"{item}_end = span_total({listing}, {readers})")
         call = f"while {at} < {item}_end:\n{_indented(call)}\n    {at} += {stride}"
-        extra = ((listing, Buckets), (stride, int))
-    names = (item, *(("lane",) if lane else ()), *(("sub",) if sub is not None else ()))
+        extra = (*extra, (listing, Buckets), (stride, int))
+    names = (
+        item,
+        *(("lane",) if lane else ()),
+        *(("sub",) if sub is not None else ()),
+        *(("rank", "group") if ranks is not None else ()),
+    )
     arguments = (at if at == "wp.tid()" else item, *names[1:])
     return Dispatch("\n".join((*head, call)), arguments, tuple((name, int) for name in names), extra, constants)
 
