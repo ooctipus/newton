@@ -260,7 +260,8 @@ def _admit_world_contact(
     :func:`_admit_contact`), written for every contact, admitted or not. On a later step of its collision pass
     (``kept``) the pass's admission, class and size stand, and only the verdict is the step's."""
     if kept != 0:
-        if data.path[c] < 0:
+        # No verdict read (no acts word, no contact verdicts): nothing of the step's own.
+        if data.path[c] < 0 or (acts.shape[0] == 0 and data.acts.shape[0] == 0):
             if data.acts.shape[0] > 0:
                 data.acts[c] = 0
             return data.world[c]
