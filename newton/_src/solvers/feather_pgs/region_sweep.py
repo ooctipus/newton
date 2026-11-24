@@ -2088,7 +2088,8 @@ int* const node_owner = body_owner.data;
 int* const node_level = body_level.data;
 {dedent(levels)}
 // Each level's first place from the world's first (an exclusive scan of the counts), each region at its
-// level's first plus its rank, then each level's end (the next level's first; the last's, the walk's acting end).
+// level's first plus its rank (a few turns' loads in flight, _WALK_TURNS), then each level's end (the next level's
+// first; the last's, the walk's acting end).
 int carry = s0;
 for (int base = 0; base < levels; base += STRIDE) {{
     const int k = base + lane;
@@ -2098,9 +2099,18 @@ for (int base = 0; base < levels; base += STRIDE) {{
     carry += READ(below + n, STRIDE - 1);
 }}
 SYNC();
-for (int p = s0 + lane; p < s0 + acting; p += STRIDE) {{
-    const int g = reg_walk.data[p];
-    level_region.data[level_end.data[s0 + reg_level.data[g]] + reg_rank.data[g]] = g;
+for (int base = s0; base < s0 + acting; base += {_WALK_TURNS} * STRIDE) {{
+    int g[{_WALK_TURNS}], level[{_WALK_TURNS}], rank[{_WALK_TURNS}];
+    for (int u = 0; u < {_WALK_TURNS}; ++u) {{
+        const int p = base + u * STRIDE + lane;
+        g[u] = p < s0 + acting ? reg_walk.data[p] : -1;
+    }}
+    for (int u = 0; u < {_WALK_TURNS}; ++u) {{
+        level[u] = g[u] >= 0 ? reg_level.data[g[u]] : 0;
+        rank[u] = g[u] >= 0 ? reg_rank.data[g[u]] : 0;
+    }}
+    for (int u = 0; u < {_WALK_TURNS}; ++u) level[u] = g[u] >= 0 ? level_end.data[s0 + level[u]] : 0;
+    for (int u = 0; u < {_WALK_TURNS}; ++u) if (g[u] >= 0) level_region.data[level[u] + rank[u]] = g[u];
 }}
 SYNC();
 for (int base = 0; base < levels; base += STRIDE) {{
