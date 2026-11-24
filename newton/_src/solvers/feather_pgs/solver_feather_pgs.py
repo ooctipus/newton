@@ -974,9 +974,11 @@ class SolverFeatherPGS(SolverBase):
         device-resident ``placement.constraint_overflow`` boolean array is always
         maintained, including without ``Diagnostics.row_watermark``; GPU consumers can
         inspect it without host synchronization. Status remains set until
-        :meth:`reset` clears the affected worlds. Increasing capacity requires
-        constructing a solver and recapturing graphs before restarting the
-        invalidated transition.
+        :meth:`reset` clears the affected worlds. The error names the rows the
+        invalid worlds asked for past each row class's capacity and the option
+        value that holds them. Increasing capacity requires constructing a
+        solver and recapturing graphs before restarting the invalidated
+        transition.
         """
         self.placement.check_capacity()
 

@@ -489,6 +489,8 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
         (call, "default_control", True, (STEP, "default_control", model)),
         (call, "bind_material", options.contact_compliance, (solver, "_bind_contact_material", CONTACTS)),
         (call, "follow_contacts", articulated, (STEP, "follow_contacts", placement)),
+        # A pass that dropped rows fails the next step that sees its record (outside capture).
+        (call, "fail_on_dropped_rows", articulated, (placement, "fail_on_dropped_rows")),
         (call, "warm_start_contract", warm, (STEP, "warm_start_contract")),
         (call, "wait_for_collision", particles, (STEP, "wait_for_collision", device)),
         (call, "particle_forces", particles, (solver, "_eval_particle_forces", STATE_IN, CONTROL, CONTACTS)),

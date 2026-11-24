@@ -301,19 +301,20 @@ class TestSeparatedWorldsDevice(unittest.TestCase):
 
     def test_capacity_rejections_keep_their_anchors(self):
         """A separating world whose contact rows overflow a route: the allocator rejects them as on the complete path,
-        and the rejected contact keeps its anchor while the world takes no sweep."""
+        and the rejected contact keeps its anchor while the world takes no sweep; the next step fails closed on the
+        dropped rows on both paths."""
         model = _tossed_spheres(wp.get_device())
         # Thirty steps: each sphere rises about 5 cm and starts falling, inside the 10 cm contact gap.
         # A free body's contacts are rows of the line: two rows a world cannot hold a contact's three.
         options = {"steps": 30, "toss_every": 1, "solver_kwargs": {"dense_max_constraints": 1, "mf_max_constraints": 1}}
         complete_history, history = [], []
-        plain_solver, plain, _ = _rollout(model, separated=False, history=complete_history, **options)
-        solver, poses, _ = _rollout(model, history=history, **options)
+        for separated, steps in ((False, complete_history), (True, history)):
+            with self.assertRaisesRegex(RuntimeError, "dropped them"):
+                _rollout(model, separated=separated, history=steps, **options)
+        self.assertGreater(len(complete_history), 0, "no step before the pass that dropped rows")
         self.assertGreater(min(int(np.sum(record["valid"])) for record in complete_history), 0, "no anchor kept")
         for step, (record, expected) in enumerate(zip(history, complete_history, strict=True)):
             np.testing.assert_array_equal(record["valid"], expected["valid"], err_msg=f"anchors at {step}")
-        assert_history_close(solver, plain_solver)
-        np.testing.assert_array_equal(poses, plain)
 
 
 def _walkers(device, worlds=4):
@@ -346,7 +347,7 @@ class TestSeparatedWorldsSparseRoute(unittest.TestCase):
                 model,
                 pgs_iterations=8,
                 enable_joint_limits=True,
-                dense_max_constraints=56,
+                dense_max_constraints=96,
             )
         self.assertLessEqual(set(env), set(solver.get_path_selection()["environment"]["unknown"]))
         self.assertIsNotNone(solver.spec.classes.packed_size)

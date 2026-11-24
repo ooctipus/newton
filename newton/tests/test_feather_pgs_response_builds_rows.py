@@ -212,7 +212,10 @@ def _arm_stack_run(device, pins=None, steps: int = 8):
         builder.add_shape_box(body, hx=0.04, hy=0.04, hz=0.04)
     builder.add_ground_plane()
     model = builder.finalize(device=device)
-    solver = newton.solvers.SolverFeatherPGS(model, pins=newton.solvers.SolverFeatherPGS.Pins(**(pins or {})))
+    # The stack's rows a world (38) past the default line's 32.
+    solver = newton.solvers.SolverFeatherPGS(
+        model, dense_max_constraints=64, pins=newton.solvers.SolverFeatherPGS.Pins(**(pins or {}))
+    )
     pipeline = newton.CollisionPipeline(model, growable_contacts=True)
     contacts = pipeline.contacts()
     state, out = model.state(), model.state()

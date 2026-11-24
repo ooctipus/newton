@@ -215,7 +215,14 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
             contacts.rigid_contact_normal.assign(np.tile([0.0, 0.0, -1.0], (count, 1)).astype(np.float32))
             history = []
             observables = solver.observables(contacts=contacts, kinds={solver.ObservableKind.CONTACT_F})
-            for _ in range(3):
+            for step in range(3):
+                if capacity < 640 and step > 0:
+                    # The pass that dropped rows fails the next step, naming the rows the world asked for.
+                    with self.assertRaisesRegex(
+                        RuntimeError, "requested 615 dense rows .*dense_max_constraints >= 615"
+                    ):
+                        solver.step(state_in, state_out, model.control(), contacts, dt, observables=observables)
+                    break
                 old_velocity = float(state_in.joint_qd.numpy()[0])
                 old_position = float(state_in.joint_q.numpy()[0])
                 solver.step(state_in, state_out, model.control(), contacts, dt, observables=observables)
@@ -355,6 +362,48 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
         self.assertFalse(any(solver.constraint_capacity_status().values()))
         solver.check_constraint_capacity()
         self.assertEqual(solver.placement.dense_max_constraints, 192)
+
+    def test_overflow_reports_the_rows_a_world_asked_for(self):
+        """A box on a ball joint that lands on the floor asks for more dense rows than the line holds: the next step
+        fails closed with the rows asked for, the world's latch stays set, its largest reservation is kept until reset,
+        and the public check names it with the option that would hold it; the state stays finite."""
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()
+        anchor = builder.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, 0.25), wp.quat_identity()))
+        builder.add_shape_box(anchor, hx=0.2, hy=0.2, hz=0.05)
+        limb = builder.add_link(xform=wp.transform(wp.vec3(0.3, 0.0, 0.25), wp.quat_identity()))
+        builder.add_shape_box(limb, hx=0.1, hy=0.2, hz=0.05)
+        free = builder.add_joint_free(anchor)
+        ball = builder.add_joint_ball(
+            anchor,
+            limb,
+            parent_xform=wp.transform(wp.vec3(0.2, 0.0, 0.0), wp.quat_identity()),
+            child_xform=wp.transform(wp.vec3(-0.1, 0.0, 0.0), wp.quat_identity()),
+        )
+        builder.add_articulation([free, ball])
+        model = builder.finalize(device="cpu")
+        solver = SolverFeatherPGS(model, dense_max_constraints=6)
+        pipeline = newton.CollisionPipeline(model)
+        contacts = pipeline.contacts()
+        state_in, state_out, control = model.state(), model.state(), model.control()
+        with self.assertRaisesRegex(
+            RuntimeError, "requested [0-9]+ dense rows .*the solver does not step without them"
+        ):
+            for _ in range(40):
+                pipeline.collide(state_in, contacts)
+                solver.step(state_in, state_out, control, contacts, 1.0 / 200.0)
+                state_in, state_out = state_out, state_in
+        self.assertTrue(np.isfinite(state_in.body_q.numpy()).all())
+        self.assertTrue(solver.placement.constraint_overflow.numpy()[0])
+        asked = int(solver.placement.row_demand.numpy()[0, 0])
+        self.assertGreater(asked, solver.placement.dense_max_constraints)
+        with self.assertRaisesRegex(RuntimeError, f"requested {asked} dense rows .*dense_max_constraints >= {asked}"):
+            solver.check_constraint_capacity()
+        solver.reset(model.state())
+        self.assertEqual(int(solver.placement.row_demand.numpy()[0, 0]), 0)
+        solver.check_constraint_capacity()
+        # The reset restarts the record: the next pass steps.
+        solver.step(state_in, state_out, control, contacts, 1.0 / 200.0)
 
     def test_public_check_rejects_capture(self):
         """Reject host reads and explicit clears during CUDA graph capture."""

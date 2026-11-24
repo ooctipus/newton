@@ -261,9 +261,9 @@ class TestFeatherPGSContactRowOrder(unittest.TestCase):
 
         With 40 dense rows the tripods' worlds overflow their dense rows while their matrix-free
         rows fit. Each family's accepted rows tile the world's rows up to the finalized count, in
-        the frame's order.
+        the frame's order (one step: the next fails closed on the dropped rows).
         """
-        records = _step_tripods(wp.get_device("cpu"), steps=2, dense_max_constraints=40)
+        records = _step_tripods(wp.get_device("cpu"), steps=1, dense_max_constraints=40)
         for step, record in enumerate(records):
             for path in _ROW_PATHS:
                 counts, starts = record["counts"][path], record["starts"][path]

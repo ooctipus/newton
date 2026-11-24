@@ -161,8 +161,16 @@ CAPACITY_STATUS = FieldGroup(
     Field("constraint_capacity_status", wp.int32, (2,), owner="placement"),
     Field("constraint_overflow", wp.bool, ("world",), owner="placement"),
     Field("row_dropped_all", wp.int32, (2, "status_world"), owner="placement"),
+    Field("row_demand", wp.int32, (2, "world"), owner="placement"),
 )
-"""Sticky capacity flags of the dense and matrix-free rows, the per-world overflow latch and dropped rows."""
+"""Sticky capacity flags of the dense and matrix-free rows, the per-world overflow latch and dropped rows, and each
+world's largest reservation past a class's capacity since its reset (``row_demand``: the rows it asked for, 0 while it
+fits), which the capacity check reports."""
+
+ROW_DROP_WORDS = 3
+"""The host's record of the row passes that dropped rows since the last reset (:meth:`Placement.fail_on_dropped_rows`):
+the worlds' passes that reserved past a class's capacity, then the largest reservation of the dense rows and of the free
+bodies' run."""
 
 OVERFLOW_WARNING = FieldGroup(Field("row_overflow_warning_emitted", wp.int32, (2,), owner="placement"))
 """The one-shot overflow warning latch of each row family."""
@@ -302,13 +310,25 @@ def _latch_world(
     capacity: wp.vec2i,
     contact_capacity: int,
     overflow: wp.array[wp.bool],
+    demand: wp.array2d[int],
+    record: wp.array[wp.int32],
 ):
     """Latch ``world``'s invalid status until reset: a row class (by class and world) that reserved past its
-    ``capacity`` or dropped rows, or the contacts' overflow."""
+    ``capacity`` or dropped rows, or the contacts' overflow; a class past its capacity also keeps its largest
+    reservation (``demand``) and counts in the host's drop record (:data:`ROW_DROP_WORDS`): a world's pass that dropped
+    rows, the largest reservation of each class."""
     invalid = contact_count[0] > contact_capacity or reduction_overflow[0] != 0
+    dropped_rows = bool(False)
     for row_class in range(2):
-        if slot_counter[row_class, world] > capacity[row_class] or dropped[row_class, world] > 0:
+        asked = slot_counter[row_class, world]
+        if asked > capacity[row_class]:
+            demand[row_class, world] = wp.max(demand[row_class, world], asked)
+            wp.atomic_max(record, 1 + row_class, wp.int32(asked))
+            dropped_rows = True
+        if asked > capacity[row_class] or dropped[row_class, world] > 0:
             invalid = True
+    if dropped_rows:
+        wp.atomic_add(record, 0, wp.int32(1))
     if invalid:
         overflow[world] = True
 
@@ -319,12 +339,15 @@ def _reset_solver_status(
     articulation_world: wp.array[int],
     mass_update_requested: wp.array[int],
     overflow: wp.array[wp.bool],
+    demand: wp.array2d[int],
 ):
-    """Clear selected world status and request only its articulation factors."""
+    """Clear selected world status (its latch and row demand) and request only its articulation factors."""
     tid = wp.tid()
     if tid < overflow.shape[0]:
         if not world_mask or world_mask[tid] != 0:
             overflow[tid] = False
+            demand[0, tid] = 0
+            demand[1, tid] = 0
     if tid < mass_update_requested.shape[0]:
         world = articulation_world[tid]
         if not world_mask or world_mask[world] != 0:
@@ -384,6 +407,8 @@ def _close_row_pass(
     count: wp.array2d[int],
     capacity_status: wp.array[int],
     overflow: wp.array[wp.bool],
+    demand: wp.array2d[int],
+    record: wp.array[wp.int32],
 ):
     """Close each world's row pass once every row producer reserved: the first ``families`` row classes' counts (the
     dense rows', then the free bodies' run), each its accepted prefix with sticky overflow (:func:`.row_slots`'
@@ -394,7 +419,18 @@ def _close_row_pass(
         count[family, world] = reserved_count(
             slot_counter[family], world, capacity[family], first_rejected[family], capacity_status, family
         )
-    _latch_world(world, slot_counter, dropped, contact_count, reduction_overflow, capacity, contact_capacity, overflow)
+    _latch_world(
+        world,
+        slot_counter,
+        dropped,
+        contact_count,
+        reduction_overflow,
+        capacity,
+        contact_capacity,
+        overflow,
+        demand,
+        record,
+    )
     if warn != 0:
         _warn_world(world, slot_counter, dropped, capacity, mf_active, warning_emitted)
 
@@ -706,6 +742,15 @@ class Placement:
         self.slot_counter, self.mf_slot_counter = self.row_slot_counter[0], self.row_slot_counter[1]
         self.dense_first_rejected_slot = self.row_first_rejected[0]
         self.mf_first_rejected_slot = self.row_first_rejected[1]
+        # The host's drop record (ROW_DROP_WORDS): pinned memory on CUDA, which the row pass's close writes through
+        # the device's mapping of it, so the step reads it without synchronizing (fail_on_dropped_rows).
+        self.row_drop_host = wp.zeros(ROW_DROP_WORDS, dtype=wp.int32, device=self.model.device)
+        self.row_drop_mirror = self.row_drop_host
+        if self.model.device.is_cuda:
+            self.row_drop_host = wp.zeros(ROW_DROP_WORDS, dtype=wp.int32, device="cpu", pinned=True)
+            self.row_drop_mirror = wp.array(
+                ptr=self.row_drop_host.ptr, dtype=wp.int32, shape=(ROW_DROP_WORDS,), device=self.model.device
+            )
         if self.forest.world_count == 0:
             return
 
@@ -966,16 +1011,62 @@ class Placement:
                 int(self.forest.has_free_rigid_bodies),
                 self.row_overflow_warning_emitted if warn else self.dummy_contact_count,
             ],
-            outputs=[self.row_count, self.constraint_capacity_status, self.constraint_overflow],
+            outputs=[
+                self.row_count,
+                self.constraint_capacity_status,
+                self.constraint_overflow,
+                self.row_demand,
+                self.row_drop_mirror,
+            ],
             row_args=(8,) if contacts is not None else (),
         )
 
+    def fail_on_dropped_rows(self) -> None:
+        """Fail closed on dropped rows: outside capture, once the drop record (its pinned words, read without
+        synchronizing, so on CUDA up to the passes still in flight later) holds a pass that reserved past a class's
+        capacity, the step raises with the rows asked for and the option that holds them instead of solving without
+        them. In graph replays the latched status (:meth:`check_capacity`) and the device warning report it."""
+        if self.model.device.is_cuda and self.model.device.is_capturing:
+            return
+        record = self.row_drop_host.numpy()
+        if record[0] == 0:
+            return
+        raise RuntimeError(
+            f"FeatherPGS: {int(record[0])} world pass(es) reserved rows past capacity and dropped them; "
+            f"{self._asked(record[1], record[2])}; the solver does not step without them. Build the solver with "
+            "that capacity, reset and recapture."
+        )
+
+    def _asked(self, dense: int, free: int) -> str:
+        """The rows asked for past each class's capacity, as the options that would hold them (a world's dense rows hold
+        its links' on top of the option's)."""
+        links = int(self.dense_max_constraints) - int(self.options.dense_max_constraints)
+        asked = []
+        if dense > 0:
+            asked.append(
+                f"requested {int(dense)} dense rows a world against {int(self.dense_max_constraints)}: "
+                f"dense_max_constraints >= {int(dense) - links}"
+            )
+        if free > 0:
+            asked.append(
+                f"requested {int(free)} matrix-free rows a world against {int(self.mf_max_constraints)}: "
+                f"mf_max_constraints >= {int(free)}"
+            )
+        return "; ".join(asked)
+
     def reset_status(self, world_mask):
-        """Clear the selected worlds' overflow latch and request their factors."""
+        """Clear the selected worlds' overflow latch and request their factors; the drop record restarts."""
+        self.row_drop_mirror.zero_()
         wp.launch(
             _reset_solver_status,
             dim=max(self.forest.world_count, self.model.articulation_count),
-            inputs=[world_mask, self.forest.art_to_world, self.factor.mass_update_requested, self.constraint_overflow],
+            inputs=[
+                world_mask,
+                self.forest.art_to_world,
+                self.factor.mass_update_requested,
+                self.constraint_overflow,
+                self.row_demand,
+            ],
             device=self.model.device,
         )
 
@@ -1059,9 +1150,14 @@ class Placement:
             )
         worlds = np.flatnonzero(self.constraint_overflow.numpy())
         if worlds.size:
+            # The rows the invalid worlds asked for past each class's capacity, as the options that would hold them
+            # (a world's dense rows hold its links' on top of the option's).
+            demand = self.row_demand.numpy()[:, worlds].max(axis=1)
+            asked = self._asked(demand[0], demand[1])
             raise RuntimeError(
                 f"FeatherPGS constraint/contact capacity exceeded in worlds {worlds[:16].tolist()}"
-                f" ({worlds.size} invalid worlds); increase capacities and reset before accepting transitions."
+                f" ({worlds.size} invalid worlds){'; ' + asked if asked else ''}; increase capacities and reset before"
+                " accepting transitions."
             )
 
     def row_watermarks(self) -> dict:
