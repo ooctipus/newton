@@ -2234,6 +2234,21 @@ lane group's count and places of the acting and left-out regions of a part of it
 loads in flight, :data:`_WALK_TURNS`), and ``walk_wide``, the walk of a world over a block's warps (``BLOCK_SYNC``),
 a part each."""
 
+_WIDE_LEVELS = f"""        {{
+            __shared__ int s_wide_turn[1];
+            const int world_k = world - SUB + k;
+            {{
+                const int world = world_k, s0 = s, acting = total;
+                __syncthreads();
+{walk_levels("                ", turns="s_wide_turn[0]")}
+                __syncthreads();
+            }}
+        }}
+"""
+"""A wide world's levels in the step's walk (:func:`level_acting`): every warp of the block takes the level builder's
+batches in turn (:func:`walk_levels`' turns), world ``world - SUB + k`` of the block, its walk's ``total`` acting
+regions from ``s``."""
+
 _ACTING = f"""    const int lane = LANE, world = tid / LANES, worlds = world_regions.shape[0];
     // A world's listed regions in its order, [s, end) (none past the worlds).
     const auto span = [&](int w, int& s, int& end) {{
@@ -2255,18 +2270,21 @@ _ACTING = f"""    const int lane = LANE, world = tid / LANES, worlds = world_reg
         acting = count_part(s0, end);
         place_part(s0, s0, end, 0, acting);
     }}
-    // The block's wide worlds in turn, a part a warp.
+    // The block's wide worlds in turn, a part a warp, each then levelled by the block's warps in turn (the level
+    // builder's turns: the same levels and ranks as one warp's pass).
     for (int k = 0; k < GROUPS; ++k) {{
         int s, e;
         span(world - SUB + k, s, e);
         if (!wide(e - s)) continue;
         const int total = walk_wide(s, e, GROUPS, SUB);
         if (k == SUB) acting = total;
-    }}
+{indent(device_branches(_WIDE_LEVELS, "        // The CPU's one thread walks no world wide (GROUPS is one).\n"), "    ")}    }}
     if (end <= s0) {{
         if (world < worlds && lane == 0) world_levels.data[world] = 0;
         return;
     }}
+    // A narrow world's levels by its warp.
+    if (wide(end - s0)) return;
     SYNC();
 {walk_levels("    ")}
 """
