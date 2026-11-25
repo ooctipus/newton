@@ -1674,13 +1674,16 @@ def unit_visit(
     mu: str,
     guard: tuple[str, str],
     record: tuple[str, str] = ("", ""),
+    taken: bool = False,
     pad: str,
 ) -> str:
     """A contact unit's visit of row ``i`` of a row loop over ``count`` rows (:func:`contact_unit`): a contact normal
     and its two tangents (``active``: the first tangent selected too) past the placement's ``guard`` (its loads, its
     condition), one load group and one reduction of their terms, their staged values held, one apply; it consumes the
-    pair (``consumed_tangent``). The Gram couplings and pair metric are a ``record``'s (its loads, then its couplings
-    after the reduction), else the same reduction's (``gram_n1``, ``gram_n2``, ``unit_cross``).
+    pair (``consumed_tangent``); with ``taken`` it tells its schedule the row after the pair once it is admitted
+    (``UNIT_TAKEN``, :func:`rows_block`: a loop that loads its next row ahead loads that one, any other ignores it).
+    The Gram couplings and pair metric are a ``record``'s (its loads, then its couplings after the reduction), else the
+    same reduction's (``gram_n1``, ``gram_n2``, ``unit_cross``).
     """
     unit_rows = {"normal": "i", "tangent": "tangent", "sibling": "sibling"}
     loads, after = record
@@ -1725,7 +1728,7 @@ if ({entry_guard}i + 2 < {count}
     && (({kind("i")} == {ROW_CONTACT}) & ({kind("i + 1")} == {ROW_FRICTION}) & ({kind("i + 2")} == {ROW_FRICTION})
         & (isfinite({diag("i")}) != 0) & ({diag("i")} > 0.0f){selected})) {{
     const int head = i, tangent = i + 1, sibling = i + 2;{loaded}
-    if ({condition}) {{
+    if ({condition}) {{{chr(10) + "        UNIT_TAKEN(sibling + 1);" if taken else ""}
 {units}
         consumed_tangent = tangent;
         SYNC();
@@ -2498,9 +2501,15 @@ def _visit_pipeline(rows: WorldRows, end: str, begin: str, torsion: bool) -> Pip
     def prologue(pad: str) -> str:
         held = ", ".join(f"pre_{name} = 0.0f" for name in HELD)
         probe = f"{pad}int pre_probe = 0;\n" if torsion else ""
+        # A contact unit consumes its pair (unit_visit): the loop steps past it, the row after it loaded instead.
+        taken = (
+            f"{pad}const auto UNIT_TAKEN = [&](const int next) {{\n{pad}    pipe_next = next;\n"
+            f"{pad}    if (next < {end}) {{\n{_visit_load(rows, 'next', begin, end, torsion, pad + '        ')}\n"
+            f"{pad}    }}\n{pad}}};\n"
+        )
         return (
             f"{pad}int4 {', '.join(f'pre_{name[-1]}' for name in rows.registers)};\n{pad}float {held};\n{probe}"
-            f"{pad}int pipe_next = {begin};\n"
+            f"{pad}int pipe_next = {begin};\n{taken}"
             f"{pad}if ({end} > {begin}) {{\n{_visit_load(rows, begin, begin, end, torsion, pad + '    ')}\n{pad}}}"
         )
 
@@ -2656,12 +2665,14 @@ def rows_block(
         inner = order.inner(pad)
         visit = row_step(rows, op, laws, **step, pad=inner)
         visit = f"{indent(unit, inner)}\n{visit}" if unit else visit
+        visit = f"{inner}const auto UNIT_TAKEN = [](int) {{}};\n{visit}" if unit else visit
         return order.wrap(indent(rows.visit("i"), inner) + "\n" + visit if rows.record else visit, pad)
     if not rows.free:
         visit = row_step(rows, op, laws, **step, pipelined=rows.record, pad=inner)
         visit = f"{indent(unit, inner)}\n{visit}" if unit else visit
         if rows.record:
             return f"{pad}{{\n{_visit_pipeline(rows, end, begin, laws.torsion).wrap(visit, pad)}\n{pad}}}"
+        visit = f"{inner}const auto UNIT_TAKEN = [](int) {{}};\n{visit}" if unit else visit
         return SlotOrder(end, begin).wrap(visit, pad)
     ctx = RowContext(
         row="i",

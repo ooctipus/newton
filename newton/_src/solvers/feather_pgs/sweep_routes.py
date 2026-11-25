@@ -681,6 +681,7 @@ def dense_units(
         mu=dense.mu("tangent"),
         guard=("", condition),
         record=(loads, after),
+        taken=True,
         pad=pad,
     )
 
