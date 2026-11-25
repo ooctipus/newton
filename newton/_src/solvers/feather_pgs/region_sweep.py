@@ -1915,13 +1915,110 @@ def _place_by_key(level_end: wp.array[int], s: int, key: int, item: int, places:
         pending = pending & ~peers
 
 
+_WIDE_DEPTHS = """    for (int k = 0; k < GROUPS; ++k) {
+        int ws, we, wf0, wf1;
+        span(world - SUB + k, ws, we, wf0, wf1);
+        if (!wide(we - ws)) continue;
+        __syncthreads();
+        depths(ws, we, wf0, wf1, (int)threadIdx.x, (int)blockDim.x, []() { __syncthreads(); },
+               [](bool p) { return __syncthreads_or(p) != 0; });
+    }
+"""
+"""The block's wide worlds' depths (:data:`_DEPTHS`), each by every thread of the block, in turn."""
+
+_FAR = wp.constant(1 << 29)
+"""A body's depth where the contact graph does not reach it from an immovable partner (:func:`level_depths`)."""
+
+_DEPTHS = f"""    const int lane = LANE, world = tid / LANES, worlds = world_regions.shape[0];
+    // A world's open regions [s, e) and free bodies [f0, f1) (none past the worlds).
+    const auto span = [&](int w, int& s, int& e, int& f0, int& f1) {{
+        s = e = f0 = f1 = 0;
+        if (w < worlds) {{
+            const wp::vec2i r = world_regions.data[w];
+            s = r[0];
+            e = r[1];
+            f0 = world_free_start.data[w];
+            f1 = world_free_start.data[w + 1];
+        }}
+    }};
+    // The depths: each free body's distance on the contact graph from the immovable partners (one for a body with a
+    // region against one, one more for each region between two movable bodies on the way), relaxed over the regions
+    // until none lowers; the fixpoint whatever order relaxes it. A pair block's members take no part (form_blocks).
+    // ``me`` of ``stride`` threads; ``sync`` and ``any`` the group's barrier and vote.
+    const auto depths = [&](int s, int e, int f0, int f1, int me, int stride, auto sync, auto any) {{
+        for (int i = f0 + me; i < f1; i += stride) body_level.data[world_free.data[i]] = {int(_FAR)};
+        sync();
+        for (int g = s + me; g < e; g += stride) {{
+            const wp::vec2i sides = reg_body.data[g];
+            if (sides[1] < 0 && (reg_kind.data[g] & {int(KIND_MEMBER)}) == 0) body_level.data[sides[0]] = 1;
+        }}
+        sync();
+        for (bool changed = true; changed;) {{
+            bool lowered = false;
+            for (int g = s + me; g < e; g += stride) {{
+                const wp::vec2i sides = reg_body.data[g];
+                if (sides[1] < 0 || (reg_kind.data[g] & {int(KIND_MEMBER)}) != 0) continue;
+                // The depths as they stand (another thread's lowering is read where it has landed).
+                volatile const int* const depth = body_level.data;
+                const int a = depth[sides[0]], b = depth[sides[1]];
+                if (b < {int(_FAR)} && b + 1 < a && atomicMin(&body_level.data[sides[0]], b + 1) > b + 1) lowered = true;
+                if (a < {int(_FAR)} && a + 1 < b && atomicMin(&body_level.data[sides[1]], a + 1) > a + 1) lowered = true;
+            }}
+            changed = any(lowered);
+        }}
+    }};
+    // A world wider than a turn of its block's lanes is relaxed by every thread of the block, the block's wide worlds
+    // in turn (GROUPS: the block's warps, SUB: this warp's; one on the CPU, whose one thread relaxes a world).
+    const auto wide = [&](int n) {{ return GROUPS > 1 && n > STRIDE * GROUPS; }};
+    int s, e, f0, f1;
+    span(world, s, e, f0, f1);
+    if (e > s && !wide(e - s)) depths(s, e, f0, f1, lane, STRIDE, [&]() {{ SYNC(); }}, [&](bool p) {{ return ANY(p); }});
+{indent(device_branches(_WIDE_DEPTHS, "    // The CPU's one thread relaxes no world wide (GROUPS is one).\n"), "")}"""
+"""A world's depths (:func:`level_depths`), a world a warp of a block of :data:`_ACTING_BLOCK`, a wide world the block."""
+
+
+@wp.func_native(
+    dual_native(
+        _DEPTHS,
+        preludes=(lane_group(int(_WORLD_LANES)), LANE_WORDS, CPU_MATH, CPU_WORDS),
+    )
+)
+def _level_depths(
+    tid: int,
+    world_regions: wp.array[wp.vec2i],
+    world_free_start: wp.array[int],
+    world_free: wp.array[int],
+    reg_body: wp.array[wp.vec2i],
+    reg_kind: wp.array[int],
+    body_level: wp.array[int],
+): ...
+
+
+@wp.kernel(enable_backward=False, module="unique")
+def level_depths(
+    relist: wp.array[int],
+    world_regions: wp.array[wp.vec2i],
+    world_free_start: wp.array[int],
+    world_free: wp.array[int],
+    reg_body: wp.array[wp.vec2i],
+    reg_kind: wp.array[int],
+    body_level: wp.array[int],
+):
+    """Where the step lists its regions anew, each world's depths for its order (:func:`level_regions`): a free body's
+    distance on the contact graph from the immovable partners, relaxed over the world's regions until none lowers,
+    a world a warp of a block of :data:`_ACTING_BLOCK` threads, a world wider than a turn of the block's lanes by every
+    thread of the block (one thread a world on the CPU). The depths are the relaxation's fixpoint, whatever order or
+    lanes relax it."""
+    if relist[0] == 0:
+        return
+    _level_depths(wp.tid(), world_regions, world_free_start, world_free, reg_body, reg_kind, body_level)
+
+
 @wp.kernel(enable_backward=False, module="unique")
 def level_regions(
     relist: wp.array[int],
     cursor: wp.array[int],
     world_regions: wp.array[wp.vec2i],
-    world_free_start: wp.array[int],
-    world_free: wp.array[int],
     reg_body: wp.array[wp.vec2i],
     reg_kind: wp.array[int],
     body_level: wp.array[int],
@@ -1945,9 +2042,9 @@ def level_regions(
     members after it): it is made where the step lists its regions anew, whose listing then stands for the frame's
     later steps if it fit (``relist[1]``).
 
-    The lanes take the world's regions a stride at a time: the depths are the relaxation's fixpoint (each body's
-    distance on the contact graph, whatever order relaxes it) and the counting sort keeps the stream's order (a
-    chunk's lanes of one key take their places in lane order; ``level_end`` holds the depths' counts).
+    The depths are :func:`level_depths`' (``body_level``); the lanes take the world's regions a stride at a time and
+    the counting sort keeps the stream's order (a chunk's lanes of one key take their places in lane order;
+    ``level_end`` holds the depths' counts).
     """
     if relist[0] == 0:
         return
@@ -1967,35 +2064,9 @@ def level_regions(
         if lane == 0:
             world_order_end[world] = s
         return
-    far = int(1 << 29)
-    f0 = world_free_start[world]
-    f1 = world_free_start[world + 1]
-    # A block's members (form_blocks) leave the order: the region that stands for the block takes their place.
-    # The depths: relaxed over the regions until they stand.
-    for i in range(f0 + lane, f1, lanes):
-        body_level[world_free[i]] = far
-    lane_sync(_WORLD_LANES)
-    for g in range(s + lane, e, lanes):
-        sides = reg_body[g]
-        if sides[1] < 0 and (reg_kind[g] & KIND_MEMBER) == 0:
-            body_level[sides[0]] = 1
-    lane_sync(_WORLD_LANES)
-    changed = bool(True)
-    while changed:
-        lowered = bool(False)
-        for g in range(s + lane, e, lanes):
-            sides = reg_body[g]
-            if sides[1] >= 0 and (reg_kind[g] & KIND_MEMBER) == 0:
-                a = body_level[sides[0]]
-                b = body_level[sides[1]]
-                if b < far and b + 1 < a:
-                    if wp.atomic_min(body_level, sides[0], b + 1) > b + 1:
-                        lowered = True
-                if a < far and a + 1 < b:
-                    if wp.atomic_min(body_level, sides[1], a + 1) > a + 1:
-                        lowered = True
-        lane_sync(_WORLD_LANES)
-        changed = lane_any(lowered, _WORLD_LANES)
+    far = int(_FAR)
+    # A block's members (form_blocks) leave the order: the region that stands for the block takes their place. The
+    # depths are level_depths'.
     deepest = int(0)
     unreached = int(0)
     kept = int(0)
@@ -2647,7 +2718,8 @@ class Regions:
         frame's regions anew, or a check failed, the step lists them anew: the regions marked and counted a contact
         (:func:`mark_regions`), each world's bodies placed in the stream (:func:`place_bodies`), the regions placed
         and ordered a body with their candidates' contacts (:func:`place_regions`, :func:`order_regions`), then,
-        after the fill, the frame's blocks and levels (:func:`form_blocks`, :func:`level_regions`). Every step forms
+        after the fill, the frame's blocks, depths and order (:func:`form_blocks`, :func:`level_depths`,
+        :func:`level_regions`). Every step forms
         each region at the step's rows and poses (:func:`fill_regions`) and its blocks' responses and records
         (:func:`factor_blocks`, :func:`stage_blocks`)."""
         from .contact_input import bind as bind_contact_input  # noqa: PLC0415
@@ -2890,14 +2962,20 @@ class Regions:
                 device=device,
             )
         wp.launch(
+            level_depths,
+            dim=self.acting_threads,
+            inputs=[self.relist, self.world_regions, self.world_free_start, self.world_free, self.reg_body, self.reg_kind],
+            outputs=[self.body_level],
+            device=device,
+            block_dim=_ACTING_BLOCK,
+        )
+        wp.launch(
             level_regions,
             dim=world_threads,
             inputs=[
                 self.relist,
                 self.cursor,
                 self.world_regions,
-                self.world_free_start,
-                self.world_free,
                 self.reg_body,
                 self.reg_kind,
             ],
