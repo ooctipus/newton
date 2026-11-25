@@ -1740,14 +1740,37 @@ if COLORED_THREADS != 32 * GROUP_WARPS:
     raise ValueError("a grouped world's block holds the colored mapping's threads, a warp a group")
 
 
+# A world's group of blocks meets at a counter (its job word 6, from zero each launch): every block counts itself in,
+# after its own stores, and waits until the group's every block has; with ``voted`` each block's loud change joins the
+# world's (job word 5) as it counts in.
+GROUP_BARRIER = """        {{
+            const bool voted = {vote};
+            ++wide_meets;
+            if (tid == 0) {{
+                if (voted) atomicOr(wide_job + 5, 1);
+                __threadfence();
+                atomicAdd(wide_job + 6, 1);
+                const volatile int* const job = wide_job;
+                while (job[6] < wide_meets * group) {{ }}
+                __threadfence();
+            }}
+            __syncthreads();
+        }}
+"""
+
+
 def group_rows(loop: Callable[[str, str, str], str], pad: str, *, group: bool = False) -> str:
     """A grouped world's dense rows (:class:`.row_slots.RowGroups`) by its block: the rows before its first group (the
     topology's: limits, links, mimics) in order on the first warp, then its colors in turn, a color's groups a warp
     each, its rows in order (``loop(begin, end, pad)``: the rows ``[begin, end)``), a barrier after each. A color's
     groups share no tree, so they write no coordinate another reads: the colors' order is the sweep's.
 
-    Over a world's ``group`` of blocks (:func:`worlds`' ranks) a color with more groups than the block's warps is the
-    group's (:func:`group_stage`, :data:`GROUP_JOIN`): its groups spread over the blocks' warps, the same visits."""
+    Over a world's ``group`` of blocks (:func:`worlds`' ranks) the world's block (rank 0) runs the topology rows, then
+    opens the sweep (its job words, :data:`WIDE_JOB`), which the other blocks take, the world's end last. Every block
+    reads the colors (the group's tables): a color with more groups than a block's warps is the group's, its groups
+    spread over the blocks' warps (``warp * group + rank``), a narrow one the world's block's. The blocks meet
+    (:data:`GROUP_BARRIER`) after a color of the group and before one, the sweep's last with their exit votes, which
+    the world's block takes; between two narrow colors its own barrier suffices. The same visits in the same colors."""
     inner = "        "
     topology = f"""    if (warp == 0{" && rank == 0" if group else ""}) {{
         const int row_begin = 0;
@@ -1770,20 +1793,59 @@ def group_rows(loop: Callable[[str, str, str], str], pad: str, *, group: bool = 
 {visit("color_first + warp", str(GROUP_WARPS))}
         __syncthreads();
     }}"""
-    else:
-        stage = group_stage(
-            "color",
-            "color_first",
-            "color_end",
-            "        if (color >= group_colors) break;\n"
-            "        color_first = group_offsets[color];\n        color_end = group_offsets[color + 1];",
-            str(GROUP_WARPS),
-            "warp",
-            declare="    int color_first = 0, color_end = 0;",
-        )
-        colors = f"""{stage}
+        return indent(f"{{\n{topology}\n{colors}\n}}", pad)
+    wide = f"group > 1 && group_offsets[{{c}} + 1] - group_offsets[{{c}}] > {GROUP_WARPS}"
+    meet = GROUP_BARRIER.format(vote="__syncthreads_or(iteration_changed != 0)")
+    colors = f"""    for (;;) {{
+    // The world's block opens the sweep (its topology rows ran); the others take it, or the world's end.
+    if (group > 1) {{
+        ++wide_gen;
+        if (rank == 0) {{
+            if (tid == 0) {{
+                __threadfence();
+                atomicExch(wide_job, wide_gen);
+            }}
+        }} else {{
+            if (tid == 0) {{
+                const volatile int* const job = wide_job;
+                while (job[0] < wide_gen) {{ }}
+                __threadfence();
+            }}
+            __syncthreads();
+            const volatile int* const job = wide_job;
+            if (job[3] != 0) break;
+        }}
+    }}
+    for (int color = 0; color < group_colors; ++color) {{
+        const int color_first = group_offsets[color], color_end = group_offsets[color + 1];
+        const bool wide = {wide.format(c="color")};
+        if (wide || rank == 0) {{
+            const int place_at = wide ? warp * group + rank : warp;
+            const int place_step = wide ? {GROUP_WARPS} * group : {GROUP_WARPS};
 {visit("color_first + place_at", "place_step")}
-{GROUP_JOIN}        __syncthreads();
+        }}
+        if (group > 1 && (wide || color + 1 == group_colors || ({wide.format(c="color + 1")}))) {{
+{indent(meet, "    ")}
+        }} else {{
+            __syncthreads();
+        }}
+    }}
+    // The world's block takes the group's votes (each counted in before the sweep's last meeting) and clears them for
+    // the next sweep, which it opens; the others reset theirs and take its next.
+    if (group > 1) {{
+        if (rank == 0) {{
+            if (tid == 0) {{
+                volatile int* const job = wide_job;
+                if (job[5] != 0) {{
+                    job[5] = 0;
+                    iteration_changed = 1;
+                }}
+            }}
+        }} else {{
+            iteration_changed = 0;
+        }}
+    }}
+    if (rank == 0) break;
     }}"""
     return indent(f"{{\n{topology}\n{colors}\n}}", pad)
 
@@ -2016,7 +2078,9 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     if sweep.world_blocks:
         # A world's group of blocks (group_stage): its block (rank 0) runs every phase, the others serve its stages
         # wider than the block and leave the sweeps at the world's end, which the block posts after its last sweep.
-        head += f"\n    int wide_gen = 0;\n    int* const wide_job = wide_jobs.data + (size_t)world * {WIDE_JOB};"
+        head += (
+            f"\n    int wide_gen = 0, wide_meets = 0;\n    int* const wide_job = wide_jobs.data + (size_t)world * {WIDE_JOB};"
+        )
         first_warp = "    if (warp == 0 && rank == 0) {\n"
         alone, end_alone = "    if (rank == 0) {\n", "    }\n"
         leave = "        if (rank != 0) break;\n"
