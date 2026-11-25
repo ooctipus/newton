@@ -49,6 +49,7 @@ from .projection_laws import IDLE_LAW
 from .response_operator import Lanes, SparseFactor
 from .row_inputs import RowArgument
 from .row_laws import ROW_CONTACT, ROW_TORSION
+from .row_records import line_size
 from .sweep import (
     FORMED_RECORD,
     ITERATION,
@@ -489,7 +490,7 @@ def _source(sweep: SparseSweep) -> tuple[str, Staging]:
     body = f"""    const int lane = LANE;
     const int line = dense_first.data[world];
     __builtin_assume(line >= 0);
-    const int offset = line * {M};
+    const int offset = line * {line_size("world_impulses")};
     const int row_base = offset * {S};
     const int count = min(world_constraint_count.data[world], {M});
 {staging.declarations("    ")}

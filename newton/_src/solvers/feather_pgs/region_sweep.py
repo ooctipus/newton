@@ -2758,7 +2758,7 @@ class Regions:
         )
         rows, bias = bind_dense_rows(placement), solver.laws.bias(self.options, dt)
         data = bind_contact_input(solver, state_in, self.factor, contacts, dt, 1.0)
-        mf_max, pitch = int(placement.mf_max_constraints), int(placement.row_pitch)
+        mf_max, pitch = int(placement.mf_max_constraints), int(placement.line_rows)
         dense_max = int(placement.dense_max_constraints)
         # Sized for the pool's launch rows: a capture's replays run them at the live count (ContactPool.launch).
         threads = min(pool.launch_rows(), _THREAD_CAP)
@@ -3124,7 +3124,7 @@ class Regions:
                 self.body_open,
                 self.body_regions,
                 self.world_regions,
-                int(placement.row_pitch),
+                int(placement.line_rows),
                 int(placement.body_base),
                 coordinates,
                 self.body_first,

@@ -54,7 +54,7 @@ from .row_laws import (
     ROW_MIMIC,
     ROW_TORSION,
 )
-from .row_records import DenseRows
+from .row_records import DenseRows, line_size
 from .row_records import bind as bind_dense_rows
 from .sweep_routes import free_body_rows, packed_operator
 from .sweep_routes_diag import slot_rows
@@ -246,8 +246,8 @@ def packed_class(support: int, wide: bool, classes: bool = False) -> RowClass:
             "mf_counts",
             "tier_rows",
         ),
-        """    const int off_dense = line * row_sides.shape[1];
-    const int packed_base = line * packed_Z.shape[1] * packed_Z.shape[2];
+        f"""    const int off_dense = line * {line_size("row_sides")};
+    const int packed_base = line * {line_size("packed_Z")};
     const int dof_map_base = world * world_dof_indices.shape[1];
     const float* u = coordinates.data + (size_t)world * coordinates.shape[1];
     const float* u_hat = hat.data + (size_t)world * hat.shape[1];
@@ -259,7 +259,7 @@ def packed_class(support: int, wide: bool, classes: bool = False) -> RowClass:
 """
         + _sum(at_hat, "zhat", "0.0f")
         + """
-            term = incident.data[(size_t)line * incident.shape[1] + i] + zu - zhat;
+            term = incident.data[(size_t)line * (incident.strides[0] / (int)sizeof(*incident.data)) + i] + zu - zhat;
         }""",
         (PACKED_SIDES, *((CLASS_SIDES,) if classes else ())),
     )
@@ -284,7 +284,7 @@ def slot_class(dense: int, rows: int) -> RowClass:
             "v",
         ),
         f"""    const int dense_offset = dense_offsets.data[world], dense_group = dense_groups.data[world];
-    const int row_base = line * sparse_row_dof.shape[1];
+    const int row_base = line * ({line_size("sparse_row_dof")} / 2);
     const float* u = coordinates.data + (size_t)world * coordinates.shape[1];
     const int* dofs = world_dof_indices.data + (size_t)world * world_dof_indices.shape[1];
     const auto U = [&](const int c) -> float {{
@@ -306,9 +306,9 @@ def free_class() -> RowClass:
     return RowClass(
         "free",
         OPERANDS.select("row_type", "row_sides", "base", "packed_Z", "world_offset", "coordinates"),
-        """    const int records = line * row_type.shape[1] + base;
+        f"""    const int records = line * {line_size("row_type")} + base;
     const int S = packed_Z.shape[2];
-    const size_t free_base = ((size_t)line * packed_Z.shape[1] + base) * S;
+    const size_t free_base = (size_t)line * {line_size("packed_Z")} + (size_t)base * S;
     const float* u = coordinates.data + (size_t)world * coordinates.shape[1];""",
         """        const wp::vec2i sides = row_sides.data[records + i];
         const int dof_a = sides[0] >= 0 ? world_offset.data[sides[0]] : -1;
@@ -334,19 +334,19 @@ _SEEDED += " row_incident topology_rows"
 
 
 @functools.cache
-def seeded_class(dofs: int, response: tuple, frame: tuple, classes: tuple, material: bool, pitch: int) -> RowClass:
+def seeded_class(dofs: int, response: tuple, frame: tuple, classes: tuple, material: bool) -> RowClass:
     """The rows a Jacobi tier walks from their seeds (:class:`.walk_rows.RowSeeds`), by the tier's own text
     (:func:`.sweep_routes_tiers._seeded_row`, :meth:`.WalkedRows.seed_walk`): ``Z_i^T u+`` its term; its rhs (a bounce
     from ``J_i v_hat``) and diagonal ``|Z_i|^2 + cfm`` as the tier forms them, into ``rhs`` and ``diag``."""
     NA, NB, OA, OB = response
     walk, release = WalkedRows(NA, NB, OA, OB, dofs, 1, ONE, "", True, frame, len(classes)).seed_walk("        ")
-    read = _seeded_row(False, material, _stored_row(pitch, dofs), release)
+    read = _seeded_row(False, material, _stored_row(dofs), release)
     tables = walk_tables(classes)
     return RowClass(
         f"seeded{dofs}_{NA}_{NB}_{OA}_{OB}_f{frame[0]}_{frame[1]}_{abs(hash(tables)) % (1 << 32):08x}"
         + ("_material" if material else ""),
         OPERANDS.select(*_SEEDED.split(), *(("world_row_eps",) if material else ())),
-        f"""    const int off_dense = line * rhs_bias.shape[1];
+        f"""    const int off_dense = line * {line_size("rhs_bias")};
     const int art_a = ink_meta.data[world * 4], art_b = ink_meta.data[world * 4 + 2];
     const int* dof_map = world_dof_indices.data + (size_t)world * world_dof_indices.shape[1];
     const float* u = coordinates.data + (size_t)world * coordinates.shape[1];
@@ -569,8 +569,7 @@ class Audit:
         if not emitted:
             return None
         tier = emitted[0]
-        pitch = tier.max_constraints if tier.pitch is None else int(tier.pitch)
-        return seeded_class(tier.max_world_dofs, tier.inkernel_response, tier.frame, tier.classes, tier.material, pitch)
+        return seeded_class(tier.max_world_dofs, tier.inkernel_response, tier.frame, tier.classes, tier.material)
 
     def _operands_of(self, cls: RowClass, v: wp.array) -> list:
         solver, placement, classes = self.solver, self.solver.placement, self.solver.spec.classes

@@ -266,7 +266,6 @@ class TestShapeAgainstTodaysRules(unittest.TestCase):
             30,
             22,
             "103",
-            pitch=288,
             max_row_dofs=22,
             free_rows=False,
             block_warps=2,

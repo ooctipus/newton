@@ -57,7 +57,7 @@ from .row_kernels import (
     write_link_rows,
 )
 from .row_laws import LINK_ROWS, ROW_LAW
-from .row_records import UNIT_LIMIT, UNIT_MIMIC, UNIT_SHIFT, RowSupport
+from .row_records import UNIT_LIMIT, UNIT_MIMIC, UNIT_SHIFT, RowSupport, line_size
 from .row_records import bind as bind_dense_rows
 from .row_slots import (
     RESERVE_BLOCK,
@@ -162,7 +162,7 @@ def _prefix_warp_kernel(size: int, family: str, device_arch, mimics: int = 0) ->
         source, extra = f"({kind} << {int(UNIT_SHIFT)}) | (2 * (first_dof + d0) + (w0 < 0.0f ? 1 : 0))", ""
     # The row's seed: its unit source, the coordinate's side, in the units' own rows. The sink runs on an accepted slot
     # (below the capacity), and the unit sources are the capacity wide (Placement.hold_units).
-    sink = f"""{extra}            support.units.data[(size_t)prefix_line * support.units.shape[1] + slot] = {source};"""
+    sink = f"""{extra}            support.units.data[(size_t)prefix_line * {line_size("support.units")} + slot] = {source};"""
     if family == "mimics":
         candidates = prefix_rows.mimics(mimics, "law.")
     else:

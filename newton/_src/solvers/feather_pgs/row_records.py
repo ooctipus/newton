@@ -36,6 +36,15 @@ contact's slot and its rows' parents count in the line. ``row_incident`` is each
 incident velocity ``J v_hat``, written where its walk sums it: the one writer (:mod:`.walk_rows`), the free bodies'
 writer (:func:`.walk_rows.write_free_body_rows`)."""
 
+
+def line_size(array: str) -> str:
+    """Native text: the elements from one line of the row store to the next in ``array``, an operand laid out by line
+    and row (its first two axes; the rows of a line, times the entries a row where the array has a third axis), read from
+    the array's own outer stride. The store's line is the array's: a native body that addresses a line by it reads the
+    store the Warp kernels index, at whatever length the store's lines have."""
+    return f"({array}.strides[0] / (int)sizeof(*{array}.data))"
+
+
 ROW_RECORDS = FieldGroup(Field("row_record", wp.int32, ("world", "record"), owner="placement"))
 """The streamed rows' records, which the sweeps' row loops load a row ahead, stored by the rows' writers
 (:func:`.response_builds_rows.write_row_record`): the dense rows' from the plan's first streamed row, then the free

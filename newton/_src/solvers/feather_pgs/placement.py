@@ -487,6 +487,9 @@ class Placement:
         # ``body_base``.
         self.body_base = self.dense_max_constraints
         self.row_pitch = spec.capacities.row_pitch
+        # The row store's line length: the rows from one line to the next (the outer stride of the store's arrays, which
+        # the native bodies read from the arrays themselves, row_records.line_size), here the capacities' line.
+        self.line_rows = self.row_pitch
         # All inactive weight arguments alias this one element. Their producer kernels skip stores and their consumer
         # kernels skip reads when regularization is disabled.
         self.contact_row_w_dummy = self.arrays.placeholder(wp.float32, (1, 1), 1.0)

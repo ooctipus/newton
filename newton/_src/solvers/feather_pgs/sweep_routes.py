@@ -41,6 +41,7 @@ from .response_operator import Lanes, SparseFactor, Velocity
 from .row_inputs import RowArgument
 from .row_laws import ROW_CONTACT, ROW_FRICTION, ROW_JOINT_LIMIT, ROW_TORSION
 from .row_metadata import record_layout
+from .row_records import line_size
 from .solve_policy import QUIET_LITERAL, block_argmax, sweep_exit
 from .sweep import (
     EXACT,
@@ -1869,8 +1870,6 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     block = colored or grouped
     lanes = sweep.lanes
     M_D, M_MF, D = sweep.max_constraints, sweep.mf_max_constraints, sweep.max_world_dofs
-    # The row store's line: the dense rows, then the free bodies' from M_D (:mod:`.row_records`).
-    P = int(M_D + M_MF if sweep.pitch is None else sweep.pitch)
     row_lanes = Lanes(lanes)
     laws = sweep.laws
     # A packed row's coordinates decode from its staged sides, as a streamed record's do.
@@ -2039,7 +2038,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
             f"{share};"
             f"\n    const int record_stride = records_by_row ? 1 : {share};"
             "\n    float* const unit_record_line = friction_metric.data + static_cast<size_t>(line) * "
-            f"friction_metric.shape[1] * {FRICTION_METRIC_FLOATS};"
+            f"{line_size('friction_metric')};"
         )
     elif grouped:
         # The world's groups (sweep_routes.group_rows): its colors' first groups and its groups' first rows.
@@ -2262,10 +2261,12 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         budget=budget,
     )
     # The streamed rows' records (row_record, row_metadata.record_layout).
-    free_records, line_records = record_layout(sweep.record_rows, M_D, P, split)
-    records = f"    const int off_rec_mf = line * {line_records} + {free_records};"
+    # The row store's line (:mod:`.row_records`): the dense rows, then the free bodies' from M_D, at the store's line
+    # length; the free rows' records follow the dense rows' (:func:`.row_metadata.record_layout`).
+    free_records = record_layout(sweep.record_rows, M_D, M_D, split)[0]
+    records = f"    const int off_rec_mf = line * {line_size('row_record')} + {free_records};"
     if dense.record:
-        records = f"    const int off_rec_dense = line * {line_records};\n" + records
+        records = f"    const int off_rec_dense = line * {line_size('row_record')};\n" + records
     # The way back after the sweeps: the change in the walk's coordinates to the step's one leave (WalkTrees.du,
     # factor.walk.walk_leave_kernel).
     # The free bodies' run's rows (free_rows): their count, impulses' staging and publication.
@@ -2342,10 +2343,10 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     int dof_map_base = world * {D};
     const int line = dense_first.data[world];
     __builtin_assume(line >= 0);
-    int off_dense = line * {P};
+    int off_dense = line * {line_size("world_impulses")};
     int off_mf = off_dense + {M_D};
 {records}
-    const size_t packed_base = (size_t)line * {P * int(max_row_dofs)};
+    const size_t packed_base = (size_t)line * {line_size("packed_Z")};
     const size_t free_base = packed_base + {M_D * int(max_row_dofs)};{offsets}
 
 {staging.declarations("    ")}{velocity_view}
@@ -2388,7 +2389,7 @@ class GeneralSweep(SweepConfig):
     - the support class: ``max_row_dofs`` (the placement's packed support), ``support_classes`` (the rows' sides by
       their classes, :func:`.packed_rows.row_classes`), ``wide_rows`` (the bilateral block's), and the free bodies' 6 +
       6 class: ``free_rows`` their own run, else rows of the line;
-    - ``seeded``: the seed; ``pitch``: the line.
+    - ``seeded``: the seed.
 
     The warp mapping: ``lanes_per_world`` lanes a world in blocks of ``block_warps`` warps (one thread on the CPU); the
     colored one a block of :data:`COLORED_THREADS`; the ``grouped`` one (a world of many trees whose reservation placed
@@ -2410,7 +2411,6 @@ class GeneralSweep(SweepConfig):
     coordinate_levels: bool = False
     lanes_per_world: int = 32
     block_warps: int = 1
-    pitch: int | None = None
     free_rows: bool = True
     one_tree: bool = False
     records: int | None = None
@@ -2536,7 +2536,7 @@ class GeneralSweep(SweepConfig):
 
     @property
     def name(self) -> str:
-        M, MF, pitch = self.max_constraints, self.mf_max_constraints, self.pitch
+        M, MF = self.max_constraints, self.mf_max_constraints
         return (
             f"sweep_mf_{'colored' if self.colored else 'gs'}_{M}_{MF}_{self.max_world_dofs}"
             f"_s{self.max_row_dofs}"
@@ -2552,7 +2552,6 @@ class GeneralSweep(SweepConfig):
             + ("_levels" if self.coordinate_levels else "")
             + (f"_l{self.lanes_per_world}" if self.lanes_per_world != 32 else "")
             + (f"_w{self.block_warps}" if self.block_warps > 1 else "")
-            + (f"_p{pitch}" if pitch is not None and pitch != M + MF else "")
             + ("" if self.free_rows else "_line")
             + ("_regions" if self.regions else "")
             + {"inline": "", "ahead": "_formed", "stage": "_records"}[self.formed]

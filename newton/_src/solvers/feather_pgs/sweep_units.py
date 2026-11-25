@@ -442,7 +442,7 @@ SHARED_DECLARATIONS
     const int mf_line = mf_first.data[world];
     __builtin_assume(mf_line >= 0);
     // The free bodies' records (row_metadata.pack_row_record), from the line's word free_records.
-    const int off_meta = mf_line * row_record.shape[1] + free_records;
+    const int off_meta = mf_line * (row_record.strides[0] / (int)sizeof(*row_record.data)) + free_records;
     // The world's slot (a candidate's: the claim stage's) places its units and its colors' offsets in the pool, from
     // the slot's first entry (place_slots, from its counted units); a world with fewer contact rows than the rule's
     // units keeps the one-warp sweep: no units, the general bucket.

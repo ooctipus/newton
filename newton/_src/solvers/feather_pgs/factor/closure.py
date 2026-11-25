@@ -71,12 +71,12 @@ def closure_staging(capacity: int, entries: int, block: int) -> Staging:
 _CLOSE = """    const int M = $capacity, W = $entries, S = Z.shape[2];
 $stage
     float* const stage = $rows;
-    float* const z = Z.data + (size_t)line * Z.shape[1] * S;
-    float* const r = rhs.data + (size_t)line * rhs.shape[1];
-    float* const v = incident.data + (size_t)line * incident.shape[1];
-    float* const d = diag.data + (size_t)line * diag.shape[1];
-    const int* const source = units.data + (size_t)line * units.shape[1];
-    const auto* const side = sides.data + (size_t)line * sides.shape[1];
+    float* const z = Z.data + (size_t)line * (Z.strides[0] / (int)sizeof(*Z.data));
+    float* const r = rhs.data + (size_t)line * (rhs.strides[0] / (int)sizeof(*rhs.data));
+    float* const v = incident.data + (size_t)line * (incident.strides[0] / (int)sizeof(*incident.data));
+    float* const d = diag.data + (size_t)line * (diag.strides[0] / (int)sizeof(*diag.data));
+    const int* const source = units.data + (size_t)line * (units.strides[0] / (int)sizeof(*units.data));
+    const auto* const side = sides.data + (size_t)line * (sides.strides[0] / (int)sizeof(*sides.data));
     for (int pe = preelim.world_start.data[world]; pe < preelim.world_start.data[world + 1]; ++pe) {
         // The block's reserved rows in its constraints' order: a mimic's, a link's six.
         int row[M], m = 0;

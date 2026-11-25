@@ -34,6 +34,7 @@ from newton._src.core.memory import Place
 from newton._src.solvers.feather_pgs import sweep_plan, sweep_routes, sweep_units
 from newton._src.solvers.feather_pgs.row_laws import ROW_CONTACT, ROW_FRICTION, ROW_TORSION
 from newton._src.solvers.feather_pgs.row_metadata import HEADER_WORDS, record_layout, record_views
+from newton._src.solvers.feather_pgs.row_records import line_size
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_scenes as scenes
 from newton.tests import test_feather_pgs_conformance as conf
@@ -462,8 +463,10 @@ class TestColoredSweep(unittest.TestCase):
         self.assertEqual(placement.record_first, 0, "the streamed sweep's dense records lead the line")
         self.assertEqual(sweep.colored_sweep.places.metadata, Place.SHARED)
         free, words = record_layout(placement.record_first, placement.body_base, placement.row_pitch)
+        # The sweep reads each line's records at the store's line, the free rows' after the dense rows'.
+        self.assertEqual(placement.row_record.shape[1], words)
         source = sweep_routes.mf_gs_source(sweep.colored_sweep)[0]
-        self.assertIn(f"const int off_rec_mf = line * {words} + {free};", source)
+        self.assertIn(f"const int off_rec_mf = line * {line_size('row_record')} + {free};", source)
         for name in ("body_q", "body_qd"):
             np.testing.assert_array_equal(getattr(runs[0], name), getattr(runs[1], name), err_msg=name)
 

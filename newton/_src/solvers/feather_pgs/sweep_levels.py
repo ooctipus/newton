@@ -34,6 +34,7 @@ from .device_preludes import LANE_WORDS, SHARED_STORAGE, group_native, lane_grou
 from .kernel_template import KernelTemplate, items, python_kernel
 from .packed_rows import CLASS_SIDES
 from .row_laws import ROW_CONTACT, ROW_FRICTION, ROW_JOINT_LIMIT, ROW_TORSION
+from .row_records import line_size
 
 # FeatherPGS takes no gradients: its kernels compile no adjoints.
 wp.set_module_options({"enable_backward": False})
@@ -602,8 +603,8 @@ def _sparse_contact_levels_kernel(
     const int units = contact_end - contact_start;
     const int line = dense_first.data[world];
     __builtin_assume(line >= 0);
-    const int row_base = line * {M};
-    const int sparse_world_base = line * {M} * 2;"""
+    const int row_base = line * {line_size("world_row_type")};
+    const int sparse_world_base = line * {line_size("sparse_row_dof")};"""
     reserve = f"""    // A coupled unit reserves every coordinate it holds: a scalar contact sharing one stays in the serial order.
     for (int normal = contact_start + lane; normal < contact_end; normal += {L}) {{
         const int sparse_row = sparse_world_base + normal * 2;
@@ -633,9 +634,9 @@ def _sparse_contact_levels_kernel(
 
 
 @cache
-def coordinate_levels_kernel(M: int, P: int, D: int, device_arch: str, *, torsion: bool = False) -> "wp.Kernel":
+def coordinate_levels_kernel(M: int, D: int, device_arch: str, *, torsion: bool = False) -> "wp.Kernel":
     """The levels of the units on one coordinate no wider unit holds, over a world's rows by support class
-    (:func:`.packed_rows.row_classes`, ``P`` rows a line), which the general sweep steps first (``coordinate_levels``).
+    (:func:`.packed_rows.row_classes`), which the general sweep steps first (``coordinate_levels``).
 
     A unit heads its contact's rows (its pair and spin row name it as parent) or is any other row. A contact or joint limit of one entry ahead of every other unit on its coordinate is leveled in
     row order (:func:`_levels_kernel`), so it commutes with every row stepped in order: the order's iterate.
@@ -657,7 +658,7 @@ def coordinate_levels_kernel(M: int, P: int, D: int, device_arch: str, *, torsio
     const int units = contact_end;
     const int line = dense_first.data[world];
     __builtin_assume(line >= 0);
-    const int row_base = line * {P};"""
+    const int row_base = line * {line_size("world_row_type")};"""
     # Each coordinate's first row of a unit no level holds (node_owner, scratch of this rule): a contact or joint
     # limit of one entry before it on its coordinate keeps that coordinate for the pass (unit_coordinate, 0 for none).
     reserve = f"""    for (int c = lane; c < {D}; c += {L}) node_owner[c] = {M};
@@ -690,7 +691,7 @@ def coordinate_levels_kernel(M: int, P: int, D: int, device_arch: str, *, torsio
             if (valid) valid = unit_coordinate[base / {L}] > 0;
             if (valid) node_a = unit_coordinate[base / {L}] - 1;
             unit_place[base / {L}] = -1;"""
-    name = f"coordinate_levels_{M}_{P}_{D}" + ("_torsion" if torsion else "") + ("" if L == 32 else f"_lanes{L}")
+    name = f"coordinate_levels_{M}_{D}" + ("_torsion" if torsion else "") + ("" if L == 32 else f"_lanes{L}")
     params = (
         ("world_constraint_count", wp.array[int]),
         ("dense_first", wp.array[int]),

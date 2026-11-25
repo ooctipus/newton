@@ -28,6 +28,7 @@ from .kernel_template import Dispatch
 from .response_operator import Lanes, ResponseOperator, SparseFactor, Velocity
 from .row_inputs import RowArgument
 from .row_laws import ROW_CONTACT, ROW_FRICTION, ROW_JOINT_LIMIT
+from .row_records import line_size
 from .sweep import (
     EXACT,
     ITERATION,
@@ -577,7 +578,7 @@ const unsigned noop_lanes = BALLOT(candidate_noop);"""
     contact_start = "min(topology_rows.data[world], row_count)" if scheduled else "row_count"
     body = f"""    const int line = dense_first.data[world];
     __builtin_assume(line >= 0);
-    const int row_base = line * {M};
+    const int row_base = line * {line_size("world_impulses")};
     const int lane = LANE;
     int row_count = world_constraint_count.data[world];
     if (row_count > {M}) row_count = {M};

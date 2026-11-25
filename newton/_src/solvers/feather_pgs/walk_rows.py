@@ -640,9 +640,9 @@ _SUPPORT = """    // One unit's rows into the packed rows (walk_rows.support_row
     const int rows = unit.rows, art_a = unit.art_a, art_b = unit.art_b, body_a = unit.body_a, body_b = unit.body_b;
     const int dof0 = unit.dof0, dof1 = unit.dof1;
     const int S = sink.entries.shape[2];
-    const int row0 = unit.line * sink.entries.shape[1] + unit.slot;
+    const int row0 = unit.line * (sink.diag.strides[0] / (int)sizeof(*sink.diag.data)) + unit.slot;
     // The row's records in the row store, whose line holds the free bodies' rows after the dense ones.
-    const int rec0 = unit.line * sink.diag.shape[1] + unit.slot;
+    const int rec0 = row0;
     float* const Z = sink.entries.data + (size_t)$zrow * S;
     const bool covector = dof0 >= 0;
     float incident[$rows], norm[$rows];
@@ -982,7 +982,7 @@ _PACKED_START = """    // The unit's packed rows cleared: each side's walk store
     for (int r = 0; r < rows; ++r)
         for (int e = 0; e < S; ++e) STORE_rows(Z + r * S + e, 0.0f);
     // The row's first side (its layout, dense_rows.row_sides), read after its records' writer wrote it.
-    const int first = LOAD_rows(sink.layout.sides.data + ((size_t)unit.line * sink.layout.sides.shape[1] + unit.slot)).c[0];
+    const int first = LOAD_rows(sink.layout.sides.data + ((size_t)unit.line * (sink.layout.sides.strides[0] / (int)sizeof(*sink.layout.sides.data)) + unit.slot)).c[0];
 """
 
 _PACKED_SIDE = """$skip$tree
@@ -1021,7 +1021,7 @@ _CLASS_TREE = """        // The tree's class: its path from the classes' tables 
 
 _UNIT_ART = "side == 0 ? art_a : art_b"
 
-_SIDES_LOAD = """    const wp::vec2i sides = LOAD_rows(sink.layout.sides.data + ((size_t)unit.line * sink.layout.sides.shape[1] + unit.slot));
+_SIDES_LOAD = """    const wp::vec2i sides = LOAD_rows(sink.layout.sides.data + ((size_t)unit.line * (sink.layout.sides.strides[0] / (int)sizeof(*sink.layout.sides.data)) + unit.slot));
 """
 
 _ROW_SIDES = (
@@ -1177,8 +1177,8 @@ _BLOCK = """    // A block of up to $rows covector rows of the packed sink from 
     const auto& walk = sink.walk;
     const auto& release = sink.release;
     const int S = sink.entries.shape[2];
-    float* const Z = sink.entries.data + ((size_t)line * sink.entries.shape[1] + slot) * S;
-    const int rec0 = line * sink.diag.shape[1] + slot;
+    float* const Z = sink.entries.data + (size_t)line * (sink.entries.strides[0] / (int)sizeof(*sink.entries.data)) + (size_t)slot * S;
+    const int rec0 = line * (sink.diag.strides[0] / (int)sizeof(*sink.diag.data)) + slot;
     float norm[$rows], incident[$rows];
     int pending = 0, reread = 0;$declare
 WALK_UNROLLED

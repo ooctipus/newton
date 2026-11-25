@@ -17,7 +17,7 @@ from .device_preludes import CPU_MATH, CPU_WORDS, dual_native
 from .projection_laws import idle_key, idle_root
 from .row_laws import ROW_CONTACT, ROW_JOINT_LIMIT, ROW_TORSION
 from .row_metadata import pack_row_record, record_words
-from .row_records import DenseRows
+from .row_records import DenseRows, line_size
 
 # ---------------------------------------------------------------------------------------------------------------------
 # Free-body rows
@@ -56,11 +56,13 @@ def _name(func, split: bool):
 
 @functools.cache
 def _record_store(split: bool) -> wp.Function:
-    """Store a row's record of ``words`` words at ``at`` (:func:`.row_metadata.pack_row_record`), packed or ``split``
-    (:func:`.row_metadata.split_records`): the form is the line's, fixed where the writer is built."""
+    """Store a row's record of ``words`` words at word ``at`` of line ``line``'s records
+    (:func:`.row_metadata.pack_row_record`), packed or ``split`` (:func:`.row_metadata.split_records`): the form is the
+    line's, fixed where the writer is built."""
 
     def store_row_record(
         record: wp.array2d[wp.int32],
+        line: int,
         at: int,
         words: int,
         dof_a: int,
@@ -78,7 +80,10 @@ def _record_store(split: bool) -> wp.Function:
 
     _name(store_row_record, split)
     return wp.func_native(
-        dual_native(pack_row_record("&record.data[at]", split=split), preludes=(CPU_MATH, CPU_WORDS))
+        dual_native(
+            pack_row_record(f"&record.data[(size_t)line * {line_size('record')} + at]", split=split),
+            preludes=(CPU_MATH, CPU_WORDS),
+        )
     )(store_row_record)
 
 
@@ -115,22 +120,21 @@ def record_writers(split: bool = False) -> tuple[wp.Function, wp.Function]:
     store = _record_store(split)
     header, dense = record_words(True, split), record_words(False, split)
 
-    def record_at(records: RowRecords, line: int, slot: int) -> int:
-        """The flat index of row ``slot``'s record in line ``line``'s records (-1 for a row without one): a dense row's
-        of :func:`.row_metadata.record_words` words, a free row's header from ``free``."""
+    def record_at(records: RowRecords, slot: int) -> int:
+        """The word of row ``slot``'s record in its line's records (-1 for a row without one): a dense row's of
+        :func:`.row_metadata.record_words` words, a free row's header from ``free``."""
         if slot < records.first:
             return -1
-        at = line * records.record.shape[1]
         if slot >= records.base:
-            return at + records.free + (slot - records.base) * wp.static(header)
-        return at + (slot - records.first) * wp.static(dense)
+            return records.free + (slot - records.base) * wp.static(header)
+        return (slot - records.first) * wp.static(dense)
 
     record_at = wp.func(_name(record_at, split))
 
     def write_row_record(records: RowRecords, rows: DenseRows, incident: float, line: int, slot: int):
         """Store row ``slot``'s record (:func:`.row_metadata.pack_row_record`) from the row as its writers left it (its
         rhs plus ``incident``). A free row's is its header, with its diagonal's inverse and its parent from ``base``."""
-        at = record_at(records, line, slot)
+        at = record_at(records, slot)
         if at < 0:
             return
         diagonal = rows.diag[line, slot]
@@ -164,7 +168,9 @@ def record_writers(split: bool = False) -> tuple[wp.Function, wp.Function]:
             mu = rows.row_mu[line, slot]
             key = row_idle_key(kind, rhs, diagonal)
             root = idle_root(diagonal)
-        store(records.record, at, words, firsts[0], firsts[1], n_a, n_b, diagonal, rhs, kind, parent, mu, key, root)
+        store(
+            records.record, line, at, words, firsts[0], firsts[1], n_a, n_b, diagonal, rhs, kind, parent, mu, key, root
+        )
 
     write_row_record = wp.func(_name(write_row_record, split))
 

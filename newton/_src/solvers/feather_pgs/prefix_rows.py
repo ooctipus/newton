@@ -142,7 +142,7 @@ _PHASE = """    for (int chunk = 0; chunk < $CANDIDATES; chunk += STRIDE) {
         float phi = 0.0f, target = 0.0f, beta = 0.0f, mu = 0.0f, w0 = 0.0f, w1 = 0.0f;
 $LOCALS$EVALUATE        $SLOT
         if (active && slot < LAW::capacity) {
-            const int at = prefix_line * LAW::row_type.shape[1] + slot;
+            const int at = prefix_line * (LAW::row_type.strides[0] / (int)sizeof(*LAW::row_type.data)) + slot;
             LAW::row_type.data[at] = type;
             LAW::row_parent.data[at] = -1;
             LAW::row_mu.data[at] = mu;

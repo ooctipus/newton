@@ -32,6 +32,7 @@ from .law_source import law_preludes
 from .response_operator import Lanes, TransposedResponse, WalkedRows
 from .row_inputs import RowArgument
 from .row_laws import ROW_CONTACT, ROW_JOINT_LIMIT, ROW_LAW
+from .row_records import line_size
 from .solve_policy import block_argmax
 from .sweep import SPLIT, JacobiRows, SweepConfig, dense_tier_world, jacobi_scale, jacobi_sweeps
 from .sweep_routes import MF_GS_ABI, worlds
@@ -92,11 +93,11 @@ def tier_sweeps(rows: int, iterations: int) -> int:
     return min(raw, TIER_SWEEPS_CAP)
 
 
-def _stored_row(pitch: int, dofs: int) -> str:
+def _stored_row(dofs: int) -> str:
     """Read the lane's row as the one writer stored it (:mod:`.walk_rows`: the packed sink at its world coordinates, the
-    slips' frame applied; ``pitch`` rows a world's line) and its incident velocity ``J v_hat`` (``row_incident``)."""
+    slips' frame applied) and its incident velocity ``J v_hat`` (``row_incident``)."""
     return (
-        f"        const float* Z_row = &packed_Z.data[((size_t)line * {pitch} + i) * packed_Z.shape[2]];\n"
+        f"        const float* Z_row = &packed_Z.data[(size_t)line * {line_size('packed_Z')} + (size_t)i * packed_Z.shape[2]];\n"
         "        #pragma unroll\n"
         f"        for (int q = 0; q < {dofs}; ++q) Zi[q * ZS] = Z_row[q];\n"
         "        incident = row_incident.data[off_dense + i];"
@@ -177,13 +178,13 @@ def parallel_source(tier: TierSweep) -> tuple[str, Staging]:
     NA, NB, OA, OB = tier.inkernel_response
     emit = tier.emit
     M_D, D, AM, NT = tier.max_constraints, tier.max_world_dofs, tier.rows, tier.threads
-    pitch, frame, classes, sweeps = tier.pitch, tier.frame, tier.classes, tier.levels.budget
+    frame, classes, sweeps = tier.frame, tier.classes, tier.levels.budget
     torsion, solve_policy, linked_rows = tier.torsion, tier.solve_policy, tier.linked_rows
     serial = device_lanes(tier.device_arch) == 1
     laws = tier.laws
     store = JacobiRows(AM, types=solve_policy.traces, weighted=tier.weighted, torsion=torsion)
     row_lanes = Lanes(NT)
-    stored, frame = _stored_row(M_D if pitch is None else int(pitch), D), tuple(int(cap) for cap in frame)
+    stored, frame = _stored_row(D), tuple(int(cap) for cap in frame)
     walked = WalkedRows(NA, NB, OA, OB, D, AM + 4, row_lanes, stored, emit, frame, len(classes))
     if emit:
         release = walked.seed_walk("        ")[1]
@@ -216,7 +217,7 @@ def parallel_source(tier: TierSweep) -> tuple[str, Staging]:
     }}"""
     publish = op.publish(indent="    ", applied=lambda row: f"s_x[{row}]") + "\n" + store.stores()
     body = f"""    const int lane = LANE;
-{dense_tier_world(D, M_D, rows="n_rows", support=D, pitch=M_D if pitch is None else int(pitch))}
+{dense_tier_world(D, M_D, rows="n_rows", support=D)}
 
 {staging.declarations("    ")}{trace_reduction}
 {op.declarations("    ")}
@@ -261,7 +262,7 @@ class TierSweep(SweepConfig):
 
     - the level law: split (:class:`.sweep.LevelLaw`), its budget :func:`tier_sweeps` of the bucket's bound ``rows``;
     - the producer's sink: under ``emit`` the rows are walked from the seeds the one writer kept in the kernel's
-      prologue (:func:`_seeded_row`), else read as the one writer stored them (``pitch`` rows a world's line);
+      prologue (:func:`_seeded_row`), else read as the one writer stored them;
     - the rows' trees: ``inkernel_response`` ``(NA, NB, OA, OB)``, their slip capacities ``frame`` and walking
       ``classes``;
     - ``linked_rows``: pairs project on their patch ring's pooled load.
@@ -284,7 +285,6 @@ class TierSweep(SweepConfig):
     linked_rows: bool = False
     frame: tuple[int, int] = (0, 0)
     classes: tuple[WalkClass, ...] = ()
-    pitch: int | None = None
 
     ABI: ClassVar[tuple] = PARALLEL_ABI
     NATIVE: ClassVar[str] = "sweep_parallel_native"
@@ -317,14 +317,13 @@ class TierSweep(SweepConfig):
     def name(self) -> str:
         NA, NB, OA, OB = self.inkernel_response
         walk_half = classes_half(self.classes) if self.classes else WALK_BOTH
-        frame, pitch = self.frame, self.pitch
+        frame = self.frame
         return (
             f"sweep_{'seeded_parallel' if self.emit else 'parallel'}_{self.max_constraints}_"
             f"{self.mf_max_constraints}_{self.max_world_dofs}_rows{int(self.rows)}_sweeps{int(self.levels.budget)}"
             f"_nt{self.threads}_ink{NA}_{NB}_o{OA}_{OB}"
             + (f"_frame{int(frame[0])}_{int(frame[1])}" if any(frame) else "")
             + ("" if walk_half == WALK_BOTH else f"_half{walk_half}")
-            + ("" if pitch is None or pitch == self.max_constraints else f"_p{int(pitch)}")
             + ("_linked" if self.linked_rows else "")
             + ("_weighted" if self.weighted else "")
             + ("_material" if self.material else "")

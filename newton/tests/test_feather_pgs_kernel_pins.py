@@ -139,7 +139,7 @@ def _audit_calls():
     yield "audit.slot_class", kernel(audit.slot_class), (6, 1024), {}
     yield "audit.free_class", kernel(audit.free_class), (), {}
     # The rows the tiers walk from their seeds, at the seeded tiers' 16+6 coordinate world (_emit_tier_kwargs).
-    seeded = (22, (16, 6, 0, 16), (0, 0), tier_classes((16, 6)), False, 128)
+    seeded = (22, (16, 6, 0, 16), (0, 0), tier_classes((16, 6)), False)
     yield "audit.seeded_class", kernel(audit.seeded_class), seeded, {}
 
 
@@ -337,7 +337,7 @@ def _solver_factory_calls():
         kwargs = {"places": places, "support_classes": True, "max_row_dofs": 7}
         yield "sweep_routes.GeneralSweep", built(sweep_routes.GeneralSweep), (64, 32, 12, _ARCH), kwargs
     # The coordinate levels: their schedule over the rows' classes, and the general sweep that steps them first.
-    yield name + "coordinate_levels_kernel", sweep_levels.coordinate_levels_kernel.__wrapped__, (64, 64, 12, _ARCH), {}
+    yield name + "coordinate_levels_kernel", sweep_levels.coordinate_levels_kernel.__wrapped__, (64, 12, _ARCH), {}
     for places in (sweep_routes.RowPlaces(), sweep_routes.RowPlaces(Place.STREAMED)):
         kwargs = {"places": places, "support_classes": True, "max_row_dofs": 7, "coordinate_levels": True}
         yield "sweep_routes.GeneralSweep", built(sweep_routes.GeneralSweep), (64, 32, 12, _ARCH), kwargs

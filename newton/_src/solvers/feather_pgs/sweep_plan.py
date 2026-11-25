@@ -439,7 +439,6 @@ class Sweep:
                 self.placement.mf_max_constraints,
                 self.forest.max_world_dofs,
                 device_arch,
-                pitch=self.placement.row_pitch,
                 places=pinned,
                 max_row_dofs=self.placement.packed_support,
                 seeded=self.seeded,
@@ -634,7 +633,6 @@ class Sweep:
                 )
                 self.sparse_contact_schedule = sweep_levels.coordinate_levels_kernel(
                     rows,
-                    self.placement.row_pitch,
                     self.forest.max_world_dofs,
                     device_arch,
                     torsion=bool(self.laws.spin_rows),
@@ -679,7 +677,6 @@ class Sweep:
                         linked_rows=True,
                         frame=self._tier_frame(),
                         classes=self.factor.walk_classes,
-                        pitch=self.placement.row_pitch,
                         **self.law_fields,
                     )
                     emits = self.pins.sink == "emit" or sweep_routes_tiers.emits(config)
