@@ -477,8 +477,10 @@ class RowGroups:
     (``slot``, -1 for a world that cannot take it; the slots' tables row-major at their capacities).
 
     A group is up to :data:`GROUP_MEMBERS` body pairs of one list (with an immovable side, or the others) that touch
-    the same trees, their rows together; its color the first-fit color at its leader (its first pair) in the row order
-    (the lists in turn, each in the row order): the least color no earlier leader on one of its trees holds. Groups
+    the same trees, their rows together; its color the first-fit color with the largest groups first (their rows
+    descending, a size's groups by their leaders, its first pairs, in the row order, the lists in turn): the least color
+    no group before it on one of its trees holds (:func:`color_largest_first`; groups re-form at every reservation,
+    so none keeps a last color as its tier). Groups
     of one color share no tree, so a sweep steps them at once, a warp a group, their rows in order; the colors in
     turn. A world takes it at a reservation where its groups meet the rule (``min_units`` groups and ``need`` groups a
     color, the colored mapping's :class:`.sweep_units.ColoredRule`) and its colors fit a word: its contact rows are
@@ -490,8 +492,9 @@ class RowGroups:
     the line. The reservation's scratch: each pair of the sequence's head, list, leader and place among its group's
     (``pairs``), each leader's members' rows (``members``) and its color with its place in it (``places``), each
     color's groups and rows (``totals``), a key table over the groups' trees and lists (``keys``, ``open``: the pairs
-    counted and the open group's leader), each tree's colors in use (``used``, zero between reservations), and what the
-    warps' turns pass on (``turns``: the sequence's count, its leaders and colors, :func:`_group_rows`)."""
+    counted and the open group's leader), each tree's colors in use (``used``, zero between reservations), what the
+    warps' turns pass on (``turns``: the sequence's count and its leaders, :func:`_group_rows`), and the coloring's
+    scratch (``starts``, ``order``, ``cells``: :func:`color_largest_first`, the groups its vertices)."""
 
     slot: wp.array[int]
     colors: wp.array[int]
@@ -505,6 +508,9 @@ class RowGroups:
     open: wp.array2d[wp.vec2i]
     used: wp.array[wp.int64]
     turns: wp.array2d[int]
+    starts: wp.array2d[int]
+    order: wp.array2d[int]
+    cells: wp.array2d[int]
     min_units: int
     need: float
 
@@ -524,7 +530,10 @@ def row_groups(slot, slots: int, rows: int, trees: int, min_units: int, need: fl
     groups.keys = wp.zeros((slots, 2 * rows), dtype=wp.int64, device=device)
     groups.open = wp.zeros((slots, 2 * rows), dtype=wp.vec2i, device=device)
     groups.used = wp.zeros(trees, dtype=wp.int64, device=device)
-    groups.turns = wp.zeros((slots, 4), dtype=int, device=device)
+    groups.turns = wp.zeros((slots, 2), dtype=int, device=device)
+    groups.starts = wp.zeros((slots, rows + 1), dtype=int, device=device)
+    groups.order = wp.zeros((slots, rows), dtype=int, device=device)
+    groups.cells = wp.zeros((slots, 2), dtype=int, device=device)
     groups.min_units = int(min_units)
     groups.need = float(need)
     return groups
@@ -759,6 +768,139 @@ def _turn(warp: int, warps: int) -> int:
 
 
 @wp.func
+def color_largest_first(
+    vertices: wp.array[wp.vec4i],
+    count: int,
+    used: wp.array[wp.int64],
+    starts: wp.array[int],
+    order: wp.array[int],
+    cells: wp.array[int],
+    lanes: int,
+    lane: int,
+    warp: int,
+    warps: int,
+) -> int:
+    """Color a graph's vertices first-fit, the largest first; return the colors (every thread).
+
+    A vertex is ``vertices[v] = (color, side_a, side_b, size)`` for ``v < count`` (``size < 0``: not one): it holds
+    its two sides (``side_b`` -1 for none), indices of ``used``, each side's colors in use (bit ``c``: color ``c``;
+    the caller clears them after), and the routine writes its ``color``, the least color no vertex before it on one of
+    its sides holds, the vertices taken by their sizes descending, a size's in index order. A color of a sweep lasts
+    its longest vertex, so the large vertices share colors and the colors' series is short.
+
+    One rule for every vertex kind: the largest first, where a vertex that persists across colorings keeps its last
+    color as its tier (its order against the neighbours it keeps). A grouped world's groups (:func:`_group_rows`)
+    re-form from the sequence at every reservation, so none persists and the rule is this routine's first-fit, the
+    largest first; the tiers come with the first vertices that persist, a region route's body pairs.
+
+    Scratch: ``starts`` (a size's count, then its first place: the largest size plus one), ``order`` (the vertices in
+    that order: ``count``), ``cells`` (two: the largest size, the colors). Over ``warps`` warps of ``lanes`` lanes
+    (:func:`.device_preludes.lane_stride`: one on the CPU, where one thread runs the group): the counts take every
+    thread; the first warp orders (a batch of the index order at a time, a size's vertices in turn) and colors (a batch
+    of the order at a time, a vertex once no lower vertex of its batch on one of its sides waits).
+    """
+    threads = lanes * warps
+    if warp == 0 and lane == 0:
+        cells[0] = 0
+    if warps > 1:
+        lane_sync(threads)
+    else:
+        lane_sync(lanes)
+    largest = int(0)
+    for v in range(warp * lanes + lane, count, threads):
+        largest = wp.max(largest, vertices[v][3])
+    largest = int(lane_maximum(float(largest), lanes))
+    if lane == 0:
+        wp.atomic_max(cells, 0, largest)
+    if warps > 1:
+        lane_sync(threads)
+    else:
+        lane_sync(lanes)
+    largest = cells[0]
+    for b in range(warp * lanes + lane, largest + 1, threads):
+        starts[b] = 0
+    if warps > 1:
+        lane_sync(threads)
+    else:
+        lane_sync(lanes)
+    for v in range(warp * lanes + lane, count, threads):
+        size = vertices[v][3]
+        if size >= 0:
+            wp.atomic_add(starts, size, 1)
+    if warps > 1:
+        lane_sync(threads)
+    else:
+        lane_sync(lanes)
+    colors = int(0)
+    if warp == 0:
+        total = int(0)
+        if lane == 0:
+            for k in range(largest + 1):
+                b = largest - k
+                n = starts[b]
+                starts[b] = total
+                total += n
+        total = lane_read(total, 0, lanes)
+        lane_sync(lanes)
+        for base in range(0, count, lanes):
+            v = base + lane
+            size = int(-1 - lane)
+            if v < count:
+                if vertices[v][3] >= 0:
+                    size = vertices[v][3]
+            peers = lane_match(size, lanes)
+            at = int(0)
+            if size >= 0:
+                at = starts[size] + lane_below(peers, lanes)
+            lane_sync(lanes)
+            if size >= 0:
+                order[at] = v
+                if lane_last(peers, lanes) == lane:
+                    starts[size] = at + 1
+            lane_sync(lanes)
+        for base in range(0, total, lanes):
+            k = base + lane
+            v = int(-1)
+            waiting = False
+            vertex = wp.vec4i(0, -1, -1, 0)
+            if k < total:
+                v = order[k]
+                vertex = vertices[v]
+                waiting = True
+            sides = wp.vec2i(vertex[1], vertex[2])
+            # The batch's lower vertices that share a side with this one.
+            shares = wp.uint32(0)
+            for j in range(lanes):
+                other = wp.vec2i(lane_read(sides[0], j, lanes), lane_read(sides[1], j, lanes))
+                if j < lane and waiting and _shares_tree(sides, other):
+                    shares = shares | (wp.uint32(1) << wp.uint32(j))
+            lower = shares & lane_ballot(waiting, lanes)
+            while lane_any(waiting, lanes):
+                votes = lane_ballot(waiting, lanes)
+                if waiting and (votes & lower) == wp.uint32(0):
+                    held = used[sides[0]]
+                    if sides[1] >= 0:
+                        held = held | used[sides[1]]
+                    color = _first_free_color(held)
+                    if color < GROUP_COLORS:
+                        bit = wp.int64(1) << wp.int64(color)
+                        used[sides[0]] = used[sides[0]] | bit
+                        if sides[1] >= 0:
+                            used[sides[1]] = used[sides[1]] | bit
+                    vertices[v] = wp.vec4i(color, sides[0], sides[1], vertex[3])
+                    colors = wp.max(colors, color + 1)
+                    waiting = False
+                lane_sync(lanes)
+        colors = int(lane_maximum(float(colors), lanes))
+    if warps > 1:
+        if warp == 0 and lane == 0:
+            cells[1] = colors
+        lane_sync(threads)
+        colors = cells[1]
+    return colors
+
+
+@wp.func
 def _group_rows(
     order: RowOrder,
     groups: RowGroups,
@@ -776,17 +918,17 @@ def _group_rows(
     place its dense contact rows color-major (each pair's ``rows_before``) and write its tables; else its colors
     are 0 and the row order's places stand. ``line_first`` is the line's row of the world's first contact row.
 
-    One pass over the sequence a batch of the lanes at a time forms the groups and colors their leaders; one over the
-    leaders places each group in its color and frees the trees' colors; one over the pairs places their rows.
+    One pass over the sequence a batch of the lanes at a time forms the groups; one colors them, the largest first
+    (:func:`color_largest_first`, the groups its vertices); one over the leaders places each group in its color and
+    frees the trees' colors; one over the pairs places their rows.
 
     Over ``warps`` warps of the block (warp ``warp``; one on the CPU, or where a warp is the world's), the warps take
-    the passes' batches in turn, warp ``w`` the batches ``w``, ``w + warps``, ...: a batch's own loads, its keys' places
-    (open addressing, whose places do not depend on the order keys arrive in) and which of its leaders share a tree
-    come before its turn; its turn (the warp before it passed it, :func:`_turn_wait`) reads what the batches before it
-    left (the sequence's count, the open groups, the trees' colors in use, the colors' totals), leaves its own, and
-    passes it on. The batches take their turns in the sequence's order, so every group, color and place is the one
-    warp's. The leaders and colors are sums and maxima over the batches; the passes over the keys and the pairs take
-    every thread."""
+    the passes' batches in turn, warp ``w`` the batches ``w``, ``w + warps``, ...: a batch's own loads and its keys'
+    places (open addressing, whose places do not depend on the order keys arrive in) come before its turn; its turn
+    (the warp before it passed it, :func:`_turn_wait`) reads what the batches before it left (the sequence's count, the
+    open groups, the colors' totals), leaves its own, and passes it on. The batches take their turns in the sequence's
+    order, so every group and place is the one warp's. The leaders are a sum over the batches; the passes over the keys
+    and the pairs take every thread."""
     capacity = groups.pairs.shape[1]
     threads = lanes * warps
     # A key a pair at most (the pairs past the capacity take none): twice the keys' places.
@@ -798,7 +940,6 @@ def _group_rows(
         if warp == 0 and lane == 0:
             groups.turns[slot, 0] = 0
             groups.turns[slot, 1] = 0
-            groups.turns[slot, 2] = 0
         lane_sync(threads)
     else:
         lane_sync(RESERVE_LANES)
@@ -808,7 +949,6 @@ def _group_rows(
     batches = (pairs + lanes - 1) // lanes
     count = int(0)
     leaders = int(0)
-    colors = int(0)
     for g in range(warp, 2 * batches, warps):
         half = g // batches
         base = (g - half * batches) * lanes
@@ -831,12 +971,6 @@ def _group_rows(
         place = int(-1 - lane)
         if candidate:
             place = _group_key_place(groups, slot, key, keys)
-        # The batch's lower pairs that share a tree with this one.
-        shares = wp.uint32(0)
-        for k in range(lanes):
-            other = wp.vec2i(lane_read(sides[0], k, RESERVE_LANES), lane_read(sides[1], k, RESERVE_LANES))
-            if k < lane and candidate and _shares_tree(sides, other):
-                shares = shares | (wp.uint32(1) << wp.uint32(k))
         # The batch's turn: what the batches before it left.
         if warps > 1:
             if g > 0:
@@ -876,24 +1010,9 @@ def _group_rows(
         lane_sync(RESERVE_LANES)
         if active and member > 0:
             groups.members[slot, GROUP_MEMBERS * leader + member] = own
-        lower = shares & lane_ballot(waiting, RESERVE_LANES)
-        while lane_any(waiting, RESERVE_LANES):
-            votes = lane_ballot(waiting, RESERVE_LANES)
-            if waiting and (votes & lower) == wp.uint32(0):
-                used = groups.used[sides[0]]
-                if sides[1] >= 0:
-                    used = used | groups.used[sides[1]]
-                color = _first_free_color(used)
-                if color < GROUP_COLORS:
-                    bit = wp.int64(1) << wp.int64(color)
-                    groups.used[sides[0]] = groups.used[sides[0]] | bit
-                    if sides[1] >= 0:
-                        groups.used[sides[1]] = groups.used[sides[1]] | bit
-                # The leader's color and trees, until the leaders' pass places it.
-                groups.places[slot, s] = wp.vec4i(color, sides[0], sides[1], 0)
-                colors = wp.max(colors, color + 1)
-                waiting = False
-            lane_sync(RESERVE_LANES)
+        if waiting:
+            # The leader's trees, until the coloring and the leaders' pass place it.
+            groups.places[slot, s] = wp.vec4i(-1, sides[0], sides[1], 0)
         count += lane_sum(wp.where(active, 1, 0), RESERVE_LANES)
         leaders += lane_sum(wp.where(active and member == 0, 1, 0), RESERVE_LANES)
         if warps > 1:
@@ -901,17 +1020,38 @@ def _group_rows(
                 groups.turns[slot, 0] = count
             if g + 1 < 2 * batches:
                 _turn_pass(_turn(warp + 1, warps))
-    colors = int(lane_maximum(float(colors), RESERVE_LANES))
     if warps > 1:
-        # The leaders and colors over the warps; the count the last batch's.
+        # The leaders over the warps; the count the last batch's.
         if lane == 0:
             wp.atomic_add(groups.turns, slot, 1, leaders)
-            wp.atomic_max(groups.turns, slot, 2, colors)
         lane_sync(threads)
         count = groups.turns[slot, 0]
         leaders = groups.turns[slot, 1]
-        colors = groups.turns[slot, 2]
     count = wp.min(count, capacity)
+    # The groups as the coloring's vertices: each leader's place its trees and rows, every other pair's none.
+    if warps == 1:
+        lane_sync(RESERVE_LANES)
+    for s in range(warp * lanes + lane, count, threads):
+        vertex = wp.vec4i(-1, -1, -1, -1)
+        if groups.pairs[slot, s][3] == 0:
+            size = int(0)
+            for m in range(GROUP_MEMBERS):
+                size += groups.members[slot, GROUP_MEMBERS * s + m]
+            lead = groups.places[slot, s]
+            vertex = wp.vec4i(-1, lead[1], lead[2], size)
+        groups.places[slot, s] = vertex
+    colors = color_largest_first(
+        groups.places[slot],
+        count,
+        groups.used,
+        groups.starts[slot],
+        groups.order[slot],
+        groups.cells[slot],
+        lanes,
+        lane,
+        warp,
+        warps,
+    )
     takes = (
         colors <= GROUP_COLORS
         and leaders >= groups.min_units
