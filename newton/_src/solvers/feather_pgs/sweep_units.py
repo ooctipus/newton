@@ -57,7 +57,7 @@ from .row_metadata import HEADER_WORDS, record_parent
 from .sweep_levels import COST_CLASSES
 
 BUILD_WARPS = 8
-"""Warps of a world's unit builder block: they share the parallel passes; the first levels the units."""
+"""Warps of a world's unit builder block: they share the parallel passes and level the units in turn."""
 
 GROUP_WARPS = 8
 """Warps of a grouped world's block (:func:`.sweep_routes.group_rows`, the colored mapping's block of
@@ -540,17 +540,13 @@ SHARED_DECLARATIONS
         return used_prefix[dof >> 5] + __popc(used_bits[dof >> 5] & ((1u << (dof & 31)) - 1u));
     };
 
-    // Levels in row order (the level builder's pass): a unit's color is one past the latest color of its bodies, so
-    // units on a body keep their row order. The counts of colors [0, units] start at zero; a unit's rank is its
-    // place among its color's units in row order.
-    if (warp == 0) {
+    // Levels in row order (the level builder's pass, the block's warps in turn): a unit's color is one past the latest
+    // color of its bodies, so units on a body keep their row order. The counts of colors [0, units] start at zero; a
+    // unit's rank is its place among its color's units in row order.
+    {
 LEVEL_PASS
-        if (lane == 0) {
-            color_count.data[world] = levels;
-            colors_s[0] = levels;
-        }
+        if (tid == 0) color_count.data[world] = levels;
     }
-    __syncthreads();
     // Color offsets: an exclusive scan of the counts, in place; offset `colors` is the unit count.
     const int colors = colors_s[0];
 LEVEL_OFFSETS
@@ -590,6 +586,7 @@ _LEVEL_PASS = sweep_levels.level_pass(
     store="unit_color.data[off_mf + unit] = level;\n                unit_rank.data[off_mf + unit] = rank;"
     "\n                unit_after.data[(off_mf + unit) * 2] = after_a;\n                unit_after.data[(off_mf + unit) * 2 + 1] = after_b;",
     after=True,
+    turns="colors_s[0]",
 )
 _LEVEL_OFFSETS = sweep_levels.level_offsets(levels="colors", counts="color_offset.data[off_color + {}]")
 
