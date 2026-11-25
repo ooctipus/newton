@@ -59,6 +59,7 @@ from .factor.kernels import (
     publish_prescribed_bodies,
     take_gravity,
     turn_forces,
+    turn_moments,
 )
 from .factor.walk import (
     RELEASE_SLIPS,
@@ -869,7 +870,21 @@ class TreeFactor:
             _trees, first = np.unique(tree[turning], return_index=True)
             starts = np.append(first, turning.size).astype(np.int32)
         lin, ang = (dof_dim[turning, 0], dof_dim[turning, 1]) if turning.size else (turning, turning)
-        dofs = np.stack([model.joint_qd_start.numpy()[turning] + lin, ang, lin], axis=1) if turning.size else turning
+        qd_start = model.joint_qd_start.numpy() if model.joint_count else np.zeros(0, dtype=np.int32)
+        dofs = np.stack([qd_start[turning] + lin, ang, lin], axis=1) if turning.size else turning
+        # The coordinates the turns' moments reach, each with its joint and tree: a turning joint's turn coordinates and
+        # its ancestors', each once a tree (turn_forces).
+        reached = []
+        for t in range(starts.size - 1):
+            joints = set()
+            for joint in turning[starts[t] : starts[t + 1]]:
+                up = int(joint)
+                while up >= 0:
+                    joints.add(up)
+                    up = int(parent_joint[up])
+            for joint in sorted(joints):
+                angular = qd_start[joint] + dof_dim[joint, 0]
+                reached += [(dof, joint, t) for dof in range(angular, angular + dof_dim[joint, 1])]
         device = model.device
         self.turning_joints = wp.array(turning, dtype=wp.int32, device=device)
         self.turn_body = wp.array(
@@ -878,24 +893,25 @@ class TreeFactor:
         self.turn_dofs = wp.array(np.asarray(dofs, dtype=np.int32).reshape(-1, 3), dtype=wp.vec3i, device=device)
         self.turn_tree_start = wp.array(starts, dtype=wp.int32, device=device)
         self.turn_parent_joint = wp.array(parent_joint, dtype=wp.int32, device=device)
+        self.turn_coordinates = wp.array(
+            np.asarray(reached, dtype=np.int32).reshape(-1, 3), dtype=wp.vec3i, device=device
+        )
+        self.turn_moments = wp.zeros(turning.size, dtype=wp.vec3, device=device)
         self.turn_tau = wp.zeros(max(1, int(model.joint_dof_count)), dtype=wp.float32, device=device)
         # The prediction waits for the turns' forces: their stream goes first beside the refreshes.
         self.turn_beside = execution.Beside(device, priority=-1)
 
     def turn_forces(self, state_in, dt: float) -> None:
-        """The turning joints' gyroscopic moments as coordinate forces (from FK/ID's columns, for the prediction)."""
+        """The turning joints' gyroscopic moments as coordinate forces (from FK/ID's columns, for the prediction): each
+        joint's moment at once, then each coordinate's sum of those it takes."""
         model = self.model
         wp.launch(
-            turn_forces,
-            dim=self.turn_tree_start.shape[0] - 1,
+            turn_moments,
+            dim=self.turning_joints.shape[0],
             inputs=[
-                self.turn_tree_start,
                 self.turning_joints,
                 self.turn_body,
                 self.turn_dofs,
-                self.turn_parent_joint,
-                model.joint_dof_dim,
-                model.joint_qd_start,
                 model.joint_X_c,
                 self.kinematic_joint_mask,
                 state_in.body_q,
@@ -907,6 +923,22 @@ class TreeFactor:
                 state_in.joint_qd,
                 self.dof_armature,
                 dt,
+            ],
+            outputs=[self.turn_moments],
+            block_dim=TURN_BLOCK,
+            device=model.device,
+        )
+        wp.launch(
+            turn_forces,
+            dim=self.turn_coordinates.shape[0],
+            inputs=[
+                self.turn_tree_start,
+                self.turning_joints,
+                self.turn_parent_joint,
+                self.kinematic_joint_mask,
+                self.turn_coordinates,
+                self.joint_S_s,
+                self.turn_moments,
             ],
             outputs=[self.turn_tau],
             block_dim=TURN_BLOCK,

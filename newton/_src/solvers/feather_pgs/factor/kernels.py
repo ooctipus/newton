@@ -255,14 +255,10 @@ def _turn_moment(
 
 
 @wp.kernel
-def turn_forces(
-    tree_start: wp.array[int],
+def turn_moments(
     turning_joints: wp.array[int],
     turn_body: wp.array[int],
     turn_dofs: wp.array[wp.vec3i],
-    parent_joint: wp.array[int],
-    joint_dof_dim: wp.array2d[int],
-    joint_qd_start: wp.array[int],
     joint_X_c: wp.array[wp.transform],
     kinematic_joint_mask: wp.array[int],
     body_q: wp.array[wp.transform],
@@ -274,29 +270,14 @@ def turn_forces(
     joint_qd: wp.array[float],
     armature: wp.array[float],
     dt: float,
-    turn_tau: wp.array[float],
+    moments: wp.array[wp.vec3],
 ):
-    """One tree's turning joints' gyroscopic moments (:func:`_turn_moment`; its joints
-    ``turning_joints[tree_start[t]:tree_start[t + 1]]``, each one's body and its turns' first coordinate, count and the
-    joint's linear axes in ``turn_body`` / ``turn_dofs``) as coordinate forces, ``J^T`` of each pure moment: the turn
-    coordinates of the joint and of its ancestors (``parent_joint``) take their axis against it, summed in that fixed
-    order. A moment has no lever, so no wrench is carried. A kinematic joint's body takes none."""
-    tree = wp.tid()
-    first, last = tree_start[tree], tree_start[tree + 1]
-    for k in range(first, last):
-        dofs = turn_dofs[k]
-        for dof in range(dofs[0], dofs[0] + dofs[1]):
-            turn_tau[dof] = 0.0
-        up = parent_joint[turning_joints[k]]
-        while up >= 0:
-            start = joint_qd_start[up] + joint_dof_dim[up, 0]
-            for dof in range(start, start + joint_dof_dim[up, 1]):
-                turn_tau[dof] = 0.0
-            up = parent_joint[up]
-    for k in range(first, last):
-        joint = turning_joints[k]
-        if kinematic_joint_mask[joint] != 0:
-            continue
+    """Each turning joint's gyroscopic moment (:func:`_turn_moment`), a thread a joint (its body and its turns' first
+    coordinate, count and linear axes in ``turn_body`` / ``turn_dofs``); a kinematic joint's body takes none."""
+    k = wp.tid()
+    joint = turning_joints[k]
+    moment = wp.vec3(0.0)
+    if kinematic_joint_mask[joint] == 0:
         dofs = turn_dofs[k]
         moment = _turn_moment(
             joint,
@@ -315,14 +296,39 @@ def turn_forces(
             armature,
             dt,
         )
-        for dof in range(dofs[0], dofs[0] + dofs[1]):
-            turn_tau[dof] += wp.dot(wp.spatial_bottom(joint_S_s[dof]), moment)
-        up = parent_joint[joint]
-        while up >= 0:
-            start = joint_qd_start[up] + joint_dof_dim[up, 0]
-            for dof in range(start, start + joint_dof_dim[up, 1]):
-                turn_tau[dof] += wp.dot(wp.spatial_bottom(joint_S_s[dof]), moment)
+    moments[k] = moment
+
+
+@wp.kernel
+def turn_forces(
+    tree_start: wp.array[int],
+    turning_joints: wp.array[int],
+    parent_joint: wp.array[int],
+    kinematic_joint_mask: wp.array[int],
+    turn_coordinates: wp.array[wp.vec3i],
+    joint_S_s: wp.array[wp.spatial_vector],
+    moments: wp.array[wp.vec3],
+    turn_tau: wp.array[float],
+):
+    """The turning joints' moments (:func:`turn_moments`) as coordinate forces, ``J^T`` of each pure moment, a thread a
+    coordinate that takes one (``turn_coordinates``: the coordinate, its joint and its tree): the turn coordinates of
+    a joint and of its ancestors (``parent_joint``) take their axis against it, summed over the tree's turning joints in
+    joint order. A moment has no lever, so no wrench is carried. A kinematic joint's body takes none."""
+    entry = turn_coordinates[wp.tid()]
+    dof, owner, tree = entry[0], entry[1], entry[2]
+    axis = wp.spatial_bottom(joint_S_s[dof])
+    tau = float(0.0)
+    for k in range(tree_start[tree], tree_start[tree + 1]):
+        joint = turning_joints[k]
+        if kinematic_joint_mask[joint] != 0:
+            continue
+        # The coordinate takes the moment where its joint is this one or one of its ancestors.
+        up = joint
+        while up >= 0 and up != owner:
             up = parent_joint[up]
+        if up >= 0:
+            tau += wp.dot(axis, moments[k])
+    turn_tau[dof] = tau
 
 
 @wp.kernel
