@@ -990,13 +990,12 @@ def region_phase(pad: str = "        ", *, block: bool = False, group: bool = Fa
     in the world's job words (:data:`WIDE_JOB`), every block of the group takes its regions (spread over the blocks,
     ``tid * group + rank``), and the block joins them, with their exit votes, before its next level. The other blocks
     take what it posts until the world's end. A level's regions share no body, so the order is the same sweep."""
-    gather = """const wp::spatial_vector seen = body_seen.data[{f}];
+    # A body's version from its words as the region's head loaded them (``{u}_in``, ``{seen}``, ``{version}_in``): raised
+    # where its walk coordinates differ from those it was last seen at.
+    gather = """{u} = {u}_in;
+{version} = {version}_in;
 bool same = true;
-for (int k = 0; k < 6; ++k) {{
-    {u}[k] = s_v[{first} + k];
-    same = same && {u}[k] == seen[k];
-}}
-{version} = body_version.data[{f}];
+for (int k = 0; k < 6; ++k) same = same && {u}[k] == {seen}[k];
 if (!same) {{
     {version} += 1;
     body_version.data[{f}] = {version};
@@ -1015,8 +1014,8 @@ if (moved) {{
     body_version.data[{f}] = {version};
     body_seen.data[{f}] = {u};
 }}"""
-    first_body = indent(gather.format(f="f", u="u", first="first", version="version"), "            ")
-    second_body = indent(gather.format(f="f_b", u="u_b", first="first_b", version="version_b"), "            ")
+    first_body = indent(gather.format(f="f", u="u", seen="seen", version="version"), "            ")
+    second_body = indent(gather.format(f="f_b", u="u_b", seen="seen_b", version="version_b"), "            ")
     push_a = indent(
         push.format(u="u", op="+", basis="basis", wrench="push", first="first", version="version", f="f"),
         "            ",
@@ -1078,15 +1077,30 @@ if (moved) {{
         if (!teamed && {passed}) continue;
         if (teamed) WARP_SYNC();
         const int g = alone ? reg_walk.data[place] : level_region.data[place];
-        // A left-out region waits for the sweeps' end (region_verify).
+        // The region's words at once (its state, bodies, second body's stamp, kind): one round of memory latency.
         const int state = reg_state.data[g];
-        if (state == {int(REGION_LEFT)}) continue;
         const wp::vec2i sides = reg_body.data[g];
+        const int stamp = reg_stamp.data[g];
+        const int kind = reg_kind.data[g];
+        // A left-out region waits for the sweeps' end (region_verify).
+        if (state == {int(REGION_LEFT)}) continue;
         const int f = sides[0], f_b = sides[1];
+        // Both bodies' words at once (a lone body reads its own twice): their first coordinates, the coordinates
+        // their versions were taken at and the versions, then their walk coordinates. A body's version is raised
+        // only by its own gather, so the second body's words do not wait for the first's.
+        const int other = f_b >= 0 ? f_b : f;
+        const int first_in = body_first.data[f], first_b_in = body_first.data[other];
+        const wp::spatial_vector seen = body_seen.data[f], seen_b = body_seen.data[other];
+        const int version_in = body_version.data[f], version_b_in = body_version.data[other];
+        wp::spatial_vector u_in, u_b_in;
+        for (int k = 0; k < 6; ++k) {{
+            u_in[k] = s_v[first_in + k];
+            u_b_in[k] = s_v[first_b_in + k];
+        }}
         if (!alone || f != body) {{
             // The first body: its walk coordinates, its version and its twist.
             body = f;
-            first = body_first.data[f];
+            first = first_in;
             basis = body_basis.data + (size_t)f * 6;
             {{
 {first_body}
@@ -1100,7 +1114,7 @@ if (moved) {{
         const wp::spatial_vector* basis_b = basis;
         wp::vec3 v_b, w_b;
         if (f_b >= 0) {{
-            first_b = body_first.data[f_b];
+            first_b = first_b_in;
             basis_b = body_basis.data + (size_t)f_b * 6;
             {{
 {second_body}
@@ -1108,8 +1122,7 @@ if (moved) {{
             v_b = wp::vec3(wp::dot(basis_b[0], u_b), wp::dot(basis_b[1], u_b), wp::dot(basis_b[2], u_b));
             w_b = wp::vec3(wp::dot(basis_b[3], u_b), wp::dot(basis_b[4], u_b), wp::dot(basis_b[5], u_b));
         }}
-        if (state == version && (f_b < 0 || reg_stamp.data[g] == version_b)) continue;
-        const int kind = reg_kind.data[g];
+        if (state == version && (f_b < 0 || stamp == version_b)) continue;
 {pair_block}
         const float sign = (kind & {int(KIND_SECOND)}) != 0 ? -1.0f : 1.0f;
         const wp::mat33 frame = reg_frame.data[g];
