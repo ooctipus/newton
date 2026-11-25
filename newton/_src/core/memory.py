@@ -837,9 +837,11 @@ SPILL_SLOTS = 32
 def stage(
     staging: Staging, warps: Callable[[int], int], budget: int, hiding: int, filled: Callable, ceiling: int
 ) -> Staging:
-    """The staging rule: buffers without an alternative place, then each with one in order of reuse while the stage fits
-    ``budget`` [B] and leaves (``warps(bytes)``) at least the fewer of the warps without it and ``hiding`` a scheduler;
-    one that streams otherwise pays only in throughput: only where the live items fill them (``filled``).
+    """The staging rule: buffers without an alternative place, then each with one in order of reuse that the stage still
+    holds within ``budget`` [B] leaving (``warps(bytes)``) at least the fewer of the warps without it and ``hiding`` a
+    scheduler; one that streams otherwise pays only in throughput: only where the live items fill them (``filled``). A
+    buffer the stage declines yields to the buffers after it: its length never moves another operand (a dense row
+    capacity's impulses, at their alternative place, leave the free rows' impulses their stage).
 
     A buffer that spills (:attr:`Buffer.spill`) and does not fit whole within ``ceiling`` [B] (the static stage on
     CUDA, :data:`STATIC_SHARED_BYTES`; the budget where no L1 shares the stage; within the budget for a block of
@@ -864,10 +866,8 @@ def stage(
         if buffer.spill and spills is None and not (admits(trial) and (staging.groups > 1 or trial.bytes <= ceiling)):
             spills = buffer
             continue
-        if not admits(trial):
-            break
-        if buffer.alternative is Place.STREAMED and not filled(trial.bytes):
-            break
+        if not admits(trial) or (buffer.alternative is Place.STREAMED and not filled(trial.bytes)):
+            continue
         names.add(buffer.name)
         kept = trial
     if spills is None or staging.groups > 1:

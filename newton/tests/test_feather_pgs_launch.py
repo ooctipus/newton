@@ -282,6 +282,34 @@ class TestShapeAgainstTodaysRules(unittest.TestCase):
         for device, places in expected.items():
             self.assertEqual((placed(device, None), placed(device, 0)), places)
 
+    def test_a_dense_capacity_moves_no_other_operand(self):
+        """The hardware clutter's colored world (1,551 coordinates, 37,248 free rows): at 256 dense rows the block stages
+        the dense rows and keeps heads of the free rows' impulses; at 65,504 the dense operands go to their alternative
+        places (impulses in place, records streamed) and yield to the free rows' impulses, whose heads take the room
+        they leave (memory.stage)."""
+        clutter = functools.partial(
+            sweep_routes.GeneralSweep,
+            mf_max_constraints=37248,
+            max_world_dofs=1551,
+            device_arch="120",
+            max_row_dofs=15,
+            levels=LevelLaw(EXACT),
+        )
+
+        def placed(rows, device):
+            config = clutter(rows)
+            return config.places.placed(shape(config.work(1, config.staging()), device).staging)
+
+        for device in (PRO, GB300):
+            with self.subTest(arch=device.arch):
+                held, past = placed(256, device), placed(65504, device)
+                self.assertEqual((held.metadata, held.dense_impulses), (Place.SHARED, Place.SHARED))
+                self.assertEqual((past.metadata, past.dense_impulses), (Place.STREAMED, Place.GLOBAL))
+                self.assertIs(past.impulses, Place.SHARED)
+                self.assertGreater(held.free_slots, 0)
+                self.assertGreater(past.free_slots, held.free_slots)
+                self.assertGreaterEqual(past.wide_slots, held.wide_slots)
+
     def test_the_held_tree_stages_at_its_own_level(self):
         """The held tree's state block holds its outputs on its inputs' words (19 words a body, 6 a coordinate, 6 a
         root), so kuka's held forest keeps 22 of the PRO's 24 blocks in flight a multiprocessor; a 128-body chain's
