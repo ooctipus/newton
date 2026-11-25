@@ -1138,6 +1138,7 @@ if (moved) {{
             const auto push_b = RegionLaw::frame_wrench(d_wrench, d_phi, reg_arm_b.data[again], n_out, t0_out, t1_out);
 {push_b}
         }}
+{_FLOW_MARK}
         // The exit law's vote: a coordinate of the region whose own change is past the floor of its terms (its
         // velocity, its right-hand side, what the region's wrench holds of it).
         {{
@@ -1185,7 +1186,8 @@ if (moved) {{
         reg_stamp.data[g] = version_b;
 """
     if block and not group:
-        return indent(_region_flow(visit), pad)
+        return indent(_region_flow(visit.replace(_FLOW_MARK, _FLOW_RAN)), pad)
+    visit = visit.replace(_FLOW_MARK + "\n", "")
     text = f"""{sync}
 {{
     const wp::vec2i region_span = world_regions.data[world];
@@ -1235,6 +1237,21 @@ if (moved) {{
     return indent(text, pad)
 
 
+_FLOW_MARK = "        // FLOW_RAN"
+"""Where a region's visit has left its bodies' coordinates and versions (after its pushes): the flow marks its turn
+there (:data:`_FLOW_RAN`), so the next region on each body waits for no store of the region's own state."""
+
+_FLOW_RAN = """        // Its bodies hold their coordinates and versions: its turn on them, so the next region on each may run while
+        // this one stores its own state.
+        __threadfence_block();
+        {
+            volatile int* const done = s_ran;
+            done[slot_a] = region_turn + flow_level;
+            if (flow_sides[1] >= 0) done[slot_b] = region_turn + flow_level;
+            marked = true;
+        }"""
+
+
 def _region_flow(visit: str) -> str:
     """The region phase over a world's block (:func:`region_phase`'s block form) as a flow: the block takes the acting
     regions by level in rounds of its threads, a thread a place, and a region runs once the regions before it on its
@@ -1272,14 +1289,17 @@ def _region_flow(visit: str) -> str:
                     wp::spatial_vector u;
                     wp::vec3 v, w;
                     const wp::spatial_vector* basis = body_basis.data;
+                    // A visit marks its turn once its pushes are done (_FLOW_RAN); a region passed before them here.
+                    bool marked = false;
                     do {{
 {indent(visit, "                ")}
                     }} while (false);
-                    // Its turn on its bodies, after its changes: the next region on each may run.
-                    __threadfence_block();
-                    volatile int* const done = s_ran;
-                    done[slot_a] = region_turn + flow_level;
-                    if (flow_sides[1] >= 0) done[slot_b] = region_turn + flow_level;
+                    if (!marked) {{
+                        __threadfence_block();
+                        volatile int* const done = s_ran;
+                        done[slot_a] = region_turn + flow_level;
+                        if (flow_sides[1] >= 0) done[slot_b] = region_turn + flow_level;
+                    }}
                     pending = false;
                 }}
             }}
