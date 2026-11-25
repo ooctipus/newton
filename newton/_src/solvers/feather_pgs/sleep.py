@@ -175,7 +175,7 @@ def _contact_cone(
 @wp.kernel
 def _contact_load(
     dense_first: wp.array[int],
-    body_base: int,
+    body_base: wp.array[int],
     routes: ContactRoutes,
     impulses: wp.array2d[wp.float32],
     constraint_count: wp.array[wp.int32],

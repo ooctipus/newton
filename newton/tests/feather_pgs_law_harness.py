@@ -1094,11 +1094,12 @@ def leave_walk(walk: WalkTrees, velocity, device) -> None:
 
 def line_rows(solver, world: int) -> np.ndarray:
     """World ``world``'s live rows by their index in its line: the line's rows from 0 (a free body's contacts among
-    them where they are rows of the line), then the free bodies' own rows from the store's ``body_base``."""
+    them where they are rows of the line), then the free bodies' own rows from the line's body base."""
     placement = solver.placement
     dense = int(placement.constraint_count.numpy()[world])
     free = int(placement.mf_constraint_count.numpy()[world])
-    return np.concatenate((np.arange(dense), placement.body_base + np.arange(free)))
+    base = int(placement.body_base.numpy()[placement.dense_first.numpy()[world]])
+    return np.concatenate((np.arange(dense), base + np.arange(free)))
 
 
 def walked_worlds(solver) -> np.ndarray:
@@ -1111,11 +1112,18 @@ def walked_worlds(solver) -> np.ndarray:
     return dense & ((int(seeds.tiers) >> tier) & 1 != 0)
 
 
+def free_rows(placement, values: np.ndarray) -> np.ndarray:
+    """Each line's free-body rows of a host copy of a row-store array (``[line, row, ...]``): the free capacity's rows
+    from the line's body base."""
+    rows = int(placement.mf_max_constraints)
+    return np.stack([values[line, base : base + rows] for line, base in enumerate(placement.body_base.numpy())])
+
+
 def free_body_Z(solver) -> np.ndarray:
-    """Every world's free-body rows' packed entries ``[world, row, 12]`` (float32): the line's packed rows from
-    ``body_base`` in the sides layout, side ``a``'s six then side ``b``'s (zero past a line narrower than twelve)."""
+    """Every world's free-body rows' packed entries ``[world, row, 12]`` (float32): the line's packed rows from its
+    body base in the sides layout, side ``a``'s six then side ``b``'s (zero past a line narrower than twelve)."""
     placement = solver.placement
-    packed = placement.packed_Z.numpy()[:, placement.body_base :, :12]
+    packed = free_rows(placement, placement.packed_Z.numpy())[..., :12]
     Z = np.zeros((*packed.shape[:2], 12), np.float32)
     Z[..., : packed.shape[2]] = packed
     return Z
@@ -1124,11 +1132,11 @@ def free_body_Z(solver) -> np.ndarray:
 def free_body_incident_gaps(solver) -> tuple[np.ndarray, np.ndarray]:
     """:func:`incident_gaps` of the free-body rows: each row's ``|mf_row_incident - Z^T u_hat|`` over its two bodies'
     six coordinates, ``u_hat`` the walk's enter of ``v_hat`` (:func:`_walked_coordinates`), and its terms' magnitude."""
-    incident = solver.placement.row_incident.numpy()[:, solver.placement.body_base :].astype(np.float64)
+    incident = free_rows(solver.placement, solver.placement.row_incident.numpy()).astype(np.float64)
     Z = free_body_Z(solver).astype(np.float64)
     Z_a, Z_b = Z[..., :6], Z[..., 6:]
     # Each row's sides: its responding bodies' articulations (one-node trees), -1 for none.
-    sides = solver.placement.row_sides.numpy()[:, solver.placement.body_base :]
+    sides = free_rows(solver.placement, solver.placement.row_sides.numpy())
     walked, offsets = _walked_coordinates(solver), solver.forest.articulation_world_dof_offset.numpy()
     gaps, terms = np.zeros(incident.shape), np.zeros(incident.shape)
     for world, count in enumerate(solver.placement.mf_constraint_count.numpy()):
@@ -1543,6 +1551,9 @@ def allocate_contacts(operands, device) -> None:
         "world_held": wp.zeros(worlds, dtype=wp.int32, device=device),
         "contact_rows_kept": wp.zeros((2, worlds), dtype=wp.int32, device=device),
     }
+    # Each line's free rows from the dense capacity (the placement's body base before the store follows its rows).
+    if "body_base" not in values:
+        values["body_base"] = wp.full(worlds, int(values["max_constraints"]), dtype=wp.int32, device=device)
 
     # Each contact its own body pair: the scenes' contacts carry no frame.
     n = max(slots, 1)

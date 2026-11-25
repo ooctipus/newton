@@ -3,10 +3,10 @@
 
 """The row records every row producer writes, declared once as fields (:mod:`.field_group`).
 
-One store holds every world line's rows (:data:`DENSE_ROWS`): the dense class's from row 0, then the
-free bodies' from the store's ``body_base``. :data:`DenseRows` is the Warp struct of the dense class's records; the
-contact producers' input (:data:`.contact_input.ContactInput`) carries the same fields. :data:`MfRows` reads the free
-bodies' rows: the same records at ``base``. Every row's whitened ``Z`` is the packed rows' (:mod:`.packed_rows`).
+One store holds every world line's rows (:data:`DENSE_ROWS`): the dense class's from row 0, then the free bodies'
+from the line's body base (``body_base``, by line). :data:`DenseRows` is the Warp struct of the dense class's records;
+the contact producers' input (:data:`.contact_input.ContactInput`) carries the same fields. :data:`MfRows` reads the
+free bodies' rows: the same records from ``base``. Every row's whitened ``Z`` is the packed rows' (:mod:`.packed_rows`).
 """
 
 import dataclasses
@@ -30,17 +30,17 @@ DENSE_ROWS = FieldGroup(
     Field("target_velocity", wp.float32, ("world", "row"), owner="placement"),
     Field("row_sides", wp.vec2i, ("world", "row"), owner="placement"),
 )
-"""The row store: every world line's rows, the dense class's (``[0, dense_max_constraints)``) then the free bodies'
-(from ``body_base``): the system and the row records (with each row's sides). One row index for both classes: a
-contact's slot and its rows' parents count in the line. ``row_incident`` is each row's
-incident velocity ``J v_hat``, written where its walk sums it: the one writer (:mod:`.walk_rows`), the free bodies'
+"""The row store: every world line's rows, the dense class's then the free bodies' (from the line's body base,
+``body_base``, at most ``dense_max_constraints``): the system and the row records (with each row's sides). One row index
+for both classes: a contact's slot and its rows' parents count in the line. ``row_incident`` is each row's incident
+velocity ``J v_hat``, written where its walk sums it: the one writer (:mod:`.walk_rows`), the free bodies'
 writer (:func:`.walk_rows.write_free_body_rows`)."""
 
 
 def line_size(array: str) -> str:
     """Native text: the elements from one line of the row store to the next in ``array``, an operand laid out by line
-    and row (its first two axes; the rows of a line, times the entries a row where the array has a third axis), read from
-    the array's own outer stride. The store's line is the array's: a native body that addresses a line by it reads the
+    and row (its first two axes; the rows of a line, times the entries a row where the array has a third axis), read
+    from the array's own outer stride. The store's line is the array's: a native body that addresses a line by it reads the
     store the Warp kernels index, at whatever length the store's lines have."""
     return f"({array}.strides[0] / (int)sizeof(*{array}.data))"
 
@@ -48,8 +48,8 @@ def line_size(array: str) -> str:
 ROW_RECORDS = FieldGroup(Field("row_record", wp.int32, ("world", "record"), owner="placement"))
 """The streamed rows' records, which the sweeps' row loops load a row ahead, stored by the rows' writers
 (:func:`.response_builds_rows.write_row_record`): the dense rows' from the plan's first streamed row, then the free
-rows' headers from ``body_base`` (:func:`.row_metadata.record_layout`). The free rows themselves are the line's: their
-records the row store's (:data:`DENSE_ROWS`), their whitened ``Z = L^-1 J^T`` the packed rows'
+rows' headers after them (:func:`.row_metadata.record_layout`). The free rows themselves are the line's, from its body
+base: their records the row store's (:data:`DENSE_ROWS`), their whitened ``Z = L^-1 J^T`` the packed rows'
 (:data:`.packed_rows.PACKED_ROWS`)."""
 
 
@@ -173,9 +173,9 @@ MF_RECORDS = (
     ),
     Field("eps", wp.float32, ("world", "row"), attr="row_eps", owner="placement"),
     Field("first", wp.int32, ("world",), attr="dense_first", owner="placement"),
-    Field("base", wp.int32, attr="body_base", owner="placement"),
+    Field("base", wp.int32, ("line",), attr="body_base", owner="placement"),
 )
-"""Each free-body row's records, the row store's at row ``base + i`` of the world's line (one row index
+"""Each free-body row's records, the row store's at row ``base[line] + i`` of the world's line (one row index
 for both classes: a free-body contact's slot, its rows' parents): kind, friction parent, coefficient, the row law's
 beta, gap, restitution, incident velocity (``J v_hat``, stored by the build), rhs, target, effective mass ``A_ii``,
 material compliance and sides (the responding bodies' articulations in ``a``/``b`` order, -1 for none)."""

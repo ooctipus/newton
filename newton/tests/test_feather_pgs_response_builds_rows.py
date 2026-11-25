@@ -79,7 +79,7 @@ class TestFreeBodyRowsBuild(unittest.TestCase):
         rows = int(p.constraint_count.numpy()[0])
         self.assertGreater(rows, 0, "the box must touch the ground")
         line = int(p.dense_first.numpy()[0])
-        record = record_views(p.row_record.numpy(), p.free_records)[0][line][: rows - p.record_first]
+        record = record_views(p.row_record.numpy(), p.body_base.numpy() * p.dense_record_words)[0][line][:rows]
         offset = p.forest.articulation_world_dof_offset.numpy()
         dofs = p.forest.articulation_response_dof_count.numpy()
         sides = p.row_sides.numpy()[line, p.record_first : rows]
@@ -108,7 +108,8 @@ class TestFreeBodyRowsBuild(unittest.TestCase):
             rows = int(p.constraint_count.numpy()[0])
             self.assertGreater(rows, 0, "the box must touch the ground")
             line = int(p.dense_first.numpy()[0])
-            record = record_views(p.row_record.numpy(), p.free_records, split=True)[0][line][: rows - p.record_first]
+            free_first = p.body_base.numpy() * p.dense_record_words
+            record = record_views(p.row_record.numpy(), free_first, split=True)[0][line][:rows]
         self.assertEqual(record.shape[1], RECORD_WORDS + SPLIT_WORDS)
         offset = p.forest.articulation_world_dof_offset.numpy()
         sides = p.row_sides.numpy()[line, p.record_first : rows]

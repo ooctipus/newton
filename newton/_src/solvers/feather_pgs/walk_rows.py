@@ -869,9 +869,8 @@ class RowSink:
     incident velocities and diagonals; the support placement's (case K1, :func:`support_rows_kernel`) support masks of
     each body and coordinate (its root path, a bit a tree coordinate); the packed rows' layout, where each side's entries
     sit in a packed row (:class:`.dense_rows.RowSupport`, :func:`packed_walker`), the star's coordinates (the sparse
-    diagonal's), the free bodies' first row in the store's line (``base``: their slots count from it), and the rows'
-    support classes where the packed rows are stored by them (``classes``, :func:`.packed_rows.row_classes`). A
-    placement binds what its writer reads."""
+    diagonal's), and the rows' support classes where the packed rows are stored by them (``classes``,
+    :func:`.packed_rows.row_classes`). A placement binds what its writer reads."""
 
     walk: WalkTrees
     release: WalkRelease
@@ -885,7 +884,6 @@ class RowSink:
     dof_mask: wp.array[wp.uint64]
     layout: RowSupport
     star: int
-    base: int
     classes: RowClasses
 
 
@@ -982,7 +980,8 @@ _PACKED_START = """    // The unit's packed rows cleared: each side's walk store
     for (int r = 0; r < rows; ++r)
         for (int e = 0; e < S; ++e) STORE_rows(Z + r * S + e, 0.0f);
     // The row's first side (its layout, dense_rows.row_sides), read after its records' writer wrote it.
-    const int first = LOAD_rows(sink.layout.sides.data + ((size_t)unit.line * (sink.layout.sides.strides[0] / (int)sizeof(*sink.layout.sides.data)) + unit.slot)).c[0];
+    const int first = LOAD_rows(sink.layout.sides.data
+        + (unit.line * (sink.layout.sides.strides[0] / sizeof(*sink.layout.sides.data)) + unit.slot)).c[0];
 """
 
 _PACKED_SIDE = """$skip$tree
@@ -1021,7 +1020,8 @@ _CLASS_TREE = """        // The tree's class: its path from the classes' tables 
 
 _UNIT_ART = "side == 0 ? art_a : art_b"
 
-_SIDES_LOAD = """    const wp::vec2i sides = LOAD_rows(sink.layout.sides.data + ((size_t)unit.line * (sink.layout.sides.strides[0] / (int)sizeof(*sink.layout.sides.data)) + unit.slot));
+_SIDES_LOAD = """    const wp::vec2i sides = LOAD_rows(sink.layout.sides.data
+        + (unit.line * (sink.layout.sides.strides[0] / sizeof(*sink.layout.sides.data)) + unit.slot));
 """
 
 _ROW_SIDES = (
@@ -1177,7 +1177,8 @@ _BLOCK = """    // A block of up to $rows covector rows of the packed sink from 
     const auto& walk = sink.walk;
     const auto& release = sink.release;
     const int S = sink.entries.shape[2];
-    float* const Z = sink.entries.data + (size_t)line * (sink.entries.strides[0] / (int)sizeof(*sink.entries.data)) + (size_t)slot * S;
+    float* const Z = sink.entries.data + (size_t)line * (sink.entries.strides[0] / (int)sizeof(*sink.entries.data))
+        + (size_t)slot * S;
     const int rec0 = line * (sink.diag.strides[0] / (int)sizeof(*sink.diag.data)) + slot;
     float norm[$rows], incident[$rows];
     int pending = 0, reread = 0;$declare
@@ -1922,14 +1923,14 @@ def write_free_body_rows(device_arch, split: bool = False) -> wp.Kernel:
 
 
 def free_body_sink(solver) -> RowSink:
-    """The free bodies' sink (:class:`RowSink`, :data:`walk_body_row`): the packed rows of the line from the store's
-    ``body_base`` (``base``: the free bodies' slots count from it), each side's entries after the row's first side (the
-    packed rows' sides layout, whatever the dense rows' layout: :func:`.sweep_routes.free_body_rows`)."""
+    """The free bodies' sink (:class:`RowSink`, :data:`walk_body_row`): the packed rows of the line from its body base
+    (the free bodies' slots count from it), each side's entries after the row's first side (the packed rows' sides
+    layout, whatever the dense rows' layout: :func:`.sweep_routes.free_body_rows`)."""
     placement = solver.placement
     sink = row_sink(solver.factor, solver.forest, placement, solver.v_hat)
     layout = placement.row_support()
     layout.dense = 0
-    sink.layout, sink.entries, sink.base = layout, placement.packed_Z, int(placement.body_base)
+    sink.layout, sink.entries = layout, placement.packed_Z
     return sink
 
 

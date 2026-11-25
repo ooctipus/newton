@@ -130,7 +130,7 @@ OPERANDS = FieldGroup(
     Field("tier_rows", int, owner="classes"),
     Field("row_type", int, ("line", "row"), owner="placement"),
     Field("dof_start", int, ("art",), owner="forest", attr="articulation_dof_start"),
-    Field("base", int, owner="placement", attr="body_base"),
+    Field("base", int, ("line",), owner="placement", attr="body_base"),
     Field("v", float, ("dof",), owner="step"),
     Field("dense_offsets", int, ("world",), owner="placement", attr="sparse_diagonal_dense_offsets"),
     Field("dense_groups", int, ("world",), owner="placement", attr="sparse_diagonal_dense_groups"),
@@ -306,9 +306,9 @@ def free_class() -> RowClass:
     return RowClass(
         "free",
         OPERANDS.select("row_type", "row_sides", "base", "packed_Z", "world_offset", "coordinates"),
-        f"""    const int records = line * {line_size("row_type")} + base;
+        f"""    const int records = line * {line_size("row_type")} + base.data[line];
     const int S = packed_Z.shape[2];
-    const size_t free_base = (size_t)line * {line_size("packed_Z")} + (size_t)base * S;
+    const size_t free_base = (size_t)line * {line_size("packed_Z")} + (size_t)base.data[line] * S;
     const float* u = coordinates.data + (size_t)world * coordinates.shape[1];""",
         """        const wp::vec2i sides = row_sides.data[records + i];
         const int dof_a = sides[0] >= 0 ? world_offset.data[sides[0]] : -1;
@@ -472,7 +472,7 @@ def audit_store(
 def audit_world(
     a: AuditRows,
     seeds: RowSeeds,
-    base: int,
+    base: wp.array[int],
     velocity: wp.array2d[float],
     mf_velocity: wp.array2d[float],
     fused: wp.array[wp.vec3],
@@ -481,7 +481,7 @@ def audit_world(
     readout: wp.array2d[float],
 ):
     """One thread per world: the row laws of both stores over the rows' velocity terms, into :data:`AUDIT_SLOTS`; the
-    free bodies' rows from ``base`` of the world's line, a tier's walked rows by ``rhs`` and ``diag``."""
+    free bodies' rows from the line's body base ``base``, a tier's walked rows by ``rhs`` and ``diag``."""
     world = wp.tid()
     # A world none of whose rows can act holds them unwritten at their solution, zero impulse: it has none to read.
     rows = a.counts[world]
@@ -492,7 +492,7 @@ def audit_world(
     line = a.rows.first[world]
     walked = emits(seeds, world, rows)
     dense = audit_store(a, world, line, 0, wp.min(rows, a.capacity), velocity, walked, rhs, diag)
-    free = audit_store(a, world, line, base, free_rows, mf_velocity, False, rhs, diag)
+    free = audit_store(a, world, line, base[line], free_rows, mf_velocity, False, rhs, diag)
     extra = fused[world]
     gap = dense[0] + free[0] + extra[0]
     violation = wp.max(wp.max(dense[1], free[1]), extra[1])
@@ -627,7 +627,7 @@ class Audit:
             # Where the free bodies' contacts are regions, their rows' terms are the regions' (no row holds a Z).
             if solver.sweep.regions is not None:
                 solver.sweep.regions.audit(self.coordinates, self.mf_velocity)
-        inputs = [self._operands(), placement.row_seeds, int(placement.body_base)]
+        inputs = [self._operands(), placement.row_seeds, placement.body_base]
         inputs += [self.velocity, self.mf_velocity, self.fused, self.rhs, self.diag]
         wp.launch(audit_world, dim=worlds, inputs=inputs, outputs=[self.readout], device=device)
 

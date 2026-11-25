@@ -471,7 +471,7 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
     # writers published, over the claims' candidates.
     seeds = (factor, "seed_blocks", placement.dense_first, placement.rhs, placement.impulses) if preelimination else ()
     built = (
-        "mf_constraint_count dense_first mf_contact_rows_end row_record free_records packed_Z row_mu row_w body_base "
+        "mf_constraint_count dense_first mf_contact_rows_end row_record dense_record_words packed_Z row_mu row_w body_base "
         "world_acts pass_words"
     )
     build = () if colored is None else (colored, "build", *attrgetter(*built.split())(placement))

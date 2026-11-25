@@ -40,7 +40,7 @@ from .region_sweep import (
 from .response_operator import Lanes, SparseFactor, Velocity
 from .row_inputs import RowArgument
 from .row_laws import ROW_CONTACT, ROW_FRICTION, ROW_JOINT_LIMIT, ROW_TORSION
-from .row_metadata import record_layout
+from .row_metadata import record_words
 from .row_records import line_size
 from .solve_policy import QUIET_LITERAL, block_argmax, sweep_exit
 from .sweep import (
@@ -120,6 +120,7 @@ MF_GS_ABI = kernel_template.params(
     ("world_diag", wp.array2d[float]),
     ("world_row_w", wp.array2d[float]),
     ("world_impulses", wp.array2d[float]),
+    ("body_base", wp.array[int]),
     ("response_dofs", wp.array[int]),
     ("articulation_world_dof_offset", wp.array[int]),
     ("packed_dense", int),
@@ -1948,8 +1949,8 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         if free_rows and not colored and not sweep.regions and sweep.formed != "stage":
 
             def free_record(row: str) -> str:
-                # The free bodies' rows follow the dense ones in the line.
-                return friction_metric(row, str(M_D), rows=3)
+                # The free bodies' rows follow the dense ones in the line, from its body base.
+                return friction_metric(row, "free_row0", rows=3)
 
             stage = friction_record_stage(
                 free, free_op, end="mf_contact_end", record=free_record, declare=sides, pad="    "
@@ -1994,14 +1995,14 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
 
         def unit_metric(row: str) -> Callable[[str], str]:
             # A unit's record in its world's line: by its place in the colors' order, field-major at the share's stride
-            # from the free rows' first record (every dense contact's normal precedes row M_D - 2), where the world's
+            # from the free rows' first record (every dense contact's normal precedes the body base), where the world's
             # units fit its share: its visit's loads do not wait for its color slot, and a color's units read each float
             # together. A world past its share keeps them where the warp sweep keeps its free rows' records, by its
             # normal row (a friction unit's rows are three apart at least), each record's floats together: the line
             # holds a record for every three rows either way, so the records take no memory of their own.
-            first = M_D // 3 * FRICTION_METRIC_FLOATS
+            first = f"(free_row0 / 3) * {FRICTION_METRIC_FLOATS}"
             return lambda place: (
-                f"(unit_record_line + (records_by_row ? (({M_D} + ({row})) / 3) * {FRICTION_METRIC_FLOATS} "
+                f"(unit_record_line + (records_by_row ? ((free_row0 + ({row})) / 3) * {FRICTION_METRIC_FLOATS} "
                 f": {first} + ({place})))"
             )
 
@@ -2260,10 +2261,10 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         exit=leave + sweep_vote + left_verify + sweep_end,
         budget=budget,
     )
-    # The streamed rows' records (row_record, row_metadata.record_layout).
-    # The row store's line (:mod:`.row_records`): the dense rows, then the free bodies' from M_D, at the store's line
-    # length; the free rows' records follow the dense rows' (:func:`.row_metadata.record_layout`).
-    free_records = record_layout(sweep.record_rows, M_D, M_D, split)[0]
+    # The streamed rows' records (row_record, row_metadata.record_layout). The row store's line (:mod:`.row_records`):
+    # the dense rows, then the free bodies' from the line's body base (free_row0), at the store's line length; the
+    # free rows' records follow the dense rows' where those stream.
+    free_records = f"free_row0 * {record_words(False, split)}" if sweep.record_rows == 0 else "0"
     records = f"    const int off_rec_mf = line * {line_size('row_record')} + {free_records};"
     if dense.record:
         records = f"    const int off_rec_dense = line * {line_size('row_record')};\n" + records
@@ -2344,10 +2345,11 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     const int line = dense_first.data[world];
     __builtin_assume(line >= 0);
     int off_dense = line * {line_size("world_impulses")};
-    int off_mf = off_dense + {M_D};
+    const int free_row0 = body_base.data[line];
+    int off_mf = off_dense + free_row0;
 {records}
     const size_t packed_base = (size_t)line * {line_size("packed_Z")};
-    const size_t free_base = packed_base + {M_D * int(max_row_dofs)};{offsets}
+    const size_t free_base = packed_base + (size_t)free_row0 * {int(max_row_dofs)};{offsets}
 
 {staging.declarations("    ")}{velocity_view}
 {dense_view}{free_view}{trace_reduction}

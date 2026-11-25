@@ -997,6 +997,8 @@ def _launch_parallel(tier, case, *, device):
         "row_incident": rows(case["J"] @ v_hat),
         "world_diag": rows(case["diag"]),
         "world_impulses": rows(case["impulses"]),
+        # The line's free rows (none) from its dense capacity.
+        "body_base": wp.array([_CAPACITY], dtype=wp.int32, device=device),
         # The world's stored rows (dense): every row on articulation 0, its coordinates from 0.
         "packed_Z": wp.array(Z, dtype=wp.float32, device=device),
         "world_row_type": rows(case["types"], wp.int32),

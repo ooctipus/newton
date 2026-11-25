@@ -31,7 +31,7 @@ import newton
 from newton._src.solvers.feather_pgs.factor.walk import TreeWalk, local_frames
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_scenes as scenes
-from newton.tests.feather_pgs_law_harness import packed_coordinates, walk_class_of, walked_worlds
+from newton.tests.feather_pgs_law_harness import free_rows, packed_coordinates, walk_class_of, walked_worlds
 from newton.tests.test_feather_pgs_factor import BOUND, ROUNDING, Capture, catalogue, random_tree, run_route
 from newton.tests.test_feather_pgs_response_diagonal import _build_mixed_response_model
 
@@ -492,7 +492,7 @@ def walked_frames(solver, joint_q: np.ndarray, capture) -> dict:
     free_du = {}
     if capture.mf_final is not None:
         Z_a, Z_b, lam, mf_counts, side_a, side_b, _dof_a, _dof_b = capture.mf_final
-        mf_incident = placement.row_incident.numpy()[:, placement.body_base :].astype(np.float64)
+        mf_incident = free_rows(placement, placement.row_incident.numpy()).astype(np.float64)
         for world, count in enumerate(mf_counts):
             line = int(capture.mf_first[world])
             for row in range(int(count)):

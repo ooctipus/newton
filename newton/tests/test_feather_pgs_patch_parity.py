@@ -78,14 +78,17 @@ def _ring_pool_dropped(solver):
             placement.row_parent.assign(parents)
             if placement.writes_records:
                 records = placement.row_record.numpy()
-                # The dense rows' records from record_first, the free rows' headers from body_base (record_layout).
-                first, base = placement.record_first, placement.body_base
-                for words, start in zip(
-                    record_views(records, placement.free_records), (first, max(first, base)), strict=True
-                ):
-                    cut_rows = normals[: words.shape[0], start : start + words.shape[1]]
-                    # The kind in the low half, no parent (0xFFFF) in the high half (row_metadata.record_kind).
-                    words[..., 3][cut_rows] = (words[..., 3][cut_rows] & 0xFFFF) | np.int32(-0x10000)
+                # Each line's dense rows' records from row 0 (where they stream), its free rows' headers from its
+                # body base (record_layout).
+                bases = placement.body_base.numpy()
+                dense, free = record_views(records, bases * placement.dense_record_words)
+                for line, base in enumerate(bases):
+                    for words, start in ((dense[line], 0), (free[line], int(base))):
+                        rows = min(words.shape[0], normals.shape[1] - start)
+                        cut_rows = normals[line, start : start + rows]
+                        kinds = words[:rows, 3]
+                        # The kind in the low half, no parent (0xFFFF) in the high half (row_metadata.record_kind).
+                        kinds[cut_rows] = (kinds[cut_rows] & 0xFFFF) | np.int32(-0x10000)
                 placement.row_record.assign(records)
         return launch(kernel, *args, **kwargs)
 

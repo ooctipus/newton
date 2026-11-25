@@ -162,7 +162,8 @@ def _prefix_warp_kernel(size: int, family: str, device_arch, mimics: int = 0) ->
         source, extra = f"({kind} << {int(UNIT_SHIFT)}) | (2 * (first_dof + d0) + (w0 < 0.0f ? 1 : 0))", ""
     # The row's seed: its unit source, the coordinate's side, in the units' own rows. The sink runs on an accepted slot
     # (below the capacity), and the unit sources are the capacity wide (Placement.hold_units).
-    sink = f"""{extra}            support.units.data[(size_t)prefix_line * {line_size("support.units")} + slot] = {source};"""
+    line = line_size("support.units")
+    sink = f"""{extra}            support.units.data[(size_t)prefix_line * {line} + slot] = {source};"""
     if family == "mimics":
         candidates = prefix_rows.mimics(mimics, "law.")
     else:
@@ -787,6 +788,7 @@ class RowLaws:
                     placement.row_groups,
                     placement.slot_counter,
                     mf_slot_counter,
+                    placement.body_base,
                     placement.contact_worlds,
                 ],
                 outputs=[

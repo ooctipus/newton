@@ -37,7 +37,7 @@ from .forest_plan import RowLaw
 from .friction_patches import frame_kept
 from .route_table import first_failed
 from .row_laws import LINK_ROWS
-from .row_metadata import record_layout, split_records
+from .row_metadata import record_layout, record_words, split_records
 from .row_records import DENSE_ROWS, ROW_RECORDS, RowSupport
 from .row_slots import ROW_SLOT_UNBOUNDED, RowGroups, RowOrder, row_groups
 from .warm_start import ContactCarry, prepare_world_impulses, row_lanes
@@ -483,9 +483,11 @@ class Placement:
         self.free_contact_rows = spec.capacities.free_contact_rows
         # The streamed rows' records, once the sweep's plan places them (allocate_row_records).
         self.row_record, self.writes_records = None, False
-        # The row store's line: the dense class's rows, then (with free rigid bodies) the free bodies' from
-        # ``body_base``.
-        self.body_base = self.dense_max_constraints
+        # The row store's line: the dense class's rows, then (with free rigid bodies) the free bodies' from the line's
+        # body base, by line (``body_base``): the row where its free rows start, which every free row's slot counts
+        # from (the dense capacity until the store follows the live rows).
+        lines = max(forest.world_count, 1)
+        self.body_base = wp.full(lines, self.dense_max_constraints, dtype=wp.int32, device=model.device)
         self.row_pitch = spec.capacities.row_pitch
         # The row store's line length: the rows from one line to the next (the outer stride of the store's arrays, which
         # the native bodies read from the arrays themselves, row_records.line_size), here the capacities' line.
@@ -942,8 +944,11 @@ class Placement:
         self.record_first = int(first)
         rows = self.row_pitch - self.record_first
         free_rows = self.mf_max_constraints if self.free_contact_rows else 0
-        self.writes_records = bool(rows > 0 and (self.record_first < self.body_base or free_rows > 0))
-        self.free_records, words = record_layout(self.record_first, self.body_base, self.row_pitch, self.split_records)
+        dense = self.dense_max_constraints
+        self.writes_records = bool(rows > 0 and (self.record_first < dense or free_rows > 0))
+        words = record_layout(self.record_first, dense, self.row_pitch, self.split_records)[1]
+        # A line's free rows' records follow its dense rows' where those stream: from word ``body_base * words``.
+        self.dense_record_words = record_words(False, self.split_records) if self.record_first == 0 else 0
         self.arrays.allocate(ROW_RECORDS, world=self.forest.world_count, record=max(words, 1))
 
     def hold_acts(self, solver) -> None:
@@ -1227,7 +1232,7 @@ class Placement:
         writes the dense rows' diagonals. The same launch decides which worlds keep their contacts' rows this step
         (``count``, ``generation``, ``stream`` and ``built_frame`` name the step's contact frame and the last build's,
         :func:`.friction_patches.frame_kept`)."""
-        cleared = int(self.body_base) if self.clears_diagonals else 0
+        cleared = int(self.dense_max_constraints) if self.clears_diagonals else 0
         wp.launch(
             _bound_topology,
             dim=self.forest.world_count * max(cleared, 1),

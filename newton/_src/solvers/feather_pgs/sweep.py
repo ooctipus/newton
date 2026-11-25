@@ -2271,7 +2271,8 @@ def friction_metric(row: str, first: str = "", *, rows: int = 4) -> str:
     triple holds four rows and a contact at least three (``rows``), so two never share a slot."""
     at = f"({first} + ({row}))" if first else f"({row})"
     return (
-        f"(friction_metric.data + (static_cast<size_t>(line) * ({line_size('friction_metric')} / {FRICTION_METRIC_FLOATS}) + {at} / {rows})"
+        f"(friction_metric.data + (static_cast<size_t>(line) * ({line_size('friction_metric')} / {FRICTION_METRIC_FLOATS})"
+        f" + {at} / {rows})"
         f" * {FRICTION_METRIC_FLOATS})"
     )
 
@@ -2917,8 +2918,8 @@ def dense_tier_world(
     so one without free-body rows and with the tier's count of dense rows.
 
     Declares ``m_dense``, ``rows`` (the rows the tier holds, ``m_dense``), ``dof_map_base``, ``off_dense`` (the world's
-    line of the row store, at the store's line length), and the world's first packed row entry ``packed_base`` (the line's
-    rows of ``support`` entries: :mod:`.packed_rows`).
+    line of the row store, at the store's line length), and the world's first packed row entry ``packed_base`` (the
+    line's rows of ``support`` entries: :mod:`.packed_rows`).
     """
     base = f"const size_t packed_base = (size_t)line * {line_size('packed_Z')};"
     return f"""{pad}int m_dense = world_constraint_count.data[world];

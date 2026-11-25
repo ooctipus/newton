@@ -225,7 +225,7 @@ class TestFeatherPGSContactControls(unittest.TestCase):
             dim=1,
             inputs=[
                 row_lines(device),
-                0,
+                wp.zeros(1, dtype=wp.int32, device=device),
                 field_group.upload(
                     ContactRoutes,
                     device,

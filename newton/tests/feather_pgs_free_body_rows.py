@@ -19,7 +19,7 @@ from newton._src.solvers.feather_pgs import sweep_routes
 from newton._src.solvers.feather_pgs.factor.walk import unpack_walk_records
 from newton._src.solvers.feather_pgs.row_metadata import HEADER_WORDS, record_layout
 from newton._src.solvers.feather_pgs.sweep import sweep_kernel
-from newton.tests.feather_pgs_law_harness import chain_walk, free_body_Z, one_world
+from newton.tests.feather_pgs_law_harness import chain_walk, free_body_Z, free_rows, one_world
 
 
 def free_body_jacobians(solver, Z_a=None, Z_b=None):
@@ -32,7 +32,7 @@ def free_body_jacobians(solver, Z_a=None, Z_b=None):
     Z = free_body_Z(solver)
     Z_a = Z[..., :6] if Z_a is None else np.asarray(Z_a)
     Z_b = Z[..., 6:] if Z_b is None else np.asarray(Z_b)
-    sides = solver.placement.row_sides.numpy()[:, solver.placement.body_base :]
+    sides = free_rows(solver.placement, solver.placement.row_sides.numpy())
     records = solver.factor.walk_view().data.numpy()
     data = unpack_walk_records(records, records.shape[0]).astype(np.float64)
     starts = solver.forest.articulation_dof_start.numpy()
@@ -102,6 +102,7 @@ def sweep_free_body_rows(
         "mf_contact_rows_end": wp.array((rows,), dtype=wp.int32, device=device),
         "row_record": wp.array(records, device=device),
         "world_impulses": per_row(impulses),
+        "body_base": wp.array((dense,), dtype=wp.int32, device=device),
         "packed_Z": wp.array(packed, device=device),
         "world_row_mu": per_row(mu),
         "world_row_w": per_row(np.ones(rows) if weights is None else weights),

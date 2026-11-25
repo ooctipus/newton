@@ -952,6 +952,7 @@ class Sweep:
             "world_row_w": placement.row_w,
             "world_row_eps": placement.row_eps,
             "world_impulses": placement.impulses,
+            "body_base": placement.body_base,
             "response_dofs": forest.articulation_response_dof_count,
             "articulation_world_dof_offset": forest.articulation_world_dof_offset,
             "packed_dense": int(placement.packed_dense),

@@ -44,7 +44,7 @@ def prepare_world_impulses(
     world_constraint_count: wp.array[int],
     max_constraints: int,
     free_count: wp.array[int],
-    free_base: int,
+    free_base: wp.array[int],
     free_max: int,
     warmstart: int,
     lanes: int,
@@ -52,8 +52,8 @@ def prepare_world_impulses(
     world_impulses: wp.array2d[float],
 ):
     """Cold-initialize each world's rows before identity-gathering contact impulses, ``lanes`` lanes a world striding
-    over its rows: the dense rows, then the free bodies' rows (``free_count`` of them from ``free_base``, at most
-    ``free_max``: zero where no free body keeps rows).
+    over its rows: the dense rows, then the free bodies' rows (``free_count`` of them from the line's body base
+    ``free_base``, at most ``free_max``: zero where no free body keeps rows).
 
     No current non-contact row family has a cross-step identity contract:
     limits are activation-allocated, while mimic and link rows can be enabled
@@ -77,7 +77,7 @@ def prepare_world_impulses(
     for i in range(lane, clear_count, lanes):
         world_impulses[line, i] = 0.0
     for i in range(lane, free_clear, lanes):
-        world_impulses[line, free_base + i] = 0.0
+        world_impulses[line, free_base[line] + i] = 0.0
 
 
 ContactCarry = field_group.struct(

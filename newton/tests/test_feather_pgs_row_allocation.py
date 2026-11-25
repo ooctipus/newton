@@ -190,8 +190,8 @@ def _step_tripods(device, *, steps=4, sorted_contacts=False, substeps=1, **optio
         record["immovable"] = np.logical_or.reduce(
             [(side < 0) | (shape_body[np.maximum(side, 0)] < 0) for side in sides]
         )
-        # Each family's contact rows in the world's line: the free bodies' from the store's body base.
-        base = solver.placement.body_base
+        # Each family's contact rows in the world's line: the free bodies' from the line's body base.
+        base = solver.placement.body_base.numpy()[solver.placement.dense_first.numpy()]
         record.update(
             counts=(
                 solver.placement.constraint_count.numpy().copy(),

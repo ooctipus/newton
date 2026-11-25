@@ -15,7 +15,7 @@ import warp as wp
 import newton
 from newton._src.solvers.feather_pgs.friction_patches import _FrictionPatchState, _pose_motion, patch_routes
 from newton._src.solvers.feather_pgs.row_laws import ROW_CONTACT, ROW_FRICTION
-from newton.tests.feather_pgs_law_harness import line_rows, row_lines, unpacked_rows
+from newton.tests.feather_pgs_law_harness import free_rows, line_rows, row_lines, unpacked_rows
 from newton.tests.feather_pgs_patch_reference import store_frame
 from newton.tests.test_feather_pgs_friction_anchors import _SQUEEZE_SOLVER, _build_v_jaws
 
@@ -1280,7 +1280,7 @@ class TestFeatherPGSFrictionPatches(unittest.TestCase):
             rows = np.concatenate(
                 [
                     solver.placement.row_type.numpy()[0, : solver.placement.constraint_count.numpy()[0]],
-                    solver.placement.row_type.numpy()[:, solver.placement.body_base :][
+                    free_rows(solver.placement, solver.placement.row_type.numpy())[
                         0, : solver.placement.mf_constraint_count.numpy()[0]
                     ],
                 ]

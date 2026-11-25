@@ -15,7 +15,7 @@ from newton._src.solvers.feather_pgs.audit import AUDIT_SLOTS
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_scenes as scenes
 from newton.tests import test_feather_pgs_conformance as conformance
-from newton.tests.feather_pgs_law_harness import line_rows, walk_inverse
+from newton.tests.feather_pgs_law_harness import free_rows, line_rows, walk_inverse
 
 H = 1.0 / 240.0
 G0 = 9.81
@@ -100,11 +100,12 @@ def _store_sums(solver):
     total, biased = 0.0, 0.0
     # Each class's rows from its first row in the world's line.
     impulses, rhs = solver.placement.impulses.numpy(), solver.placement.rhs.numpy()
-    for base, velocity, counts in (
-        (0, audit.velocity, solver.placement.constraint_count),
-        (solver.placement.body_base, audit.mf_velocity, solver.placement.mf_constraint_count),
+    placement = solver.placement
+    for lam, b, velocity, counts in (
+        (impulses, rhs, audit.velocity, placement.constraint_count),
+        (free_rows(placement, impulses), free_rows(placement, rhs), audit.mf_velocity, placement.mf_constraint_count),
     ):
-        lam, jv, b = impulses[:, base:], velocity.numpy(), rhs[:, base:]
+        jv = velocity.numpy()
         for world, count in enumerate(counts.numpy()):
             total += float(np.sum(lam[world, :count].astype(np.float64) * (jv[world, :count] + b[world, :count])))
             biased += float(np.sum(lam[world, :count].astype(np.float64) * b[world, :count]))

@@ -10,6 +10,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs.row_laws import ROW_CONTACT, ROW_FRICTION
+from newton.tests.feather_pgs_law_harness import free_rows
 from newton.tests.test_feather_pgs_warmstart import gather_rows
 from newton.tests.unittest_utils import add_function_test, get_selected_cuda_test_devices
 
@@ -37,8 +38,8 @@ def _stack(device, restitution=0.0, drop=False):
 
 
 def _normal_impulse_total(solver):
-    imp = solver.placement.impulses.numpy()[:, solver.placement.body_base :][0]
-    rt = solver.placement.row_type.numpy()[:, solver.placement.body_base :][0]
+    imp = free_rows(solver.placement, solver.placement.impulses.numpy())[0]
+    rt = free_rows(solver.placement, solver.placement.row_type.numpy())[0]
     return float(imp[rt == ROW_CONTACT].sum())
 
 

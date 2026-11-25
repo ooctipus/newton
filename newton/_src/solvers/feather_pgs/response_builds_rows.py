@@ -33,15 +33,16 @@ from .row_records import DenseRows, line_size
 
 @wp.struct
 class RowRecords:
-    """Where a line's rows' records sit (:func:`.row_metadata.record_layout`: ``record`` from row ``first``, the free
-    rows' headers from row ``base`` at word ``free``) and each articulation's first world coordinate and coordinates
-    (``offset``, ``dofs``), or where the rows take support classes (``classed``) each row's word (``classes``,
-    :func:`.packed_rows.row_classes`), which its record holds in place of its sides' widths."""
+    """Where a line's rows' records sit (:func:`.row_metadata.record_layout`: ``record``, the dense rows' from row 0
+    where ``dense``, then the free rows' headers from the line's body base ``base`` where ``free``) and each
+    articulation's first world coordinate and coordinates (``offset``, ``dofs``), or where the rows take support
+    classes (``classed``) each row's word (``classes``, :func:`.packed_rows.row_classes`), which its record holds in
+    place of its sides' widths."""
 
     record: wp.array2d[wp.int32]
-    first: int
-    base: int
+    dense: int
     free: int
+    base: wp.array[int]
     offset: wp.array[int]
     dofs: wp.array[int]
     classed: int
@@ -120,21 +121,24 @@ def record_writers(split: bool = False) -> tuple[wp.Function, wp.Function]:
     store = _record_store(split)
     header, dense = record_words(True, split), record_words(False, split)
 
-    def record_at(records: RowRecords, slot: int) -> int:
-        """The word of row ``slot``'s record in its line's records (-1 for a row without one): a dense row's of
-        :func:`.row_metadata.record_words` words, a free row's header from ``free``."""
-        if slot < records.first:
+    def record_at(records: RowRecords, line: int, slot: int) -> int:
+        """The word of row ``slot``'s record in line ``line``'s records (-1 for a row without one): a dense row's of
+        :func:`.row_metadata.record_words` words, a free row's header after the dense rows' records."""
+        base = records.base[line]
+        if slot >= base:
+            if records.free == 0:
+                return -1
+            return records.dense * base * wp.static(dense) + (slot - base) * wp.static(header)
+        if records.dense == 0:
             return -1
-        if slot >= records.base:
-            return records.free + (slot - records.base) * wp.static(header)
-        return (slot - records.first) * wp.static(dense)
+        return slot * wp.static(dense)
 
     record_at = wp.func(_name(record_at, split))
 
     def write_row_record(records: RowRecords, rows: DenseRows, incident: float, line: int, slot: int):
         """Store row ``slot``'s record (:func:`.row_metadata.pack_row_record`) from the row as its writers left it (its
         rhs plus ``incident``). A free row's is its header, with its diagonal's inverse and its parent from ``base``."""
-        at = record_at(records, slot)
+        at = record_at(records, line, slot)
         if at < 0:
             return
         diagonal = rows.diag[line, slot]
@@ -149,14 +153,14 @@ def record_writers(split: bool = False) -> tuple[wp.Function, wp.Function]:
         mu = float(0.0)
         key = float(0.0)
         root = float(0.0)
-        if slot >= records.base:
+        if slot >= records.base[line]:
             words = wp.static(header)
             inverse = float(0.0)
             if diagonal > 0.0:
                 inverse = 1.0 / diagonal
             diagonal = inverse
             if parent >= 0:
-                parent = parent - records.base
+                parent = parent - records.base[line]
         else:
             if records.classed != 0:
                 n_a = records.classes[line, slot]
@@ -177,12 +181,13 @@ def record_writers(split: bool = False) -> tuple[wp.Function, wp.Function]:
     def write_world_records(
         records: RowRecords, rows: DenseRows, incident: wp.array2d[float], line: int, lane: int, lanes: int, count: int
     ):
-        """Store the records of a world's ``count`` dense rows from ``records.first``, ``lanes`` lanes striding over
+        """Store the records of a world's ``count`` dense rows where they hold records, ``lanes`` lanes striding over
         them (:func:`write_row_record`), once its writer and the closure left them final: the general placement's
         writer, after the part that writes the world's last rows. A world none of whose rows a sweep reads (no row can
         act, or a tier walks them) stores none."""
-        for slot in range(records.first + lane, wp.min(count, records.base), lanes):
-            write_row_record(records, rows, incident[line, slot], line, slot)
+        if records.dense != 0:
+            for slot in range(lane, wp.min(count, records.base[line]), lanes):
+                write_row_record(records, rows, incident[line, slot], line, slot)
 
     return write_row_record, wp.func(_name(write_world_records, split))
 
@@ -191,9 +196,9 @@ def bind_row_records(placement) -> RowRecords:
     """The placement's records (:meth:`.placement.Placement.allocate_row_records`) as their pass takes them."""
     records = RowRecords()
     records.record = placement.row_record
-    records.first = int(placement.record_first) if placement.writes_records else int(placement.row_pitch)
-    records.base = int(placement.body_base)
-    records.free = int(placement.free_records)
+    records.dense = int(placement.writes_records and placement.record_first == 0)
+    records.free = int(placement.writes_records)
+    records.base = placement.body_base
     records.offset = placement.forest.articulation_world_dof_offset
     records.dofs = placement.forest.articulation_response_dof_count
     records.classed = int(placement.classed)

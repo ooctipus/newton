@@ -68,6 +68,7 @@ from newton.tests import test_feather_pgs_conformance as conformance
 from newton.tests.feather_pgs_law_harness import (
     dense_factor32,
     free_body_Z,
+    free_rows,
     packed_coordinates,
     unpacked_rows,
     walk_inverse,
@@ -716,13 +717,13 @@ class Capture:
         self.mf_final = None
         if self.mf is not None:
             # Each row's sides (its responding bodies' articulations) and their first world coordinates.
-            sides = placement.row_sides.numpy()[:, placement.body_base :].copy()
+            sides = free_rows(placement, placement.row_sides.numpy())
             offsets = solver.forest.articulation_world_dof_offset.numpy()
             dofs = np.where(sides >= 0, offsets[np.maximum(sides, 0)], -1)
             self.mf_final = (
                 free_body_Z(solver)[..., :6].astype(np.float64),
                 free_body_Z(solver)[..., 6:].astype(np.float64),
-                placement.impulses.numpy()[:, placement.body_base :].astype(np.float64),
+                free_rows(placement, placement.impulses.numpy()).astype(np.float64),
                 placement.mf_constraint_count.numpy().copy(),
                 sides[..., 0],
                 sides[..., 1],

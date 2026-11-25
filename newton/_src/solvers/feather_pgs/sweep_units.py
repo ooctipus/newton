@@ -209,17 +209,20 @@ def stage_slots(weighted: bool) -> wp.Kernel:
         mf_line: int,
         color_slot: wp.array2d[wp.int32],
         row_record: wp.array2d[wp.int32],
-        free_records: int,
+        dense_record_words: int,
         packed_Z: wp.array3d[float],
         mf_row_mu: wp.array2d[float],
         mf_row_w: wp.array2d[float],
-        body_base: int,
+        body_bases: wp.array[int],
         layout_rows: int,
         slot_data: wp.array[float],
         slot_words: wp.array[wp.int32],
     ):
         # The unit at place p of its world: its color slot at the world's first entry plus p; field f of the world's
-        # block at data (words_at for the words) + f * need + p.
+        # block at data (words_at for the words) + f * need + p. The line's free rows from its body base, their records
+        # after its dense rows'.
+        body_base = body_bases[mf_line]
+        free_records = body_base * dense_record_words
         row = color_slot[first + p, 0]
         rows = color_slot[first + p, 1] & 7
         for r in range(4):
@@ -287,11 +290,11 @@ def stage_slots(weighted: bool) -> wp.Kernel:
         unit_count: wp.array[wp.int32],
         color_slot: wp.array2d[wp.int32],
         row_record: wp.array2d[wp.int32],
-        free_records: int,
+        dense_record_words: int,
         packed_Z: wp.array3d[float],
         mf_row_mu: wp.array2d[float],
         mf_row_w: wp.array2d[float],
-        body_base: int,
+        body_base: wp.array[int],
         layout_rows: int,
         fields: int,
         words: int,
@@ -308,7 +311,8 @@ def stage_slots(weighted: bool) -> wp.Kernel:
         A unit stages only what its rows hold: its pair's friction coefficient when it has a friction pair, its spin row's
         when it has one, and its normal row's weight from ``mf_row_w`` only where the laws are weighted; otherwise the
         solver binds a one-element stand-in for the weights, and the row's weight is 1.
-        The coefficients, weights and packed rows are the line's, the free bodies' row ``i`` at ``body_base + i``; a
+        The coefficients, weights and packed rows are the line's, the free bodies' row ``i`` at its body base plus
+        ``i``; a
         row's twelve entries in the sides layout (:func:`.sweep_routes.free_body_rows`): a capable world holds two
         free bodies, so its line holds twelve (:func:`capable_worlds`, asserted at the plan by :class:`ColoredUnits`).
         """
@@ -331,7 +335,7 @@ def stage_slots(weighted: bool) -> wp.Kernel:
                 mf_line,
                 color_slot,
                 row_record,
-                free_records,
+                dense_record_words,
                 packed_Z,
                 mf_row_mu,
                 mf_row_w,
@@ -441,8 +445,9 @@ SHARED_DECLARATIONS
     const int end = min(mf_contact_rows_end.data[world], m_mf);
     const int mf_line = mf_first.data[world];
     __builtin_assume(mf_line >= 0);
-    // The free bodies' records (row_metadata.pack_row_record), from the line's word free_records.
-    const int off_meta = mf_line * (row_record.strides[0] / (int)sizeof(*row_record.data)) + free_records;
+    // The free bodies' records (row_metadata.pack_row_record), after the line's dense rows' (from its body base).
+    const int off_meta = mf_line * (row_record.strides[0] / (int)sizeof(*row_record.data))
+        + body_base.data[mf_line] * dense_record_words;
     // The world's slot (a candidate's: the claim stage's) places its units and its colors' offsets in the pool, from
     // the slot's first entry (place_slots, from its counted units); a world with fewer contact rows than the rule's
     // units keeps the one-warp sweep: no units, the general bucket.
@@ -646,7 +651,8 @@ def build_units_kernel(
     One block of :data:`BUILD_WARPS` warps per world of the claims' candidate bucket (a world with a slot,
     :func:`.sweep_levels.claim_worlds`): launch tiled over the bucket's capacity, the slots, with ``block_dim=32 *
     BUILD_WARPS``. Inputs: ``mf_constraint_count``, ``mf_contact_rows_end`` and the free bodies' records
-    (``row_record`` from the line's word ``free_records``, :func:`.row_metadata.record_layout`); outputs:
+    (``row_record`` after the line's dense rows' records, ``dense_record_words`` a row to its body base ``body_base``,
+    :func:`.row_metadata.record_layout`); outputs:
     :data:`WORLD_FIELDS` (``world_slot`` is read) and its :data:`UNIT_FIELDS` in the pool, and each world appended to the
     claims' colored bucket or their general one by ``rule`` (:func:`~newton._src.core.execution.append`'s
     statements; the general one is the sweep's cost class of the world, ``world_cost``, from ``general_bucket`` on,
@@ -687,7 +693,8 @@ def build_units_kernel(
         ("mf_first", wp.array[int]),
         ("mf_contact_rows_end", wp.array[int]),
         ("row_record", wp.array2d[int]),
-        ("free_records", int),
+        ("dense_record_words", int),
+        ("body_base", wp.array[int]),
         *WORLD_FIELDS,
         ("slot_first", wp.array[wp.int32]),
         *UNIT_FIELDS,
@@ -728,7 +735,8 @@ def count_units(
     mf_first: wp.array[int],
     mf_contact_rows_end: wp.array[int],
     row_record: wp.array2d[int],
-    free_records: int,
+    dense_record_words: int,
+    body_base: wp.array[int],
     mf_rows: int,
     min_units: int,
     chunks: int,
@@ -752,8 +760,10 @@ def count_units(
         return
     head = int(0)
     row = first + t
+    line = mf_first[world]
+    free_records = body_base[line] * dense_record_words
     while row < end:
-        if (row_record[mf_first[world], free_records + row * _HEADER_WORDS + 3] & 0xFFFF) == _ROW_CONTACT:
+        if (row_record[line, free_records + row * _HEADER_WORDS + 3] & 0xFFFF) == _ROW_CONTACT:
             head += 1
         row += chunks * wp.block_dim()
     total = wp.tile_sum(wp.tile(head))
@@ -883,11 +893,11 @@ class ColoredUnits:
         mf_first,
         mf_contact_rows_end,
         row_record,
-        free_records: int,
+        dense_record_words: int,
         packed_Z,
         mf_row_mu,
         mf_row_w,
-        body_base: int,
+        body_base,
         world_acts,
         pass_words,
     ) -> None:
@@ -914,7 +924,8 @@ class ColoredUnits:
                 mf_first,
                 mf_contact_rows_end,
                 row_record,
-                int(free_records),
+                int(dense_record_words),
+                body_base,
                 self.mf_rows,
                 int(self.rule.min_units),
                 self.count_chunks,
@@ -943,7 +954,8 @@ class ColoredUnits:
                 mf_first,
                 mf_contact_rows_end,
                 row_record,
-                int(free_records),
+                int(dense_record_words),
+                body_base,
             ],
             outputs=[
                 *(units[field.name] for field in WORLD_FIELDS),
@@ -977,11 +989,11 @@ class ColoredUnits:
                 units["unit_count"],
                 units["color_slot"],
                 row_record,
-                int(free_records),
+                int(dense_record_words),
                 packed_Z,
                 mf_row_mu,
                 mf_row_w,
-                int(body_base),
+                body_base,
                 self.layout.rows,
                 self.layout.fields,
                 self.layout.words,

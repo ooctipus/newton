@@ -182,7 +182,7 @@ class TestFeatherPGSIdentityWarmstartKernel(unittest.TestCase):
                 wp.array([4], dtype=wp.int32, device="cpu"),
                 4,
                 wp.zeros(1, dtype=wp.int32, device="cpu"),
-                4,
+                wp.full(1, 4, dtype=wp.int32, device="cpu"),
                 0,
                 1,
                 2,

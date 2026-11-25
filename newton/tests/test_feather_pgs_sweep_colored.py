@@ -33,7 +33,7 @@ import warp as wp
 from newton._src.core.memory import Place
 from newton._src.solvers.feather_pgs import sweep_plan, sweep_routes, sweep_units
 from newton._src.solvers.feather_pgs.row_laws import ROW_CONTACT, ROW_FRICTION, ROW_TORSION
-from newton._src.solvers.feather_pgs.row_metadata import HEADER_WORDS, record_layout, record_views
+from newton._src.solvers.feather_pgs.row_metadata import HEADER_WORDS, RECORD_WORDS, record_layout, record_views
 from newton._src.solvers.feather_pgs.row_records import line_size
 from newton.solvers import SolverFeatherPGS
 from newton.tests import feather_pgs_scenes as scenes
@@ -227,7 +227,7 @@ class TestStageSlots(unittest.TestCase):
                 wp.array(rng.standard_normal((self.WORLDS, self.ROWS, 12)), dtype=float, device=device),
                 wp.array(mu, dtype=float, device=device),
                 weights,
-                0,
+                wp.zeros(self.WORLDS, dtype=wp.int32, device=device),
                 layout.rows,
                 layout.fields,
                 layout.words,
@@ -301,7 +301,9 @@ class TestColoredSweep(unittest.TestCase):
         host = {name: array.numpy() for name, array in solver.sweep.colored_units.units.items()}
         # The free bodies' records (row_metadata.pack_row_header).
         placement = solver.placement
-        metas = record_views(placement.row_record.numpy(), placement.free_records)[1][:, : placement.mf_max_constraints]
+        free_first = placement.body_base.numpy() * placement.dense_record_words
+        free = record_views(placement.row_record.numpy(), free_first)[1]
+        metas = np.stack([line[: placement.mf_max_constraints] for line in free])
         return solver, host, metas
 
     def test_units_follow_the_host_rules(self):
@@ -462,10 +464,12 @@ class TestColoredSweep(unittest.TestCase):
         placement, sweep = solvers[-1].placement, solvers[-1].sweep
         self.assertEqual(placement.record_first, 0, "the streamed sweep's dense records lead the line")
         self.assertEqual(sweep.colored_sweep.places.metadata, Place.SHARED)
-        free, words = record_layout(placement.record_first, placement.body_base, placement.row_pitch)
-        # The sweep reads each line's records at the store's line, the free rows' after the dense rows'.
+        words = record_layout(placement.record_first, placement.dense_max_constraints, placement.row_pitch)[1]
+        # The sweep reads each line's records at the store's line, the free rows' after the dense rows' (from the
+        # line's body base).
         self.assertEqual(placement.row_record.shape[1], words)
         source = sweep_routes.mf_gs_source(sweep.colored_sweep)[0]
+        free = f"free_row0 * {RECORD_WORDS}"
         self.assertIn(f"const int off_rec_mf = line * {line_size('row_record')} + {free};", source)
         for name in ("body_q", "body_qd"):
             np.testing.assert_array_equal(getattr(runs[0], name), getattr(runs[1], name), err_msg=name)

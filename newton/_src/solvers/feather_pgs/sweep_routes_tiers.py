@@ -97,7 +97,8 @@ def _stored_row(dofs: int) -> str:
     """Read the lane's row as the one writer stored it (:mod:`.walk_rows`: the packed sink at its world coordinates, the
     slips' frame applied) and its incident velocity ``J v_hat`` (``row_incident``)."""
     return (
-        f"        const float* Z_row = &packed_Z.data[(size_t)line * {line_size('packed_Z')} + (size_t)i * packed_Z.shape[2]];\n"
+        f"        const float* Z_row = &packed_Z.data[(size_t)line * {line_size('packed_Z')}\n"
+        "            + (size_t)i * packed_Z.shape[2]];\n"
         "        #pragma unroll\n"
         f"        for (int q = 0; q < {dofs}; ++q) Zi[q * ZS] = Z_row[q];\n"
         "        incident = row_incident.data[off_dense + i];"

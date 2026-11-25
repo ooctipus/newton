@@ -2966,7 +2966,14 @@ class Regions:
         wp.launch(
             level_depths,
             dim=self.acting_threads,
-            inputs=[self.relist, self.world_regions, self.world_free_start, self.world_free, self.reg_body, self.reg_kind],
+            inputs=[
+                self.relist,
+                self.world_regions,
+                self.world_free_start,
+                self.world_free,
+                self.reg_body,
+                self.reg_kind,
+            ],
             outputs=[self.body_level],
             device=device,
             block_dim=_ACTING_BLOCK,
@@ -3125,7 +3132,7 @@ class Regions:
                 self.body_regions,
                 self.world_regions,
                 int(placement.line_rows),
-                int(placement.body_base),
+                placement.body_base,
                 coordinates,
                 self.body_first,
                 self.body_basis,
@@ -3161,7 +3168,7 @@ def audit_region(
     g: int,
     world: int,
     pitch: int,
-    base: int,
+    base: wp.array[int],
     coordinates: wp.array2d[float],
     body_first: wp.array[int],
     body_basis: wp.array2d[wp.spatial_vector],
@@ -3218,12 +3225,12 @@ def audit_region(
         a = candidate_row(record)
         line = cand_row[i] / pitch
         row = cand_row[i] - line * pitch
-        velocity[world, row - base] = wp.dot(a, sn)
+        velocity[world, row - base[line]] = wp.dot(a, sn)
         diag[line, row] = wp.dot(a, Wnn * a)
     friction = reg_row[g]
     if friction >= 0:
         line = friction / pitch
-        row = friction - line * pitch - base
+        row = friction - line * pitch - base[line]
         velocity[world, row] = sf[0]
         velocity[world, row + 1] = sf[1]
         if (kind & FRICTION_ROWS) == 3:
@@ -3238,7 +3245,7 @@ def audit_regions(
     body_regions: wp.array[wp.vec2i],
     world_regions: wp.array[wp.vec2i],
     pitch: int,
-    base: int,
+    base: wp.array[int],
     coordinates: wp.array2d[float],
     body_first: wp.array[int],
     body_basis: wp.array2d[wp.spatial_vector],

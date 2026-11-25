@@ -1328,6 +1328,7 @@ def reserve_world_rows_kernel(grouped: bool, warps: int = 1):
         groups: RowGroups,
         world_slot_counter: wp.array[int],
         mf_slot_counter: wp.array[int],
+        body_base: wp.array[int],
         contact_worlds: wp.array[int],
         # outputs
         contact_worlds_listed: wp.array[int],
@@ -1472,7 +1473,7 @@ def reserve_world_rows_kernel(grouped: bool, warps: int = 1):
                     data.slot[c] = -1
                     data.path[c] = -1
                 else:
-                    data.slot[c] = slot + max_constraints
+                    data.slot[c] = slot + body_base[data.first[world]]
             else:
                 slot = world_slot_counter[world] + offset
                 if slot + n > max_constraints:

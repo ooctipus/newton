@@ -98,12 +98,17 @@ def record_layout(first: int, base: int, pitch: int, split: bool = False) -> tup
     return dense_words, dense_words + free * record_words(True, split)
 
 
-def record_views(records, free_first: int, split: bool = False):
-    """A host array of lines' records (``[lines, words]``) as the dense rows' (``[lines, rows, words]``) and the free
-    rows' from the free rows' first word ``free_first`` (:func:`record_layout`; :func:`record_words` each)."""
-    lines = records.shape[0]
-    dense = records[:, :free_first].reshape(lines, -1, record_words(False, split))
-    free = records[:, free_first:].reshape(lines, -1, record_words(True, split))
+def record_views(records, free_first, split: bool = False) -> tuple[list, list]:
+    """A host array of lines' records (``[lines, words]``) as each line's dense rows' (``[rows, words]``) and free
+    rows' records, the free rows' from the line's first free word ``free_first[line]`` (its body base times the dense
+    rows' words where those stream: :func:`record_layout`; :func:`record_words` each). Views of ``records``."""
+    dense_words, free_words = record_words(False, split), record_words(True, split)
+    dense, free = [], []
+    for line in range(records.shape[0]):
+        first = int(free_first[line])
+        tail = records[line, first:]
+        dense.append(records[line, :first].reshape(-1, dense_words))
+        free.append(tail[: tail.size // free_words * free_words].reshape(-1, free_words))
     return dense, free
 
 

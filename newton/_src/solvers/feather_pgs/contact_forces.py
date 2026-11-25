@@ -17,7 +17,7 @@ wp.set_module_options({"enable_backward": False})
 @wp.func
 def contact_linear_force(
     dense_first: wp.array[int],
-    body_base: int,
+    body_base: wp.array[int],
     routes: ContactRoutes,
     c: int,
     world_impulses: wp.array2d[wp.float32],
@@ -54,7 +54,7 @@ def contact_linear_force(
         # The end of the contact's class in the line.
         end = world_constraint_count[world]
         if path == 1:
-            end = body_base + mf_constraint_count[world]
+            end = body_base[line] + mf_constraint_count[world]
         if (
             enable_friction != 0
             and slot + 2 < end
@@ -78,7 +78,7 @@ def contact_linear_force(
 @wp.kernel
 def compute_contact_linear_force_from_impulses(
     dense_first: wp.array[int],
-    body_base: int,
+    body_base: wp.array[int],
     routes: ContactRoutes,
     world_impulses: wp.array2d[wp.float32],
     world_constraint_count: wp.array[wp.int32],
