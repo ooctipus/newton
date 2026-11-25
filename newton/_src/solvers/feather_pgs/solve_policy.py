@@ -469,6 +469,8 @@ class SolveReadoutRecord:
     def __init__(self, policy: SolvePolicy):
         self.policy = policy
         self._slots: dict[str, _ReadoutSlot] = {}
+        # A kernel that shares another's slot (a mapping's launches at its dense heads: one sweep), by key.
+        self._shared: dict[str, str] = {}
         self._skipped: wp.array | None = None
 
     def register(
@@ -480,6 +482,7 @@ class SolveReadoutRecord:
         world_count: int,
         budget: int,
         device,
+        shares=None,
     ) -> None:
         """Allocate the counters of a readout kernel; kernels built without a readout are ignored.
 
@@ -491,8 +494,13 @@ class SolveReadoutRecord:
             world_count: Number of worlds the kernel can solve.
             budget: Largest sweep budget a launch of the kernel passes.
             device: Device of the counters.
+            shares: A registered kernel whose slot this one counts into: the same sweep, its worlds split between
+                launches by where their rows are staged (:meth:`.sweep_plan.Sweep._dense_heads`).
         """
-        if kernel is None or not readout or kernel.key in self._slots:
+        if kernel is None or not readout or kernel.key in self._slots or kernel.key in self._shared:
+            return
+        if shares is not None and shares.key in self._slots:
+            self._shared[kernel.key] = shares.key
             return
         rows = max(int(budget), 1) + 1
         trace = readout == "trace"
@@ -540,13 +548,14 @@ class SolveReadoutRecord:
     def operands(self, kernel) -> list:
         """Return the readout operand to append to a launch of ``kernel``, or nothing."""
         key = getattr(kernel, "key", None) if kernel is not None else None
-        slot = self._slots.get(key)
+        slot = self._slots.get(self._shared.get(key, key))
         return [] if slot is None else [slot.operand]
 
     @property
     def kernels(self) -> dict[str, str]:
-        """``{kernel key: route label}`` of the registered readout kernels."""
-        return {key: slot.label for key, slot in self._slots.items()}
+        """``{kernel key: route label}`` of the registered readout kernels, those sharing a slot included."""
+        shared = {key: self._slots[slot].label for key, slot in self._shared.items()}
+        return {**{key: slot.label for key, slot in self._slots.items()}, **shared}
 
     @property
     def counts_skipped(self) -> bool:

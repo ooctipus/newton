@@ -129,6 +129,12 @@ class WorldRows:
     (:attr:`.sweep_routes.RowPlaces.free_slots`); ``0``: every row's at its place."""
     wide: int = 0
     """The wide head's count (:attr:`.sweep_routes.RowPlaces.wide_slots`), which a second launch stages; ``0``: none."""
+    head: int = 0
+    """The dense rows the stage holds (:attr:`.sweep_routes.RowPlaces.dense_rows`): their staged metadata at its word
+    stride and their impulses; the launch sweeps the worlds whose live rows it holds and that pass ``floor``. ``0``: the
+    capacity."""
+    floor: int = 0
+    """The dense rows of the worlds an earlier launch's head holds (:attr:`.sweep_routes.RowPlaces.dense_floor`)."""
 
     VISITED: ClassVar[str] = "i"
     """The row a row loop visits, whose record the loop holds in registers."""
@@ -143,6 +149,15 @@ class WorldRows:
             raise ValueError("the free rows' staged impulses spill past their slots, no other class's")
         if self.wide and self.wide <= self.slots:
             raise ValueError("a wide head holds more slots than the stage's")
+        if (self.head or self.floor) and self.free:
+            raise ValueError("the dense rows keep heads of their own; the free rows' spill past their slots")
+        if self.head and not self.floor < self.head <= self.capacity:
+            raise ValueError(f"a dense head of {self.head} rows passes {self.floor} and holds at most the capacity")
+
+    @property
+    def staged_rows(self) -> int:
+        """The rows the stage holds: the dense head (:attr:`head`), else the capacity."""
+        return self.head or self.capacity
 
     @property
     def spilled(self) -> bool:
@@ -211,7 +226,7 @@ class WorldRows:
     def word(self, row: str, word: int) -> str:
         """Word ``word`` of row ``row``'s record: a staged row's from the stage, the visited row's from its registers."""
         if not self.record:
-            return f"s_rec_dense[{self.staged_words.index(word) * self.capacity} + ({row})]"
+            return f"s_rec_dense[{self.staged_words.index(word) * self.staged_rows} + ({row})]"
         if row == self.VISITED:
             if word >= self.words:
                 raise ValueError(f"a record of {self.words} words has no word {word}")
@@ -362,13 +377,13 @@ class WorldRows:
                 Buffer(
                     self.impulses,
                     "float",
-                    self.wide or self.slots or self.capacity,
+                    self.wide or self.slots or self.staged_rows,
                     alternative=Place.GLOBAL,
                     spill=self.free and not self.spilled,
                 ),
             )
         )
-        staged = Buffer("s_rec_dense", "int", len(self.staged_words) * self.capacity, alternative=Place.STREAMED)
+        staged = Buffer("s_rec_dense", "int", len(self.staged_words) * self.staged_rows, alternative=Place.STREAMED)
         return impulses if self.record else (*impulses, staged)
 
     def declaration(self) -> str:
@@ -388,7 +403,13 @@ class WorldRows:
 
     def admission(self) -> str:
         """With a wide head, the world's return from a launch that is not its own: the wide launch's world is one whose
-        live rows (``m_mf``) pass the stage's head and fit the wide one; every other world is the first launch's."""
+        live rows (``m_mf``) pass the stage's head and fit the wide one; every other world is the first launch's. A
+        dense head's launch takes the worlds whose live dense rows (``m_dense``) pass its floor and fit its head."""
+        if not self.free:
+            bounds = ([f"m_dense <= {self.floor}"] if self.floor else []) + (
+                [f"m_dense > {self.head}"] if self.head else []
+            )
+            return f"    if ({' || '.join(bounds)}) return;\n" if bounds else ""
         if not self.wide:
             return ""
         return f"    if ((m_mf > {self.slots} && m_mf <= {self.wide}) != ({FREE_HEAD} > {self.slots})) return;\n"
@@ -3449,6 +3470,10 @@ class SweepConfig:
         """The operands beyond the ABI (:func:`.kernel_template.operands`)."""
         return ()
 
+    def bound_bytes(self, staging) -> int:
+        """The stage bytes the kernel's launch bound is shaped at (:func:`sweep_kernel`): its own stage's."""
+        return staging.bytes
+
     def work(self, items: int = 0, shared: int = 0) -> Work:
         """What the kernel's launches over ``items`` worlds declare (:class:`~newton._src.core.execution.Work`), its
         block's working set ``shared``: its launch bound is the layer's shape of it at no items."""
@@ -3466,7 +3491,7 @@ def sweep_kernel(config: SweepConfig) -> wp.Kernel:
     """
     snippet, staging = config.source()
     staging.check(config.label, arch_budget(config.device_arch))
-    bounds = shape(config.work(0, staging.bytes), built_for(config.device_arch)).bounds
+    bounds = shape(config.work(0, config.bound_bytes(staging)), built_for(config.device_arch)).bounds
     return KernelTemplate.from_abi(
         config.name,
         config.ABI,

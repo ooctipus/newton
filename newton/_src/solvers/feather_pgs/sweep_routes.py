@@ -165,6 +165,12 @@ class RowPlaces:
             (:attr:`.memory.Staging.wide`), its slots: the sweep launches twice, at each head's shared memory, and a
             world is swept by the launch whose head holds its live rows (past both, the first's, in place), so its
             stage follows its live rows, not the capacity. ``0``: one head (``free_slots``) or none.
+        dense_rows: The dense rows this launch's stage holds, a head of the capacity (their metadata at its word
+            stride, their impulses, the active enumeration's bitsets and the levels' marks): the launch sweeps the
+            worlds whose live dense rows pass ``dense_floor`` and fit it (:meth:`.sweep_plan.Sweep._dense_heads`).
+            ``0``: the capacity, every world past ``dense_floor``.
+        dense_floor: The dense rows of the worlds an earlier launch's head holds: this launch takes the worlds past
+            them. ``0``: from the first.
     """
 
     metadata: Place = Place.SHARED
@@ -173,19 +179,29 @@ class RowPlaces:
     velocity: Place = Place.SHARED
     free_slots: int = 0
     wide_slots: int = 0
+    dense_rows: int = 0
+    dense_floor: int = 0
 
     def __post_init__(self):
         if (self.free_slots or self.wide_slots) and self.impulses is not Place.SHARED:
             raise ValueError("the free bodies' impulses spill past their staged slots: they are staged")
         if self.wide_slots and self.wide_slots <= self.free_slots:
             raise ValueError("a wide head holds more slots than the stage's")
+        if self.dense_rows and self.dense_rows <= self.dense_floor:
+            raise ValueError("a dense head holds more rows than the earlier heads")
 
     def __repr__(self) -> str:
         dense = f", {self.dense_impulses.name}" if self.dense_impulses is not Place.SHARED else ""
         velocity = f", velocity {self.velocity.name}" if self.velocity is not Place.SHARED else ""
         slots = f", {self.free_slots} slots" if self.spilled else ""
         wide = f" or {self.wide_slots}" if self.wide_slots else ""
-        return f"RowPlaces({self.metadata.name}, {self.impulses.name}{slots}{wide}{dense}{velocity})"
+        head = f", dense rows {self.dense_floor} to {self.dense_rows or 'all'}" if self.dense_headed else ""
+        return f"RowPlaces({self.metadata.name}, {self.impulses.name}{slots}{wide}{dense}{velocity}{head})"
+
+    @property
+    def dense_headed(self) -> bool:
+        """Whether the launch sweeps only the worlds whose live dense rows its head range holds (:attr:`dense_rows`)."""
+        return bool(self.dense_rows or self.dense_floor)
 
     @property
     def spilled(self) -> bool:
@@ -214,6 +230,7 @@ class RowPlaces:
             + (f"to{self.wide_slots}" if self.wide_slots else "")
             + ("" if self.dense_impulses is Place.SHARED else "_gline")
             + ("" if self.velocity is Place.SHARED else "_gv")
+            + (f"_d{self.dense_floor}to{self.dense_rows or 'all'}" if self.dense_headed else "")
         )
 
 
@@ -701,7 +718,8 @@ def coordinate_levels(
         f"{pad}}} else {{\n{limit}\n{pad}}}"
     )
     phase = f"        {{\n{levels.wrap(heads, ' ' * 12)}\n        }}"
-    marks = f"""    for (int w = lane; w < {(M + 31) // 32}; w += STRIDE) s_level_mark[w] = 0;
+    # The marks the stage holds: the head's rows (every leveled head is a live row of the world, which the head holds).
+    marks = f"""    for (int w = lane; w < {(dense.staged_rows + 31) // 32}; w += STRIDE) s_level_mark[w] = 0;
     SYNC();
     for (int p = lane; p < {offsets.format(count)}; p += STRIDE) {{
         const int head = sparse_contact_level_units.data[world * {M} + p];
@@ -1421,7 +1439,13 @@ def mf_gs_staging(
     # A packed row's sides stage with its metadata (the classes' word takes the widths' place).
     sides = None if wide_rows else "widths"
     dense = WorldRows(
-        max_constraints, places.metadata, stream=places.dense_impulses is Place.GLOBAL, sides=sides, split=split
+        max_constraints,
+        places.metadata,
+        stream=places.dense_impulses is Place.GLOBAL,
+        sides=sides,
+        split=split,
+        head=places.dense_rows,
+        floor=places.dense_floor,
     )
     free = WorldRows(
         mf_max_constraints,
@@ -1458,8 +1482,8 @@ def mf_gs_staging(
         *velocity,
         *rows,
         *levels,
-        *(active_words(max_constraints) if active_rows else ()),
-        *((Buffer("s_level_mark", "int", (max_constraints + 31) // 32),) if coordinate_levels else ()),
+        *(active_words(dense.staged_rows) if active_rows else ()),
+        *((Buffer("s_level_mark", "int", (dense.staged_rows + 31) // 32),) if coordinate_levels else ()),
     )
     if free.wide:
         # The wide head lies last, so the stage's launch takes a prefix of the wide launch's bytes
@@ -1560,7 +1584,14 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     sides = None if wide_rows else "classes" if sweep.support_classes else "widths"
     split = sweep.split
     dense = WorldRows(
-        M_D, places.metadata, stream=places.dense_impulses is Place.GLOBAL, lanes=row_lanes, sides=sides, split=split
+        M_D,
+        places.metadata,
+        stream=places.dense_impulses is Place.GLOBAL,
+        lanes=row_lanes,
+        sides=sides,
+        split=split,
+        head=places.dense_rows,
+        floor=places.dense_floor,
     )
     free = WorldRows(
         M_MF,
@@ -1983,7 +2014,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     if (m_dense == 0 && m_mf == 0) return;
     if (m_dense > {M_D}) m_dense = {M_D};
     if (m_mf > {M_MF}) m_mf = {M_MF};
-{free.admission()}    int mf_contact_end = mf_contact_rows_end.data[world];
+{dense.admission()}{free.admission()}    int mf_contact_end = mf_contact_rows_end.data[world];
     if (mf_contact_end > m_mf) mf_contact_end = m_mf;
 
     int dof_map_base = world * {D};
@@ -2066,6 +2097,10 @@ class GeneralSweep(SweepConfig):
     formed: str = "inline"
     world_blocks: bool = False
     grouped: bool = False
+    line_stage: int = 0
+    """The stage bytes its launch bound (the register line) is shaped at: a dense head's launch keeps its mapping's,
+    the capacity's stage (:meth:`.sweep_plan.Sweep._dense_heads`), so a head moves no register and no arithmetic;
+    ``0``: its own stage."""
 
     def __post_init__(self):
         if self.regions and not self.free_rows:
@@ -2206,6 +2241,10 @@ class GeneralSweep(SweepConfig):
         )
 
     source = mf_gs_source
+
+    def bound_bytes(self, staging: Staging) -> int:
+        """The stage bytes its launch bound is shaped at: its mapping's (:attr:`line_stage`), else its own."""
+        return self.line_stage or staging.bytes
 
     def staging(self) -> Staging:
         """The block's working set at its places (:func:`mf_gs_staging`): each staged operand with its alternative."""

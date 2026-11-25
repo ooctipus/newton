@@ -3,6 +3,7 @@
 
 """Test sticky overflow visibility independently of opt-in row telemetry."""
 
+import contextlib
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -418,6 +419,57 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
                 solver.constraint_capacity_status(clear=True)
             with self.assertRaisesRegex(RuntimeError, "capture"):
                 solver.check_constraint_capacity()
+
+
+def _sprawl_run(device, capacity: int, heads=None, steps: int = 30):
+    """Step two worlds of the sprawled tree (scenes.sprawl: a free torso and its limbs resting on the ground, one contact
+    a link: dense contact rows) at ``capacity`` dense rows; with ``heads`` (first, second), the general sweep's launches
+    are dense heads at those rows and the capacity's (:meth:`.sweep_plan.Sweep.dense_head`, forced on any device).
+    Returns the poses and velocities, the most live dense rows a world held and the solver."""
+    from newton._src.solvers.feather_pgs import sweep_plan  # noqa: PLC0415
+    from newton.tests import feather_pgs_scenes as scenes  # noqa: PLC0415
+
+    def forced(plan, config, items):
+        first, wide = heads
+        full = plan._staged(config, items)
+        head = sweep_plan.Sweep.dense_head
+        return head(full, first), head(full, wide, first), head(full, 0, wide)
+
+    scene = scenes.sprawl(fingers=2, finger_links=2, worlds=2)
+    model = scene.build(device)
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=scene.rigid_contact_max)
+    contacts = pipeline.contacts()
+    patch = mock.patch.object(sweep_plan.Sweep, "_dense_heads", forced) if heads else contextlib.nullcontext()
+    with patch:
+        # The dense storage's route: the matrix-free sweep over the world's dense line.
+        solver = SolverFeatherPGS(model, dense_max_constraints=capacity, pins=SolverFeatherPGS.Pins(storage="dense"))
+    state, out, control = model.state(), model.state(), model.control()
+    rows = 0
+    for _ in range(steps):
+        pipeline.collide(state, contacts)
+        solver.step(state, out, control, contacts, scene.dt)
+        state, out = out, state
+        rows = max(rows, int(solver.placement.constraint_count.numpy().max()))
+    return state.body_q.numpy(), state.body_qd.numpy(), rows, solver
+
+
+class TestDenseHeads(unittest.TestCase):
+    def test_a_world_steps_alike_in_every_dense_head(self):
+        """A capacity past the live dense rows keeps their stage: with the general sweep's launches at dense heads, a
+        world swept by the launch whose head holds its live rows (the first head's, the wide one's, or past both the
+        capacity's own launch) steps bit for bit as at the capacity alone, and each launch's kernel stages its head."""
+        devices = ["cpu"] + (["cuda:0"] if wp.is_cuda_available() else [])
+        for device in devices:
+            q, qd, rows, _solver = _sprawl_run(device, 256, heads=None)
+            self.assertTrue(32 < rows <= 192, f"the sprawl's live dense rows: {rows}")
+            for heads in ((rows + 32, rows + 64), (32, rows + 32), (32, 64) if rows > 64 else (16, 32)):
+                with self.subTest(device=device, heads=heads):
+                    q_h, qd_h, _rows, solver = _sprawl_run(device, 256, heads=heads)
+                    names = [launch.kernel.key for launch in solver.sweep.launches]
+                    for first, wide in ((0, heads[0]), (heads[0], heads[1]), (heads[1], "all")):
+                        self.assertTrue(any(f"_d{first}to{wide}" in name for name in names), (first, wide, names))
+                    np.testing.assert_array_equal(q, q_h)
+                    np.testing.assert_array_equal(qd, qd_h)
 
 
 if __name__ == "__main__":

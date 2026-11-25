@@ -29,7 +29,7 @@ import numpy as np
 import warp as wp
 
 from ...core.execution import Beside, Buckets, Queue, shape, staged_launch
-from ...core.memory import Place, arch_budget, device
+from ...core.memory import L1_LINE_BYTES, STATIC_SHARED_BYTES, Place, arch_budget, device
 from . import (
     class_plan,
     packed_rows,
@@ -287,7 +287,9 @@ class Sweep:
             "torsion": bool(self.laws.spin_rows),
         }
 
-    def sweep(self, route: str, config: SweepConfig, readout_budget: int | None = None) -> wp.Kernel:
+    def sweep(
+        self, route: str, config: SweepConfig, readout_budget: int | None = None, shares: wp.Kernel | None = None
+    ) -> wp.Kernel:
         """Build the sweep of ``config`` (:func:`.sweep.sweep_kernel`) and allocate its readout counters, outside any
         graph capture.
 
@@ -296,12 +298,16 @@ class Sweep:
             config: The sweep's configuration, its laws :attr:`law_fields`.
             readout_budget: The sweep budget the kernel compiles in (a parallel tier's), or ``None`` for the
                 solver's iteration counts.
+            shares: The mapping's kernel whose readout counters this one shares (a dense head's launch,
+                :meth:`_dense_heads`: one sweep).
         """
         kernel = sweep_kernel(config)
-        self._register(route, kernel, readout_budget)
+        self._register(route, kernel, readout_budget, shares)
         return kernel
 
-    def _register(self, route: str, kernel: wp.Kernel, readout_budget: int | None) -> None:
+    def _register(
+        self, route: str, kernel: wp.Kernel, readout_budget: int | None, shares: wp.Kernel | None = None
+    ) -> None:
         policy = self.policy
         budget = int(self.options.pgs_iterations if readout_budget is None else readout_budget)
         self.readout.register(
@@ -311,6 +317,7 @@ class Sweep:
             world_count=int(self.forest.world_count),
             budget=max(budget, 1),
             device=self.model.device,
+            shares=shares,
         )
 
     def build(self) -> None:
@@ -371,6 +378,9 @@ class Sweep:
                 metric=FRICTION_METRIC_FLOATS,
             )
         self.mf_gs_kernel = None
+        # The warp mapping's launches before its own (its sweep at the capacity, the last): the dense heads'
+        # (_dense_heads), each with its config, kernel, records config and records kernel.
+        self.dense_heads = ()
         # The general sweep's dense friction records, formed by a launch of its text without its sweeps ahead of it
         # (sweep_routes.GeneralSweep.formed), where it forms them.
         self.general_records = None
@@ -473,7 +483,7 @@ class Sweep:
                 if pair.staging().fits(budget):
                     block_warps = pair.block_warps
             declared = general(lanes_per_world=lanes, block_warps=block_warps)
-            self.general_sweep = self._staged(declared, worlds)
+            *general_heads, self.general_sweep = self._dense_heads(declared, worlds)
             # The colored mapping takes the worlds the unit builder's rule picks at every pack
             # (sweep_units.COLORED_RULE), among those whose free bodies and row capacity admit it: built, with a
             # storage slot each, for those worlds only, it runs beside the one-warp mapping. More of them than the
@@ -513,7 +523,9 @@ class Sweep:
                 )
                 # The region visit holds more values than the register line of two warps a block keeps in registers
                 # (sweep_routes.WARP_LINE): a sweep that visits regions takes one warp a block and no line.
-                self.general_sweep = self._staged(dataclasses.replace(declared, regions=True, block_warps=1), worlds)
+                *general_heads, self.general_sweep = self._dense_heads(
+                    dataclasses.replace(declared, regions=True, block_warps=1), worlds
+                )
             # The colored mapping's block takes its worlds' regions where their contacts are regions (a world that
             # forms pair blocks keeps the warp, whose lanes team on them, region_sweep.PAIR_SIDE).
             self.region_slot = None
@@ -587,11 +599,25 @@ class Sweep:
                 grouped_sweep = self._staged(grouped_declared, grouped_worlds.size)
             # The streamed rows' records, in the worlds the sweeps and the unit builder read: one layout, which every
             # sweep reads whatever its own stage holds, with the dense rows' where any sweep streams theirs.
-            staged = [sweep for sweep in (self.general_sweep, colored_sweep, grouped_sweep) if sweep is not None]
+            staged = [
+                sweep
+                for sweep in (
+                    *general_heads,
+                    self.general_sweep,
+                    colored_sweep,
+                    grouped_sweep,
+                )
+                if sweep is not None
+            ]
             self.placement.allocate_row_records(
                 min(sweep_routes.record_first(self.placement.dense_max_constraints, sweep.places) for sweep in staged)
             )
-            self.general_sweep = dataclasses.replace(self.general_sweep, records=self.placement.record_first)
+
+            def recorded(sweep):
+                return dataclasses.replace(sweep, records=self.placement.record_first)
+
+            self.general_sweep = recorded(self.general_sweep)
+            general_heads = [recorded(head) for head in general_heads]
             if coordinate_levels:
                 rows = self.placement.dense_max_constraints
                 self.placement.arrays.allocate(
@@ -614,6 +640,7 @@ class Sweep:
                 self.general_sweep = dataclasses.replace(self.general_sweep, formed="ahead")
                 self.mf_records_kernel = sweep_kernel(self.general_records)
             self.mf_gs_kernel = self.sweep("mf_gs", self.general_sweep)
+            self.dense_heads = tuple(self._head_kernels(head) for head in general_heads)
             if colored:
                 colored_sweep = dataclasses.replace(colored_sweep, records=self.placement.record_first)
                 colored_sweep = self._block_records("colored", colored_sweep, capable.size, model)
@@ -689,15 +716,20 @@ class Sweep:
                 )
             # The general sweep walks its bucket on a persistent grid, a warp a world (its work's shape); the colored
             # bucket a block a world of its slots, a color's units at once.
-            mapped = self._claim_launch(
-                self.general_sweep, self.mf_gs_kernel, worlds, self.claim_general, sweep_levels.COST_CLASSES
-            )
+            # A mapping's launches: each dense head's (the worlds whose live dense rows it holds), then its own at the
+            # capacity (the worlds past every head; _dense_heads).
+            general = (*self.dense_heads, (self.general_sweep, self.mf_gs_kernel, None, None))
+            mapped = ()
+            for config, kernel, _records, _records_kernel in general:
+                mapped += self._claim_launch(config, kernel, worlds, self.claim_general, sweep_levels.COST_CLASSES)
             if self.general_records is not None:
-                # In line with the sweep, on its stream: the records it reads, then the sweep.
-                records = self._claim_launch(
-                    self.general_records, self.mf_records_kernel, worlds, self.claim_general, sweep_levels.COST_CLASSES
-                )
-                mapped = (*records, *mapped)
+                # In line with the sweeps, on their stream: the records they read, then the sweeps.
+                records = ((*head[2:],) for head in self.dense_heads)
+                records = (*records, (self.general_records, self.mf_records_kernel))
+                staged = ()
+                for config, kernel in records:
+                    staged += self._claim_launch(config, kernel, worlds, self.claim_general, sweep_levels.COST_CLASSES)
+                mapped = (*staged, *mapped)
             if colored:
                 slots = self.colored_units.slot_count if self.colored_units is not None else int(capable.size)
                 if "colored" in self.block_records:
@@ -710,7 +742,9 @@ class Sweep:
             if grouped_sweep is not None:
                 if "grouped" in self.block_records:
                     config, kernel, ranks = self.block_records["grouped"]
-                    mapped += self._claim_launch(config, kernel, int(grouped_worlds.size), self.claim_grouped, ranks=ranks)
+                    mapped += self._claim_launch(
+                        config, kernel, int(grouped_worlds.size), self.claim_grouped, ranks=ranks
+                    )
                 mapped += self._claim_launch(
                     self.grouped_sweep,
                     self.mf_grouped_kernel,
@@ -996,6 +1030,69 @@ class Sweep:
         ranks = max(min(held * found.sms // max(int(worlds), 1), -(-int(rows) // sweep_routes.COLORED_THREADS)), 1)
         self.block_records[form] = (records, sweep_kernel(records), ranks)
         return dataclasses.replace(config, formed="ahead")
+
+    def _dense_heads(self, config: SweepConfig, items: int) -> tuple[SweepConfig, ...]:
+        """The warp mapping ``config``'s launches at the places its stage gives (:meth:`_staged`), by the dense rows'
+        head: where the capacity's stage holds dense operands (staged metadata at the head's word stride, impulses, the active
+        enumeration's bitsets and the levels' marks), a head holds them for the worlds whose live dense rows fit it,
+        so their stage follows their live rows, not the capacity (D1: a capacity costs only memory).
+
+        A head's launch is the capacity's but for the length of its dense operands: every operand at the capacity's
+        place (the form, which decides how a row is read: streamed records carry the idle keys the live order passes
+        rows by) and the capacity's launch bound (its register line, :attr:`.sweep_routes.GeneralSweep.line_stage`),
+        so the same arithmetic. The head is the longest of whole lines that keeps the resident blocks of one line of
+        rows and the static stage (:data:`.memory.STATIC_SHARED_BYTES`, so the L1 stays); the worlds past it are the
+        capacity's launch's, and a capacity the head would hold keeps the one launch. The CPU's one thread holds the
+        whole stage: one launch.
+
+        Returns the launches in order, the capacity's last."""
+        full = self._staged(config, items)
+        line = L1_LINE_BYTES // 4
+        capacity = int(config.max_constraints)
+        held = full.places
+        staged = held.metadata is Place.SHARED or held.dense_impulses is Place.SHARED
+        if not self.model.device.is_cuda or capacity <= line or not staged:
+            return (full,)
+        found = device(self.model.device)
+
+        def layout(rows: int):
+            return shape(self._launch_work(self.dense_head(full, rows), items), found)
+
+        tight = layout(line)
+        resident, ceiling = tight.blocks_per_sm, max(STATIC_SHARED_BYTES, tight.staging.bytes)
+
+        def keeps(rows: int) -> bool:
+            held_rows = layout(rows)
+            return held_rows.blocks_per_sm >= resident and held_rows.staging.bytes <= ceiling
+
+        if keeps(capacity):
+            return (full,)
+        low, high = 1, capacity // line
+        while low < high:
+            middle = (low + high + 1) // 2
+            if keeps(middle * line):
+                low = middle
+            else:
+                high = middle - 1
+        return self.dense_head(full, low * line), self.dense_head(full, 0, low * line)
+
+    @staticmethod
+    def dense_head(full: SweepConfig, rows: int, floor: int = 0) -> SweepConfig:
+        """The launch of ``full`` (a mapping at the capacity, its stage given) whose stage holds ``rows`` dense rows
+        (0: the capacity's) for the worlds whose live dense rows pass ``floor`` (:meth:`_dense_heads`): every operand
+        at the capacity's place, a head at the capacity's launch bound."""
+        places = dataclasses.replace(full.places, dense_rows=rows, dense_floor=floor)
+        return dataclasses.replace(full, places=places, line_stage=full.staging().bytes if rows else 0)
+
+    def _head_kernels(self, head: SweepConfig) -> tuple:
+        """A dense head's launch of the warp mapping (:meth:`_dense_heads`): its configuration and kernel, which counts its
+        solves into the mapping's readout, and where the general sweep forms its dense records ahead (``formed``), the
+        records launch's configuration and kernel."""
+        if self.general_records is None:
+            return head, self.sweep("mf_gs", head, shares=self.mf_gs_kernel), None, None
+        records = dataclasses.replace(head, formed="stage", solve_policy=SolvePolicy())
+        head = dataclasses.replace(head, formed="ahead")
+        return head, self.sweep("mf_gs", head, shares=self.mf_gs_kernel), records, sweep_kernel(records)
 
     def _claim_launch(
         self, config: SweepConfig, kernel: wp.Kernel, items: int, bucket: int, buckets: int = 1, ranks: int = 1
