@@ -261,6 +261,15 @@ ROW_PLACES = (
 """Every placement of the sweep's row operands (the census's axis)."""
 
 
+RUN_AHEAD_WORDS = (("i + 1", 1), ("tangent", 1), ("i + 2", 2), ("sibling", 2), ("(i) + 3", 3))
+"""The kind and parent words a grouped run's visit reads past its own row (:attr:`.sweep.WorldRows.ahead`): a contact
+unit's test of its pair (``i + 1``, ``i + 2``, the unit's ``tangent`` and ``sibling``) and of a spin row (``i + 3``)."""
+
+RUN_AHEAD_ENTRIES = (("i", 0), ("(parent + 2)", 1), ("spin", 2), ("tangent", 1), ("sibling", 2))
+"""The rows whose entries a grouped run's visit reads (:attr:`.response_operator.SparseFactor.ahead`): the visited
+row, a first tangent's sibling and spin row (rows ``i + 1`` and ``i + 2`` at its visit), a unit's pair."""
+
+
 def packed_operator(
     support: int,
     lanes: Lanes,
@@ -2104,10 +2113,10 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
             heads=lambda row: f"{dense.spin_of(row, 'm_dense')} >= 0 && {dense.kind(row)} == {ROW_CONTACT}",
             pad="        ",
         )
-    def unit_text(op: SparseFactor) -> str:
-        return dense_units(dense, op, laws, active=sweep.active_rows, record=dense_record, pad="")
+    def unit_text(rows: WorldRows, op: SparseFactor) -> str:
+        return dense_units(rows, op, laws, active=sweep.active_rows, record=dense_record, pad="")
 
-    units = unit_text(dense_op) if sweep.contact_units else ""
+    units = unit_text(dense, dense_op) if sweep.contact_units else ""
     level_marks = level_phase = skip = ""
     if sweep.coordinate_levels:
         level_marks, level_phase, skip = coordinate_levels(
@@ -2133,16 +2142,19 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         pad="        ",
     )
     if grouped:
-        # A run of the world's rows: the topology rows on the first warp, then each group's on its warp. A run's visits
-        # carry the velocity they kept where it lies in global memory and their records stream (Velocity.carried).
-        run_op = dense_op
+        # A run of the world's rows: the topology rows on the first warp, then each group's on its warp. Where the
+        # velocity lies in global memory and the records stream, a run's visits carry the velocity they kept
+        # (Velocity.carried) and load the next visit's operands while a visit runs (RUN_AHEAD).
+        run_rows, run_op = dense, dense_op
         if dense_op.keeps_velocity and dense_op.key is not None:
-            run_op = dataclasses.replace(dense_op, velocity=dataclasses.replace(dense_op.velocity, carried=True))
+            run_rows = dataclasses.replace(dense, ahead=RUN_AHEAD_WORDS)
+            velocity = dataclasses.replace(dense_op.velocity, carried=True)
+            run_op = dataclasses.replace(dense_op, velocity=velocity, ahead=RUN_AHEAD_ENTRIES)
             if sweep.contact_units:
-                units = "\n".join(text for text in (skip, unit_text(run_op)) if text)
+                units = "\n".join(text for text in (skip, unit_text(run_rows, run_op)) if text)
         dense_phase = group_rows(
             lambda begin, end, pad: rows_block(
-                dense,
+                run_rows,
                 run_op,
                 laws,
                 metric=metric,

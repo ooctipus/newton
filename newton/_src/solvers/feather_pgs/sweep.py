@@ -135,6 +135,10 @@ class WorldRows:
     capacity."""
     floor: int = 0
     """The dense rows of the worlds an earlier launch's head holds (:attr:`.sweep_routes.RowPlaces.dense_floor`)."""
+    ahead: tuple[tuple[str, int], ...] = ()
+    """Rows a visit reads the kind and parent word of (their expressions, each with its offset ``k`` from the visited
+    row ``i``) that its run loaded while the visit before ran (:func:`_visit_pipeline`): a read of one takes the
+    run's register ``held_w{k}``, the word its load would read."""
 
     VISITED: ClassVar[str] = "i"
     """The row a row loop visits, whose record the loop holds in registers."""
@@ -227,6 +231,9 @@ class WorldRows:
         """Word ``word`` of row ``row``'s record: a staged row's from the stage, the visited row's from its registers."""
         if not self.record:
             return f"s_rec_dense[{self.staged_words.index(word) * self.staged_rows} + ({row})]"
+        held = dict(self.ahead).get(row) if word == 3 else None
+        if held is not None:
+            return f"held_w{held}"
         if row == self.VISITED:
             if word >= self.words:
                 raise ValueError(f"a record of {self.words} words has no word {word}")
@@ -2457,11 +2464,19 @@ of rows ``i - 1`` (a first tangent's normal, its patch ring's first), ``i``, ``i
 second tangent, for its zero pair's test, and spin row)."""
 
 
-def _visit_load(rows: WorldRows, row: str, begin: str, end: str, torsion: bool, indent: str) -> str:
+def _visit_load(rows: WorldRows, row: str, begin: str, end: str, torsion: bool, indent: str, op=None) -> str:
     """Load what row ``row``'s visit reads first into the pipeline's registers: its record (``pre_a``, ``pre_b``), the
     impulses of :data:`HELD` that lie in ``[begin, end)`` (``pre_held_*``), and under ``torsion`` the kind word of row
-    ``row + 2``, a first tangent's spin row if it has one (``pre_probe``)."""
+    ``row + 2``, a first tangent's spin row if it has one (``pre_probe``). A run that loads its visits' operands ahead
+    loads the kind words of :attr:`WorldRows.ahead` (``pre_w{k}``) and the entries of ``op``'s rows
+    (:attr:`.response_operator.SparseFactor.ahead`), each where it lies in the class's rows, as the visit reads it."""
     lines = [rows.load_record(tuple(f"pre_{name[-1]}" for name in rows.registers), row, indent)]
+    count = "mf_contact_end" if rows.free else "m_dense"
+    for k in sorted({k for _, k in rows.ahead}):
+        at = f"({row}) + {k}"
+        lines.append(f"{indent}pre_w{k} = {at} < ({count}) ? {rows.word(at, 3)} : 0;")
+    if op is not None and getattr(op, "ahead", ()):
+        lines.append(op.ahead_load(row, count, indent))
     rows_held = (
         (f"({row}) - 1", f"({row}) > ({begin})"),
         (row, ""),
@@ -2476,7 +2491,7 @@ def _visit_load(rows: WorldRows, row: str, begin: str, end: str, torsion: bool, 
     return "\n".join(lines)
 
 
-def _visit_pipeline(rows: WorldRows, end: str, begin: str, torsion: bool, carry: str = "") -> Pipelined:
+def _visit_pipeline(rows: WorldRows, end: str, begin: str, torsion: bool, op=None) -> Pipelined:
     """A dense class's rows ``[begin, end)`` in slot order, stepping from row to row the visits read (a first
     tangent's second tangent and spin row are its visit's), each row's record and the impulses its visit reads
     (:func:`_visit_load`) loaded while the row before it is visited.
@@ -2484,12 +2499,18 @@ def _visit_pipeline(rows: WorldRows, end: str, begin: str, torsion: bool, carry:
     A row's visit stores only its own impulses (its pair's and spin row's with a first tangent), all before the next
     row, so the loaded impulses are those a load at the next row's visit reads, but one: the next row's normal
     ``i - 1`` (its patch ring's first) when it is the row just visited, which the visit's store sets
-    (:func:`row_step`). The visits read the same values in the same order: a move. ``carry`` declares the run's
-    carried velocity (:attr:`.response_operator.Velocity.carried`)."""
+    (:func:`row_step`). The visits read the same values in the same order: a move. A run on ``op`` that carries its
+    velocity (:attr:`.response_operator.Velocity.carried`) declares it, and one that loads its visits' operands ahead
+    (:attr:`WorldRows.ahead`, :attr:`.response_operator.SparseFactor.ahead`) loads them with the record."""
+    ahead = op is not None and bool(getattr(op, "ahead", ()))
+    words = sorted({k for _, k in rows.ahead})
 
     def consume(row: str, indent: str) -> str:
         lines = [f"{indent}const int4 {name} = pre_{name[-1]};" for name in rows.registers]
         lines += [f"{indent}const float {name} = pre_{name};" for name in HELD]
+        lines += [f"{indent}const int held_w{k} = pre_w{k};" for k in words]
+        if ahead:
+            lines.append(op.ahead_take(indent))
         spin = ""
         if torsion:
             lines.append(f"{indent}const int held_probe = pre_probe;")
@@ -2501,7 +2522,7 @@ def _visit_pipeline(rows: WorldRows, end: str, begin: str, torsion: bool, carry:
         lines += [
             f"{indent}pipe_next = {kind} == {ROW_FRICTION} && {row} == {parent} + 1 ? {row} + 2{spin} : {row} + 1;",
             f"{indent}if (pipe_next < {end}) {{",
-            _visit_load(rows, "pipe_next", begin, end, torsion, indent + "    "),
+            _visit_load(rows, "pipe_next", begin, end, torsion, indent + "    ", op),
             f"{indent}}}",
         ]
         return "\n".join(lines)
@@ -2512,14 +2533,17 @@ def _visit_pipeline(rows: WorldRows, end: str, begin: str, torsion: bool, carry:
         # A contact unit consumes its pair (unit_visit): the loop steps past it, the row after it loaded instead.
         taken = (
             f"{pad}const auto UNIT_TAKEN = [&](const int next) {{\n{pad}    pipe_next = next;\n"
-            f"{pad}    if (next < {end}) {{\n{_visit_load(rows, 'next', begin, end, torsion, pad + '        ')}\n"
+            f"{pad}    if (next < {end}) {{\n{_visit_load(rows, 'next', begin, end, torsion, pad + '        ', op)}\n"
             f"{pad}    }}\n{pad}}};\n"
         )
-        carried = f"{indent(carry, pad)}\n" if carry else ""
+        state = [op.carry_state(pad)] if op is not None and op.carries else []
+        state += [f"{pad}int {', '.join(f'pre_w{k} = 0' for k in words)};"] if words else []
+        state += [op.ahead_state(pad)] if ahead else []
+        declared = "".join(f"{line}\n" for line in state)
         return (
             f"{pad}int4 {', '.join(f'pre_{name[-1]}' for name in rows.registers)};\n{pad}float {held};\n{probe}"
-            f"{carried}{pad}int pipe_next = {begin};\n{taken}"
-            f"{pad}if ({end} > {begin}) {{\n{_visit_load(rows, begin, begin, end, torsion, pad + '    ')}\n{pad}}}"
+            f"{declared}{pad}int pipe_next = {begin};\n{taken}"
+            f"{pad}if ({end} > {begin}) {{\n{_visit_load(rows, begin, begin, end, torsion, pad + '    ', op)}\n{pad}}}"
         )
 
     return Pipelined(end, prologue, consume, begin, step="i = pipe_next")
@@ -2687,8 +2711,7 @@ def rows_block(
         visit = row_step(rows, op, laws, **step, pipelined=rows.record, pad=inner)
         visit = f"{indent(unit, inner)}\n{visit}" if unit else visit
         if rows.record:
-            carry = op.carry_state("") if op.carries else ""
-            return f"{pad}{{\n{_visit_pipeline(rows, end, begin, laws.torsion, carry).wrap(visit, pad)}\n{pad}}}"
+            return f"{pad}{{\n{_visit_pipeline(rows, end, begin, laws.torsion, op).wrap(visit, pad)}\n{pad}}}"
         visit = f"{inner}{_unit_hooks(rows)}\n{visit}" if unit else visit
         return SlotOrder(end, begin).wrap(visit, pad)
     ctx = RowContext(

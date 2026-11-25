@@ -318,6 +318,10 @@ class SparseFactor(ResponseOperator):
     key: Callable[[str], tuple[str, ...]] | None = None
     """The words of row ``row`` that its coordinates ``index(row, entry)`` are a function of: rows of equal keys have
     one support (a carried velocity's test, :attr:`Velocity.carried`)."""
+    ahead: tuple[tuple[str, int], ...] = ()
+    """Rows a visit reads (their expressions, each with its offset ``k`` from the visited row ``i``) whose entries its
+    run loaded while the visit before ran: a read of one takes this lane's register ``held_z{k}[q]`` (the run's,
+    :meth:`ahead_state`), the value its load would read."""
 
     @property
     def width(self) -> int:
@@ -334,10 +338,36 @@ class SparseFactor(ResponseOperator):
         return entry if self.dense else self.index(_operand(row), entry)
 
     def element(self, row: str, entry: str = "entry") -> str:
-        """Row ``row``'s value at entry ``entry``."""
+        """Row ``row``'s value at entry ``entry`` (a row loaded ahead: its register, :attr:`ahead`)."""
         if self.dense:
             return f"{self.local}[{_operand(row)} * {self.dense} + {entry}]"
+        held = dict(self.ahead).get(_operand(row))
+        if held is not None and entry == "entry":
+            return f"held_z{held}[q]"
         return self.factor(_operand(row), entry)
+
+    def ahead_state(self, indent: str) -> str:
+        """Declare the registers a run loads its next visit's entries into (:attr:`ahead`), zero."""
+        rows = sorted({k for _, k in self.ahead})
+        zero = ", ".join("0.0f" for _ in range(self.entries))
+        return "\n".join(f"{indent}float pre_z{k}[{self.entries}] = {{{zero}}};" for k in rows)
+
+    def ahead_take(self, indent: str) -> str:
+        """Take the visit's entries from the run's registers (:attr:`ahead`), before its next visit's load."""
+        rows = sorted({k for _, k in self.ahead})
+        lines = [f"{indent}float {', '.join(f'held_z{k}[{self.entries}]' for k in rows)};"]
+        body = "\n".join(f"held_z{k}[q] = pre_z{k}[q];" for k in rows)
+        return "\n".join(lines) + "\n" + self.entries_loop(body, indent, entry=False)
+
+    def ahead_load(self, row: str, count: str, indent: str) -> str:
+        """Load the entries of the rows :attr:`ahead` reads for a visit of row ``row`` of rows ``[0, count)``."""
+        rows = sorted({k for _, k in self.ahead})
+        guard = f" && entry < {self.width}" if self.lanes.parallel else ""
+        body = "\n".join(
+            f"pre_z{k}[q] = ({row}) + {k} < ({count}){guard} ? {self.factor(f'(({row}) + {k})', 'entry')} : 0.0f;"
+            for k in rows
+        )
+        return self.entries_loop(body, indent)
 
     def entries_loop(self, body: str, indent: str, *, entry: bool = True) -> str:
         """``body`` for each entry this lane owns, ``q`` ascending; ``entry`` declares the row entry."""
