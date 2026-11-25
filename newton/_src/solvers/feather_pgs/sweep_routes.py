@@ -1375,10 +1375,16 @@ const wp::vec3 w{s}(wp::dot(basis{s}[3], u{s}), wp::dot(basis{s}[4], u{s}), wp::
     text = f"""{{
     {sync}
     const wp::vec2i left_span = world_regions.data[world];
+    // The left-out regions are the walk's places after its acting ones (the last level's end) up to the order's end
+    // (region_sweep.level_acting); a verify that opens one makes the walk anew below.
+    const int left_levels = world_levels.data[world];
+    const int left_first = left_levels > 0 ? level_end.data[left_span[0] + left_levels - 1] : left_span[0];
+    const int left_last = world_order_end.data[world];
     int joined = 0;
-    for (int g = left_span[0] + {me}; g < left_span[1]; g += {stride}) {{
-        if (reg_state.data[g] != {int(REGION_LEFT)}) continue;
+    for (int place = left_first + {me}; place < left_last; place += {stride}) {{
+        const int g = reg_walk.data[place];
         const wp::vec2i sides = reg_body.data[g];
+        if (reg_state.data[g] != {int(REGION_LEFT)}) continue;
 {indent(twist.format(s="", f="sides[0]"), "        ")}
         wp::vec3 v_b, w_b;
         if (sides[1] >= 0) {{
