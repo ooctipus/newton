@@ -658,7 +658,11 @@ def dense_units(
         kind="row_type",
         operator=UnitZ(cached=record is not None, fused_pair_apply=op.fused_pair_apply),
         diagonal=Diagonal(dense.diag),
-        load=dense.load,
+        # The unit's rows' impulses as its loop holds them (UNIT_IMPULSE, sweep.rows_block).
+        load=lambda row: (
+            {"head": "UNIT_IMPULSE(0)", "head + 1": "UNIT_IMPULSE(1)", "head + 2": "UNIT_IMPULSE(2)"}.get(row)
+            or dense.load(row)
+        ),
         store=dense.store,
         rhs=dense.rhs_of,
         mu=lambda row: "mu",

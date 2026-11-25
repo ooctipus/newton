@@ -1681,7 +1681,8 @@ def unit_visit(
     and its two tangents (``active``: the first tangent selected too) past the placement's ``guard`` (its loads, its
     condition), one load group and one reduction of their terms, their staged values held, one apply; it consumes the
     pair (``consumed_tangent``); with ``taken`` it tells its schedule the row after the pair once it is admitted
-    (``UNIT_TAKEN``, :func:`rows_block`: a loop that loads its next row ahead loads that one, any other ignores it).
+    (``UNIT_TAKEN``, :func:`rows_block`: a loop that loads its next row ahead loads that one, any other ignores it)
+    and reads its rows' impulses as the schedule holds them (``UNIT_IMPULSE(k)``: loaded ahead, or loaded here).
     The Gram couplings and pair metric are a ``record``'s (its loads, then its couplings after the reduction), else the
     same reduction's (``gram_n1``, ``gram_n2``, ``unit_cross``).
     """
@@ -2490,6 +2491,9 @@ def _visit_pipeline(rows: WorldRows, end: str, begin: str, torsion: bool) -> Pip
             lines.append(f"{indent}const int held_probe = pre_probe;")
             spin = f" + ({row} + 2 < ({end}) && (held_probe & 0xFFFF) == {ROW_TORSION} ? 1 : 0)"
         kind, parent = rows.kind(row), rows.parent(row, enclosed=True)
+        # A contact unit at the row reads its three rows' impulses where the loop holds them (unit_visit).
+        held = "k == 0 ? held_row : (k == 1 ? held_sib : held_spin)"
+        lines.append(f"{indent}const auto UNIT_IMPULSE = [&](const int k) {{ return {held}; }};")
         lines += [
             f"{indent}pipe_next = {kind} == {ROW_FRICTION} && {row} == {parent} + 1 ? {row} + 2{spin} : {row} + 1;",
             f"{indent}if (pipe_next < {end}) {{",
@@ -2608,6 +2612,13 @@ def row_step(
     return indent("\n".join(line for line in head if line), pad) + "\n" + visit
 
 
+def _unit_hooks(rows: WorldRows) -> str:
+    """A row loop's hooks for its contact units (:func:`unit_visit`) where it loads nothing ahead: the row after a
+    consumed pair is the loop's own next, and a unit's impulses load at the unit."""
+    impulse = rows.load("i + k")
+    return f"const auto UNIT_TAKEN = [](int) {{}}; const auto UNIT_IMPULSE = [&](const int k) {{ return {impulse}; }};"
+
+
 def rows_block(
     rows: WorldRows,
     op,
@@ -2665,14 +2676,14 @@ def rows_block(
         inner = order.inner(pad)
         visit = row_step(rows, op, laws, **step, pad=inner)
         visit = f"{indent(unit, inner)}\n{visit}" if unit else visit
-        visit = f"{inner}const auto UNIT_TAKEN = [](int) {{}};\n{visit}" if unit else visit
+        visit = f"{inner}{_unit_hooks(rows)}\n{visit}" if unit else visit
         return order.wrap(indent(rows.visit("i"), inner) + "\n" + visit if rows.record else visit, pad)
     if not rows.free:
         visit = row_step(rows, op, laws, **step, pipelined=rows.record, pad=inner)
         visit = f"{indent(unit, inner)}\n{visit}" if unit else visit
         if rows.record:
             return f"{pad}{{\n{_visit_pipeline(rows, end, begin, laws.torsion).wrap(visit, pad)}\n{pad}}}"
-        visit = f"{inner}const auto UNIT_TAKEN = [](int) {{}};\n{visit}" if unit else visit
+        visit = f"{inner}{_unit_hooks(rows)}\n{visit}" if unit else visit
         return SlotOrder(end, begin).wrap(visit, pad)
     ctx = RowContext(
         row="i",
