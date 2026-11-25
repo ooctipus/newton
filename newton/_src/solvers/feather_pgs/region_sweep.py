@@ -2546,6 +2546,8 @@ class Regions:
         self.body_basis = wp.zeros((count, 6), dtype=wp.spatial_vector, device=device)
         self.body_inertia = wp.zeros((count, 3), dtype=wp.mat33, device=device)
         self.body_twist = wp.zeros(count, dtype=wp.spatial_vector, device=device)
+        # Each free body's twist at a sweep's end, formed once a body for the sweeps' end test of the left-out regions.
+        self.body_end_twist = wp.zeros(count, dtype=wp.spatial_vector, device=device)
         # A body no world lists (it has no world) is open: only a world's sweep may visit its regions.
         self.body_open = wp.ones(count, dtype=wp.int32, device=device)
         self.body_count = wp.zeros((count, 3), dtype=wp.int32, device=device)
@@ -3149,7 +3151,8 @@ class Regions:
         names += " reg_frame reg_arm reg_arm_b reg_body reg_cand reg_law reg_wnn reg_wnf reg_wff reg_ball_values"
         names += " reg_ball_vectors reg_ginv reg_k reg_lk reg_lw"
         names += " reg_bf reg_kind reg_row cand cand_floor cand_row reg_wrench reg_phi reg_set reg_spring reg_state reg_stamp"
-        names += " reg_bound body_seen body_version blk_pair blk_blob blk_L blk_d blk_wrench blk_stage blk_istage"
+        names += " reg_bound body_seen body_version world_free_start world_free body_end_twist"
+        names += " blk_pair blk_blob blk_L blk_d blk_wrench blk_stage blk_istage"
         return {**{name: getattr(self, name) for name in names.split()}, "region_cfm": float(self.options.pgs_cfm)}
 
 

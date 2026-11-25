@@ -952,6 +952,9 @@ REGION_OPERANDS = (
     ("reg_bound", wp.array[wp.vec2]),
     ("body_seen", wp.array[wp.spatial_vector]),
     ("body_version", wp.array[int]),
+    ("world_free_start", wp.array[int]),
+    ("world_free", wp.array[int]),
+    ("body_end_twist", wp.array[wp.spatial_vector]),
     ("blk_pair", wp.array[wp.vec2i]),
     ("blk_blob", wp.array[wp.vec4i]),
     ("blk_L", wp.array[wp.spatial_matrix]),
@@ -965,8 +968,9 @@ REGION_OPERANDS = (
 body's first world coordinate and basis, the regions' records, step terms (:func:`.region_sweep.region_terms`),
 candidates and state, each open
 body's walk coordinates as its last visit or sweep left them with its version (``body_seen``, ``body_version``: the
-pass rule's; ``reg_stamp`` a region's second body's version at its last settled visit), the friction units'
-regularization."""
+pass rule's; ``reg_stamp`` a region's second body's version at its last settled visit), each world's free bodies and
+their twists at a sweep's end (``world_free_start``, ``world_free``, ``body_end_twist``: the sweeps' end test's,
+:func:`region_verify`), the friction units' regularization."""
 
 
 def region_phase(pad: str = "        ", *, block: bool = False, group: bool = False) -> str:
@@ -1325,6 +1329,11 @@ __syncthreads();"""
 # first and last places, the world's end, the blocks that joined, their exit votes.
 WIDE_JOB = 8
 
+_VERIFY_TURNS = 4
+"""The places a lane of the sweeps' end test (:func:`region_verify`) loads at once: their words (the region's record
+and its bodies' twists) in flight together, not a test's latency each. A hardware choice that changes no result:
+each test reads only its own region and the bodies' twists, and writes only its own state."""
+
 _LEVEL_STAGE = """    for (int level = 0; level < spans; ++level) {
     const int level_last = alone ? kept_end : level_end.data[region_span[0] + level];"""
 
@@ -1462,16 +1471,9 @@ const wp::vec3 w{s}(wp::dot(basis{s}[3], u{s}), wp::dot(basis{s}[4], u{s}), wp::
         SYNC();
 {walk_levels()}
         SYNC();"""
-    text = f"""{{
-    {sync}
-    const wp::vec2i left_span = world_regions.data[world];
-    // The left-out regions are the walk's places after its acting ones (the last level's end) up to the order's end
-    // (region_sweep.level_acting); a verify that opens one makes the walk anew below.
-    const int left_levels = world_levels.data[world];
-    const int left_first = left_levels > 0 ? level_end.data[left_span[0] + left_levels - 1] : left_span[0];
-    const int left_last = world_order_end.data[world];
-    int joined = 0;
-    for (int place = left_first + {me}; place < left_last; place += {stride}) {{
+    # The tests: each forms its two bodies' twists (the per-test form, every form's). A block (its lanes many, its
+    # tests often many a lane) forms each body's twist once instead where that takes a lane fewer rounds.
+    tests = f"""    for (int place = left_first + {me}; place < left_last; place += {stride}) {{
         const int g = reg_walk.data[place];
         const wp::vec2i sides = reg_body.data[g];
         if (reg_state.data[g] != {int(REGION_LEFT)}) continue;
@@ -1503,7 +1505,94 @@ const wp::vec3 w{s}(wp::dot(basis{s}[3], u{s}), wp::dot(basis{s}[4], u{s}), wp::
             reg_state.data[g] = {int(REGION_IDLE)};
             joined = 1;
         }}
-    }}
+    }}"""
+    if block:
+        tests = f"""    // The bodies' twists once a body (each formed once, then the tests {_VERIFY_TURNS} at a time) where that takes a lane
+    // fewer rounds than each test forming its own: the same twists, the shorter wait.
+    const int free_first = world_free_start.data[world], free_last = world_free_start.data[world + 1];
+    const int test_rounds = (left_last - left_first + {stride} - 1) / ({stride});
+    const int body_rounds = (free_last - free_first + {stride} - 1) / ({stride})
+        + (left_last - left_first + {_VERIFY_TURNS} * {stride} - 1) / ({_VERIFY_TURNS} * {stride});
+    if (test_rounds > body_rounds) {{
+        {{
+            // Each free body's twist as the sweep leaves it (its walk coordinates through its basis, as the phase forms
+            // it), once a body: a test then reads its two bodies' twists, not their coordinates and bases.
+            for (int k = free_first + {me}; k < free_last; k += {stride}) {{
+                const int f = world_free.data[k];
+    {indent(twist.format(s="", f="f"), "            ")}
+                body_end_twist.data[f] = wp::spatial_vector(v, w);
+            }}
+            {sync}
+        }}
+        // The tests, {_VERIFY_TURNS} places of a lane at once: their words in flight together, then each test in turn.
+        for (int base = left_first + {me}; base < left_last; base += {_VERIFY_TURNS} * {stride}) {{
+            int g[{_VERIFY_TURNS}];
+            wp::vec2i sides[{_VERIFY_TURNS}];
+    #pragma unroll
+            for (int t = 0; t < {_VERIFY_TURNS}; ++t) {{
+                const int place = base + t * {stride};
+                g[t] = place < left_last ? reg_walk.data[place] : -1;
+            }}
+    #pragma unroll
+            for (int t = 0; t < {_VERIFY_TURNS}; ++t) sides[t] = g[t] >= 0 ? reg_body.data[g[t]] : wp::vec2i(-1, -1);
+            int state[{_VERIFY_TURNS}], kind[{_VERIFY_TURNS}];
+            wp::mat33 frame[{_VERIFY_TURNS}];
+            wp::vec3 arm[{_VERIFY_TURNS}], arm_b[{_VERIFY_TURNS}];
+            wp::vec2 bound[{_VERIFY_TURNS}];
+            wp::spatial_vector twist[{_VERIFY_TURNS}], twist_b[{_VERIFY_TURNS}];
+    #pragma unroll
+            for (int t = 0; t < {_VERIFY_TURNS}; ++t) {{
+                const int at = g[t] >= 0 ? g[t] : 0;
+                state[t] = g[t] >= 0 ? reg_state.data[at] : {int(REGION_IDLE)};
+                kind[t] = reg_kind.data[at];
+                frame[t] = reg_frame.data[at];
+                arm[t] = reg_arm.data[at];
+                arm_b[t] = reg_arm_b.data[at];
+                bound[t] = reg_bound.data[at];
+                twist[t] = body_end_twist.data[sides[t][0] >= 0 ? sides[t][0] : 0];
+                twist_b[t] = body_end_twist.data[sides[t][1] >= 0 ? sides[t][1] : 0];
+            }}
+    #pragma unroll
+            for (int t = 0; t < {_VERIFY_TURNS}; ++t) {{
+                if (state[t] != {int(REGION_LEFT)}) continue;
+                const wp::vec3 v(twist[t][0], twist[t][1], twist[t][2]), w(twist[t][3], twist[t][4], twist[t][5]);
+                const float sign = (kind[t] & {int(KIND_SECOND)}) != 0 ? -1.0f : 1.0f;
+                const wp::vec3 n(frame[t].data[0][0], frame[t].data[0][1], frame[t].data[0][2]);
+                const wp::vec3 t0(frame[t].data[1][0], frame[t].data[1][1], frame[t].data[1][2]);
+                const wp::vec3 t1(frame[t].data[2][0], frame[t].data[2][1], frame[t].data[2][2]);
+                wp::vec3 sn = wp::mul(RegionLaw::frame_twist(v, w, arm[t], n, t0, t1).v0, sign);
+                if (sides[t][1] >= 0) {{
+                    const wp::vec3 v_b(twist_b[t][0], twist_b[t][1], twist_b[t][2]);
+                    const wp::vec3 w_b(twist_b[t][3], twist_b[t][4], twist_b[t][5]);
+                    sn = wp::sub(sn, wp::mul(RegionLaw::frame_twist(v_b, w_b, arm_b[t], n, t0, t1).v0, sign));
+                }}
+                // Where its closing bound rules a closing out none closes (region_laws.stays_open), as in the phase.
+                if (RegionLaw::stays_open(sn, bound[t])) continue;
+                const wp::vec2i span = reg_cand.data[g[t]];
+                bool closes = false;
+                for (int i = span[0]; i < span[1]; ++i) {{
+                    const wp::vec4 record = cand.data[i];
+                    closes = closes || RegionLaw::candidate_closes(record, sn, cand_floor.data[i]);
+                }}
+                if (closes) {{
+                    reg_state.data[g[t]] = {int(REGION_IDLE)};
+                    joined = 1;
+                }}
+            }}
+        }}
+    }} else {{
+{indent(tests, "    ")}
+    }}"""
+    text = f"""{{
+    {sync}
+    const wp::vec2i left_span = world_regions.data[world];
+    // The left-out regions are the walk's places after its acting ones (the last level's end) up to the order's end
+    // (region_sweep.level_acting); a verify that opens one makes the walk anew below.
+    const int left_levels = world_levels.data[world];
+    const int left_first = left_levels > 0 ? level_end.data[left_span[0] + left_levels - 1] : left_span[0];
+    const int left_last = world_order_end.data[world];
+    int joined = 0;
+{tests}
     if ({voted}) {{
         iteration_changed = 1;
         if ({iteration} + 1 == {budget}) {budget} += 1;
