@@ -78,7 +78,7 @@ DENSE_ROUTE, FREE_ROUTE = 0, 1
 """The patch rows' routes (:meth:`Sweep.patch_row_arrays`, a contact's ``path``): the line's dense rows and the free
 bodies' rows."""
 
-FRICTION_METRIC = FieldGroup(Field("friction_metric", wp.float32, ("world", "contact", "metric"), owner="placement"))
+FRICTION_METRIC = FieldGroup(Field("friction_metric", wp.float32, ("line", "contact", "metric"), owner="placement"))
 """Where spin rows may appear, a world can take the colored mapping or K1 fuses contact units, each friction contact's
 record, formed once per launch (:func:`.sweep.friction_record_stage`, :func:`.walk_rows.contact_record`,
 :func:`.sweep.friction_metric_stage`): a slot per three rows of the row store's line, a contact's rows."""
@@ -373,7 +373,7 @@ class Sweep:
             # read them (sweep.friction_record_stage) or by K1's writer (walk_rows.contact_record).
             self.placement.arrays.allocate(
                 FRICTION_METRIC,
-                world=self.forest.world_count,
+                line=self.placement.lines,
                 contact=(self.placement.row_pitch + 2) // 3,
                 metric=FRICTION_METRIC_FLOATS,
             )

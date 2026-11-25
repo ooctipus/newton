@@ -54,7 +54,7 @@ WIDE = 2
 """The ``dense`` layout of rows that bilateral elimination corrected: every entry is a world coordinate's, sides or
 not."""
 
-PACKED_ROWS = FieldGroup(Field("packed_Z", wp.float32, ("world", "row", "support"), owner="placement"))
+PACKED_ROWS = FieldGroup(Field("packed_Z", wp.float32, ("line", "row", "support"), owner="placement"))
 """Each dense row's packed entries: its whitened value."""
 
 

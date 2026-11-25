@@ -76,6 +76,7 @@ from .device_preludes import (
     lane_sync,
 )
 from .factor.walk import FREE_BODY_WALK, WALK_COORDINATE, WalkTrees, leave_columns, walk_down_prelude
+from .field_group import SolverArrays
 from .friction_patches import PatchRowLaw, patch_friction_location
 from .projection_laws import friction_ball_metric
 from .region_laws import (
@@ -3099,7 +3100,7 @@ class Regions:
                 self.reg_spring,
                 self.reg_state,
                 self.reg_bound,
-                impulses.reshape((impulses.size,)),
+                SolverArrays.line_flat(impulses),
                 self.lane_change,
             ],
             device=device,

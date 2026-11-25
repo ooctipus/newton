@@ -1946,8 +1946,13 @@ def row_seeds(placement, tiers: int, bound: int, width: int) -> RowSeeds:
         seeds.free_body_rows = placement.mf_constraint_count
         seeds.units, seeds.counts = placement.unit_source, placement.constraint_count
         seeds.topology = placement.topology_rows
-    shape = placement.phi.shape if tiers else (1, 1)
-    seeds.ids = wp.empty(shape, dtype=wp.vec4i, device=device)
-    seeds.direction = wp.empty(shape, dtype=wp.vec4, device=device)
-    seeds.point = wp.empty(shape, dtype=wp.vec4, device=device)
+    if tiers:
+        # The store's rows, laid out by line as the store's fields are.
+        seeds.ids = placement.line_array("ids", wp.vec4i)
+        seeds.direction = placement.line_array("direction", wp.vec4)
+        seeds.point = placement.line_array("point", wp.vec4)
+    else:
+        seeds.ids = wp.empty((1, 1), dtype=wp.vec4i, device=device)
+        seeds.direction = wp.empty((1, 1), dtype=wp.vec4, device=device)
+        seeds.point = wp.empty((1, 1), dtype=wp.vec4, device=device)
     return seeds

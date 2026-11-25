@@ -50,11 +50,11 @@ SIZE_JACOBIAN = FieldGroup(Field("J", wp.float32, ("response_art", "response_row
 """One size group's Jacobian. The matrix-free sweeps' producers write the packed rows instead (:mod:`.packed_rows`):
 their Jacobian is a (1, 1, 1) placeholder."""
 
-DENSE_ROW_WEIGHTS = FieldGroup(Field("row_w", wp.float32, ("world", "row"), fill=1.0, owner="placement"))
+DENSE_ROW_WEIGHTS = FieldGroup(Field("row_w", wp.float32, ("line", "row"), fill=1.0, owner="placement"))
 """Per-row weights of the regularized row law: the relative option's (speculative and restitution rows keep the rigid
 law) or a material contact's ``d / (d + eps)``."""
 
-DENSE_ROW_EPS = FieldGroup(Field("row_eps", wp.float32, ("world", "row"), owner="placement"))
+DENSE_ROW_EPS = FieldGroup(Field("row_eps", wp.float32, ("line", "row"), owner="placement"))
 """Per-row compliance of material contact normals (:attr:`.route_table.Laws.material`): positive [1/kg] from a
 contact's stiffness, negative ``-rho`` (relative, of the row's diagonal; its weight ``1 / (1 + rho)``) from authored
 shape materials; zero elsewhere."""
@@ -138,8 +138,8 @@ ROW_WATERMARKS = FieldGroup(
 """Whole-run row high-water telemetry for explicit readback (``Diagnostics.row_watermark``)."""
 
 SPARSE_DIAGONAL_ROWS = FieldGroup(
-    Field("sparse_diagonal_row_dof", wp.int32, ("world", "row", 2), fill=-1, owner="placement"),
-    Field("sparse_diagonal_row_z", wp.float32, ("world", "row", 2), owner="placement"),
+    Field("sparse_diagonal_row_dof", wp.int32, ("line", "row", 2), fill=-1, owner="placement"),
+    Field("sparse_diagonal_row_z", wp.float32, ("line", "row", 2), owner="placement"),
 )
 """Each sparse-diagonal row's two response coordinates and their whitened entries ``J / sqrt(m)``."""
 
@@ -489,9 +489,13 @@ class Placement:
         lines = max(forest.world_count, 1)
         self.body_base = wp.full(lines, self.dense_max_constraints, dtype=wp.int32, device=model.device)
         self.row_pitch = spec.capacities.row_pitch
-        # The row store's line length: the rows from one line to the next (the outer stride of the store's arrays, which
-        # the native bodies read from the arrays themselves, row_records.line_size), here the capacities' line.
+        # The row store's lines (one a world) and their length: the rows from one line to the next, the outer stride of
+        # the store's arrays, which the native bodies read from the arrays themselves (row_records.line_size), here the
+        # capacities' line. A line field's arrays are runs of lines at that stride (field_group.SolverArrays.array):
+        # its rows, and its friction records a slot per three rows.
+        self.lines = forest.world_count
         self.line_rows = self.row_pitch
+        self.arrays.line_strides.update(row=self.line_rows, contact=-(-self.line_rows // 3))
         # All inactive weight arguments alias this one element. Their producer kernels skip stores and their consumer
         # kernels skip reads when regularization is disabled.
         self.contact_row_w_dummy = self.arrays.placeholder(wp.float32, (1, 1), 1.0)
@@ -764,7 +768,7 @@ class Placement:
 
         # The widest world's DOFs exist where a world response mapping was built (the routes that read them).
         world_dof = self.forest.max_world_dofs
-        sizes = {"world": self.forest.world_count, "row": self.row_pitch, "world_dof": world_dof}
+        sizes = {"world": self.forest.world_count, "line": self.lines, "row": self.row_pitch, "world_dof": world_dof}
         arrays.allocate(DENSE_ROWS, **sizes)
         fused = bool(self.classes.fused_sizes)
         arrays.allocate(FUSED_DIAGONAL_LIMITS, **(sizes if fused else {"world": 1, "world_dof": 1}))
@@ -784,9 +788,9 @@ class Placement:
         # The sparse-diagonal schedule's buffers, one row per world when it is off.
         diagonal = self.classes.diagonal
         if diagonal is not None:
-            self.arrays.allocate(SPARSE_DIAGONAL_ROWS, world=self.forest.world_count, row=self.dense_max_constraints)
+            self.arrays.allocate(SPARSE_DIAGONAL_ROWS, line=self.lines, row=self.dense_max_constraints)
         else:
-            self.arrays.allocate(SPARSE_DIAGONAL_ROWS, world=1, row=1)
+            self.arrays.allocate(SPARSE_DIAGONAL_ROWS, line=1, row=1)
         if diagonal is not None and diagonal.units:
             # A world's rows hold at most a unit a row, so at most that many levels.
             rows = self.dense_max_constraints
@@ -829,12 +833,12 @@ class Placement:
             if self.classes.tier_rows and not self.packed_dense:
                 raise RuntimeError("The parallel tiers read their worlds' packed rows at their coordinates")
             self.place_row_classes()
-            sizes = {"world": self.forest.world_count, "row": self.row_pitch, "support": self.packed_support}
+            sizes = {"line": self.lines, "row": self.row_pitch, "support": self.packed_support}
         else:
             self.packed_support, self.packed_dense = 1, 0
             self.row_classes = packed_rows.RowClasses()
             self.row_classes_reason = "No sweep reads packed rows."
-            sizes = {"world": 1, "row": 1, "support": 1}
+            sizes = {"line": 1, "row": 1, "support": 1}
         self.arrays.allocate(packed_rows.PACKED_ROWS, **sizes)
 
     @property
@@ -897,7 +901,7 @@ class Placement:
             )
         if self.row_classes_reason is not None:
             return
-        row_class = wp.full((forest.world_count, self.row_pitch), -1, dtype=wp.int32, device=model.device)
+        row_class = self.line_array("row_class", wp.int32, fill=-1)
         self.row_classes = field_group.upload(packed_rows.RowClasses, model.device, table, row_class=row_class)
         self.packed_support, self.packed_dense = int(table.width), 0
 
@@ -949,7 +953,11 @@ class Placement:
         words = record_layout(self.record_first, dense, self.row_pitch, self.split_records)[1]
         # A line's free rows' records follow its dense rows' where those stream: from word ``body_base * words``.
         self.dense_record_words = record_words(False, self.split_records) if self.record_first == 0 else 0
-        self.arrays.allocate(ROW_RECORDS, world=self.forest.world_count, record=max(words, 1))
+        # A line's records at the store's line length: the most words its rows can need, a dense row's record a row
+        # (a line's free rows start at its body base, anywhere in it), whole words of the 16-byte quads records are
+        # stored in.
+        self.arrays.line_strides["record"] = self.line_rows * record_words(False, self.split_records)
+        self.arrays.allocate(ROW_RECORDS, line=self.lines, record=max(words, 1))
 
     def hold_acts(self, solver) -> None:
         """Hold each world's acts word (:data:`WORLD_ACTS`) where every row is separable (:attr:`.route_table.Laws.separable`,
@@ -1218,10 +1226,15 @@ class Placement:
     # Step: the whitening and the diagonals
     # ---------------------------------------------------------------------------------------------------------------
 
+    def line_array(self, name: str, dtype, *, rows: int | None = None, fill=None) -> wp.array:
+        """One field of the row store by line (``rows`` a line, the store's line by default), laid out as the store's
+        fields are (:attr:`lines` at the store's line length)."""
+        rows = self.row_pitch if rows is None else int(rows)
+        return self.arrays.array(Field(name, dtype, ("line", "row"), fill=fill), {"line": self.lines, "row": rows})
+
     def hold_units(self) -> None:
         """The one writer's unit sources (:mod:`.walk_rows`): an int per row, by world line and row."""
-        rows = self.dense_max_constraints
-        self.unit_source = wp.full((self.forest.world_count, rows), 0, dtype=wp.int32, device=self.model.device)
+        self.unit_source = self.line_array("unit_source", wp.int32, rows=self.dense_max_constraints, fill=0)
 
     def bound_topology(self, count, generation, stream: int, built_frame) -> None:
         """Snapshot where each world's topology rows end (:meth:`.rows.RowLaws.bound_topology`) and, where the packed

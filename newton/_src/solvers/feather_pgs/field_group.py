@@ -33,6 +33,7 @@ from __future__ import annotations
 import dataclasses
 from typing import Any
 
+import numpy as np
 import warp as wp
 
 __all__ = ["Field", "FieldGroup", "SolverArrays", "bind", "fields_of", "replace", "struct", "upload", "values"]
@@ -104,15 +105,47 @@ class SolverArrays:
         self.owner = owner
         self.device = device
         self._placeholders: dict[tuple, wp.array] = {}
+        self.line_strides: dict[str, int] = {}
+        """A line field's stride by its second dimension's name (:meth:`array`): the entries of that dimension from one
+        line to the next, where they are fewer than the dimension holds."""
+        self._line_buffers: list[wp.array] = []
 
-    def array(self, field: Field, sizes: dict[str, int]) -> wp.array:
-        """Allocate one field at the given sizes."""
-        shape = field.shape(sizes)
+    @staticmethod
+    def line_flat(array: wp.array) -> wp.array:
+        """A line field's entries as one flat array (:meth:`array`): entry ``(line, row)`` of a two-dimensional field at
+        ``line`` times its line stride plus ``row``, a run of lines included."""
+        if array.is_contiguous:
+            return array.reshape((array.size,))
+        stride = array.strides[0] // wp.types.type_size_in_bytes(array.dtype)
+        entries = (array.shape[0] - 1) * stride + int(np.prod(array.shape[1:]))
+        return wp.array(ptr=array.ptr, dtype=array.dtype, shape=(entries,), device=array.device)
+
+    def _filled(self, shape, field: Field) -> wp.array:
         if field.fill is None:
             return wp.empty(shape, dtype=field.dtype, device=self.device)
         if isinstance(field.fill, (int, float)) and field.fill == 0:
             return wp.zeros(shape, dtype=field.dtype, device=self.device)
         return wp.full(shape, field.fill, dtype=field.dtype, device=self.device)
+
+    def array(self, field: Field, sizes: dict[str, int]) -> wp.array:
+        """Allocate one field at the given sizes.
+
+        A field laid out by line (its first dimension ``"line"``) whose second dimension has a line stride
+        (:attr:`line_strides`) shorter than the dimension is a run of lines: one buffer of the lines at that stride, and
+        the field a view of it whose second index runs past a line into the next ones (a world's run that holds more
+        than a line). Its trailing dimensions are each entry's."""
+        shape = field.shape(sizes)
+        stride = self.line_strides.get(field.dims[1]) if len(field.dims) > 1 and field.dims[0] == "line" else None
+        if stride is None or stride >= shape[1] or shape[0] == 0:
+            return self._filled(shape, field)
+        lines, rows, trailing = shape[0], shape[1], shape[2:]
+        entries = int(np.prod(trailing)) if trailing else 1
+        buffer = self._filled(((lines - 1) * stride + rows) * entries, field)
+        self._line_buffers.append(buffer)
+        size = wp.types.type_size_in_bytes(field.dtype)
+        inner = tuple(int(np.prod(trailing[k + 1 :])) * size for k in range(len(trailing)))
+        strides = (stride * entries * size, entries * size, *inner)
+        return wp.array(ptr=buffer.ptr, dtype=field.dtype, shape=shape, strides=strides, device=self.device)
 
     def allocate(self, group, /, *, owner=None, **sizes: int) -> dict[str, wp.array]:
         """Allocate every field of ``group`` at ``sizes`` and give it to its owner.

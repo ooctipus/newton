@@ -17,18 +17,18 @@ from . import field_group
 from .field_group import Field, FieldGroup
 
 DENSE_ROWS = FieldGroup(
-    Field("rhs", wp.float32, ("world", "row"), owner="placement"),
-    Field("row_incident", wp.float32, ("world", "row"), owner="placement"),
-    Field("impulses", wp.float32, ("world", "row"), owner="placement"),
-    Field("diag", wp.float32, ("world", "row"), owner="placement"),
-    Field("row_type", wp.int32, ("world", "row"), owner="placement"),
-    Field("row_parent", wp.int32, ("world", "row"), fill=-1, owner="placement"),
-    Field("row_mu", wp.float32, ("world", "row"), owner="placement"),
-    Field("row_restitution", wp.float32, ("world", "row"), owner="placement"),
-    Field("row_beta", wp.float32, ("world", "row"), owner="placement"),
-    Field("phi", wp.float32, ("world", "row"), owner="placement"),
-    Field("target_velocity", wp.float32, ("world", "row"), owner="placement"),
-    Field("row_sides", wp.vec2i, ("world", "row"), owner="placement"),
+    Field("rhs", wp.float32, ("line", "row"), owner="placement"),
+    Field("row_incident", wp.float32, ("line", "row"), owner="placement"),
+    Field("impulses", wp.float32, ("line", "row"), owner="placement"),
+    Field("diag", wp.float32, ("line", "row"), owner="placement"),
+    Field("row_type", wp.int32, ("line", "row"), owner="placement"),
+    Field("row_parent", wp.int32, ("line", "row"), fill=-1, owner="placement"),
+    Field("row_mu", wp.float32, ("line", "row"), owner="placement"),
+    Field("row_restitution", wp.float32, ("line", "row"), owner="placement"),
+    Field("row_beta", wp.float32, ("line", "row"), owner="placement"),
+    Field("phi", wp.float32, ("line", "row"), owner="placement"),
+    Field("target_velocity", wp.float32, ("line", "row"), owner="placement"),
+    Field("row_sides", wp.vec2i, ("line", "row"), owner="placement"),
 )
 """The row store: every world line's rows, the dense class's then the free bodies' (from the line's body base,
 ``body_base``, at most ``dense_max_constraints``): the system and the row records (with each row's sides). One row index
@@ -45,7 +45,7 @@ def line_size(array: str) -> str:
     return f"({array}.strides[0] / (int)sizeof(*{array}.data))"
 
 
-ROW_RECORDS = FieldGroup(Field("row_record", wp.int32, ("world", "record"), owner="placement"))
+ROW_RECORDS = FieldGroup(Field("row_record", wp.int32, ("line", "record"), owner="placement"))
 """The streamed rows' records, which the sweeps' row loops load a row ahead, stored by the rows' writers
 (:func:`.response_builds_rows.write_row_record`): the dense rows' from the plan's first streamed row, then the free
 rows' headers after them (:func:`.row_metadata.record_layout`). The free rows themselves are the line's, from its body
