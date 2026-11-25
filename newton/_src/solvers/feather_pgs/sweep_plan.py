@@ -383,6 +383,10 @@ class Sweep:
         # The dense line by colors of groups (sweep_routes.group_rows), when a world of many trees can take it.
         self.grouped_sweep = None
         self.mf_grouped_kernel = None
+        # The block forms' friction records (the colored units', a grouped world's), formed by a launch of their text
+        # without the sweeps ahead of them, spread over each world's group of blocks (GeneralSweep.spread): each
+        # form's records config, kernel and blocks a world.
+        self.block_records = {}
         self.claim_grouped = -1
         self.region_slot = None
         self.general_active_reason = None
@@ -611,10 +615,13 @@ class Sweep:
                 self.mf_records_kernel = sweep_kernel(self.general_records)
             self.mf_gs_kernel = self.sweep("mf_gs", self.general_sweep)
             if colored:
-                self.colored_sweep = dataclasses.replace(colored_sweep, records=self.placement.record_first)
+                colored_sweep = dataclasses.replace(colored_sweep, records=self.placement.record_first)
+                colored_sweep = self._block_records("colored", colored_sweep, capable.size, model)
+                self.colored_sweep = colored_sweep
                 self.mf_colored_kernel = self.sweep("mf_colored", self.colored_sweep)
             if grouped_sweep is not None:
-                self.grouped_sweep = dataclasses.replace(grouped_sweep, records=self.placement.record_first)
+                grouped_sweep = dataclasses.replace(grouped_sweep, records=self.placement.record_first)
+                self.grouped_sweep = self._block_records("grouped", grouped_sweep, grouped_worlds.size, model)
                 self.mf_grouped_kernel = self.sweep("mf_grouped", self.grouped_sweep)
             if parallel_rows > 0:
                 # The producer's sink, a tier's by data and the device (sweep_routes_tiers.emits): a tier that takes EMIT
@@ -693,10 +700,17 @@ class Sweep:
                 mapped = (*records, *mapped)
             if colored:
                 slots = self.colored_units.slot_count if self.colored_units is not None else int(capable.size)
+                if "colored" in self.block_records:
+                    # In line with the sweep, on its stream: the records it reads, then the sweep.
+                    config, kernel, ranks = self.block_records["colored"]
+                    mapped += self._claim_launch(config, kernel, slots, self.claim_colored, ranks=ranks)
                 mapped += self._claim_launch(
                     self.colored_sweep, self.mf_colored_kernel, slots, self.claim_colored, ranks=self.world_blocks
                 )
             if grouped_sweep is not None:
+                if "grouped" in self.block_records:
+                    config, kernel, ranks = self.block_records["grouped"]
+                    mapped += self._claim_launch(config, kernel, int(grouped_worlds.size), self.claim_grouped, ranks=ranks)
                 mapped += self._claim_launch(
                     self.grouped_sweep,
                     self.mf_grouped_kernel,
@@ -968,6 +982,21 @@ class Sweep:
         layout = shape(self._launch_work(config, items), device(self.model.device))
         return dataclasses.replace(config, places=config.places.placed(layout.staging))
 
+    def _block_records(self, form: str, config: SweepConfig, worlds: int, model) -> SweepConfig:
+        """A block form's sweep (``form``: the colored units' or a grouped world's, over ``worlds`` worlds) with its friction
+        records formed ahead of it, where it reads them: a launch of the form's text without its sweeps
+        (:attr:`.sweep_routes.GeneralSweep.spread`), each world over as many blocks as its rows can fill at a contact a
+        thread, within the blocks the device holds over the worlds (:attr:`block_records`). The sweep forms none."""
+        if not (config.torsion or config.colored) or config.regions:
+            return config
+        records = dataclasses.replace(config, formed="stage", solve_policy=SolvePolicy(), world_blocks=False)
+        found = device(model.device)
+        held = shape(self._launch_work(records, int(worlds)), found).blocks_per_sm
+        rows = self.placement.mf_max_constraints if config.colored else self.placement.dense_max_constraints
+        ranks = max(min(held * found.sms // max(int(worlds), 1), -(-int(rows) // sweep_routes.COLORED_THREADS)), 1)
+        self.block_records[form] = (records, sweep_kernel(records), ranks)
+        return dataclasses.replace(config, formed="ahead")
+
     def _claim_launch(
         self, config: SweepConfig, kernel: wp.Kernel, items: int, bucket: int, buckets: int = 1, ranks: int = 1
     ) -> tuple[SweepLaunch, ...]:
@@ -978,7 +1007,7 @@ class Sweep:
         world returns from the launch that is not its own (:meth:`.sweep.WorldRows.admission`)."""
         layout = shape(self._launch_work(config, items), device(self.model.device))
         named = functools.partial(self._mapped_operands, bucket, buckets, layout.grid * layout.groups)
-        if ranks > 1:
+        if ranks > 1 or getattr(config, "spread", False):
             named = functools.partial(lambda base: {**base(), "world_blocks": ranks}, named)
         places = config.places
         if not places.wide_slots:

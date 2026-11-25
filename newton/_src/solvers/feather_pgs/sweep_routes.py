@@ -367,6 +367,9 @@ and entries of the unit pool, the worlds' color counts, and the pool's colors, s
 (:data:`.sweep_units.WORLD_FIELDS`, :data:`.sweep_units.SLOT_PLACES`, :data:`.sweep_units.UNIT_FIELDS`,
 :data:`.sweep_units.SLOT_FIELDS`) before ``v_out``."""
 
+COLORED_GROUP_ABI = kernel_template.params(COLORED_ABI[0], ("rank", int), ("group", int), *COLORED_ABI[1:])
+"""The colored mapping's ABI over a world's group of blocks (its records stage, :attr:`GeneralSweep.spread`)."""
+
 
 _UNIT_ROWS = (("n", "unit_jv0", "unit_dn"), ("t1", "unit_jv1", "unit_dt1"), ("t2", "unit_jv2", "unit_dt2"))
 """A colored unit's rows: each one's partial sum, velocity term and deferred change, at ``E``'s ``12 r``."""
@@ -1598,8 +1601,12 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         # The dense contacts' records: formed here, or by the stage launch that runs this text without its sweeps
         # ahead of it (``formed``), so the sweep's own code holds none of the formation.
         if sweep.formed != "ahead":
+            # A block form's stage launch: the world's group of blocks, a contact a thread (spread).
+            spread = block and sweep.formed == "stage"
             metric_stage = (
-                friction_record_stage(dense, dense_op, end="m_dense", record=dense_record, block=grouped, pad="    ")
+                friction_record_stage(
+                    dense, dense_op, end="m_dense", record=dense_record, block=grouped or spread, spread=spread, pad="    "
+                )
                 + "\n"
             )
         if free_rows and not colored and not sweep.regions and sweep.formed != "stage":
@@ -1661,18 +1668,20 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         # The units' records at the line's stride, with the normal's couplings a unit moves its rows' terms by.
         listed = ("color_offset.data[off_color + color_count.data[world]]", COLOR_SLOT, "record_stride")
         # No unit ran yet (turns are at least zero), before the records' barrier.
-        metric_build = (
-            f"    for (int d = tid; d < {ran_slots(D)}; d += blockDim.x) s_ran[d] = -1;\n"
-            + friction_record_stage(
-                free,
-                free_op,
-                end="mf_contact_end",
-                record=unit_metric("unit.x"),
-                declare=sides,
-                units=listed,
-                pad="    ",
-            )
+        ran = f"    for (int d = tid; d < {ran_slots(D)}; d += blockDim.x) s_ran[d] = -1;\n"
+        unit_records = friction_record_stage(
+            free,
+            free_op,
+            end="mf_contact_end",
+            record=unit_metric("unit.x"),
+            declare=sides,
+            units=listed,
+            spread=sweep.formed == "stage",
+            pad="    ",
         )
+        # The units' records: formed here (inline), by the stage launch over the world's group of blocks (stage), whose
+        # sweep forms none (ahead).
+        metric_build = {"inline": ran + unit_records, "stage": unit_records, "ahead": ran}[sweep.formed]
         trace_reduction = ""
         if solve_policy.traces:
             trace_reduction = block_argmax(COLORED_THREADS // 32, warp="warp", lane="lane")[0]
@@ -1958,6 +1967,15 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     }}{free_loads}
     for (int d = {thread}; d < {D}; d += {threads}) s_v[d] = 0.0f;
 {end_alone}"""
+    records_stage = f"{alone + metric_stage + end_alone if grouped else first_warp + metric_stage + end_first_warp}"
+    if block and sweep.formed == "stage":
+        # A block form's stage launch (spread over the world's group of blocks): every block stages the rows' records
+        # its share reads, then forms its contacts' records; it clears and solves nothing.
+        start = f"""    for (int i = {thread}; i < m_dense; i += {threads}) {{
+{dense_loads}
+    }}
+"""
+        records_stage = metric_stage
     body = f"""{head}
 
     {dense_count}
@@ -1981,7 +1999,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
 {dense_view}{free_view}{trace_reduction}
 {friction_laws}
 {start}    {barrier}
-{seed}{alone + metric_stage + end_alone if grouped else first_warp + metric_stage + end_first_warp}{metric_build}{chr(10) if level_marks else ""}{level_marks}
+{seed}{records_stage}{metric_build}{chr(10) if level_marks else ""}{level_marks}
 {rest}"""
     # The rows' layout is the configuration's: rows as wide as the world (and no classes) sit at their coordinates.
     packed = PACKED_SIDES_DENSE if not sweep.support_classes and max_row_dofs == D else PACKED_SIDES_BY_SIDE
@@ -2081,8 +2099,10 @@ class GeneralSweep(SweepConfig):
             raise ValueError(
                 f"a sweep's dense friction records are formed inline, ahead or as the stage, got {self.formed}"
             )
-        if self.formed != "inline" and (self.colored or not self.torsion):
-            raise ValueError("the dense friction records form ahead of the warp mapping's sweep, where it forms them")
+        if self.formed != "inline" and not (self.torsion or self.colored):
+            raise ValueError("friction records form ahead of a sweep only where it reads them: spin rows, colored units")
+        if self.formed == "stage" and (self.colored or self.grouped) and self.world_blocks:
+            raise ValueError("a block form's records stage spreads over the world's group of blocks itself (spread)")
         if self.formed == "stage" and self.solve_policy.counts:
             raise ValueError("the records stage runs no sweep: it is no solve and carries no readout")
         if self.colored and (self.active_rows or self.contact_units or self.block_warps != 1):
@@ -2097,11 +2117,10 @@ class GeneralSweep(SweepConfig):
             or self.one_tree
             or self.block_warps != 1
             or self.lanes_per_world != 32
-            or self.formed != "inline"
         ):
             raise ValueError(
                 "the grouped mapping sweeps the dense line of a world of many trees, a world a block, its colors' "
-                "groups a warp each in slot order, forming its records itself"
+                "groups a warp each in slot order"
             )
         if self.coordinate_levels and (self.colored or self.active_rows or not self.support_classes):
             raise ValueError("the coordinate levels read the rows' support classes and precede every row in order")
@@ -2136,10 +2155,17 @@ class GeneralSweep(SweepConfig):
         return device_lanes(self.device_arch, 32 * self.block_warps) // self.lanes
 
     @property
+    def spread(self) -> bool:
+        """Whether the launch is a block form's records stage, spread over each world's group of blocks (:func:`worlds`'
+        ranks): a contact a thread."""
+        return self.formed == "stage" and (self.colored or self.grouped)
+
+    @property
     def ABI(self) -> tuple:
-        if self.world_blocks:
-            return GROUP_ABI
-        return COLORED_ABI if self.colored and not self.regions else MF_GS_ABI
+        units = self.colored and not self.regions
+        if self.world_blocks or self.spread:
+            return COLORED_GROUP_ABI if units else GROUP_ABI
+        return COLORED_ABI if units else MF_GS_ABI
 
     @property
     def NATIVE(self) -> str:
@@ -2204,7 +2230,7 @@ class GeneralSweep(SweepConfig):
     def dispatch(self, staging: Staging) -> Dispatch:
         # The warp mapping walks the general sweep's cost classes (sweep_levels.COST_CLASSES), the colored one its bucket.
         classes = not (self.colored or self.grouped)
-        if self.world_blocks:
+        if self.world_blocks or self.spread:
             return worlds(lanes=self.lanes, ranks="world_blocks")
         return (
             worlds(self.groups, self.lanes, classes) if self.groups > 1 else worlds(lanes=self.lanes, classes=classes)

@@ -2257,6 +2257,7 @@ def friction_record_stage(
     declare: str = "",
     units: tuple[str, str, str] | None = None,
     block: bool = False,
+    spread: bool = False,
     pad: str,
 ) -> str:
     """Before the sweeps, form the record of every friction contact of a class's rows ``[0, end)`` at
@@ -2267,7 +2268,9 @@ def friction_record_stage(
     ``units`` (their count, the ``int4`` of the unit at place ``{}``: its normal row and rows first, and the stride of
     a record's floats) form theirs a thread a unit at ``record(place)``, slot-major, a triple's whenever it has a spin
     row, with ``W_nt1, W_nt2, W_ns`` last: a unit moves its rows' terms by its normal's change (:class:`UnitZ`).
-    A ``block``'s threads (a world a block) form a contact each, else the world's lanes."""
+    A ``block``'s threads (a world a block) form a contact each, else the world's lanes; with ``spread`` (a ``block``'s,
+    or the ``units``') the world's group of blocks (:func:`.sweep_routes.worlds`' ranks, ``rank`` of ``group``) form
+    them, each block a share, a contact a thread."""
     kind, parent = rows.scan()
     serial = dataclasses.replace(op, lanes=Lanes(1, "0"))
     sums = (
@@ -2315,18 +2318,24 @@ def friction_record_stage(
             contact,
             "}",
         ]
-        text = f"for (int first = 0; first < {count}; first += (int)blockDim.x) " + _block(head, "")
+        start, step = ("rank * (int)blockDim.x", "group * (int)blockDim.x") if spread else ("0", "(int)blockDim.x")
+        text = f"for (int first = {start}; first < {count}; first += {step}) " + _block(head, "")
         return indent(f"{text}\n__syncthreads();", pad)
+    if spread and not block:
+        raise ValueError("a world's group of blocks forms its records a thread a contact: a block's form")
     thread, stride, sync = (
         ("(int)threadIdx.x", "(int)blockDim.x", "__syncthreads();") if block else ("LANE", "STRIDE", "SYNC();")
     )
+    start = "rank * (int)blockDim.x" if spread else "0"
+    if spread:
+        stride = "group * (int)blockDim.x"
     head = [
         f"const int head = first + {thread};",
         f"if (head < {end} && {kind('head')} == {ROW_FRICTION} && ({parent('head')}) + 1 == head) {{",
         contact,
         "}",
     ]
-    text = f"for (int first = 0; first < {end}; first += {stride}) " + _block(head, "")
+    text = f"for (int first = {start}; first < {end}; first += {stride}) " + _block(head, "")
     return indent(f"{text}\n{sync}", pad)
 
 
