@@ -112,7 +112,7 @@
   "sweep_routes.GeneralSweep(192, 64, 22, '120', free_rows=False, solve_policy=SolvePolicy(readout='sweeps'))": "08dda8c325ea7d7a21cbc86eb090e236383df9d5c227131f86431fc022568569",
   "sweep_routes.GeneralSweep(192, 64, 22, '120', solve_policy=SolvePolicy(readout='sweeps'))": "67d312ebd6abe7efffc08a569d722fb43a1147699750f721eee66b6802972b81",
   "sweep_routes.GeneralSweep(64, 32, 12, '120', coordinate_levels=True, max_row_dofs=7, places=RowPlaces(SHARED, SHARED), support_classes=True)": "25b6cae31964527c066756a61568e5d949e2f466d79a92dd4d484fdcf1d24da5",
-  "sweep_routes.GeneralSweep(64, 32, 12, '120', coordinate_levels=True, max_row_dofs=7, places=RowPlaces(STREAMED, SHARED), support_classes=True)": "961c0806902e44fe5a042674ea3220fa67ba32a67321262eeff4325f1e5fddba",
+  "sweep_routes.GeneralSweep(64, 32, 12, '120', coordinate_levels=True, max_row_dofs=7, places=RowPlaces(STREAMED, SHARED), support_classes=True)": "a8359be31a8f5f1760e2e6f290bf7cbfc1c1f7c9e58266f760dce554f0dbd1d9",
   "sweep_routes.GeneralSweep(64, 32, 12, '120', free_rows=False)": "7892bf20753b4cdfcfd84499a4edd3a415c96323cbce4b6e379def75ca700063",
   "sweep_routes.GeneralSweep(64, 32, 12, '120', free_rows=True)": "363a25730cffc19ba056912a19825ddf3c7d21ad9ef7a04c196564c9e8d22265",
   "sweep_routes.GeneralSweep(64, 32, 12, '120', max_row_dofs=7, places=RowPlaces(SHARED, SHARED), support_classes=True)": "afd91da3e57092791a0494f8bd634465701d7cee43271dcf38e2b79be061a828",

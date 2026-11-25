@@ -2142,13 +2142,15 @@ class Pipelined:
     prologue: Callable[[str], str]
     consume: Callable[[str, str], str]
     begin: str = "0"
+    step: str = "++i"
+    """The loop's step: the next slot, or the next row the visits read (``i = pipe_next``, :func:`_visit_pipeline`)."""
 
     def inner(self, pad: str) -> str:
         return pad + "    "
 
     def wrap(self, visit: str, pad: str) -> str:
         return (
-            f"{self.prologue(pad)}\n{pad}for (int i = {self.begin}; i < {self.end}; ++i) {{\n"
+            f"{self.prologue(pad)}\n{pad}for (int i = {self.begin}; i < {self.end}; {self.step}) {{\n"
             f"{self.consume('i', pad + '    ')}\n{visit}\n{pad}}}"
         )
 
@@ -2435,6 +2437,69 @@ def _record_pipeline(rows: WorldRows, op, end: str, begin: str = "0") -> Pipelin
     )
 
 
+HELD = ("held_parent", "held_row", "held_sib", "held_spin")
+"""The impulses a dense row's visit reads, loaded while the row before it is visited (:func:`_visit_pipeline`): those
+of rows ``i - 1`` (a first tangent's normal, its patch ring's first), ``i``, ``i + 1`` and ``i + 2`` (a first tangent's
+second tangent, for its zero pair's test, and spin row)."""
+
+
+def _visit_load(rows: WorldRows, row: str, begin: str, end: str, torsion: bool, indent: str) -> str:
+    """Load what row ``row``'s visit reads first into the pipeline's registers: its record (``pre_a``, ``pre_b``), the
+    impulses of :data:`HELD` that lie in ``[begin, end)`` (``pre_held_*``), and under ``torsion`` the kind word of row
+    ``row + 2``, a first tangent's spin row if it has one (``pre_probe``)."""
+    lines = [rows.load_record(tuple(f"pre_{name[-1]}" for name in rows.registers), row, indent)]
+    rows_held = (
+        (f"({row}) - 1", f"({row}) > ({begin})"),
+        (row, ""),
+        (f"({row}) + 1", f"({row}) + 1 < ({end})"),
+        (f"({row}) + 2", f"({row}) + 2 < ({end})"),
+    )
+    for name, (at, inside) in zip(HELD, rows_held, strict=True):
+        value = rows.peek(at)
+        lines.append(f"{indent}pre_{name} = {f'{inside} ? {value} : 0.0f' if inside else value};")
+    if torsion:
+        lines.append(f"{indent}pre_probe = ({row}) + 2 < ({end}) ? {rows.word(f'({row}) + 2', 3)} : 0;")
+    return "\n".join(lines)
+
+
+def _visit_pipeline(rows: WorldRows, end: str, begin: str, torsion: bool) -> Pipelined:
+    """A dense class's rows ``[begin, end)`` in slot order, stepping from row to row the visits read (a first
+    tangent's second tangent and spin row are its visit's), each row's record and the impulses its visit reads
+    (:func:`_visit_load`) loaded while the row before it is visited.
+
+    A row's visit stores only its own impulses (its pair's and spin row's with a first tangent), all before the next
+    row, so the loaded impulses are those a load at the next row's visit reads, but one: the next row's normal
+    ``i - 1`` (its patch ring's first) when it is the row just visited, which the visit's store sets
+    (:func:`row_step`). The visits read the same values in the same order: a move."""
+
+    def consume(row: str, indent: str) -> str:
+        lines = [f"{indent}const int4 {name} = pre_{name[-1]};" for name in rows.registers]
+        lines += [f"{indent}const float {name} = pre_{name};" for name in HELD]
+        spin = ""
+        if torsion:
+            lines.append(f"{indent}const int held_probe = pre_probe;")
+            spin = f" + ({row} + 2 < ({end}) && (held_probe & 0xFFFF) == {ROW_TORSION} ? 1 : 0)"
+        kind, parent = rows.kind(row), rows.parent(row, enclosed=True)
+        lines += [
+            f"{indent}pipe_next = {kind} == {ROW_FRICTION} && {row} == {parent} + 1 ? {row} + 2{spin} : {row} + 1;",
+            f"{indent}if (pipe_next < {end}) {{",
+            _visit_load(rows, "pipe_next", begin, end, torsion, indent + "    "),
+            f"{indent}}}",
+        ]
+        return "\n".join(lines)
+
+    def prologue(pad: str) -> str:
+        held = ", ".join(f"pre_{name} = 0.0f" for name in HELD)
+        probe = f"{pad}int pre_probe = 0;\n" if torsion else ""
+        return (
+            f"{pad}int4 {', '.join(f'pre_{name[-1]}' for name in rows.registers)};\n{pad}float {held};\n{probe}"
+            f"{pad}int pipe_next = {begin};\n"
+            f"{pad}if ({end} > {begin}) {{\n{_visit_load(rows, begin, begin, end, torsion, pad + '    ')}\n{pad}}}"
+        )
+
+    return Pipelined(end, prologue, consume, begin, step="i = pipe_next")
+
+
 def row_step(
     rows: RowStore,
     op,
@@ -2449,6 +2514,7 @@ def row_step(
     metric: str | None = None,
     formed: Callable[[str], str] | None = None,
     reach: str | None = None,
+    pipelined: bool = False,
     pad: str = "            ",
 ) -> str:
     """Row ``i``'s step in a row loop over a store's rows ``[0, end)``: its kind read from the store, the schedule's
@@ -2467,7 +2533,10 @@ def row_step(
       (:func:`friction_laws`);
     - a row known where the step is emitted (``kind``, and a friction row's ``parent``) replaces its metadata, so the
       step compiles to that kind's law: a known kind is no spin row, and one other than friction admits no pair (the
-      sparse-diagonal sweep's chains).
+      sparse-diagonal sweep's chains);
+    - ``pipelined``: the loop loaded the row's impulses, its patch ring's first and its spin row's kind while the row
+      before it was visited (:func:`_visit_pipeline`, :data:`HELD`); a store of the row before the next one's (its
+      normal) sets that row's loaded impulse.
 
     A spin row is skipped first (solved with its pair, here or in the triple phase), then ``admission``, the
     schedule's own skips; with ``reach`` (the live order's bound of the
@@ -2483,6 +2552,22 @@ def row_step(
         reach=reach,
         **({"root": rows.idle_root} if reach is not None and rows.record else {}),
     )
+    if pipelined:
+        # The pair's second tangent is read where its law reads it: held from the row before, the compiler contracts
+        # the law's products otherwise (a rounding change), while the zero pair's test reads the held one.
+        loaded = {"i": "held_row", "i + 1": "held_sib", "spin": "held_spin"}
+
+        def store(row: str, value: str) -> str:
+            return f"{{ {rows.store(row, value)} if (({row}) == pipe_next - 1) pre_held_parent = {value}; }}"
+
+        # A visited first tangent's normal is row i - 1, and its spin row, if any, row i + 2.
+        ctx = dataclasses.replace(
+            ctx,
+            load=lambda row: loaded.get(row) or rows.load(row),
+            store=store,
+            ring_load=lambda parent, load=None: rows.ring_load(parent, load or "held_parent"),
+            spin_row=lambda parent: f"(i + 2 < ({end}) && (held_probe & 0xFFFF) == {ROW_TORSION} ? i + 2 : -1)",
+        )
     hold = {}
     if held:
         registers = {"i": "row_impulse", "sib": "pair_impulse"}
@@ -2566,10 +2651,10 @@ def rows_block(
         visit = f"{indent(unit, inner)}\n{visit}" if unit else visit
         return order.wrap(indent(rows.visit("i"), inner) + "\n" + visit if rows.record else visit, pad)
     if not rows.free:
-        visit = row_step(rows, op, laws, **step, pad=inner)
+        visit = row_step(rows, op, laws, **step, pipelined=rows.record, pad=inner)
         visit = f"{indent(unit, inner)}\n{visit}" if unit else visit
         if rows.record:
-            return f"{pad}{{\n{_record_pipeline(rows, op, end, begin).wrap(visit, pad)}\n{pad}}}"
+            return f"{pad}{{\n{_visit_pipeline(rows, end, begin, laws.torsion).wrap(visit, pad)}\n{pad}}}"
         return SlotOrder(end, begin).wrap(visit, pad)
     ctx = RowContext(
         row="i",
