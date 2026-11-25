@@ -221,12 +221,15 @@ def _bound_topology(
     generation: wp.array[wp.int32],
     stream: wp.int64,
     built_frame: wp.array[wp.int64],
+    home: wp.array[int],
     # outputs
     topology_rows: wp.array[int],
     diag: wp.array2d[float],
     contact_rows_kept: wp.array2d[int],
     world_held: wp.array[int],
     pass_words: wp.array[int],
+    world_run: wp.array[wp.vec2i],
+    arena_cursor: wp.array[int],
 ):
     """Record where each world's topology rows (mimics, links, joint limits) end and its contacts start, decide whether
     the step keeps the world's contact rows, and zero its first ``cleared`` dense rows' diagonals: the free bodies'
@@ -242,7 +245,9 @@ def _bound_topology(
     world reserves (``reserve_world_rows``), which the reservation's extent follows.
 
     One linear launch of ``worlds * max(cleared, 1)`` threads: thread ``t`` below the worlds decides world ``t`` (whole
-    warps of worlds), and every thread clears ``diag[t // cleared, t % cleared]`` (a world's row after row).
+    warps of worlds), and every thread clears row ``t % cleared`` of world ``t // cleared``'s home line. On a new frame
+    (every world reserves) the arena's runs start over; on a kept frame a world that reserves anew may keep its run
+    (:func:`.row_slots.reserve_world_rows_kernel`).
     """
     t = wp.tid()
     worlds = topology_rows.shape[0]
@@ -260,18 +265,66 @@ def _bound_topology(
             slot_counter[0, world] = dense + contact_rows_kept[0, world]
             slot_counter[1, world] = slot_counter[1, world] + contact_rows_kept[1, world]
         else:
-            # The reservation writes a listed world's rows; a world without contacts adds none.
+            # The reservation writes a listed world's rows (and claims its run anew); a world without contacts adds
+            # none.
             contact_rows_kept[0, world] = 0
             contact_rows_kept[1, world] = 0
+        # A new frame: every world reserves, so the arena's runs start over.
+        if kept == 0:
+            world_run[world] = wp.vec2i(-1, 0)
         # The words, once: on a new frame every world reserves; on a kept frame only a world that does not keep its
         # slots (rare) stores the extent.
         if world == 0:
             pass_words[0] = kept
+            if kept == 0:
+                arena_cursor[0] = 0
         if (kept == 0 and world == 0) or (kept != 0 and held == 0):
             pass_words[1] = live
     if cleared > 0:
         if t < worlds * cleared:
-            diag[t // cleared, t % cleared] = 0.0
+            diag[home[t // cleared], t % cleared] = 0.0
+
+
+@wp.func_native("""
+    const unsigned char* const from = reinterpret_cast<const unsigned char*>(source);
+    unsigned char* const to = reinterpret_cast<unsigned char*>(target);
+    for (long long b = 0; b < bytes; ++b) to[b] = from == nullptr ? 0 : from[b];
+""")
+def _copy_bytes(target: wp.uint64, source: wp.uint64, bytes: wp.int64): ...
+
+
+@wp.kernel
+def _move_to_runs(
+    home: wp.array[int],
+    run_of: wp.array[wp.vec2i],
+    topology_rows: wp.array[int],
+    slot_counter: wp.array2d[int],
+    capacity: int,
+    fields: wp.array[wp.uint64],
+    row_bytes: wp.array[wp.int64],
+    line_bytes: wp.array[wp.int64],
+    diag: int,
+    # outputs
+    first: wp.array[int],
+):
+    """Take each world whose rows run in the arena (``run_of``, the reservation's claim, or kept while it holds its
+    slots) to its run: its topology rows, which its producers wrote at its home line this step, copied there in every
+    field laid out by line and row (``fields``: their addresses, their rows' bytes and their lines' bytes), and its
+    contact rows' diagonals zeroed for the one writer's sums (field ``diag``). A thread a world and field."""
+    world, field = wp.tid()
+    run = run_of[world][0]
+    if run < 0:
+        return
+    if field == 0:
+        first[world] = run
+    rows = topology_rows[world]
+    size = row_bytes[field]
+    at = fields[field] + wp.uint64(run) * wp.uint64(line_bytes[field])
+    _copy_bytes(at, fields[field] + wp.uint64(home[world]) * wp.uint64(line_bytes[field]), wp.int64(rows) * size)
+    if field == diag:
+        count = wp.min(slot_counter[0, world], capacity)
+        if count > rows:
+            _copy_bytes(at + wp.uint64(wp.int64(rows) * size), wp.uint64(0), wp.int64(count - rows) * size)
 
 
 @wp.kernel
@@ -280,14 +333,18 @@ def _clear_dense_row_state(
     first_rejected: wp.array2d[int],
     count: wp.array2d[int],
     dropped: wp.array2d[int],
+    home: wp.array[int],
     acts: wp.array[int],
     pass_words: wp.array[int],
+    first: wp.array[int],
 ):
     """Clear each row class's allocation state and row-loss counters (by class and world), the free bodies' row count
-    and the world's acts word, in one launch. The dense rows' count stands until their producers' finalize: the last
-    step's rows are cleared by it. The rows' impulses start where the counts are final
-    (:func:`.warm_start.prepare_world_impulses`)."""
+    and the world's acts word, in one launch, and take each world to its home line, where the step's topology rows are
+    written (a world whose rows run in the arena moves to its run once they are, :func:`_move_to_runs`). The dense
+    rows' count stands until their producers' finalize: the last step's rows are cleared by it. The rows' impulses
+    start where the counts are final (:func:`.warm_start.prepare_world_impulses`)."""
     world = wp.tid()
+    first[world] = home[world]
     for row_class in range(2):
         slot_counter[row_class, world] = 0
         first_rejected[row_class, world] = ROW_SLOT_UNBOUNDED
@@ -316,7 +373,7 @@ def _latch_world(
     """Latch ``world``'s invalid status until reset: a row class (by class and world) that reserved past its
     ``capacity`` or dropped rows, or the contacts' overflow; a class past its capacity also keeps its largest
     reservation (``demand``) and counts in the host's drop record (:data:`ROW_DROP_WORDS`): a world's pass that dropped
-    rows, the largest reservation of each class."""
+    rows (past its capacity, or past its line where the arena held no run), the largest reservation of each class."""
     invalid = contact_count[0] > contact_capacity or reduction_overflow[0] != 0
     dropped_rows = bool(False)
     for row_class in range(2):
@@ -327,6 +384,7 @@ def _latch_world(
             dropped_rows = True
         if asked > capacity[row_class] or dropped[row_class, world] > 0:
             invalid = True
+            dropped_rows = True
     if dropped_rows:
         wp.atomic_add(record, 0, wp.int32(1))
     if invalid:
@@ -469,6 +527,7 @@ class Placement:
         # The line of the row store where each world's rows sit: the dense class's from row 0, the free bodies' from
         # ``body_base``.
         worlds = np.arange(forest.world_count, dtype=np.int32)
+        self.home_first = wp.array(worlds, dtype=wp.int32, device=model.device)
         self.dense_first = wp.array(worlds, dtype=wp.int32, device=model.device)
         # Launches over the contact capacity (the force export, the warm start's carry and gathers) grid-stride over
         # about one wave of blocks.
@@ -484,18 +543,9 @@ class Placement:
         # The streamed rows' records, once the sweep's plan places them (allocate_row_records).
         self.row_record, self.writes_records = None, False
         # The row store's line: the dense class's rows, then (with free rigid bodies) the free bodies' from the line's
-        # body base, by line (``body_base``): the row where its free rows start, which every free row's slot counts
-        # from (the dense capacity until the store follows the live rows).
-        lines = max(forest.world_count, 1)
-        self.body_base = wp.full(lines, self.dense_max_constraints, dtype=wp.int32, device=model.device)
+        # body base (lay_out_lines), at most the capacities' line.
         self.row_pitch = spec.capacities.row_pitch
-        # The row store's lines (one a world) and their length: the rows from one line to the next, the outer stride of
-        # the store's arrays, which the native bodies read from the arrays themselves (row_records.line_size), here the
-        # capacities' line. A line field's arrays are runs of lines at that stride (field_group.SolverArrays.array):
-        # its rows, and its friction records a slot per three rows.
-        self.lines = forest.world_count
-        self.line_rows = self.row_pitch
-        self.arrays.line_strides.update(row=self.line_rows, contact=-(-self.line_rows // 3))
+        self.lay_out_lines(self.row_pitch, 0)
         # All inactive weight arguments alias this one element. Their producer kernels skip stores and their consumer
         # kernels skip reads when regularization is disabled.
         self.contact_row_w_dummy = self.arrays.placeholder(wp.float32, (1, 1), 1.0)
@@ -1004,8 +1054,14 @@ class Placement:
         wp.launch(
             _clear_dense_row_state,
             dim=self.forest.world_count,
-            inputs=[self.row_slot_counter, self.row_first_rejected, self.row_count, self.row_dropped_all],
-            outputs=[self.world_acts, self.pass_words],
+            inputs=[
+                self.row_slot_counter,
+                self.row_first_rejected,
+                self.row_count,
+                self.row_dropped_all,
+                self.home_first,
+            ],
+            outputs=[self.world_acts, self.pass_words, self.dense_first],
             device=self.model.device,
         )
 
@@ -1050,10 +1106,12 @@ class Placement:
         record = self.row_drop_host.numpy()
         if record[0] == 0:
             return
+        refused = int(self.arena_record_host.numpy()[1])
+        arena = f"; the row store's arena held no run for {refused} claim(s)" if refused else ""
         raise RuntimeError(
             f"FeatherPGS: {int(record[0])} world pass(es) reserved rows past capacity and dropped them; "
-            f"{self._asked(record[1], record[2])}; the solver does not step without them. Build the solver with "
-            "that capacity, reset and recapture."
+            f"{self._asked(record[1], record[2])}{arena}; the solver does not step without them. Build the solver "
+            "with that capacity, reset and recapture."
         )
 
     def _asked(self, dense: int, free: int) -> str:
@@ -1226,6 +1284,71 @@ class Placement:
     # Step: the whitening and the diagonals
     # ---------------------------------------------------------------------------------------------------------------
 
+    def lay_out_lines(self, rows: int, arena: int) -> None:
+        """Lay out the row store, before its fields are allocated: a home line a world (``home_first``, where the step's
+        topology rows are written) and ``arena`` lines more, each ``rows`` rows long, the outer stride of the store's
+        arrays (which the native bodies read from the arrays themselves, :func:`.row_records.line_size`). A line
+        field's arrays are runs of lines at that stride (:meth:`.field_group.SolverArrays.array`): its rows, and its
+        friction records a slot per three rows. A world whose rows pass its line takes a run of the arena's lines in
+        the reservation (:func:`.row_slots.reserve_world_rows_kernel`); each line's free rows start at its body base,
+        a line's own (``body_base``, the dense rows' end, set by the reservation)."""
+        model, worlds = self.model, self.forest.world_count
+        self.line_rows, self.home_lines, self.arena_lines = int(rows), worlds, int(arena)
+        self.lines = worlds + self.arena_lines
+        self.line_geometry = wp.vec2i(self.line_rows, self.home_lines)
+        # The arena's lines mapped, on the device (the reservation's claims' bound), and its record in pinned memory the
+        # device writes and the host reads without synchronizing: the high water of the lines the claims reached and
+        # the claims it refused.
+        self.arena_bound = wp.array([self.arena_lines], dtype=wp.int32, device=model.device)
+        self.arena_record_host = wp.zeros(2, dtype=wp.int32, device="cpu", pinned=model.device.is_cuda)
+        self.arena_record = self.arena_record_host
+        if model.device.is_cuda:
+            self.arena_record = wp.array(
+                ptr=self.arena_record_host.ptr, dtype=wp.int32, shape=(2,), device=model.device
+            )
+        self.arrays.line_strides.update(row=self.line_rows, contact=-(-self.line_rows // 3))
+        self.body_base = wp.full(max(self.lines, 1), self.dense_max_constraints, dtype=wp.int32, device=model.device)
+        # Each world's run of the arena (-1 for its home line), kept while it holds its slots, and the arena's lines
+        # taken this frame.
+        self.world_run = wp.full(max(worlds, 1), wp.vec2i(-1, 0), dtype=wp.vec2i, device=model.device)
+        self.arena_cursor = wp.zeros(1, dtype=wp.int32, device=model.device)
+        self._run_fields = None
+
+    def move_to_runs(self) -> None:
+        """After the reservation, take each world whose rows run in the arena to its run (:func:`_move_to_runs`): none
+        without an arena."""
+        if not self.arena_lines or not self.forest.world_count:
+            return
+        # The store's fields (a feature's one-line placeholder holds no world's rows).
+        fields = [array for array in self.arrays.line_fields if array.shape[0] == self.lines]
+        if self._run_fields is None or self._run_fields[0] != len(fields):
+            device = self.model.device
+            self._run_fields = (
+                len(fields),
+                wp.array([int(a.ptr) for a in fields], dtype=wp.uint64, device=device),
+                wp.array([int(a.strides[1]) for a in fields], dtype=wp.int64, device=device),
+                wp.array([int(a.strides[0]) for a in fields], dtype=wp.int64, device=device),
+                next(i for i, a in enumerate(fields) if a.ptr == self.diag.ptr),
+            )
+        count, pointers, row_bytes, line_bytes, diag = self._run_fields
+        wp.launch(
+            _move_to_runs,
+            dim=(self.forest.world_count, count),
+            inputs=[
+                self.home_first,
+                self.world_run,
+                self.topology_rows,
+                self.row_slot_counter,
+                int(self.dense_max_constraints),
+                pointers,
+                row_bytes,
+                line_bytes,
+                diag,
+            ],
+            outputs=[self.dense_first],
+            device=self.model.device,
+        )
+
     def line_array(self, name: str, dtype, *, rows: int | None = None, fill=None) -> wp.array:
         """One field of the row store by line (``rows`` a line, the store's line by default), laid out as the store's
         fields are (:attr:`lines` at the store's line length)."""
@@ -1245,12 +1368,20 @@ class Placement:
         writes the dense rows' diagonals. The same launch decides which worlds keep their contacts' rows this step
         (``count``, ``generation``, ``stream`` and ``built_frame`` name the step's contact frame and the last build's,
         :func:`.friction_patches.frame_kept`)."""
-        cleared = int(self.dense_max_constraints) if self.clears_diagonals else 0
+        cleared = min(int(self.dense_max_constraints), int(self.line_rows)) if self.clears_diagonals else 0
         wp.launch(
             _bound_topology,
             dim=self.forest.world_count * max(cleared, 1),
-            inputs=[self.row_slot_counter, cleared, count, generation, stream, built_frame],
-            outputs=[self.topology_rows, self.diag, self.contact_rows_kept, self.world_held, self.pass_words],
+            inputs=[self.row_slot_counter, cleared, count, generation, stream, built_frame, self.home_first],
+            outputs=[
+                self.topology_rows,
+                self.diag,
+                self.contact_rows_kept,
+                self.world_held,
+                self.pass_words,
+                self.world_run,
+                self.arena_cursor,
+            ],
             device=self.model.device,
         )
 

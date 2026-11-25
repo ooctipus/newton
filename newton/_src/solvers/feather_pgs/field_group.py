@@ -109,6 +109,8 @@ class SolverArrays:
         """A line field's stride by its second dimension's name (:meth:`array`): the entries of that dimension from one
         line to the next, where they are fewer than the dimension holds."""
         self._line_buffers: list[wp.array] = []
+        self.line_fields: list[wp.array] = []
+        """Every field laid out by line and row: a world's rows move with it between lines (its run of the arena)."""
 
     @staticmethod
     def line_flat(array: wp.array) -> wp.array:
@@ -136,6 +138,12 @@ class SolverArrays:
         than a line). Its trailing dimensions are each entry's."""
         shape = field.shape(sizes)
         stride = self.line_strides.get(field.dims[1]) if len(field.dims) > 1 and field.dims[0] == "line" else None
+        array = self._lines(field, shape, stride)
+        if stride is not None and field.dims[1] == "row":
+            self.line_fields.append(array)
+        return array
+
+    def _lines(self, field: Field, shape: tuple, stride: int | None) -> wp.array:
         if stride is None or stride >= shape[1] or shape[0] == 0:
             return self._filled(shape, field)
         lines, rows, trailing = shape[0], shape[1], shape[2:]

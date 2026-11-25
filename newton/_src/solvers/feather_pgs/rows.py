@@ -784,14 +784,19 @@ class RowLaws:
                     max_constraints,
                     placement.mf_max_constraints,
                     1,
+                    placement.line_geometry,
+                    placement.arena_bound,
                     placement.row_order(self.friction_patches.current.keys, self.friction_patches.kept_frame()),
                     placement.row_groups,
                     placement.slot_counter,
                     mf_slot_counter,
-                    placement.body_base,
                     placement.contact_worlds,
                 ],
                 outputs=[
+                    placement.arena_cursor,
+                    placement.arena_record,
+                    placement.world_run,
+                    placement.body_base,
                     placement.contact_worlds_listed,
                     dense_dropped_rows,
                     mf_dropped_rows,
@@ -805,6 +810,8 @@ class RowLaws:
                 clamp=True,
                 block_dim=lanes if warps > 1 else RESERVE_BLOCK,
             )
+            # Each world whose rows run in the arena to its run (its topology rows written at home move with it).
+            placement.move_to_runs()
 
     def bound_free_body_contacts(self, solver) -> None:
         """Record where the free bodies' contact rows end in their run (staged with the run,

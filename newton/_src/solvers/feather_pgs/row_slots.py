@@ -1324,13 +1324,18 @@ def reserve_world_rows_kernel(grouped: bool, warps: int = 1):
         max_constraints: int,
         mf_max_constraints: int,
         row_capacity_telemetry: int,
+        lines: wp.vec2i,
+        arena_lines: wp.array[int],
         order: RowOrder,
         groups: RowGroups,
         world_slot_counter: wp.array[int],
         mf_slot_counter: wp.array[int],
-        body_base: wp.array[int],
         contact_worlds: wp.array[int],
         # outputs
+        arena_cursor: wp.array[int],
+        arena_record: wp.array[int],
+        world_run: wp.array[wp.vec2i],
+        body_base: wp.array[int],
         contact_worlds_listed: wp.array[int],
         dense_dropped_contact_rows: wp.array[int],
         mf_dropped_contact_rows: wp.array[int],
@@ -1440,6 +1445,49 @@ def reserve_world_rows_kernel(grouped: bool, warps: int = 1):
                 _group_rows(
                     order, groups, group_slot, first, pairs, rows, world_slot_counter[world], lanes, lane, warp, warps
                 )
+        # The world's line (``lines``: the store's line length and its home lines; ``arena_lines``, the arena's lines
+        # mapped): its home where its rows fit the line, else a run of the arena's lines, one claim (the run it holds
+        # this frame where that holds them), which it keeps while it holds its slots; its free rows from its body base,
+        # its dense rows' end. Where the arena holds no run, the rows past its home line are rejected (the capacity
+        # status), and the arena records the lines asked for (``arena_record``: the high water of the lines the
+        # claims reached, and the claims refused).
+        dense_total = world_slot_counter[world] + rows[0] + rows[2]
+        free_total = mf_slot_counter[world] + rows[1] + rows[3]
+        base = wp.min(dense_total, max_constraints)
+        extent = dense_total
+        if free_total > 0:
+            extent = base + free_total
+        line = data.first[world]
+        dense_cap = max_constraints
+        free_cap = mf_max_constraints
+        if extent > lines[0]:
+            if warp == 0 and lane == 0:
+                need = (extent + lines[0] - 1) // lines[0]
+                held_run = world_run[world]
+                if held_run[0] < 0 or held_run[1] < need:
+                    claim = wp.atomic_add(arena_cursor, 0, need)
+                    wp.atomic_max(arena_record, 0, claim + need)
+                    held_run = wp.vec2i(-1, 0)
+                    if claim + need <= arena_lines[0]:
+                        held_run = wp.vec2i(lines[1] + claim, need)
+                    else:
+                        wp.atomic_add(arena_record, 1, 1)
+                    world_run[world] = held_run
+            if wp.static(warps > 1):
+                lane_sync(threads)
+            else:
+                lane_sync(RESERVE_LANES)
+            run = world_run[world][0]
+            if run >= 0:
+                line = run
+            else:
+                dense_cap = wp.min(max_constraints, lines[0])
+                base = wp.min(base, dense_cap)
+                free_cap = wp.min(mf_max_constraints, wp.max(lines[0] - base, 0))
+        elif warp == 0 and lane == 0:
+            world_run[world] = wp.vec2i(-1, 0)
+        if warp == 0 and lane == 0:
+            body_base[line] = base
         # Each admitted contact's slot; each pair's head restores its trees (_order_islands' starting state).
         for c in range(first + warp * lanes + lane, end, threads):
             if data.world[c] != world:
@@ -1466,17 +1514,17 @@ def reserve_world_rows_kernel(grouped: bool, warps: int = 1):
             n = data.slots_needed[c]
             if path != 0:
                 slot = mf_slot_counter[world] + offset
-                if slot + n > mf_max_constraints:
+                if slot + n > free_cap:
                     wp.atomic_min(mf_first_rejected_slot, world, slot)
                     if row_capacity_telemetry != 0:
                         wp.atomic_add(mf_dropped_contact_rows, world, n)
                     data.slot[c] = -1
                     data.path[c] = -1
                 else:
-                    data.slot[c] = slot + body_base[data.first[world]]
+                    data.slot[c] = slot + base
             else:
                 slot = world_slot_counter[world] + offset
-                if slot + n > max_constraints:
+                if slot + n > dense_cap:
                     wp.atomic_min(dense_first_rejected_slot, world, slot)
                     if row_capacity_telemetry != 0:
                         wp.atomic_add(dense_dropped_contact_rows, world, n)
@@ -1486,7 +1534,7 @@ def reserve_world_rows_kernel(grouped: bool, warps: int = 1):
                     data.slot[c] = slot
                     if units.shape[0] > 0:
                         for r in range(n):
-                            units[data.first[world], slot + r] = unit_source(UNIT_CONTACT, 4 * c + r)
+                            units[line, slot + r] = unit_source(UNIT_CONTACT, 4 * c + r)
         if wp.static(warps > 1):
             lane_sync(threads)
         else:

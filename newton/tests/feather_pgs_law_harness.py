@@ -1551,9 +1551,14 @@ def allocate_contacts(operands, device) -> None:
         "world_held": wp.zeros(worlds, dtype=wp.int32, device=device),
         "contact_rows_kept": wp.zeros((2, worlds), dtype=wp.int32, device=device),
     }
-    # Each line's free rows from the dense capacity (the placement's body base before the store follows its rows).
-    if "body_base" not in values:
-        values["body_base"] = wp.full(worlds, int(values["max_constraints"]), dtype=wp.int32, device=device)
+    # Each world on its home line, its free rows from its body base (written by the reservation): lines as long as the
+    # scene's rows, no arena.
+    values.setdefault("body_base", wp.full(worlds, int(values["max_constraints"]), dtype=wp.int32, device=device))
+    values.setdefault("lines", wp.vec2i(int(values["max_constraints"]) + int(values["mf_max_constraints"]), worlds))
+    values.setdefault("arena_lines", wp.zeros(1, dtype=wp.int32, device=device))
+    values.setdefault("arena_cursor", wp.zeros(1, dtype=wp.int32, device=device))
+    values.setdefault("arena_record", wp.zeros(2, dtype=wp.int32, device=device))
+    values.setdefault("world_run", wp.full(worlds, wp.vec2i(-1, 0), dtype=wp.vec2i, device=device))
 
     # Each contact its own body pair: the scenes' contacts carry no frame.
     n = max(slots, 1)
