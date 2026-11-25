@@ -1044,7 +1044,10 @@ def _row_tail(ctx: RowContext, laws: RowLaws) -> list[str]:
             "if (spin_delta != 0.0f) {",
             change_vote(laws, (_spin_change(ctx),), "    "),
             indent(
-                op.axpy((("spin", "spin_delta"),), "", row=None if op.pair_with_visit else "spin").lstrip("\n"), "    "
+                op.axpy(
+                    (("spin", "spin_delta"),), "", row=None if op.pair_with_visit else "spin", kept=op.keeps_velocity
+                ).lstrip("\n"),
+                "    ",
             ),
             indent(idle_growth(ctx, (("spin", "spin_delta"),)), "    "),
             "}",
@@ -1057,7 +1060,10 @@ def _row_tail(ctx: RowContext, laws: RowLaws) -> list[str]:
         lines += [
             "if (delta_impulse != 0.0f || sib_delta != 0.0f) {",
             change_vote(laws, (row_change, sib_change), "    "),
-            indent(op.axpy((("sib", "sib_delta"), ("row", "delta_impulse")), "").lstrip("\n"), "    "),
+            indent(
+                op.axpy((("sib", "sib_delta"), ("row", "delta_impulse")), "", kept=op.keeps_velocity).lstrip("\n"),
+                "    ",
+            ),
             indent(idle_growth(ctx, (("sib", "sib_delta"), ("row", "delta_impulse"))), "    "),
             "}",
         ]
@@ -1073,7 +1079,7 @@ def _row_tail(ctx: RowContext, laws: RowLaws) -> list[str]:
         lines += [
             "if (delta_impulse != 0.0f) {",
             change_vote(laws, (row_change,), "    "),
-            indent(op.axpy((("row", "delta_impulse"),), "").lstrip("\n"), "    "),
+            indent(op.axpy((("row", "delta_impulse"),), "", kept=op.keeps_velocity).lstrip("\n"), "    "),
             indent(idle_growth(ctx, (("row", "delta_impulse"),)), "    "),
             "}",
         ]
@@ -1292,8 +1298,9 @@ def row_sums(
     the spin row's (``spin_jv``, ``spin_coupling``, ``spin_coupling_sibling``), reduced only by a triple; ``formed``
     (the laws on the contact's record) reduces the velocity terms alone.
     """
+    keep = {"keep_velocity": True} if op.keeps_velocity else {}
     if sibling is None:
-        return op.dot(((out, "row", None),), {"row": row}, pad)
+        return op.dot(((out, "row", None),), {"row": row}, pad, **keep)
     sums = ((out, "row", None), ("sibling_jv", "sib", None)) + (() if formed else (("pair_coupling", "row", "sib"),))
     rows, exists, apart = {"row": row, "sib": sibling}, {"sib": paired}, None
     if spin:
@@ -1301,7 +1308,7 @@ def row_sums(
         sums += ((spun[0], "spin", None),) + (() if formed else ((spun[1], "row", "spin"), (spun[2], "sib", "spin")))
         rows, exists = {**rows, "spin": "spin"}, {**exists, "spin": f"{paired} && spin >= 0"}
         apart = None if formed else ("spin >= 0", spun)
-    return op.dot(sums, rows, pad, exists=exists, apart=apart)
+    return op.dot(sums, rows, pad, exists=exists, apart=apart, **keep)
 
 
 FORMED_RECORD = ("friction_m0", "friction_m1", "friction_m2", "friction_m3")

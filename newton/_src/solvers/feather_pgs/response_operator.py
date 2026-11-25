@@ -102,6 +102,9 @@ class Velocity:
     """Where a sweep's rows read and update the velocity they act on: ``array[index]``."""
 
     array: str = "s_v"
+    held: bool = False
+    """The velocity lies a round trip away (global memory): a row's apply adds its changes to the values its reduction
+    read, kept in registers (``velocities``), and stores them, instead of reading them again."""
 
     def at(self, index: str) -> str:
         return f"{self.array}[{index}]"
@@ -124,6 +127,8 @@ class ResponseOperator:
     pair_with_visit = False
     """Whether the visited row's residual reduces its friction pair's sums in its own ladder (``sibling_jv``,
     ``pair_coupling``: :func:`.sweep.row_sums`), which the pair's terms then read instead of reducing their own."""
+    keeps_velocity = False
+    """Whether a row's reduction keeps the velocity it read for the row's applies (:attr:`Velocity.held`)."""
 
     def terms(self, out: str, rhs: str, *, whole: bool) -> str:
         """``S_i`` of a sum this operator reduced into ``out``, the magnitude of the terms its velocity sum adds, or a
@@ -461,7 +466,11 @@ class SparseFactor(ResponseOperator):
             head, guard = [], "indices[q]"
         target = self.velocity.at(guard)
         base = "velocities[q]" if kept else target
-        if len(changes) == 1:
+        if len(changes) == 1 and kept and not head:
+            # The kept velocity takes the change too, for the row's next apply.
+            ((name, delta),) = changes
+            body = [f"if ({guard} >= 0) {{ velocities[q] += {entries[name]} * {delta}; {target} = velocities[q]; }}"]
+        elif len(changes) == 1:
             ((name, delta),) = changes
             body = [*head, f"if ({guard} >= 0) {target} += {entries[name]} * {delta};"]
         elif block:
@@ -490,6 +499,11 @@ class SparseFactor(ResponseOperator):
         """Rows in memory: the visited row's residual reduces its pair's sums on the support's one load. Rows in
         registers reduce the pair's own ladder."""
         return not self.registers
+
+    @property
+    def keeps_velocity(self) -> bool:
+        """A held velocity (:attr:`Velocity.held`) of rows in memory, each lane's entries in registers."""
+        return self.velocity.held and not self.registers and not self.dense
 
     def expand(self, rows: str, indent: str) -> str:
         """Expand the packed rows ``[0, rows)`` into the dense rows (``local``), zero elsewhere; ends unsynchronized."""

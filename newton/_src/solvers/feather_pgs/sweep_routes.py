@@ -262,13 +262,19 @@ ROW_PLACES = (
 
 
 def packed_operator(
-    support: int, lanes: Lanes, *, wide: bool = False, rows: WorldRows | None = None, classes: bool = False
+    support: int,
+    lanes: Lanes,
+    *,
+    wide: bool = False,
+    rows: WorldRows | None = None,
+    classes: bool = False,
+    held: bool = False,
 ) -> SparseFactor:
     """The dense rows of a matrix-free sweep: packed whitened rows of ``support`` entries (:mod:`.packed_rows`), their
     world coordinates from their sides (``PACKED_COORDINATE``; where ``rows`` stream their records, from the sides
     their records hold, ``RECORD_COORDINATE``; with ``classes``, by their support classes too, ``CLASS_*``), or with
     ``wide`` rows every coordinate of the world, and values from the world's first row (``packed_base``), over the
-    factor velocity change the sweep stages (``s_v``)."""
+    factor velocity change the sweep stages (``s_v``; ``held`` where it lies in global memory, :attr:`Velocity.held`)."""
 
     def coordinate(row, entry):
         if wide:
@@ -294,7 +300,7 @@ def packed_operator(
     def value(row, entry):
         return f"packed_Z.data[packed_base + ({row}) * {int(support)} + ({entry})]"
 
-    return SparseFactor(int(support), coordinate, value, lanes, velocity=Velocity("s_v"))
+    return SparseFactor(int(support), coordinate, value, lanes, velocity=Velocity("s_v", held=held))
 
 
 def free_body_rows(lanes: Lanes, support: int | str = 12) -> SparseFactor:
@@ -1704,7 +1710,14 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         slots=places.free_slots,
         wide=places.wide_slots,
     )
-    dense_op = packed_operator(max_row_dofs, row_lanes, wide=wide_rows, rows=dense, classes=sweep.support_classes)
+    dense_op = packed_operator(
+        max_row_dofs,
+        row_lanes,
+        wide=wide_rows,
+        rows=dense,
+        classes=sweep.support_classes,
+        held=places.velocity is not Place.SHARED,
+    )
     free_op = free_body_rows(row_lanes, max_row_dofs)
     staging = sweep.staging()
 
@@ -1737,7 +1750,13 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
             spread = block and sweep.formed == "stage"
             metric_stage = (
                 friction_record_stage(
-                    dense, dense_op, end="m_dense", record=dense_record, block=grouped or spread, spread=spread, pad="    "
+                    dense,
+                    dense_op,
+                    end="m_dense",
+                    record=dense_record,
+                    block=grouped or spread,
+                    spread=spread,
+                    pad="    ",
                 )
                 + "\n"
             )
@@ -2241,7 +2260,9 @@ class GeneralSweep(SweepConfig):
                 f"a sweep's dense friction records are formed inline, ahead or as the stage, got {self.formed}"
             )
         if self.formed != "inline" and not (self.torsion or self.colored):
-            raise ValueError("friction records form ahead of a sweep only where it reads them: spin rows, colored units")
+            raise ValueError(
+                "friction records form ahead of a sweep only where it reads them: spin rows, colored units"
+            )
         if self.formed == "stage" and (self.colored or self.grouped) and self.world_blocks:
             raise ValueError("a block form's records stage spreads over the world's group of blocks itself (spread)")
         if self.formed == "stage" and self.solve_policy.counts:
