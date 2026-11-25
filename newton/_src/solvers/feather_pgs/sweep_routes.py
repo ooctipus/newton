@@ -1913,13 +1913,13 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         free_view = free.declaration()
         # Under regions the run's contact rows are the regions' candidates, whose impulses their visits publish: the
         # run stages none.
-        staged_first = "mf_contact_end + lane" if sweep.regions else "lane"
+        staged_first = f"mf_contact_end + {thread}" if sweep.regions else thread
         free_loads = f"""
-    for (int i = {staged_first}; i < m_mf; i += STRIDE) {{
+    for (int i = {staged_first}; i < m_mf; i += {threads}) {{
         {mf_load}
     }}"""
         free_stores = f"""
-    for (int i = {staged_first}; i < m_mf; i += STRIDE) {{
+    for (int i = {staged_first}; i < m_mf; i += {threads}) {{
         {mf_store}
     }}"""
     dense_view = dense.declaration() + "\n" if dense.stream else ""
@@ -1932,20 +1932,32 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
             velocity_view += f"\n    float* s_sweep_v = s_v + {D};"
     # The sweeps and the way back; the stage launch (``formed == "stage"``) forms the dense records and leaves.
     budget_line = f"    int {budget} = iterations;\n" if budget != "iterations" else ""
+    add_back = f"""    for (int d = {thread}; d < {D}; d += {threads}) {{
+        int global_dof = world_dof_indices.data[dof_map_base + d];
+        if (global_dof >= 0) walk.du.data[global_dof] += s_v[d];
+    }}
+"""
+    stores = f"""    for (int i = {thread}; i < m_dense; i += {threads}) {{
+        {dense.stores("i")}
+    }}{free_stores}
+"""
+    # The way back, a coordinate and a row a thread: a world a block's (its first block's, of a group), the warp
+    # mapping's lanes.
+    way_back = f"{alone}{add_back}{stores}{end_alone}"
     rest = f"""
 {budget_line}{sweeps}{world_end}
 
     {barrier}
-{first_warp}    for (int d = lane; d < {D}; d += STRIDE) {{
-        int global_dof = world_dof_indices.data[dof_map_base + d];
-        if (global_dof >= 0) walk.du.data[global_dof] += s_v[d];
-    }}
-    for (int i = lane; i < m_dense; i += STRIDE) {{
-        {dense.stores("i")}
-    }}{free_stores}
-{end_first_warp}"""
+{way_back}"""
     if sweep.formed == "stage":
         seed, rest = "", ""
+    # The rows' staging and the coordinates' clearing, a row and a coordinate a thread: a world a block's (its first
+    # block's, of a group), the warp mapping's lanes.
+    start = f"""{alone}    for (int i = {thread}; i < m_dense; i += {threads}) {{
+{dense_loads}
+    }}{free_loads}
+    for (int d = {thread}; d < {D}; d += {threads}) s_v[d] = 0.0f;
+{end_alone}"""
     body = f"""{head}
 
     {dense_count}
@@ -1968,11 +1980,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
 {staging.declarations("    ")}{velocity_view}
 {dense_view}{free_view}{trace_reduction}
 {friction_laws}
-{first_warp}    for (int i = lane; i < m_dense; i += STRIDE) {{
-{dense_loads}
-    }}{free_loads}
-    for (int d = lane; d < {D}; d += STRIDE) s_v[d] = 0.0f;
-{end_first_warp}    {barrier}
+{start}    {barrier}
 {seed}{alone + metric_stage + end_alone if grouped else first_warp + metric_stage + end_first_warp}{metric_build}{chr(10) if level_marks else ""}{level_marks}
 {rest}"""
     # The rows' layout is the configuration's: rows as wide as the world (and no classes) sit at their coordinates.
