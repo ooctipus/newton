@@ -1008,15 +1008,13 @@ def region_phase(pad: str = "        ", *, block: bool = False, group: bool = Fa
     take what it posts until the world's end. A level's regions share no body, so the order is the same sweep."""
     # A body's version from its words as the region's head loaded them (``{u}_in``, ``{seen}``, ``{version}_in``): raised
     # where its walk coordinates differ from those it was last seen at.
+    # Its store waits for the twists (the visit head below), so no store stands between the head's loads and the bases'.
     gather = """{u} = {u}_in;
 {version} = {version}_in;
 bool same = true;
 for (int k = 0; k < 6; ++k) same = same && {u}[k] == {seen}[k];
-if (!same) {{
-    {version} += 1;
-    body_version.data[{f}] = {version};
-    body_seen.data[{f}] = {u};
-}}"""
+{raised} = !same;
+if ({raised}) {version} += 1;"""
     push = """bool moved = false;
 for (int k = 0; k < 6; ++k) {{
     const float now = {u}[k] {op} sign * ({basis}[0][k] * {wrench}.v0[0] + {basis}[1][k] * {wrench}.v0[1] + {basis}[2][k] * {wrench}.v0[2]
@@ -1030,8 +1028,8 @@ if (moved) {{
     body_version.data[{f}] = {version};
     body_seen.data[{f}] = {u};
 }}"""
-    first_body = indent(gather.format(f="f", u="u", seen="seen", version="version"), "            ")
-    second_body = indent(gather.format(f="f_b", u="u_b", seen="seen_b", version="version_b"), "            ")
+    first_body = indent(gather.format(u="u", seen="seen", version="version", raised="raised"), "            ")
+    second_body = indent(gather.format(u="u_b", seen="seen_b", version="version_b", raised="raised_b"), "            ")
     push_a = indent(
         push.format(u="u", op="+", basis="basis", wrench="push", first="first", version="version", f="f"),
         "            ",
@@ -1074,6 +1072,7 @@ if (moved) {{
             u_in[k] = s_v[first_in + k];
             u_b_in[k] = s_v[first_b_in + k];
         }}
+        bool raised = false, raised_b = false;
         if (!alone || f != body) {{
             // The first body: its walk coordinates, its version and its twist.
             body = f;
@@ -1098,6 +1097,15 @@ if (moved) {{
             }}
             v_b = wp::vec3(wp::dot(basis_b[0], u_b), wp::dot(basis_b[1], u_b), wp::dot(basis_b[2], u_b));
             w_b = wp::vec3(wp::dot(basis_b[3], u_b), wp::dot(basis_b[4], u_b), wp::dot(basis_b[5], u_b));
+        }}
+        // The gathers' stores, after the twists.
+        if (raised) {{
+            body_version.data[f] = version;
+            body_seen.data[f] = u;
+        }}
+        if (raised_b) {{
+            body_version.data[f_b] = version_b;
+            body_seen.data[f_b] = u_b;
         }}
         if (state == version && (f_b < 0 || stamp == version_b)) continue;
 {pair_block}
