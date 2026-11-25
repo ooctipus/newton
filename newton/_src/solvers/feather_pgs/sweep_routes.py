@@ -300,7 +300,15 @@ def packed_operator(
     def value(row, entry):
         return f"packed_Z.data[packed_base + ({row}) * {int(support)} + ({entry})]"
 
-    return SparseFactor(int(support), coordinate, value, lanes, velocity=Velocity("s_v", held=held))
+    def key(row):
+        # The words a record's coordinates decode from (``coordinate``): its sides' and its classes' or widths'.
+        split = rows.sides_of(row)
+        return (*(split if split is not None else (rows.word(row, 0),)), rows.word(row, 4))
+
+    keyed = rows is not None and rows.record and not wide
+    return SparseFactor(
+        int(support), coordinate, value, lanes, velocity=Velocity("s_v", held=held), key=key if keyed else None
+    )
 
 
 def free_body_rows(lanes: Lanes, support: int | str = 12) -> SparseFactor:
@@ -2096,10 +2104,11 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
             heads=lambda row: f"{dense.spin_of(row, 'm_dense')} >= 0 && {dense.kind(row)} == {ROW_CONTACT}",
             pad="        ",
         )
-    units = ""
-    if sweep.contact_units:
-        units = dense_units(dense, dense_op, laws, active=sweep.active_rows, record=dense_record, pad="")
-    level_marks = level_phase = ""
+    def unit_text(op: SparseFactor) -> str:
+        return dense_units(dense, op, laws, active=sweep.active_rows, record=dense_record, pad="")
+
+    units = unit_text(dense_op) if sweep.contact_units else ""
+    level_marks = level_phase = skip = ""
     if sweep.coordinate_levels:
         level_marks, level_phase, skip = coordinate_levels(
             dense, dense_op, laws, metric=metric, formed=dense_record, triple_phase=bool(triples)
@@ -2124,11 +2133,17 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         pad="        ",
     )
     if grouped:
-        # A run of the world's rows: the topology rows on the first warp, then each group's on its warp.
+        # A run of the world's rows: the topology rows on the first warp, then each group's on its warp. A run's visits
+        # carry the velocity they kept where it lies in global memory and their records stream (Velocity.carried).
+        run_op = dense_op
+        if dense_op.keeps_velocity and dense_op.key is not None:
+            run_op = dataclasses.replace(dense_op, velocity=dataclasses.replace(dense_op.velocity, carried=True))
+            if sweep.contact_units:
+                units = "\n".join(text for text in (skip, unit_text(run_op)) if text)
         dense_phase = group_rows(
             lambda begin, end, pad: rows_block(
                 dense,
-                dense_op,
+                run_op,
                 laws,
                 metric=metric,
                 formed=dense_record,

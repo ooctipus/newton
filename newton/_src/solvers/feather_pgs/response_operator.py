@@ -105,6 +105,11 @@ class Velocity:
     held: bool = False
     """The velocity lies a round trip away (global memory): a row's apply adds its changes to the values its reduction
     read, kept in registers (``velocities``), and stores them, instead of reading them again."""
+    carried: bool = False
+    """A held velocity that a run of rows on one warp carries from visit to visit: a visit keeps the values its applies
+    stored and their coordinates (``carry_v``, ``carry_i``) with its support's key (``carry_key``), and a visit on the
+    same support reads them there instead of its coordinates' and velocity's round trips (the values its loads would
+    read: only the run's own applies write them). The run declares them (:meth:`SparseFactor.carry_state`)."""
 
     def at(self, index: str) -> str:
         return f"{self.array}[{index}]"
@@ -129,6 +134,8 @@ class ResponseOperator:
     ``pair_coupling``: :func:`.sweep.row_sums`), which the pair's terms then read instead of reducing their own."""
     keeps_velocity = False
     """Whether a row's reduction keeps the velocity it read for the row's applies (:attr:`Velocity.held`)."""
+    carries = False
+    """Whether a run's visits carry the velocity they kept to the next visit (:attr:`Velocity.carried`)."""
 
     def terms(self, out: str, rhs: str, *, whole: bool) -> str:
         """``S_i`` of a sum this operator reduced into ``out``, the magnitude of the terms its velocity sum adds, or a
@@ -308,6 +315,9 @@ class SparseFactor(ResponseOperator):
     fused_pair_apply: bool = True
     """A row's apply takes its friction pair's second tangent too, one :meth:`axpy` of the sibling's change, then the
     row's, written back once; without it the second tangent applies on its own first, then the row."""
+    key: Callable[[str], tuple[str, ...]] | None = None
+    """The words of row ``row`` that its coordinates ``index(row, entry)`` are a function of: rows of equal keys have
+    one support (a carried velocity's test, :attr:`Velocity.carried`)."""
 
     @property
     def width(self) -> int:
@@ -416,14 +426,20 @@ class SparseFactor(ResponseOperator):
             condition = " && ".join(c for c in (exists.get(name, ""), stored) if c)
             value = self.element(rows[name])
             body.append(f"const float {name}_value = {f'{condition} ? {value} : 0.0f' if condition else value};")
+        carried = self.carries and keep_velocity and keep_support and reads
         if kept:
             body.append("const int index = indices[q];")
         else:
-            body.append(f"const int index = {self.guarded_coordinate(rows[names[0]], exists.get(names[0], ''))};")
+            coordinate = self.guarded_coordinate(rows[names[0]], exists.get(names[0], ""))
+            # A visit on the support the run carries reads its coordinates and velocity there.
+            coordinate = f"carried ? carry_i[q] : ({coordinate})" if carried else coordinate
+            body.append(f"const int index = {coordinate};")
             body += ["indices[q] = index;"] if keep_support else []
         body += [f"z_{name}[q] = index >= 0 ? {name}_value : 0.0f;" for name in loaded]
         # The sums take this lane's entries where the support has one; padding adds nothing.
-        guarded = [f"const float velocity = {self.velocity.at('index')};"] if reads else []
+        velocity = self.velocity.at("index")
+        velocity = f"carried ? carry_v[q] : {velocity}" if carried else velocity
+        guarded = [f"const float velocity = {velocity};"] if reads else []
         if keep_velocity:
             guarded.append("velocities[q] = velocity;")
         for out, row, other in sums:
@@ -432,6 +448,9 @@ class SparseFactor(ResponseOperator):
             if f"{out}_terms" in outs:
                 guarded.append(f"{out}_terms += fabsf({product});")
         body += ["if (index >= 0) {", *("    " + line for line in guarded), "}"]
+        if carried:
+            same = " && ".join(f"carry_key[{k}] == {word}" for k, word in enumerate(self.key(rows[names[0]])))
+            lines.append(f"const bool carried = carry_live && {same};")
         text = "\n".join(indent + line for line in lines) + "\n" + self.entries_loop("\n".join(body), indent)
         ladder = self.lanes.reduce(*(o for o in outs if not apart or o not in apart[1])) if reduce else ""
         if reduce and apart and self.lanes.parallel:
@@ -478,7 +497,11 @@ class SparseFactor(ResponseOperator):
             total = f"{terms[0]} + {terms[1]}"
             for term in terms[2:]:
                 total = f"({total}) + {term}"
-            body = [*head, f"if ({guard} >= 0) {target} = {base} + ({total});"]
+            if kept and self.carries:
+                # The kept velocity takes the change too, for the run's next visit.
+                body = [*head, f"if ({guard} >= 0) {{ velocities[q] = {base} + ({total}); {target} = velocities[q]; }}"]
+            else:
+                body = [*head, f"if ({guard} >= 0) {target} = {base} + ({total});"]
         else:
             body = [
                 *head,
@@ -486,9 +509,24 @@ class SparseFactor(ResponseOperator):
                 f"    float value = {base};",
                 *(f"    if ({delta} != 0.0f) value += {entries[name]} * {delta};" for name, delta in changes),
                 f"    {target} = value;",
+                *(["    velocities[q] = value;"] if kept and self.carries else []),
                 "}",
             ]
         return self.entries_loop("\n".join(body), indent, entry=bool(head))
+
+    def carry_state(self, indent: str) -> str:
+        """Declare a run's carried velocity (:attr:`Velocity.carried`), none yet."""
+        words = len(self.key("i"))
+        return (
+            f"{indent}bool carry_live = false;\n{indent}int carry_key[{words}];\n"
+            f"{indent}int carry_i[{self.entries}];\n{indent}float carry_v[{self.entries}];"
+        )
+
+    def carry(self, row: str, indent: str) -> str:
+        """After a visit's applies, carry its kept velocity, coordinates and support key of row ``row``."""
+        keys = "".join(f" carry_key[{k}] = {word};" for k, word in enumerate(self.key(row)))
+        body = "carry_i[q] = indices[q];\nif (indices[q] >= 0) carry_v[q] = velocities[q];"
+        return f"{indent}carry_live = true;{keys}\n" + self.entries_loop(body, indent, entry=False)
 
     def terms(self, out: str, rhs: str, *, whole: bool) -> str:
         """``sum_k |Z_k u_k|`` of a velocity sum reduced into ``out``, reduced beside it (``magnitudes``)."""
@@ -504,6 +542,11 @@ class SparseFactor(ResponseOperator):
     def keeps_velocity(self) -> bool:
         """A held velocity (:attr:`Velocity.held`) of rows in memory, each lane's entries in registers."""
         return self.velocity.held and not self.registers and not self.dense
+
+    @property
+    def carries(self) -> bool:
+        """A kept velocity that the run carries (:attr:`Velocity.carried`)."""
+        return self.keeps_velocity and self.velocity.carried
 
     def expand(self, rows: str, indent: str) -> str:
         """Expand the packed rows ``[0, rows)`` into the dense rows (``local``), zero elsewhere; ends unsynchronized."""
