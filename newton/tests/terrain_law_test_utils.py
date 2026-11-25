@@ -561,7 +561,9 @@ def contact_rows(model, state, contacts, heightfield: int) -> dict[int, list]:
     ``q`` is the contact's terrain point, ``n`` its normal from the terrain to the partner and ``d = n . (k - q)``
     with ``k`` its partner point. Today's narrow phase puts that point within about 0.1 mm of the partner's core (a
     sphere's centre, a point of a capsule's axis), so ``d`` approximates the law's core distance to that much only:
-    compare today's rows with the law's on ``q`` and ``n``.
+    compare today's rows with the law's on ``q`` and ``n``. The contact writer holds a cylinder's or cone's curved
+    side at its axis point plus a radius (its margin beyond the shape's own margin and rounding); ``d`` drops that
+    radius, so it is read at the side's surface as the law's rows are.
     """
     count = int(contacts.rigid_contact_count.numpy()[0])
     shape0 = contacts.rigid_contact_shape0.numpy()[:count]
@@ -569,8 +571,19 @@ def contact_rows(model, state, contacts, heightfield: int) -> dict[int, list]:
     point0 = contacts.rigid_contact_point0.numpy()[:count].astype(np.float64)
     point1 = contacts.rigid_contact_point1.numpy()[:count].astype(np.float64)
     normal = contacts.rigid_contact_normal.numpy()[:count].astype(np.float64)
+    margins = (contacts.rigid_contact_margin0.numpy()[:count], contacts.rigid_contact_margin1.numpy()[:count])
     body_q = state.body_q.numpy().astype(np.float64)
     shape_body = model.shape_body.numpy()
+    shape_type = model.shape_type.numpy()
+    shape_rounding = np.where(
+        np.isin(shape_type, (int(newton.GeoType.SPHERE), int(newton.GeoType.CAPSULE))),
+        model.shape_scale.numpy()[:, 0],
+        0.0,
+    )
+    shape_margin = model.shape_margin.numpy()
+
+    def held_radius(shape, margin):
+        return float(margin) - float(shape_margin[shape]) - float(shape_rounding[shape])
 
     def world(shape, p):
         body = shape_body[shape]
@@ -583,11 +596,13 @@ def contact_rows(model, state, contacts, heightfield: int) -> dict[int, list]:
         a, b = int(shape0[i]), int(shape1[i])
         if a == heightfield:
             partner, q, k, n = b, world(a, point0[i]), world(b, point1[i]), normal[i]
+            held = held_radius(b, margins[1][i])
         elif b == heightfield:
             partner, q, k, n = a, world(b, point1[i]), world(a, point0[i]), -normal[i]
+            held = held_radius(a, margins[0][i])
         else:
             continue
-        out.setdefault(partner, []).append((q, n, float(n @ (k - q))))
+        out.setdefault(partner, []).append((q, n, float(n @ (k - q)) - held))
     return out
 
 

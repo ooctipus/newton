@@ -379,6 +379,7 @@ class Contacts:
                 ContactField("rigid_contact_normal", wp.vec3),
                 ContactField("rigid_contact_margin0", wp.float32),
                 ContactField("rigid_contact_margin1", wp.float32),
+                ContactField("rigid_contact_point_share", wp.float32, 0.5),
                 ContactField("rigid_contact_tids", wp.int32, -1),
                 ContactField("rigid_contact_key", wp.int64),
                 ContactField("rigid_contact_force", wp.vec3),
@@ -435,6 +436,12 @@ class Contacts:
             """Surface thickness for shape 0: effective radius + margin [m], shape (rigid_contact_max,), dtype float."""
             self.rigid_contact_margin1: wp.array[wp.float32]
             """Surface thickness for shape 1: effective radius + margin [m], shape (rigid_contact_max,), dtype float."""
+            self.rigid_contact_point_share: wp.array[wp.float32]
+            """Where between its two surface points a contact touches [unitless], shape (rigid_contact_max,), dtype float:
+            0 at shape 0's surface point, 1 at shape 1's. The collision declares it from the two sides' radii of
+            curvature at the contact: a rounded side (a sphere, a capsule, a cylinder's or cone's curved part) touches
+            at its own support point against a flat or sharp one, two rounded sides where their spheres meet
+            (``radius0 / (radius0 + radius1)`` of the way), any other pair at the midpoint (0.5)."""
             self.rigid_contact_tids: wp.array[wp.int32]
             self.rigid_contact_key: wp.array[wp.int64]
             """Each contact's identity in its pass: its shapes and the feature of its pair that made it (the

@@ -525,6 +525,119 @@ def _record_reduction_overflow(
 _EMPTY_AABB_EXTENT = wp.constant(1.0e30)
 
 
+_SPHERE = wp.constant(int(GeoType.SPHERE))
+_CAPSULE = wp.constant(int(GeoType.CAPSULE))
+_CYLINDER = wp.constant(int(GeoType.CYLINDER))
+_CONE = wp.constant(int(GeoType.CONE))
+
+
+@wp.func
+def _rounded_side_radius(
+    shape: int,
+    witness: wp.vec3,
+    outward: wp.vec3,
+    shape_type: wp.array[int],
+    shape_scale: wp.array[wp.vec3],
+    shape_transform: wp.array[wp.transform],
+) -> tuple[float, float]:
+    """Return a contact side's radius of curvature at its witness [m] and the radius its held point still needs.
+
+    A sphere's or capsule's side is its radius, held already at its centre or axis point (the narrow phase's
+    ``radius_eff``). A cylinder's or cone's curved side is held, like a capsule's, at the point where the inward normal
+    line through the world ``witness`` (``outward`` points from the shape toward the other side) meets the shape's
+    axis, at the distance ``(r . n_perp) / (n_perp . n_perp)`` (``r`` the witness's offset from the axis, ``n_perp``
+    the normal's part across it, never past the shape's radius): its centre of curvature about the axis, so rolling
+    about the axis leaves the held point at the support. Every other side (a face, an edge, a vertex; a cylinder's
+    cap face, a cone's apex) is 0. Returns ``(radius, radius still to apply)``."""
+    radius = float(0.0)
+    apply = float(0.0)
+    if shape >= 0:
+        kind = shape_type[shape]
+        if kind == _SPHERE or kind == _CAPSULE:
+            radius = shape_scale[shape][0]
+        elif kind == _CYLINDER or kind == _CONE:
+            pose = shape_transform[shape]
+            axis = wp.quat_rotate(wp.transform_get_rotation(pose), wp.vec3(0.0, 0.0, 1.0))
+            offset = witness - wp.transform_get_translation(pose)
+            across = offset - wp.dot(offset, axis) * axis
+            normal_across = outward - wp.dot(outward, axis) * axis
+            reach = wp.dot(across, normal_across)
+            spread = wp.dot(normal_across, normal_across)
+            if reach > 0.0 and spread > 0.0:
+                radius = wp.min(reach / spread, shape_scale[shape][0])
+                apply = radius
+    return radius, apply
+
+
+@wp.func
+def contact_point_share(radius_a: float, radius_b: float) -> float:
+    """Return where between its two surface points a contact touches, 0 at A's, 1 at B's, from the two sides' radii of
+    curvature there (0 for a flat or sharp side): a rounded side against any other touches at its own point, two
+    rounded sides at ``radius_a / (radius_a + radius_b)`` of the way (where their spheres meet), any other pair at the
+    midpoint."""
+    share = float(0.5)
+    if radius_a > 0.0 and radius_b > 0.0:
+        share = radius_a / (radius_a + radius_b)
+    elif radius_a > 0.0:
+        share = 0.0
+    elif radius_b > 0.0:
+        share = 1.0
+    return share
+
+
+@wp.kernel(enable_backward=False)
+def declare_rounded_sides(
+    contact_count: wp.array[int],
+    contact_shape0: wp.array[int],
+    contact_shape1: wp.array[int],
+    contact_normal: wp.array[wp.vec3],
+    body_q: wp.array[wp.transform],
+    shape_body: wp.array[int],
+    shape_type: wp.array[int],
+    shape_scale: wp.array[wp.vec3],
+    shape_transform: wp.array[wp.transform],
+    # in and out
+    contact_point0: wp.array[wp.vec3],
+    contact_point1: wp.array[wp.vec3],
+    contact_offset0: wp.array[wp.vec3],
+    contact_offset1: wp.array[wp.vec3],
+    contact_margin0: wp.array[float],
+    contact_margin1: wp.array[float],
+    # out
+    point_share: wp.array[float],
+):
+    """Declare each live contact's rounded sides once a pass: hold a cylinder's or cone's curved side at its axis point
+    plus a radius along the normal (:func:`_rounded_side_radius`) and write where the contact touches
+    (:func:`contact_point_share`). A contact with no rounded side keeps its witness records bit for bit."""
+    tid = wp.tid()
+    if tid >= contact_count[0]:
+        return
+    n = contact_normal[tid]
+    shape0 = contact_shape0[tid]
+    shape1 = contact_shape1[tid]
+    body0 = shape_body[shape0]
+    body1 = shape_body[shape1]
+    X_wb0 = wp.transform_identity() if body0 < 0 else body_q[body0]
+    X_wb1 = wp.transform_identity() if body1 < 0 else body_q[body1]
+    radius0, apply0 = _rounded_side_radius(
+        shape0, wp.transform_point(X_wb0, contact_point0[tid]), n, shape_type, shape_scale, shape_transform
+    )
+    radius1, apply1 = _rounded_side_radius(
+        shape1, wp.transform_point(X_wb1, contact_point1[tid]), -n, shape_type, shape_scale, shape_transform
+    )
+    if apply0 > 0.0:
+        inward = wp.quat_rotate_inv(wp.transform_get_rotation(X_wb0), apply0 * n)
+        contact_point0[tid] = contact_point0[tid] - inward
+        contact_offset0[tid] = contact_offset0[tid] + inward
+        contact_margin0[tid] = contact_margin0[tid] + apply0
+    if apply1 > 0.0:
+        inward = wp.quat_rotate_inv(wp.transform_get_rotation(X_wb1), apply1 * n)
+        contact_point1[tid] = contact_point1[tid] + inward
+        contact_offset1[tid] = contact_offset1[tid] - inward
+        contact_margin1[tid] = contact_margin1[tid] + apply1
+    point_share[tid] = contact_point_share(radius0, radius1)
+
+
 @wp.kernel(enable_backward=False)
 def _clear_match_index(count: wp.array[wp.int32], match_index: wp.array[wp.int32]):
     """Mark every live contact unmatched, for a buffer whose producer does not match contacts."""
@@ -5600,6 +5713,34 @@ class CollisionPipeline:
             device=self.device,
             limit=self._sort_limit(contacts),
             published=True,
+        )
+
+        # Each contact's rounded sides, declared once on the pass's final order: a curved cylinder or cone side held at
+        # its axis point plus a radius, and where the contact touches (Contacts.rigid_contact_point_share).
+        pool.launch(
+            declare_rounded_sides,
+            pool.launch_rows(),
+            inputs=[
+                contacts.rigid_contact_count,
+                contacts.rigid_contact_shape0,
+                contacts.rigid_contact_shape1,
+                contacts.rigid_contact_normal,
+                state.body_q,
+                model.shape_body,
+                model.shape_type,
+                model.shape_scale,
+                self.geom_transform,
+            ],
+            outputs=[
+                contacts.rigid_contact_point0,
+                contacts.rigid_contact_point1,
+                contacts.rigid_contact_offset0,
+                contacts.rigid_contact_offset1,
+                contacts.rigid_contact_margin0,
+                contacts.rigid_contact_margin1,
+                contacts.rigid_contact_point_share,
+            ],
+            extent=contacts.rigid_contact_count,
         )
 
         # Match and save the retained stream so all indices name solver contacts.

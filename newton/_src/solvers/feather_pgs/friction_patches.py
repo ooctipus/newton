@@ -476,7 +476,7 @@ def _prepare_contact_fields(
         n = -n
     frame.surface_a[c] = surface_b if flip != 0 else surface_a
     frame.surface_b[c] = surface_a if flip != 0 else surface_b
-    frame.center[c] = contact_point(translation_a, offset_a, separation)
+    frame.center[c] = contact_point(translation_a, offset_a, separation, 0.5)
     if kept == 0:
         frame.normal[c] = n
         frame.body_a[c] = a

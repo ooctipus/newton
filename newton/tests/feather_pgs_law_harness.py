@@ -372,6 +372,7 @@ def twin_inputs(name: str, rng, n: int, device) -> dict:
             "margin1": np.abs(rng.normal(scale=0.01, size=contacts)).astype(np.float32),
             "shape_body": shape_body,
             "body_q": body_q,
+            "weight_b": rng.choice(np.array([0.0, 0.5, 1.0, 0.25], dtype=np.float32), n),
         }
     if name.startswith("contact_points"):
         return {
@@ -389,7 +390,12 @@ def twin_inputs(name: str, rng, n: int, device) -> dict:
     if name == "contact_tangent_basis":
         return {"n": unit_vectors(rng, n)}
     if name == "contact_point":
-        return {"translation_a": vec(3.0), "offset_a": vec(0.3), "separation": vec(0.01)}
+        return {
+            "translation_a": vec(3.0),
+            "offset_a": vec(0.3),
+            "separation": vec(0.01),
+            "weight_b": rng.choice(np.array([0.0, 0.5, 1.0, 0.25], dtype=np.float32), n),
+        }
     if name == "contact_row_frame":
         return {
             "row": ints(0, 4),

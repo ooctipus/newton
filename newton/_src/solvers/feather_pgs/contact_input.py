@@ -30,6 +30,9 @@ CONTACT_INPUT = (
     Field("shape1", wp.int32, ("contact",), owner="contacts", attr="rigid_contact_shape1"),
     Field("margin0", wp.float32, ("contact",), owner="contacts", attr="rigid_contact_margin0"),
     Field("margin1", wp.float32, ("contact",), owner="contacts", attr="rigid_contact_margin1"),
+    # Where between its two surface points each contact touches, 0 at shape 0's, 1 at shape 1's: the collision's
+    # declaration from the sides' radii of curvature (Contacts.rigid_contact_point_share).
+    Field("point_share", wp.float32, ("contact",), owner="contacts", attr="rigid_contact_point_share"),
     # Each contact's surface velocity, shape1's surface less shape0's [m/s] (a conveyor's belt: a mesh with
     # surface velocities), where the pipeline samples one; none (an empty array) where no shape moves its surface.
     Field("surface_velocity", wp.vec3, ("contact",), owner="contacts", attr="rigid_contact_surface_velocity"),
@@ -135,13 +138,15 @@ def contact_front_end(
     shape_body: wp.array[int],
     body_q: wp.array[wp.transform],
     friction_point: wp.vec3,
+    weight_b: float,
 ) -> ContactFrame:
     """Return the front end (:class:`ContactFrame`) of the contact whose collision record is ``at`` in the given arrays
-    (the collision pipeline's, or a copy in another order) with the friction location ``friction_point``: the
+    (the collision pipeline's, or a copy in another order) with the friction location ``friction_point`` and B's
+    share ``weight_b`` of its row point (:func:`.contact_laws.contact_point`): the
     bodies, normal, the one point the contact's rows act at, the gap and its rounding of
     :func:`.contact_laws.contact_geometry`, and the tangent basis."""
     body_a, body_b, n, point, phi, rounding = contact_geometry(
-        at, shape0, shape1, point0, point1, normal, margin0, margin1, shape_body, body_q
+        at, shape0, shape1, point0, point1, normal, margin0, margin1, shape_body, body_q, weight_b
     )
     tangent0, tangent1 = contact_tangent_basis(n)
     frame = ContactFrame()
@@ -174,6 +179,7 @@ def contact_frame(data: ContactInput, law: PatchRowLaw, c: int) -> ContactFrame:
         data.shape_body,
         data.body_q,
         patch_friction_location(law.patches, c),
+        data.point_share[c],
     )
     normal = region_normal(law.patches, c, frame.normal)
     # A carrier's region normal is its own: only a member whose normal differs takes the region's frame.

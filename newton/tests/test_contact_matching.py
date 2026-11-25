@@ -1199,9 +1199,10 @@ def _check_sticky_rotated_witness(test, device, *, plane_first, threshold, use_c
         fields = ("point0", "point1", "offset0", "offset1", "normal")
         previous = {field: getattr(contacts, f"rigid_contact_{field}").numpy()[:count].copy() for field in fields}
 
-        # The cylinder's geometry stays put while its material witnesses rotate.
+        # A 10 mm slide across the cylinder's axis keeps its contact's geometry while the plane's witnesses move with it
+        # (a cylinder's side is held at its axis point, which a turn about the axis would not move).
         pose = state.body_q.numpy()
-        pose[0, 3:] = np.asarray(wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), 0.1))
+        pose[0, 1] += 0.01
         state.body_q.assign(pose)
         reference = newton.CollisionPipeline(model, broad_phase="nxn", rigid_contact_max=64)
         reference_contacts = reference.contacts()
@@ -1230,7 +1231,7 @@ def _check_sticky_rotated_witness(test, device, *, plane_first, threshold, use_c
             np.linalg.norm(previous[field][penetrating] - fresh[field][penetrating], axis=1).max()
             for field in ("point0", "point1")
         )
-        test.assertGreater(drift, 0.005, "Rotation must move a saved witness by more than 5 mm")
+        test.assertGreater(drift, 0.005, "The slide must move a saved witness by more than 5 mm")
         if expect_replay:
             test.assertLess(drift, threshold)
         else:
@@ -1245,9 +1246,8 @@ def _check_sticky_rotated_witness(test, device, *, plane_first, threshold, use_c
             pipeline.collide(state, contacts)
         test.assertEqual(count, int(contacts.rigid_contact_count.numpy()[0]))
         match_index = contacts.rigid_contact_match_index.numpy()[:count]
-        # Rotation moves the saved material witnesses even when the geometric
-        # surface stays put. Match only while each transported witness remains
-        # inside the configured radius; otherwise report the contact as broken.
+        # The slide moves the saved witnesses while the contact's geometry stays put. Match only while each
+        # transported witness remains inside the configured radius; otherwise report the contact as broken.
         if expect_replay:
             test.assertTrue(np.all(match_index >= 0))
         else:

@@ -210,7 +210,7 @@ def _prepare(
     frame.flipped[c] = flip
     frame.surface_a[c] = surface_b if flip != 0 else surface_a
     frame.surface_b[c] = surface_a if flip != 0 else surface_b
-    frame.center[c] = contact_point(translation_a, offset_a, separation)
+    frame.center[c] = contact_point(translation_a, offset_a, separation, 0.5)
     frame.normal[c] = n
     mu_a = float(0.0)
     mu_b = float(0.0)

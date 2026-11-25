@@ -209,9 +209,11 @@ def contact_geometry(
     margin1: wp.array[float],
     shape_body: wp.array[int],
     body_q: wp.array[wp.transform],
+    weight_b: float,
 ) -> tuple[int, int, wp.vec3, wp.vec3, float, float]:
-    """Return contact ``c``'s bodies, normal, the point its rows act at, its gap and the gap's rounding from the
-    contact arrays: ``(body_a, body_b, normal, point, phi, rounding)``.
+    """Return contact ``c``'s bodies, normal, the point its rows act at (B's share ``weight_b`` of the separation from
+    A's surface point), its gap and the gap's rounding from the contact arrays: ``(body_a, body_b, normal, point, phi,
+    rounding)``.
 
     :func:`contact_bodies`, :func:`contact_points`, :func:`contact_point` and :func:`gap_rounding`, for the producers
     that read a contact straight from the collision pipeline's arrays.
@@ -221,7 +223,7 @@ def contact_geometry(
         normal[c], point0[c], point1[c], margin0[c], margin1[c], body_a, body_b, body_q
     )
     rounding = gap_rounding(n, translation_a, offset_a, translation_b, offset_b)
-    return body_a, body_b, n, contact_point(translation_a, offset_a, separation), phi, rounding
+    return body_a, body_b, n, contact_point(translation_a, offset_a, separation, weight_b), phi, rounding
 
 
 @CONTACT_LAW.law
@@ -302,11 +304,14 @@ def contact_tangent_basis(n: wp.vec3) -> tuple[wp.vec3, wp.vec3]:
 
 
 @CONTACT_LAW.law
-def contact_point(translation_a: wp.vec3, offset_a: wp.vec3, separation: wp.vec3) -> wp.vec3:
-    """Return the one point a contact's rows act at: the midpoint of its surface points, A's surface point less half
-    the separation (:func:`contact_points`). Equal and opposite impulses at one point put no torque on the pair, so a
-    contact conserves angular momentum."""
-    return translation_a + (offset_a - 0.5 * separation)
+def contact_point(translation_a: wp.vec3, offset_a: wp.vec3, separation: wp.vec3, weight_b: float) -> wp.vec3:
+    """Return the one point a contact's rows act at: A's surface point less B's share ``weight_b`` of the separation
+    (:func:`contact_points`), between the two surface points: where the collision declared the contact touches
+    (``Contacts.rigid_contact_point_share``, from the sides' radii of curvature). Equal and opposite impulses at one
+    point put no torque on the pair, so a contact conserves angular momentum. A held contact's surface points part as
+    its bodies move between collision passes; a rounded side rolling on a flat or sharp one keeps the point at its own
+    surface point, where the gap is read, so its normal row does no work while it rolls."""
+    return translation_a + (offset_a - weight_b * separation)
 
 
 @CONTACT_LAW.law

@@ -385,7 +385,8 @@ class TestMeshBackfaceCulling(unittest.TestCase):
                     points0 = contacts.rigid_contact_point0.numpy()[: len(normals)]
                     points1 = contacts.rigid_contact_point1.numpy()[: len(normals)]
                     points1 += np.asarray((0.03, -0.02, height))
-                    separation = np.einsum("ij,ij->i", points1 - points0, normals)
+                    margins = contacts.rigid_contact_margin0.numpy() + contacts.rigid_contact_margin1.numpy()
+                    separation = np.einsum("ij,ij->i", points1 - points0, normals) - margins[: len(normals)]
                     np.testing.assert_allclose(separation, -expected_depth, atol=2e-5)
 
     def test_closed_mesh_recovery_rejects_other_faces(self):
@@ -443,7 +444,8 @@ class TestMeshBackfaceCulling(unittest.TestCase):
                     points1 = contacts.rigid_contact_point1.numpy()[: len(normals)]
                     body_pose = wp.transform(wp.vec3(*shape_pos), shape_rot)
                     points1 = np.asarray([wp.transform_point(body_pose, wp.vec3(*point)) for point in points1])
-                    separation = np.einsum("ij,ij->i", points1 - points0, normals)
+                    margins = contacts.rigid_contact_margin0.numpy() + contacts.rigid_contact_margin1.numpy()
+                    separation = np.einsum("ij,ij->i", points1 - points0, normals) - margins[: len(normals)]
                     np.testing.assert_allclose(separation, -expected_depth, atol=2e-5)
 
     def test_closed_mesh_recovery_convex_types(self):
