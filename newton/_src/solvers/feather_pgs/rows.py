@@ -63,6 +63,7 @@ from .row_slots import (
     RESERVE_BLOCK,
     RESERVE_LANES,
     admit_world_contacts,
+    reserve_warps,
     reserve_world_rows_kernel,
 )
 from .sweep_plan import FREE_ROUTE
@@ -766,14 +767,16 @@ class RowLaws:
             # contacts together), each contact's rows reserved in it and each world's counters advanced: a world with
             # contacts a lane group, one launch.
             placement = solver.placement
-            lanes = int(RESERVE_LANES) if model.device.is_cuda else 1
+            # A warp a world where the worlds fill the device, else a block of warps a world (reserve_warps).
+            warps = reserve_warps(solver.forest.world_count, model.device)
+            lanes = int(RESERVE_LANES) * warps if model.device.is_cuda else 1
             # A replay runs a lane group a contact, at most a world's (the contact count, known at the pass's
             # updater, bounds the worlds the admission lists after it): none on a step without contacts, nor on a
             # later step of a collision pass where every world keeps its contacts' slots (the placement's
             # pass_words[1], Placement.bound_topology). The listed worlds' count itself is written after the updater,
             # so it cannot size the launch.
             pool.launch(
-                reserve_world_rows_kernel(placement.row_groups.colors.shape[0] > 0),
+                reserve_world_rows_kernel(placement.row_groups.colors.shape[0] > 0, warps),
                 solver.forest.world_count * lanes,
                 inputs=[
                     contact_input,
@@ -798,7 +801,7 @@ class RowLaws:
                 extent=placement.pass_words[1:2],
                 scale=lanes,
                 clamp=True,
-                block_dim=RESERVE_BLOCK,
+                block_dim=lanes if warps > 1 else RESERVE_BLOCK,
             )
 
     def bound_free_body_contacts(self, solver) -> None:

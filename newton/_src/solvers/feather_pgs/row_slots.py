@@ -10,6 +10,7 @@ import numpy as np
 import warp as wp
 
 from ...core import union_find
+from ...core.execution import fill_lanes
 from ...sim import BodyFlags
 from .contact_filters import contact_normal_gap_limit
 from .contact_input import ContactInput
@@ -423,7 +424,10 @@ RESERVE_LANES = wp.constant(32)
 """The lanes of a world's reservation (:func:`reserve_world_rows`): a warp on CUDA, one thread on the CPU."""
 
 RESERVE_BLOCK = 64
-"""Threads of a block of :func:`reserve_world_rows`: two worlds' lanes."""
+"""Threads of a block of :func:`reserve_world_rows` at a warp a world: two worlds' lanes."""
+
+RESERVE_WARPS = 8
+"""Warps a world of :func:`reserve_world_rows` at most (:func:`reserve_warps`): a block of them, one world."""
 
 
 @wp.struct
@@ -915,12 +919,22 @@ def _group_rows(
     lane_sync(RESERVE_LANES)
 
 
+def reserve_warps(worlds: int, device) -> int:
+    """Warps a world of the reservation (:func:`reserve_world_rows_kernel`'s ``warps``): one where the worlds fill the
+    device at a warp each, else as many as fill it (:func:`~newton._src.core.execution.fill_lanes`), at most a block's
+    :data:`RESERVE_WARPS`; one on the CPU."""
+    lanes = int(RESERVE_LANES)
+    return fill_lanes(worlds, device, least=lanes, most=lanes * RESERVE_WARPS) // lanes
+
+
 @cache
-def reserve_world_rows_kernel(grouped: bool):
+def reserve_world_rows_kernel(grouped: bool, warps: int = 1):
     """The reservation kernel (:func:`reserve_world_rows`, its body below): ``grouped`` where the model holds worlds
     that can take the dense line by colors of groups (a slot of :class:`RowGroups`), whose reservations group them;
     without, the kernel holds none of the grouping's code (a one-warp walk over a world's pairs that the others never
-    take, whose code alone cost the cube pile's one-world reservation 70% more time)."""
+    take, whose code alone cost the cube pile's one-world reservation 70% more time). ``warps`` (:func:`reserve_warps`)
+    a world, a world a block of them past one: the passes whose contacts are their threads' own (the heads' unions,
+    the slots) take every warp, the ordered passes the first."""
 
     @wp.kernel(enable_backward=False, module="unique")
     def reserve_world_rows(
@@ -993,6 +1007,13 @@ def reserve_world_rows_kernel(grouped: bool):
         lane = lane_index(RESERVE_LANES)
         listed = contact_worlds_listed[0]
         item = wp.tid() // lanes
+        warp = int(0)
+        threads = lanes
+        if wp.static(warps > 1):
+            # A world a block of warps.
+            threads = lanes * warps
+            item = wp.tid() // threads
+            warp = (wp.tid() // lanes) % warps
         if item >= listed:
             return
         world = contact_worlds[item]
@@ -1000,60 +1021,78 @@ def reserve_world_rows_kernel(grouped: bool):
         kept = order.frame_kept[0]
         first = order.world_contact_first[world]
         end = wp.min(order.world_contact_last[world] + 1, data.count[0])
+        if wp.static(warps > 1):
+            # Each pair's head joins its trees' islands (_order_islands), a contact a thread of the block: the union
+            # by lowest id gives every island the same root whatever order the unions run in.
+            if kept == 0:
+                for c in range(first + warp * lanes + lane, end, threads):
+                    if data.world[c] == world:
+                        if c == first or order.pair_keys[c] != order.pair_keys[c - 1]:
+                            sides = row_sides(data.art0[c], data.art1[c], data.response_dofs)
+                            if sides[1] >= 0:
+                                union_find.union(order.island_parent, sides[0], sides[1])
+            lane_sync(threads)
         # The frame's order: each contact's rows before it and its pair, each pair's head.
         rows = wp.vec4i(0)
         pairs = int(0)
-        for base in range(first, end, lanes):
-            c = base + lane
-            mine = bool(False)
-            heads = bool(False)
-            own = wp.vec4i(0)
-            if c < end:
-                if data.world[c] == world:
-                    mine = True
-                    heads = c == first or order.pair_keys[c] != order.pair_keys[c - 1]
-                    own = _contact_rows(data, c)
-            votes = lane_ballot(heads, RESERVE_LANES)
-            lower = _lane_scan4(own)
-            if mine:
-                pair = pairs + lane_below(votes, RESERVE_LANES) + wp.where(heads, 1, 0) - 1
-                order.pairs_before[c] = pair
-                order.rows_frame[c] = rows + lower
-                if heads:
-                    order.pairs[first + pair] = c
-                    if kept == 0:
-                        # The pair joins its trees' islands (_order_islands).
-                        sides = row_sides(data.art0[c], data.art1[c], data.response_dofs)
-                        order.pair_sides[first + pair] = sides
-                        if sides[1] >= 0:
-                            union_find.union(order.island_parent, sides[0], sides[1])
-            rows = rows + _lane_sum4(own)
-            pairs += lane_count(votes, RESERVE_LANES)
-        lane_sync(RESERVE_LANES)
-        if kept == 0:
-            _order_islands(data, order, first, pairs, lanes, lane)
-        # The row order: each pair's rows before it.
-        seen = wp.vec4i(0)
-        for base in range(0, pairs, lanes):
-            q = base + lane
-            own = wp.vec4i(0)
-            head = int(-1)
-            if q < pairs:
-                j = order.row_pairs[first + q]
-                head = order.pairs[first + j]
-                own = _pair_rows(order, first, pairs, rows, j)
-            before = seen + _lane_scan4(own)
-            if head >= 0:
-                order.rows_before[head] = before
-            seen = seen + _lane_sum4(own)
-        lane_sync(RESERVE_LANES)
-        # A world of many trees: its dense contact rows by colors of groups, where it takes them (RowGroups).
-        if wp.static(grouped):
-            group_slot = groups.slot[world]
-            if group_slot >= 0:
-                _group_rows(order, groups, group_slot, first, pairs, rows, world_slot_counter[world], lanes, lane)
+        if warp == 0:
+            for base in range(first, end, lanes):
+                c = base + lane
+                mine = bool(False)
+                heads = bool(False)
+                own = wp.vec4i(0)
+                if c < end:
+                    if data.world[c] == world:
+                        mine = True
+                        heads = c == first or order.pair_keys[c] != order.pair_keys[c - 1]
+                        own = _contact_rows(data, c)
+                votes = lane_ballot(heads, RESERVE_LANES)
+                lower = _lane_scan4(own)
+                if mine:
+                    pair = pairs + lane_below(votes, RESERVE_LANES) + wp.where(heads, 1, 0) - 1
+                    order.pairs_before[c] = pair
+                    order.rows_frame[c] = rows + lower
+                    if heads:
+                        order.pairs[first + pair] = c
+                        if kept == 0:
+                            # The pair joins its trees' islands (_order_islands).
+                            sides = row_sides(data.art0[c], data.art1[c], data.response_dofs)
+                            order.pair_sides[first + pair] = sides
+                            if wp.static(warps == 1):
+                                if sides[1] >= 0:
+                                    union_find.union(order.island_parent, sides[0], sides[1])
+                rows = rows + _lane_sum4(own)
+                pairs += lane_count(votes, RESERVE_LANES)
+            lane_sync(RESERVE_LANES)
+            if kept == 0:
+                _order_islands(data, order, first, pairs, lanes, lane)
+            # The row order: each pair's rows before it.
+            seen = wp.vec4i(0)
+            for base in range(0, pairs, lanes):
+                q = base + lane
+                own = wp.vec4i(0)
+                head = int(-1)
+                if q < pairs:
+                    j = order.row_pairs[first + q]
+                    head = order.pairs[first + j]
+                    own = _pair_rows(order, first, pairs, rows, j)
+                before = seen + _lane_scan4(own)
+                if head >= 0:
+                    order.rows_before[head] = before
+                seen = seen + _lane_sum4(own)
+            lane_sync(RESERVE_LANES)
+            # A world of many trees: its dense contact rows by colors of groups, where it takes them (RowGroups).
+            if wp.static(grouped):
+                group_slot = groups.slot[world]
+                if group_slot >= 0:
+                    _group_rows(order, groups, group_slot, first, pairs, rows, world_slot_counter[world], lanes, lane)
+        if wp.static(warps > 1):
+            lane_sync(threads)
+            # The world's rows of each list (the first warp's sums): its last contact's before it and its own.
+            if end > first:
+                rows = order.rows_frame[end - 1] + _contact_rows(data, end - 1)
         # Each admitted contact's slot; each pair's head restores its trees (_order_islands' starting state).
-        for c in range(first + lane, end, lanes):
+        for c in range(first + warp * lanes + lane, end, threads):
             if data.world[c] != world:
                 continue
             pair = first + order.pairs_before[c]
@@ -1099,8 +1138,11 @@ def reserve_world_rows_kernel(grouped: bool):
                     if units.shape[0] > 0:
                         for r in range(n):
                             units[data.first[world], slot + r] = unit_source(UNIT_CONTACT, 4 * c + r)
-        lane_sync(RESERVE_LANES)
-        if lane == 0:
+        if wp.static(warps > 1):
+            lane_sync(threads)
+        else:
+            lane_sync(RESERVE_LANES)
+        if warp == 0 and lane == 0:
             # The world's counters, rejected rows included, and its run cleared for the next step; the last listed world
             # to finish clears the list (every listed world read its count before).
             world_slot_counter[world] += rows[0] + rows[2]
