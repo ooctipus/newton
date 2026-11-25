@@ -490,7 +490,8 @@ class RowGroups:
     the line. The reservation's scratch: each pair of the sequence's head, list, leader and place among its group's
     (``pairs``), each leader's members' rows (``members``) and its color with its place in it (``places``), each
     color's groups and rows (``totals``), a key table over the groups' trees and lists (``keys``, ``open``: the pairs
-    counted and the open group's leader), and each tree's colors in use (``used``, zero between reservations)."""
+    counted and the open group's leader), each tree's colors in use (``used``, zero between reservations), and what the
+    warps' turns pass on (``turns``: the sequence's count, its leaders and colors, :func:`_group_rows`)."""
 
     slot: wp.array[int]
     colors: wp.array[int]
@@ -503,6 +504,7 @@ class RowGroups:
     keys: wp.array2d[wp.int64]
     open: wp.array2d[wp.vec2i]
     used: wp.array[wp.int64]
+    turns: wp.array2d[int]
     min_units: int
     need: float
 
@@ -522,6 +524,7 @@ def row_groups(slot, slots: int, rows: int, trees: int, min_units: int, need: fl
     groups.keys = wp.zeros((slots, 2 * rows), dtype=wp.int64, device=device)
     groups.open = wp.zeros((slots, 2 * rows), dtype=wp.vec2i, device=device)
     groups.used = wp.zeros(trees, dtype=wp.int64, device=device)
+    groups.turns = wp.zeros((slots, 4), dtype=int, device=device)
     groups.min_units = int(min_units)
     groups.need = float(need)
     return groups
@@ -724,6 +727,37 @@ def _shares_tree(a: wp.vec2i, b: wp.vec2i) -> bool:
     return a[1] >= 0 and (a[1] == b[0] or a[1] == b[1])
 
 
+@wp.func_native("""
+#if defined(__CUDA_ARCH__)
+    asm volatile("bar.sync %0, 64;" ::"r"(barrier) : "memory");
+#else
+    (void)barrier;  // one thread runs the world: every turn is its own
+#endif
+""")
+def _turn_wait(barrier: int):
+    """Wait for this warp's turn: the warp before it arrived at the named barrier ``barrier`` (its two warps, 64
+    threads), its stores fenced at the block's scope (:func:`_turn_pass`). On the CPU one thread runs the world."""
+
+
+@wp.func_native("""
+#if defined(__CUDA_ARCH__)
+    __threadfence_block();
+    asm volatile("bar.arrive %0, 64;" ::"r"(barrier) : "memory");
+#else
+    (void)barrier;  // one thread runs the world: every turn is its own
+#endif
+""")
+def _turn_pass(barrier: int):
+    """Pass the turn to the warp waiting at the named barrier ``barrier``, after this warp's stores (a block fence).
+    On the CPU one thread runs the world."""
+
+
+@wp.func
+def _turn(warp: int, warps: int) -> int:
+    """The named barrier at which warp ``warp`` of ``warps`` takes its turns (1 + its warp; 0 is the block's)."""
+    return 1 + warp % warps
+
+
 @wp.func
 def _group_rows(
     order: RowOrder,
@@ -735,109 +769,149 @@ def _group_rows(
     line_first: int,
     lanes: int,
     lane: int,
+    warp: int,
+    warps: int,
 ):
     """Group the world's dense pairs, color the groups, and where the world takes the colors (:class:`RowGroups`)
     place its dense contact rows color-major (each pair's ``rows_before``) and write its tables; else its colors
     are 0 and the row order's places stand. ``line_first`` is the line's row of the world's first contact row.
 
     One pass over the sequence a batch of the lanes at a time forms the groups and colors their leaders; one over the
-    leaders places each group in its color and frees the trees' colors; one over the pairs places their rows."""
+    leaders places each group in its color and frees the trees' colors; one over the pairs places their rows.
+
+    Over ``warps`` warps of the block (warp ``warp``; one on the CPU, or where a warp is the world's), the warps take
+    the passes' batches in turn, warp ``w`` the batches ``w``, ``w + warps``, ...: a batch's own loads, its keys' places
+    (open addressing, whose places do not depend on the order keys arrive in) and which of its leaders share a tree
+    come before its turn; its turn (the warp before it passed it, :func:`_turn_wait`) reads what the batches before it
+    left (the sequence's count, the open groups, the trees' colors in use, the colors' totals), leaves its own, and
+    passes it on. The batches take their turns in the sequence's order, so every group, color and place is the one
+    warp's. The leaders and colors are sums and maxima over the batches; the passes over the keys and the pairs take
+    every thread."""
     capacity = groups.pairs.shape[1]
+    threads = lanes * warps
     # A key a pair at most (the pairs past the capacity take none): twice the keys' places.
     keys = wp.min(2 * pairs, groups.keys.shape[1])
-    for h in range(lane, keys, lanes):
+    for h in range(warp * lanes + lane, keys, threads):
         groups.keys[slot, h] = _NO_KEY
         groups.open[slot, h] = wp.vec2i(0, -1)
-    lane_sync(RESERVE_LANES)
+    if warps > 1:
+        if warp == 0 and lane == 0:
+            groups.turns[slot, 0] = 0
+            groups.turns[slot, 1] = 0
+            groups.turns[slot, 2] = 0
+        lane_sync(threads)
+    else:
+        lane_sync(RESERVE_LANES)
     # The sequence: the pairs with dense rows, the list with an immovable side, then the others, each in the row order.
     # Each pair's place among its key's (its trees and list) in the sequence, a group every GROUP_MEMBERS of them; each
     # leader's first-fit color, a leader of the batch once no lower leader of the batch on one of its trees waits.
+    batches = (pairs + lanes - 1) // lanes
     count = int(0)
     leaders = int(0)
     colors = int(0)
-    for half in range(2):
-        lst = int(half) * 2
-        for base in range(0, pairs, lanes):
-            q = base + lane
-            head = int(-1)
-            own = int(0)
-            key = wp.int64(-1)
-            sides = wp.vec2i(-1, -1)
-            if q < pairs:
-                j = order.row_pairs[first + q]
-                own = _pair_rows(order, first, pairs, rows, j)[lst]
-                if own > 0:
-                    head = order.pairs[first + j]
-                    sides = order.pair_sides[first + j]
-                    key = (wp.int64(half) << wp.int64(62)) | (wp.int64(sides[0]) << wp.int64(31))
-                    key = key | wp.int64(sides[1] + 1)
-            active = head >= 0
-            s = count + lane_scan(wp.where(active, 1, 0), RESERVE_LANES)
-            if s >= capacity:
-                active = False
-            place = int(-1 - lane)
-            if active:
-                place = _group_key_place(groups, slot, key, keys)
-            peers = lane_match(place, RESERVE_LANES)
-            held = wp.vec2i(0, -1)
-            if active:
-                held = groups.open[slot, place]
-            rank = held[0] + lane_below(peers, RESERVE_LANES)
-            member = rank % GROUP_MEMBERS
-            # A member's leader: the open group's (counted before this batch) or a peer of this batch.
-            source = int(lane)
-            if active and member > 0 and rank - member >= held[0]:
-                skip = rank - member - held[0]
-                rest = wp.uint32(peers)
-                while skip > 0:
-                    rest = rest & (rest - wp.uint32(1))
-                    skip -= 1
-                source = lane_first(rest, RESERVE_LANES)
-            peer = lane_read(s, source, RESERVE_LANES)
-            leader = int(s)
-            if active and member > 0:
-                leader = wp.where(rank - member >= held[0], peer, held[1])
-            waiting = active and member == 0
-            lane_sync(RESERVE_LANES)
-            if active:
-                groups.pairs[slot, s] = wp.vec4i(head, lst, leader, member)
-                if lane_last(peers, RESERVE_LANES) == lane:
-                    groups.open[slot, place] = wp.vec2i(rank + 1, leader)
-                if waiting:
-                    groups.members[slot, GROUP_MEMBERS * s] = own
-                    for m in range(1, GROUP_MEMBERS):
-                        groups.members[slot, GROUP_MEMBERS * s + m] = 0
-            lane_sync(RESERVE_LANES)
-            if active and member > 0:
-                groups.members[slot, GROUP_MEMBERS * leader + member] = own
-            # The batch's lower leaders that share a tree with this one.
-            lower = wp.uint32(0)
-            for k in range(lanes):
-                other = wp.vec2i(lane_read(sides[0], k, RESERVE_LANES), lane_read(sides[1], k, RESERVE_LANES))
-                other_leads = lane_read(wp.where(waiting, 1, 0), k, RESERVE_LANES)
-                if k < lane and waiting and other_leads != 0 and _shares_tree(sides, other):
-                    lower = lower | (wp.uint32(1) << wp.uint32(k))
-            while lane_any(waiting, RESERVE_LANES):
-                votes = lane_ballot(waiting, RESERVE_LANES)
-                if waiting and (votes & lower) == wp.uint32(0):
-                    used = groups.used[sides[0]]
+    for g in range(warp, 2 * batches, warps):
+        half = g // batches
+        base = (g - half * batches) * lanes
+        lst = half * 2
+        q = base + lane
+        head = int(-1)
+        own = int(0)
+        key = wp.int64(-1)
+        sides = wp.vec2i(-1, -1)
+        if q < pairs:
+            j = order.row_pairs[first + q]
+            own = _pair_rows(order, first, pairs, rows, j)[lst]
+            if own > 0:
+                head = order.pairs[first + j]
+                sides = order.pair_sides[first + j]
+                key = (wp.int64(half) << wp.int64(62)) | (wp.int64(sides[0]) << wp.int64(31))
+                key = key | wp.int64(sides[1] + 1)
+        candidate = head >= 0
+        # Its key's place (claimed by every pair with rows: a pair past the capacity holds a place no read finds).
+        place = int(-1 - lane)
+        if candidate:
+            place = _group_key_place(groups, slot, key, keys)
+        # The batch's lower pairs that share a tree with this one.
+        shares = wp.uint32(0)
+        for k in range(lanes):
+            other = wp.vec2i(lane_read(sides[0], k, RESERVE_LANES), lane_read(sides[1], k, RESERVE_LANES))
+            if k < lane and candidate and _shares_tree(sides, other):
+                shares = shares | (wp.uint32(1) << wp.uint32(k))
+        # The batch's turn: what the batches before it left.
+        if warps > 1:
+            if g > 0:
+                _turn_wait(_turn(warp, warps))
+            count = groups.turns[slot, 0]
+        s = count + lane_scan(wp.where(candidate, 1, 0), RESERVE_LANES)
+        active = candidate and s < capacity
+        peers = lane_match(wp.where(active, place, -1 - lane), RESERVE_LANES)
+        held = wp.vec2i(0, -1)
+        if active:
+            held = groups.open[slot, place]
+        rank = held[0] + lane_below(peers, RESERVE_LANES)
+        member = rank % GROUP_MEMBERS
+        # A member's leader: the open group's (counted before this batch) or a peer of this batch.
+        source = int(lane)
+        if active and member > 0 and rank - member >= held[0]:
+            skip = rank - member - held[0]
+            rest = wp.uint32(peers)
+            while skip > 0:
+                rest = rest & (rest - wp.uint32(1))
+                skip -= 1
+            source = lane_first(rest, RESERVE_LANES)
+        peer = lane_read(s, source, RESERVE_LANES)
+        leader = int(s)
+        if active and member > 0:
+            leader = wp.where(rank - member >= held[0], peer, held[1])
+        waiting = active and member == 0
+        lane_sync(RESERVE_LANES)
+        if active:
+            groups.pairs[slot, s] = wp.vec4i(head, lst, leader, member)
+            if lane_last(peers, RESERVE_LANES) == lane:
+                groups.open[slot, place] = wp.vec2i(rank + 1, leader)
+            if waiting:
+                groups.members[slot, GROUP_MEMBERS * s] = own
+                for m in range(1, GROUP_MEMBERS):
+                    groups.members[slot, GROUP_MEMBERS * s + m] = 0
+        lane_sync(RESERVE_LANES)
+        if active and member > 0:
+            groups.members[slot, GROUP_MEMBERS * leader + member] = own
+        lower = shares & lane_ballot(waiting, RESERVE_LANES)
+        while lane_any(waiting, RESERVE_LANES):
+            votes = lane_ballot(waiting, RESERVE_LANES)
+            if waiting and (votes & lower) == wp.uint32(0):
+                used = groups.used[sides[0]]
+                if sides[1] >= 0:
+                    used = used | groups.used[sides[1]]
+                color = _first_free_color(used)
+                if color < GROUP_COLORS:
+                    bit = wp.int64(1) << wp.int64(color)
+                    groups.used[sides[0]] = groups.used[sides[0]] | bit
                     if sides[1] >= 0:
-                        used = used | groups.used[sides[1]]
-                    color = _first_free_color(used)
-                    if color < GROUP_COLORS:
-                        bit = wp.int64(1) << wp.int64(color)
-                        groups.used[sides[0]] = groups.used[sides[0]] | bit
-                        if sides[1] >= 0:
-                            groups.used[sides[1]] = groups.used[sides[1]] | bit
-                    # The leader's color and trees, until the leaders' pass places it.
-                    groups.places[slot, s] = wp.vec4i(color, sides[0], sides[1], 0)
-                    colors = wp.max(colors, color + 1)
-                    waiting = False
-                lane_sync(RESERVE_LANES)
-            count += lane_sum(wp.where(active, 1, 0), RESERVE_LANES)
-            leaders += lane_sum(wp.where(active and member == 0, 1, 0), RESERVE_LANES)
-    count = wp.min(count, capacity)
+                        groups.used[sides[1]] = groups.used[sides[1]] | bit
+                # The leader's color and trees, until the leaders' pass places it.
+                groups.places[slot, s] = wp.vec4i(color, sides[0], sides[1], 0)
+                colors = wp.max(colors, color + 1)
+                waiting = False
+            lane_sync(RESERVE_LANES)
+        count += lane_sum(wp.where(active, 1, 0), RESERVE_LANES)
+        leaders += lane_sum(wp.where(active and member == 0, 1, 0), RESERVE_LANES)
+        if warps > 1:
+            if lane == 0:
+                groups.turns[slot, 0] = count
+            if g + 1 < 2 * batches:
+                _turn_pass(_turn(warp + 1, warps))
     colors = int(lane_maximum(float(colors), RESERVE_LANES))
+    if warps > 1:
+        # The leaders and colors over the warps; the count the last batch's.
+        if lane == 0:
+            wp.atomic_add(groups.turns, slot, 1, leaders)
+            wp.atomic_max(groups.turns, slot, 2, colors)
+        lane_sync(threads)
+        count = groups.turns[slot, 0]
+        leaders = groups.turns[slot, 1]
+        colors = groups.turns[slot, 2]
+    count = wp.min(count, capacity)
     takes = (
         colors <= GROUP_COLORS
         and leaders >= groups.min_units
@@ -845,13 +919,17 @@ def _group_rows(
         and line_first + rows[0] + rows[2] <= capacity
     )
     if takes:
-        for c in range(lane, colors, lanes):
+        for c in range(warp * lanes + lane, colors, threads):
             groups.totals[slot, c] = wp.vec2i(0, 0)
-    lane_sync(RESERVE_LANES)
+    if warps > 1:
+        lane_sync(threads)
+    else:
+        lane_sync(RESERVE_LANES)
     # The leaders in order: each tree's colors freed for the next reservation; where the world takes the colors, each
     # group's place among its color's groups and rows (a batch at a time), and each color's groups and rows.
-    for base in range(0, count, lanes):
-        s = base + lane
+    rounds = (count + lanes - 1) // lanes
+    for g in range(warp, rounds, warps):
+        s = g * lanes + lane
         color = int(-1 - lane)
         size = int(0)
         if s < count:
@@ -870,6 +948,8 @@ def _group_rows(
                 peer_size = lane_read(size, k, RESERVE_LANES)
                 if k < lane and (peers >> wp.uint32(k)) & wp.uint32(1) != wp.uint32(0):
                     below += peer_size
+            if warps > 1 and g > 0:
+                _turn_wait(_turn(warp, warps))
             held = wp.vec2i(0, 0)
             if color >= 0:
                 held = groups.totals[slot, color]
@@ -881,13 +961,17 @@ def _group_rows(
                     groups.totals[slot, color] = wp.vec2i(
                         held[0] + lane_count(peers, RESERVE_LANES), held[1] + below + size
                     )
+            if warps > 1 and g + 1 < rounds:
+                _turn_pass(_turn(warp + 1, warps))
         lane_sync(RESERVE_LANES)
+    if warps > 1:
+        lane_sync(threads)
     if not takes:
-        if lane == 0:
+        if warp == 0 and lane == 0:
             groups.colors[slot] = 0
         return
     # The colors' first groups and rows.
-    if lane == 0:
+    if warp == 0 and lane == 0:
         start = wp.vec2i(0, 0)
         for c in range(colors):
             total = groups.totals[slot, c]
@@ -897,10 +981,13 @@ def _group_rows(
         groups.offsets[slot, colors] = start[0]
         groups.rows[slot, start[0]] = line_first + start[1]
         groups.colors[slot] = colors
-    lane_sync(RESERVE_LANES)
+    if warps > 1:
+        lane_sync(threads)
+    else:
+        lane_sync(RESERVE_LANES)
     # Each pair's rows before it in the line's contact rows (the slot pass adds the list with an immovable side's rows
     # to the others'), each group's first row.
-    for s in range(lane, count, lanes):
+    for s in range(warp * lanes + lane, count, threads):
         pair = groups.pairs[slot, s]
         lead = groups.places[slot, pair[2]]
         start = groups.totals[slot, lead[0]]
@@ -916,7 +1003,10 @@ def _group_rows(
         else:
             b[2] = offset - rows[0]
         order.rows_before[pair[0]] = b
-    lane_sync(RESERVE_LANES)
+    if warps > 1:
+        lane_sync(threads)
+    else:
+        lane_sync(RESERVE_LANES)
 
 
 def reserve_warps(worlds: int, device) -> int:
@@ -1081,16 +1171,21 @@ def reserve_world_rows_kernel(grouped: bool, warps: int = 1):
                     order.rows_before[head] = before
                 seen = seen + _lane_sum4(own)
             lane_sync(RESERVE_LANES)
-            # A world of many trees: its dense contact rows by colors of groups, where it takes them (RowGroups).
-            if wp.static(grouped):
-                group_slot = groups.slot[world]
-                if group_slot >= 0:
-                    _group_rows(order, groups, group_slot, first, pairs, rows, world_slot_counter[world], lanes, lane)
         if wp.static(warps > 1):
             lane_sync(threads)
-            # The world's rows of each list (the first warp's sums): its last contact's before it and its own.
+            # The world's rows of each list and its pairs (the first warp's sums): its last contact's before it and
+            # its own, and its pair's place and one.
             if end > first:
                 rows = order.rows_frame[end - 1] + _contact_rows(data, end - 1)
+                pairs = order.pairs_before[end - 1] + 1
+        # A world of many trees: its dense contact rows by colors of groups, where it takes them (RowGroups), over the
+        # world's warps in turn.
+        if wp.static(grouped):
+            group_slot = groups.slot[world]
+            if group_slot >= 0:
+                _group_rows(
+                    order, groups, group_slot, first, pairs, rows, world_slot_counter[world], lanes, lane, warp, warps
+                )
         # Each admitted contact's slot; each pair's head restores its trees (_order_islands' starting state).
         for c in range(first + warp * lanes + lane, end, threads):
             if data.world[c] != world:
