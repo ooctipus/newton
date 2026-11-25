@@ -77,10 +77,15 @@ __all__ = [
 # ---------------------------------------------------------------------------------------------------------------------
 
 
+FILL_THREADS = 1024
+"""Threads a launch whose items stride over their own work fills on each SM (:func:`fill_lanes`): a block's most."""
+
+
 def fill_lanes(items: int, device, least: int = 32, most: int = 1024) -> int:
     """Lanes an item of a launch whose items stride over their own work (a world's rows, no lane waiting on another):
-    the smallest power of two from ``least`` at which ``items`` items cover a block of ``most`` threads on each SM, at
-    most ``most``; ``least`` on the CPU.
+    the smallest power of two from ``least`` at which ``items`` items cover a block of :data:`FILL_THREADS` on each
+    SM, at most ``most`` (the item's own work, e.g. its rows' capacity, bounds the lanes and never sizes them, so a
+    capacity past the device's fill costs no lane); ``least`` on the CPU.
 
     A latency-bound map over a world's rows at a few worlds idles the device at a warp or a block a world (coins'
     128 worlds of 9k free-body rows on 188 SMs); many worlds keep ``least``.
@@ -88,7 +93,7 @@ def fill_lanes(items: int, device, least: int = 32, most: int = 1024) -> int:
     device = wp.get_device(device)
     if not device.is_cuda:
         return least
-    need = -(-int(device.sm_count) * most // max(int(items), 1))
+    need = -(-int(device.sm_count) * FILL_THREADS // max(int(items), 1))
     lanes = least
     while lanes < min(need, most):
         lanes *= 2

@@ -46,7 +46,7 @@ from typing import NamedTuple
 import numpy as np
 import warp as wp
 
-from ...core.execution import Queue, appended
+from ...core.execution import Queue, appended, fill_lanes
 from ...core.memory import REFERENCE_ARCH, Buffer, Staging, arch_budget, device
 from . import kernel_template, sweep_levels
 from .device_preludes import SHARED_STORAGE, cuda_native, lane_group
@@ -734,15 +734,17 @@ def count_units(
     free_records: int,
     mf_rows: int,
     min_units: int,
+    chunks: int,
     pass_words: wp.array[wp.int32],
     slot_need: wp.array[wp.int32],
 ):
     """Each candidate world's units, as the unit builder counts them (a contact normal row among its free rows before
     their contact rows' end; none under ``min_units`` such rows), and one more: its entries of the pool, added at its
-    slot (``slot_need``, zero beforehand). A block of :data:`PLACE_THREADS` takes as many of a candidate's rows, a
-    thread a row, and adds its count once (launch tiled over the slots and the row capacity's blocks), so a world of
-    many rows counts them over the device, not on one block. A later step of the collision pass keeps the pass's
-    counts (``pass_words[0]``, :data:`.placement.CONTACT_PASS`)."""
+    slot (``slot_need``, zero beforehand). A candidate's ``chunks`` blocks of :data:`PLACE_THREADS` (launch tiled over
+    the slots and the blocks that fill the device, :func:`.core.execution.fill_lanes`) stride over its live rows, a
+    thread a row at a time, and each adds its count once, so a world of many rows counts them over the device, not on
+    one block, and the launch follows the device, not the row capacity. A later step of the collision pass keeps the
+    pass's counts (``pass_words[0]``, :data:`.placement.CONTACT_PASS`)."""
     item, chunk, t = wp.tid()
     if item >= candidate_count[0] or pass_words[0] != 0:
         return
@@ -751,11 +753,12 @@ def count_units(
     first = chunk * wp.block_dim()
     if end < min_units or first >= end:
         return
-    row = first + t
     head = int(0)
-    if row < end:
+    row = first + t
+    while row < end:
         if (row_record[mf_first[world], free_records + row * _HEADER_WORDS + 3] & 0xFFFF) == _ROW_CONTACT:
-            head = 1
+            head += 1
+        row += chunks * wp.block_dim()
     total = wp.tile_sum(wp.tile(head))
     if t == 0:
         # The first block adds the world's colors' one more.
@@ -847,6 +850,10 @@ class ColoredUnits:
         self.unit_capacity = unit_capacity(self.mf_rows)
         slot_world = np.asarray(worlds, dtype=np.int32)
         self.slot_count = int(slot_world.size)
+        # The count's blocks of a slot follow the device's fill, bounded by the row capacity, never sized by it: they
+        # stride over the slot's live rows.
+        rows = -(-max(self.mf_rows, 1) // PLACE_THREADS) * PLACE_THREADS
+        self.count_chunks = fill_lanes(self.slot_count, device, least=PLACE_THREADS, most=rows) // PLACE_THREADS
         self.pool = pool_capacity(self.slot_count, self.mf_rows)
         self.layout = slot_layout(torsion)
         sizes = UnitPlan(self.world_count, self.slot_count, self.pool, self.layout).sizes
@@ -901,7 +908,7 @@ class ColoredUnits:
         )
         wp.launch_tiled(
             count_units,
-            dim=[self.slot_count, -(-self.mf_rows // PLACE_THREADS)],
+            dim=[self.slot_count, self.count_chunks],
             inputs=[
                 candidates,
                 candidate_worlds,
@@ -913,6 +920,7 @@ class ColoredUnits:
                 int(free_records),
                 self.mf_rows,
                 int(self.rule.min_units),
+                self.count_chunks,
                 pass_words,
             ],
             outputs=[units["slot_need"]],
@@ -957,7 +965,8 @@ class ColoredUnits:
             block_dim=32 * BUILD_WARPS,
             device=self.device,
         )
-        # A thread per unit of a slot's share, striding past it.
+        # A thread per unit of a slot's share, striding past it: a unit's gather is a chain of loads, which a lane a
+        # unit hides (2,048 lanes a slot, the device's fill, cost the clutter hardware's stage 12% at 5k units a world).
         wp.launch(
             self.stage_kernel,
             dim=(self.slot_count, self.unit_capacity),
