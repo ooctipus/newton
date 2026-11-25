@@ -2105,8 +2105,12 @@ def walk_levels(pad: str = "        ", *, turns: str = "") -> str:
         resources=resources,
         ahead=(WALK_AHEAD[0].format(unit=me), during),
         counts="level_end.data[s0 + {}]",
-        store="reg_level.data[region] = level;\n                reg_rank.data[region] = rank;",
+        store=(
+            "reg_level.data[region] = level;\n                reg_rank.data[region] = rank;"
+            "\n                reg_after.data[region] = wp::vec2i(after_a, after_b);"
+        ),
         lanes=32 if turns else "STRIDE",
+        after=True,
         turns=turns,
     )
     # The pass's own barrier (with turns) follows the counts' clearing.
@@ -2310,6 +2314,7 @@ def _walk_acting(
     body_level: wp.array[int],
     reg_level: wp.array[int],
     reg_rank: wp.array[int],
+    reg_after: wp.array[wp.vec2i],
     reg_walk: wp.array[int],
     level_end: wp.array[int],
     level_region: wp.array[int],
@@ -2327,6 +2332,7 @@ def level_acting(
     body_level: wp.array[int],
     reg_level: wp.array[int],
     reg_rank: wp.array[int],
+    reg_after: wp.array[wp.vec2i],
     reg_walk: wp.array[int],
     level_end: wp.array[int],
     level_region: wp.array[int],
@@ -2362,6 +2368,7 @@ def level_acting(
         body_level,
         reg_level,
         reg_rank,
+        reg_after,
         reg_walk,
         level_end,
         level_region,
@@ -2409,6 +2416,7 @@ _REGION_FIELDS = (
     ("reg_bound", wp.vec2, 1),
     ("reg_level", wp.int32, 1),
     ("reg_rank", wp.int32, 1),
+    ("reg_after", wp.vec2i, 1),
     ("reg_order", wp.int32, 1),
     ("reg_walk", wp.int32, 1),
     ("level_region", wp.int32, 1),
@@ -2913,6 +2921,7 @@ class Regions:
                 self.body_level,
                 self.reg_level,
                 self.reg_rank,
+                self.reg_after,
                 self.reg_walk,
                 self.level_end,
                 self.level_region,
@@ -3058,7 +3067,7 @@ class Regions:
     def operands(self) -> dict:
         """The stream as the general sweep's region phase takes it (:data:`.sweep_routes.REGION_OPERANDS`)."""
         names = "world_regions world_levels world_order_end level_end level_region reg_order reg_walk reg_level"
-        names += " reg_rank body_level body_first body_basis"
+        names += " reg_rank reg_after body_level body_first body_basis"
         names += " reg_frame reg_arm reg_arm_b reg_body reg_cand reg_law reg_wnn reg_wnf reg_wff reg_ball_values"
         names += " reg_ball_vectors reg_ginv reg_k reg_lk reg_lw"
         names += " reg_bf reg_kind reg_row cand cand_floor cand_row reg_wrench reg_phi reg_set reg_spring reg_state reg_stamp"

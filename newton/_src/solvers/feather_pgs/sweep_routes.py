@@ -907,6 +907,7 @@ REGION_OPERANDS = (
     ("reg_walk", wp.array[int]),
     ("reg_level", wp.array[int]),
     ("reg_rank", wp.array[int]),
+    ("reg_after", wp.array[wp.vec2i]),
     ("body_level", wp.array[int]),
     ("body_first", wp.array[int]),
     ("body_basis", wp.array2d[wp.spatial_vector]),
@@ -1037,46 +1038,7 @@ if (moved) {{
     alone = "false" if block else f"(float)(kept_end - region_span[0]) < {parallelism}f * (float)levels"
     holds = "false" if block else f"blk_pair.data[world * {int(PAIR_BLOCKS)}][0] >= 0"
     passed = "place >= level_last" if block else "(place >= level_last || ((blocks >> lane) & 1u) != 0u)"
-    text = f"""{sync}
-{{
-    const wp::vec2i region_span = world_regions.data[world];
-    const int levels = world_levels.data[world];
-    // The colored rule's measure (sweep_units.COLORED_RULE): a world whose levels hold fewer regions than its
-    // parallelism, a chain, is walked by its first lane in the order the levels were made from, a body's twist kept
-    // from one region to the next of the same body; the others' levels take the lanes. Both are the same sweep.
-    const int kept_end = levels > 0 ? level_end.data[region_span[0] + levels - 1] : region_span[0];
-    const bool alone = {alone};
-    // Whether the world holds a pair block: its first is listed first (region_sweep.form_blocks).
-    const bool holds_block = {holds};
-    int level_first = region_span[0];
-    int body = -1, first = 0, version = 0;
-    wp::spatial_vector u;
-    wp::vec3 v, w;
-    const wp::spatial_vector* basis = body_basis.data;
-    // A chain world walks its order itself (reg_walk: a body's regions together, so its twist stays kept), as one
-    // span; the others take the levels.
-    const int spans = alone ? 1 : levels;
-{_REGION_GROUP_STAGE if group else _LEVEL_STAGE}
-    for (int chunk = level_first; chunk < level_last; chunk += {stride}) {{
-    // A chain world's lanes all walk its order, each doing the same work (a block's candidate passes split over them),
-    // a chunk of the lanes' width at a time: each lane reads one place's state, and the chunk's turns are its regions
-    // that are not left out, in order (a left-out region stays so until the sweeps' end and its turn writes nothing).
-    // A pair block takes every lane (teamed): the lanes visit a chunk's blocks together, one after another, then each
-    // lane its own other region; a level's regions share no body, so its order inside the level is the same sweep.
-    const unsigned blocks = alone ? BALLOT(chunk + lane < level_last
-        && reg_state.data[reg_walk.data[chunk + lane]] != {int(REGION_LEFT)}) : !holds_block ? 0u
-        : BALLOT(chunk + lane < level_last && (reg_kind.data[level_region.data[chunk + lane]] & {int(KIND_BLOCK)}) != 0);
-    unsigned left = blocks;
-    const int turns = alone ? COUNT(blocks) : COUNT(blocks) + 1;
-    // One copy of a region's visit: the turns are a schedule, not to be unrolled (each copy is the whole visit).
-    #pragma unroll 1
-    for (int turn = 0; turn < turns; ++turn) {{
-        const bool teamed = alone || left != 0u;
-        const int place = chunk + (left != 0u ? FIRST(left) : {me});
-        left &= left - 1u;
-        if (!teamed && {passed}) continue;
-        if (teamed) WARP_SYNC();
-        const int g = alone ? reg_walk.data[place] : level_region.data[place];
+    visit = f"""        const int g = alone ? reg_walk.data[place] : level_region.data[place];
         // The region's words at once (its state, bodies, second body's stamp, kind): one round of memory latency.
         const int state = reg_state.data[g];
         const wp::vec2i sides = reg_body.data[g];
@@ -1221,7 +1183,49 @@ if (moved) {{
         reg_spring.data[g] = out.v6;
         reg_state.data[g] = out.v8 == {int(REGION_SLIDE)} ? {int(REGION_LOOSE)} : out.v0[0] > 0.0f ? version : {int(REGION_IDLE)};
         reg_stamp.data[g] = version_b;
-    }}
+"""
+    if block and not group:
+        return indent(_region_flow(visit), pad)
+    text = f"""{sync}
+{{
+    const wp::vec2i region_span = world_regions.data[world];
+    const int levels = world_levels.data[world];
+    // The colored rule's measure (sweep_units.COLORED_RULE): a world whose levels hold fewer regions than its
+    // parallelism, a chain, is walked by its first lane in the order the levels were made from, a body's twist kept
+    // from one region to the next of the same body; the others' levels take the lanes. Both are the same sweep.
+    const int kept_end = levels > 0 ? level_end.data[region_span[0] + levels - 1] : region_span[0];
+    const bool alone = {alone};
+    // Whether the world holds a pair block: its first is listed first (region_sweep.form_blocks).
+    const bool holds_block = {holds};
+    int level_first = region_span[0];
+    int body = -1, first = 0, version = 0;
+    wp::spatial_vector u;
+    wp::vec3 v, w;
+    const wp::spatial_vector* basis = body_basis.data;
+    // A chain world walks its order itself (reg_walk: a body's regions together, so its twist stays kept), as one
+    // span; the others take the levels.
+    const int spans = alone ? 1 : levels;
+{_REGION_GROUP_STAGE if group else _LEVEL_STAGE}
+    for (int chunk = level_first; chunk < level_last; chunk += {stride}) {{
+    // A chain world's lanes all walk its order, each doing the same work (a block's candidate passes split over them),
+    // a chunk of the lanes' width at a time: each lane reads one place's state, and the chunk's turns are its regions
+    // that are not left out, in order (a left-out region stays so until the sweeps' end and its turn writes nothing).
+    // A pair block takes every lane (teamed): the lanes visit a chunk's blocks together, one after another, then each
+    // lane its own other region; a level's regions share no body, so its order inside the level is the same sweep.
+    const unsigned blocks = alone ? BALLOT(chunk + lane < level_last
+        && reg_state.data[reg_walk.data[chunk + lane]] != {int(REGION_LEFT)}) : !holds_block ? 0u
+        : BALLOT(chunk + lane < level_last && (reg_kind.data[level_region.data[chunk + lane]] & {int(KIND_BLOCK)}) != 0);
+    unsigned left = blocks;
+    const int turns = alone ? COUNT(blocks) : COUNT(blocks) + 1;
+    // One copy of a region's visit: the turns are a schedule, not to be unrolled (each copy is the whole visit).
+    #pragma unroll 1
+    for (int turn = 0; turn < turns; ++turn) {{
+        const bool teamed = alone || left != 0u;
+        const int place = chunk + (left != 0u ? FIRST(left) : {me});
+        left &= left - 1u;
+        if (!teamed && {passed}) continue;
+        if (teamed) WARP_SYNC();
+{visit}    }}
     }}
 {GROUP_JOIN if group else ""}    level_first = level_last;
     if (!alone) {sync}
@@ -1229,6 +1233,61 @@ if (moved) {{
 }}
 {sync}"""
     return indent(text, pad)
+
+
+def _region_flow(visit: str) -> str:
+    """The region phase over a world's block (:func:`region_phase`'s block form) as a flow: the block takes the acting
+    regions by level in rounds of its threads, a thread a place, and a region runs once the regions before it on its
+    bodies ran (the levels its bodies held before it in the walk, ``reg_after``: the level builder's), each body's
+    latest region's turn in ``s_ran`` at its first coordinate's slot (:data:`RAN_SLOT`). A level's regions share no
+    body and a body's regions run in the walk's order, so every region reads the coordinates the sequential sweep of
+    the order gives it: the levels' sweep, without a barrier a level nor a level's slowest visit. No region waits
+    forever: those it waits for sit at lower levels, at earlier places, and a warp takes its rounds in order and
+    polls until its lanes ran. The turns rise by the levels each sweep (``region_turn``), so ``s_ran`` needs no
+    clearing between sweeps, nor after the sweeps' end remakes the levels."""
+    return f"""__syncthreads();
+{{
+    const wp::vec2i region_span = world_regions.data[world];
+    const int levels = world_levels.data[world];
+    const int kept_end = levels > 0 ? level_end.data[region_span[0] + levels - 1] : region_span[0];
+    const bool alone = false;
+    for (int base = region_span[0]; base < kept_end; base += (int)blockDim.x) {{
+        const int place = base + tid;
+        bool pending = place < kept_end;
+        // The place's region, its level and the levels its bodies held before it, and its bodies' slots.
+        const int at = pending ? level_region.data[place] : level_region.data[region_span[0]];
+        const wp::vec2i flow_sides = reg_body.data[at];
+        const wp::vec2i after = reg_after.data[at];
+        const int flow_level = reg_level.data[at];
+        const int slot_a = body_first.data[flow_sides[0]] / {RAN_SLOT};
+        const int slot_b = flow_sides[1] >= 0 ? body_first.data[flow_sides[1]] / {RAN_SLOT} : slot_a;
+        while (__any_sync(0xffffffffu, pending)) {{
+            if (pending) {{
+                volatile const int* const ran = s_ran;
+                const bool ready = (after[0] < 0 || ran[slot_a] == region_turn + after[0])
+                    && (after[1] < 0 || ran[slot_b] == region_turn + after[1]);
+                if (ready) {{
+                    __threadfence_block();
+                    int body = -1, first = 0, version = 0;
+                    wp::spatial_vector u;
+                    wp::vec3 v, w;
+                    const wp::spatial_vector* basis = body_basis.data;
+                    do {{
+{indent(visit, "                ")}
+                    }} while (false);
+                    // Its turn on its bodies, after its changes: the next region on each may run.
+                    __threadfence_block();
+                    volatile int* const done = s_ran;
+                    done[slot_a] = region_turn + flow_level;
+                    if (flow_sides[1] >= 0) done[slot_b] = region_turn + flow_level;
+                    pending = false;
+                }}
+            }}
+        }}
+    }}
+    region_turn += levels;
+}}
+__syncthreads();"""
 
 
 # A world's job words where it takes a group of blocks (region_phase): the generation of its last post, the level's
@@ -1440,6 +1499,7 @@ def mf_gs_staging(
     colored: bool = False,
     grouped: bool = False,
     regions: bool = False,
+    flow: bool = False,
     places: RowPlaces = STAGED_ROWS,
     traces: bool = False,
     wide_rows: bool = False,
@@ -1482,7 +1542,9 @@ def mf_gs_staging(
         # Each body's latest unit's turn, at its first coordinate (_colored_units); under regions the remake's turn
         # words (region_verify: the level count, a narrow walk's acting count).
         levels = (
-            (Buffer("s_level_turn", "int", 2),) if regions else (Buffer("s_ran", "int", ran_slots(max_world_dofs)),)
+            (Buffer("s_level_turn", "int", 2), *((Buffer("s_ran", "int", ran_slots(max_world_dofs)),) if flow else ()))
+            if regions
+            else (Buffer("s_ran", "int", ran_slots(max_world_dofs)),)
         )
         if traces:
             levels += block_argmax(COLORED_THREADS // 32, warp="warp", lane="lane")[1]
@@ -1695,6 +1757,11 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         if solve_policy.traces:
             trace_reduction = block_argmax(COLORED_THREADS // 32, warp="warp", lane="lane")[0]
         offsets = metric_build = ""
+        if not sweep.world_blocks:
+            # The flow's marks (_region_flow): no region ran yet (turns are at least zero), before the sweeps' barrier.
+            metric_build = (
+                f"    for (int d = tid; d < {ran_slots(D)}; d += blockDim.x) s_ran[d] = -1;\n    int region_turn = 0;\n"
+            )
     elif colored:
         # The world's entries of the pool: the stride of its units' staged fields and words in its block
         # (sweep_units.SLOT_FIELDS).
@@ -2274,6 +2341,7 @@ class GeneralSweep(SweepConfig):
             colored=self.colored,
             grouped=self.grouped,
             regions=self.regions,
+            flow=self.regions and self.colored and not self.world_blocks,
             places=self.places,
             traces=self.solve_policy.traces,
             wide_rows=self.wide_rows,

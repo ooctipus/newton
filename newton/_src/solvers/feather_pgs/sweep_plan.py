@@ -541,23 +541,32 @@ class Sweep:
             if colored:
                 colored_declared = dataclasses.replace(declared, regions=self.regions is not None, **_COLORED)
                 if self.region_slot is not None:
-                    # A level's regions share no body, so a world holds a level wider than its block only where its
-                    # free bodies outnumber the block's threads: such worlds take the device's blocks beside their own,
-                    # as many each as the device holds over the worlds, with the velocity change in global memory.
+                    # A world's block flows its regions (_region_flow) with its velocity change and its bodies' marks
+                    # in its stage. A world past that reach keeps its velocity in global memory, and where its free
+                    # bodies outnumber the block's threads (so a level can be wider than its block: a level's regions
+                    # share no body) it takes the device's blocks beside its own, as many each as the device holds
+                    # over the worlds (their own form's stage, which holds no marks); a world the block holds keeps it
+                    # and takes a wide level in rounds of its threads.
                     found = device(model.device)
-                    held = shape(colored_declared.work(), found).blocks_per_sm
+                    places = dataclasses.replace(colored_declared.places, velocity=Place.GLOBAL)
+                    reach = colored_declared.places.velocity is not Place.SHARED or not sweep_routes.velocity_fits(
+                        colored_declared, budget
+                    )
+                    if reach:
+                        colored_declared = dataclasses.replace(colored_declared, places=places)
+                    grouped = dataclasses.replace(colored_declared, places=places, world_blocks=True)
+                    held = shape(grouped.work(), found).blocks_per_sm
                     group = held * found.sms // int(capable.size)
                     bodies = int(np.asarray(self.forest.free_rigid_per_world)[capable].max())
-                    if group > 1 and bodies > sweep_routes.COLORED_THREADS and self.pins.world_group:
+                    if group > 1 and bodies > sweep_routes.COLORED_THREADS and reach and self.pins.world_group:
                         self.world_blocks = group
-                        places = dataclasses.replace(colored_declared.places, velocity=Place.GLOBAL)
-                        colored_declared = dataclasses.replace(colored_declared, places=places, world_blocks=True)
+                        colored_declared = grouped
                         self.wide_jobs = wp.zeros(
                             self.forest.world_count * sweep_routes.WIDE_JOB, dtype=wp.int32, device=model.device
                         )
-                        # The general sweep's lines where it keeps its own there, else the colored block's.
-                        if self.sweep_velocity.size < self.forest.world_count * self.forest.max_world_dofs:
-                            self.sweep_velocity = self._velocity_lines(colored_declared)
+                    # The general sweep's lines where it keeps its own there, else the colored block's.
+                    if reach and self.sweep_velocity.size < self.forest.world_count * self.forest.max_world_dofs:
+                        self.sweep_velocity = self._velocity_lines(colored_declared)
                 colored_sweep = self._staged(colored_declared, capable.size)
             # A world of many trees on the dense line: its contact rows by colors of groups (row_slots.RowGroups), a
             # block a world, a color's groups a warp each, for the worlds whose trees can meet the colored mapping's

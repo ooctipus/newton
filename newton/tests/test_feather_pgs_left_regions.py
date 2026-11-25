@@ -305,16 +305,20 @@ class TestFeatherPGSLeftRegions(unittest.TestCase):
     @unittest.skipUnless(wp.is_cuda_available(), "the colored mapping's block runs on CUDA")
     def test_wide_levels_take_the_world_group(self):
         # A world of more free bodies than the colored block's threads holds levels wider than the block (the ground
-        # level: a region a bottom box): the device's other blocks join its block on those levels. Every mapping
-        # sweeps the order by its levels, so the published motion is the warp's to its rounding.
+        # level: a region a bottom box). Where the block holds the world's velocity change it takes such a level in
+        # rounds of its threads; where it cannot (here pinned to global memory) the device's other blocks join its
+        # block on those levels. Every mapping sweeps the order by its levels, so the published motion is the warp's
+        # to its rounding.
         model = _columns("cuda:0", columns=18, height=2)
         poses = []
-        for region_block in (True, False):
+        for region_block, velocity in ((True, None), (True, "global"), (False, None)):
             solver = SolverFeatherPGS(
-                model, pins=SolverFeatherPGS.Pins(region_block=region_block), mf_max_constraints=65_536
+                model,
+                pins=SolverFeatherPGS.Pins(region_block=region_block, velocity=velocity),
+                mf_max_constraints=65_536,
             )
             self.assertTrue(solver.placement.split_records)
-            self.assertEqual(solver.sweep.world_blocks > 1, region_block)
+            self.assertEqual(solver.sweep.world_blocks > 1, velocity == "global")
             pipeline = newton.CollisionPipeline(model)
             contacts = pipeline.contacts()
             states = [model.state(), model.state()]
@@ -335,7 +339,8 @@ class TestFeatherPGSLeftRegions(unittest.TestCase):
             if region_block:
                 self.assertGreater(widest, 256)
             poses.append(states[0].body_q.numpy())
-        np.testing.assert_allclose(poses[0], poses[1], rtol=0.0, atol=1.0e-5)
+        for other in poses[1:]:
+            np.testing.assert_allclose(poses[0], other, rtol=0.0, atol=1.0e-5)
         self.assertGreater(float(poses[0][:, 2].min()), HALF - 1.0e-3)
 
 
