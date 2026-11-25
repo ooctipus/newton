@@ -278,7 +278,7 @@ class WriterShape(NamedTuple):
             found = shape(Work(0, block=self.block, registers=self.line, shared=size), device)
             return found.blocks_per_sm * (found.block // 32)
 
-        return stage(staging, warps, budget, HIDING_WARPS, lambda size: True)
+        return stage(staging, warps, budget, HIDING_WARPS, lambda size: True, budget)
 
 
 WRITERS = MappingProxyType(

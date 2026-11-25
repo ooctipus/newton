@@ -31,6 +31,7 @@ The one rule (``SP/core/FL/HANDOFF_ZEX.md`` §3.2):
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import enum
 import math
@@ -46,6 +47,7 @@ from .memory import (
     REGISTER_GRANULE,
     REGISTER_PARTITIONS,
     REGISTERS_PER_THREAD,
+    STATIC_SHARED_BYTES,
     Device,
     Staging,
     carveout,
@@ -67,6 +69,7 @@ __all__ = [
     "fill_lanes",
     "launch",
     "shape",
+    "staged_launch",
 ]
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -397,6 +400,7 @@ def shape(work: Work, device: Device) -> Shape:
             device.shared_per_block,
             work.hiding,
             lambda size: _warps(live, device, size) >= _warps(work, device, size),
+            STATIC_SHARED_BYTES if device.cuda else device.shared_per_block,
         )
         work = dataclasses.replace(work, shared=staging.bytes)
     if not device.cuda:
@@ -473,6 +477,25 @@ def launch(
         wp.launch(kernel, dim=shape.grid * shape.block, stream=stream, **common)
 
 
+def staged_launch(kernel, grid: int, inputs, block: int, device, *, stream=None, stage: int = 0) -> None:
+    """Launch the tiled ``kernel`` over ``grid`` blocks of ``block`` threads, at ``stage`` bytes of dynamic shared
+    memory where it stages less than it declares (a prefix of its dynamic stage: :meth:`.memory.Staging.resized`);
+    at 0, the kernel's own."""
+    if not stage:
+        wp.launch_tiled(kernel, dim=[grid], inputs=inputs, block_dim=block, device=device, stream=stream)
+        return
+    command = wp.launch_tiled(
+        kernel, dim=[grid], inputs=inputs, block_dim=block, device=device, stream=stream, record_cmd=True
+    )
+    declared = command.hooks.forward_smem_bytes
+    if not 0 < stage <= declared:
+        raise ValueError(f"{kernel.key} declares {declared} bytes of dynamic shared memory, a launch takes {stage}")
+    hooks = copy.copy(command.hooks)
+    hooks.forward_smem_bytes = int(stage)
+    command.hooks = hooks
+    command.launch(stream=stream)
+
+
 # ---------------------------------------------------------------------------------------------------------------------
 # Work beside the step's stream
 # ---------------------------------------------------------------------------------------------------------------------
@@ -529,7 +552,7 @@ class Beside:
 # ---------------------------------------------------------------------------------------------------------------------
 
 
-def compile_ahead(variants: Iterable[tuple[wp.Kernel | None, int]], device=None) -> None:
+def compile_ahead(variants: Iterable[tuple], device=None) -> None:
     """Compile and load the code of every launch variant ``(kernel, block)`` on ``device`` now, the modules in parallel.
 
     Warp compiles a module at its first launch, so a step's first run compiles its modules one after another. An owner
@@ -542,10 +565,18 @@ def compile_ahead(variants: Iterable[tuple[wp.Kernel | None, int]], device=None)
     the launch takes (:func:`warp.overload`), and a generic kernel here is an error, never an empty module.
 
     Args:
-        variants: Each launch's kernel (``None`` for a launch the owner does not make) and its threads per block.
+        variants: Each launch's kernel (``None`` for a launch the owner does not make) and its threads per block, and
+            where a kernel launches at less dynamic shared memory than it declares (:func:`staged_launch`), the least
+            such launch's bytes: the kernel prefers that launch's carveout, which the driver raises for a launch
+            that needs more.
         device: The device the kernels launch on.
     """
-    variants = [(kernel, block) for kernel, block in variants if kernel is not None]
+    variants = [(kernel, int(block), *staged) for kernel, block, *staged in variants if kernel is not None]
+    shared = {}
+    for kernel, block, *staged in variants:
+        if staged and staged[0]:
+            shared[kernel, block] = min(shared.get((kernel, block), staged[0]), staged[0])
+    variants = [(kernel, block) for kernel, block, *_staged in variants]
     generic = [kernel.key for kernel, _block in variants if kernel.is_generic]
     if generic:
         raise TypeError(f"compile_ahead takes the overloads a launch makes, not the generic kernels {generic}")
@@ -559,4 +590,4 @@ def compile_ahead(variants: Iterable[tuple[wp.Kernel | None, int]], device=None)
         for done in [pool.submit(module.load, device, block) for module, block in jobs]:
             done.result()
     for kernel, block in dict.fromkeys(variants):
-        fit_carveout(kernel, block, device)
+        fit_carveout(kernel, block, device, shared=shared.get((kernel, block)))

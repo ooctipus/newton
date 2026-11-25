@@ -217,9 +217,11 @@ class TestShapeAgainstTodaysRules(unittest.TestCase):
             self.assertEqual(placed(config, device, worlds), sweep_routes.STAGED_ROWS)
 
     def test_a_run_past_the_block_keeps_its_first_impulses_staged(self):
-        """The house of cards' colored world at 65,535 free rows: the block keeps the longest head of the free rows'
-        impulses its static stage holds (fixed slots, whole warps' worth) and the rest stay in place; at 2,048 rows
-        every impulse stages, as before. The CPU stages every row."""
+        """The house of cards' colored world at 65,535 free rows: the block keeps two heads of the free rows' impulses
+        (fixed slots, whole warps' worth), the longest its static stage holds and the longest its budget holds, the
+        rest in place: the sweep launches at each, the first at a prefix of the kernel's stage within the static
+        stage; at 2,048 rows every impulse stages, as before. The CPU stages every row. Past both heads, the capacity
+        moves no other operand: at 65,504 and 65,535 rows the places are one."""
         cards = functools.partial(
             sweep_routes.GeneralSweep, 32, max_world_dofs=162, device_arch="120", max_row_dofs=12, torsion=True
         )
@@ -234,11 +236,19 @@ class TestShapeAgainstTodaysRules(unittest.TestCase):
                 spilled = placed(65535, device)
                 self.assertIs(spilled.impulses, Place.SHARED)
                 self.assertGreater(spilled.free_slots, 2048)
-                self.assertEqual(spilled.free_slots % memory.SPILL_SLOTS, 0)
+                self.assertGreater(spilled.wide_slots, spilled.free_slots)
+                for slots in (spilled.free_slots, spilled.wide_slots):
+                    self.assertEqual(slots % memory.SPILL_SLOTS, 0)
                 config = cards(mf_max_constraints=65535, places=spilled, **colored)
-                self.assertTrue(config.staging().fits(memory.STATIC_SHARED_BYTES))
-                self.assertIn(f"_slots{spilled.free_slots}", config.name)
+                staging = config.staging()
+                self.assertEqual(staging.buffers[-1].name, sweep_routes.FREE_IMPULSES)
+                self.assertTrue(staging.fits(device.shared_per_block))
+                first = staging.resized(sweep_routes.FREE_IMPULSES, spilled.free_slots)
+                self.assertTrue(first.fits(memory.STATIC_SHARED_BYTES))
+                self.assertIn(f"_slots{spilled.free_slots}to{spilled.wide_slots}", config.name)
+                self.assertEqual(placed(65504, device), spilled)
                 self.assertEqual(placed(2048, device).free_slots, 0)
+                self.assertEqual(placed(2048, device).wide_slots, 0)
         self.assertEqual(placed(65535, CPU).free_slots, 0)
         # NIST's warp mapping holds four worlds a block: its stage is their worlds in flight, so it keeps no head and
         # its impulses stay in place, as before.

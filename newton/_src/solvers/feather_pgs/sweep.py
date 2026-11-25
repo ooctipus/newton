@@ -80,6 +80,10 @@ fit them, else the world's in place, chosen once a world."""
 STAGED_RUN = "mf_staged"
 """Whether the world's live free rows fit their staged slots (:attr:`WorldRows.slots`)."""
 
+FREE_HEAD = "free_head"
+"""A two-head sweep's launch operand: the head its stage holds, the stage's (:attr:`WorldRows.slots`) or the wide one
+(:attr:`WorldRows.wide`)."""
+
 
 @dataclasses.dataclass(frozen=True)
 class WorldRows:
@@ -103,7 +107,9 @@ class WorldRows:
     every lane (every row's with ``every_lane``) stores what it computed and reads its own stores; a streamed free row's
     first lane stores without a barrier, and every lane reads it by broadcast. With ``slots``, a world whose live free
     rows fit ``slots`` stages their impulses and a world past them keeps every one in place (the spill), read and
-    stored through one pointer (``lam_mf``) as a staged row's: the same values at either place.
+    stored through one pointer (``lam_mf``) as a staged row's: the same values at either place. With ``wide`` too, the
+    sweep launches at each head (its :data:`FREE_HEAD`) and a world is swept by the launch whose head holds its live
+    rows, past both by the first's (:meth:`admission`).
     """
 
     capacity: int
@@ -121,6 +127,8 @@ class WorldRows:
     slots: int = 0
     """The staged impulses' count where a world past it keeps its impulses in place
     (:attr:`.sweep_routes.RowPlaces.free_slots`); ``0``: every row's at its place."""
+    wide: int = 0
+    """The wide head's count (:attr:`.sweep_routes.RowPlaces.wide_slots`), which a second launch stages; ``0``: none."""
 
     VISITED: ClassVar[str] = "i"
     """The row a row loop visits, whose record the loop holds in registers."""
@@ -131,8 +139,15 @@ class WorldRows:
             raise ValueError(f"a row's metadata is staged or streams (the free bodies' streams), got {self.metadata}")
         if self.stream and self.every_lane:
             raise ValueError("a class whose every lane reads its own stores stages its impulses")
-        if self.slots and (self.stream or not self.free):
+        if self.spilled and (self.stream or not self.free):
             raise ValueError("the free rows' staged impulses spill past their slots, no other class's")
+        if self.wide and self.wide <= self.slots:
+            raise ValueError("a wide head holds more slots than the stage's")
+
+    @property
+    def spilled(self) -> bool:
+        """Whether the impulses keep a head staged and the rest in place (:attr:`slots`, :attr:`wide`)."""
+        return bool(self.slots or self.wide)
 
     @property
     def record(self) -> bool:
@@ -303,12 +318,12 @@ class WorldRows:
 
     def peek(self, row: str) -> str:
         """Row ``row``'s impulse read directly (every lane reads the staged value, or a spilled row's in place)."""
-        if self.slots:
+        if self.spilled:
             return f"{SPILL}[{row}]"
         return f"{self.impulses}[{row}]"
 
     def store(self, row: str, value: str) -> str:
-        if self.slots:
+        if self.spilled:
             return f"{SPILL}[{row}] = {value};"
         if self.own_stores:
             return f"{self.impulses}[{row}] = {value};"
@@ -347,9 +362,9 @@ class WorldRows:
                 Buffer(
                     self.impulses,
                     "float",
-                    self.slots or self.capacity,
+                    self.wide or self.slots or self.capacity,
                     alternative=Place.GLOBAL,
-                    spill=self.free and not self.slots,
+                    spill=self.free and not self.spilled,
                 ),
             )
         )
@@ -358,9 +373,9 @@ class WorldRows:
 
     def declaration(self) -> str:
         """The streamed impulses' view of the world's line; with slots, the staged run's or the line's (the spill)."""
-        if self.slots:
+        if self.spilled:
             return (
-                f"    const bool {STAGED_RUN} = m_mf <= {self.slots};\n"
+                f"    const bool {STAGED_RUN} = m_mf <= {FREE_HEAD if self.wide else self.slots};\n"
                 f"    float* {SPILL} = {STAGED_RUN} ? {self.impulses} : &world_impulses.data[{self.base}];"
             )
         if self.stream:
@@ -369,7 +384,14 @@ class WorldRows:
 
     def _staged(self, row: str, statement: str) -> str:
         """``statement`` for row ``row`` where its impulse is staged (a world whose live rows fit the slots)."""
-        return f"if ({STAGED_RUN}) {statement}" if self.slots else statement
+        return f"if ({STAGED_RUN}) {statement}" if self.spilled else statement
+
+    def admission(self) -> str:
+        """With a wide head, the world's return from a launch that is not its own: the wide launch's world is one whose
+        live rows (``m_mf``) pass the stage's head and fit the wide one; every other world is the first launch's."""
+        if not self.wide:
+            return ""
+        return f"    if ((m_mf > {self.slots} && m_mf <= {self.wide}) != ({FREE_HEAD} > {self.slots})) return;\n"
 
     def loads(self, row: str = "i") -> str:
         """Stage row ``row``'s impulse and metadata."""

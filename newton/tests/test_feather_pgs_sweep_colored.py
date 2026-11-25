@@ -500,14 +500,24 @@ class TestSpilledImpulses(unittest.TestCase):
             with self.subTest(slots=slots):
                 self._spilled(slots)
 
-    def _spilled(self, slots: int):
+    def test_two_heads_hold_the_staged_values(self):
+        """With a wide head too (a launch a head, each world swept by the launch whose head holds its live rows), the
+        tray steps bit for bit as with every impulse staged: its world in the wide launch where its rows outgrow the
+        stage's four slots, in the stage's launch where they fit its 256 (on CUDA at a prefix of the kernel's dynamic
+        stage, whose wide head passes the static stage), and in place where they outgrow both heads."""
+        for slots, wide in ((4, 12288), (256, 12288), (4, 8)):
+            with self.subTest(slots=slots, wide=wide):
+                self._spilled(slots, wide)
+
+    def _spilled(self, slots: int, wide: int = 0):
         original = sweep_plan.Sweep._staged
 
         def spilled(plan, config, items):
             staged = original(plan, config, items)
             if not config.free_rows or staged.places.impulses is not Place.SHARED:
                 return staged
-            return dataclasses.replace(staged, places=dataclasses.replace(staged.places, free_slots=slots))
+            places = dataclasses.replace(staged.places, free_slots=slots, wide_slots=wide)
+            return dataclasses.replace(staged, places=places)
 
         devices = ["cpu"] + (["cuda:0"] if wp.is_cuda_available() else [])
         physics = conf._physics(tray(), "patch", 32)
@@ -523,7 +533,10 @@ class TestSpilledImpulses(unittest.TestCase):
                     sweeps.append(solvers[-1].sweep.colored_sweep)
                 for sweep in sweeps:
                     self.assertEqual(sweep.places.free_slots, slots, sweep.name)
-                    self.assertIn(f"_slots{slots}", sweep.name)
+                    self.assertEqual(sweep.places.wide_slots, wide, sweep.name)
+                    self.assertIn(f"_slots{slots}" + (f"to{wide}" if wide else ""), sweep.name)
+                launches = [launch for launch in solvers[-1].sweep.launches if launch.config in sweeps]
+                self.assertEqual(len(launches), len(sweeps) * (2 if wide else 1))
                 rows = int(solvers[-1].placement.mf_constraint_count.numpy().max())
                 self.assertTrue(4 < rows <= 256, "the tray's rows outgrow four slots and fit 256")
                 for name in ("body_q", "body_qd"):

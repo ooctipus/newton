@@ -306,12 +306,14 @@ def _call(name: str, *args) -> None:
         raise RuntimeError(f"{name} failed with CUresult {status}")
 
 
-def fit_carveout(kernel: wp.Kernel, block: int, device=None) -> int:
+def fit_carveout(kernel: wp.Kernel, block: int, device=None, shared: int | None = None) -> int:
     """Prefer for ``kernel`` (the one launched: a generic kernel's overload), launched in blocks of ``block`` threads
     on ``device``, the carveout step that holds the blocks its loaded code keeps resident (:func:`carveout`, the
-    driver's occupancy: its registers, its static and dynamic shared memory), once a kernel and device, and return the
-    step [KiB]; 0 on the CPU. The kernel's module is loaded here if its launch has not loaded it yet. The preference is
-    the step's share of the unified memory (:func:`carveout_share`), on which the driver lands this step."""
+    driver's occupancy: its registers, its static and dynamic shared memory, or ``shared`` dynamic bytes where its
+    launches stage less than it declares), once a kernel and device, and return the step [KiB]; 0 on the CPU. The
+    kernel's module is loaded here if its launch has not loaded it yet. The preference is the step's share of the
+    unified memory (:func:`carveout_share`), on which the driver lands this step; a launch that needs more shared
+    memory than the step holds takes the step that holds it."""
     found = wp.get_device(device)
     if not found.is_cuda:
         return 0
@@ -331,7 +333,7 @@ def fit_carveout(kernel: wp.Kernel, block: int, device=None) -> int:
     resident = ctypes.c_int(0)
     with wp.ScopedDevice(found):
         _call("cuFuncGetAttribute", ctypes.byref(static), ctypes.c_int(_CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES), function)
-        dynamic = int(hooks.forward_smem_bytes)
+        dynamic = int(hooks.forward_smem_bytes if shared is None else shared)
         _call(
             "cuOccupancyMaxActiveBlocksPerMultiprocessor",
             ctypes.byref(resident),
@@ -638,6 +640,9 @@ class Staging:
         declined: The buffers :func:`stage` left at their alternative place.
         heads: The buffers :func:`stage` kept only the first elements of (their count here), the rest at their
             alternative place (:attr:`Buffer.spill`).
+        wide: Where the stage's head keeps the L1 (:func:`stage`) and a longer one fits the block's budget, that head's
+            count: a second launch of the block takes the worlds whose live items pass the stage's head and fit it, at
+            :meth:`resized` shared memory; 0: the one head (or none).
     """
 
     buffers: tuple[Buffer, ...] = ()
@@ -647,6 +652,7 @@ class Staging:
     layout: str = "struct"
     declined: tuple[Buffer, ...] = ()
     heads: tuple[str, ...] = ()
+    wide: int = 0
 
     def __post_init__(self):
         names = [buffer.name for buffer in self.buffers]
@@ -673,6 +679,16 @@ class Staging:
         kept = tuple(buffer for buffer in self.buffers if buffer.name in names)
         out = tuple(buffer for buffer in self.buffers if buffer.name not in names)
         return dataclasses.replace(self, buffers=kept, declined=(*self.declined, *out))
+
+    def resized(self, name: str, count: int) -> Staging:
+        """This staging with buffer ``name`` holding ``count`` elements, or none at 0 (a head's launch at its own
+        length)."""
+        buffers = tuple(
+            dataclasses.replace(buffer, count=int(count)) if buffer.name == name else buffer
+            for buffer in self.buffers
+            if buffer.name != name or count > 0
+        )
+        return dataclasses.replace(self, buffers=buffers)
 
     def place(self, name: str) -> Place:
         """Where buffer ``name`` lives: the stage, or the alternative place of a declined one."""
@@ -818,17 +834,25 @@ SPILL_SLOTS = 32
 """The granule of a spilling buffer's staged head (:attr:`Buffer.spill`): a warp's elements."""
 
 
-def stage(staging: Staging, warps: Callable[[int], int], budget: int, hiding: int, filled: Callable) -> Staging:
+def stage(
+    staging: Staging, warps: Callable[[int], int], budget: int, hiding: int, filled: Callable, ceiling: int
+) -> Staging:
     """The staging rule: buffers without an alternative place, then each with one in order of reuse while the stage fits
     ``budget`` [B] and leaves (``warps(bytes)``) at least the fewer of the warps without it and ``hiding`` a scheduler;
-    one that streams otherwise pays only in throughput: only where the live items fill them (``filled``). A buffer that
-    spills (:attr:`Buffer.spill`) and does not fit whole yields to the buffers after it, then keeps the longest head of
-    :data:`SPILL_SLOTS` granules that costs no resident warp and stays within the static stage
-    (:data:`STATIC_SHARED_BYTES`), its rest at its alternative place: a head never takes the multiprocessor's L1 for
-    shared memory, which the spill and the streamed operands read through (a 230 KB head on the GB300 cost the house of
-    cards 8% against a 10 KB stage), nor warps that hide the sweep's chain. A head is one lane group's: where a block
-    holds several groups, its stage is their worlds in flight, and a head there trades them for rows a world may not
-    have (a 1,216-row head cost NIST's general sweep, four worlds a block, 2.2% on the GB300)."""
+    one that streams otherwise pays only in throughput: only where the live items fill them (``filled``).
+
+    A buffer that spills (:attr:`Buffer.spill`) and does not fit whole within ``ceiling`` [B] (the static stage on
+    CUDA, :data:`STATIC_SHARED_BYTES`; the budget where no L1 shares the stage; within the budget for a block of
+    several lane groups, whose stage holds no head) yields to the buffers after it, so its length never moves another
+    operand. It then keeps two heads of :data:`SPILL_SLOTS` granules, each costing no resident warp, its rest at its
+    alternative place: the longest within ``ceiling``, which keeps the multiprocessor's L1 for the streamed and
+    spilled operands, and the longest within the budget (:attr:`Staging.wide`). Each world is swept by the launch whose
+    head holds its live items (a launch a head; past both, the first's, every item in place), so the stage a world runs
+    at follows its live items, not the buffer's length: a head past the static stage that its world's items outgrow
+    only takes the L1 (the PRO's 1k cube pile 2.7%, chain fan 6.1%, 4k pile 12% slower at 28 KiB than at 64), and one
+    that holds them pays (the clutter hardware at 37,248 free rows 10% slower spilled than staged). A head is one lane
+    group's: where a block holds several groups, its stage is their worlds in flight, and a head there trades them for
+    rows a world may not have (a 1,216-row head cost NIST's general sweep, four worlds a block, 2.2% on the GB300)."""
     names = {buffer.name for buffer in staging if buffer.alternative is None}
     kept, spills = staging.only(names), None
 
@@ -837,10 +861,10 @@ def stage(staging: Staging, warps: Callable[[int], int], budget: int, hiding: in
 
     for buffer in (buffer for buffer in staging if buffer.alternative is not None):
         trial = staging.only(names | {buffer.name})
+        if buffer.spill and spills is None and not (admits(trial) and (staging.groups > 1 or trial.bytes <= ceiling)):
+            spills = buffer
+            continue
         if not admits(trial):
-            if buffer.spill and spills is None:
-                spills = buffer
-                continue
             break
         if buffer.alternative is Place.STREAMED and not filled(trial.bytes):
             break
@@ -848,12 +872,22 @@ def stage(staging: Staging, warps: Callable[[int], int], budget: int, hiding: in
         kept = trial
     if spills is None or staging.groups > 1:
         return kept
-    ceiling, resident = max(STATIC_SHARED_BYTES, kept.bytes), warps(kept.bytes)
+    resident = warps(kept.bytes)
 
-    def head_admits(trial: Staging) -> bool:
-        return trial.bytes <= ceiling and trial.fits(budget) and warps(trial.bytes) >= resident
+    def head_admits(limit: int) -> Callable[[Staging], bool]:
+        return lambda trial: trial.bytes <= limit and trial.fits(budget) and warps(trial.bytes) >= resident
 
-    return _spill_head(staging, names, spills, head_admits) or kept
+    head = _spill_head(staging, names, spills, head_admits(max(ceiling, kept.bytes)))
+    wide = _spill_head(staging, names, spills, head_admits(budget))
+    if wide is None:
+        return kept
+    shortest = 0 if head is None else next(buffer.count for buffer in head.buffers if buffer.name == spills.name)
+    if shortest == spills.count:
+        return staging.only(names | {spills.name})
+    longest = next(buffer.count for buffer in wide.buffers if buffer.name == spills.name)
+    if longest == shortest:
+        return head
+    return dataclasses.replace(head or kept, heads=(spills.name,), wide=longest)
 
 
 def _spill_head(staging: Staging, names: set, buffer: Buffer, admits: Callable[[Staging], bool]) -> Staging | None:
@@ -866,6 +900,8 @@ def _spill_head(staging: Staging, names: set, buffer: Buffer, admits: Callable[[
         trial = dataclasses.replace(staging, buffers=buffers).only(names | {buffer.name})
         return dataclasses.replace(trial, heads=(*trial.heads, buffer.name))
 
+    if admits(with_head(buffer.count)):
+        return with_head(buffer.count)
     low, high = 0, (buffer.count - 1) // SPILL_SLOTS
     while low < high:
         middle = (low + high + 1) // 2

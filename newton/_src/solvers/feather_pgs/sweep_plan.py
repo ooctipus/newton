@@ -28,7 +28,7 @@ from collections.abc import Callable
 import numpy as np
 import warp as wp
 
-from ...core.execution import Beside, Buckets, Queue, shape
+from ...core.execution import Beside, Buckets, Queue, shape, staged_launch
 from ...core.memory import Place, arch_budget, device
 from . import (
     class_plan,
@@ -49,7 +49,7 @@ from .path_selection import json_value, kernel_key
 from .placement import SPARSE_CONTACT_LEVELS
 from .region_sweep import PAIR_SIDE, Regions
 from .solve_policy import QUIET_UNITS, UNIT_ROUNDOFF, SolvePolicy, SolveReadoutRecord
-from .sweep import EXACT, FRICTION_METRIC_FLOATS, LevelLaw, SweepConfig, sweep_kernel
+from .sweep import EXACT, FREE_HEAD, FRICTION_METRIC_FLOATS, LevelLaw, SweepConfig, sweep_kernel
 from .sweep_levels import (
     _get_mark_independent_sparse_contact_candidates_kernel,
     _get_sparse_contact_levels_kernel,
@@ -99,6 +99,9 @@ class SweepLaunch:
     grid: int
     block: int
     named: Callable[[], dict]
+    stage: int = 0
+    """The launch's dynamic shared memory [B] where it stages less than its kernel declares (a two-head sweep's first
+    launch, :attr:`.sweep_routes.RowPlaces.wide_slots`); 0: the kernel's own."""
 
 
 class Sweep:
@@ -679,32 +682,28 @@ class Sweep:
                 )
             # The general sweep walks its bucket on a persistent grid, a warp a world (its work's shape); the colored
             # bucket a block a world of its slots, a color's units at once.
-            general = self._claim_launch(
+            mapped = self._claim_launch(
                 self.general_sweep, self.mf_gs_kernel, worlds, self.claim_general, sweep_levels.COST_CLASSES
             )
-            mapped = (general,)
             if self.general_records is not None:
                 # In line with the sweep, on its stream: the records it reads, then the sweep.
                 records = self._claim_launch(
                     self.general_records, self.mf_records_kernel, worlds, self.claim_general, sweep_levels.COST_CLASSES
                 )
-                mapped = (records, general)
+                mapped = (*records, *mapped)
             if colored:
                 slots = self.colored_units.slot_count if self.colored_units is not None else int(capable.size)
-                mapped += (
-                    self._claim_launch(
-                        self.colored_sweep, self.mf_colored_kernel, slots, self.claim_colored, ranks=self.world_blocks
-                    ),
+                mapped += self._claim_launch(
+                    self.colored_sweep, self.mf_colored_kernel, slots, self.claim_colored, ranks=self.world_blocks
                 )
             if grouped_sweep is not None:
-                launch = self._claim_launch(
+                mapped += self._claim_launch(
                     self.grouped_sweep,
                     self.mf_grouped_kernel,
                     int(grouped_worlds.size),
                     self.claim_grouped,
                     ranks=self.grouped_blocks,
                 )
-                mapped += (launch,)
             # In line, the tiers and then the general sweep; on the claims' streams (open_streams) the first tier in
             # line and the general sweep and the other tiers beside it.
             self.launches = (*self.tiers, *mapped)
@@ -971,14 +970,34 @@ class Sweep:
 
     def _claim_launch(
         self, config: SweepConfig, kernel: wp.Kernel, items: int, bucket: int, buckets: int = 1, ranks: int = 1
-    ) -> SweepLaunch:
-        """The launch of a matrix-free mapping over its claim's ``buckets`` from ``bucket``: the layer's shape of
-        :meth:`_launch_work`, each of its worlds ``ranks`` consecutive blocks (sweep_routes.worlds)."""
+    ) -> tuple[SweepLaunch, ...]:
+        """The launches of a matrix-free mapping over its claim's ``buckets`` from ``bucket``: the layer's shape of
+        :meth:`_launch_work`, each of its worlds ``ranks`` consecutive blocks (sweep_routes.worlds). Where the free rows
+        keep two heads (:attr:`.sweep_routes.RowPlaces.wide_slots`), one launch a head, each staging its own: the
+        first at the stage's head (a prefix of the kernel's stage, the wide head last), the second at the wide one; a
+        world returns from the launch that is not its own (:meth:`.sweep.WorldRows.admission`)."""
         layout = shape(self._launch_work(config, items), device(self.model.device))
         named = functools.partial(self._mapped_operands, bucket, buckets, layout.grid * layout.groups)
         if ranks > 1:
             named = functools.partial(lambda base: {**base(), "world_blocks": ranks}, named)
-        return SweepLaunch(config, kernel, layout.grid * ranks, layout.block, named)
+        places = config.places
+        if not places.wide_slots:
+            return (SweepLaunch(config, kernel, layout.grid * ranks, layout.block, named),)
+        # On CUDA the kernel's stage is dynamic (its wide head passes the static stage) and the first launch takes its
+        # prefix; the CPU's one thread holds the whole stage on its stack.
+        first = config.staging().resized(sweep_routes.FREE_IMPULSES, places.free_slots)
+        first = first.bytes - first.tile_bytes if config.staging().dynamic_bytes(config.device_arch) else 0
+        return tuple(
+            SweepLaunch(
+                config,
+                kernel,
+                layout.grid * ranks,
+                layout.block,
+                functools.partial(lambda base, head: {**base(), FREE_HEAD: head}, named, head),
+                stage,
+            )
+            for head, stage in ((places.free_slots, first), (places.wide_slots, 0))
+        )
 
     def _walk(self) -> dict:
         """The walk's view, where the sweeps leave by the walk and find a free body's tree in it."""
@@ -1050,19 +1069,20 @@ class Sweep:
     def launch_variants(self):
         """Each sweep kernel with its threads per block (:func:`~newton._src.core.execution.compile_ahead`)."""
         for launch in self.launches:
-            yield launch.kernel, launch.block
+            yield launch.kernel, launch.block, launch.stage
 
     def _launch(self, launch: SweepLaunch, operands: dict, stream=None) -> None:
         """Launch a sweep with each of its parameters read by name: its own operands first, then the step's."""
         kernel, named = launch.kernel, launch.named()
         named.update(zip(("readout",), self.readout.operands(kernel), strict=False))
-        wp.launch_tiled(
+        staged_launch(
             kernel,
-            dim=[launch.grid],
-            inputs=[named[arg.label] if arg.label in named else operands[arg.label] for arg in kernel.adj.args],
-            block_dim=launch.block,
-            device=self.model.device,
+            launch.grid,
+            [named[arg.label] if arg.label in named else operands[arg.label] for arg in kernel.adj.args],
+            launch.block,
+            self.model.device,
             stream=stream,
+            stage=launch.stage,
         )
 
     def solve(self, v_hat: wp.array, v_out: wp.array) -> None:
@@ -1391,8 +1411,10 @@ class Sweep:
         places = self.general_sweep.places
         names = {"metadata": places.metadata, "mf_impulses": places.impulses, "dense_impulses": places.dense_impulses}
         record = {name: "resident" if place is Place.SHARED else "streamed" for name, place in names.items()}
-        if places.free_slots:
+        if places.spilled:
             record["mf_impulse_slots"] = int(places.free_slots)
+        if places.wide_slots:
+            record["mf_impulse_wide_slots"] = int(places.wide_slots)
         return {**record, "reason": "The stage rule (memory.stage) on the sweep's launch."}
 
     def _record_colored(self, plan) -> dict | None:

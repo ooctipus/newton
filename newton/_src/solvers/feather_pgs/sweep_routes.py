@@ -45,6 +45,7 @@ from .solve_policy import QUIET_LITERAL, block_argmax, sweep_exit
 from .sweep import (
     EXACT,
     FORMED_RECORD,
+    FREE_HEAD,
     FRICTION_METRIC_FLOATS,
     ITERATION,
     SEQUENTIAL,
@@ -141,6 +142,9 @@ line; the streamed rows' records the line's (``row_record``, :func:`.row_metadat
 _ROW_BUFFERS = {"metadata": "s_rec_dense", "impulses": "s_lam_mf", "dense_impulses": "s_lam_dense"}
 """Each row operand's buffer in the block's stage (:func:`mf_gs_staging`)."""
 
+FREE_IMPULSES = _ROW_BUFFERS["impulses"]
+"""The free bodies' staged impulses, the buffer that keeps a head where a block cannot hold every row's."""
+
 
 @dataclasses.dataclass(frozen=True)
 class RowPlaces:
@@ -157,6 +161,10 @@ class RowPlaces:
         free_slots: Where the free bodies' impulses are staged but a block cannot hold every row's, the rows staged
             (fixed slots, the stage's head: :attr:`.memory.Staging.heads`): a world whose live rows fit them stages
             them, a world past them keeps every impulse in place (the spill). ``0``: every row's at ``impulses``.
+        wide_slots: Where the block's budget holds a longer head than the stage that keeps the L1
+            (:attr:`.memory.Staging.wide`), its slots: the sweep launches twice, at each head's shared memory, and a
+            world is swept by the launch whose head holds its live rows (past both, the first's, in place), so its
+            stage follows its live rows, not the capacity. ``0``: one head (``free_slots``) or none.
     """
 
     metadata: Place = Place.SHARED
@@ -164,25 +172,36 @@ class RowPlaces:
     dense_impulses: Place = Place.SHARED
     velocity: Place = Place.SHARED
     free_slots: int = 0
+    wide_slots: int = 0
 
     def __post_init__(self):
-        if self.free_slots and self.impulses is not Place.SHARED:
+        if (self.free_slots or self.wide_slots) and self.impulses is not Place.SHARED:
             raise ValueError("the free bodies' impulses spill past their staged slots: they are staged")
+        if self.wide_slots and self.wide_slots <= self.free_slots:
+            raise ValueError("a wide head holds more slots than the stage's")
 
     def __repr__(self) -> str:
         dense = f", {self.dense_impulses.name}" if self.dense_impulses is not Place.SHARED else ""
         velocity = f", velocity {self.velocity.name}" if self.velocity is not Place.SHARED else ""
-        slots = f", {self.free_slots} slots" if self.free_slots else ""
-        return f"RowPlaces({self.metadata.name}, {self.impulses.name}{slots}{dense}{velocity})"
+        slots = f", {self.free_slots} slots" if self.spilled else ""
+        wide = f" or {self.wide_slots}" if self.wide_slots else ""
+        return f"RowPlaces({self.metadata.name}, {self.impulses.name}{slots}{wide}{dense}{velocity})"
+
+    @property
+    def spilled(self) -> bool:
+        """Whether the free bodies' impulses keep a head of their rows staged, the rest in place."""
+        return bool(self.free_slots or self.wide_slots)
 
     def placed(self, staging: Staging) -> RowPlaces:
         """These places, each operand the stage held (:meth:`.memory.Staging.place`) at the place it got, and the free
-        bodies' impulses' slots where the stage kept their head."""
+        bodies' impulses' slots where the stage kept their head (and the wide head's, :attr:`.memory.Staging.wide`)."""
         held = {buffer.name for buffer in (*staging.buffers, *staging.declined)}
         moved = {field: staging.place(name) for field, name in _ROW_BUFFERS.items() if name in held}
-        impulses = _ROW_BUFFERS["impulses"]
+        impulses = FREE_IMPULSES
         if impulses in staging.heads:
-            moved["free_slots"] = next(buffer.count for buffer in staging.buffers if buffer.name == impulses)
+            moved["impulses"] = Place.SHARED
+            moved["free_slots"] = next((buffer.count for buffer in staging.buffers if buffer.name == impulses), 0)
+            moved["wide_slots"] = staging.wide
         return dataclasses.replace(self, **moved)
 
     @property
@@ -191,7 +210,8 @@ class RowPlaces:
         return (
             ("" if self.metadata is Place.SHARED else "_gmeta")
             + ("" if self.impulses is Place.SHARED else "_glambda")
-            + (f"_slots{self.free_slots}" if self.free_slots else "")
+            + (f"_slots{self.free_slots}" if self.spilled else "")
+            + (f"to{self.wide_slots}" if self.wide_slots else "")
             + ("" if self.dense_impulses is Place.SHARED else "_gline")
             + ("" if self.velocity is Place.SHARED else "_gv")
         )
@@ -445,7 +465,9 @@ def _colored_units(
     units a unit waits for sit at earlier places, a warp takes its rounds in order and polls until its lanes ran, so
     the earliest unit not yet run always runs. A sweep's turns follow the last sweep's (``turn``, the sweep's index
     times the colors), so ``s_ran`` needs no clearing between sweeps."""
-    unit_rows = WorldRows(M_MF, Place.STREAMED, free=True, stream=free.stream, lanes=Lanes(1), slots=free.slots)
+    unit_rows = WorldRows(
+        M_MF, Place.STREAMED, free=True, stream=free.stream, lanes=Lanes(1), slots=free.slots, wide=free.wide
+    )
     torsion = laws.torsion
     layout = sweep_units.slot_layout(torsion)
 
@@ -1405,6 +1427,7 @@ def mf_gs_staging(
         stream=places.impulses is Place.GLOBAL or not free_rows,
         split=split,
         slots=places.free_slots,
+        wide=places.wide_slots,
     )
     # The impulses each visit reads and writes, then the record words it only reads (streamed where declined).
     rows = sorted((*dense.buffers(), *free.buffers()), key=lambda buffer: buffer.alternative is not Place.GLOBAL)
@@ -1428,14 +1451,22 @@ def mf_gs_staging(
         if places.velocity is Place.SHARED
         else ()
     )
+    buffers = (
+        *velocity,
+        *rows,
+        *levels,
+        *(active_words(max_constraints) if active_rows else ()),
+        *((Buffer("s_level_mark", "int", (max_constraints + 31) // 32),) if coordinate_levels else ()),
+    )
+    if free.wide:
+        # The wide head lies last, so the stage's launch takes a prefix of the wide launch's bytes
+        # (memory.Staging.resized).
+        buffers = (
+            *(buffer for buffer in buffers if buffer.name != free.impulses),
+            *(buffer for buffer in buffers if buffer.name == free.impulses),
+        )
     return Staging(
-        (
-            *velocity,
-            *rows,
-            *levels,
-            *(active_words(max_constraints) if active_rows else ()),
-            *((Buffer("s_level_mark", "int", (max_constraints + 31) // 32),) if coordinate_levels else ()),
-        ),
+        buffers,
         **({"threads": COLORED_THREADS} if colored or grouped else {"threads": lanes * groups}),
         **({"groups": groups, "layout": "arrays"} if groups > 1 else {}),
     )
@@ -1536,6 +1567,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         lanes=row_lanes,
         split=split,
         slots=places.free_slots,
+        wide=places.wide_slots,
     )
     dense_op = packed_operator(max_row_dofs, row_lanes, wide=wide_rows, rows=dense, classes=sweep.support_classes)
     free_op = free_body_rows(row_lanes, max_row_dofs)
@@ -1921,7 +1953,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     if (m_dense == 0 && m_mf == 0) return;
     if (m_dense > {M_D}) m_dense = {M_D};
     if (m_mf > {M_MF}) m_mf = {M_MF};
-    int mf_contact_end = mf_contact_rows_end.data[world];
+{free.admission()}    int mf_contact_end = mf_contact_rows_end.data[world];
     if (mf_contact_end > m_mf) mf_contact_end = m_mf;
 
     int dof_map_base = world * {D};
@@ -2219,6 +2251,8 @@ class GeneralSweep(SweepConfig):
             ),
             # Where a world takes a group of blocks, its job words (WIDE_JOB a world, region_phase).
             *((RowArgument("wide_jobs", wp.array[int], after="omega"),) if self.world_blocks else ()),
+            # Where the free rows keep two heads, the one this launch stages (RowPlaces.wide_slots).
+            *((RowArgument(FREE_HEAD, int, after="omega"),) if self.places.wide_slots else ()),
             # The warp mapping's worlds' costs, which order its next call (sweep_levels.claim_worlds).
             *(
                 (RowArgument("world_cost", wp.array[wp.int32], after="omega"),)
