@@ -1556,8 +1556,7 @@ def allocate_contacts(operands, device) -> None:
     values.setdefault("body_base", wp.full(worlds, int(values["max_constraints"]), dtype=wp.int32, device=device))
     values.setdefault("lines", wp.vec2i(int(values["max_constraints"]) + int(values["mf_max_constraints"]), worlds))
     values.setdefault("arena_lines", wp.zeros(1, dtype=wp.int32, device=device))
-    values.setdefault("arena_cursor", wp.zeros(1, dtype=wp.int32, device=device))
-    values.setdefault("arena_record", wp.zeros(2, dtype=wp.int32, device=device))
+    values.setdefault("arena_cursor", wp.zeros(2, dtype=wp.int32, device=device))
     values.setdefault("world_run", wp.full(worlds, wp.vec2i(-1, 0), dtype=wp.vec2i, device=device))
 
     # Each contact its own body pair: the scenes' contacts carry no frame.

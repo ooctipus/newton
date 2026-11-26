@@ -1368,7 +1368,6 @@ def reserve_world_rows_kernel(grouped: bool, warps: int = 1):
         contact_worlds: wp.array[int],
         # outputs
         arena_cursor: wp.array[int],
-        arena_record: wp.array[int],
         world_run: wp.array[wp.vec2i],
         body_base: wp.array[int],
         contact_worlds_listed: wp.array[int],
@@ -1484,8 +1483,9 @@ def reserve_world_rows_kernel(grouped: bool, warps: int = 1):
         # mapped): its home where its rows fit the line, else a run of the arena's lines, one claim (the run it holds
         # this frame where that holds them), which it keeps while it holds its slots; its free rows from its body base,
         # its dense rows' end. Where the arena holds no run, the rows past its home line are rejected (the capacity
-        # status), and the arena records the lines asked for (``arena_record``: the high water of the lines the
-        # claims reached, and the claims refused).
+        # status). The claims count in device memory (``arena_cursor``: the lines taken, then the claims refused), which
+        # the arena's one writer publishes (:func:`.placement._move_to_runs`): an atomic a claim on the pinned record
+        # would cross the host bus once a world.
         dense_total = world_slot_counter[world] + rows[0] + rows[2]
         free_total = mf_slot_counter[world] + rows[1] + rows[3]
         base = wp.min(dense_total, max_constraints)
@@ -1504,11 +1504,10 @@ def reserve_world_rows_kernel(grouped: bool, warps: int = 1):
                     # A store without an arena (lines as long as the capacities) has no run to claim.
                     if arena_lines[0] > 0:
                         claim = wp.atomic_add(arena_cursor, 0, need)
-                        wp.atomic_max(arena_record, 0, claim + need)
                         if claim + need <= arena_lines[0]:
                             held_run = wp.vec2i(lines[1] + claim, need)
                         else:
-                            wp.atomic_add(arena_record, 1, 1)
+                            wp.atomic_add(arena_cursor, 1, 1)
                     world_run[world] = held_run
             if wp.static(warps > 1):
                 lane_sync(threads)

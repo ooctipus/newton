@@ -93,7 +93,7 @@ def _moved_topology(device):
             rows,
             0,
         ],
-        outputs=[first],
+        outputs=[first, wp.zeros(2, dtype=wp.int32, device=device), wp.zeros(2, dtype=wp.int32, device=device)],
         device=device,
     )
     return fields, [a.numpy() for a in arrays], runs, topology, first.numpy()

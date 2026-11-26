@@ -794,7 +794,6 @@ class RowLaws:
                 ],
                 outputs=[
                     placement.arena_cursor,
-                    placement.arena_record,
                     placement.world_run,
                     placement.body_base,
                     placement.contact_worlds_listed,

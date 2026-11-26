@@ -311,6 +311,8 @@ def _move_to_runs(
     diag: int,
     # outputs
     first: wp.array[int],
+    arena_cursor: wp.array[int],
+    arena_record: wp.array[int],
 ):
     """Take each world whose rows run in the arena (``run_of``, the reservation's claim, or kept while it holds its
     slots) to its run: its topology rows, which its producers wrote at its home line this step, copied there in every
@@ -318,8 +320,16 @@ def _move_to_runs(
     contact rows' diagonals zeroed for the one writer's sums (field ``diag``). A field's line holds ``line_rows`` rows
     in its own items (``item_bytes``: a row's entries, a record's word, a friction slot of three rows), so a world's
     first ``rows`` rows take the whole items that cover ``rows / line_rows`` of the field's line. A warp a world and
-    field (:data:`MOVE_LANES`), striding over the 4-byte words of the items (every field's item is whole words)."""
+    field (:data:`MOVE_LANES`), striding over the 4-byte words of the items (every field's item is whole words).
+
+    The first thread is the arena's record's one writer: the high water of the lines the reservation's claims reached
+    (``arena_cursor[0]``) and the claims it refused (``arena_cursor[1]``, counted anew), in the pinned record the host
+    reads without synchronizing."""
     world, field, lane = wp.tid()
+    if world == 0 and field == 0 and lane == 0:
+        arena_record[0] = wp.max(arena_record[0], arena_cursor[0])
+        arena_record[1] = arena_record[1] + arena_cursor[1]
+        arena_cursor[1] = 0
     run = run_of[world][0]
     if run < 0:
         return
@@ -1325,7 +1335,7 @@ class Placement:
         # Each world's run of the arena (-1 for its home line), kept while it holds its slots, and the arena's lines
         # taken this frame.
         self.world_run = wp.full(max(worlds, 1), wp.vec2i(-1, 0), dtype=wp.vec2i, device=model.device)
-        self.arena_cursor = wp.zeros(1, dtype=wp.int32, device=model.device)
+        self.arena_cursor = wp.zeros(2, dtype=wp.int32, device=model.device)
         self._run_fields = None
 
     def move_to_runs(self) -> None:
@@ -1360,7 +1370,7 @@ class Placement:
                 int(self.line_rows),
                 diag,
             ],
-            outputs=[self.dense_first],
+            outputs=[self.dense_first, self.arena_cursor, self.arena_record],
             device=self.model.device,
         )
 
