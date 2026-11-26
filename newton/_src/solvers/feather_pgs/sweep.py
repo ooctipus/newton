@@ -140,10 +140,9 @@ class WorldRows:
     """Rows a visit reads the kind and parent word of (their expressions, each with its offset ``k`` from the visited
     row ``i``) that its run loaded while the visit before ran (:func:`_visit_pipeline`): a read of one takes the
     run's register ``held_w{k}``, the word its load would read."""
-    kept_stores: int = 0
-    """The impulses a run keeps of its last stores with their rows (``kept_row{k}``, ``kept_impulse{k}``, the latest
-    first): a patch ring's walk (:meth:`ring_load`) reads a member there, the value its load would read (only the run
-    writes its rows' impulses inside a color)."""
+    patch: int = 0
+    """The normals of a patch ring a run's visit takes together (:func:`patch_run`): a ring that opens at the visited
+    row and closes within them is visited whole, its rows' operands loaded at once; ``0``: a visit a row."""
 
     VISITED: ClassVar[str] = "i"
     """The row a row loop visits, whose record the loop holds in registers."""
@@ -375,13 +374,10 @@ class WorldRows:
                 f"    [&](int patch_row) {{ return {member}; }},\n"
                 f"    [&](int patch_row) {{ return {impulse}; }})"
             )
-        impulse = self.peek("patch_row")
-        for k in reversed(range(self.kept_stores)):
-            impulse = f"patch_row == kept_row{k} ? kept_impulse{k} : {impulse}"
         return (
             f"RING_LOAD({load or self.peek(parent)}, {parent}, {self.capacity},\n"
             f"    [&](int patch_row) {{ return {self.parent('patch_row', enclosed=True)}; }},\n"
-            f"    [&](int patch_row) {{ return {impulse}; }})"
+            f"    [&](int patch_row) {{ return {self.peek('patch_row')}; }})"
         )
 
     def ring_any(self, first: str, predicate: str) -> str:
@@ -849,6 +845,9 @@ class RowContext:
     root: Callable[[str], str] | None = None
     """A row's bound of ``sqrt(A_ii)`` as its streamed record holds it (:meth:`WorldRows.idle_root`); ``None``: the
     growth forms it from the row's diagonal."""
+    kept_record: str | None = None
+    """Where it holds, a first tangent's record is the run's registers (``ring_m0`` to ``ring_m3``: the record of the
+    patch ring its visit took whole, :func:`patch_run`), not loaded at its visit; ``None``: always loaded."""
     pair_residual: bool = False
     """A friction pair reduces its first tangent's residual again with the pair's terms
     (:func:`_pair_terms` with ``own``) and solves on it in place of the row's: the free-body loop's
@@ -1364,15 +1363,22 @@ def _record_loads(ctx: RowContext, kind: str, pad: str, *, torsion: bool) -> str
         f"        {m3} = friction_record[3];",
         "    }",
     ]
-    lines = [
-        f"float4 {m0}, {m1}, {m2}, {m3};",
-        f"if ({kind} == {ROW_FRICTION}) {{",
+    loads = [
         f"    const float4* const friction_record = reinterpret_cast<const float4*>({ctx.formed('parent')});",
         f"    {m0} = friction_record[0];",
         f"    {m1} = friction_record[1];",
         *(spin if torsion else ()),
-        "}",
     ]
+    if ctx.kept_record is not None:
+        kept = "    " + " ".join(f"{m} = ring_m{k};" for k, m in enumerate(FORMED_RECORD))
+        loads = [
+            f"    if ({ctx.kept_record}) {{",
+            f"    {kept}",
+            "    } else {",
+            *indent("\n".join(loads), "    ").split("\n"),
+            "    }",
+        ]
+    lines = [f"float4 {m0}, {m1}, {m2}, {m3};", f"if ({kind} == {ROW_FRICTION}) {{", *loads, "}"]
     return indent("\n".join(lines), pad)
 
 
@@ -2558,12 +2564,10 @@ def _visit_pipeline(rows: WorldRows, end: str, begin: str, torsion: bool, op=Non
         state = [op.carry_state(pad)] if op is not None and op.carries else []
         state += [f"{pad}int {', '.join(f'pre_w{k} = 0' for k in words)};"] if words else []
         state += [op.ahead_state(pad)] if ahead else []
-        if rows.kept_stores:
-            kept = range(rows.kept_stores)
-            state += [
-                f"{pad}int {', '.join(f'kept_row{k} = -1' for k in kept)};",
-                f"{pad}float {', '.join(f'kept_impulse{k} = 0.0f' for k in kept)};",
-            ]
+        if rows.patch:
+            # The pooled load of the patch ring a visit took whole, at its anchor (patch_run).
+            state += [f"{pad}int ring_row = -1;", f"{pad}float ring_value = 0.0f;"]
+            state += [f"{pad}float4 {', '.join(f'ring_m{k}' for k in range(len(FORMED_RECORD)))};"]
         declared = "".join(f"{line}\n" for line in state)
         return (
             f"{pad}int4 {', '.join(f'pre_{name[-1]}' for name in rows.registers)};\n{pad}float {held};\n{probe}"
@@ -2589,6 +2593,7 @@ def row_step(
     formed: Callable[[str], str] | None = None,
     reach: str | None = None,
     pipelined: bool = False,
+    keep: str | None = None,
     pad: str = "            ",
 ) -> str:
     """Row ``i``'s step in a row loop over a store's rows ``[0, end)``: its kind read from the store, the schedule's
@@ -2610,7 +2615,10 @@ def row_step(
       sparse-diagonal sweep's chains);
     - ``pipelined``: the loop loaded the row's impulses, its patch ring's first and its spin row's kind while the row
       before it was visited (:func:`_visit_pipeline`, :data:`HELD`); a store of the row before the next one's (its
-      normal) sets that row's loaded impulse.
+      normal) sets that row's loaded impulse, and ``keep`` names a register the visited row's store sets too (a patch
+      ring's normal, :func:`patch_run`). A run that takes its patch rings whole (:attr:`WorldRows.patch`) pools a
+      ring its visit closed from the visit's registers (``ring_row``, ``ring_value``), not by its walk: the same
+      values in the same order.
 
     A spin row is skipped first (solved with its pair, here or in the triple phase), then ``admission``, the
     schedule's own skips; with ``reach`` (the live order's bound of the
@@ -2632,21 +2640,20 @@ def row_step(
         loaded = {"i": "held_row", "i + 1": "held_sib", "spin": "held_spin"}
 
         def store(row: str, value: str) -> str:
-            # The run keeps its last stores for its patch rings' walks (WorldRows.kept_stores), the latest first.
-            kept = "".join(
-                f" kept_row{k} = kept_row{k - 1}; kept_impulse{k} = kept_impulse{k - 1};"
-                for k in reversed(range(1, rows.kept_stores))
-            )
-            if rows.kept_stores:
-                kept += f" kept_row0 = {row}; kept_impulse0 = {value};"
+            kept = f" {keep} = {value};" if keep is not None and row == "i" else ""
             return f"{{ {rows.store(row, value)} if (({row}) == pipe_next - 1) pre_held_parent = {value};{kept} }}"
+
+        def ring_load(parent: str, load: str | None = None) -> str:
+            walk = rows.ring_load(parent, load or "held_parent")
+            return f"({parent} == ring_row ? ring_value : {walk})" if rows.patch else walk
 
         # A visited first tangent's normal is row i - 1, and its spin row, if any, row i + 2.
         ctx = dataclasses.replace(
             ctx,
             load=lambda row: loaded.get(row) or rows.load(row),
             store=store,
-            ring_load=lambda parent, load=None: rows.ring_load(parent, load or "held_parent"),
+            ring_load=ring_load,
+            kept_record="parent == ring_row" if rows.patch and formed is not None else None,
             spin_row=lambda parent: f"(i + 2 < ({end}) && (held_probe & 0xFFFF) == {ROW_TORSION} ? i + 2 : -1)",
         )
     hold = {}
@@ -2671,6 +2678,124 @@ def row_step(
         **hold,
     )
     return indent("\n".join(line for line in head if line), pad) + "\n" + visit
+
+
+def patch_run(rows: WorldRows, op, laws: RowLaws, step: dict, *, end: str, pad: str) -> str:
+    """A patch ring's normals in one visit of a pipelined run (:func:`_visit_pipeline`) whose rows take their patch
+    rings whole (:attr:`WorldRows.patch`): a contact normal whose ring opens at the next row (its parent word) loads
+    the records, impulses and ``Z`` entries of the rows after it up to the window's at once, steps itself, and where
+    the ring closes within the window (each normal's parent the next row's, the anchor's the visited row) and its
+    anchor's pair has a spin row (so no contact unit takes the anchor, :func:`unit_visit`) steps the ring's other
+    normals in turn, each by the normal's row step on its rows' registers (:func:`row_step`: the text, arithmetic and
+    order of a visit a row), then pools the ring's load at its anchor in ring order (``ring_row``, ``ring_value``) for
+    its pair's visit, which the run loads next (``UNIT_TAKEN``) with the anchor's record. Any other ring steps on a
+    row a visit. Bit for bit the visits a row: what it removes is a load's wait a normal and the pair's walk of the
+    ring."""
+    window = rows.patch
+    words = {k for _, k in rows.ahead}
+    held_z = {k for _, k in op.ahead}
+    held_impulse = {1: "held_sib", 2: "held_spin"}
+    contact = ROW_CONTACT
+
+    def word(r: int) -> str:
+        return f"held_w{r}" if r in words else (f"patch_a{r}.w" if r < window else f"patch_w{r}")
+
+    def normal(r: int) -> str:
+        visit = row_step(rows, op, laws, **step, kind=contact, pipelined=True, keep=f"patch_new{r}", pad="    ")
+        z = f"held_z{r}[q]" if r in held_z else f"patch_z{r}[q]"
+        impulse = held_impulse.get(r, f"patch_impulse{r}")
+        bind = (
+            [
+                f"const int i = patch_head + {r};",
+                f"const int4 rec_a = patch_a{r}, rec_b = patch_b{r};",
+                f"const float held_row = {impulse};",
+                f"float held_z0[{op.entries}];",
+                op.entries_loop(f"held_z0[q] = {z};", "", entry=False),
+            ]
+            if r
+            else []
+        )
+        body = [*bind, f"patch_new{r} = held_row;"]
+        body += ["for (int once = 0; once < 1; ++once) {", visit, "}"]
+        return "{\n" + indent("\n".join(body), "    ") + "\n}"
+
+    # The next row's record the run loaded for it (the visited normal's next is its next row); the window's others.
+    lines = ["const int patch_head = i;"]
+    loaded = ", ".join(f"patch_{name[-1]}1 = pre_{name[-1]}" for name in rows.registers)
+    lines.append(f"const int4 {loaded};")
+    for r in range(2, window):
+        at = f"patch_head + {r}"
+        lines.append(f"int4 patch_a{r} = make_int4(0, 0, 0, -1), patch_b{r} = make_int4(0, 0, 0, 0);")
+        lines.append(f"if ({at} < ({end})) {{")
+        lines.append(rows.load_record((f"patch_a{r}", f"patch_b{r}"), at, "    "))
+        lines.append("}")
+    for r in range(1, window):
+        at = f"patch_head + {r}"
+        if r not in held_impulse:
+            lines.append(f"const float patch_impulse{r} = {at} < ({end}) ? {rows.peek(at)} : 0.0f;")
+        if r not in held_z:
+            guard = f" && entry < {op.width}" if op.lanes.parallel else ""
+            lines.append(f"float patch_z{r}[{op.entries}];")
+            load = f"patch_z{r}[q] = {at} < ({end}){guard} ? {op.factor(f'({at})', 'entry')} : 0.0f;"
+            lines.append(op.entries_loop(load, ""))
+    # The kind words of the rows an anchor's spin row can take that the run did not load ahead.
+    for r in range(1, window + 3):
+        if r not in words and r >= window:
+            lines.append(
+                f"const int patch_w{r} = patch_head + {r} < ({end}) ? {rows.word(f'patch_head + {r}', 3)} : -1;"
+            )
+    lines += [f"float {', '.join(f'patch_new{r} = 0.0f' for r in range(window))};"]
+    # The ring's anchor: the first row of the window whose parent is the visited row, each before it the next's.
+    lines += ["int patch_anchor = 0;", "bool patch_open = true;"]
+    for r in range(1, window):
+        w = word(r)
+        member = f"patch_head + {r} < ({end}) && ({w} & 0xFFFF) == {contact}"
+        lines += [
+            "if (patch_open) {",
+            f"    if ({member} && ({w} >> 16) == patch_head) {{",
+            f"        patch_anchor = {r};",
+            "        patch_open = false;",
+            f"    }} else if (!({member} && ({w} >> 16) == patch_head + {r + 1})) {{",
+            "        patch_open = false;",
+            "    }",
+            "}",
+        ]
+    # A ring whose anchor's pair has a spin row: no contact unit takes its anchor (unit_visit), so its rows are the
+    # visits a row of normals, then the pair's triple. Its pair's operands and its anchor's record load as soon as the
+    # anchor is known: before the visited normal where the run loaded the words that tell it, else after.
+    taken = ["UNIT_TAKEN(patch_head + patch_anchor + 1);"]
+    if step.get("formed") is not None:
+        # The anchor's record for its pair's visit (RowContext.kept_record).
+        record = step["formed"]("(patch_head + patch_anchor)")
+        taken += [f"const float4* const ring_record = reinterpret_cast<const float4*>({record});"]
+        taken += [f"ring_m{k} = ring_record[{k}];" for k in range(len(FORMED_RECORD))]
+    early = [r for r in range(1, window) if r + 3 in words]
+    late = [r for r in range(1, window) if r + 3 not in words]
+
+    def triple(anchors: list[int], flag: str) -> list[str]:
+        return [f"bool {flag} = false;"] + [
+            f"if (patch_anchor == {r} && patch_head + {r + 3} < ({end}) && ({word(r + 3)} & 0xFFFF) == {ROW_TORSION}) "
+            f"{flag} = true;"
+            for r in anchors
+        ]
+
+    lines += triple(early, "patch_triple")
+    lines += ["if (patch_triple) {", indent("\n".join(taken), "    "), "}"]
+    # The visited normal, while the window's loads are in flight.
+    lines.append(normal(0))
+    if late:
+        lines += triple(late, "patch_late")
+        lines += ["if (patch_late) {", indent("\n".join([*taken, "patch_triple = true;"]), "    "), "}"]
+    ring = [f"float ring = patch_new{window - 1};"]
+    ring += [f"if (patch_anchor == {r}) ring = patch_new{r};" for r in range(1, window - 1)]
+    ring += [f"if ({m} < patch_anchor) ring += patch_new{m};" for m in range(window - 1)]
+    ring += ["ring_row = patch_head + patch_anchor;", "ring_value = ring;"]
+    closed = [f"if ({r} <= patch_anchor) {{\n{indent(normal(r), '    ')}\n}}" for r in range(1, window)]
+    closed += ring
+    lines += ["if (patch_triple) {", indent("\n".join(closed), "    "), "}", "SYNC();", "continue;"]
+    head = f"{rows.kind('i')} == {contact} && {rows.parent('i')} == i + 1 && i + 1 < ({end})"
+    text = f"// A patch ring that opens here: its normals in this visit (patch_run).\nif ({head}) {{\n"
+    return indent(text + indent("\n".join(lines), "    ") + "\n}", pad)
 
 
 def _unit_hooks(rows: WorldRows) -> str:
@@ -2746,6 +2871,8 @@ def rows_block(
         return order.wrap(indent(rows.visit("i"), inner) + "\n" + visit if rows.record else visit, pad)
     if not rows.free:
         visit = row_step(rows, op, laws, **step, pipelined=rows.record, pad=inner)
+        if rows.patch:
+            visit = f"{patch_run(rows, op, laws, step, end=end, pad=inner)}\n{visit}"
         visit = f"{indent(unit, inner)}\n{visit}" if unit else visit
         if rows.record:
             pipeline = _visit_pipeline(rows, end, begin, laws.torsion, op)

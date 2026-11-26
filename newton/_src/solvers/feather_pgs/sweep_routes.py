@@ -264,14 +264,24 @@ ROW_PLACES = (
 """Every placement of the sweep's row operands (the census's axis)."""
 
 
-RUN_AHEAD_WORDS = (("i + 1", 1), ("tangent", 1), ("i + 2", 2), ("sibling", 2), ("(i) + 3", 3))
+RUN_AHEAD_WORDS = (
+    ("i + 1", 1),
+    ("tangent", 1),
+    ("i + 2", 2),
+    ("sibling", 2),
+    ("(i) + 3", 3),
+    ("(i) + 4", 4),
+    ("(i) + 5", 5),
+    ("(i) + 6", 6),
+)
 """The kind and parent words a grouped run's visit reads past its own row (:attr:`.sweep.WorldRows.ahead`): a contact
-unit's test of its pair (``i + 1``, ``i + 2``, the unit's ``tangent`` and ``sibling``) and of a spin row (``i + 3``)."""
+unit's test of its pair (``i + 1``, ``i + 2``, the unit's ``tangent`` and ``sibling``) and of a spin row (``i + 3``),
+and a patch ring's (:func:`.sweep.patch_run`) of its normals and its anchor's spin row (to ``i + 6``)."""
 
-RUN_KEPT_STORES = 4
-"""The stores a grouped run keeps for its patch rings' walks (:attr:`.sweep.WorldRows.kept_stores`): a patch's
-normals are visited in turn just before its friction pair, so its ring's members are the run's last stores; a longer
-ring's others load. A hardware choice that changes no result: a member read there is the value its load reads."""
+RUN_PATCH_NORMALS = 5
+"""The normals of a patch ring a grouped run's visit takes whole (:attr:`.sweep.WorldRows.patch`,
+:func:`.sweep.patch_run`), their operands in registers; a longer ring's rows are visited one at a time and its pair
+walks it. A hardware choice that changes no result: either way each row takes the same step in the same order."""
 
 RUN_AHEAD_ENTRIES = (("i", 0), ("(parent + 2)", 1), ("spin", 2), ("tangent", 1), ("sibling", 2))
 """The rows whose entries a grouped run's visit reads (:attr:`.response_operator.SparseFactor.ahead`): the visited
@@ -2254,7 +2264,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         # (Velocity.carried) and load the next visit's operands while a visit runs (RUN_AHEAD).
         run_rows, run_op = dense, dense_op
         if dense_op.keeps_velocity and dense_op.key is not None:
-            run_rows = dataclasses.replace(dense, ahead=RUN_AHEAD_WORDS, kept_stores=RUN_KEPT_STORES)
+            run_rows = dataclasses.replace(dense, ahead=RUN_AHEAD_WORDS, patch=RUN_PATCH_NORMALS)
             velocity = dataclasses.replace(dense_op.velocity, carried=True)
             run_op = dataclasses.replace(dense_op, velocity=velocity, ahead=RUN_AHEAD_ENTRIES)
             if sweep.contact_units:
