@@ -46,7 +46,6 @@ from .contact_input import bind_routes as bind_contact_routes
 from .field_group import Field, FieldGroup
 from .friction_patches import patch_routes
 from .path_selection import json_value, kernel_key
-from .placement import SPARSE_CONTACT_LEVELS
 from .region_sweep import PAIR_SIDE, Regions
 from .solve_policy import QUIET_UNITS, UNIT_ROUNDOFF, SolvePolicy, SolveReadoutRecord
 from .sweep import EXACT, FREE_HEAD, FRICTION_METRIC_FLOATS, LevelLaw, SweepConfig, sweep_kernel
@@ -68,7 +67,6 @@ _COLORED = {
     "levels": LevelLaw(EXACT),
     "active_rows": False,
     "contact_units": False,
-    "coordinate_levels": False,
     "lanes_per_world": 32,
     "block_warps": 1,
 }
@@ -470,18 +468,7 @@ class Sweep:
             active_rows, self.general_active_reason = class_plan.active_rows_rule(
                 self.pins, small_world_lanes=small, fits=lambda: general(active_rows=True).staging().fits(budget)
             )
-            # A tree of one coordinate (forest.diagonal_mass_sizes) holds units of one entry where the rows keep their
-            # support classes: in the full ordered sweep they step by level (the builder's schedule), before the order,
-            # where the world's schedule fits a block (the levels give the order's iterate: without them, the order).
-            coordinate_levels = bool(
-                self.forest.diagonal_mass_sizes
-                and self.placement.classed
-                and not active_rows
-                and sweep_levels.levels_fit(
-                    self.placement.dense_max_constraints, self.forest.max_world_dofs, device_arch
-                )
-            )
-            general = functools.partial(general, active_rows=active_rows, coordinate_levels=coordinate_levels)
+            general = functools.partial(general, active_rows=active_rows)
             worlds = self.forest.world_count
             alone = self._staged(general(), worlds)
             lanes, block_warps = 32, 1
@@ -641,17 +628,6 @@ class Sweep:
 
             self.general_sweep = recorded(self.general_sweep)
             general_heads = [recorded(head) for head in general_heads]
-            if coordinate_levels:
-                rows = self.placement.dense_max_constraints
-                self.placement.arrays.allocate(
-                    SPARSE_CONTACT_LEVELS, world=self.forest.world_count, level=rows + 1, unit=rows
-                )
-                self.sparse_contact_schedule = sweep_levels.coordinate_levels_kernel(
-                    rows,
-                    self.forest.max_world_dofs,
-                    device_arch,
-                    torsion=bool(self.laws.spin_rows),
-                )
             if self.general_sweep.torsion:
                 # The dense contacts' records form in a launch of their own, ahead of the sweep: the formation's
                 # code (its eigen solves) leaves the sweep's, whose instruction supply bounds it (SAT). The stage is no
@@ -889,24 +865,17 @@ class Sweep:
         return not (self.factor.eliminates and self.factor.block_capacity) and self.pins.sink != "store"
 
     def schedule_diagonal(self) -> None:
-        """Publish the levels of the rows written (after every producer and the records): K2's from its slots, the
-        general sweep's from the rows' classes; a world's warp, several a block (their levels' shared working set)."""
+        """Publish K2's levels of the rows written (after every producer and the records), from its slots; a world's
+        warp, several a block (their levels' shared working set)."""
         placement = self.placement
         dim, block = sweep_levels.levels_launch(
             self.forest.world_count, self.forest.max_world_dofs, self.model.device.arch
         )
         levels = [placement.sparse_contact_level_count, placement.sparse_contact_level_offsets]
         levels += [placement.sparse_contact_level_units]
-        counts = [placement.constraint_count, placement.dense_first]
-        if self.diagonal_sweep is None:
-            classes = placement.row_classes
-            inputs = [*counts, placement.row_type, placement.row_sides, classes.row_class, classes.class_dof]
-            inputs += [classes.class_count, self.forest.articulation_world_dof_offset]
-            outputs = levels
-        else:
-            inputs = [*counts, placement.topology_rows, placement.row_type]
-            outputs = [placement.sparse_diagonal_row_dof, *levels, placement.sparse_contact_serial_count]
-            outputs += [placement.sparse_contact_serial_normals]
+        inputs = [placement.constraint_count, placement.dense_first, placement.topology_rows, placement.row_type]
+        outputs = [placement.sparse_diagonal_row_dof, *levels, placement.sparse_contact_serial_count]
+        outputs += [placement.sparse_contact_serial_normals]
         wp.launch(
             self.sparse_contact_schedule,
             dim=dim,
@@ -976,9 +945,6 @@ class Sweep:
             "packed_Z": placement.packed_Z,
             "row_sides": placement.row_sides,
             "row_classes": placement.row_classes.row_class,
-            "sparse_contact_level_count": placement.sparse_contact_level_count,
-            "sparse_contact_level_offsets": placement.sparse_contact_level_offsets,
-            "sparse_contact_level_units": placement.sparse_contact_level_units,
             "class_dof": placement.row_classes.class_dof,
             "class_count": placement.row_classes.class_count,
             "world_row_type": placement.row_type,
@@ -1005,9 +971,7 @@ class Sweep:
     def _grouped(self, declared: SweepConfig) -> SweepConfig:
         """The grouped mapping's configuration (:func:`.sweep_routes.group_rows`): the warp mapping's rows and laws, a
         block a world, its records formed in its own launch, its rows in slot order."""
-        return dataclasses.replace(
-            declared, grouped=True, lanes_per_world=32, block_warps=1, active_rows=False, coordinate_levels=False
-        )
+        return dataclasses.replace(declared, grouped=True, lanes_per_world=32, block_warps=1, active_rows=False)
 
     def _grouped_worlds(self) -> np.ndarray:
         """The worlds that can take the dense line by colors of groups (:func:`.sweep_units.grouped_worlds`) where

@@ -39,7 +39,7 @@ from .region_sweep import (
 )
 from .response_operator import Lanes, SparseFactor, Velocity
 from .row_inputs import RowArgument
-from .row_laws import ROW_CONTACT, ROW_FRICTION, ROW_JOINT_LIMIT, ROW_TORSION
+from .row_laws import ROW_CONTACT, ROW_FRICTION
 from .row_metadata import record_words
 from .row_records import line_size
 from .solve_policy import QUIET_LITERAL, block_argmax, sweep_exit
@@ -51,7 +51,6 @@ from .sweep import (
     ITERATION,
     SEQUENTIAL,
     Diagonal,
-    Levels,
     RowContext,
     RowLaws,
     SweepConfig,
@@ -70,7 +69,6 @@ from .sweep import (
     impulse_seed,
     indent,
     level_loop,
-    row_step,
     rows_block,
     triple_phase,
     unit_visit,
@@ -723,63 +721,6 @@ def dense_units(
         taken=True,
         pad=pad,
     )
-
-
-def coordinate_levels(
-    dense: WorldRows, op: SparseFactor, laws: RowLaws, *, metric: str | None, formed, triple_phase: bool = False
-) -> tuple[str, str, str]:
-    """The units on one coordinate no wider unit holds (:func:`.sweep_levels.coordinate_levels_kernel`) by level, a
-    lane a unit, before the order, with which they commute: the leveled heads' marks, the phase and the order's skip.
-    Under ``triple_phase`` a leveled contact's triple is the triple phase's, after the order, as every triple's."""
-    M = dense.capacity
-    count, offsets = (
-        "sparse_contact_level_count.data[world]",
-        f"sparse_contact_level_offsets.data[world * {M + 1} + {{}}]",
-    )
-    store = dataclasses.replace(dense, lanes=Lanes(1))
-    one = dataclasses.replace(op, support=1, index=lambda row, entry: "unit_coordinate", lanes=Lanes(1))
-
-    def visit(row: str, pad: str, **known) -> str:
-        step = row_step(store, one, laws, end="m_dense", metric=metric, formed=formed, pad=pad + "    ", **known)
-        record = indent(store.visit("i"), pad + "    ") if store.record else ""
-        return f"{pad}do {{\n{pad}    const int i = {row};\n{record}{chr(10) if record else ''}{step}\n{pad}}} while (false);"
-
-    pad = " " * 16
-    owns = f"head + 2 < m_dense && ({dense.kind('head + 1')}) == {ROW_FRICTION} && {dense.parent('head + 1', enclosed=True)} == head"
-    if triple_phase:
-        owns += f" && {dense.spin_of('head', 'm_dense')} < 0"
-    known = {"kind": ROW_FRICTION, "parent": "head", "triple_phase": triple_phase}
-    pair = f"{pad}if ({owns}) {{\n{visit('head + 1', pad + '    ', **known)}\n{pad}}}"
-    levels = Levels(
-        count,
-        offsets.format,
-        f"const int head = sparse_contact_level_units.data[world * {M} + place];\n"
-        f"const int unit_coordinate = {op.index('head', '0')};",
-        stride="STRIDE",
-    )
-    # A head is a contact's normal or a joint limit (the builder's): each steps by its kind's law, compiled apart.
-    contact, limit = visit("head", pad + "    ", kind=ROW_CONTACT), visit("head", pad + "    ", kind=ROW_JOINT_LIMIT)
-    heads = (
-        f"{pad}if (({dense.kind('head')}) == {ROW_CONTACT}) {{\n{contact}\n{indent(pair, '    ')}\n"
-        f"{pad}}} else {{\n{limit}\n{pad}}}"
-    )
-    phase = f"        {{\n{levels.wrap(heads, ' ' * 12)}\n        }}"
-    # The marks the stage holds: the head's rows (every leveled head is a live row of the world, which the head holds).
-    marks = f"""    for (int w = lane; w < {(dense.staged_rows + 31) // 32}; w += STRIDE) s_level_mark[w] = 0;
-    SYNC();
-    for (int p = lane; p < {offsets.format(count)}; p += STRIDE) {{
-        const int head = sparse_contact_level_units.data[world * {M} + p];
-        atomicOr((unsigned*)&s_level_mark[head >> 5], 1u << (head & 31));
-    }}
-    SYNC();"""
-    member = f"({dense.kind('i')}) == {ROW_FRICTION}" + (
-        f" || ({dense.kind('i')}) == {ROW_TORSION}" if laws.torsion else ""
-    )
-    skip = (
-        f"const int unit_head = {member} ? {dense.parent('i', enclosed=True)} : i;\n"
-        "if ((s_level_mark[unit_head >> 5] >> (unit_head & 31)) & 1) continue;"
-    )
-    return marks, phase, skip
 
 
 _PAIR_BLOCK = """if ((kind & 16) != 0) {
@@ -1668,7 +1609,6 @@ def mf_gs_staging(
     wide_rows: bool = False,
     free_rows: bool = True,
     active_rows: bool = False,
-    coordinate_levels: bool = False,
     groups: int = 1,
     lanes: int = 32,
     split: bool = False,
@@ -1676,8 +1616,8 @@ def mf_gs_staging(
     """The shared working set of a world's matrix-free sweep block (:func:`mf_gs_source` declares it), in order of
     reuse: the world's velocity, its dense rows' and the free bodies' run's (``free_rows``) impulses at ``places``, the
     dense rows' staged metadata, ``colored`` the colors' staged offsets (and its trace's warp maxima), ``active_rows``
-    the active enumeration's bitsets, ``coordinate_levels`` the leveled units' marks, for ``groups`` worlds of ``lanes``
-    lanes; ``grouped`` a block a world as ``colored``, its trace's warp maxima."""
+    the active enumeration's bitsets, for ``groups`` worlds of ``lanes`` lanes; ``grouped`` a block a world as
+    ``colored``, its trace's warp maxima."""
     # A packed row's sides stage with its metadata (the classes' word takes the widths' place).
     sides = None if wide_rows else "widths"
     dense = WorldRows(
@@ -1727,7 +1667,6 @@ def mf_gs_staging(
         *rows,
         *levels,
         *(active_words(dense.staged_rows) if active_rows else ()),
-        *((Buffer("s_level_mark", "int", (dense.staged_rows + 31) // 32),) if coordinate_levels else ()),
     )
     if free.wide:
         # The wide head lies last, so the stage's launch takes a prefix of the wide launch's bytes
@@ -2238,12 +2177,6 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         return dense_units(rows, op, laws, active=sweep.active_rows, record=dense_record, pad="")
 
     units = unit_text(dense, dense_op) if sweep.contact_units else ""
-    level_marks = level_phase = skip = ""
-    if sweep.coordinate_levels:
-        level_marks, level_phase, skip = coordinate_levels(
-            dense, dense_op, laws, metric=metric, formed=dense_record, triple_phase=bool(triples)
-        )
-        units = f"{skip}\n{units}" if units else skip
     # The warp mapping's dense rows step to the rows that can act (sweep.LiveOrder) where their applies are the only
     # ones inside their loop.
     live = None
@@ -2272,7 +2205,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
             velocity = dataclasses.replace(dense_op.velocity, carried=True)
             run_op = dataclasses.replace(dense_op, velocity=velocity, ahead=RUN_AHEAD_ENTRIES)
             if sweep.contact_units:
-                units = "\n".join(text for text in (skip, unit_text(run_rows, run_op)) if text)
+                units = unit_text(run_rows, run_op)
         dense_phase = group_rows(
             lambda begin, end, pad, ready="": rows_block(
                 run_rows,
@@ -2304,8 +2237,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     dense_sweep = (
         dense_phase
         if grouped
-        else f"{first_warp}{level_phase}{chr(10) if level_phase else ''}{dense_phase}\n{end_first_warp}"
-        + ("        __syncthreads();" if colored else "")
+        else f"{first_warp}{dense_phase}\n{end_first_warp}" + ("        __syncthreads();" if colored else "")
     )
     sweeps = level_loop(
         (
@@ -2416,7 +2348,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
 {dense_view}{free_view}{trace_reduction}
 {friction_laws}
 {start}    {barrier}
-{seed}{records_stage}{metric_build}{chr(10) if level_marks else ""}{level_marks}
+{seed}{records_stage}{metric_build}
 {rest}"""
     # The rows' layout is the configuration's: rows as wide as the world (and no classes) sit at their coordinates.
     packed = PACKED_SIDES_DENSE if not sweep.support_classes and max_row_dofs == D else PACKED_SIDES_BY_SIDE
@@ -2447,7 +2379,7 @@ class GeneralSweep(SweepConfig):
       regions at once, :func:`region_phase`);
     - the row record: ``places`` (:class:`RowPlaces`, the plan's storage choice): the dense rows' metadata staged or
       their records streamed; the free rows' always stream; all at the placement's layout (``records``, its first row);
-    - the enumeration: ``active_rows`` (:func:`.sweep.active_scan`), else slot order (``coordinate_levels`` first);
+    - the enumeration: ``active_rows`` (:func:`.sweep.active_scan`), else slot order;
       the friction triples after the rows (:func:`.sweep.triple_phase`, K1's order) where each world holds ``one_tree``;
     - the support class: ``max_row_dofs`` (the placement's packed support), ``support_classes`` (the rows' sides by
       their classes, :func:`.packed_rows.row_classes`), ``wide_rows`` (the bilateral block's), and the free bodies' 6 +
@@ -2471,7 +2403,6 @@ class GeneralSweep(SweepConfig):
     wide_rows: bool = False
     support_classes: bool = False
     contact_units: bool = False
-    coordinate_levels: bool = False
     lanes_per_world: int = 32
     block_warps: int = 1
     free_rows: bool = True
@@ -2535,7 +2466,6 @@ class GeneralSweep(SweepConfig):
             self.colored
             or self.free_rows
             or self.active_rows
-            or self.coordinate_levels
             or self.one_tree
             or self.block_warps != 1
             or self.lanes_per_world != 32
@@ -2544,8 +2474,6 @@ class GeneralSweep(SweepConfig):
                 "the grouped mapping sweeps the dense line of a world of many trees, a world a block, its colors' "
                 "groups a warp each in slot order"
             )
-        if self.coordinate_levels and (self.colored or self.active_rows or not self.support_classes):
-            raise ValueError("the coordinate levels read the rows' support classes and precede every row in order")
         if self.block_warps not in (1, BLOCK_WARPS):
             raise ValueError(f"the warp mapping's block holds 1 or {BLOCK_WARPS} warps, got {self.block_warps}")
         if self.lanes_per_world not in (8, 16, 32) or (self.colored and self.lanes_per_world != 32):
@@ -2612,7 +2540,6 @@ class GeneralSweep(SweepConfig):
             + ("_classes" if self.support_classes else "")
             + ("_active" if self.active_rows else "")
             + ("_units" if self.contact_units else "")
-            + ("_levels" if self.coordinate_levels else "")
             + (f"_l{self.lanes_per_world}" if self.lanes_per_world != 32 else "")
             + (f"_w{self.block_warps}" if self.block_warps > 1 else "")
             + ("" if self.free_rows else "_line")
@@ -2673,7 +2600,6 @@ class GeneralSweep(SweepConfig):
             wide_rows=self.wide_rows,
             free_rows=self.free_rows,
             active_rows=self.active_rows,
-            coordinate_levels=self.coordinate_levels,
             groups=self.groups,
             lanes=self.lanes,
             split=self.split,
@@ -2704,16 +2630,6 @@ class GeneralSweep(SweepConfig):
                     RowArgument("class_count", wp.array[int], after="omega"),
                 )
                 if self.support_classes
-                else ()
-            ),
-            # Where the units on one coordinate step by level, their schedule.
-            *(
-                (
-                    RowArgument("sparse_contact_level_count", wp.array[int], after="omega"),
-                    RowArgument("sparse_contact_level_offsets", wp.array2d[int], after="omega"),
-                    RowArgument("sparse_contact_level_units", wp.array2d[int], after="omega"),
-                )
-                if self.coordinate_levels
                 else ()
             ),
             # Where the free bodies' contacts are regions, their stream.

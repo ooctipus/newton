@@ -32,8 +32,7 @@ from . import kernel_template
 from .contact_input import ContactInput
 from .device_preludes import LANE_WORDS, SHARED_STORAGE, group_native, lane_group
 from .kernel_template import KernelTemplate, items, python_kernel
-from .packed_rows import CLASS_SIDES
-from .row_laws import ROW_CONTACT, ROW_FRICTION, ROW_JOINT_LIMIT, ROW_TORSION
+from .row_laws import ROW_FRICTION, ROW_TORSION
 from .row_records import line_size
 
 # FeatherPGS takes no gradients: its kernels compile no adjoints.
@@ -467,13 +466,6 @@ def levels_staging(max_world_dofs: int, device_arch) -> Staging:
     return Staging(buffers, groups=groups, layout="arrays")
 
 
-def levels_fit(max_constraints: int, max_world_dofs: int, device_arch) -> bool:
-    """Whether a world of ``max_constraints`` rows and ``max_world_dofs`` coordinates takes a level schedule: a unit's
-    level and rank packed in 16 bits each, and its lane group's stage in a block (:func:`levels_staging`)."""
-    budget = arch_budget(device_arch)
-    return int(max_constraints) < 1 << 15 and levels_staging(int(max_world_dofs), device_arch).fits(budget)
-
-
 def levels_launch(world_count: int, max_world_dofs: int, device_arch) -> tuple[int, int]:
     """The contact schedule's launch, ``(dim, block_dim)``: a world's lane group (a warp, or the CPU's one thread,
     :func:`.execution.device_lanes`), :func:`levels_staging`'s groups a block."""
@@ -630,79 +622,4 @@ def _sparse_contact_levels_kernel(
     )
     return _levels_kernel(
         name, params, M, D, device_arch, units=units, reserve=reserve, resources=resources, tail=serial
-    )
-
-
-@cache
-def coordinate_levels_kernel(M: int, D: int, device_arch: str, *, torsion: bool = False) -> "wp.Kernel":
-    """The levels of the units on one coordinate no wider unit holds, over a world's rows by support class
-    (:func:`.packed_rows.row_classes`), which the general sweep steps first (``coordinate_levels``).
-
-    A unit heads its contact's rows (its pair and spin row name it as parent) or is any other row. A contact or joint limit of one entry ahead of every other unit on its coordinate is leveled in
-    row order (:func:`_levels_kernel`), so it commutes with every row stepped in order: the order's iterate.
-    """
-    L = device_lanes(device_arch, 32)
-    if M >= 1 << 15:
-        raise ValueError(f"a world's level schedule packs a unit's level and rank in 16 bits each: {M} rows")
-    levels_staging(D, device_arch).check("the coordinate levels", arch_budget(device_arch))
-    kind = "world_row_type.data[row_base + row]"
-    head = f"{kind} != {int(ROW_FRICTION)}" + (f" && {kind} != {int(ROW_TORSION)}" if torsion else "")
-    entries = """const int classes = row_classes.data[row_base + row];
-            const int c1 = (classes >> 13) & 0x1FFF;
-            const int entries = ((classes >> 26) & 0x3F) + (c1 == 0x1FFF ? 0 : class_count.data[c1]);"""
-    unit = f"({head})"
-    # A level holds contacts and joint limits (the sweep compiles their laws apart).
-    kinds = f"({kind} == {int(ROW_CONTACT)} || {kind} == {int(ROW_JOINT_LIMIT)})"
-    units = f"""    const int contact_start = 0;
-    const int contact_end = min(world_constraint_count.data[world], {M});
-    const int units = contact_end;
-    const int line = dense_first.data[world];
-    __builtin_assume(line >= 0);
-    const int row_base = line * {line_size("world_row_type")};"""
-    # Each coordinate's first row of a unit no level holds (node_owner, scratch of this rule): a contact or joint
-    # limit of one entry before it on its coordinate keeps that coordinate for the pass (unit_coordinate, 0 for none).
-    reserve = f"""    for (int c = lane; c < {D}; c += {L}) node_owner[c] = {M};
-    SYNC();
-    for (int row = lane; row < contact_end; row += {L}) {{
-        if (!{unit}) continue;
-        {entries}
-        if (entries < 2 && {kinds}) continue;
-        const wp::vec2i sides = row_sides.data[row_base + row];
-        for (int e = 0; e < entries; ++e) {{
-            const int coordinate = CLASS_COORDINATE(sides, classes, e);
-            if (coordinate >= 0) atomicMin(&node_owner[coordinate], row);
-        }}
-    }}
-    SYNC();
-    int unit_coordinate[{-(-M // L)}];
-    for (int base = 0; base < units; base += {L}) {{
-        const int row = base + lane;
-        int leveled = 0;
-        if (row < units && {unit} && {kinds}) {{
-            {entries}
-            const int coordinate = CLASS_COORDINATE(row_sides.data[row_base + row], classes, 0);
-            if (entries == 1 && coordinate >= 0 && row < node_owner[coordinate]) leveled = coordinate + 1;
-        }}
-        unit_coordinate[base / {L}] = leveled;
-    }}
-    SYNC();"""
-    resources = f"""            int node_a = -1;
-            const int node_b = -1;
-            if (valid) valid = unit_coordinate[base / {L}] > 0;
-            if (valid) node_a = unit_coordinate[base / {L}] - 1;
-            unit_place[base / {L}] = -1;"""
-    name = f"coordinate_levels_{M}_{D}" + ("_torsion" if torsion else "") + ("" if L == 32 else f"_lanes{L}")
-    params = (
-        ("world_constraint_count", wp.array[int]),
-        ("dense_first", wp.array[int]),
-        ("world_row_type", wp.array2d[int]),
-        ("row_sides", wp.array2d[wp.vec2i]),
-        ("row_classes", wp.array2d[int]),
-        ("class_dof", wp.array2d[int]),
-        ("class_count", wp.array[int]),
-        ("articulation_world_dof_offset", wp.array[int]),
-        *_LEVELS_OUTPUTS,
-    )
-    return _levels_kernel(
-        name, params, M, D, device_arch, units=units, reserve=reserve, resources=resources, preludes=(CLASS_SIDES,)
     )
