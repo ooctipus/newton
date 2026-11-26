@@ -3133,6 +3133,7 @@ class Regions:
                 self.body_regions,
                 self.world_regions,
                 int(placement.line_rows),
+                placement.dense_first,
                 placement.body_base,
                 coordinates,
                 self.body_first,
@@ -3169,6 +3170,7 @@ def audit_region(
     g: int,
     world: int,
     pitch: int,
+    world_line: wp.array[int],
     base: wp.array[int],
     coordinates: wp.array2d[float],
     body_first: wp.array[int],
@@ -3220,18 +3222,19 @@ def audit_region(
         sn += tn * sign
         sf += tf * sign
         sign = -sign
+    # A row's place is absolute in the store; the world's rows run from its line (its run of the arena's lines).
+    line = world_line[world]
+    first = line * pitch
     span = reg_cand[g]
     for i in range(span[0], span[1]):
         record = cand[i]
         a = candidate_row(record)
-        line = cand_row[i] / pitch
-        row = cand_row[i] - line * pitch
+        row = cand_row[i] - first
         velocity[world, row - base[line]] = wp.dot(a, sn)
         diag[line, row] = wp.dot(a, Wnn * a)
     friction = reg_row[g]
     if friction >= 0:
-        line = friction / pitch
-        row = friction - line * pitch - base[line]
+        row = friction - first - base[line]
         velocity[world, row] = sf[0]
         velocity[world, row + 1] = sf[1]
         if (kind & FRICTION_ROWS) == 3:
@@ -3246,6 +3249,7 @@ def audit_regions(
     body_regions: wp.array[wp.vec2i],
     world_regions: wp.array[wp.vec2i],
     pitch: int,
+    world_line: wp.array[int],
     base: wp.array[int],
     coordinates: wp.array2d[float],
     body_first: wp.array[int],
@@ -3279,6 +3283,6 @@ def audit_regions(
         return
     for g in range(span[0], span[1]):
         audit_region(
-            g, world, pitch, base, coordinates, body_first, body_basis, body_inertia, reg_frame, reg_arm, reg_arm_b,
+            g, world, pitch, world_line, base, coordinates, body_first, body_basis, body_inertia, reg_frame, reg_arm, reg_arm_b,
             reg_body, reg_cand, reg_kind, reg_row, cand, cand_row, diag, velocity,
         )  # fmt: skip
