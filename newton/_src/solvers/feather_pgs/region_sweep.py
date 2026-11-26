@@ -1076,7 +1076,7 @@ def fill_region_head(
     law: PatchRowLaw,
     mf_constraint_count: wp.array[int],
     mf_contact_rows_end: wp.array[int],
-    dense_max: int,
+    base: wp.array[int],
     mf_max: int,
     pitch: int,
     cand_contact: wp.array[int],
@@ -1119,7 +1119,8 @@ def fill_region_head(
     span = reg_cand[g]
     c0 = span[0]
     size = span[1] - span[0]
-    end = dense_max + wp.min(mf_contact_rows_end[world], wp.min(mf_constraint_count[world], mf_max))
+    # The free rows' end in the line: its free rows run from its body base.
+    end = base[line] + wp.min(mf_contact_rows_end[world], wp.min(mf_constraint_count[world], mf_max))
     head = cand_contact[c0]
     r = data.slot[head]
     sides = row_sides(data.art0[head], data.art1[head], data.response_dofs)
@@ -1321,7 +1322,7 @@ def fill_regions(
     law: PatchRowLaw,
     mf_constraint_count: wp.array[int],
     mf_contact_rows_end: wp.array[int],
-    dense_max: int,
+    base: wp.array[int],
     mf_max: int,
     pitch: int,
     cand_contact: wp.array[int],
@@ -1400,7 +1401,7 @@ def fill_regions(
         rounding = float(0.0)
         if holds:
             kind, c0, size, line, source, c, sn, point, words, rounding = fill_region_head(
-                g, rows, bias, data, law, mf_constraint_count, mf_contact_rows_end, dense_max, mf_max, pitch,
+                g, rows, bias, data, law, mf_constraint_count, mf_contact_rows_end, base, mf_max, pitch,
                 cand_contact, art_free, body_twist, body_inertia, cfm, reg_head, reg_cand, reg_frame, reg_arm,
                 reg_arm_b,
                 reg_body, reg_law, reg_bf, reg_kind, reg_row, reg_wnn, reg_wnf, reg_wff, reg_ball_values,
@@ -2760,7 +2761,6 @@ class Regions:
         rows, bias = bind_dense_rows(placement), solver.laws.bias(self.options, dt)
         data = bind_contact_input(solver, state_in, self.factor, contacts, dt, 1.0)
         mf_max, pitch = int(placement.mf_max_constraints), int(placement.line_rows)
-        dense_max = int(placement.dense_max_constraints)
         # Sized for the pool's launch rows: a capture's replays run them at the live count (ContactPool.launch).
         threads = min(pool.launch_rows(), _THREAD_CAP)
         live = {"extent": contacts.rigid_contact_count, "clamp": True}
@@ -2854,7 +2854,7 @@ class Regions:
                 patch_row_law(solver),
                 placement.mf_constraint_count,
                 placement.mf_contact_rows_end,
-                dense_max,
+                placement.body_base,
                 mf_max,
                 pitch,
                 self.cand_contact,
