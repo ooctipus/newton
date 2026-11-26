@@ -66,14 +66,16 @@ def _extent(group, route, device, collide_every: int = 1) -> tuple[dict, int, in
 
 
 def _moved_topology(device):
-    """Two worlds' topology rows moved home -> run (:func:`_move_topology`) in three fields that count a line in their
-    own items, on lines of six rows: rows (a float a row), records (eight words a row) and a friction metric (a slot of
-    four floats per three rows). Returns the fields before and after, the worlds' runs and their topology rows."""
+    """Two worlds' topology rows moved home -> run (:func:`_move_topology`) in four fields that count a line in their
+    own items, on lines of six rows: rows (a float a row), records (eight words a row), a friction metric (a slot of
+    four floats per three rows) and units (an int a row, four rows a line: a field that holds fewer rows a world than
+    the store's line). Returns the fields before and after, the worlds' runs and their topology rows."""
     rows, lines = 6, 6
     fields = [
         np.arange(lines * rows, dtype=np.float32).reshape(lines, rows) + 1.0,
         np.arange(lines * rows * 8, dtype=np.int32).reshape(lines, rows * 8) + 1,
         np.arange(lines * 2 * 4, dtype=np.float32).reshape(lines, 2, 4) + 1.0,
+        np.arange(lines * 4, dtype=np.int32).reshape(lines, 4) + 1,
     ]
     arrays = [wp.array(field, device=device) for field in fields]
     runs, topology = [2, 4], [4, 1]
@@ -87,7 +89,7 @@ def _moved_topology(device):
             wp.array([int(a.ptr) for a in arrays], dtype=wp.uint64, device=device),
             wp.array([int(a.strides[1]) for a in arrays], dtype=wp.int64, device=device),
             wp.array([int(a.strides[0]) for a in arrays], dtype=wp.int64, device=device),
-            rows,
+            wp.array([rows, rows, rows, 4], dtype=wp.int64, device=device),
         ],
         device=device,
     )
@@ -160,7 +162,8 @@ class TestFeatherPGSRowLines(unittest.TestCase):
             expected[1][run, : count * 8] = before[1][home, : count * 8]
             slots = math.ceil(count / 3)
             expected[2][run, :slots] = before[2][home, :slots]
-        for name, want, got in zip(("rows", "records", "friction metric"), expected, after, strict=True):
+            expected[3][run, :count] = before[3][home, :count]
+        for name, want, got in zip(("rows", "records", "friction metric", "units"), expected, after, strict=True):
             np.testing.assert_array_equal(got, want, err_msg=name)
 
     def test_a_run_takes_its_topology_rows_in_every_field_cpu(self):

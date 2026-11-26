@@ -66,7 +66,7 @@
   "placement._bound_topology": "6ffb71c357cf250287e3a569337276f08cc3b3b2d640e47015301e19f3a20cb0",
   "placement._clear_dense_row_state": "3f3dc93749903795328e0c36d589cc75dcd6af8a6ead41536420f267ab24eb77",
   "placement._close_row_pass": "a865969aacdbada9b802ea1bf028e89435d3b75528b435b6c309a2bb23dda925",
-  "placement._move_topology": "76f8da94d6d5b9f0dae6fafe5f1f7b52cc4351f538b087c826c099bdf5eb90e5",
+  "placement._move_topology": "a75b213cbf5639fb2f7a312909f6bc0450fe3495e26dd8f1dd9de350b247dac9",
   "placement._reset_solver_status": "ed903a3467cb513819249555fe6cedacba15c0c6ab8007291d12228b8586f43c",
   "placement._take_runs": "d5b0c8c6ca0736f178d8911e0982823a2a3e404274ca9048629eadcef66539e8",
   "region_sweep.add_closed_changes": "352fc4ef8961e56b2e834f79fe88728c31c391b689741e653f99c51ff22529f7",
