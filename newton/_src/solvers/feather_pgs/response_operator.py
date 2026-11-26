@@ -110,6 +110,9 @@ class Velocity:
     stored and their coordinates (``carry_v``, ``carry_i``) with its support's key (``carry_key``), and a visit on the
     same support reads them there instead of its coordinates' and velocity's round trips (the values its loads would
     read: only the run's own applies write them). The run declares them (:meth:`SparseFactor.carry_state`)."""
+    kept: bool = False
+    """A carried velocity a visit takes without testing its key: the visit before it on the run was on its support (a
+    patch ring's later normals, which the run takes whole only on one support, :func:`.sweep.patch_run`)."""
 
     def at(self, index: str) -> str:
         return f"{self.array}[{index}]"
@@ -480,7 +483,9 @@ class SparseFactor(ResponseOperator):
         body += ["if (index >= 0) {", *("    " + line for line in guarded), "}"]
         if carried:
             same = " && ".join(f"carry_key[{k}] == {word}" for k, word in enumerate(self.key(rows[names[0]])))
-            lines.append(f"const bool carried = carry_live && {same};")
+            lines.append(
+                "const bool carried = true;" if self.velocity.kept else f"const bool carried = carry_live && {same};"
+            )
         text = "\n".join(indent + line for line in lines) + "\n" + self.entries_loop("\n".join(body), indent)
         ladder = self.lanes.reduce(*(o for o in outs if not apart or o not in apart[1])) if reduce else ""
         if reduce and apart and self.lanes.parallel:
@@ -553,7 +558,10 @@ class SparseFactor(ResponseOperator):
         )
 
     def carry(self, row: str, indent: str) -> str:
-        """After a visit's applies, carry its kept velocity, coordinates and support key of row ``row``."""
+        """After a visit's applies, carry its kept velocity, coordinates and support key of row ``row`` (a visit on the
+        kept support, :attr:`Velocity.kept`, its velocity only)."""
+        if self.velocity.kept:
+            return self.entries_loop("if (indices[q] >= 0) carry_v[q] = velocities[q];", indent, entry=False)
         keys = "".join(f" carry_key[{k}] = {word};" for k, word in enumerate(self.key(row)))
         body = "carry_i[q] = indices[q];\nif (indices[q] >= 0) carry_v[q] = velocities[q];"
         return f"{indent}carry_live = true;{keys}\n" + self.entries_loop(body, indent, entry=False)

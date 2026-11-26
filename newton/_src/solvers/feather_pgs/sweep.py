@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import re
 from collections.abc import Callable, Sequence
 from typing import ClassVar, Protocol
 
@@ -2594,6 +2595,7 @@ def row_step(
     reach: str | None = None,
     pipelined: bool = False,
     keep: str | None = None,
+    admitted: bool = False,
     pad: str = "            ",
 ) -> str:
     """Row ``i``'s step in a row loop over a store's rows ``[0, end)``: its kind read from the store, the schedule's
@@ -2618,7 +2620,8 @@ def row_step(
       normal) sets that row's loaded impulse, and ``keep`` names a register the visited row's store sets too (a patch
       ring's normal, :func:`patch_run`). A run that takes its patch rings whole (:attr:`WorldRows.patch`) pools a
       ring its visit closed from the visit's registers (``ring_row``, ``ring_value``), not by its walk: the same
-      values in the same order.
+      values in the same order;
+    - ``admitted``: the schedule tested the row's diagonal already (a patch ring taken whole), so the visit does not.
 
     A spin row is skipped first (solved with its pair, here or in the triple phase), then ``admission``, the
     schedule's own skips; with ``reach`` (the live order's bound of the
@@ -2671,7 +2674,7 @@ def row_step(
         ctx,
         dataclasses.replace(laws, torsion=False) if triple_phase else laws,
         parent=rows.parent("i") if parent is None else parent,
-        check="denom",
+        check=None if admitted else "denom",
         declare=f"float denom = {rows.diag('i')};",
         keep_next="pair_impulse" if held else None,
         pad=pad,
@@ -2688,9 +2691,11 @@ def patch_run(rows: WorldRows, op, laws: RowLaws, step: dict, *, end: str, pad: 
     and where the ring closes within the window and its anchor's pair has a spin row (so no contact unit takes the
     anchor, :func:`unit_visit`) steps the ring's other normals in turn, each by the normal's row step on its rows' registers (:func:`row_step`: the text, arithmetic and
     order of a visit a row), then pools the ring's load at its anchor in ring order (``ring_row``, ``ring_value``) for
-    its pair's visit, which the run loads next (``UNIT_TAKEN``) with the anchor's record. Any other ring steps on a
-    row a visit. Bit for bit the visits a row: what it removes is a load's wait a normal and the pair's walk of the
-    ring."""
+    its pair's visit, which the run loads next (``UNIT_TAKEN``) with the anchor's record. A ring is taken whole where
+    its normals share the visited normal's support (their records' key words) and every diagonal is positive: the
+    later normals step on the support and velocity the first one's visit carries (:attr:`Velocity.kept`), with no key
+    test, lookup or diagonal test of their own. Any other ring steps on a row a visit. Bit for bit the visits a row:
+    what it removes is a load's wait, a support's test and a diagonal's test a normal and the pair's walk of the ring."""
     window = rows.patch
     words = {k for _, k in rows.ahead}
     held_z = {k for _, k in op.ahead}
@@ -2700,8 +2705,37 @@ def patch_run(rows: WorldRows, op, laws: RowLaws, step: dict, *, end: str, pad: 
     def word(r: int) -> str:
         return f"held_w{r}" if r in words else (f"patch_a{r}.w" if r < window else f"patch_w{r}")
 
+    # A ring's later normals step on the support its first normal's visit carries (Velocity.kept), their diagonals
+    # tested where the ring is taken whole (``one``).
+    kept_op = dataclasses.replace(op, velocity=dataclasses.replace(op.velocity, kept=True))
+
+    def registered(expression: str, r: int) -> str:
+        """``expression`` of the visited row's record registers as normal ``r``'s registers hold it."""
+        for name in rows.registers:
+            expression = re.sub(rf"\b{name}\b", f"patch_{name[-1]}{r}", expression)
+        return expression
+
+    def one(r: int) -> str:
+        """Whether the ring of normals ``0..r`` is on the visited normal's support and every diagonal passes the visit's
+        test (not at or below zero)."""
+        terms = [f"!({rows.diag('i')} <= 0.0f)"]
+        for m in range(1, r + 1):
+            terms += [f"{registered(key, m)} == {key}" for key in op.key("i")]
+            terms.append(f"!({registered(rows.diag('i'), m)} <= 0.0f)")
+        return " && ".join(terms)
+
     def normal(r: int) -> str:
-        visit = row_step(rows, op, laws, **step, kind=contact, pipelined=True, keep=f"patch_new{r}", pad="    ")
+        visit = row_step(
+            rows,
+            kept_op if r else op,
+            laws,
+            **step,
+            kind=contact,
+            pipelined=True,
+            keep=f"patch_new{r}",
+            admitted=bool(r),
+            pad="    ",
+        )
         z = f"held_z{r}[q]" if r in held_z else f"patch_z{r}[q]"
         impulse = held_impulse.get(r, f"patch_impulse{r}")
         bind = (
@@ -2776,8 +2810,8 @@ def patch_run(rows: WorldRows, op, laws: RowLaws, step: dict, *, end: str, pad: 
 
     def triple(anchors: list[int], flag: str) -> list[str]:
         return [f"bool {flag} = false;"] + [
-            f"if (patch_anchor == {r} && patch_head + {r + 3} < ({end}) && ({word(r + 3)} & 0xFFFF) == {ROW_TORSION}) "
-            f"{flag} = true;"
+            f"if (patch_anchor == {r} && patch_head + {r + 3} < ({end}) && ({word(r + 3)} & 0xFFFF) == {ROW_TORSION}"
+            f" && {one(r)}) {flag} = true;"
             for r in anchors
         ]
 
