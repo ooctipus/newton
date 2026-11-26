@@ -46,33 +46,24 @@ def prepare_world_impulses(
     free_count: wp.array[int],
     free_base: wp.array[int],
     free_max: int,
-    warmstart: int,
     lanes: int,
     # in/out
     world_impulses: wp.array2d[float],
 ):
     """Cold-initialize each world's rows before identity-gathering contact impulses, ``lanes`` lanes a world striding
-    over its rows: the dense rows, then the free bodies' rows (``free_count`` of them from the line's body base
+    over its rows: its dense rows, then its free bodies' rows (``free_count`` of them from the line's body base
     ``free_base``, at most ``free_max``: zero where no free body keeps rows).
 
-    No current non-contact row family has a cross-step identity contract:
-    limits are activation-allocated, while mimic and link rows can be enabled
-    dynamically and allocated atomically. Warm start therefore clears the
-    full capacity before the contact/friction identity gather; cold solves only
-    need to clear the current active prefix.
+    No row holds an impulse from one step to the next (the warm start carries a contact's by its identity, and no other
+    row family has a cross-step identity contract: limits are activation-allocated, while mimic and link rows can be
+    enabled dynamically and allocated atomically), and no reader takes a row past the world's counts, so a world's
+    live rows are the ones cleared: a row that becomes live on a later step is cleared then. The clear stays within the
+    world's line or run of the row store, whatever its capacity.
     """
     world, lane = wp.tid()
     line = dense_first[world]
-
-    # Cold-started solves consume only the current active prefix. Rows outside
-    # that prefix are ignored, and a row that becomes active on a later step is
-    # cleared then as part of that step's prefix. Warm-started solves clear full
-    # capacity so no inactive cache can survive a later layout growth.
-    clear_count = max_constraints
-    free_clear = free_max
-    if warmstart == 0:
-        clear_count = world_constraint_count[world]
-        free_clear = wp.min(free_count[world], free_max)
+    clear_count = wp.min(world_constraint_count[world], max_constraints)
+    free_clear = wp.min(free_count[world], free_max)
 
     for i in range(lane, clear_count, lanes):
         world_impulses[line, i] = 0.0
@@ -136,15 +127,25 @@ def forget_carried_contacts(world: wp.array[int], world_mask: wp.array[wp.bool],
 
 
 @wp.kernel
-def reset_world_impulses(first: wp.array[int], world_mask: wp.array[wp.bool], lanes: int, impulses: wp.array2d[float]):
-    """Clear the selected worlds' lines of the row store, both classes' rows, ``lanes`` lanes a world striding over
-    them (:func:`row_lanes`)."""
+def reset_world_impulses(
+    first: wp.array[int],
+    world_mask: wp.array[wp.bool],
+    counts: wp.array2d[int],
+    free_base: wp.array[int],
+    lanes: int,
+    impulses: wp.array2d[float],
+):
+    """Clear the selected worlds' live rows of the row store (``counts``: by class and world), both classes' (the free
+    bodies' from the line's body base), ``lanes`` lanes a world striding over them (:func:`row_lanes`)."""
     world, lane = wp.tid()
     if world_mask and not world_mask[world]:
         return
     line = first[world]
-    for row in range(lane, impulses.shape[1], lanes):
+    for row in range(lane, counts[0, world], lanes):
         impulses[line, row] = 0.0
+    base = free_base[line]
+    for row in range(lane, counts[1, world], lanes):
+        impulses[line, base + row] = 0.0
 
 
 @wp.func

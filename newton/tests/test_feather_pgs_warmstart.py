@@ -184,7 +184,6 @@ class TestFeatherPGSIdentityWarmstartKernel(unittest.TestCase):
                 wp.zeros(1, dtype=wp.int32, device="cpu"),
                 wp.full(1, 4, dtype=wp.int32, device="cpu"),
                 0,
-                1,
                 2,
             ],
             outputs=[impulses],

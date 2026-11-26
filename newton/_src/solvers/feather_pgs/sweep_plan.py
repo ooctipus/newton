@@ -1368,7 +1368,7 @@ class Sweep:
         wp.launch(
             reset_world_impulses,
             dim=(self.forest.world_count, lanes),
-            inputs=[placement.dense_first, world_mask, lanes],
+            inputs=[placement.dense_first, world_mask, placement.row_count, placement.body_base, lanes],
             outputs=[placement.impulses],
             device=self.model.device,
         )

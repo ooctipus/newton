@@ -1392,10 +1392,8 @@ class Placement:
         return bool(self.packed_response)
 
     def prepare_impulses(self):
-        """Start the step's rows' impulses (:func:`.warm_start.prepare_world_impulses`): each world's dense rows, and
-        with free rigid bodies the rows of their run, cold where the sweep is cold and over capacity under the warm
-        start."""
-        warmstart_flag = 1 if self.options.pgs_warmstart else 0
+        """Start the step's rows' impulses (:func:`.warm_start.prepare_world_impulses`): each world's live dense rows,
+        and with free rigid bodies the live rows of their run."""
         free_max = self.mf_max_constraints if self.forest.has_free_rigid_bodies else 0
         # No more lanes a world than its rows' capacity: a world of a few rows takes as few; a few worlds of many rows
         # spread them over the GPU (row_lanes).
@@ -1412,7 +1410,6 @@ class Placement:
                 self.mf_constraint_count,
                 self.body_base,
                 free_max,
-                warmstart_flag,
                 lanes,
             ],
             outputs=[self.impulses],
