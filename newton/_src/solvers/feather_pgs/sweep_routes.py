@@ -2041,7 +2041,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
             # units fit its share: its visit's loads do not wait for its color slot, and a color's units read each float
             # together. A world past its share keeps them where the warp sweep keeps its free rows' records, by its
             # normal row (a friction unit's rows are three apart at least), each record's floats together: the line
-            # holds a record for every three rows either way, so the records take no memory of their own.
+            # holds a slot for every row either way, so the records take no memory of their own.
             first = f"(free_row0 / 3) * {FRICTION_METRIC_FLOATS}"
             return lambda place: (
                 f"(unit_record_line + (records_by_row ? ((free_row0 + ({row})) / 3) * {FRICTION_METRIC_FLOATS} "
@@ -2077,9 +2077,11 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
             "\n    const int off_color = off_unit;"
             "\n    const int unit_entries = slot_need.data[unit_slot];"
             # Its units' records in its line: by place where its units fit its share, else by normal row (unit_metric).
-            "\n    const bool records_by_row = color_offset.data[off_color + color_count.data[world]] > "
-            f"{share};"
-            f"\n    const int record_stride = records_by_row ? 1 : {share};"
+            # The share is at most the slots its line or run holds past the free rows' first record: a slot a row, and
+            # it holds its live rows at least.
+            f"\n    const int record_share = min({share}, free_row0 + m_mf - free_row0 / 3);"
+            "\n    const bool records_by_row = color_offset.data[off_color + color_count.data[world]] > record_share;"
+            "\n    const int record_stride = records_by_row ? 1 : record_share;"
             "\n    float* const unit_record_line = friction_metric.data + static_cast<size_t>(line) * "
             f"{line_size('friction_metric')};"
         )

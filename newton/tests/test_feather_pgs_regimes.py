@@ -736,7 +736,7 @@ class TestQ11Stack(unittest.TestCase):
         slot = placement.contact_slot.numpy()
         art_a, art_b = placement.contact_art_a.numpy(), placement.contact_art_b.numpy()
         ground = (slot >= 0) & (placement.contact_world.numpy() == 0) & ((art_a < 0) | (art_b < 0))
-        lam = placement.impulses.numpy()[0, slot[ground]]
+        lam = placement.impulses.numpy()[placement.dense_first.numpy()[0], slot[ground]]
         return float(np.sum(lam)) / (H * mass * G0 * count), float(state.body_q.numpy()[-1, 2]) - (
             half + 2.0 * half * (count - 1)
         )

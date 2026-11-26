@@ -111,6 +111,12 @@ class SolverArrays:
         self._line_buffers: list[wp.array] = []
         self.line_fields: list[wp.array] = []
         """Every field laid out by line and row: a world's rows move with it between lines (its run of the arena)."""
+        self.mapped_lines: int | None = None
+        """Where the store's lines are reserved past the ones mapped (:meth:`array`): the lines a line field maps (the
+        rest of its view's lines are addresses only, mapped as the store grows, :meth:`map_lines`); ``None`` maps every
+        line."""
+        self.line_stores: list = []
+        """Each line field's storage that maps lines as the store grows: ``(rows, stride, entries)``."""
 
     @staticmethod
     def line_flat(array: wp.array) -> wp.array:
@@ -144,16 +150,52 @@ class SolverArrays:
         return array
 
     def _lines(self, field: Field, shape: tuple, stride: int | None) -> wp.array:
-        if stride is None or stride >= shape[1] or shape[0] == 0:
+        if stride is None or shape[0] == 0 or (stride >= shape[1] and self.mapped_lines is None):
             return self._filled(shape, field)
         lines, rows, trailing = shape[0], shape[1], shape[2:]
+        stride = min(int(stride), rows)
         entries = int(np.prod(trailing)) if trailing else 1
-        buffer = self._filled(((lines - 1) * stride + rows) * entries, field)
-        self._line_buffers.append(buffer)
+        reserved = (lines - 1) * stride + rows
+        if self.mapped_lines is None or self.mapped_lines >= lines:
+            buffer = self._filled(reserved * entries, field)
+            self._line_buffers.append(buffer)
+        else:
+            buffer = self._mapped(field, reserved, rows, stride, entries)
         size = wp.types.type_size_in_bytes(field.dtype)
         inner = tuple(int(np.prod(trailing[k + 1 :])) * size for k in range(len(trailing)))
         strides = (stride * entries * size, entries * size, *inner)
         return wp.array(ptr=buffer.ptr, dtype=field.dtype, shape=shape, strides=strides, device=self.device)
+
+    def _mapped(self, field: Field, reserved: int, rows: int, stride: int, entries: int) -> wp.array:
+        """A line field's buffer reserved for ``reserved`` rows of ``entries`` entries, its lines ``rows`` rows wide at
+        ``stride``, mapped for its first :attr:`mapped_lines` lines
+        (:class:`~newton._src.core.contact_pool.ContactRows`: CUDA virtual memory, whose growth keeps its addresses, so
+        graphs that captured the field replay on). Without virtual memory every reserved row is held at once: an
+        ordinary array that grows would leave every view of it stale."""
+        from ...core.contact_pool import ContactField, ContactRows, _grow_rows  # noqa: PLC0415
+
+        fill = 0 if field.fill is None else field.fill
+        store = ContactRows(
+            (ContactField(field.name, field.dtype, fill=fill, per_contact=entries),),
+            rows=min((self.mapped_lines - 1) * stride + rows, reserved),
+            reserve=reserved,
+            device=self.device,
+        )
+        if not store.virtual:
+            _grow_rows([store], reserved)
+        self.line_stores.append((store, stride, rows))
+        return store.reserved[field.name]
+
+    def map_lines(self, lines: int) -> None:
+        """Map every line field's first ``lines`` lines (outside capture, :meth:`_mapped`): growth behind their fixed
+        addresses, published to the device in stream order."""
+        from ...core.contact_pool import _grow_rows  # noqa: PLC0415
+
+        for store, stride, rows in self.line_stores:
+            target = min((lines - 1) * stride + rows, store.reserve)
+            if store.rows < target:
+                _grow_rows([store], target)
+        self.mapped_lines = lines
 
     def allocate(self, group, /, *, owner=None, **sizes: int) -> dict[str, wp.array]:
         """Allocate every field of ``group`` at ``sizes`` and give it to its owner.

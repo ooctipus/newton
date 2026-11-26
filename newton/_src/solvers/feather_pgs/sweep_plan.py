@@ -81,7 +81,9 @@ bodies' rows."""
 FRICTION_METRIC = FieldGroup(Field("friction_metric", wp.float32, ("line", "contact", "metric"), owner="placement"))
 """Where spin rows may appear, a world can take the colored mapping or K1 fuses contact units, each friction contact's
 record, formed once per launch (:func:`.sweep.friction_record_stage`, :func:`.walk_rows.contact_record`,
-:func:`.sweep.friction_metric_stage`): a slot per three rows of the row store's line, a contact's rows."""
+:func:`.sweep.friction_metric_stage`): a slot per row of the row store's line. A record sits at its contact's normal
+row over three, or at its unit's place, and under friction patches every contact's normal row is a unit (only a
+patch's anchor carries a friction pair), so a world's records reach as many slots as it holds rows."""
 
 
 __all__ = ["Sweep"]
@@ -374,7 +376,7 @@ class Sweep:
             self.placement.arrays.allocate(
                 FRICTION_METRIC,
                 line=self.placement.lines,
-                contact=(self.placement.row_pitch + 2) // 3,
+                contact=self.placement.row_pitch,
                 metric=FRICTION_METRIC_FLOATS,
             )
         self.mf_gs_kernel = None

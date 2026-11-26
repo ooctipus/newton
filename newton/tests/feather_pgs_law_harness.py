@@ -42,6 +42,7 @@ from newton._src.solvers.feather_pgs.factor.walk import (
     unpack_walk_records,
     walk_leave_kernel,
 )
+from newton._src.solvers.feather_pgs.field_group import SolverArrays
 from newton._src.solvers.feather_pgs.friction_patches import FrictionPatches, PatchRowLaw
 from newton._src.solvers.feather_pgs.joint_table import JointTable
 from newton._src.solvers.feather_pgs.route_table import Laws
@@ -1112,11 +1113,17 @@ def walked_worlds(solver) -> np.ndarray:
     return dense & ((int(seeds.tiers) >> tier) & 1 != 0)
 
 
+def world_rows(placement, values: np.ndarray) -> np.ndarray:
+    """Each world's rows of a host copy of a row-store array (``[line, row, ...]``), by world: its line's (its home or
+    its run of the arena's lines, whose rows run on past one line)."""
+    return values[placement.dense_first.numpy()]
+
+
 def free_rows(placement, values: np.ndarray) -> np.ndarray:
-    """Each line's free-body rows of a host copy of a row-store array (``[line, row, ...]``): the free capacity's rows
-    from the line's body base."""
-    rows = int(placement.mf_max_constraints)
-    return np.stack([values[line, base : base + rows] for line, base in enumerate(placement.body_base.numpy())])
+    """Each world's free-body rows of a host copy of a row-store array (``[line, row, ...]``), by world: the free
+    capacity's rows from its line's body base."""
+    rows, bases = int(placement.mf_max_constraints), placement.body_base.numpy()
+    return np.stack([values[line, bases[line] : bases[line] + rows] for line in placement.dense_first.numpy()])
 
 
 def free_body_Z(solver) -> np.ndarray:
@@ -1166,7 +1173,7 @@ def region_incident_gaps(solver) -> tuple[np.ndarray, np.ndarray]:
     arm, arm_b, kind = regions.reg_arm.numpy(), regions.reg_arm_b.numpy(), regions.reg_kind.numpy()
     basis, first, world = regions.body_basis.numpy(), regions.body_first.numpy(), regions.body_world.numpy()
     cand, row = regions.cand.numpy().astype(np.float64), regions.cand_row.numpy()
-    rhs = solver.placement.rhs.numpy().reshape(-1).astype(np.float64)
+    rhs = SolverArrays.line_flat(solver.placement.rhs).numpy().astype(np.float64)
     gaps, terms = np.zeros(candidates), np.zeros(candidates)
 
     def twist(f: int, r: np.ndarray, n: np.ndarray, t0: np.ndarray, t1: np.ndarray) -> np.ndarray:
@@ -1231,7 +1238,7 @@ def whitened_rows(jacobian, L) -> np.ndarray:
 
 
 def packed_coordinates(solver) -> np.ndarray:
-    """The world coordinate of every packed row entry ``[world, row, entry]`` (-1 past the row's sides), from the
+    """The world coordinate of every packed row entry ``[line, row, entry]`` (-1 past the row's sides), from the
     rows' sides (:mod:`.packed_rows`: dense rows at their coordinates, else side by side, each side its coordinates or,
     where the rows take support classes, its class's: :func:`.packed_rows.row_classes`). Every side holds response
     coordinates (:func:`.row_records.row_sides`)."""
@@ -1242,10 +1249,12 @@ def packed_coordinates(solver) -> np.ndarray:
         table = placement.row_classes
         row_class, class_dof, class_count = (a.numpy() for a in (table.row_class, table.class_dof, table.class_count))
     dof = np.full((*sides.shape[:2], placement.packed_Z.shape[2]), -1, dtype=np.int32)
+    lines = placement.dense_first.numpy()
     for world, count in enumerate(placement.constraint_count.numpy()):
+        line = int(lines[world])
         for row in range(min(int(count), sides.shape[1])):
             first = 0
-            for side, art in enumerate(sides[world, row]):
+            for side, art in enumerate(sides[line, row]):
                 if art < 0:
                     continue
                 n, offset = int(sizes[art]), int(offsets[art])
@@ -1253,10 +1262,10 @@ def packed_coordinates(solver) -> np.ndarray:
                     raise AssertionError(f"world {world} row {row}: side {art} holds no response coordinates")
                 coordinates = np.arange(n)
                 if placement.classed:
-                    cls = (int(row_class[world, row]) >> (13 * side)) & 0x1FFF
+                    cls = (int(row_class[line, row]) >> (13 * side)) & 0x1FFF
                     coordinates = class_dof[cls, : class_count[cls]]
                 at = offset if placement.packed_dense else first
-                dof[world, row, at : at + coordinates.size] = offset + coordinates
+                dof[line, row, at : at + coordinates.size] = offset + coordinates
                 first += coordinates.size
     return dof
 
@@ -1265,9 +1274,10 @@ def unpacked_rows(solver) -> tuple[np.ndarray, np.ndarray]:
     """The matrix-free sweeps' dense rows over their worlds' coordinates, from the packed rows (:mod:`.packed_rows`),
     float64 ``[world, row, coordinate]``: the Jacobian ``J`` (``inverse^-1 z`` on each side, the side's entries found by
     their coordinates) and the response ``H^-1 J^T`` (``inverse^T z``), through each side's walk (:func:`walk_inverse`)."""
-    dof = packed_coordinates(solver)
-    Z = solver.placement.packed_Z.numpy().astype(np.float64)
-    sides, sizes = solver.placement.row_sides.numpy(), solver.forest.articulation_response_dof_count.numpy()
+    dof = world_rows(solver.placement, packed_coordinates(solver))
+    Z = world_rows(solver.placement, solver.placement.packed_Z.numpy()).astype(np.float64)
+    sides = world_rows(solver.placement, solver.placement.row_sides.numpy())
+    sizes = solver.forest.articulation_response_dof_count.numpy()
     offsets = solver.forest.articulation_world_dof_offset.numpy()
     walks = {}
     shape = (*dof.shape[:2], solver.forest.max_world_dofs)
@@ -1296,10 +1306,11 @@ def incident_gaps(solver) -> tuple[np.ndarray, np.ndarray]:
     each row's ``|row_incident - Z^T u_hat|`` with ``u_hat`` the walk's enter of ``v_hat`` on each side
     (:func:`_walked_coordinates`), and the magnitude of the
     sum's terms it rounds against (:mod:`.solve_policy`), float64 ``[world, row]``, zero past a world's rows."""
-    dof = packed_coordinates(solver)
-    Z = solver.placement.packed_Z.numpy().astype(np.float64)
-    incident = solver.placement.row_incident.numpy().astype(np.float64)
-    sides, sizes = solver.placement.row_sides.numpy(), solver.forest.articulation_response_dof_count.numpy()
+    dof = world_rows(solver.placement, packed_coordinates(solver))
+    Z = world_rows(solver.placement, solver.placement.packed_Z.numpy()).astype(np.float64)
+    incident = world_rows(solver.placement, solver.placement.row_incident.numpy()).astype(np.float64)
+    sides = world_rows(solver.placement, solver.placement.row_sides.numpy())
+    sizes = solver.forest.articulation_response_dof_count.numpy()
     offsets = solver.forest.articulation_world_dof_offset.numpy()
     gaps, terms = np.zeros(dof.shape[:2]), np.zeros(dof.shape[:2])
     walked = _walked_coordinates(solver)

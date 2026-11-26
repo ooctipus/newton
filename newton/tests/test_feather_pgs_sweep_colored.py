@@ -303,7 +303,8 @@ class TestColoredSweep(unittest.TestCase):
         placement = solver.placement
         free_first = placement.body_base.numpy() * placement.dense_record_words
         free = record_views(placement.row_record.numpy(), free_first)[1]
-        metas = np.stack([line[: placement.mf_max_constraints] for line in free])
+        # A world's records are its line's (a run's first line where its rows run in the arena).
+        metas = np.stack([free[line][: placement.mf_max_constraints] for line in placement.dense_first.numpy()])
         return solver, host, metas
 
     def test_units_follow_the_host_rules(self):

@@ -585,6 +585,8 @@ class SolverFeatherPGS(SolverBase):
         # factor's, the sweep's and, where the class walks its rows, the one writer's.
         writers = RowLaws.writer_launches(self) if route.producer == "walk" else ()
         execution.compile_ahead((*self.factor.launch_variants(), *self.sweep.launch_variants(), *writers), model.device)
+        # The row store's fields are laid out: the table a run's move copies is built here, outside any capture.
+        self.placement.hold_runs()
         # The options as construction applied them: the row laws' friction beta, the closure's pre-elimination, and a
         # readout only where a sweep kernel carries its counters. Recorded once; get_path_selection() returns copies.
         readout = options.diagnostics.solve_readout if self.sweep.readout.kernels else "off"

@@ -25,7 +25,7 @@ from __future__ import annotations
 import numpy as np
 import warp as wp
 
-from ...core.contact_pool import ContactField, model_contact_pool
+from ...core.contact_pool import INDEX_LIMIT, ContactField, model_contact_pool
 from ...sim import Contacts
 from ...sim.contacts import CAPACITY_BLOCKS_PER_SM, contact_capacity_blocks
 from ...sim.enums import JointType
@@ -37,13 +37,17 @@ from .forest_plan import RowLaw
 from .friction_patches import frame_kept
 from .route_table import first_failed
 from .row_laws import LINK_ROWS
-from .row_metadata import record_layout, record_words, split_records
+from .row_metadata import RECORD_WORDS, SPLIT_WORDS, record_layout, record_words, split_records
 from .row_records import DENSE_ROWS, ROW_RECORDS, RowSupport
 from .row_slots import ROW_SLOT_UNBOUNDED, RowGroups, RowOrder, row_groups
 from .warm_start import ContactCarry, prepare_world_impulses, row_lanes
 
 # FeatherPGS takes no gradients: its kernels compile no adjoints.
 wp.set_module_options({"enable_backward": False})
+
+LINE_QUANTUM = 96
+"""The row store's lines come in whole quanta of 96 rows (:meth:`Placement.lay_out_live_lines`): an L1 line of floats
+(32 rows), three times, so a world's run of lines keeps its friction records (a slot per three rows) contiguous."""
 
 
 SIZE_JACOBIAN = FieldGroup(Field("J", wp.float32, ("response_art", "response_row", "response_size")))
@@ -586,7 +590,9 @@ class Placement:
         # The row store's line: the dense class's rows, then (with free rigid bodies) the free bodies' from the line's
         # body base (lay_out_lines), at most the capacities' line.
         self.row_pitch = spec.capacities.row_pitch
+        self.topology_bound = 0
         self.lay_out_lines(self.row_pitch, 0)
+        self.lay_out_live_lines(model)
         # All inactive weight arguments alias this one element. Their producer kernels skip stores and their consumer
         # kernels skip reads when regularization is disabled.
         self.contact_row_w_dummy = self.arrays.placeholder(wp.float32, (1, 1), 1.0)
@@ -681,6 +687,8 @@ class Placement:
         # collision pipelines share: they are sized with the pipeline's measured demand before a graph
         # is captured, and grow with any other contact stream the solver consumes (see follow_contacts).
         self.contact_pool = model_contact_pool(self.forest.cut.source, device)
+        # The arena follows the pool's ready rows: its service maps them after the pool grows (serve_lines).
+        self.contact_pool.serve(self.serve_lines)
         contact_fields = [
             ContactField(name, wp.int32)
             for name in (
@@ -825,6 +833,9 @@ class Placement:
                 f"FeatherPGS received {rows} contact rows during CUDA graph capture, but its per-contact scratch "
                 f"holds {pool.ready}: step once outside capture first."
             ) from error
+        if not wp.get_device(pool.device).is_capturing:
+            # The arena covers the rows the pool's ready contacts can take (serve_lines).
+            self.serve_lines()
         if source is not None and not wp.get_device(pool.device).is_capturing:
             drops = source.drops()
             if drops.passes:
@@ -902,6 +913,18 @@ class Placement:
         sparse factors' (case K1)."""
         return bool(self.classes.mf_sweeps or self.classes.packed is not None)
 
+    def packed_width(self) -> tuple[int, int]:
+        """The packed rows' entries a row and their layout (:attr:`packs_rows`): the widest pair of articulations'
+        coordinates (:func:`.packed_rows.support_width`), at the world's coordinates where two articulations hold every
+        one of the widest world's; every coordinate of the world where the factor eliminates (a corrected row reaches
+        every tree of its block)."""
+        forest = self.forest
+        sizes, worlds = forest.articulation_response_dof_count.numpy(), forest.art_to_world.numpy()
+        support = packed_rows.support_width(sizes, worlds, forest.world_count)
+        if self.factor.eliminates:
+            return forest.max_world_dofs, packed_rows.WIDE
+        return support, int(support == forest.max_world_dofs)
+
     def allocate_packed_rows(self) -> None:
         """The packed rows (:mod:`.packed_rows`, :attr:`packs_rows`): every row of the world's line, by side or by
         support class; a placeholder without them."""
@@ -915,12 +938,7 @@ class Placement:
             same_world = worlds[responding][1:] == worlds[responding][:-1]
             if np.any(same_world & (offsets[responding][1:] < offsets[responding][:-1])):
                 raise RuntimeError("Packed rows need each world's coordinates in articulation order")
-            self.packed_support = packed_rows.support_width(sizes, worlds, self.forest.world_count)
-            # Two articulations hold every coordinate of the widest world: the rows are laid out at their coordinates.
-            self.packed_dense = int(self.packed_support == self.forest.max_world_dofs)
-            if self.factor.eliminates:
-                # A corrected row reaches every tree of its block.
-                self.packed_support, self.packed_dense = self.forest.max_world_dofs, packed_rows.WIDE
+            self.packed_support, self.packed_dense = self.packed_width()
             if self.classes.tier_rows and not self.packed_dense:
                 raise RuntimeError("The parallel tiers read their worlds' packed rows at their coordinates")
             self.place_row_classes()
@@ -1325,7 +1343,53 @@ class Placement:
     # Step: the whitening and the diagonals
     # ---------------------------------------------------------------------------------------------------------------
 
-    def lay_out_lines(self, rows: int, arena: int) -> None:
+    def lay_out_live_lines(self, model) -> None:
+        """Lay out the row store to follow the live rows (:meth:`lay_out_lines`): a home line a world as long as its
+        topology rows can be (the model's exact bound, in whole :data:`LINE_QUANTUM` lines), every other row in runs of
+        an arena that covers the rows the contact pool's ready contacts can take (:meth:`arena_cover`), reserved in CUDA
+        virtual memory for the most the capacities can ask (:meth:`arena_limit`) and mapped as the pool grows
+        (:meth:`serve_lines`). Where the capacities' line is no longer, the store keeps it."""
+        topology = self.internal_rows_per_world(model, at_once=True)
+        rows = min(self.row_pitch, -(-max(topology, 1) // LINE_QUANTUM) * LINE_QUANTUM)
+        if rows >= self.row_pitch or not self.forest.world_count:
+            return
+        self.topology_bound = topology
+        pool = model_contact_pool(self.forest.cut.source, model.device)
+        limit = self.arena_limit(rows)
+        self.lay_out_lines(rows, min(self.arena_cover(pool.ready, rows), limit), limit)
+
+    def arena_cover(self, ready: int, rows: int) -> int:
+        """The arena's lines that hold every run a step can claim with ``ready`` contact rows ready and lines of
+        ``rows`` rows: a world's run is its dense rows (its topology rows and its contacts') then its free rows, at
+        most four rows a contact, and a run ends in a partial line, one a world."""
+        worlds = self.forest.world_count
+        return worlds + -(-(worlds * self.topology_bound + 4 * int(ready)) // rows)
+
+    def arena_limit(self, rows: int) -> int:
+        """The arena's lines the store reserves with lines of ``rows`` rows: a run of the capacities' line for every
+        world (the most every world can ask at once), and no more than a field's int32 indices reach at the widest
+        row's entries (a record's words, the packed rows' entries, :meth:`packed_width`)."""
+        worlds, line = self.forest.world_count, self.row_pitch
+        entries = max(int(self.packed_width()[0]) if self.packs_rows else 1, RECORD_WORDS + SPLIT_WORDS)
+        indexed = (INDEX_LIMIT // entries - line) // rows + 1 - worlds
+        return max(min(worlds * -(-line // rows), indexed), 0)
+
+    def serve_lines(self) -> bool:
+        """Map the arena's lines that cover the rows the contact pool's ready contacts can take (:meth:`arena_cover`)
+        and publish them to the reservation's claims (``arena_bound``) in stream order: outside capture, as the pool's
+        service after its growth (:meth:`.ContactPool.serve`) and where the solver follows a contact stream
+        (:meth:`follow_contacts`), so a replay never finds the arena short of the contacts the pool holds. The
+        store's addresses stay, so no graph is recaptured."""
+        if self.arena_reserve <= self.arena_lines:
+            return False
+        target = min(self.arena_cover(self.contact_pool.ready, self.line_rows), self.arena_reserve)
+        if target > self.arena_lines:
+            self.arrays.map_lines(self.home_lines + target)
+            self.arena_lines = target
+            self.arena_bound.fill_(target)
+        return False
+
+    def lay_out_lines(self, rows: int, arena: int, reserve: int | None = None) -> None:
         """Lay out the row store, before its fields are allocated: a home line a world (``home_first``, where the step's
         topology rows are written) and ``arena`` lines more, each ``rows`` rows long, the outer stride of the store's
         arrays (which the native bodies read from the arrays themselves, :func:`.row_records.line_size`). A line
@@ -1335,7 +1399,11 @@ class Placement:
         a line's own (``body_base``, the dense rows' end, set by the reservation)."""
         model, worlds = self.model, self.forest.world_count
         self.line_rows, self.home_lines, self.arena_lines = int(rows), worlds, int(arena)
-        self.lines = worlds + self.arena_lines
+        # The arena's lines reserved (``reserve``, the views' lines) past the ones mapped (``arena``): addresses only,
+        # mapped as the store grows (serve_lines).
+        self.arena_reserve = self.arena_lines if reserve is None else max(int(reserve), self.arena_lines)
+        self.lines = worlds + self.arena_reserve
+        self.arrays.mapped_lines = None if self.arena_reserve == self.arena_lines else worlds + self.arena_lines
         self.line_geometry = wp.vec2i(self.line_rows, self.home_lines)
         # The arena's lines mapped, on the device (the reservation's claims' bound), and its record in pinned memory the
         # device writes and the host reads without synchronizing: the high water of the lines the claims reached and
@@ -1347,7 +1415,7 @@ class Placement:
             self.arena_record = wp.array(
                 ptr=self.arena_record_host.ptr, dtype=wp.int32, shape=(2,), device=model.device
             )
-        self.arrays.line_strides.update(row=self.line_rows, contact=-(-self.line_rows // 3))
+        self.arrays.line_strides.update(row=self.line_rows, contact=self.line_rows)
         self.body_base = wp.full(max(self.lines, 1), self.dense_max_constraints, dtype=wp.int32, device=model.device)
         # Each world's run of the arena (-1 for its home line), kept while it holds its slots, and the arena's lines
         # taken this frame.
@@ -1368,37 +1436,47 @@ class Placement:
             device=self.model.device,
         )
 
-    def move_topology(self) -> None:
-        """Before the one writer walks the rows past the topology rows, copy each world whose rows run in the arena its
-        topology rows from its home line (:func:`_move_topology`): their families wrote them there before the
-        reservation, and the writer's topology part, which runs beside the contact pass, while the claims take the
-        worlds to their runs. Every field laid out by line moves, the dense rows' records where they stream (a free
-        row's header sits past the dense rows' records, from its line's body base): none without an arena."""
-        if not self.arena_lines or not self.forest.world_count:
+    def hold_runs(self) -> None:
+        """The table of the fields a run's move copies (:meth:`move_topology`), built once the store's fields are laid
+        out, outside capture: every field laid out by line, the dense rows' records where they stream (a free row's
+        header sits past the dense rows' records, from its line's body base), with their addresses, their items' bytes,
+        their lines' bytes and their rows a line. Built inside a capture, the table's upload would be a copy from host
+        memory the graph's replays read after it is gone. None without an arena's reserve."""
+        if not self.arena_reserve or not self.forest.world_count:
             return
         # The store's fields (a feature's one-line placeholder holds no world's rows, nor a field of no rows a world).
         fields = [array for array in self.arrays.line_fields if array.shape[0] == self.lines and array.shape[1] > 0]
         if self.dense_record_words and self.row_record.shape[0] == self.lines:
             fields.append(self.row_record)
-        if self._run_fields is None or self._run_fields[0] != len(fields):
-            device = self.model.device
-            self._run_fields = (
-                len(fields),
-                wp.array([int(a.ptr) for a in fields], dtype=wp.uint64, device=device),
-                wp.array([int(a.strides[1]) for a in fields], dtype=wp.int64, device=device),
-                wp.array([int(a.strides[0]) for a in fields], dtype=wp.int64, device=device),
-                # A field's rows a line: the store's line, at most the rows the field holds a world (a records line
-                # holds the store's line of rows in words).
-                wp.array(
-                    [
-                        min(int(self.line_rows), int(a.shape[1])) if a is not self.row_record else int(self.line_rows)
-                        for a in fields
-                    ],
-                    dtype=wp.int64,
-                    device=device,
-                ),
-            )
-        count, pointers, item_bytes, line_bytes, line_rows = self._run_fields
+        device = self.model.device
+        self._run_fields = (
+            len(self.arrays.line_fields),
+            len(fields),
+            wp.array([int(a.ptr) for a in fields], dtype=wp.uint64, device=device),
+            wp.array([int(a.strides[1]) for a in fields], dtype=wp.int64, device=device),
+            wp.array([int(a.strides[0]) for a in fields], dtype=wp.int64, device=device),
+            # A field's rows a line: the store's line, at most the rows the field holds a world (a records line holds
+            # the store's line of rows in words).
+            wp.array(
+                [
+                    min(int(self.line_rows), int(a.shape[1])) if a is not self.row_record else int(self.line_rows)
+                    for a in fields
+                ],
+                dtype=wp.int64,
+                device=device,
+            ),
+        )
+
+    def move_topology(self) -> None:
+        """Before the one writer walks the rows past the topology rows, copy each world whose rows run in the arena its
+        topology rows from its home line (:func:`_move_topology`), in every field of :meth:`hold_runs`' table: their
+        families wrote them there before the reservation, and the writer's topology part, which runs beside the contact
+        pass, while the claims take the worlds to their runs. None without an arena."""
+        if not self.arena_lines or not self.forest.world_count:
+            return
+        if self._run_fields is None or self._run_fields[0] != len(self.arrays.line_fields):
+            raise RuntimeError("FeatherPGS: the row store's fields changed after their runs' table was built")
+        _, count, pointers, item_bytes, line_bytes, line_rows = self._run_fields
         wp.launch(
             _move_topology,
             dim=(self.forest.world_count, count, MOVE_LANES),
