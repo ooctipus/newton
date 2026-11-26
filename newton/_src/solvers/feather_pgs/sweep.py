@@ -422,13 +422,13 @@ class WorldRows:
         """``statement`` for row ``row`` where its impulse is staged (a world whose live rows fit the slots)."""
         return f"if ({STAGED_RUN}) {statement}" if self.spilled else statement
 
-    def admission(self) -> str:
+    def admission(self, live: str = "m_dense") -> str:
         """With a wide head, the world's return from a launch that is not its own: the wide launch's world is one whose
         live rows (``m_mf``) pass the stage's head and fit the wide one; every other world is the first launch's. A
-        dense head's launch takes the worlds whose live dense rows (``m_dense``) pass its floor and fit its head."""
+        dense head's launch takes the worlds whose live dense rows (``live``) pass its floor and fit its head."""
         if not self.free:
-            bounds = ([f"m_dense <= {self.floor}"] if self.floor else []) + (
-                [f"m_dense > {self.head}"] if self.head else []
+            bounds = ([f"{live} <= {self.floor}"] if self.floor else []) + (
+                [f"{live} > {self.head}"] if self.head else []
             )
             return f"    if ({' || '.join(bounds)}) return;\n" if bounds else ""
         if not self.wide:

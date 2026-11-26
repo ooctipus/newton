@@ -572,6 +572,56 @@ class TestDenseHeads(unittest.TestCase):
                     np.testing.assert_array_equal(q, q_h)
                     np.testing.assert_array_equal(qd, qd_h)
 
+    def test_a_diagonal_world_steps_alike_in_every_dense_head(self):
+        """The sparse diagonal's stage follows the live rows too: with its launches at dense heads (forced on any
+        device), a world swept by the launch whose head holds its live rows (the first head's, the second's, or past
+        both the capacity's own launch) steps bit for bit as at the capacity alone, and each launch stages its head."""
+        devices = ["cpu"] + (["cuda:0"] if wp.is_cuda_available() else [])
+        for device in devices:
+            q, qd, rows, solver = _keyboard_run(device, 64, heads=None)
+            self.assertIsNotNone(solver.sweep.diagonal_sweep, "the keyboard takes the sparse diagonal")
+            self.assertTrue(2 < rows < 64, f"the keyboard's live rows: {rows}")
+            for heads in ((rows, rows + 1), (rows - 1, rows), (1, 2)):
+                with self.subTest(device=device, heads=heads):
+                    q_h, qd_h, _rows, solver = _keyboard_run(device, 64, heads=heads)
+                    names = [launch.kernel.key for launch in solver.sweep.launches]
+                    for first, wide in ((0, heads[0]), (heads[0], heads[1]), (heads[1], "all")):
+                        self.assertTrue(any(f"_d{first}to{wide}" in name for name in names), (first, wide, names))
+                    np.testing.assert_array_equal(q, q_h)
+                    np.testing.assert_array_equal(qd, qd_h)
+
+
+def _keyboard_run(device, capacity: int, heads=None, steps: int = 30):
+    """Step two worlds of the keyboard (scenes.keyboard: a fixed frame of keys and an arm pressing key 0: the sparse
+    diagonal's rows) at ``capacity`` dense rows; with ``heads`` (first, second), the sparse diagonal's launches are
+    dense heads at those rows and the capacity's (:meth:`.sweep_plan.Sweep.dense_head`, forced on any device).
+    Returns the joint coordinates and velocities, the most live rows a world held and the solver."""
+    from newton._src.solvers.feather_pgs import sweep_plan, sweep_routes_diag  # noqa: PLC0415
+    from newton.tests import feather_pgs_scenes as scenes  # noqa: PLC0415
+
+    def forced(plan, full, items):
+        if not isinstance(full, sweep_routes_diag.DiagonalSweep):
+            return (full,)
+        first, wide = heads
+        head = sweep_plan.Sweep.dense_head
+        return head(full, first), head(full, wide, first), head(full, 0, wide)
+
+    scene = scenes.keyboard(worlds=2)
+    model = scene.build(device)
+    pipeline = newton.CollisionPipeline(model, rigid_contact_max=scene.rigid_contact_max)
+    contacts = pipeline.contacts()
+    patch = mock.patch.object(sweep_plan.Sweep, "_dense_heads", forced) if heads else contextlib.nullcontext()
+    with patch:
+        solver = SolverFeatherPGS(model, **{**scene.solver_options, "dense_max_constraints": capacity})
+    state, out, control = model.state(), model.state(), model.control()
+    rows = 0
+    for _ in range(steps):
+        pipeline.collide(state, contacts)
+        solver.step(state, out, control, contacts, scene.dt)
+        state, out = out, state
+        rows = max(rows, int(solver.placement.constraint_count.numpy().max()))
+    return state.joint_q.numpy(), state.joint_qd.numpy(), rows, solver
+
 
 if __name__ == "__main__":
     unittest.main()

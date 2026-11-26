@@ -2630,6 +2630,19 @@ class GeneralSweep(SweepConfig):
         """The stage bytes its launch bound is shaped at: its mapping's (:attr:`line_stage`), else its own."""
         return self.line_stage or staging.bytes
 
+    @property
+    def dense_staged(self) -> bool:
+        """Whether the stage holds dense operands, which a head shortens (:meth:`.sweep_plan.Sweep._dense_heads`): the
+        dense rows' metadata or impulses at their places."""
+        return Place.SHARED in (self.places.metadata, self.places.dense_impulses)
+
+    def with_head(self, rows: int, floor: int = 0) -> GeneralSweep:
+        """This mapping at the capacity, its stage given, with a stage of ``rows`` dense rows (``0``: the capacity's)
+        for the worlds whose live dense rows pass ``floor`` (:meth:`.sweep_plan.Sweep.dense_head`): every operand at
+        the capacity's place, a head at the capacity's launch bound."""
+        places = dataclasses.replace(self.places, dense_rows=int(rows), dense_floor=int(floor))
+        return dataclasses.replace(self, places=places, line_stage=self.staging().bytes if rows else 0)
+
     def staging(self) -> Staging:
         """The block's working set at its places (:func:`mf_gs_staging`): each staged operand with its alternative."""
         return mf_gs_staging(

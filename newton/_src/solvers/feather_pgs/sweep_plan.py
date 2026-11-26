@@ -351,23 +351,29 @@ class Sweep:
             if sparse_contact_schedule
             else None
         )
-        self.diagonal_sweep = (
-            sweep_routes_diag.DiagonalSweep(
-                self.placement.dense_max_constraints,
-                self.forest.max_world_dofs,
-                diagonal.dense_size,
-                device_arch,
-                speculative_contact_batches=diagonal.speculative_batches,
-                levels=LevelLaw(EXACT) if diagonal.units else LevelLaw(),
-                seeded=self.seeded,
-                **self.law_fields,
+        self.diagonal_sweep = self.sparse_diagonal_kernel = None
+        # The sparse diagonal's launches: each dense head's (the worlds whose live rows it holds), then its own at the
+        # capacity (the worlds past every head; _dense_heads), one sweep: each head's kernel counts its solves into the
+        # capacity's readout.
+        self.diagonal_heads = ()
+        if diagonal is not None:
+            *heads, self.diagonal_sweep = self._dense_heads(
+                sweep_routes_diag.DiagonalSweep(
+                    self.placement.dense_max_constraints,
+                    self.forest.max_world_dofs,
+                    diagonal.dense_size,
+                    device_arch,
+                    speculative_contact_batches=diagonal.speculative_batches,
+                    levels=LevelLaw(EXACT) if diagonal.units else LevelLaw(),
+                    seeded=self.seeded,
+                    **self.law_fields,
+                ),
+                int(self.forest.world_count),
             )
-            if diagonal is not None
-            else None
-        )
-        self.sparse_diagonal_kernel = (
-            self.sweep("sparse_diagonal", self.diagonal_sweep) if self.diagonal_sweep is not None else None
-        )
+            self.sparse_diagonal_kernel = self.sweep("sparse_diagonal", self.diagonal_sweep)
+            self.diagonal_heads = tuple(
+                (head, self.sweep("sparse_diagonal", head, shares=self.sparse_diagonal_kernel)) for head in heads
+            )
         row_by_row = self.sparse_diagonal_kernel is not None
         mapped = (self.laws.spin_rows or self.placement.free_contact_rows) and (self.classes.mf_sweeps or row_by_row)
         if mapped or (self.sparse_sweep is not None and self.sparse_sweep.records):
@@ -486,7 +492,7 @@ class Sweep:
                 if pair.staging().fits(budget):
                     block_warps = pair.block_warps
             declared = general(lanes_per_world=lanes, block_warps=block_warps)
-            *general_heads, self.general_sweep = self._dense_heads(declared, worlds)
+            *general_heads, self.general_sweep = self._dense_heads(self._staged(declared, worlds), worlds)
             # The colored mapping takes the worlds the unit builder's rule picks at every pack
             # (sweep_units.COLORED_RULE), among those whose free bodies and row capacity admit it: built, with a
             # storage slot each, for those worlds only, it runs beside the one-warp mapping. More of them than the
@@ -527,7 +533,7 @@ class Sweep:
                 # The region visit holds more values than the register line of two warps a block keeps in registers
                 # (sweep_routes.WARP_LINE): a sweep that visits regions takes one warp a block and no line.
                 *general_heads, self.general_sweep = self._dense_heads(
-                    dataclasses.replace(declared, regions=True, block_warps=1), worlds
+                    self._staged(dataclasses.replace(declared, regions=True, block_warps=1), worlds), worlds
                 )
             # The colored mapping's block takes its worlds' regions where their contacts are regions (a world that
             # forms pair blocks keeps the warp, whose lanes team on them, region_sweep.PAIR_SIDE).
@@ -772,9 +778,11 @@ class Sweep:
             self.launches = (*self.tiers, *mapped)
             self.claim_groups = (*((tier,) for tier in self.tiers[:1]), mapped, *((tier,) for tier in self.tiers[1:]))
         else:
-            # A class whose one sweep owns every world (K1, K2): one launch over the worlds, in line.
+            # A class whose one sweep owns every world (K1, K2): its launches over the worlds, in line (K2's at its
+            # dense heads, then at the capacity).
             single = (
                 (self.sparse_sweep, self.sparse_kernel, self._sparse_operands),
+                *((config, kernel, self._diagonal_operands) for config, kernel in self.diagonal_heads),
                 (self.diagonal_sweep, self.sparse_diagonal_kernel, self._diagonal_operands),
             )
             self.launches = tuple(
@@ -1047,28 +1055,29 @@ class Sweep:
         self.block_records[form] = (records, sweep_kernel(records), ranks)
         return dataclasses.replace(config, formed="ahead")
 
-    def _dense_heads(self, config: SweepConfig, items: int) -> tuple[SweepConfig, ...]:
-        """The warp mapping ``config``'s launches at the places its stage gives (:meth:`_staged`), by the dense rows'
-        head: where the capacity's stage holds dense operands (staged metadata at the head's word stride, impulses, the active
-        enumeration's bitsets and the levels' marks), a head holds them for the worlds whose live dense rows fit it,
-        so their stage follows their live rows, not the capacity (D1: a capacity costs only memory).
+    def _dense_heads(self, full: SweepConfig, items: int) -> tuple[SweepConfig, ...]:
+        """The launches of a sweep that stages a world's dense rows (the warp mapping ``full`` at the places its stage
+        gives, :meth:`_staged`, or the sparse diagonal's), by the dense rows' head: where the capacity's stage holds
+        dense operands (staged metadata at the head's word stride, impulses, the active enumeration's bitsets and the
+        levels' marks), a head holds them for the worlds whose live dense rows fit it, so their stage follows their
+        live rows, not the capacity (D1: a capacity costs only memory).
 
         A head's launch is the capacity's but for the length of its dense operands: every operand at the capacity's
         place (the form, which decides how a row is read: streamed records carry the idle keys the live order passes
         rows by) and the capacity's launch bound (its register line, :attr:`.sweep_routes.GeneralSweep.line_stage`),
-        so the same arithmetic. The head is the longest of whole lines that keeps the resident blocks of one line of
-        rows and the static stage (:data:`.memory.STATIC_SHARED_BYTES`, so the L1 stays); the worlds past it are the
-        capacity's launch's, and a capacity the head would hold keeps the one launch, as do worlds the capacity's stage
-        already keeps resident at once (a head buys resident worlds, nothing else: past them it only adds a launch). The
-        CPU's one thread holds the whole stage: one launch.
+        so the same arithmetic. The heads climb from one line of rows: each is the longest of whole lines that keeps
+        the static stage (:data:`.memory.STATIC_SHARED_BYTES`, so the L1 stays) and its resident blocks, the first
+        one line's, each later half the one's before it, so a world runs at no less than half the resident blocks its
+        live rows allow (keyboard-so101's live rows reach 649 of 1,024: one head of 128 rows left a third of its worlds
+        at the capacity's stage); the heads stop where the capacity's own stage keeps as many, and the worlds past
+        every head are the capacity's launch's. A capacity the first head would hold keeps the one launch, as do worlds
+        the capacity's stage already keeps resident at once (a head buys resident worlds, nothing else: past them it
+        only adds a launch). The CPU's one thread holds the whole stage: one launch.
 
         Returns the launches in order, the capacity's last."""
-        full = self._staged(config, items)
         line = L1_LINE_BYTES // 4
-        capacity = int(config.max_constraints)
-        held = full.places
-        staged = held.metadata is Place.SHARED or held.dense_impulses is Place.SHARED
-        if not self.model.device.is_cuda or capacity <= line or not staged:
+        capacity = int(full.max_constraints)
+        if not self.model.device.is_cuda or capacity <= line or not full.dense_staged:
             return (full,)
         found = device(self.model.device)
 
@@ -1076,33 +1085,44 @@ class Sweep:
             return shape(self._launch_work(self.dense_head(full, rows), items), found)
 
         tight = layout(line)
-        resident, ceiling = tight.blocks_per_sm, max(STATIC_SHARED_BYTES, tight.staging.bytes)
+        ceiling = max(STATIC_SHARED_BYTES, tight.staging.bytes)
 
-        def keeps(rows: int) -> bool:
+        def keeps(rows: int, resident: int) -> bool:
             held_rows = layout(rows)
             return held_rows.blocks_per_sm >= resident and held_rows.staging.bytes <= ceiling
 
         # A head buys resident worlds: where the capacity's stage already keeps every world resident at once, the head's
         # launch would only add a launch (the bridge's one world: an empty second launch a sweep).
         whole = shape(self._launch_work(full, items), found)
-        if keeps(capacity) or -(-items // whole.groups) <= whole.blocks_per_sm * found.sms:
+        if keeps(capacity, tight.blocks_per_sm) or -(-items // whole.groups) <= whole.blocks_per_sm * found.sms:
             return (full,)
-        low, high = 1, capacity // line
-        while low < high:
-            middle = (low + high + 1) // 2
-            if keeps(middle * line):
-                low = middle
-            else:
-                high = middle - 1
-        return self.dense_head(full, low * line), self.dense_head(full, 0, low * line)
+        heads, lines, resident = [], 1, tight.blocks_per_sm
+        while resident > whole.blocks_per_sm and keeps(lines * line, resident):
+            high = capacity // line
+            while lines < high:
+                middle = (lines + high + 1) // 2
+                if keeps(middle * line, resident):
+                    lines = middle
+                else:
+                    high = middle - 1
+            if lines * line >= capacity:
+                break
+            heads.append(lines * line)
+            resident, lines = layout(lines * line).blocks_per_sm // 2, lines + 1
+        if not heads:
+            return (full,)
+        floors = (0, *heads)
+        return (
+            *(self.dense_head(full, rows, floor) for rows, floor in zip(heads, floors, strict=False)),
+            self.dense_head(full, 0, heads[-1]),
+        )
 
     @staticmethod
     def dense_head(full: SweepConfig, rows: int, floor: int = 0) -> SweepConfig:
-        """The launch of ``full`` (a mapping at the capacity, its stage given) whose stage holds ``rows`` dense rows
-        (0: the capacity's) for the worlds whose live dense rows pass ``floor`` (:meth:`_dense_heads`): every operand
-        at the capacity's place, a head at the capacity's launch bound."""
-        places = dataclasses.replace(full.places, dense_rows=rows, dense_floor=floor)
-        return dataclasses.replace(full, places=places, line_stage=full.staging().bytes if rows else 0)
+        """The launch of ``full`` (a sweep at the capacity, its stage given) whose stage holds ``rows`` dense rows (0:
+        the capacity's) for the worlds whose live dense rows pass ``floor`` (:meth:`_dense_heads`): the same arithmetic
+        on a shorter stage."""
+        return full.with_head(rows, floor)
 
     def _head_kernels(self, head: SweepConfig) -> tuple:
         """A dense head's launch of the warp mapping (:meth:`_dense_heads`): its configuration and kernel, which counts its

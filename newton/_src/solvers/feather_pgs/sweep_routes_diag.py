@@ -334,8 +334,8 @@ def sparse_diagonal_source(sweep: DiagonalSweep) -> tuple[str, Staging]:
     warp = Lanes(L)
     laws = sweep.laws
     # Every lane (or a scalar contact's one thread) stores what it computed and reads its own stores.
-    rows = WorldRows(M, lanes=warp, every_lane=True)
-    staging = Staging((Buffer("s_v", "float", D), *rows.buffers()), threads=L)
+    rows = sweep.rows()
+    staging = sweep.staging()
     # A friction triple reads its metric cached for the launch (sweep.friction_metric_law).
     cached = "ROW_TRIPLE" if torsion else None
 
@@ -582,7 +582,7 @@ const unsigned noop_lanes = BALLOT(candidate_noop);"""
     const int lane = LANE;
     int row_count = world_constraint_count.data[world];
     if (row_count > {M}) row_count = {M};
-    const int off_dense = row_base;
+{rows.admission("row_count")}    const int off_dense = row_base;
     const int dof_map_base = world * {D};
     const int dense_offset = dense_offsets.data[world];
     const int dense_group = dense_groups.data[world];
@@ -646,6 +646,13 @@ class DiagonalSweep(SweepConfig):
     _: dataclasses.KW_ONLY
     speculative_contact_batches: bool = False
     seeded: bool = False
+    dense_rows: int = 0
+    """The rows this launch's stage holds, a head of the capacity (their impulses and staged metadata): the launch
+    sweeps the worlds whose live rows pass ``dense_floor`` and fit it (:meth:`.sweep_plan.Sweep._dense_heads`). ``0``:
+    the capacity, every world past ``dense_floor``."""
+    dense_floor: int = 0
+    """The rows of the worlds an earlier launch's head holds: this launch takes the worlds past them. ``0``: from the
+    first."""
 
     ABI: ClassVar[tuple] = SPARSE_DIAGONAL_ABI
     NATIVE: ClassVar[str] = "sweep_sparse_diagonal_native"
@@ -664,6 +671,34 @@ class DiagonalSweep(SweepConfig):
         return device_lanes(self.device_arch, 32)
 
     @property
+    def dense_staged(self) -> bool:
+        """Whether the stage holds the rows' operands, which a head shortens (:meth:`.sweep_plan.Sweep._dense_heads`):
+        always, their impulses and metadata."""
+        return True
+
+    def with_head(self, rows: int, floor: int = 0) -> DiagonalSweep:
+        """This launch with a stage of ``rows`` rows (``0``: the capacity's) for the worlds whose live rows pass
+        ``floor`` (:meth:`.sweep_plan.Sweep.dense_head`): the same arithmetic on a shorter stage."""
+        return dataclasses.replace(self, dense_rows=int(rows), dense_floor=int(floor))
+
+    def rows(self) -> WorldRows:
+        """The world's rows: every lane (or a scalar contact's one thread) stores what it computed and reads its own
+        stores; a head's stage holds its rows."""
+        return WorldRows(
+            int(self.max_constraints),
+            lanes=Lanes(self.lanes),
+            every_lane=True,
+            head=int(self.dense_rows),
+            floor=int(self.dense_floor),
+        )
+
+    def staging(self) -> Staging:
+        """The block's working set: the world's velocity change and its rows' stage, every buffer staged (the sweep
+        reads its rows at no other place)."""
+        rows = (dataclasses.replace(buffer, alternative=None, spill=False) for buffer in self.rows().buffers())
+        return Staging((Buffer("s_v", "float", int(self.max_world_dofs)), *rows), threads=self.lanes)
+
+    @property
     def name(self) -> str:
         return (
             f"sweep_sparse_diagonal_{int(self.max_constraints)}_{int(self.max_world_dofs)}_{int(self.dense_dofs)}"
@@ -673,6 +708,7 @@ class DiagonalSweep(SweepConfig):
             + ("_material" if self.material else "")
             + ("_torsion" if self.torsion else "")
             + ("_seeded" if self.seeded else "")
+            + (f"_d{self.dense_floor}to{self.dense_rows or 'all'}" if self.dense_rows or self.dense_floor else "")
             + ("" if self.lanes == 32 else f"_lanes{self.lanes}")
             + self.solve_policy.suffix
         )
@@ -689,6 +725,6 @@ class DiagonalSweep(SweepConfig):
             *self.law_operands(),
         )
 
-    def work(self, items: int = 0, shared: int = 0) -> Work:
+    def work(self, items: int = 0, shared: int | Staging = 0) -> Work:
         """A block a world, a warp (one thread a world on the CPU); no register line, so no launch bound."""
-        return Work(int(items), lanes=32, block=32, shared=int(shared))
+        return Work(int(items), lanes=32, block=32, shared=shared)
