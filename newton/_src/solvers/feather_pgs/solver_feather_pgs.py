@@ -948,10 +948,9 @@ class SolverFeatherPGS(SolverBase):
         sharing its contact rows, that the graph's last replay skipped: its
         device graph updater failed closed after the capture emitted it, or its
         count passed the captured bound. ``slip_frames`` identifies a step in which a
-        tree's saturated drives outnumbered its release's capacity (its first
-        ``factor.walk.RELEASE_SLIPS`` slipping, the rest keeping their ``K``), or
-        in which a drive saturated on a tree that held no limited drive when
-        the solver was built (its step keeps every ``K``).
+        tree's slip could not be built (a slip's path deeper than the release's
+        depth, or a tree the walk does not hold: its step keeps every ``K``);
+        every drive that can slip has its slot (``TreeFactor.slip_capacity``).
         Flags remain set across later successful
         steps and :meth:`reset` calls; ``contact_launches`` until a replay runs
         the launch again.

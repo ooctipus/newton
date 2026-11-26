@@ -677,30 +677,28 @@ class TestDriveSaturation(unittest.TestCase):
                         self.assertLess(worst, 1.0e-4)
                     self.assertGreater(int(solver.factor.walk_view().release.count.numpy().min()), 3)
 
-    def test_slips_past_a_trees_frame_flag_its_capacity(self):
-        """The border holds a tree's slips in its frame, as many as the tree has limited drives up to
-        ``factor.walk.RELEASE_SLIPS``: a chain of 40 drives all at their limits passes it and flags ``slip_frames``, two
-        hinges never do."""
-        for scene, flagged in ((_driven_chain, True), (_driven_forest, False)):
+    def test_every_drive_has_its_slip(self):
+        """The border holds a slot for every driven coordinate of a tree: a chain of 40 drives all at their limits
+        slips them all without flagging ``slip_frames``, as two hinges do."""
+        for scene in (_driven_chain, _driven_forest):
             with self.subTest(scene=scene.__name__):
                 model, control = scene("cpu")
                 targets = np.random.default_rng(1).uniform(-1.0, 1.0, model.joint_dof_count).astype(np.float32)
                 control.joint_target_q.assign(targets)
                 _, solver = _drive_roll(model, control, 4, dt=1.0 / 60.0)
-                self.assertEqual(solver.constraint_capacity_status()["slip_frames"], flagged)
+                self.assertFalse(solver.constraint_capacity_status()["slip_frames"])
 
-    def test_a_limit_set_after_construction_is_flagged(self):
-        """A tree with no limited drive when the solver is built has no room in the slips' frame (and, unless its class
-        walks, no walk): a limit written later saturates its drive, the step keeps that drive's ``K`` and
-        ``slip_frames`` says so, rather than reading past an array."""
+    def test_a_limit_set_after_construction_slips(self):
+        """A tree's drives have their slips whether or not a limit binds when the solver is built: a limit written
+        later saturates its drive, which slips (no ``slip_frames``) and stays finite."""
         model, control = _driven_hinges((0.02, 0.01), ke=1.0e3, kd=20.0, effort=float("inf"), target=[0.6, -0.8])
         solver = SolverFeatherPGS(model, angular_damping=0.0, pgs_iterations=4)
-        self.assertEqual(solver.factor.slip_capacity([0]), 0)
+        self.assertEqual(solver.factor.slip_capacity([0]), 2)
         model.joint_effort_limit.assign(np.full(model.joint_dof_count, 0.5, dtype=np.float32))
         state, out = model.state(), model.state()
         solver.step(state, out, control, None, H)
         self.assertTrue(np.all(np.isfinite(out.joint_qd.numpy())))
-        self.assertTrue(solver.constraint_capacity_status()["slip_frames"])
+        self.assertFalse(solver.constraint_capacity_status()["slip_frames"])
 
     def test_a_saturation_change_refreshes_a_stale_factor(self):
         """Hold ``update_mass_matrix_interval=2`` to the every-step result where ``H`` is constant: only ``K`` moves."""
@@ -1044,11 +1042,18 @@ class TestDriveSaturationOnRoutes(unittest.TestCase):
                 np.testing.assert_allclose(history, reference, rtol=0.0, atol=1.0e-2)
 
     def test_a_long_chain_takes_the_decision(self):
-        """A tree of two warps: the block's barriers and, past the shared factor's size, its factor in place."""
-        reference, _ = self._roll("cpu", {}, scene=_driven_chain)
+        """A tree of two warps: the block's barriers and, past the shared factor's size, its factor in place. More
+        drives slip than one register slot of lanes holds (CUDA) or one word of slips (the CPU): on each evaluator
+        the border is the decided operator."""
+        reference, cpu = self._roll("cpu", {}, scene=_driven_chain)
         history, solver = self._roll("cuda:0", {}, scene=_driven_chain)
         self.assertEqual(solver.factor.held.groups[0].layout.lanes, 64)
         self.assertLess(float(_decided_K(solver).min()), 1.0e-6)
+        for evaluator in (cpu, solver):
+            self.assertGreater(int(evaluator.factor.walk_view().release.count.numpy().max()), 32)
+            worst, trees = _decided_operator(evaluator, evaluator.model.joint_q.numpy().astype(np.float64))
+            self.assertGreater(trees, 0)
+            self.assertLess(worst, 1.0e-4)
         np.testing.assert_allclose(history[:20], reference[:20], rtol=0.0, atol=2.0e-2)
 
     def test_the_border_is_the_decided_operator(self):

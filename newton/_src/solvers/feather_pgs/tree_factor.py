@@ -62,7 +62,6 @@ from .factor.kernels import (
     turn_moments,
 )
 from .factor.walk import (
-    RELEASE_SLIPS,
     WALK_COORDINATE,
     WALK_JOIN_SLOTS,
     WALK_LINK,
@@ -1088,7 +1087,7 @@ class TreeFactor:
         body_joint[: joint_of.size] = joint_of[: body_joint.size]
         view.body_joint = wp.array(body_joint, dtype=wp.int32, device=device)
         # The release of each tree's slips, which the predictor's border writes (tree_kinetic_state.border_solve): as
-        # many slips a tree as it has limited drives (at most RELEASE_SLIPS), each as deep as the deepest root path.
+        # many slips a tree as it has drives that can slip, each as deep as the deepest root path.
         self.walk_slip_capacity = self.slip_capacity(arts)
         depth = max(
             [1, *(sum(s.c >= 0 for s in walk.steps(False, c)) for walk in classes for c in range(walk.coordinates))]
@@ -1144,16 +1143,16 @@ class TreeFactor:
             yield from group.launch_variants()
 
     def slips_by_tree(self, articulations) -> np.ndarray:
-        """Each of ``articulations``' drives that can slip: its driven coordinates with a gain and a finite effort
-        limit (the model's data at construction)."""
+        """Each of ``articulations``' drives that can slip: its driven coordinates with a gain. Any of them saturates
+        once an effort limit binds, and limits may be set after construction, so the count does not read them."""
         model, forest = self.model, self.forest
         arts = np.asarray(articulations, dtype=np.int64)
         if not self.parallel_drives or not model.joint_dof_count:
             return np.zeros(arts.size, dtype=np.int64)
         ke, kd = model.joint_target_ke.numpy(), model.joint_target_kd.numpy()
-        damping, limit = self.passive_joint_damping.numpy(), model.joint_effort_limit.numpy()
+        damping = self.passive_joint_damping.numpy()
         driven = self.drive_row_by_dof.numpy() >= 0
-        limited = driven & ((ke > 0) | (kd > 0) | (damping > 0)) & (limit > 0) & np.isfinite(limit)
+        limited = driven & ((ke > 0) | (kd > 0) | (damping > 0))
         starts, counts = forest.articulation_dof_start_host, forest.articulation_dof_count_host
         # Each tree's count of limited coordinates, as running totals over its coordinate range (clipped as a slice).
         total = np.concatenate(([0], np.cumsum(limited, dtype=np.int64)))
@@ -1206,11 +1205,10 @@ class TreeFactor:
         return tuple(classes), walk_class
 
     def slip_capacity(self, articulations) -> int:
-        """The most drives of one of ``articulations`` that can slip (:meth:`slips_by_tree`), at most
-        :data:`.factor.walk.RELEASE_SLIPS`. A tree's border holds that many; 0 where none can slip, so a consumer compiles no
-        release."""
-        slips = self.slips_by_tree(articulations)
-        return min(int(slips.max(initial=0)), RELEASE_SLIPS)
+        """The most drives of one of ``articulations`` that can slip (:meth:`slips_by_tree`): every one of them may
+        saturate in one step, so a tree's border holds that many, sized by the data; 0 where none can slip, so a
+        consumer compiles no release."""
+        return int(self.slips_by_tree(articulations).max(initial=0))
 
     def walk_view(self) -> WalkTrees:
         """The walk's view (:class:`.factor.walk.WalkTrees`) the one writer, the leave and the audit read."""

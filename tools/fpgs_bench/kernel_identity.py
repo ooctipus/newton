@@ -344,7 +344,6 @@ def held_tree_calls():
     which the pins family records.
     """
     from newton._src.solvers.feather_pgs import tree_kinetic_state as native  # noqa: PLC0415
-    from newton._src.solvers.feather_pgs.factor.walk import RELEASE_SLIPS  # noqa: PLC0415
 
     state = _unwrapped(native.get_state_kernel)
     predictor = _unwrapped(native.get_predictor_kernel)
@@ -371,7 +370,7 @@ def held_tree_calls():
                     "response": response,
                     "twists": twists,
                     "classes": walk_classes(tree),
-                    "slips": RELEASE_SLIPS,
+                    "slips": 16,
                     "device_arch": ARCH,
                     **options,
                 }
@@ -476,7 +475,7 @@ def walk_calls():
         kwargs = {"layout": tree, "response": "sparse", "classes": named[name], "device_arch": ARCH}
         yield "tree_kinetic_state.get_force_kernel", force, (schedules,), kwargs
         twists = native.publishes_twists(tree.value, schedules.value, cuda=True)
-        kwargs = {**kwargs, "twists": twists, "slips": factor_walk.RELEASE_SLIPS}
+        kwargs = {**kwargs, "twists": twists, "slips": 16}
         yield "tree_kinetic_state.get_predictor_kernel", predictor, (schedules,), kwargs
         if name == "g1":
             yield "tree_kinetic_state.get_predictor_kernel", predictor, (schedules,), {**kwargs, "side": False}

@@ -15,7 +15,6 @@ import warp as wp
 
 import newton
 from newton._src.solvers.feather_pgs import tree_kinetic_state
-from newton._src.solvers.feather_pgs.factor.walk import RELEASE_SLIPS
 from newton._src.solvers.feather_pgs.held_tree import HeldTree
 from newton._src.solvers.feather_pgs.solver_feather_pgs import SolverFeatherPGS
 from newton._src.solvers.feather_pgs.tree_kinetic_layout import TreeLayout
@@ -54,7 +53,7 @@ def _kernels(clocked):
             clocked=clocked,
             twists=tree_kinetic_state.publishes_twists(_LAYOUT, schedules, cuda=True),
             classes=(WalkClass(tuple(int(p) for p in _TREE.parent), tuple(int(f) for f in _TREE.dof_start)),),
-            slips=RELEASE_SLIPS,
+            slips=16,
             device_arch=wp.get_device().arch,
         ),
     )

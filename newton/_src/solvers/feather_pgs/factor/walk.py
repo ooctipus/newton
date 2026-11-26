@@ -1518,10 +1518,6 @@ def walk_enter_kernel(classes: tuple[WalkClass, ...]) -> wp.Kernel:
     ).kernel()
 
 
-RELEASE_SLIPS = 16
-"""The most slipping drives a tree's release holds (:class:`WalkRelease`, three floats and a coordinate a slip and path
-step): a tree past it keeps the rest's ``K`` and ``constraint_capacity_status()["slip_frames"]`` flags it. It bounds the
-release's memory until a data-sized arena holds it (DECISIONS 10-24); nothing else reads it."""
 
 
 # ---------------------------------------------------------------------------------------------------------------------
