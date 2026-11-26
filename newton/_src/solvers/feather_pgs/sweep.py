@@ -2682,11 +2682,11 @@ def row_step(
 
 def patch_run(rows: WorldRows, op, laws: RowLaws, step: dict, *, end: str, pad: str) -> str:
     """A patch ring's normals in one visit of a pipelined run (:func:`_visit_pipeline`) whose rows take their patch
-    rings whole (:attr:`WorldRows.patch`): a contact normal whose ring opens at the next row (its parent word) loads
-    the records, impulses and ``Z`` entries of the rows after it up to the window's at once, steps itself, and where
-    the ring closes within the window (each normal's parent the next row's, the anchor's the visited row) and its
-    anchor's pair has a spin row (so no contact unit takes the anchor, :func:`unit_visit`) steps the ring's other
-    normals in turn, each by the normal's row step on its rows' registers (:func:`row_step`: the text, arithmetic and
+    rings whole (:attr:`WorldRows.patch`): a contact normal whose ring opens at the next row (its parent word) finds
+    the ring's anchor from the words the run loaded ahead (each normal's parent the next row's, the anchor's the
+    visited row), loads the records, impulses and ``Z`` entries of the ring's other normals at once, steps itself,
+    and where the ring closes within the window and its anchor's pair has a spin row (so no contact unit takes the
+    anchor, :func:`unit_visit`) steps the ring's other normals in turn, each by the normal's row step on its rows' registers (:func:`row_step`: the text, arithmetic and
     order of a visit a row), then pools the ring's load at its anchor in ring order (``ring_row``, ``ring_value``) for
     its pair's visit, which the run loads next (``UNIT_TAKEN``) with the anchor's record. Any other ring steps on a
     row a visit. Bit for bit the visits a row: what it removes is a load's wait a normal and the pair's walk of the
@@ -2719,34 +2719,8 @@ def patch_run(rows: WorldRows, op, laws: RowLaws, step: dict, *, end: str, pad: 
         body += ["for (int once = 0; once < 1; ++once) {", visit, "}"]
         return "{\n" + indent("\n".join(body), "    ") + "\n}"
 
-    # The next row's record the run loaded for it (the visited normal's next is its next row); the window's others.
-    lines = ["const int patch_head = i;"]
-    loaded = ", ".join(f"patch_{name[-1]}1 = pre_{name[-1]}" for name in rows.registers)
-    lines.append(f"const int4 {loaded};")
-    for r in range(2, window):
-        at = f"patch_head + {r}"
-        lines.append(f"int4 patch_a{r} = make_int4(0, 0, 0, -1), patch_b{r} = make_int4(0, 0, 0, 0);")
-        lines.append(f"if ({at} < ({end})) {{")
-        lines.append(rows.load_record((f"patch_a{r}", f"patch_b{r}"), at, "    "))
-        lines.append("}")
-    for r in range(1, window):
-        at = f"patch_head + {r}"
-        if r not in held_impulse:
-            lines.append(f"const float patch_impulse{r} = {at} < ({end}) ? {rows.peek(at)} : 0.0f;")
-        if r not in held_z:
-            guard = f" && entry < {op.width}" if op.lanes.parallel else ""
-            lines.append(f"float patch_z{r}[{op.entries}];")
-            load = f"patch_z{r}[q] = {at} < ({end}){guard} ? {op.factor(f'({at})', 'entry')} : 0.0f;"
-            lines.append(op.entries_loop(load, ""))
-    # The kind words of the rows an anchor's spin row can take that the run did not load ahead.
-    for r in range(1, window + 3):
-        if r not in words and r >= window:
-            lines.append(
-                f"const int patch_w{r} = patch_head + {r} < ({end}) ? {rows.word(f'patch_head + {r}', 3)} : -1;"
-            )
-    lines += [f"float {', '.join(f'patch_new{r} = 0.0f' for r in range(window))};"]
     # The ring's anchor: the first row of the window whose parent is the visited row, each before it the next's.
-    lines += ["int patch_anchor = 0;", "bool patch_open = true;"]
+    lines = ["const int patch_head = i;", "int patch_anchor = 0;", "bool patch_open = true;"]
     for r in range(1, window):
         w = word(r)
         member = f"patch_head + {r} < ({end}) && ({w} & 0xFFFF) == {contact}"
@@ -2760,6 +2734,34 @@ def patch_run(rows: WorldRows, op, laws: RowLaws, step: dict, *, end: str, pad: 
             "    }",
             "}",
         ]
+    # The ring's other normals' operands: the next row's record the run loaded for it (the visited normal's next is
+    # its next row), the others' loaded here, each where the ring holds it.
+    loaded = ", ".join(f"patch_{name[-1]}1 = pre_{name[-1]}" for name in rows.registers)
+    lines.append(f"const int4 {loaded};")
+    for r in range(2, window):
+        at = f"patch_head + {r}"
+        lines.append(f"int4 patch_a{r} = make_int4(0, 0, 0, -1), patch_b{r} = make_int4(0, 0, 0, 0);")
+        if r not in held_impulse:
+            lines.append(f"float patch_impulse{r} = 0.0f;")
+        if r not in held_z:
+            lines.append(f"float patch_z{r}[{op.entries}] = {{{', '.join('0.0f' for _ in range(op.entries))}}};")
+        lines.append(f"if ({r} <= patch_anchor) {{")
+        lines.append(rows.load_record((f"patch_a{r}", f"patch_b{r}"), at, "    "))
+        if r not in held_impulse:
+            lines.append(f"    patch_impulse{r} = {rows.peek(at)};")
+        if r not in held_z:
+            guard = f"entry < {op.width} ? " if op.lanes.parallel else ""
+            load = f"patch_z{r}[q] = {guard}{op.factor(f'({at})', 'entry')}{' : 0.0f' if guard else ''};"
+            lines.append(op.entries_loop(load, "    "))
+        lines.append("}")
+    # The kind words of the rows an anchor's spin row can take that the run did not load ahead.
+    for r in range(window, window + 3):
+        if r not in words:
+            lines.append(
+                f"const int patch_w{r} = patch_anchor + 3 == {r} && patch_head + {r} < ({end}) ? "
+                f"{rows.word(f'patch_head + {r}', 3)} : -1;"
+            )
+    lines += [f"float {', '.join(f'patch_new{r} = 0.0f' for r in range(window))};"]
     # A ring whose anchor's pair has a spin row: no contact unit takes its anchor (unit_visit), so its rows are the
     # visits a row of normals, then the pair's triple. Its pair's operands and its anchor's record load as soon as the
     # anchor is known: before the visited normal where the run loaded the words that tell it, else after.
