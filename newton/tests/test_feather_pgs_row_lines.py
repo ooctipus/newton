@@ -19,7 +19,7 @@ from unittest import mock
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs.placement import Placement
+from newton._src.solvers.feather_pgs.placement import MOVE_LANES, Placement, _move_to_runs
 from newton.tests import test_feather_pgs_conformance as conformance
 
 _construct = Placement.__init__
@@ -63,6 +63,40 @@ def _extent(group, route, device, collide_every: int = 1) -> tuple[dict, int, in
     with mock.patch.object(Placement, "close_rows", close):
         states = _states(group, route, device, collide_every)
     return states, held[0], held[1], held[2]
+
+
+def _moved_topology(device):
+    """Two worlds' topology rows moved home -> run (:func:`_move_to_runs`) in three fields that count a line in their
+    own items, on lines of six rows: rows (a float a row), records (eight words a row) and a friction metric (a slot of
+    four floats per three rows). Returns the fields before and after, the worlds' runs and their topology rows."""
+    rows, lines = 6, 6
+    fields = [
+        np.arange(lines * rows, dtype=np.float32).reshape(lines, rows) + 1.0,
+        np.arange(lines * rows * 8, dtype=np.int32).reshape(lines, rows * 8) + 1,
+        np.arange(lines * 2 * 4, dtype=np.float32).reshape(lines, 2, 4) + 1.0,
+    ]
+    arrays = [wp.array(field, device=device) for field in fields]
+    runs, topology = [2, 4], [4, 1]
+    first = wp.zeros(2, dtype=wp.int32, device=device)
+    wp.launch(
+        _move_to_runs,
+        dim=(2, len(arrays), MOVE_LANES),
+        inputs=[
+            wp.array([0, 1], dtype=wp.int32, device=device),
+            wp.array([wp.vec2i(run, 1) for run in runs], dtype=wp.vec2i, device=device),
+            wp.array(topology, dtype=wp.int32, device=device),
+            wp.array([topology], dtype=wp.int32, device=device),
+            rows,
+            wp.array([int(a.ptr) for a in arrays], dtype=wp.uint64, device=device),
+            wp.array([int(a.strides[1]) for a in arrays], dtype=wp.int64, device=device),
+            wp.array([int(a.strides[0]) for a in arrays], dtype=wp.int64, device=device),
+            rows,
+            0,
+        ],
+        outputs=[first],
+        device=device,
+    )
+    return fields, [a.numpy() for a in arrays], runs, topology, first.numpy()
 
 
 def _laid_out(rows: int, arena: int):
@@ -122,6 +156,28 @@ class TestFeatherPGSRowLines(unittest.TestCase):
     def test_worlds_keep_their_physics_on_short_lines_cuda(self):
         """Run the CUDA matrix's routes on lines as short as their rows, bitwise as on the capacities' lines."""
         self._check_short(conformance.cuda_groups(), wp.get_device("cuda"))
+
+    def _check_moved_topology(self, device):
+        before, after, runs, topology, first = _moved_topology(device)
+        np.testing.assert_array_equal(first, runs)
+        expected = [field.copy() for field in before]
+        for home, (run, count) in enumerate(zip(runs, topology, strict=True)):
+            expected[0][run, :count] = before[0][home, :count]
+            expected[1][run, : count * 8] = before[1][home, : count * 8]
+            slots = math.ceil(count / 3)
+            expected[2][run, :slots] = before[2][home, :slots]
+        for name, want, got in zip(("rows", "records", "friction metric"), expected, after, strict=True):
+            np.testing.assert_array_equal(got, want, err_msg=name)
+
+    def test_a_run_takes_its_topology_rows_in_every_field_cpu(self):
+        """Move two worlds' topology rows to their runs in fields that count a line in rows, in records' words and in
+        friction slots of three rows: each takes exactly its rows' items, and no line past its run changes."""
+        self._check_moved_topology(wp.get_device("cpu"))
+
+    @unittest.skipUnless(wp.is_cuda_available(), "CUDA only")
+    def test_a_run_takes_its_topology_rows_in_every_field_cuda(self):
+        """The topology rows' move on the device, as on the CPU."""
+        self._check_moved_topology(wp.get_device("cuda"))
 
     def test_a_full_arena_drops_rows_with_status_cpu(self):
         """Run a stack on lines that hold only its topology rows and an arena of one line, too short for its run: its

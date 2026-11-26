@@ -305,8 +305,9 @@ def _move_to_runs(
     slot_counter: wp.array2d[int],
     capacity: int,
     fields: wp.array[wp.uint64],
-    row_bytes: wp.array[wp.int64],
+    item_bytes: wp.array[wp.int64],
     line_bytes: wp.array[wp.int64],
+    line_rows: int,
     diag: int,
     # outputs
     first: wp.array[int],
@@ -314,8 +315,10 @@ def _move_to_runs(
     """Take each world whose rows run in the arena (``run_of``, the reservation's claim, or kept while it holds its
     slots) to its run: its topology rows, which its producers wrote at its home line this step, copied there in every
     field laid out by line and row (``fields``: their addresses, their rows' bytes and their lines' bytes), and its
-    contact rows' diagonals zeroed for the one writer's sums (field ``diag``). A warp a world and field
-    (:data:`MOVE_LANES`), striding over the 4-byte words of the rows (every field's row is whole words)."""
+    contact rows' diagonals zeroed for the one writer's sums (field ``diag``). A field's line holds ``line_rows`` rows
+    in its own items (``item_bytes``: a row's entries, a record's word, a friction slot of three rows), so a world's
+    first ``rows`` rows take the whole items that cover ``rows / line_rows`` of the field's line. A warp a world and
+    field (:data:`MOVE_LANES`), striding over the 4-byte words of the items (every field's item is whole words)."""
     world, field, lane = wp.tid()
     run = run_of[world][0]
     if run < 0:
@@ -323,10 +326,13 @@ def _move_to_runs(
     if field == 0 and lane == 0:
         first[world] = run
     rows = topology_rows[world]
-    size = row_bytes[field]
-    at = fields[field] + wp.uint64(run) * wp.uint64(line_bytes[field])
-    source = fields[field] + wp.uint64(home[world]) * wp.uint64(line_bytes[field])
-    _copy_words(at, source, wp.int64(rows) * size // wp.int64(4), lane, MOVE_LANES)
+    size = item_bytes[field]
+    line = line_bytes[field]
+    at = fields[field] + wp.uint64(run) * wp.uint64(line)
+    source = fields[field] + wp.uint64(home[world]) * wp.uint64(line)
+    reach = wp.int64(line_rows) * size
+    items = (wp.int64(rows) * line + reach - wp.int64(1)) // reach
+    _copy_words(at, source, items * size // wp.int64(4), lane, MOVE_LANES)
     if field == diag:
         count = wp.min(slot_counter[0, world], capacity)
         if count > rows:
@@ -1338,7 +1344,7 @@ class Placement:
                 wp.array([int(a.strides[0]) for a in fields], dtype=wp.int64, device=device),
                 next(i for i, a in enumerate(fields) if a.ptr == self.diag.ptr),
             )
-        count, pointers, row_bytes, line_bytes, diag = self._run_fields
+        count, pointers, item_bytes, line_bytes, diag = self._run_fields
         wp.launch(
             _move_to_runs,
             dim=(self.forest.world_count, count, MOVE_LANES),
@@ -1349,8 +1355,9 @@ class Placement:
                 self.row_slot_counter,
                 int(self.dense_max_constraints),
                 pointers,
-                row_bytes,
+                item_bytes,
                 line_bytes,
+                int(self.line_rows),
                 diag,
             ],
             outputs=[self.dense_first],
