@@ -632,7 +632,15 @@ def _world_sync(lanes: int, warps: int):
 
 @wp.func
 def _order_islands(
-    data: ContactInput, order: RowOrder, world: int, first: int, pairs: int, lanes: int, lane: int, warp: int, warps: int
+    data: ContactInput,
+    order: RowOrder,
+    world: int,
+    first: int,
+    pairs: int,
+    lanes: int,
+    lane: int,
+    warp: int,
+    warps: int,
 ):
     """The world's row order over its ``pairs`` body pairs (``order.pairs`` from ``first``), by its group's ``lanes``:
     ``order.row_pairs[first + q]`` the index of the pair the order visits ``q``-th.

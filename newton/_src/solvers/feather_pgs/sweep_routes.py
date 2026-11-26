@@ -2083,9 +2083,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     if sweep.world_blocks:
         # A world's group of blocks (group_stage): its block (rank 0) runs every phase, the others serve its stages
         # wider than the block and leave the sweeps at the world's end, which the block posts after its last sweep.
-        head += (
-            f"\n    int wide_gen = 0, wide_meets = 0;\n    int* const wide_job = wide_jobs.data + (size_t)world * {WIDE_JOB};"
-        )
+        head += f"\n    int wide_gen = 0, wide_meets = 0;\n    int* const wide_job = wide_jobs.data + (size_t)world * {WIDE_JOB};"
         first_warp = "    if (warp == 0 && rank == 0) {\n"
         alone, end_alone = "    if (rank == 0) {\n", "    }\n"
         leave = "        if (rank != 0) break;\n"
@@ -2182,6 +2180,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
             heads=lambda row: f"{dense.spin_of(row, 'm_dense')} >= 0 && {dense.kind(row)} == {ROW_CONTACT}",
             pad="        ",
         )
+
     def unit_text(rows: WorldRows, op: SparseFactor) -> str:
         return dense_units(rows, op, laws, active=sweep.active_rows, record=dense_record, pad="")
 
