@@ -1716,14 +1716,16 @@ $passes
             if (!any) continue;
             #pragma unroll 1
             for (int c = f1 - 1; c >= f0; --c) {
-                bool on[HOLD_SLOTS];
-                unsigned slipping = 0u;
+                // Each slot's slips on the coordinate, a lane a bit (slip k: bit k % WIDTH of slot k / WIDTH).
+                bool on[HOLD_SLOTS], slipping = false;
+                unsigned slots[HOLD_SLOTS];
                 #pragma unroll
                 for (int m = 0; m < HOLD_SLOTS; ++m) {
                     on[m] = c <= start[m];
-                    slipping |= BALLOT(on[m]) << (m * WIDTH);
+                    slots[m] = BALLOT(on[m]);
+                    slipping = slipping || slots[m] != 0u;
                 }
-                if (slipping == 0u) continue;
+                if (!slipping) continue;
                 float d[13];
                 HELD_ROW(h.r, c, d);
                 #pragma unroll
@@ -1741,7 +1743,7 @@ $passes
                 #pragma unroll
                 for (int k = 0; k < HOLD_SLIPS; ++k) {
                     if (k >= slips) break;
-                    if (!((slipping >> k) & 1u)) continue;
+                    if (!((slots[k / WIDTH] >> (k % WIDTH)) & 1u)) continue;
                     float bk = 0.0f, ak = 0.0f, gk = 0.0f, dk = 0.0f, rk = 0.0f;
                     if (lane == k % WIDTH) {
                         const int i = is[k / WIDTH];
