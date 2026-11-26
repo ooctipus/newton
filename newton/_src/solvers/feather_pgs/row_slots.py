@@ -622,7 +622,18 @@ def _row_inverse(n: int) -> int:
 
 
 @wp.func
-def _order_islands(data: ContactInput, order: RowOrder, first: int, pairs: int, lanes: int, lane: int):
+def _world_sync(lanes: int, warps: int):
+    """Synchronize a world's threads: its block of ``warps`` warps, or its warp."""
+    if warps > 1:
+        lane_sync(lanes * warps)
+    else:
+        lane_sync(RESERVE_LANES)
+
+
+@wp.func
+def _order_islands(
+    data: ContactInput, order: RowOrder, world: int, first: int, pairs: int, lanes: int, lane: int, warp: int, warps: int
+):
     """The world's row order over its ``pairs`` body pairs (``order.pairs`` from ``first``), by its group's ``lanes``:
     ``order.row_pairs[first + q]`` the index of the pair the order visits ``q``-th.
 
@@ -634,19 +645,27 @@ def _order_islands(data: ContactInput, order: RowOrder, first: int, pairs: int, 
     holds no rows: those follow the islands, in frame order. Every place depends only on the pair's island, so a pair
     of another island never moves it; the islands' places among each other are free (they share no tree). A world that
     is one island takes the order of a stride over all its pairs. Each tree starts as its own root with an empty island,
-    as the reservation leaves it after the slots."""
+    as the reservation leaves it after the slots.
+
+    Both passes go a batch of the lanes at a time, over a block of ``warps`` warps in turns as :func:`_frame_turns`
+    does (a batch's loads before its turn; the islands' sizes, the pairs placed and the loose ones carried through the
+    turns, ``turns``), every place the one warp's."""
     parent = order.island_parent
     size = order.island_size
-    # Each pair's island and its rank there in frame order, a batch of the group's lanes at a time; each island's size.
+    batches = (pairs + lanes - 1) // lanes
+    # Each pair's island and its rank there in frame order; each island's size.
     grouped = int(0)
-    for base in range(0, pairs, lanes):
-        j = base + lane
+    for g in range(warp, batches, warps):
+        j = g * lanes + lane
         island = int(-2)
         if j < pairs:
             island = order.pair_sides[first + j][0]
             if island >= 0:
                 island = union_find.root_now(parent, island)
         peers = lane_match(island, RESERVE_LANES)
+        if warps > 1 and g > 0:
+            _turn_wait(_turn(warp, warps))
+            grouped = order.turns[world, 5]
         held = int(0)
         if island >= 0:
             held = size[island]
@@ -660,12 +679,20 @@ def _order_islands(data: ContactInput, order: RowOrder, first: int, pairs: int, 
             order.pair_island[first + j] = -1
         grouped += lane_sum(wp.where(island >= 0, 1, 0), RESERVE_LANES)
         lane_sync(RESERVE_LANES)
+        if warps > 1:
+            if lane == 0:
+                order.turns[world, 5] = grouped
+            if g + 1 < batches:
+                _turn_pass(_turn(warp + 1, warps))
+    if warps > 1:
+        lane_sync(lanes * warps)
+        grouped = order.turns[world, 5]
     # Each pair's place: an island's first pair takes the island's first place (its base and stride's inverse), then
     # every pair its own; the pairs without rows after the islands.
     placed = int(0)
     loose = int(0)
-    for base in range(0, pairs, lanes):
-        j = base + lane
+    for g in range(warp, batches, warps):
+        j = g * lanes + lane
         island = int(-2)
         rank = int(0)
         if j < pairs:
@@ -675,6 +702,10 @@ def _order_islands(data: ContactInput, order: RowOrder, first: int, pairs: int, 
         if island >= 0 and rank == 0:
             span = size[island]
         lone = wp.where(island == -1, 1, 0)
+        if warps > 1 and g > 0:
+            _turn_wait(_turn(warp, warps))
+            placed = order.turns[world, 6]
+            loose = order.turns[world, 7]
         start = placed + lane_scan(span, RESERVE_LANES)
         lone_rank = loose + lane_scan(lone, RESERVE_LANES)
         if span > 0:
@@ -682,13 +713,53 @@ def _order_islands(data: ContactInput, order: RowOrder, first: int, pairs: int, 
         placed += lane_sum(span, RESERVE_LANES)
         loose += lane_sum(lone, RESERVE_LANES)
         lane_sync(RESERVE_LANES)
+        if warps > 1:
+            if lane == 0:
+                order.turns[world, 6] = placed
+                order.turns[world, 7] = loose
+            if g + 1 < batches:
+                _turn_pass(_turn(warp + 1, warps))
         if island >= 0:
             at = order.island_base[island]
             q = at[0] + int((wp.int64(rank) * wp.int64(at[1])) % wp.int64(size[island]))
             order.row_pairs[first + q] = j
         elif island == -1:
             order.row_pairs[first + grouped + lone_rank] = j
-    lane_sync(RESERVE_LANES)
+    _world_sync(lanes, warps)
+
+
+@wp.func
+def _rows_before(
+    order: RowOrder, world: int, first: int, pairs: int, rows: wp.vec4i, lanes: int, lane: int, warp: int, warps: int
+):
+    """The row order's rows before each pair (``rows_before`` at its head), the pairs in the row order a batch of the
+    lanes at a time, over a block of ``warps`` warps in turns as :func:`_frame_turns` does (the rows seen carried
+    through the turns, ``turns``)."""
+    batches = (pairs + lanes - 1) // lanes
+    seen = wp.vec4i(0)
+    for g in range(warp, batches, warps):
+        q = g * lanes + lane
+        own = wp.vec4i(0)
+        head = int(-1)
+        if q < pairs:
+            j = order.row_pairs[first + q]
+            head = order.pairs[first + j]
+            own = _pair_rows(order, first, pairs, rows, j)
+        lower = _lane_scan4(own)
+        if warps > 1 and g > 0:
+            _turn_wait(_turn(warp, warps))
+            seen = wp.vec4i(order.turns[world, 0], order.turns[world, 1], order.turns[world, 2], order.turns[world, 3])
+        if head >= 0:
+            order.rows_before[head] = seen + lower
+        seen = seen + _lane_sum4(own)
+        if warps > 1:
+            lane_sync(RESERVE_LANES)
+            if lane == 0:
+                for k in range(4):
+                    order.turns[world, k] = seen[k]
+            if g + 1 < batches:
+                _turn_pass(_turn(warp + 1, warps))
+    _world_sync(lanes, warps)
 
 
 @wp.func
@@ -1346,25 +1417,10 @@ def reserve_world_rows_kernel(grouped: bool, warps: int = 1):
         if end > first:
             rows = wp.vec4i(order.turns[world, 0], order.turns[world, 1], order.turns[world, 2], order.turns[world, 3])
             pairs = order.turns[world, 4]
-        if warp == 0:
-            lane_sync(RESERVE_LANES)
-            if kept == 0:
-                _order_islands(data, order, first, pairs, lanes, lane)
-            # The row order: each pair's rows before it.
-            seen = wp.vec4i(0)
-            for base in range(0, pairs, lanes):
-                q = base + lane
-                own = wp.vec4i(0)
-                head = int(-1)
-                if q < pairs:
-                    j = order.row_pairs[first + q]
-                    head = order.pairs[first + j]
-                    own = _pair_rows(order, first, pairs, rows, j)
-                before = seen + _lane_scan4(own)
-                if head >= 0:
-                    order.rows_before[head] = before
-                seen = seen + _lane_sum4(own)
-            lane_sync(RESERVE_LANES)
+        # The row order (_order_islands), then each pair's rows before it (_rows_before).
+        if kept == 0:
+            _order_islands(data, order, world, first, pairs, lanes, lane, warp, warps)
+        _rows_before(order, world, first, pairs, rows, lanes, lane, warp, warps)
         if wp.static(warps > 1):
             lane_sync(threads)
         # A world of many trees: its dense contact rows by colors of groups, where it takes them (RowGroups), over the
