@@ -140,13 +140,13 @@ class GenericShapeData:
 
 
 @wp.func
-def enclosing_half_extents(geom: Any) -> wp.vec3:
-    """Half-extents [m] of the shape's local box about ``geom.center``, or zero when it has none.
+def enclosing_box(geom: Any) -> tuple[wp.vec3, wp.vec3]:
+    """Center and half-extents [m] of the shape's local box, or a zero box when it has none.
 
-    Primitives derive theirs from ``geom.scale`` (a sphere or capsule as the core the narrow phase
-    hands GJK/MPR); a convex hull carries its AABB in ``geom.bounds_half``. A mesh triangle's box
-    holds its three corners about its first (``geom.center``): flat along an axis the triangle is
-    normal to. Planes, heightfield prisms and shapes without a stored box return zero.
+    Primitives derive theirs from ``geom.scale`` about ``geom.center`` (a sphere or capsule as the core the narrow
+    phase hands GJK/MPR); a convex hull carries its AABB in ``geom.bounds_half``. A mesh triangle's box holds its
+    three corners about its first (``geom.center``): flat along an axis the triangle is normal to (its own box is
+    :func:`triangle_box`). Planes, heightfield prisms and shapes without a stored box return zero half-extents.
     """
     scale = geom.scale
     half = wp.vec3(0.0)
@@ -165,7 +165,16 @@ def enclosing_half_extents(geom: Any) -> wp.vec3:
         half = geom.bounds_half
     elif geom.shape_type == int(GeoTypeEx.TRIANGLE):
         half = wp.max(wp.abs(scale), wp.abs(geom.auxiliary))
-    return half
+    return geom.center, half
+
+
+@wp.func
+def triangle_box(geom: Any) -> tuple[wp.vec3, wp.vec3]:
+    """Center and half-extents [m] of a mesh triangle's own box: the box of its corners ``0``, ``geom.scale`` and
+    ``geom.auxiliary`` in its frame."""
+    lower = wp.min(wp.vec3(0.0), wp.min(geom.scale, geom.auxiliary))
+    upper = wp.max(wp.vec3(0.0), wp.max(geom.scale, geom.auxiliary))
+    return 0.5 * (lower + upper), 0.5 * (upper - lower)
 
 
 @wp.func
@@ -792,6 +801,7 @@ def create_triangle_prism_penetration_refiner(support_func: Any):
         point_b: wp.vec3,
         normal: wp.vec3,
         penetration: float,
+        query_context: Any = 0,
     ) -> tuple[wp.vec3, wp.vec3, wp.vec3, float]:
         if geom_a.shape_type == int(GeoTypeEx.TRIANGLE_PRISM):
             surface_normal = wp.cross(geom_a.scale, geom_a.auxiliary)

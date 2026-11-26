@@ -39,7 +39,7 @@ from .support_function import (
     GeoTypeEx,
     create_shape_center_function,
     create_shape_support_function,
-    enclosing_half_extents,
+    enclosing_box,
 )
 
 PORTAL_HEIGHT_RTOL = wp.constant(1.0e-6)
@@ -205,6 +205,61 @@ def create_support_map_function(support_func: Any, use_precomputed_center: bool 
     return support_map_b, minkowski_support, geometric_center
 
 
+def create_box_hold(support_func: Any):
+    """Create the hold of a penetrating MPR result to two enclosing boxes.
+
+    MPR's portal lies where the ray from the shapes' center difference through the origin leaves the Minkowski
+    difference. Near the end of a long shape that ray can leave through a distant face, deeper than the enclosing
+    boxes overlap along their shallowest face normal. Then the shapes' own support planes along that normal give the
+    overlap (at most the portal's) and the contact: B's deepest point and its partner on A's support plane, so the
+    smaller shape (B or A swapped) keeps the witness inside the overlap. A shape without a box (zero half-extents)
+    leaves the result as it is.
+    """
+    shape_support = create_shape_support_function(support_func, center_ties=True)
+    _, mpr_support, _ = create_support_map_function(shape_support)
+
+    @wp.func
+    def hold_to_boxes(
+        geom_a: Any,
+        geom_b: Any,
+        orientation_b: wp.quat,
+        position_b: wp.vec3,
+        extend: float,
+        data_provider: Any,
+        point_a: wp.vec3,
+        point_b: wp.vec3,
+        normal: wp.vec3,
+        penetration: float,
+        center_a: wp.vec3,
+        half_a: wp.vec3,
+        center_b: wp.vec3,
+        half_b: wp.vec3,
+        epsilon: float,
+    ) -> tuple[wp.vec3, wp.vec3, wp.vec3, float]:
+        if wp.max(half_a) > 0.0 and wp.max(half_b) > 0.0:
+            offset = position_b + wp.quat_rotate(orientation_b, center_b) - center_a
+            bound_normal, bound_depth = enclosing_box_depth(half_a, half_b, orientation_b, offset)
+            if penetration > bound_depth + extend + epsilon:
+                support = mpr_support(geom_a, geom_b, bound_normal, orientation_b, position_b, extend, data_provider)
+                depth = wp.dot(support.BtoA, bound_normal)
+                if depth < penetration:
+                    normal = bound_normal
+                    penetration = depth
+                    # The smaller shape's deepest point, and its partner on the other's support plane. A mesh
+                    # triangle's own deepest corner is the witness whatever its box: a point of the surface the
+                    # contact is reported on (its partner's deepest point along a box axis can lie far from the
+                    # triangle, where the surface's refiner would measure the face).
+                    if geom_a.shape_type != int(GeoTypeEx.TRIANGLE) and wp.length_sq(half_b) <= wp.length_sq(half_a):
+                        point_b = support.B
+                        point_a = point_b + depth * normal
+                    else:
+                        point_a = vert_a(support)
+                        point_b = point_a - depth * normal
+        return point_a, point_b, normal, penetration
+
+    return hold_to_boxes
+
+
 def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
     """
     Factory function to create MPR solver with specific support and center functions.
@@ -229,6 +284,7 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
 
     shape_support = create_shape_support_function(support_func, center_ties=True)
     _, mpr_support, _ = create_support_map_function(shape_support)
+    hold_to_boxes = create_box_hold(support_func)
 
     @wp.func
     def solve_mpr_portal(
@@ -499,32 +555,25 @@ def create_solve_mpr(support_func: Any, _support_funcs: Any = None):
             geom_a, geom_b, orientation_b, position_b, extend, data_provider, MAX_ITER, COLLIDE_EPSILON
         )
         if collision:
-            half_a = enclosing_half_extents(geom_a)
-            half_b = enclosing_half_extents(geom_b)
-            # A shape without a box has none of its half-extents; a mesh triangle's box is flat along one.
-            if wp.max(half_a) > 0.0 and wp.max(half_b) > 0.0:
-                offset = position_b + wp.quat_rotate(orientation_b, geom_b.center) - geom_a.center
-                bound_normal, bound_depth = enclosing_box_depth(half_a, half_b, orientation_b, offset)
-                if penetration > bound_depth + extend + COLLIDE_EPSILON:
-                    support = mpr_support(
-                        geom_a, geom_b, bound_normal, orientation_b, position_b, extend, data_provider
-                    )
-                    depth = wp.dot(support.BtoA, bound_normal)
-                    if depth < penetration:
-                        normal = bound_normal
-                        penetration = depth
-                        # The smaller shape's deepest point, and its partner on the other's support plane. A
-                        # mesh triangle's own deepest corner is the witness whatever its box: a point of the
-                        # surface the contact is reported on (its partner's deepest point along a box axis can
-                        # lie far from the triangle, where the surface's refiner would measure the face).
-                        if geom_a.shape_type != int(GeoTypeEx.TRIANGLE) and wp.length_sq(half_b) <= wp.length_sq(
-                            half_a
-                        ):
-                            point_b = support.B
-                            point_a = point_b + depth * normal
-                        else:
-                            point_a = vert_a(support)
-                            point_b = point_a - depth * normal
+            center_a, half_a = enclosing_box(geom_a)
+            center_b, half_b = enclosing_box(geom_b)
+            point_a, point_b, normal, penetration = hold_to_boxes(
+                geom_a,
+                geom_b,
+                orientation_b,
+                position_b,
+                extend,
+                data_provider,
+                point_a,
+                point_b,
+                normal,
+                penetration,
+                center_a,
+                half_a,
+                center_b,
+                half_b,
+                COLLIDE_EPSILON,
+            )
         return collision, point_a, point_b, normal, penetration
 
     @wp.func

@@ -639,6 +639,64 @@ def test_part_sunk_into_a_large_box(test, device):
                     )
 
 
+def test_tilted_part_sunk_into_a_large_box(test, device):
+    """A small closed mesh part sunk tilted into the face of a large box is pushed out along the box's face normal.
+
+    The part's facets near the box lean on it by the tilt; the box is the larger body, and the larger body's face gives
+    the contact's direction, not a facet of the part. Every penetrating contact is the box face's, at the depth the part
+    sank. The parts of the NIST demo landing on its board
+    took their own facet normals (resultants tilted up to 40 degrees) or, landing on a corner, no contact at all, and
+    were thrown off the board under MuJoCo Warp.
+    """
+    hx, hy, hz = 0.1925, 0.1923, 0.015  # the NIST board
+    parts = (("bar", _box(0.006, 0.025, 0.004)), ("subdivided bar", _box(0.006, 0.025, 0.004, n=3)))
+    sink = 0.002
+    for name, (vertices, faces) in parts:
+        for tilt in (0.17, 0.44, 0.7):
+            for axis in ((1.0, 0.0, 0.0), (0.6, 0.8, 0.0), (0.0, 0.6, 0.8)):
+                rot = wp.quat_from_axis_angle(wp.normalize(wp.vec3(*axis)), tilt)
+                turned = np.array([wp.quat_rotate(rot, wp.vec3(*v)) for v in vertices], np.float32)
+                lowest = float(turned[:, 2].min())
+                for x, y in ((0.0, 0.0), (0.12, 0.08), (-0.15, 0.03)):
+                    # The part rests at the origin; the box's top face lies `sink` above its lowest point.
+                    xform = wp.transform(wp.vec3(-x, -y, lowest + sink - hz), wp.quat_identity())
+                    for reduce in (False, True):
+                        count, normal, _p0, sep = _collide(
+                            device, turned, faces, ("box", {"hx": hx, "hy": hy, "hz": hz}), xform, reduce=reduce
+                        )
+                        label = f"{name} tilted {tilt} about {axis} at ({x}, {y}), reduce {reduce}"
+                        test.assertGreaterEqual(count, 1, label)
+                        test.assertAlmostEqual(float(sep.min()), -sink, delta=2e-5, msg=label)
+                        test.assertTrue(
+                            np.all(normal[sep < 0.0][:, 2] < -1.0 + 1e-6), f"{label}: a penetrating normal off the face"
+                        )
+
+
+def test_floor_far_from_its_origin_holds_a_sunk_box(test, device):
+    """A floor mesh authored far from its origin holds a box sunk into it by the floor's own normal.
+
+    The floor is the larger body, so its face gives the direction wherever its vertices sit relative to its origin (a
+    terrain authored from a corner).
+    """
+    v, f = _lattice(16, 0.8)
+    v = np.asarray(v, np.float32) + np.array([20.0, 20.0, 0.0], np.float32)
+    floor = _soup(v, f)
+    hx, hy, hz = 0.13, 0.07, 0.05
+    for tilt in (0.05, 0.4):
+        rot = wp.quat_from_axis_angle(wp.normalize(wp.vec3(0.6, 0.8, 0.0)), tilt)
+        corners = np.array([wp.quat_rotate(rot, wp.vec3(sx * hx, sy * hy, -hz)) for sx in (-1, 1) for sy in (-1, 1)])
+        for sink in (0.001, 0.004):
+            z = -sink - float(corners[:, 2].min())
+            xform = wp.transform(wp.vec3(20.0, 20.0, z), rot)
+            count, normal, _p0, sep = _collide(device, *floor, ("box", {"hx": hx, "hy": hy, "hz": hz}), xform)
+            label = f"tilt {tilt}, sink {sink}"
+            test.assertGreaterEqual(count, 1, label)
+            test.assertAlmostEqual(float(sep.min()), -sink, delta=2e-5, msg=label)
+            test.assertTrue(
+                np.all(normal[sep < 0.0][:, 2] > 1.0 - 1e-6), f"{label}: a penetrating normal off the floor's"
+            )
+
+
 def test_box_on_stair_nose(test, device):
     """A box resting across a stair nose: its patch on the tread, cut at the nose, with no ghost normal.
 
@@ -695,6 +753,8 @@ for _name, _fn in (
     ("test_capsule_core_around_a_thin_part", test_capsule_core_around_a_thin_part),
     ("test_capsule_core_through_a_face", test_capsule_core_through_a_face),
     ("test_part_sunk_into_a_large_box", test_part_sunk_into_a_large_box),
+    ("test_tilted_part_sunk_into_a_large_box", test_tilted_part_sunk_into_a_large_box),
+    ("test_floor_far_from_its_origin_holds_a_sunk_box", test_floor_far_from_its_origin_holds_a_sunk_box),
     ("test_box_on_stair_nose", test_box_on_stair_nose),
     ("test_small_facet_keeps_its_corners", test_small_facet_keeps_its_corners),
     ("test_unreferenced_vertices", test_unreferenced_vertices),

@@ -252,6 +252,7 @@ def create_solve_convex_multi_contact(
                     point_b,
                     normal,
                     penetration,
+                    query_context,
                 )
             signed_distance = -penetration + enlarge
             # Undo the inflate on the witness points so downstream consumers
@@ -425,6 +426,7 @@ def create_solve_convex_single_contact(
                     point_b,
                     normal,
                     penetration,
+                    query_context,
                 )
             signed_distance = -penetration + enlarge
             half_enlarge = enlarge * 0.5

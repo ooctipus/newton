@@ -45,12 +45,15 @@ from .heightfield_features import (
     faces_witness,
     seam_surface_witness,
 )
+from .mpr import create_box_hold
 from .support_function import (
     GenericShapeData,
     GeoTypeEx,
     closest_point_on_triangle,
     create_shape_support_function,
     create_triangle_prism_penetration_refiner,
+    enclosing_box,
+    triangle_box,
 )
 from .types import GeoType
 
@@ -363,6 +366,10 @@ class SurfaceFeatureContext:
     """Component k: the edge's own rounding band [m] (relative to its length)."""
     flat: int
     """The row's flat bits (bit k: edge k joins a coplanar triangle; bit 3 + k: corner k is a flat vertex)."""
+    partner_larger: int
+    """1 when the partner is the larger body (by bounding radius). The larger body's face gives a contact's direction:
+    the mesh is then a body pressed against its partner (a part on a board), not a surface under it (a floor under a
+    box)."""
 
 
 @wp.func
@@ -902,8 +909,11 @@ def mesh_surface_context(
     context.p2 = p2
     context.partner_center = partner_center
     context.partner_radius = 0.0
+    context.partner_larger = 0
     if partner < topology.shape_radius.shape[0]:
         context.partner_radius = topology.shape_radius[partner]
+        if shape < topology.shape_radius.shape[0]:
+            context.partner_larger = int(context.partner_radius > topology.shape_radius[shape])
     return context
 
 
@@ -1362,9 +1372,52 @@ def create_surface_penetration_refiner(support_func: Any):
     face (else MPR's witness on the partner). A direction farther from the face keeps MPR's result: mapping it to the
     face would push a partner across a thin feature (a brick's rim) along the feature's face. The feature rule's
     ghost test is for separated witnesses only, as on heightfields.
+
+    The larger body's face gives a contact's direction: all of the above is for a mesh that is the larger body, a
+    surface under its partner. Against a larger partner (:attr:`SurfaceFeatureContext.partner_larger`: a small part
+    sunk into the face of a board) the mesh is a body pressed into it, its triangle's corner or edge is in the partner,
+    and MPR's normal and depth stand, held to the triangle's own box (the box of its corners: a long sliver on a large
+    partner then gets the partner's axis and depth; MPR's own hold keeps a looser triangle box, so a surface's lone
+    triangle is not held to sideways escapes off it).
     """
     prism_refiner = create_triangle_prism_penetration_refiner(support_func)
     shape_support = create_shape_support_function(support_func, center_ties=True)
+    hold_to_boxes = create_box_hold(support_func)
+
+    @wp.func
+    def hold_to_own_box(
+        geom_a: Any,
+        geom_b: Any,
+        orientation_b: wp.quat,
+        position_b: wp.vec3,
+        extend: float,
+        data_provider: Any,
+        point_a: wp.vec3,
+        point_b: wp.vec3,
+        normal: wp.vec3,
+        penetration: float,
+    ) -> tuple[wp.vec3, wp.vec3, wp.vec3, float]:
+        # MPR's result held to the triangle's own box: a long sliver on a large partner gets the partner's axis and
+        # depth (MPR's own hold uses a looser triangle box, about its first corner).
+        center_a, half_a = triangle_box(geom_a)
+        center_b, half_b = enclosing_box(geom_b)
+        return hold_to_boxes(
+            geom_a,
+            geom_b,
+            orientation_b,
+            position_b,
+            extend,
+            data_provider,
+            point_a,
+            point_b,
+            normal,
+            penetration,
+            center_a,
+            half_a,
+            center_b,
+            half_b,
+            1.0e-5,
+        )
 
     @wp.func
     def refine_surface_penetration(
@@ -1378,6 +1431,7 @@ def create_surface_penetration_refiner(support_func: Any):
         point_b: wp.vec3,
         normal: wp.vec3,
         penetration: float,
+        context: Any,
     ) -> tuple[wp.vec3, wp.vec3, wp.vec3, float]:
         if geom_a.shape_type == int(GeoTypeEx.TRIANGLE_PRISM):
             return prism_refiner(
@@ -1385,6 +1439,20 @@ def create_surface_penetration_refiner(support_func: Any):
             )
         if geom_a.shape_type != int(GeoTypeEx.TRIANGLE):
             return point_a, point_b, normal, penetration
+        if context.partner_larger != 0:
+            # The larger body's face gives the direction: MPR's own (the partner's face).
+            return hold_to_own_box(
+                geom_a,
+                geom_b,
+                orientation_b,
+                position_b,
+                extend,
+                data_provider,
+                point_a,
+                point_b,
+                normal,
+                penetration,
+            )
         face = wp.cross(geom_a.scale, geom_a.auxiliary)
         length_sq = wp.length_sq(face)
         if length_sq < 1.0e-24:
