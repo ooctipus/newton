@@ -281,9 +281,16 @@ def _world_material(
 
 
 def simulate(
-    scene: scenes.Scene, route: Route, device, *, options: dict | None = None, steps: int | None = None
+    scene: scenes.Scene,
+    route: Route,
+    device,
+    *,
+    options: dict | None = None,
+    steps: int | None = None,
+    collide_every: int = 1,
 ) -> Run:
-    """Step ``scene`` through ``route`` and record states, contacts and exported contact forces.
+    """Step ``scene`` through ``route`` and record states, contacts and exported contact forces, with a collision pass
+    every ``collide_every`` steps (the steps between step the last pass's contacts, as substeps do).
 
     The output state is copied back into the input state, so the solver sees
     one input object, as a captured step loop does. The history is recorded on
@@ -340,7 +347,8 @@ def simulate(
             state.clear_forces()
             if scene.control is not None:
                 scene.control(model, control, state, step)
-            pipeline.collide(state, contacts)
+            if step % collide_every == 0:
+                pipeline.collide(state, contacts)
             if material is not None:
                 outputs = [
                     contacts.rigid_contact_stiffness,

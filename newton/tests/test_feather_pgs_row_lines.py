@@ -37,14 +37,15 @@ def _reversed_lines(self, *args, **kwargs):
     self.dense_first.assign(self.home_first)
 
 
-def _states(group, route, device):
+def _states(group, route, device, collide_every: int = 1):
     physics = group.physics
     # The pipeline sorts its contacts, so two runs of one route agree, tables or not.
-    run = conformance.simulate(physics.scene, route, device, options=physics.options(physics.iterations), steps=30)
+    options = physics.options(physics.iterations)
+    run = conformance.simulate(physics.scene, route, device, options=options, steps=30, collide_every=collide_every)
     return {name: getattr(run, name) for name in conformance.STATE_FIELDS}
 
 
-def _extent(group, route, device) -> tuple[dict, int, int, int]:
+def _extent(group, route, device, collide_every: int = 1) -> tuple[dict, int, int, int]:
     """The route's states on full lines, the most rows any world's line held (its dense rows, or its free rows' end
     past its body base) and its topology rows, read after each row pass, and its worlds."""
     held = [0, 0, 0]
@@ -60,7 +61,7 @@ def _extent(group, route, device) -> tuple[dict, int, int, int]:
         held[2] = self.forest.world_count
 
     with mock.patch.object(Placement, "close_rows", close):
-        states = _states(group, route, device)
+        states = _states(group, route, device, collide_every)
     return states, held[0], held[1], held[2]
 
 
@@ -87,19 +88,20 @@ class TestFeatherPGSRowLines(unittest.TestCase):
                     for name, value in identity.items():
                         np.testing.assert_array_equal(value, moved[name], err_msg=name)
 
-    def _check_short(self, groups, device, *, runs: bool = False):
+    def _check_short(self, groups, device, *, runs: bool = False, collide_every: int = 1):
         """Each route on lines as short as its rows, or (``runs``) as short as its topology rows, the rest of its rows
-        in runs of an arena of a line a world for each line its rows hold."""
+        in runs of an arena of a line a world for each line its rows hold; a collision pass every ``collide_every``
+        steps (the steps between keep its frame: a world holds its slots and its run)."""
         for group in groups:
             for route in group.routes:
                 with self.subTest(group=group.name, route=route.name):
-                    full, held, topology, worlds = _extent(group, route, device)
+                    full, held, topology, worlds = _extent(group, route, device, collide_every)
                     rows, arena = _quantum(held), 0
                     if runs:
                         rows = _quantum(topology)
                         arena = worlds * math.ceil(held / rows)
                     with mock.patch.object(Placement, "__init__", _laid_out(rows, arena)):
-                        short = _states(group, route, device)
+                        short = _states(group, route, device, collide_every)
                     for name, value in full.items():
                         np.testing.assert_array_equal(value, short[name], err_msg=name)
 
@@ -146,6 +148,11 @@ class TestFeatherPGSRowLines(unittest.TestCase):
         """Run the CPU's routes on lines that hold only their topology rows, every world's contact rows in a run of the
         arena's lines, bitwise as on the capacities' lines."""
         self._check_short(conformance.cpu_groups(), wp.get_device("cpu"), runs=True)
+
+    def test_worlds_keep_their_runs_through_kept_frames_cpu(self):
+        """Run the CPU's routes with arena runs and a collision pass every other step, bitwise as on the capacities'
+        lines: a step that keeps its frame keeps each world's slots and run, its topology rows moved to it anew."""
+        self._check_short(conformance.cpu_groups(), wp.get_device("cpu"), runs=True, collide_every=2)
 
     @unittest.skipUnless(wp.is_cuda_available(), "CUDA only")
     def test_worlds_keep_their_physics_in_arena_runs_cuda(self):
