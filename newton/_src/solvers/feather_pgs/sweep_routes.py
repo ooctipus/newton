@@ -265,6 +265,11 @@ RUN_AHEAD_WORDS = (("i + 1", 1), ("tangent", 1), ("i + 2", 2), ("sibling", 2), (
 """The kind and parent words a grouped run's visit reads past its own row (:attr:`.sweep.WorldRows.ahead`): a contact
 unit's test of its pair (``i + 1``, ``i + 2``, the unit's ``tangent`` and ``sibling``) and of a spin row (``i + 3``)."""
 
+RUN_KEPT_STORES = 4
+"""The stores a grouped run keeps for its patch rings' walks (:attr:`.sweep.WorldRows.kept_stores`): a patch's
+normals are visited in turn just before its friction pair, so its ring's members are the run's last stores; a longer
+ring's others load. A hardware choice that changes no result: a member read there is the value its load reads."""
+
 RUN_AHEAD_ENTRIES = (("i", 0), ("(parent + 2)", 1), ("spin", 2), ("tangent", 1), ("sibling", 2))
 """The rows whose entries a grouped run's visit reads (:attr:`.response_operator.SparseFactor.ahead`): the visited
 row, a first tangent's sibling and spin row (rows ``i + 1`` and ``i + 2`` at its visit), a unit's pair."""
@@ -2211,7 +2216,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         # (Velocity.carried) and load the next visit's operands while a visit runs (RUN_AHEAD).
         run_rows, run_op = dense, dense_op
         if dense_op.keeps_velocity and dense_op.key is not None:
-            run_rows = dataclasses.replace(dense, ahead=RUN_AHEAD_WORDS)
+            run_rows = dataclasses.replace(dense, ahead=RUN_AHEAD_WORDS, kept_stores=RUN_KEPT_STORES)
             velocity = dataclasses.replace(dense_op.velocity, carried=True)
             run_op = dataclasses.replace(dense_op, velocity=velocity, ahead=RUN_AHEAD_ENTRIES)
             if sweep.contact_units:

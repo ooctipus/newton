@@ -139,6 +139,10 @@ class WorldRows:
     """Rows a visit reads the kind and parent word of (their expressions, each with its offset ``k`` from the visited
     row ``i``) that its run loaded while the visit before ran (:func:`_visit_pipeline`): a read of one takes the
     run's register ``held_w{k}``, the word its load would read."""
+    kept_stores: int = 0
+    """The impulses a run keeps of its last stores with their rows (``kept_row{k}``, ``kept_impulse{k}``, the latest
+    first): a patch ring's walk (:meth:`ring_load`) reads a member there, the value its load would read (only the run
+    writes its rows' impulses inside a color)."""
 
     VISITED: ClassVar[str] = "i"
     """The row a row loop visits, whose record the loop holds in registers."""
@@ -361,10 +365,13 @@ class WorldRows:
                 f"    [&](int patch_row) {{ return {member}; }},\n"
                 f"    [&](int patch_row) {{ return {impulse}; }})"
             )
+        impulse = self.peek("patch_row")
+        for k in reversed(range(self.kept_stores)):
+            impulse = f"patch_row == kept_row{k} ? kept_impulse{k} : {impulse}"
         return (
             f"RING_LOAD({load or self.peek(parent)}, {parent}, {self.capacity},\n"
             f"    [&](int patch_row) {{ return {self.parent('patch_row', enclosed=True)}; }},\n"
-            f"    [&](int patch_row) {{ return {self.peek('patch_row')}; }})"
+            f"    [&](int patch_row) {{ return {impulse}; }})"
         )
 
     def ring_any(self, first: str, predicate: str) -> str:
@@ -2539,6 +2546,12 @@ def _visit_pipeline(rows: WorldRows, end: str, begin: str, torsion: bool, op=Non
         state = [op.carry_state(pad)] if op is not None and op.carries else []
         state += [f"{pad}int {', '.join(f'pre_w{k} = 0' for k in words)};"] if words else []
         state += [op.ahead_state(pad)] if ahead else []
+        if rows.kept_stores:
+            kept = range(rows.kept_stores)
+            state += [
+                f"{pad}int {', '.join(f'kept_row{k} = -1' for k in kept)};",
+                f"{pad}float {', '.join(f'kept_impulse{k} = 0.0f' for k in kept)};",
+            ]
         declared = "".join(f"{line}\n" for line in state)
         return (
             f"{pad}int4 {', '.join(f'pre_{name[-1]}' for name in rows.registers)};\n{pad}float {held};\n{probe}"
@@ -2607,7 +2620,14 @@ def row_step(
         loaded = {"i": "held_row", "i + 1": "held_sib", "spin": "held_spin"}
 
         def store(row: str, value: str) -> str:
-            return f"{{ {rows.store(row, value)} if (({row}) == pipe_next - 1) pre_held_parent = {value}; }}"
+            # The run keeps its last stores for its patch rings' walks (WorldRows.kept_stores), the latest first.
+            kept = "".join(
+                f" kept_row{k} = kept_row{k - 1}; kept_impulse{k} = kept_impulse{k - 1};"
+                for k in reversed(range(1, rows.kept_stores))
+            )
+            if rows.kept_stores:
+                kept += f" kept_row0 = {row}; kept_impulse0 = {value};"
+            return f"{{ {rows.store(row, value)} if (({row}) == pipe_next - 1) pre_held_parent = {value};{kept} }}"
 
         # A visited first tangent's normal is row i - 1, and its spin row, if any, row i + 2.
         ctx = dataclasses.replace(
