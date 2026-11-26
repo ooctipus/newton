@@ -315,8 +315,9 @@ class TestFeatherPGSHeteroGuard(unittest.TestCase):
 
 
 class TestFeatherPGSCapacityStatus(unittest.TestCase):
-    def test_capacity_failure_is_observable_without_watermarks(self):
-        """Expose dropped contacts even when optional detailed telemetry is off."""
+    def test_a_step_past_its_capacity_drops_nothing(self):
+        """A step outside capture whose world asks for more rows than its capacities hold grows them and repeats: no
+        contact is dropped, no status latches, and the applied options name the grown capacities."""
         builder = newton.ModelBuilder()
         builder.add_ground_plane()
         body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.1), wp.quat_identity()))
@@ -329,11 +330,11 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
         state_in, state_out = model.state(), model.state()
         pipeline.collide(state_in, contacts)
         solver.step(state_in, state_out, model.control(), contacts, 1.0 / 240.0)
-        with self.assertRaisesRegex(RuntimeError, "capacity"):
-            solver.check_constraint_capacity()
-        self.assertTrue(solver.placement.constraint_overflow.numpy()[0])
-        solver.reset(state_out)
         solver.check_constraint_capacity()
+        self.assertFalse(any(solver.constraint_capacity_status().values()))
+        options = solver.get_path_selection()["options"]
+        self.assertGreater(options["dense_max_constraints"]["applied"], 1)
+        self.assertEqual(options["dense_max_constraints"]["requested"], 1)
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -543,7 +544,7 @@ class TestFeatherPGSReset(unittest.TestCase):
 
     def test_model_change_restarts_every_world_and_keeps_the_status(self):
         """After a model change, step every world as a fresh solver that starts from the same friction history does,
-        and keep a capacity failure latched.
+        and keep the capacities a step grew.
 
         A model change restarts the solver's caches. The friction anchors are physical state, not a cache: a stick's
         displacement is where a contact held, so the notified solver keeps them (geometry edits retire them, and
@@ -567,18 +568,17 @@ class TestFeatherPGSReset(unittest.TestCase):
                 stepped, expected = run.step(), fresh.step()
                 for name in STATE_FIELDS:
                     np.testing.assert_array_equal(stepped[name], expected[name], err_msg=name)
-        # Two rows a world (a free body's contacts are rows of the line) cannot hold a box's contacts: the failure stays
-        # latched through a model change.
+        # Two rows a world (a free body's contacts are rows of the line) cannot hold a box's contacts: the step grows
+        # them, and a model change keeps what it grew.
         solver = SolverFeatherPGS(model, dense_max_constraints=1, mf_max_constraints=1)
         pipeline = newton.CollisionPipeline(model, growable_contacts=True)
         contacts = pipeline.contacts()
         pipeline.collide(start, contacts)
         solver.step(start, model.state(), model.control(), contacts, DT)
-        with self.assertRaisesRegex(RuntimeError, "capacity"):
-            solver.check_constraint_capacity()
+        grown = solver.get_path_selection()["options"]["dense_max_constraints"]["applied"]
         solver.notify_model_changed(newton.ModelFlags.BODY_INERTIAL_PROPERTIES)
-        with self.assertRaisesRegex(RuntimeError, "capacity"):
-            solver.check_constraint_capacity()
+        solver.check_constraint_capacity()
+        self.assertEqual(solver.get_path_selection()["options"]["dense_max_constraints"]["applied"], grown)
 
 
 for _test in (test_reset_restarts_only_the_masked_worlds, test_reset_is_capturable):

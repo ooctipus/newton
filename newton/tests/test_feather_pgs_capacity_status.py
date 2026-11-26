@@ -168,7 +168,8 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
         solver.check_constraint_capacity()
 
     def test_sufficient_capacity_preserves_full_contact_law(self):
-        """Solve all 205 point-friction contacts at 640 rows and compare a larger control."""
+        """Solve all 205 point-friction contacts at 640 rows and a larger control alike; from 192 rows the first step
+        grows the capacity and repeats, so it solves them alike too."""
         count = 205
         dt = 0.01
         depths = np.full(count, 0.005, dtype=np.float32)
@@ -216,14 +217,7 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
             contacts.rigid_contact_normal.assign(np.tile([0.0, 0.0, -1.0], (count, 1)).astype(np.float32))
             history = []
             observables = solver.observables(contacts=contacts, kinds={solver.ObservableKind.CONTACT_F})
-            for step in range(3):
-                if capacity < 640 and step > 0:
-                    # The pass that dropped rows fails the next step, naming the rows the world asked for.
-                    with self.assertRaisesRegex(
-                        RuntimeError, "requested 615 dense rows .*dense_max_constraints >= 615"
-                    ):
-                        solver.step(state_in, state_out, model.control(), contacts, dt, observables=observables)
-                    break
+            for _ in range(3):
                 old_velocity = float(state_in.joint_qd.numpy()[0])
                 old_position = float(state_in.joint_q.numpy()[0])
                 solver.step(state_in, state_out, model.control(), contacts, dt, observables=observables)
@@ -231,32 +225,36 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
                 forces = contacts.rigid_contact_force.numpy()
                 self.assertTrue(np.isfinite(forces).all())
                 self.assertTrue(np.isfinite(state_out.joint_q.numpy()).all())
-                if capacity >= 640:
-                    solver.check_constraint_capacity()
-                    # Every contact's three rows.
-                    self.assertEqual(int(solver.placement.constraint_count.numpy()[0]), count * 3)
-                    residual = velocity + solver.options.pgs_beta * (old_position - depths.astype(np.float64)) / dt
-                    self.assertGreaterEqual(float(residual.min()), -2.0e-6)
-                    self.assertGreaterEqual(float(forces[:, 2].min()), -1.0e-7)
-                    np.testing.assert_allclose(dt * forces[:, 2] * residual, 0.0, atol=1.0e-7)
-                    np.testing.assert_allclose(forces[:, :2], 0.0, atol=1.0e-7)
-                    # Force on contact A opposes the collision normal, so the
-                    # upward published impulse accounts for the body's momentum.
-                    np.testing.assert_allclose(
-                        dt * forces[:, 2].sum(dtype=np.float64),
-                        float(model.body_mass.numpy()[body]) * (velocity - old_velocity),
-                        rtol=2.0e-5,
-                        atol=2.0e-6,
-                    )
-                else:
-                    self.assertTrue(solver.constraint_capacity_status()["dense"])
+                if capacity < 640:
+                    # The step outside capture grew the capacity to the rows it asked for (615: a rise from none
+                    # predicts no more), in a power of two of L1 lines, and repeated: nothing dropped.
+                    self.assertEqual(solver.placement.dense_max_constraints, 1024)
+                    self.assertFalse(any(solver.constraint_capacity_status().values()))
+                solver.check_constraint_capacity()
+                # Every contact's three rows.
+                self.assertEqual(int(solver.placement.constraint_count.numpy()[0]), count * 3)
+                residual = velocity + solver.options.pgs_beta * (old_position - depths.astype(np.float64)) / dt
+                self.assertGreaterEqual(float(residual.min()), -2.0e-6)
+                self.assertGreaterEqual(float(forces[:, 2].min()), -1.0e-7)
+                np.testing.assert_allclose(dt * forces[:, 2] * residual, 0.0, atol=1.0e-7)
+                np.testing.assert_allclose(forces[:, :2], 0.0, atol=1.0e-7)
+                # Force on contact A opposes the collision normal, so the
+                # upward published impulse accounts for the body's momentum.
+                np.testing.assert_allclose(
+                    dt * forces[:, 2].sum(dtype=np.float64),
+                    float(model.body_mass.numpy()[body]) * (velocity - old_velocity),
+                    rtol=2.0e-5,
+                    atol=2.0e-6,
+                )
                 history.append((state_out.joint_q.numpy().copy(), state_out.joint_qd.numpy().copy(), forces.copy()))
                 state_in, state_out = state_out, state_in
             histories[capacity] = history
         for actual, expected in zip(histories[640], histories[768], strict=True):
             for actual_array, expected_array in zip(actual, expected, strict=True):
                 np.testing.assert_allclose(actual_array, expected_array, rtol=2.0e-5, atol=2.0e-6)
-        self.assertLess(float(histories[192][0][1][0]), float(histories[640][0][1][0]) - 1.0e-3)
+        for actual, expected in zip(histories[192], histories[640], strict=True):
+            for actual_array, expected_array in zip(actual, expected, strict=True):
+                np.testing.assert_allclose(actual_array, expected_array, rtol=2.0e-5, atol=2.0e-6)
 
     def test_full_triples_192_vs_640(self):
         """Expose dropped triples at 192 rows while retaining all 615 rows at 640."""
@@ -364,15 +362,13 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
         solver.check_constraint_capacity()
         self.assertEqual(solver.placement.dense_max_constraints, 192)
 
-    def test_overflow_reports_the_rows_a_world_asked_for(self):
-        """A box on a ball joint that lands on the floor asks for more dense rows than the line holds: the next step
-        fails closed with the rows asked for, the world's latch stays set, its largest reservation is kept until reset,
-        and the public check names it with the option that would hold it; the state stays finite."""
+    @staticmethod
+    def _box_on_ball(device="cpu", height=0.25):
         builder = newton.ModelBuilder()
         builder.add_ground_plane()
-        anchor = builder.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, 0.25), wp.quat_identity()))
+        anchor = builder.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, height), wp.quat_identity()))
         builder.add_shape_box(anchor, hx=0.2, hy=0.2, hz=0.05)
-        limb = builder.add_link(xform=wp.transform(wp.vec3(0.3, 0.0, 0.25), wp.quat_identity()))
+        limb = builder.add_link(xform=wp.transform(wp.vec3(0.3, 0.0, height), wp.quat_identity()))
         builder.add_shape_box(limb, hx=0.1, hy=0.2, hz=0.05)
         free = builder.add_joint_free(anchor)
         ball = builder.add_joint_ball(
@@ -382,29 +378,134 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
             child_xform=wp.transform(wp.vec3(-0.1, 0.0, 0.0), wp.quat_identity()),
         )
         builder.add_articulation([free, ball])
-        model = builder.finalize(device="cpu")
-        solver = SolverFeatherPGS(model, dense_max_constraints=6)
+        return builder.finalize(device=device)
+
+    @staticmethod
+    def _land(model, solver, steps=40):
+        """Drop the box on its ball joint for ``steps`` steps, the solver's service after each; each step's state."""
         pipeline = newton.CollisionPipeline(model)
         contacts = pipeline.contacts()
         state_in, state_out, control = model.state(), model.state(), model.control()
-        with self.assertRaisesRegex(
-            RuntimeError, "requested [0-9]+ dense rows .*the solver does not step without them"
-        ):
-            for _ in range(40):
-                pipeline.collide(state_in, contacts)
-                solver.step(state_in, state_out, control, contacts, 1.0 / 200.0)
-                state_in, state_out = state_out, state_in
-        self.assertTrue(np.isfinite(state_in.body_q.numpy()).all())
-        self.assertTrue(solver.placement.constraint_overflow.numpy()[0])
-        asked = int(solver.placement.row_demand.numpy()[0, 0])
-        self.assertGreater(asked, solver.placement.dense_max_constraints)
-        with self.assertRaisesRegex(RuntimeError, f"requested {asked} dense rows .*dense_max_constraints >= {asked}"):
-            solver.check_constraint_capacity()
-        solver.reset(model.state())
-        self.assertEqual(int(solver.placement.row_demand.numpy()[0, 0]), 0)
+        history = []
+        for _ in range(steps):
+            pipeline.collide(state_in, contacts)
+            solver.step(state_in, state_out, control, contacts, 1.0 / 200.0)
+            # The pipeline's contacts are fixed, so its service does not reach the solver's pool: serve it directly.
+            solver.serve_rows()
+            state_in, state_out = state_out, state_in
+            history.append((state_in.body_q.numpy().copy(), state_in.body_qd.numpy().copy()))
+        return history, state_in, state_out, contacts, control
+
+    def test_a_step_past_its_capacity_grows_and_repeats(self):
+        """A box on a ball joint that lands on the floor asks for more dense rows than the line holds: the step, outside
+        capture, grows the capacity and repeats, so no pass drops a row, no status latches, and the run equals one
+        built at the grown capacity, bit for bit."""
+        model = self._box_on_ball()
+        solver = SolverFeatherPGS(model, dense_max_constraints=6)
+        history, *_ = self._land(model, solver)
+        capacity = solver.placement.dense_max_constraints
+        self.assertGreater(capacity, 6)
+        self.assertEqual(solver.placement.rows_asked()[0], 0)
+        self.assertFalse(solver.placement.constraint_overflow.numpy().any())
+        self.assertFalse(any(solver.constraint_capacity_status().values()))
         solver.check_constraint_capacity()
-        # The reset restarts the record: the next pass steps.
-        solver.step(state_in, state_out, control, contacts, 1.0 / 200.0)
+        self.assertEqual(solver.get_path_selection()["options"]["dense_max_constraints"]["requested"], 6)
+        built, *_ = self._land(model, SolverFeatherPGS(model, dense_max_constraints=capacity))
+        for actual, expected in zip(history, built, strict=True):
+            for actual_array, expected_array in zip(actual, expected, strict=True):
+                np.testing.assert_array_equal(actual_array, expected_array)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "graph replays are CUDA's")
+    def test_a_replay_past_its_capacity_latches_and_the_service_grows(self):
+        """Inside capture no step can stop: a graph replay whose world asks for more dense rows than its capacity holds
+        drops them and latches the world's status; the next service grows the capacity and asks for a recapture, and
+        the recaptured step's replays drop nothing: one replay dropped rows, and the status stays until reset."""
+        device = wp.get_cuda_device()
+        model = self._box_on_ball(device, height=1.0)
+        # One row: the first contact's three rows pass it.
+        solver = SolverFeatherPGS(model, dense_max_constraints=1)
+        pipeline = newton.CollisionPipeline(model)
+        contacts = pipeline.contacts()
+        states, control = (model.state(), model.state()), model.control()
+
+        def step(source, target):
+            pipeline.collide(states[source], contacts)
+            solver.step(states[source], states[target], control, contacts, 1.0 / 200.0)
+
+        # Eager steps high in the air (the box falls about 95 cm to the floor): every kernel loads, no row is asked for.
+        for k in range(10):
+            step(k % 2, 1 - k % 2)
+        self.assertEqual(solver.placement.dense_max_constraints, 1)
+
+        def capture():
+            graphs = []
+            for source in (0, 1):
+                with wp.ScopedCapture(device) as scope:
+                    step(source, 1 - source)
+                graphs.append(scope.graph)
+            return graphs
+
+        graphs, dropped_replays, grown = capture(), 0, False
+        for k in range(160):
+            wp.capture_launch(graphs[k % 2])
+            wp.synchronize_device(device)
+            if solver.placement.rows_asked()[0] > 0:
+                dropped_replays += 1
+                self.assertTrue(solver.placement.constraint_overflow.numpy()[0])
+            if solver.serve_rows():
+                grown = True
+                graphs = capture()
+        self.assertTrue(grown)
+        self.assertEqual(dropped_replays, 1)
+        self.assertGreater(solver.placement.dense_max_constraints, 1)
+        self.assertEqual(solver.placement.rows_asked()[0], 0)
+        with self.assertRaisesRegex(RuntimeError, "dense_max_constraints >= "):
+            solver.check_constraint_capacity()
+        self.assertTrue(np.isfinite(states[0].body_q.numpy()).all())
+        solver.reset(model.state())
+        solver.check_constraint_capacity()
+
+    @staticmethod
+    def _box_stack(levels=4):
+        """A 2 x 2 x ``levels`` stack of free boxes resting on a ground plane."""
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()
+        for i in range(2):
+            for j in range(2):
+                for k in range(levels):
+                    body = builder.add_body(
+                        xform=wp.transform(wp.vec3(0.2 * i, 0.2 * j, 0.1 + 0.2 * k), wp.quat_identity())
+                    )
+                    builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1)
+        return builder.finalize(device="cpu")
+
+    def test_default_rows_hold_a_resting_box_stack(self):
+        """A resting 2 x 2 x 4 box stack asks for more free-body rows than the default 512 a world: its steps grow the
+        rows without dropping any, and it stays stacked."""
+        model = self._box_stack()
+        solver = SolverFeatherPGS(model, diagnostics=SolverFeatherPGS.Diagnostics(row_watermark=True))
+        pipeline = newton.CollisionPipeline(model)
+        contacts = pipeline.contacts()
+        state_in, state_out, control = model.state(), model.state(), model.control()
+        for _ in range(30):
+            pipeline.collide(state_in, contacts)
+            solver.step(state_in, state_out, control, contacts, 1.0 / 600.0)
+            state_in, state_out = state_out, state_in
+        marks = solver.constraint_row_watermarks()
+        self.assertGreater(marks["mf_high_water"], 512)
+        self.assertLessEqual(marks["mf_raw_high_water"], solver.placement.mf_max_constraints)
+        self.assertEqual(marks["mf_overflow_world_steps"], 0)
+        self.assertAlmostEqual(float(state_in.body_q.numpy()[:, 2].max()), 0.7, delta=1.0e-3)
+
+    def test_default_dense_rows_hold_a_landing_limb(self):
+        """The jointed box that lands on the floor (above) steps at the default dense rows, dropping none."""
+        model = self._box_on_ball()
+        solver = SolverFeatherPGS(model)
+        self.assertEqual(solver.placement.dense_max_constraints, 32)
+        _, state_in, *_ = self._land(model, solver)
+        solver.check_constraint_capacity()
+        self.assertFalse(any(solver.constraint_capacity_status().values()))
+        self.assertTrue(np.isfinite(state_in.body_q.numpy()).all())
 
     def test_public_check_rejects_capture(self):
         """Reject host reads and explicit clears during CUDA graph capture."""

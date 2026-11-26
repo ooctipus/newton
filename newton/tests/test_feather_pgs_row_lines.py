@@ -193,8 +193,8 @@ class TestFeatherPGSRowLines(unittest.TestCase):
 
     def test_a_full_arena_drops_rows_with_status_cpu(self):
         """Run a stack on lines that hold only its topology rows and an arena of one line, too short for its run: its
-        contact rows have no run, so they are rejected past its line, the arena records the refused claim and the step
-        fails closed on the dropped rows instead of writing past its line."""
+        contact rows have no run, so they are rejected past its line instead of written past it: the arena records the
+        refused claim, the pass counts its dropped rows and the world's latch holds them."""
         device = wp.get_device("cpu")
         group = next(group for group in conformance.cpu_groups() if group.name == "box_stack_patch")
         route = group.routes[0]
@@ -208,9 +208,10 @@ class TestFeatherPGSRowLines(unittest.TestCase):
             placements.append(self)
 
         with mock.patch.object(Placement, "__init__", construct):
-            with self.assertRaisesRegex(RuntimeError, "dropped"):
-                _states(group, route, device)
+            _states(group, route, device)
         self.assertGreater(int(placements[-1].arena_record_host.numpy()[1]), 0)
+        self.assertGreater(placements[-1].rows_asked()[0], 0)
+        self.assertTrue(placements[-1].constraint_overflow.numpy().any())
 
     def test_worlds_keep_their_physics_in_arena_runs_cpu(self):
         """Run the CPU's routes on lines that hold only their topology rows, every world's contact rows in a run of the

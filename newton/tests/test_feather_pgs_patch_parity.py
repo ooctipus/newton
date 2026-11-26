@@ -363,13 +363,14 @@ class TestFeatherPGSPatchParity(unittest.TestCase):
             device="cpu",
         )
         solver = case[1]
-        starts, dispatch = [], solver.sweep.solve
+        # On the sweep's class: a capacity's growth plans the step anew with a sweep of its own.
+        starts, dispatch = [], type(solver.sweep).solve
 
-        def recorded(*args, **kwargs):
+        def recorded(sweep, *args, **kwargs):
             starts.append((solver.placement.impulses.numpy().copy(), solver.placement.row_type.numpy().copy()))
-            return dispatch(*args, **kwargs)
+            return dispatch(sweep, *args, **kwargs)
 
-        with mock.patch.object(solver.sweep, "solve", recorded):
+        with mock.patch.object(type(solver.sweep), "solve", recorded):
             for _ in range(4):
                 sparse_scene.step(case)
         self.assertEqual(len(starts), 4)

@@ -299,20 +299,20 @@ class TestSeparatedWorldsDevice(unittest.TestCase):
         self.assertGreater(int(masks.sum()), 0)
         self.assertGreater(solver.constraint_row_watermarks()["dense_high_water"], 0)
 
-    def test_capacity_rejections_keep_their_anchors(self):
-        """A separating world whose contact rows overflow a route: the allocator rejects them as on the complete path,
-        and the rejected contact keeps its anchor while the world takes no sweep; the next step fails closed on the
-        dropped rows on both paths."""
+    def test_a_separating_world_past_its_capacity_grows_alike(self):
+        """A separating world whose contact rows ask past a route's capacity: the step grows the capacity and repeats
+        on both paths alike, so no row is rejected, no status latches, and the separated path keeps the anchors the
+        complete path keeps, step by step."""
         model = _tossed_spheres(wp.get_device())
         # Thirty steps: each sphere rises about 5 cm and starts falling, inside the 10 cm contact gap.
         # A free body's contacts are rows of the line: two rows a world cannot hold a contact's three.
         options = {"steps": 30, "toss_every": 1, "solver_kwargs": {"dense_max_constraints": 1, "mf_max_constraints": 1}}
         complete_history, history = [], []
         for separated, steps in ((False, complete_history), (True, history)):
-            with self.assertRaisesRegex(RuntimeError, "dropped them"):
-                _rollout(model, separated=separated, history=steps, **options)
-        self.assertGreater(len(complete_history), 0, "no step before the pass that dropped rows")
-        self.assertGreater(min(int(np.sum(record["valid"])) for record in complete_history), 0, "no anchor kept")
+            solver, *_ = _rollout(model, separated=separated, history=steps, **options)
+            self.assertFalse(solver.placement.constraint_overflow.numpy().any())
+            self.assertGreater(solver.placement.mf_max_constraints + solver.placement.dense_max_constraints, 2)
+        self.assertEqual(len(history), len(complete_history))
         for step, (record, expected) in enumerate(zip(history, complete_history, strict=True)):
             np.testing.assert_array_equal(record["valid"], expected["valid"], err_msg=f"anchors at {step}")
 

@@ -256,12 +256,12 @@ class TestFeatherPGSContactRowOrder(unittest.TestCase):
         """Order the contact rows by the frame whatever order the CUDA collision's threads write the contacts in."""
         self._check_collision_order_changes_nothing(wp.get_device("cuda:0"))
 
-    def test_overflowing_family_keeps_the_frame_order_cpu(self):
-        """Keep both row families in the frame's order when the dense family overflows.
+    def test_a_family_past_its_capacity_grows_in_the_frame_order_cpu(self):
+        """Keep both row families in the frame's order when the dense family asks past its capacity.
 
-        With 40 dense rows the tripods' worlds overflow their dense rows while their matrix-free
-        rows fit. Each family's accepted rows tile the world's rows up to the finalized count, in
-        the frame's order (one step: the next fails closed on the dropped rows).
+        With 40 dense rows the tripods' worlds ask past their dense rows while their matrix-free rows
+        fit: the step grows the dense rows and repeats, so no row is rejected, and each family's rows
+        tile the world's rows up to the finalized count, in the frame's order.
         """
         records = _step_tripods(wp.get_device("cpu"), steps=1, dense_max_constraints=40)
         for step, record in enumerate(records):
@@ -275,7 +275,7 @@ class TestFeatherPGSContactRowOrder(unittest.TestCase):
                         rows, np.arange(starts[world], counts[world]), err_msg=f"step {step} path {path}"
                     )
                     self.assertTrue(np.all(np.diff(slots) > 0), f"step {step}: {slots}")
-            self.assertTrue(np.all(record["dense_overflow"]), f"step {step}: dense rows did not overflow")
+            self.assertFalse(np.any(record["dense_overflow"]), f"step {step}: dense rows overflowed")
             self.assertTrue(np.isfinite(record["joint_qd"]).all())
 
 

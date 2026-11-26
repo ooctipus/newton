@@ -394,6 +394,8 @@ class TestRegionStream(unittest.TestCase):
                 pipeline.collide(state, contacts)
             solver.step(state, out, control, contacts, dt)
             state, out = out, state
+            # The step's own sweep: a capacity's growth plans the step anew with a sweep of its own.
+            regions = solver.sweep.regions
             if regions.relist.numpy()[0] != 0:
                 continue
             held += 1
@@ -465,6 +467,8 @@ class TestRegionStream(unittest.TestCase):
             left_seen += len(left)
             acting_seen += len(acting)
             solver.step(state, out, control, contacts, 1.0 / 480.0)
+            # The step's own sweep: a capacity's growth plans the step anew with a sweep of its own.
+            regions = solver.sweep.regions
             state, out = out, state
         self.assertGreater(left_seen, 0)
         self.assertGreater(acting_seen, 0)

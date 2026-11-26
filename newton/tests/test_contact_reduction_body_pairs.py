@@ -803,8 +803,10 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
         # bound instead of the calm default.
         self.assertLess(w_on, max(2.0 * w_off, w_tol), f"reduced settle is rocking: |w| {w_on} vs {w_off}")
 
-    def test_row_watermark_reports_raw_dense_overflow(self):
-        """Report attempted dense rows separately from the clamped count."""
+    def test_row_watermark_reports_raw_dense_rows(self):
+        """A chain past every limit asks for more dense rows than four: the step outside capture grows the capacity and
+        repeats, so the attempted rows are the held ones, no world step overflows and no warning is emitted (inside
+        capture the status answers it: test_feather_pgs_capacity_status)."""
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, -9.81))
         no_collision = builder.default_shape_cfg.copy()
         no_collision.has_shape_collision = False
@@ -846,15 +848,16 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
         solver.step(state_0, state_1, model.control(), contacts, DT)
         rows = solver.constraint_row_watermarks()
 
-        self.assertGreater(rows["dense_high_water"], 0)
-        self.assertLessEqual(rows["dense_high_water"], 4)
-        self.assertGreater(rows["dense_raw_high_water"], rows["dense_high_water"])
-        self.assertEqual(rows["dense_overflow_world_steps"], 1)
-        self.assertGreater(rows["dense_overflow_excess_high_water"], 0)
-        self.assertEqual(int(solver.placement.row_overflow_warning_emitted.numpy()[0]), 1)
+        self.assertGreater(rows["dense_high_water"], 4)
+        self.assertLessEqual(rows["dense_high_water"], solver.placement.dense_max_constraints)
+        self.assertEqual(rows["dense_raw_high_water"], rows["dense_high_water"])
+        self.assertEqual(rows["dense_overflow_world_steps"], 0)
+        self.assertEqual(rows["dense_overflow_excess_high_water"], 0)
+        self.assertEqual(int(solver.placement.row_overflow_warning_emitted.numpy()[0]), 0)
 
-    def test_row_watermark_includes_rolled_back_contact_rows(self):
-        """Count contact bundles rejected and rolled back by the allocator."""
+    def test_row_watermark_rolls_back_no_contact_rows(self):
+        """A foot's contacts ask for more dense rows than four: the step outside capture grows the capacity and
+        repeats, so the allocator rolls back no contact bundle."""
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
         _prismatic_jointed_foot(builder, (0.0, 0.0, 0.02))
         builder.add_ground_plane()
@@ -875,17 +878,14 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
         solver.step(state_0, state_1, model.control(), contacts, DT)
         rows = solver.constraint_row_watermarks()
 
-        self.assertGreater(rows["dense_raw_high_water"], rows["dense_high_water"])
-        self.assertGreater(rows["dense_dropped_contact_rows_high_water"], 0)
-        self.assertEqual(
-            rows["dense_raw_high_water"],
-            rows["dense_high_water"] + rows["dense_dropped_contact_rows_high_water"],
-        )
-        self.assertEqual(rows["dense_overflow_world_steps"], 1)
-        self.assertGreater(rows["dense_overflow_excess_high_water"], 0)
+        self.assertGreater(rows["dense_high_water"], 4)
+        self.assertEqual(rows["dense_dropped_contact_rows_high_water"], 0)
+        self.assertEqual(rows["dense_raw_high_water"], rows["dense_high_water"])
+        self.assertEqual(rows["dense_overflow_world_steps"], 0)
 
-    def test_constraint_overflow_warning_does_not_require_row_watermark(self):
-        """Keep the default warning active without full high-water telemetry."""
+    def test_a_dense_overflow_is_grown_without_row_watermark(self):
+        """Without the high-water telemetry, a step whose foot asks past four dense rows grows them and repeats: no row
+        is dropped and no warning is emitted."""
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
         _prismatic_jointed_foot(builder, (0.0, 0.0, 0.02))
         builder.add_ground_plane()
@@ -904,12 +904,14 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
         solver.step(state_0, state_1, model.control(), contacts, DT)
 
         self.assertEqual(solver.constraint_row_watermarks()["dense_high_water"], 0)
-        self.assertGreater(int(solver.placement.row_dropped_dense.numpy().max()), 0)
-        self.assertEqual(int(solver.placement.row_overflow_warning_emitted.numpy()[0]), 1)
+        self.assertEqual(int(solver.placement.row_dropped_dense.numpy().max()), 0)
+        self.assertEqual(int(solver.placement.row_overflow_warning_emitted.numpy()[0]), 0)
+        self.assertGreater(solver.placement.dense_max_constraints, 4)
 
-    def test_constraint_overflow_warning_covers_matrix_free_rows(self):
-        """Identify overflows of a free body's contact rows: a lone free body's are rows of the line, whose capacity
-        holds the free bodies' (``mf_max_constraints``) beside the dense rows'."""
+    def test_a_free_body_overflow_is_grown(self):
+        """A lone free body's contact rows are rows of the line, whose capacity holds the free bodies'
+        (``mf_max_constraints``) beside the dense rows': a step past four of each grows the line and repeats, dropping
+        none."""
         if not wp.get_device().is_cuda:
             self.skipTest("matrix-free FeatherPGS overflow coverage is CUDA-only")
 
@@ -931,8 +933,9 @@ class TestBodyPairReductionSolverConformance(unittest.TestCase):
         )
         solver.step(state_0, state_1, model.control(), contacts, DT)
 
-        self.assertGreater(int(solver.placement.row_dropped_dense.numpy().max()), 0)
-        self.assertEqual(int(solver.placement.row_overflow_warning_emitted.numpy()[0]), 1)
+        self.assertEqual(int(solver.placement.row_dropped_dense.numpy().max()), 0)
+        self.assertEqual(int(solver.placement.row_overflow_warning_emitted.numpy()[0]), 0)
+        self.assertGreater(solver.placement.dense_max_constraints, 4)
 
     def test_feather_pgs_conformance(self):
         """SolverFeatherPGS rests a free-jointed foot at the same height on/off.

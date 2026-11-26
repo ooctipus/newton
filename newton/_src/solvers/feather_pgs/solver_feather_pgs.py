@@ -16,6 +16,7 @@
 import copy
 import dataclasses
 import sys
+import warnings
 from collections.abc import Sequence
 from types import SimpleNamespace
 
@@ -23,6 +24,7 @@ import numpy as np
 import warp as wp
 
 from ...core import execution
+from ...core.contact_pool import FORECAST_QUEUE, capturing
 from ...core.types import override
 from ...sim import Contacts, Control, Model, ModelBuilder, ModelFlags, State, StateFlags
 from ..semi_implicit.kernels_contact import (
@@ -45,7 +47,7 @@ from .field_group import Field, FieldGroup, SolverArrays
 from .forest_plan import ForestPlan, joint_forest
 from .joint_wrenches import parent_wrenches
 from .path_selection import applied_options, measurement_selection, route_selection
-from .placement import Placement
+from .placement import Placement, RowsDropped
 from .route_table import Pins, RouteRow
 from .rows import RowLaws
 from .sleep import Sleep
@@ -391,8 +393,10 @@ class SolverFeatherPGS(SolverBase):
                 target fires are solved rigid. ``0`` is the
                 exact rigid law. Values above ``1e6`` are rejected because they are not
                 numerically useful in the float32 solve. Defaults to 0.0.
-            dense_max_constraints (int, optional): Maximum number of dense (articulation) contact constraint
-                rows stored per world. Free rigid body contacts are bounded by mf_max_constraints. Defaults to 32.
+            dense_max_constraints (int, optional): The dense (articulation) contact constraint rows a world
+                starts with. Free rigid body contacts are held by mf_max_constraints. A step outside capture whose
+                world asks for more grows it and repeats, dropping nothing; under capture, where the worlds' next ask
+                is predicted past it, it grows at the next service (:meth:`serve_rows`). Defaults to 32.
             pgs_warmstart (bool, optional): Re-use dense and matrix-free contact normal
                 impulses from the previous frame. Contact normal rows carry by contact identity
                 through the collision pipeline's ``rigid_contact_match_index``; a non-``None``
@@ -403,10 +407,10 @@ class SolverFeatherPGS(SolverBase):
                 contract. Defaults to False.
             pgs_warmstart_decay (float, optional): Finite non-negative scale applied to
                 contact impulses carried from the previous frame. Defaults to 1.0.
-            mf_max_constraints (int, optional): Maximum number of free rigid body contact rows per world, at
-                least 1 and at most 65535. A free body is a one-node tree: its contact rows join the world's row
-                capacity, except in models whose worlds hold enough free bodies for the colored sweep, where they
-                keep a run of their own. Defaults to 512.
+            mf_max_constraints (int, optional): The free rigid body contact rows a world starts with, at least 1.
+                A free body is a one-node tree: its contact rows join the world's row capacity, except in models whose
+                worlds hold enough free bodies for the colored sweep, where they keep a run of their own. It grows as
+                ``dense_max_constraints`` does. Defaults to 512.
             enable_restitution: Whether rigid contacts apply their authored restitution coefficients. Defaults to
                 ``True`` to preserve FeatherPGS behavior before this option was exposed.
             restitution_velocity_threshold (float, optional): Minimum magnitude of the frozen pre-contact
@@ -470,7 +474,31 @@ class SolverFeatherPGS(SolverBase):
         laws = self.laws.set
         # The passive joint forces and the per-coordinate drive rows the class rules read (the held tree's admission).
         self.factor.plan(self.forest, self.laws)
-        capacities = Capacities.build(options, self.forest, self.laws.link_rows_per_world)
+        # The rest law (sleep.py), where a tree can rest: its stages hold the asleep trees and count the quiet ones. It
+        # reads no row capacity, so a re-plan keeps it, and the collision pipeline's filter on it.
+        self.sleep = Sleep.build(self)
+        self._contact_material_placeholder = self._arrays.placeholder(wp.float32, (1,))
+        self._bind_contact_material(None)
+        self._allocate_common_buffers(model)
+        self._pins, self._requested_options, self._replanned, self._walking = pins, requested_options, False, None
+        self._retired_plan = None
+        # The rows any world asked for at the last service and their largest rise from one service to the next, a
+        # class: the next ask is predicted as the one plus the other (serve_rows).
+        self._rows_seen, self._rows_rise = [0, 0], [0, 0]
+        self._plan_rows(Capacities.build(options, self.forest, self.laws.link_rows_per_world))
+        # A world near a row capacity grows it at the contact pool's service, outside capture (serve_rows); a model
+        # without worlds holds no pool.
+        pool = getattr(self.placement, "contact_pool", None)
+        if pool is not None:
+            pool.serve(self.serve_rows)
+
+    def _plan_rows(self, capacities: Capacities) -> None:
+        """Plan the step at the row capacities ``capacities``: the class plan, the spec, the placement, the sweep, the
+        held dynamics and the step plan are each built from them, at construction and at a capacity's growth
+        (:meth:`serve_rows`). The cut, the forest, the row laws (the friction anchors among them), the tree factor's
+        plan and the rest law read no capacity and stay."""
+        model, options, pins = self.model, self.options, self._pins
+        laws = self.laws.set
         # The class plan, axis 3 of the route table: the placement case, decided by rules over the data above before
         # any owner of the class (class_plan.RULES, in precedence order).
         classes = plan_class(
@@ -496,9 +524,12 @@ class SolverFeatherPGS(SolverBase):
         self.sweep.place_diagonal(classes.diagonal)
         self.placement.dense_internal_max_rows = self.placement.internal_rows_per_world(model)
         self.placement.dense_internal_rows_at_once = self.placement.internal_rows_per_world(model, at_once=True)
-        self._contact_material_placeholder = self._arrays.placeholder(wp.float32, (1,))
-        self._bind_contact_material(None)
-        self._allocate_common_buffers(model)
+        diagonal = classes.diagonal
+        self.placement.fused_diagonal_limit_dof_mask = (
+            wp.array(diagonal.fused_mask, dtype=wp.int32, device=model.device)
+            if diagonal is not None and diagonal.fused_sizes
+            else self._arrays.placeholder(wp.int32)
+        )
         self.sweep.place_packed(classes.packed)
         # The dense rows live packed (packed_rows) in every class but the sparse diagonal (case K2): the matrix-free
         # sweeps and native sparse factors (case K1) read them there. Decided before the buffers, since that placement
@@ -517,8 +548,10 @@ class SolverFeatherPGS(SolverBase):
         # a coordinate, which the star's rows and the sparse diagonal's leave already take), so it takes none either,
         # in a held tree group or in the one-coordinate class (coordinate_trees.py). The packed rows' classes read it.
         walking = classes.held.walking
-        if walking.size:
+        # A re-plan that walks the same trees keeps the walk's data, which the last step's finish published.
+        if walking.size and not np.array_equal(walking, self._walking):
             self.factor.plan_walk(walking)
+        self._walking = walking
         self.placement.allocate_packed_rows()
         # The general placement (case K6) whitens and leaves its rows by the walk (FL3.3): the factor holds the walk's
         # data for every responding tree, a free rigid body's six coordinates included, and the one writer, the free
@@ -576,8 +609,6 @@ class SolverFeatherPGS(SolverBase):
                 "dense": self.spec.classes.dense_size if support == "diagonal" else None,
             },
         )
-        # The rest law (sleep.py), where a tree can rest: its stages hold the asleep trees and count the quiet ones.
-        self.sleep = Sleep.build(self)
         # The step: its stages bound to the owners above from the spec and the route, the sweep's kernels and streams,
         # and its per-stage dispatch tables, which the route record reads.
         self._plan = StepPlan.build(self.spec, route, self)
@@ -596,7 +627,84 @@ class SolverFeatherPGS(SolverBase):
             enable_bilateral_preelimination=self.factor.eliminates,
             diagnostics=dataclasses.replace(options.diagnostics, solve_readout=readout),
         )
-        self._applied_options = applied_options(SolverFeatherPGS.__init__, requested_options, applied)
+        self._applied_options = applied_options(SolverFeatherPGS.__init__, self._requested_options, applied)
+
+    def serve_rows(self) -> bool:
+        """Grow the row capacities a graph replay's world asked to pass, outside capture, between collision passes: the
+        contact pool's service (:meth:`.ContactPool.serve`, from :meth:`newton.CollisionPipeline.service_capacity` of a
+        pipeline with growable contacts, which an application calls once a frame); an application whose contacts are
+        fixed calls it once a frame itself. Returns whether graphs that captured the step must be recaptured: a
+        capacity grew since the last service.
+
+        Inside capture no step can stop: a replay whose world asked past a capacity dropped the rows past it, latched
+        the world's status and counted the pass in pinned memory the host reads without synchronizing (so it lags the
+        replays in flight), beside the most rows any world asked for of each class. Here the class grows
+        (:meth:`.step_plan.Capacities.grown`) to that ask plus its largest rise from one service to the next seen so
+        far (between services that both saw rows asked) over the replays the host runs ahead of the device
+        (:data:`~newton._src.core.contact_pool.FORECAST_QUEUE`) and the next, and the step is planned anew at the grown
+        capacities: one re-specialisation of the kernels the capacities size, after the device finishes the replays in
+        flight. The new plan keeps what a step keeps for the next (the friction anchors, the warm start's carry, the
+        status) and takes the next step's contacts as a new frame. The world's latch and the capacity status stay set
+        until reset (:meth:`check_constraint_capacity`), and the service warns. A world whose rows fit its capacity
+        never grows it: its steps stay the same, bit for bit.
+        """
+        if capturing(self.model.device):
+            return False
+        self._grow_rows()
+        replanned, self._replanned = self._replanned, False
+        return replanned
+
+    def _grow_rows(self, asked: tuple[int, int] = (0, 0)) -> bool:
+        """Plan the step anew at the row capacities the asks need, where a replay dropped rows (:meth:`serve_rows`) or
+        a step outside capture saw a world ask for ``asked`` past them (:class:`.placement.RowsDropped`); return
+        whether it did."""
+        placement = self.placement
+        dropped, *recorded = placement.rows_asked()
+        past = dropped > 0 or any(asked)
+        asked = [max(int(rows), int(seen)) for rows, seen in zip(recorded, asked, strict=True)]
+        for row_class, rows in enumerate(asked):
+            # A rise between two services that both saw rows asked: the first asks arrive from none (a spawn), which
+            # is no rate the next service sees.
+            if self._rows_seen[row_class] > 0:
+                self._rows_rise[row_class] = max(self._rows_rise[row_class], rows - self._rows_seen[row_class])
+            self._rows_seen[row_class] = max(self._rows_seen[row_class], rows)
+        # The grown plan reaches the replay after the ones the host already runs ahead of the device: the asks rise
+        # over every one of them before it.
+        ahead = FORECAST_QUEUE + 1
+        need = tuple(rows + ahead * rise for rows, rise in zip(asked, self._rows_rise, strict=True))
+        if not past:
+            return False
+        options = self.spec.capacities.grown(self.options, need)
+        if options is None:
+            return False
+        if dropped:
+            warnings.warn(
+                f"FeatherPGS: {dropped} world pass(es) asked for more rows than a capacity held and dropped them (up to "
+                f"{asked[0]} dense and {asked[1]} free-body rows a world against {placement.dense_max_constraints} and "
+                f"{placement.mf_max_constraints}); the capacities grow to {options.dense_max_constraints} dense and "
+                f"{options.mf_max_constraints} free-body contact rows a world from the next step",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+        # The replays in flight read the old plan: it is planned anew once they finish. Retired, the old placement no
+        # longer answers the contact pool (its patch phi, its arena), and the old plan stays alive until the next step
+        # is planned (a graph an application kept replays it, dropping as before, until it is recaptured).
+        wp.synchronize_device(self.model.device)
+        placement.retired = True
+        self._retired_plan = self._plan
+        self.options = options
+        self._plan_rows(Capacities.build(options, self.forest, self.laws.link_rows_per_world))
+        self.placement.carry(placement)
+        # The new plan reserves the next step's rows anew: its contacts are a new frame to it, whatever pass they are.
+        if self.laws.friction_patches is not None:
+            self.laws.friction_patches.forget_frame()
+        # The arena's lines cover the contact pool's ready rows before the next replay (the pool serves the new
+        # placement from its next service on).
+        self.placement.serve_lines()
+        # The new plan's walk and held dynamics are derived anew: every tree's factor refreshes on the next step.
+        self.factor.mass_update_requested.fill_(1)
+        self._replanned = True
+        return True
 
     def get_path_selection(self) -> dict:
         """Return the active plans and selection reasons.
@@ -856,12 +964,6 @@ class SolverFeatherPGS(SolverBase):
             arrays.release(DOF_WORK)
             arrays.release(STAGE3_SNAPSHOTS)
 
-        diagonal = self.spec.classes.diagonal
-        self.placement.fused_diagonal_limit_dof_mask = (
-            wp.array(diagonal.fused_mask, dtype=wp.int32, device=model.device)
-            if diagonal is not None and diagonal.fused_sizes
-            else arrays.placeholder(wp.int32)
-        )
         # The tree factor's mass-update mask, compact inverse mass, body inertia records and articulation origins.
         self.factor.allocate_common()
 
@@ -918,7 +1020,19 @@ class SolverFeatherPGS(SolverBase):
         if state_in.requires_grad or state_out.requires_grad:
             raise ValueError("FeatherPGS has no gradients: step states built with requires_grad=False.")
         self.validate_observables(observables, contacts)
-        self._plan.run(Step(state_in, state_out, control, contacts, dt, collide_done_event, self._step))
+        # A step of the current plan: no graph replays a retired one from here (:meth:`_grow_rows`).
+        self._retired_plan = None
+        while True:
+            try:
+                self._plan.run(Step(state_in, state_out, control, contacts, dt, collide_done_event, self._step))
+                break
+            except RowsDropped as dropped:
+                # Outside capture a world that asked past a capacity ended the step before it latched a status or wrote
+                # anything it keeps: grow the capacity and repeat the step, which then drops nothing. The growth runs
+                # past this handler, whose traceback holds the old plan.
+                asked = dropped.asked
+            if not self._grow_rows(asked):
+                raise RuntimeError(f"FeatherPGS: a world asked for {asked} rows, and the capacities did not grow")
         if observables is not None and observables.is_requested(SolverBase.ObservableKind.CONTACT_F):
             self.sweep.forces(contacts, observables.contact_f)
         if observables is not None and observables.is_requested(SolverBase.ObservableKind.BODY_PARENT_F):
@@ -962,8 +1076,8 @@ class SolverFeatherPGS(SolverBase):
         Args:
             clear: Clear the flags after reading, returning their previous
                 values. Clearing acknowledges past loss; it does not repair
-                affected states or resize storage. Reconstruct the solver and
-                recapture graphs to change capacities safely.
+                affected states or resize storage; the capacities grow by
+                themselves (:meth:`serve_rows`).
 
         Raises:
             RuntimeError: If called during CUDA graph capture.
@@ -979,9 +1093,9 @@ class SolverFeatherPGS(SolverBase):
         inspect it without host synchronization. Status remains set until
         :meth:`reset` clears the affected worlds. The error names the rows the
         invalid worlds asked for past each row class's capacity and the option
-        value that holds them. Increasing capacity requires constructing a
-        solver and recapturing graphs before restarting the invalidated
-        transition.
+        value that holds them. The capacities grow at the next service
+        (:meth:`serve_rows`); an invalidated transition is restarted after a
+        reset.
         """
         self.placement.check_capacity()
 

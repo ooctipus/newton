@@ -20,6 +20,7 @@ kernels they name, so the three cannot disagree.
 
 from __future__ import annotations
 
+import dataclasses
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, fields
@@ -50,9 +51,18 @@ __all__ = [
 ]
 
 
+def _doubled_lines(rows: int) -> int:
+    """``rows`` in a power of two of whole L1 lines of rows, one line at least."""
+    line = L1_LINE_BYTES // 4
+    lines = max(1, -(-int(rows) // line))
+    return (1 << (lines - 1).bit_length()) * line
+
+
 @dataclass(frozen=True)
 class Capacities:
-    """The row capacities a world holds, fixed at construction; each class's status word records an overflow."""
+    """The row capacities a world holds, fixed for a plan of the step; each class's status word records an overflow,
+    and a class a world asked past grows (:meth:`grown`, a new plan: in the step outside capture, at the solver's next
+    service inside it)."""
 
     dense_rows: int
     """Dense (articulation) rows a world, its link rows included (``dense_max_constraints`` plus the links)."""
@@ -60,28 +70,37 @@ class Capacities:
     """Matrix-free (free-body) rows a world (``mf_max_constraints``)."""
     row_pitch: int
     """A world's rows in the row store: the dense rows, then the free-body rows where free bodies exist."""
+    link_rows: int
+    """The closure's link rows a world, within the dense rows (:attr:`.rows.RowLaws.link_rows_per_world`)."""
     free_contact_rows: bool
     """The free bodies' contacts keep a run of their own (the free-body rows): only where a world can take the colored
     mapping, whose units are that run's (:func:`.sweep_units.capable_worlds`)."""
+    option_rows: tuple[int, int]
+    """The options that build these capacities (``dense_max_constraints``, ``mf_max_constraints``)."""
+    joined: bool
+    """The free bodies' rows join the line's dense rows (:attr:`dense_rows` holds them)."""
 
     @classmethod
     def build(cls, options, forest: ForestPlan, link_rows: int) -> Capacities:
         """The capacities from the options and the forest: a link's rows are the closure's, on top of the rows the
-        option gives the world's contacts (``link_rows`` a world).
+        option gives the world's contacts (``link_rows`` a world); a class grows from them to the rows its worlds ask
+        for (:meth:`grown`).
 
         A free body is a one-node tree: its contacts are rows of the line like any other, written by the one writer
         and swept by the class's sweep. They keep a run of their own only where a world can take the colored mapping;
-        elsewhere their capacity (``mf_max_constraints``) joins the line's dense rows, and the free-body rows hold
-        none."""
+        elsewhere their capacity joins the line's dense rows, and the free-body rows hold none."""
         from . import sweep_units  # noqa: PLC0415
 
-        dense = int(options.dense_max_constraints) + int(link_rows)
+        links = int(link_rows)
+        dense = int(options.dense_max_constraints) + links
         free = int(options.mf_max_constraints)
         free_bodies = forest.has_free_rigid_bodies
         # The production rule decides the run (the rows' layout); a test that relaxes the rule changes only which of
         # the run's worlds the colored mapping takes.
         run = bool(free_bodies and sweep_units.capable_worlds(forest.free_rigid_per_world, free).size > 0)
-        if free_bodies and not run:
+        joined = free_bodies and not run
+        options_rows = (dense - links, free)
+        if joined:
             dense += free
             # The line ends on a whole L1 line, so every world's line starts on one: the free bodies' (empty) rows
             # fill it, one at least.
@@ -91,8 +110,25 @@ class Capacities:
             dense_rows=dense,
             free_body_rows=free,
             row_pitch=dense + (free if free_bodies else 0),
+            link_rows=links,
             free_contact_rows=run,
+            option_rows=options_rows,
+            joined=bool(joined),
         )
+
+    def grown(self, options, need: tuple[int, int]):
+        """The options whose capacities hold ``need`` (the dense rows a world, links included, and the free bodies' run
+        rows), or ``None`` where these hold it: a class past its rows grows to the need in a power of two of whole L1
+        lines, so a run's growths are logarithmic in its largest need, each a re-plan (the virtual memory holds the
+        reserve). The dense rows hold the free bodies' where they join the line."""
+        free_option = self.option_rows[1]
+        held = (self.dense_rows, self.free_body_rows if self.free_contact_rows else 0)
+        if need[0] <= held[0] and need[1] <= held[1]:
+            return None
+        rows = [_doubled_lines(ask) if ask > have else have for ask, have in zip(need, held, strict=True)]
+        dense = rows[0] - self.link_rows - (free_option if self.joined else 0)
+        free = rows[1] if self.free_contact_rows else free_option
+        return dataclasses.replace(options, dense_max_constraints=int(dense), mf_max_constraints=int(free))
 
 
 DIAGNOSTICS = ("nvtx", "snapshots", "audit", "row_watermark", "readout", "sync_timings")
@@ -491,8 +527,6 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
         (call, "default_control", True, (STEP, "default_control", model)),
         (call, "bind_material", options.contact_compliance, (solver, "_bind_contact_material", CONTACTS)),
         (call, "follow_contacts", articulated, (STEP, "follow_contacts", placement)),
-        # A pass that dropped rows fails the next step that sees its record (outside capture).
-        (call, "fail_on_dropped_rows", articulated, (placement, "fail_on_dropped_rows")),
         (call, "warm_start_contract", warm, (STEP, "warm_start_contract")),
         (call, "wait_for_collision", particles, (STEP, "wait_for_collision", device)),
         (call, "particle_forces", particles, (solver, "_eval_particle_forces", STATE_IN, CONTROL, CONTACTS)),
@@ -530,6 +564,9 @@ def _stages(spec: StepSpec, route: RouteRow, solver) -> tuple[Stage, ...]:
         # The free bodies' run (their contacts) where a colored world holds one.
         (s4, "bound_free_body_contacts", run, (laws, "bound_free_body_contacts", solver)),
         (s4, "write_free_bodies", run and not regions, (laws, "write_free_bodies", solver, STATE_IN, CONTACTS, DT)),
+        # Outside capture, a world that asked past a capacity ends the step before the close latches a status or the
+        # step writes anything it keeps: the solver grows the capacity and repeats it (SolverFeatherPGS.step).
+        (call, "check_rows", True, (placement, "check_rows", 2 if run else 1)),
         # The pass's close: the row classes' counts with status (the free bodies' where their run is staged), the
         # overflow latch and the warning, one launch.
         (
