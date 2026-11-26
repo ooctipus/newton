@@ -463,18 +463,22 @@ def _vertex_rule(
     With ``exact``, a one-ring vertex retires the contact when it lies in front of the plane through the vertex
     with normal ``point - vertex`` (the canonical edge parameter); otherwise by :func:`faces_witness`, with
     ``point - vertex`` the unit witness normal. The owner is the lowest incident triangle among the most
-    front-facing ones.
+    front-facing ones. Against a larger partner (:attr:`SurfaceFeatureContext.partner_larger`, GJK/MPR witnesses only)
+    the vertex's contact stands without the one-ring test, and the owner is chosen the same way among the incident
+    triangles whose own witness it is (none of their corners in front).
     """
     start = context.topology[context.vertex_start + welded_vertex]
     end = context.topology[context.vertex_start + welded_vertex + 1]
     mesh = wp.mesh_get(context.mesh_id)
     direction = point - vertex
+    past = not exact and context.partner_larger != 0
     ghost = bool(False)
     owner = context.triangle
     best = int(-1)
     for entry in range(start, end):
         other = context.topology[entry]
         row = (context.triangle_base + other) * ROW
+        witness = bool(True)
         for j in range(3):
             welded = context.topology[row + 6 + j]
             if welded != welded_vertex:
@@ -484,10 +488,15 @@ def _vertex_rule(
                         ghost = True
                 elif faces_witness(position - vertex, direction):
                     ghost = True
-        level = _facing(context.partner_center, vertex, _world_normal(context, other))
-        if level > best:
-            best = level
-            owner = other
+                    witness = False
+        # Against a larger partner only the triangles whose own witness the vertex is can own it.
+        if witness or not past:
+            level = _facing(context.partner_center, vertex, _world_normal(context, other))
+            if level > best:
+                best = level
+                owner = other
+    if past:
+        return owner == context.triangle
     return (not ghost) and owner == context.triangle
 
 
@@ -676,7 +685,11 @@ def mesh_contact_filter(contact: ContactData, context: SurfaceFeatureContext) ->
     coordinates' rounding), and its normal as the face normal or tilted. A face-normal contact is the face's
     own: the triangle containing it reports it (on an edge or a corner shared with coplanar triangles, the
     lowest of them). A tilted contact on an edge or vertex is reported only if no vertex adjacent to the feature
-    lies in front of the plane through it (:func:`faces_witness`) and this triangle owns the feature.
+    lies in front of the plane through it (:func:`faces_witness`) and this triangle owns the feature. Against a
+    larger partner (:attr:`SurfaceFeatureContext.partner_larger`: the larger body's face gives the direction) every
+    feature within the gap is a contact, as a mesh's vertices are a plane's: reported
+    once, by the triangle whose witness it is, whether or not it is a local minimum of the distance (a turning part's
+    far end, closing on the partner before the next pass).
     Contacts beyond the writer's gap, of triangles without topology and of heightfields are left to the writer.
     """
     if context.row < 0:
@@ -750,7 +763,9 @@ def _contact_feature_rule(
             a = b
             b = swap
         if faces_witness(_mesh_point(context, context.topology[row + 3 + edge]) - point, normal):
-            return False
+            # The neighbour dips in front: no local minimum, unless the partner is the larger body, where the edge
+            # is this triangle's witness alone.
+            return context.partner_larger != 0
         if faces_witness(corners[edge] - point, normal):
             # The witness leaves this triangle's own cone: it is not a closest feature; keep it.
             return True

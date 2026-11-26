@@ -697,6 +697,40 @@ def test_floor_far_from_its_origin_holds_a_sunk_box(test, device):
             )
 
 
+def test_tilted_part_above_a_large_box(test, device):
+    """A small closed mesh part tilted over the face of a large box keeps its contacts within the gap.
+
+    The box is the larger body. As on a plane, each vertex of the part that is its triangles' closest point to the box
+    within the gap is a
+    contact along the box face's normal, at its own height, once, whether or not it is a local minimum of the
+    distance: the raised end of a part turning onto the board closes on it before the next collision pass. A bar
+    with subdivided faces tilted about its long axis: among them the rows of its lower face but the raised end
+    (whose triangles' closest points are elsewhere; side faces facing the box add their own rows). The NIST demo's
+    spinning parts kept only their lowest corner, swung their far end through the board between passes and were
+    thrown off it under MuJoCo Warp.
+    """
+    hx, hy, hz = 0.1925, 0.1923, 0.015  # the NIST board
+    vertices, faces = _box(0.006, 0.025, 0.004, n=3)
+    rows = [wp.vec3(sx, sy, -0.004) for sx in (-0.006, -0.002, 0.002, 0.006) for sy in (-0.025, -0.025 / 3, 0.025 / 3)]
+    for tilt in (0.1, 0.2):
+        rot = wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), tilt)
+        turned = np.array([wp.quat_rotate(rot, wp.vec3(*v)) for v in vertices], np.float32)
+        want = np.array([wp.quat_rotate(rot, v) for v in rows])
+        top = float(turned[:, 2].min()) - 0.001
+        for x, y in ((0.0, 0.0), (0.12, 0.08)):
+            xform = wp.transform(wp.vec3(-x, -y, top - hz), wp.quat_identity())
+            count, normal, p0, sep = _collide(device, turned, faces, ("box", {"hx": hx, "hy": hy, "hz": hz}), xform)
+            label = f"tilted {tilt} at ({x}, {y})"
+            test.assertGreaterEqual(count, want.shape[0], label)
+            test.assertTrue(np.all(normal[:, 2] < -1.0 + 1e-6), f"{label}: a normal off the box face's")
+            spacing = np.linalg.norm(p0[:, None, :] - p0[None, :, :], axis=2) + np.eye(count)
+            test.assertTrue(np.all(spacing > 2e-5), f"{label}: a contact reported twice")
+            np.testing.assert_allclose(sep, p0[:, 2] - top, atol=2e-5, err_msg=label)
+            for point in want:
+                near = np.linalg.norm(p0 - point, axis=1) < 2e-5
+                test.assertEqual(int(near.sum()), 1, f"{label}: vertex {point} reported {int(near.sum())} times")
+
+
 def test_box_on_stair_nose(test, device):
     """A box resting across a stair nose: its patch on the tread, cut at the nose, with no ghost normal.
 
@@ -755,6 +789,7 @@ for _name, _fn in (
     ("test_part_sunk_into_a_large_box", test_part_sunk_into_a_large_box),
     ("test_tilted_part_sunk_into_a_large_box", test_tilted_part_sunk_into_a_large_box),
     ("test_floor_far_from_its_origin_holds_a_sunk_box", test_floor_far_from_its_origin_holds_a_sunk_box),
+    ("test_tilted_part_above_a_large_box", test_tilted_part_above_a_large_box),
     ("test_box_on_stair_nose", test_box_on_stair_nose),
     ("test_small_facet_keeps_its_corners", test_small_facet_keeps_its_corners),
     ("test_unreferenced_vertices", test_unreferenced_vertices),
