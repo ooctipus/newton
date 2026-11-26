@@ -286,11 +286,15 @@ def _bound_topology(
 
 
 @wp.func_native("""
-    const unsigned char* const from = reinterpret_cast<const unsigned char*>(source);
-    unsigned char* const to = reinterpret_cast<unsigned char*>(target);
-    for (long long b = 0; b < bytes; ++b) to[b] = from == nullptr ? 0 : from[b];
+    const unsigned int* const from = reinterpret_cast<const unsigned int*>(source);
+    unsigned int* const to = reinterpret_cast<unsigned int*>(target);
+    for (long long w = lane; w < words; w += lanes) to[w] = from == nullptr ? 0u : from[w];
 """)
-def _copy_bytes(target: wp.uint64, source: wp.uint64, bytes: wp.int64): ...
+def _copy_words(target: wp.uint64, source: wp.uint64, words: wp.int64, lane: int, lanes: int): ...
+
+
+MOVE_LANES = wp.constant(32)
+"""Lanes a world and field of :func:`_move_to_runs`: a warp, whose word copies coalesce."""
 
 
 @wp.kernel
@@ -310,21 +314,24 @@ def _move_to_runs(
     """Take each world whose rows run in the arena (``run_of``, the reservation's claim, or kept while it holds its
     slots) to its run: its topology rows, which its producers wrote at its home line this step, copied there in every
     field laid out by line and row (``fields``: their addresses, their rows' bytes and their lines' bytes), and its
-    contact rows' diagonals zeroed for the one writer's sums (field ``diag``). A thread a world and field."""
-    world, field = wp.tid()
+    contact rows' diagonals zeroed for the one writer's sums (field ``diag``). A warp a world and field
+    (:data:`MOVE_LANES`), striding over the 4-byte words of the rows (every field's row is whole words)."""
+    world, field, lane = wp.tid()
     run = run_of[world][0]
     if run < 0:
         return
-    if field == 0:
+    if field == 0 and lane == 0:
         first[world] = run
     rows = topology_rows[world]
     size = row_bytes[field]
     at = fields[field] + wp.uint64(run) * wp.uint64(line_bytes[field])
-    _copy_bytes(at, fields[field] + wp.uint64(home[world]) * wp.uint64(line_bytes[field]), wp.int64(rows) * size)
+    source = fields[field] + wp.uint64(home[world]) * wp.uint64(line_bytes[field])
+    _copy_words(at, source, wp.int64(rows) * size // wp.int64(4), lane, MOVE_LANES)
     if field == diag:
         count = wp.min(slot_counter[0, world], capacity)
         if count > rows:
-            _copy_bytes(at + wp.uint64(wp.int64(rows) * size), wp.uint64(0), wp.int64(count - rows) * size)
+            words = wp.int64(count - rows) * size // wp.int64(4)
+            _copy_words(at + wp.uint64(wp.int64(rows) * size), wp.uint64(0), words, lane, MOVE_LANES)
 
 
 @wp.kernel
@@ -1334,7 +1341,7 @@ class Placement:
         count, pointers, row_bytes, line_bytes, diag = self._run_fields
         wp.launch(
             _move_to_runs,
-            dim=(self.forest.world_count, count),
+            dim=(self.forest.world_count, count, MOVE_LANES),
             inputs=[
                 self.home_first,
                 self.world_run,
