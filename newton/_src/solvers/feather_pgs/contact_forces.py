@@ -31,7 +31,7 @@ def contact_linear_force(
     rigid_contact_force: wp.array[wp.vec3],
 ):
     """Convert solved FeatherPGS contact impulses into world-frame forces: contact ``c``'s rows sit at its slot of its
-    world's line, a free body's contact's (``path`` 1) among the free bodies' rows from ``body_base``."""
+    world's line, a free body's contact's (``path`` 1) among the free bodies' rows from the line's body base."""
     total_contacts = routes.count[0]
     if c >= total_contacts:
         return

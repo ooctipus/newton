@@ -524,8 +524,9 @@ class Placement:
         self.factor = factor
         self.support_pin = spec.pins.row_support
         self.arrays = SolverArrays(self, model.device)
-        # The line of the row store where each world's rows sit: the dense class's from row 0, the free bodies' from
-        # ``body_base``.
+        # The line of the row store where each world's rows sit (the dense class's from row 0, the free bodies' from its
+        # body base): its home line, where its topology rows are written, and the line it holds this step, its home or
+        # its run of the arena (lay_out_lines).
         worlds = np.arange(forest.world_count, dtype=np.int32)
         self.home_first = wp.array(worlds, dtype=wp.int32, device=model.device)
         self.dense_first = wp.array(worlds, dtype=wp.int32, device=model.device)

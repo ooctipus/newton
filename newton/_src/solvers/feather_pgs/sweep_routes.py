@@ -137,8 +137,8 @@ MF_GS_ABI = kernel_template.params(
     ("omega", float),
 )
 """The matrix-free sweep's native ABI: one world per call (the world queue's dispatch). The free bodies' run's rows are
-the row store's (the ``world_*`` records) and the packed rows' (``packed_Z``), from the dense capacity of the world's
-line; the streamed rows' records the line's (``row_record``, :func:`.row_metadata.pack_row_record`)."""
+the row store's (the ``world_*`` records) and the packed rows' (``packed_Z``), from the line's body base
+(``body_base``); the streamed rows' records the line's (``row_record``, :func:`.row_metadata.pack_row_record`)."""
 
 
 _ROW_BUFFERS = {"metadata": "s_rec_dense", "impulses": "s_lam_mf", "dense_impulses": "s_lam_dense"}
@@ -249,7 +249,8 @@ def velocity_fits(config, budget: int) -> bool:
 
 def record_first(max_constraints: int, places: RowPlaces) -> int:
     """The line's first row with a record (:func:`.row_metadata.pack_row_record`): the dense rows' first where their
-    metadata streams, else the free bodies' (from the dense capacity ``max_constraints``), which always stream."""
+    metadata streams, else the dense capacity ``max_constraints`` (no dense row's record; the free rows', from the
+    line's body base, always stream)."""
     return 0 if places.metadata is Place.STREAMED else int(max_constraints)
 
 
