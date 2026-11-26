@@ -681,6 +681,11 @@ class DiagonalSweep(SweepConfig):
         ``floor`` (:meth:`.sweep_plan.Sweep.dense_head`): the same arithmetic on a shorter stage."""
         return dataclasses.replace(self, dense_rows=int(rows), dense_floor=int(floor))
 
+    def head_placed(self, staging: Staging) -> DiagonalSweep:
+        """A head at its own stage (:meth:`.sweep_routes.GeneralSweep.head_placed`): every buffer is staged, so this
+        launch."""
+        return self
+
     def rows(self) -> WorldRows:
         """The world's rows: every lane (or a scalar contact's one thread) stores what it computed and reads its own
         stores; a head's stage holds its rows."""

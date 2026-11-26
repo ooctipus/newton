@@ -4,6 +4,7 @@
 """Test sticky overflow visibility independently of opt-in row telemetry."""
 
 import contextlib
+import dataclasses
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -522,25 +523,35 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
                 solver.check_constraint_capacity()
 
 
-def _sprawl_run(device, capacity: int, heads=None, steps: int = 30):
+def _sprawl_run(device, capacity: int, heads=None, steps: int = 30, in_place: bool = False):
     """Step two worlds of the sprawled tree (scenes.sprawl: a free torso and its limbs resting on the ground, one contact
     a link: dense contact rows) at ``capacity`` dense rows; with ``heads`` (first, second), the general sweep's launches
-    are dense heads at those rows and the capacity's (:meth:`.sweep_plan.Sweep.dense_head`, forced on any device).
+    are dense heads at those rows and the capacity's (:meth:`.sweep_plan.Sweep.dense_head`, forced on any device); with
+    ``in_place``, the capacity's dense impulses in place, as where its stage declines them (each head places its own).
     Returns the poses and velocities, the most live dense rows a world held and the solver."""
     from newton._src.solvers.feather_pgs import sweep_plan  # noqa: PLC0415
+    from newton._src.solvers.feather_pgs.sweep_routes import Place  # noqa: PLC0415
     from newton.tests import feather_pgs_scenes as scenes  # noqa: PLC0415
 
     def forced(plan, config, items):
-        first, wide = heads
         full = plan._staged(config, items)
-        head = sweep_plan.Sweep.dense_head
-        return head(full, first), head(full, wide, first), head(full, 0, wide)
+        if in_place:
+            full = dataclasses.replace(full, places=dataclasses.replace(full.places, dense_impulses=Place.GLOBAL))
+        if heads is None:
+            return (full,)
+        first, wide = heads
+        return (
+            plan.dense_head(full, items, first),
+            plan.dense_head(full, items, wide, first),
+            plan.dense_head(full, items, 0, wide),
+        )
 
     scene = scenes.sprawl(fingers=2, finger_links=2, worlds=2)
     model = scene.build(device)
     pipeline = newton.CollisionPipeline(model, rigid_contact_max=scene.rigid_contact_max)
     contacts = pipeline.contacts()
-    patch = mock.patch.object(sweep_plan.Sweep, "_dense_heads", forced) if heads else contextlib.nullcontext()
+    forcing = heads or in_place
+    patch = mock.patch.object(sweep_plan.Sweep, "_dense_heads", forced) if forcing else contextlib.nullcontext()
     with patch:
         # The dense storage's route: the matrix-free sweep over the world's dense line.
         solver = SolverFeatherPGS(model, dense_max_constraints=capacity, pins=SolverFeatherPGS.Pins(storage="dense"))
@@ -571,6 +582,31 @@ class TestDenseHeads(unittest.TestCase):
                         self.assertTrue(any(f"_d{first}to{wide}" in name for name in names), (first, wide, names))
                     np.testing.assert_array_equal(q, q_h)
                     np.testing.assert_array_equal(qd, qd_h)
+
+    def test_heads_stage_the_dense_impulses_a_capacity_keeps_in_place(self):
+        """A capacity whose stage declines the dense impulses (in place) costs the worlds a head holds nothing: each
+        head's launch stages them at its own length, and a world steps bit for bit as at the capacity alone, its
+        impulses in place or staged."""
+        devices = ["cpu"] + (["cuda:0"] if wp.is_cuda_available() else [])
+        for device in devices:
+            q, qd, rows, _solver = _sprawl_run(device, 256, heads=None)
+            q_g, qd_g, _rows, solver = _sprawl_run(device, 256, heads=None, in_place=True)
+            self.assertTrue(any("_gline" in launch.kernel.key for launch in solver.sweep.launches))
+            np.testing.assert_array_equal(q, q_g)
+            np.testing.assert_array_equal(qd, qd_g)
+            heads = (32, rows + 32)
+            with self.subTest(device=device, heads=heads):
+                q_h, qd_h, _rows, solver = _sprawl_run(device, 256, heads=heads, in_place=True)
+                keys = {
+                    launch.config.places.dense_rows: launch.kernel.key
+                    for launch in solver.sweep.launches
+                    if launch.kernel.key.startswith("sweep_mf_gs") and "_records" not in launch.kernel.key
+                }
+                for head in heads:
+                    self.assertNotIn("_gline", keys[head], keys)
+                self.assertIn("_gline", keys[0], keys)
+                np.testing.assert_array_equal(q, q_h)
+                np.testing.assert_array_equal(qd, qd_h)
 
     def test_a_diagonal_world_steps_alike_in_every_dense_head(self):
         """The sparse diagonal's stage follows the live rows too: with its launches at dense heads (forced on any
@@ -603,8 +639,11 @@ def _keyboard_run(device, capacity: int, heads=None, steps: int = 30):
         if not isinstance(full, sweep_routes_diag.DiagonalSweep):
             return (full,)
         first, wide = heads
-        head = sweep_plan.Sweep.dense_head
-        return head(full, first), head(full, wide, first), head(full, 0, wide)
+        return (
+            plan.dense_head(full, items, first),
+            plan.dense_head(full, items, wide, first),
+            plan.dense_head(full, items, 0, wide),
+        )
 
     scene = scenes.keyboard(worlds=2)
     model = scene.build(device)

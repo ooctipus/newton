@@ -1057,47 +1057,55 @@ class Sweep:
 
     def _dense_heads(self, full: SweepConfig, items: int) -> tuple[SweepConfig, ...]:
         """The launches of a sweep that stages a world's dense rows (the warp mapping ``full`` at the places its stage
-        gives, :meth:`_staged`, or the sparse diagonal's), by the dense rows' head: where the capacity's stage holds
+        gives, :meth:`_staged`, or the sparse diagonal's), by the dense rows' head: where a head's stage holds the
         dense operands (staged metadata at the head's word stride, impulses, the active enumeration's bitsets and the
-        levels' marks), a head holds them for the worlds whose live dense rows fit it, so their stage follows their
-        live rows, not the capacity (D1: a capacity costs only memory).
+        levels' marks), it holds them for the worlds whose live dense rows fit it, so their stage follows their live
+        rows, not the capacity (D1: a capacity costs only memory).
 
-        A head's launch is the capacity's but for the length of its dense operands: every operand at the capacity's
-        place (the form, which decides how a row is read: streamed records carry the idle keys the live order passes
-        rows by) and the capacity's launch bound (its register line, :attr:`.sweep_routes.GeneralSweep.line_stage`),
-        so the same arithmetic. The heads climb from one line of rows: each is the longest of whole lines that keeps
+        A head's launch is the capacity's but for its dense operands (:meth:`dense_head`): their length, and the dense
+        impulses at the place the head's own stage gives them, so a capacity whose stage declines them (in place) costs
+        the worlds a head holds nothing; every other operand at the capacity's place (the metadata's form decides how a
+        row is read: streamed records carry the idle keys the live order passes rows by) and the capacity's launch
+        bound (its register line, :attr:`.sweep_routes.GeneralSweep.line_stage`), so the same arithmetic. The heads
+        climb from one line of rows: each is the longest of whole lines whose stage holds the dense impulses, keeps
         the static stage (:data:`.memory.STATIC_SHARED_BYTES`, so the L1 stays) and its resident blocks, the first
         one line's, each later half the one's before it, so a world runs at no less than half the resident blocks its
         live rows allow (keyboard-so101's live rows reach 649 of 1,024: one head of 128 rows left a third of its worlds
-        at the capacity's stage); the heads stop where the capacity's own stage keeps as many, and the worlds past
-        every head are the capacity's launch's. A capacity the first head would hold keeps the one launch, as do worlds
-        the capacity's stage already keeps resident at once (a head buys resident worlds, nothing else: past them it
-        only adds a launch). The CPU's one thread holds the whole stage: one launch.
+        at the capacity's stage); the heads stop where the capacity's own stage keeps as many and holds the dense
+        impulses, and the worlds past every head are the capacity's launch's. A capacity the first head would hold
+        keeps the one launch, as do worlds the capacity's stage already keeps resident at once with their dense
+        impulses staged (a head buys resident worlds or a stage for the impulses, nothing else: past them it only adds
+        a launch). The CPU's one thread holds the whole stage: one launch.
 
         Returns the launches in order, the capacity's last."""
         line = L1_LINE_BYTES // 4
         capacity = int(full.max_constraints)
-        if not self.model.device.is_cuda or capacity <= line or not full.dense_staged:
+        if not self.model.device.is_cuda or capacity <= line:
             return (full,)
         found = device(self.model.device)
 
-        def layout(rows: int):
-            return shape(self._launch_work(self.dense_head(full, rows), items), found)
+        def held(rows: int):
+            head = self.dense_head(full, items, rows)
+            return head, shape(self._launch_work(head, items), found)
 
-        tight = layout(line)
+        tight_head, tight = held(line)
+        if not tight_head.dense_staged:
+            return (full,)
         ceiling = max(STATIC_SHARED_BYTES, tight.staging.bytes)
 
         def keeps(rows: int, resident: int) -> bool:
-            held_rows = layout(rows)
-            return held_rows.blocks_per_sm >= resident and held_rows.staging.bytes <= ceiling
+            head, layout = held(rows)
+            return head.dense_staged and layout.blocks_per_sm >= resident and layout.staging.bytes <= ceiling
 
-        # A head buys resident worlds: where the capacity's stage already keeps every world resident at once, the head's
-        # launch would only add a launch (the bridge's one world: an empty second launch a sweep).
+        # A head buys resident worlds or a stage for the dense impulses: where the capacity's stage holds them and
+        # already keeps every world resident at once, the head's launch would only add a launch (the bridge's one
+        # world: an empty second launch a sweep).
         whole = shape(self._launch_work(full, items), found)
-        if keeps(capacity, tight.blocks_per_sm) or -(-items // whole.groups) <= whole.blocks_per_sm * found.sms:
+        resident_at_once = -(-items // whole.groups) <= whole.blocks_per_sm * found.sms
+        if keeps(capacity, tight.blocks_per_sm) or (full.dense_staged and resident_at_once):
             return (full,)
         heads, lines, resident = [], 1, tight.blocks_per_sm
-        while resident > whole.blocks_per_sm and keeps(lines * line, resident):
+        while (resident > whole.blocks_per_sm or not full.dense_staged) and keeps(lines * line, resident):
             high = capacity // line
             while lines < high:
                 middle = (lines + high + 1) // 2
@@ -1108,21 +1116,22 @@ class Sweep:
             if lines * line >= capacity:
                 break
             heads.append(lines * line)
-            resident, lines = layout(lines * line).blocks_per_sm // 2, lines + 1
+            resident, lines = held(lines * line)[1].blocks_per_sm // 2, lines + 1
         if not heads:
             return (full,)
         floors = (0, *heads)
         return (
-            *(self.dense_head(full, rows, floor) for rows, floor in zip(heads, floors, strict=False)),
-            self.dense_head(full, 0, heads[-1]),
+            *(self.dense_head(full, items, rows, floor) for rows, floor in zip(heads, floors, strict=False)),
+            self.dense_head(full, items, 0, heads[-1]),
         )
 
-    @staticmethod
-    def dense_head(full: SweepConfig, rows: int, floor: int = 0) -> SweepConfig:
+    def dense_head(self, full: SweepConfig, items: int, rows: int, floor: int = 0) -> SweepConfig:
         """The launch of ``full`` (a sweep at the capacity, its stage given) whose stage holds ``rows`` dense rows (0:
-        the capacity's) for the worlds whose live dense rows pass ``floor`` (:meth:`_dense_heads`): the same arithmetic
-        on a shorter stage."""
-        return full.with_head(rows, floor)
+        the capacity's) for the worlds whose live dense rows pass ``floor`` (:meth:`_dense_heads`): the same
+        arithmetic on a shorter stage, the dense impulses where the head's own stage over ``items`` places them
+        (:meth:`.sweep_routes.GeneralSweep.head_placed`)."""
+        head = full.with_head(rows, floor)
+        return head.head_placed(shape(self._launch_work(head, items), device(self.model.device)).staging)
 
     def _head_kernels(self, head: SweepConfig) -> tuple:
         """A dense head's launch of the warp mapping (:meth:`_dense_heads`): its configuration and kernel, which counts its

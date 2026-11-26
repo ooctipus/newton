@@ -2634,16 +2634,29 @@ class GeneralSweep(SweepConfig):
 
     @property
     def dense_staged(self) -> bool:
-        """Whether the stage holds dense operands, which a head shortens (:meth:`.sweep_plan.Sweep._dense_heads`): the
-        dense rows' metadata or impulses at their places."""
-        return Place.SHARED in (self.places.metadata, self.places.dense_impulses)
+        """Whether the stage holds the dense rows' impulses, which a head shortens
+        (:meth:`.sweep_plan.Sweep._dense_heads`), and with them any staged metadata (the stage takes the impulses first:
+        it never holds the longer metadata without them)."""
+        return self.places.dense_impulses is Place.SHARED
 
     def with_head(self, rows: int, floor: int = 0) -> GeneralSweep:
         """This mapping at the capacity, its stage given, with a stage of ``rows`` dense rows (``0``: the capacity's)
-        for the worlds whose live dense rows pass ``floor`` (:meth:`.sweep_plan.Sweep.dense_head`): every operand at
-        the capacity's place, a head at the capacity's launch bound."""
+        for the worlds whose live dense rows pass ``floor`` (:meth:`.sweep_plan.Sweep.dense_head`), at the capacity's
+        launch bound: every operand at the capacity's place but a head's dense impulses, which it offers its own stage
+        (:meth:`head_placed`)."""
         places = dataclasses.replace(self.places, dense_rows=int(rows), dense_floor=int(floor))
+        if rows:
+            places = dataclasses.replace(places, dense_impulses=Place.SHARED)
         return dataclasses.replace(self, places=places, line_stage=self.staging().bytes if rows else 0)
+
+    def head_placed(self, staging: Staging) -> GeneralSweep:
+        """A dense head (:meth:`with_head`) with its dense impulses at the place its own stage ``staging`` gives them
+        (:func:`.memory.stage`): staged where the head holds what the capacity's stage declines, the same values at
+        either place. The metadata keeps the capacity's form, the records' layout every sweep reads."""
+        if not self.places.dense_rows:
+            return self
+        places = dataclasses.replace(self.places, dense_impulses=staging.place(_ROW_BUFFERS["dense_impulses"]))
+        return dataclasses.replace(self, places=places)
 
     def staging(self) -> Staging:
         """The block's working set at its places (:func:`mf_gs_staging`): each staged operand with its alternative."""
