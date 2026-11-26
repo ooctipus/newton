@@ -230,6 +230,7 @@ def _bound_topology(
     pass_words: wp.array[int],
     world_run: wp.array[wp.vec2i],
     arena_cursor: wp.array[int],
+    body_base: wp.array[int],
 ):
     """Record where each world's topology rows (mimics, links, joint limits) end and its contacts start, decide whether
     the step keeps the world's contact rows, and zero its first ``cleared`` dense rows' diagonals: the free bodies'
@@ -261,6 +262,9 @@ def _bound_topology(
             held = 1
         world_held[world] = held
         topology_rows[world] = dense
+        # The one writer's topology part, beside the contact pass, writes the topology rows' records at the home line,
+        # whose body base must not fall inside them, whichever of this or the reservation's base it reads.
+        body_base[home[world]] = wp.max(body_base[home[world]], dense)
         if held != 0:
             slot_counter[0, world] = dense + contact_rows_kept[0, world]
             slot_counter[1, world] = slot_counter[1, world] + contact_rows_kept[1, world]
@@ -294,47 +298,64 @@ def _copy_words(target: wp.uint64, source: wp.uint64, words: wp.int64, lane: int
 
 
 MOVE_LANES = wp.constant(32)
-"""Lanes a world and field of :func:`_move_to_runs`: a warp, whose word copies coalesce."""
+"""Lanes a world (and field) of :func:`_take_runs` and :func:`_move_topology`: a warp, whose word copies coalesce."""
 
 
 @wp.kernel
-def _move_to_runs(
-    home: wp.array[int],
+def _take_runs(
     run_of: wp.array[wp.vec2i],
     topology_rows: wp.array[int],
     slot_counter: wp.array2d[int],
     capacity: int,
-    fields: wp.array[wp.uint64],
-    item_bytes: wp.array[wp.int64],
-    line_bytes: wp.array[wp.int64],
-    line_rows: int,
-    diag: int,
     # outputs
     first: wp.array[int],
+    diag: wp.array2d[float],
     arena_cursor: wp.array[int],
     arena_record: wp.array[int],
 ):
     """Take each world whose rows run in the arena (``run_of``, the reservation's claim, or kept while it holds its
-    slots) to its run: its topology rows, which its producers wrote at its home line this step, copied there in every
-    field laid out by line and row (``fields``: their addresses, their rows' bytes and their lines' bytes), and its
-    contact rows' diagonals zeroed for the one writer's sums (field ``diag``). A field's line holds ``line_rows`` rows
-    in its own items (``item_bytes``: a row's entries, a record's word, a friction slot of three rows), so a world's
-    first ``rows`` rows take the whole items that cover ``rows / line_rows`` of the field's line. A warp a world and
-    field (:data:`MOVE_LANES`), striding over the 4-byte words of the items (every field's item is whole words).
+    slots) to its run, right after the reservation: the run is its first line, where its contact rows are written,
+    and its contact rows' diagonals are zeroed there for the one writer's sums. Its topology rows follow before the
+    one writer walks the rest (:func:`_move_topology`). A warp a world (:data:`MOVE_LANES`).
 
     The first thread is the arena's record's one writer: the high water of the lines the reservation's claims reached
     (``arena_cursor[0]``) and the claims it refused (``arena_cursor[1]``, counted anew), in the pinned record the host
     reads without synchronizing."""
-    world, field, lane = wp.tid()
-    if world == 0 and field == 0 and lane == 0:
+    world, lane = wp.tid()
+    if world == 0 and lane == 0:
         arena_record[0] = wp.max(arena_record[0], arena_cursor[0])
         arena_record[1] = arena_record[1] + arena_cursor[1]
         arena_cursor[1] = 0
     run = run_of[world][0]
     if run < 0:
         return
-    if field == 0 and lane == 0:
+    if lane == 0:
         first[world] = run
+    count = wp.min(slot_counter[0, world], capacity)
+    for row in range(topology_rows[world] + lane, count, MOVE_LANES):
+        diag[run, row] = 0.0
+
+
+@wp.kernel
+def _move_topology(
+    home: wp.array[int],
+    run_of: wp.array[wp.vec2i],
+    topology_rows: wp.array[int],
+    fields: wp.array[wp.uint64],
+    item_bytes: wp.array[wp.int64],
+    line_bytes: wp.array[wp.int64],
+    line_rows: int,
+):
+    """Copy each world's topology rows from its home line, where their families and the one writer's topology part
+    wrote them this step, to its run of the arena (``run_of``), in every field laid out by line (``fields``: their
+    addresses, their items' bytes and their lines' bytes), before the one writer walks the rest. A field's line holds
+    ``line_rows`` rows in its own items (``item_bytes``: a row's entries, a record's word), so a world's first
+    ``rows`` rows take the whole items that cover ``rows / line_rows`` of the field's line. A warp a world and field
+    (:data:`MOVE_LANES`), striding over the 4-byte words of the items (every field's item is whole words)."""
+    world, field, lane = wp.tid()
+    run = run_of[world][0]
+    if run < 0:
+        return
     rows = topology_rows[world]
     size = item_bytes[field]
     line = line_bytes[field]
@@ -343,11 +364,6 @@ def _move_to_runs(
     reach = wp.int64(line_rows) * size
     items = (wp.int64(rows) * line + reach - wp.int64(1)) // reach
     _copy_words(at, source, items * size // wp.int64(4), lane, MOVE_LANES)
-    if field == diag:
-        count = wp.min(slot_counter[0, world], capacity)
-        if count > rows:
-            words = wp.int64(count - rows) * size // wp.int64(4)
-            _copy_words(at + wp.uint64(wp.int64(rows) * size), wp.uint64(0), words, lane, MOVE_LANES)
 
 
 @wp.kernel
@@ -363,7 +379,7 @@ def _clear_dense_row_state(
 ):
     """Clear each row class's allocation state and row-loss counters (by class and world), the free bodies' row count
     and the world's acts word, in one launch, and take each world to its home line, where the step's topology rows are
-    written (a world whose rows run in the arena moves to its run once they are, :func:`_move_to_runs`). The dense
+    written (a world whose rows run in the arena moves to its run once they are, :func:`_take_runs`). The dense
     rows' count stands until their producers' finalize: the last step's rows are cleared by it. The rows' impulses
     start where the counts are final (:func:`.warm_start.prepare_world_impulses`)."""
     world = wp.tid()
@@ -1338,13 +1354,31 @@ class Placement:
         self.arena_cursor = wp.zeros(2, dtype=wp.int32, device=model.device)
         self._run_fields = None
 
-    def move_to_runs(self) -> None:
-        """After the reservation, take each world whose rows run in the arena to its run (:func:`_move_to_runs`): none
+    def take_runs(self) -> None:
+        """After the reservation, take each world whose rows run in the arena to its run (:func:`_take_runs`): none
         without an arena."""
+        if not self.arena_lines or not self.forest.world_count:
+            return
+        wp.launch(
+            _take_runs,
+            dim=(self.forest.world_count, MOVE_LANES),
+            inputs=[self.world_run, self.topology_rows, self.row_slot_counter, int(self.dense_max_constraints)],
+            outputs=[self.dense_first, self.diag, self.arena_cursor, self.arena_record],
+            device=self.model.device,
+        )
+
+    def move_topology(self) -> None:
+        """Before the one writer walks the rows past the topology rows, copy each world whose rows run in the arena its
+        topology rows from its home line (:func:`_move_topology`): their families wrote them there before the
+        reservation, and the writer's topology part, which runs beside the contact pass, while the claims take the
+        worlds to their runs. Every field laid out by line moves, the dense rows' records where they stream (a free
+        row's header sits past the dense rows' records, from its line's body base): none without an arena."""
         if not self.arena_lines or not self.forest.world_count:
             return
         # The store's fields (a feature's one-line placeholder holds no world's rows).
         fields = [array for array in self.arrays.line_fields if array.shape[0] == self.lines]
+        if self.dense_record_words and self.row_record.shape[0] == self.lines:
+            fields.append(self.row_record)
         if self._run_fields is None or self._run_fields[0] != len(fields):
             device = self.model.device
             self._run_fields = (
@@ -1352,25 +1386,20 @@ class Placement:
                 wp.array([int(a.ptr) for a in fields], dtype=wp.uint64, device=device),
                 wp.array([int(a.strides[1]) for a in fields], dtype=wp.int64, device=device),
                 wp.array([int(a.strides[0]) for a in fields], dtype=wp.int64, device=device),
-                next(i for i, a in enumerate(fields) if a.ptr == self.diag.ptr),
             )
-        count, pointers, item_bytes, line_bytes, diag = self._run_fields
+        count, pointers, item_bytes, line_bytes = self._run_fields
         wp.launch(
-            _move_to_runs,
+            _move_topology,
             dim=(self.forest.world_count, count, MOVE_LANES),
             inputs=[
                 self.home_first,
                 self.world_run,
                 self.topology_rows,
-                self.row_slot_counter,
-                int(self.dense_max_constraints),
                 pointers,
                 item_bytes,
                 line_bytes,
                 int(self.line_rows),
-                diag,
             ],
-            outputs=[self.dense_first, self.arena_cursor, self.arena_record],
             device=self.model.device,
         )
 
@@ -1406,6 +1435,7 @@ class Placement:
                 self.pass_words,
                 self.world_run,
                 self.arena_cursor,
+                self.body_base,
             ],
             device=self.model.device,
         )

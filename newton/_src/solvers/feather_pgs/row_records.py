@@ -67,6 +67,7 @@ RECORDS = (
     Field("row_eps", wp.float32, ("world", "row"), owner="placement"),
     Field("sides", wp.vec2i, ("world", "row"), attr="row_sides", owner="placement"),
     Field("first", wp.int32, ("world",), attr="dense_first", owner="placement"),
+    Field("home", wp.int32, ("world",), attr="home_first", owner="placement"),
 )
 """Each dense row's kind, friction parent, coefficients, gap, targets and law outputs (a material contact's
 compliance ``row_eps`` among them), and its sides (the articulations whose response coordinates it touches:

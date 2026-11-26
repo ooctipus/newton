@@ -809,8 +809,8 @@ class RowLaws:
                 clamp=True,
                 block_dim=lanes if warps > 1 else RESERVE_BLOCK,
             )
-            # Each world whose rows run in the arena to its run (its topology rows written at home move with it).
-            placement.move_to_runs()
+            # Each world whose rows run in the arena to its run (its topology rows follow before the writer's rest).
+            placement.take_runs()
 
     def bound_free_body_contacts(self, solver) -> None:
         """Record where the free bodies' contact rows end in their run (staged with the run,
@@ -866,6 +866,10 @@ class RowLaws:
             if contacts is not None
             else ContactInput()
         )
+        # The topology rows are final at the home line (their families', the writer's topology part's): a world whose
+        # rows run in the arena takes them to its run before the rest are walked.
+        if part != walk_rows.WRITE_TOPOLOGY:
+            solver.placement.move_topology()
         if solver.spec.classes.support == "factor":
             self.write_support(solver, state_in, contact_input, dt)
         elif solver.spec.classes.support == "diagonal":

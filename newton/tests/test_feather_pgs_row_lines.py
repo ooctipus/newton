@@ -19,7 +19,7 @@ from unittest import mock
 import numpy as np
 import warp as wp
 
-from newton._src.solvers.feather_pgs.placement import MOVE_LANES, Placement, _move_to_runs
+from newton._src.solvers.feather_pgs.placement import MOVE_LANES, Placement, _move_topology
 from newton.tests import test_feather_pgs_conformance as conformance
 
 _construct = Placement.__init__
@@ -66,7 +66,7 @@ def _extent(group, route, device, collide_every: int = 1) -> tuple[dict, int, in
 
 
 def _moved_topology(device):
-    """Two worlds' topology rows moved home -> run (:func:`_move_to_runs`) in three fields that count a line in their
+    """Two worlds' topology rows moved home -> run (:func:`_move_topology`) in three fields that count a line in their
     own items, on lines of six rows: rows (a float a row), records (eight words a row) and a friction metric (a slot of
     four floats per three rows). Returns the fields before and after, the worlds' runs and their topology rows."""
     rows, lines = 6, 6
@@ -77,26 +77,21 @@ def _moved_topology(device):
     ]
     arrays = [wp.array(field, device=device) for field in fields]
     runs, topology = [2, 4], [4, 1]
-    first = wp.zeros(2, dtype=wp.int32, device=device)
     wp.launch(
-        _move_to_runs,
+        _move_topology,
         dim=(2, len(arrays), MOVE_LANES),
         inputs=[
             wp.array([0, 1], dtype=wp.int32, device=device),
             wp.array([wp.vec2i(run, 1) for run in runs], dtype=wp.vec2i, device=device),
             wp.array(topology, dtype=wp.int32, device=device),
-            wp.array([topology], dtype=wp.int32, device=device),
-            rows,
             wp.array([int(a.ptr) for a in arrays], dtype=wp.uint64, device=device),
             wp.array([int(a.strides[1]) for a in arrays], dtype=wp.int64, device=device),
             wp.array([int(a.strides[0]) for a in arrays], dtype=wp.int64, device=device),
             rows,
-            0,
         ],
-        outputs=[first, wp.zeros(2, dtype=wp.int32, device=device), wp.zeros(2, dtype=wp.int32, device=device)],
         device=device,
     )
-    return fields, [a.numpy() for a in arrays], runs, topology, first.numpy()
+    return fields, [a.numpy() for a in arrays], runs, topology
 
 
 def _laid_out(rows: int, arena: int):
@@ -158,8 +153,7 @@ class TestFeatherPGSRowLines(unittest.TestCase):
         self._check_short(conformance.cuda_groups(), wp.get_device("cuda"))
 
     def _check_moved_topology(self, device):
-        before, after, runs, topology, first = _moved_topology(device)
-        np.testing.assert_array_equal(first, runs)
+        before, after, runs, topology = _moved_topology(device)
         expected = [field.copy() for field in before]
         for home, (run, count) in enumerate(zip(runs, topology, strict=True)):
             expected[0][run, :count] = before[0][home, :count]

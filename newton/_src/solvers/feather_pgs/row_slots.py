@@ -1484,7 +1484,7 @@ def reserve_world_rows_kernel(grouped: bool, warps: int = 1):
         # this frame where that holds them), which it keeps while it holds its slots; its free rows from its body base,
         # its dense rows' end. Where the arena holds no run, the rows past its home line are rejected (the capacity
         # status). The claims count in device memory (``arena_cursor``: the lines taken, then the claims refused), which
-        # the arena's one writer publishes (:func:`.placement._move_to_runs`): an atomic a claim on the pinned record
+        # the arena's one writer publishes (:func:`.placement._take_runs`): an atomic a claim on the pinned record
         # would cross the host bus once a world.
         dense_total = world_slot_counter[world] + rows[0] + rows[2]
         free_total = mf_slot_counter[world] + rows[1] + rows[3]

@@ -499,7 +499,11 @@ def walked_rows_kernel(
         # The writer's rows are the line's dense rows: the packed rows past them are the free bodies'.
         dense_rows = support.units.shape[1]
         count = wp.min(counts[world], dense_rows)
+        # The topology part runs beside the contact pass, whose claims take a world to its run: it writes at the home
+        # line, from which the topology rows move to the run before the rest (.placement.Placement.move_topology).
         line = rows.first[world]
+        if part == WRITE_TOPOLOGY:
+            line = rows.home[world]
         # The part's rows: the topology's below the family bound (the count is not final before the contact pass),
         # the rest above it.
         first = int(0)
