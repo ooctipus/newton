@@ -628,6 +628,8 @@ class Placement:
         self.island_parent = wp.array(np.arange(trees, dtype=np.int32), dtype=wp.int32, device=device)
         self.island_size = wp.zeros(trees, dtype=wp.int32, device=device)
         self.island_base = wp.zeros(trees, dtype=wp.vec2i, device=device)
+        # What a batch of a world's frame order leaves the next in its block of warps (row_slots._frame_turns).
+        self.reserve_turns = wp.zeros((max(int(self.forest.world_count), 1), 8), dtype=wp.int32, device=device)
         # No world's dense line by colors of groups until the sweep takes them (allocate_row_groups).
         self.row_groups = self._row_groups(np.full(0, -1, dtype=np.int32), 0, 0, 0.0)
         # Allocated once here: per-step allocation is forbidden under CUDA graph capture.
@@ -676,6 +678,7 @@ class Placement:
             setattr(order, name, getattr(self, f"contact_{name}"))
         for name in ("island_parent", "island_size", "island_base"):
             setattr(order, name, getattr(self, name))
+        order.turns = self.reserve_turns
         return order
 
     def allocate_row_groups(self, worlds: np.ndarray, min_units: int, need: float) -> None:

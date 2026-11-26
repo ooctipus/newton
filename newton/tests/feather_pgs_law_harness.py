@@ -1561,6 +1561,7 @@ def allocate_contacts(operands, device) -> None:
     order.island_size = wp.zeros(trees, dtype=wp.int32, device=device)
     order.island_base = wp.zeros(trees, dtype=wp.vec2i, device=device)
     order.frame_kept = wp.zeros(1, dtype=int, device=device)
+    order.turns = wp.zeros((worlds, 8), dtype=wp.int32, device=device)
     values["order"] = order
     # No world's dense line by colors of groups (row_slots.RowGroups: the sweep plan's grouped worlds).
     values["groups"] = row_groups(np.zeros(0, dtype=np.int32), 0, 0, 0, 0, 0.0, device)

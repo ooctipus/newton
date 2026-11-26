@@ -442,8 +442,10 @@ class RowOrder:
     of the pairs before it in the row order
     (``rows_before``); and by articulation, the islands' union-find parents, sizes, and first places in the row order
     with their strides' inverses (``island_parent``, ``island_size``, ``island_base``), each tree its own root and
-    size zero between reservations; and whether the contact frame is the last build's (``frame_kept``, the patch
-    builder's word), whose islands' order the last reservation left in ``row_pairs``."""
+    size zero between reservations; whether the contact frame is the last build's (``frame_kept``, the patch
+    builder's word), whose islands' order the last reservation left in ``row_pairs``; and by world, what a batch of the
+    frame order leaves the next in a world's block of warps (``turns``: the rows of the lists and the pairs before
+    it, :func:`_frame_turns`)."""
 
     pair_keys: wp.array[wp.int64]
     world_contact_first: wp.array[int]
@@ -460,6 +462,7 @@ class RowOrder:
     island_size: wp.array[int]
     island_base: wp.array[wp.vec2i]
     frame_kept: wp.array[int]
+    turns: wp.array2d[int]
 
 
 GROUP_MEMBERS = wp.constant(4)
@@ -1157,6 +1160,76 @@ def reserve_warps(worlds: int, device) -> int:
     return fill_lanes(worlds, device, least=lanes, most=lanes * RESERVE_WARPS) // lanes
 
 
+@wp.func
+def _frame_turns(
+    data: ContactInput,
+    order: RowOrder,
+    world: int,
+    first: int,
+    end: int,
+    kept: int,
+    lanes: int,
+    lane: int,
+    warp: int,
+    warps: int,
+):
+    """The frame's order: each contact's rows before it and its pair (``rows_frame``, ``pairs_before``), each pair's
+    head and, where the frame is new, its trees (``pairs``, ``pair_sides``), a batch of the world's lanes at a time;
+    the frame's rows and pairs in ``turns`` after it.
+
+    Over a block of ``warps`` warps, warp ``w`` takes the batches ``w``, ``w + warps``, ...: a batch's loads and its own
+    sums come before its turn (the warp before it passed it, :func:`_turn_wait`), which reads what the batches before it
+    left (the rows of the lists and the pairs before it, ``turns``), writes the batch's places, leaves its own, and
+    passes it on: every place is the one warp's. A world's one warp carries them itself and joins each new pair's trees
+    (:func:`_order_islands`; a block's warps joined them before)."""
+    batches = (end - first + lanes - 1) // lanes
+    rows = wp.vec4i(0)
+    pairs = int(0)
+    for g in range(warp, batches, warps):
+        c = first + g * lanes + lane
+        mine = bool(False)
+        heads = bool(False)
+        own = wp.vec4i(0)
+        sides = wp.vec2i(-1, -1)
+        if c < end:
+            if data.world[c] == world:
+                mine = True
+                heads = c == first or order.pair_keys[c] != order.pair_keys[c - 1]
+                own = _contact_rows(data, c)
+                if heads and kept == 0:
+                    sides = row_sides(data.art0[c], data.art1[c], data.response_dofs)
+                    if warps == 1 and sides[1] >= 0:
+                        union_find.union(order.island_parent, sides[0], sides[1])
+        votes = lane_ballot(heads, RESERVE_LANES)
+        lower = _lane_scan4(own)
+        if warps > 1 and g > 0:
+            _turn_wait(_turn(warp, warps))
+            rows = wp.vec4i(order.turns[world, 0], order.turns[world, 1], order.turns[world, 2], order.turns[world, 3])
+            pairs = order.turns[world, 4]
+        if mine:
+            pair = pairs + lane_below(votes, RESERVE_LANES) + wp.where(heads, 1, 0) - 1
+            order.pairs_before[c] = pair
+            order.rows_frame[c] = rows + lower
+            if heads:
+                order.pairs[first + pair] = c
+                if kept == 0:
+                    order.pair_sides[first + pair] = sides
+        rows = rows + _lane_sum4(own)
+        pairs += lane_count(votes, RESERVE_LANES)
+        if warps > 1:
+            lane_sync(RESERVE_LANES)
+            if lane == 0:
+                for k in range(4):
+                    order.turns[world, k] = rows[k]
+                order.turns[world, 4] = pairs
+            if g + 1 < batches:
+                _turn_pass(_turn(warp + 1, warps))
+    if warps == 1 and lane == 0:
+        for k in range(4):
+            order.turns[world, k] = rows[k]
+        order.turns[world, 4] = pairs
+
+
 @cache
 def reserve_world_rows_kernel(grouped: bool, warps: int = 1):
     """The reservation kernel (:func:`reserve_world_rows`, its body below): ``grouped`` where the model holds worlds
@@ -1262,37 +1335,18 @@ def reserve_world_rows_kernel(grouped: bool, warps: int = 1):
                             if sides[1] >= 0:
                                 union_find.union(order.island_parent, sides[0], sides[1])
             lane_sync(threads)
-        # The frame's order: each contact's rows before it and its pair, each pair's head.
+        # The frame's order (_frame_turns): each contact's rows before it and its pair, each pair's head.
+        _frame_turns(data, order, world, first, end, kept, lanes, lane, warp, warps)
+        if wp.static(warps > 1):
+            lane_sync(threads)
+        else:
+            lane_sync(RESERVE_LANES)
         rows = wp.vec4i(0)
         pairs = int(0)
+        if end > first:
+            rows = wp.vec4i(order.turns[world, 0], order.turns[world, 1], order.turns[world, 2], order.turns[world, 3])
+            pairs = order.turns[world, 4]
         if warp == 0:
-            for base in range(first, end, lanes):
-                c = base + lane
-                mine = bool(False)
-                heads = bool(False)
-                own = wp.vec4i(0)
-                if c < end:
-                    if data.world[c] == world:
-                        mine = True
-                        heads = c == first or order.pair_keys[c] != order.pair_keys[c - 1]
-                        own = _contact_rows(data, c)
-                votes = lane_ballot(heads, RESERVE_LANES)
-                lower = _lane_scan4(own)
-                if mine:
-                    pair = pairs + lane_below(votes, RESERVE_LANES) + wp.where(heads, 1, 0) - 1
-                    order.pairs_before[c] = pair
-                    order.rows_frame[c] = rows + lower
-                    if heads:
-                        order.pairs[first + pair] = c
-                        if kept == 0:
-                            # The pair joins its trees' islands (_order_islands).
-                            sides = row_sides(data.art0[c], data.art1[c], data.response_dofs)
-                            order.pair_sides[first + pair] = sides
-                            if wp.static(warps == 1):
-                                if sides[1] >= 0:
-                                    union_find.union(order.island_parent, sides[0], sides[1])
-                rows = rows + _lane_sum4(own)
-                pairs += lane_count(votes, RESERVE_LANES)
             lane_sync(RESERVE_LANES)
             if kept == 0:
                 _order_islands(data, order, first, pairs, lanes, lane)
@@ -1313,11 +1367,6 @@ def reserve_world_rows_kernel(grouped: bool, warps: int = 1):
             lane_sync(RESERVE_LANES)
         if wp.static(warps > 1):
             lane_sync(threads)
-            # The world's rows of each list and its pairs (the first warp's sums): its last contact's before it and
-            # its own, and its pair's place and one.
-            if end > first:
-                rows = order.rows_frame[end - 1] + _contact_rows(data, end - 1)
-                pairs = order.pairs_before[end - 1] + 1
         # A world of many trees: its dense contact rows by colors of groups, where it takes them (RowGroups), over the
         # world's warps in turn.
         if wp.static(grouped):
