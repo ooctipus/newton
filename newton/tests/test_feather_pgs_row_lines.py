@@ -81,7 +81,7 @@ def _moved_topology(device):
     runs, topology = [2, 4], [4, 1]
     wp.launch(
         _move_topology,
-        dim=(2, len(arrays), MOVE_LANES),
+        dim=(2, MOVE_LANES),
         inputs=[
             wp.array([0, 1], dtype=wp.int32, device=device),
             wp.array([wp.vec2i(run, 1) for run in runs], dtype=wp.vec2i, device=device),
@@ -90,6 +90,7 @@ def _moved_topology(device):
             wp.array([int(a.strides[1]) for a in arrays], dtype=wp.int64, device=device),
             wp.array([int(a.strides[0]) for a in arrays], dtype=wp.int64, device=device),
             wp.array([rows, rows, rows, 4], dtype=wp.int64, device=device),
+            len(arrays),
         ],
         device=device,
     )

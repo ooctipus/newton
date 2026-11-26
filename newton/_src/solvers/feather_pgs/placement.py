@@ -349,26 +349,29 @@ def _move_topology(
     item_bytes: wp.array[wp.int64],
     line_bytes: wp.array[wp.int64],
     line_rows: wp.array[wp.int64],
+    count: int,
 ):
     """Copy each world's topology rows from its home line, where their families and the one writer's topology part
     wrote them this step, to its run of the arena (``run_of``), in every field laid out by line (``fields``: their
     addresses, their items' bytes and their lines' bytes), before the one writer walks the rest. A field's line holds
     ``line_rows`` of its rows in its own items (``item_bytes``: a row's entries, a record's word): the store's line,
     or fewer where the field holds fewer rows a world (the dense rows' units), so a world's first ``rows`` rows take
-    the whole items that cover ``rows / line_rows`` of the field's line. A warp a world and field
-    (:data:`MOVE_LANES`), striding over the 4-byte words of the items (every field's item is whole words)."""
-    world, field, lane = wp.tid()
+    the whole items that cover ``rows / line_rows`` of the field's line. A warp a world (:data:`MOVE_LANES`), the
+    ``count`` fields in turn, striding over the 4-byte words of their items (every field's item is whole words): a world
+    without a run leaves at once, so a step where none has one costs a warp a world, not a warp a world and field."""
+    world, lane = wp.tid()
     run = run_of[world][0]
     if run < 0:
         return
     rows = topology_rows[world]
-    size = item_bytes[field]
-    line = line_bytes[field]
-    at = fields[field] + wp.uint64(run) * wp.uint64(line)
-    source = fields[field] + wp.uint64(home[world]) * wp.uint64(line)
-    reach = line_rows[field] * size
-    items = (wp.int64(rows) * line + reach - wp.int64(1)) // reach
-    _copy_words(at, source, items * size // wp.int64(4), lane, MOVE_LANES)
+    for field in range(count):
+        size = item_bytes[field]
+        line = line_bytes[field]
+        at = fields[field] + wp.uint64(run) * wp.uint64(line)
+        source = fields[field] + wp.uint64(home[world]) * wp.uint64(line)
+        reach = line_rows[field] * size
+        items = (wp.int64(rows) * line + reach - wp.int64(1)) // reach
+        _copy_words(at, source, items * size // wp.int64(4), lane, MOVE_LANES)
 
 
 @wp.kernel
@@ -1479,7 +1482,7 @@ class Placement:
         _, count, pointers, item_bytes, line_bytes, line_rows = self._run_fields
         wp.launch(
             _move_topology,
-            dim=(self.forest.world_count, count, MOVE_LANES),
+            dim=(self.forest.world_count, MOVE_LANES),
             inputs=[
                 self.home_first,
                 self.world_run,
@@ -1488,6 +1491,7 @@ class Placement:
                 item_bytes,
                 line_bytes,
                 line_rows,
+                count,
             ],
             device=self.model.device,
         )
