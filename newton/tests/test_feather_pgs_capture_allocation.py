@@ -3,6 +3,7 @@
 
 """Allocate the inputs a captured step reads before the capture."""
 
+import copy
 import unittest
 from unittest.mock import patch
 
@@ -11,6 +12,7 @@ import warp as wp
 
 import newton
 from newton.tests.feather_pgs_patch_parity import standing_model
+from newton.tests.test_feather_pgs_contract_loops import _build_four_bar
 from newton.tests.test_feather_pgs_parallel_patch import _matrix_free_solver
 
 DT = 1.0 / 240.0
@@ -85,6 +87,52 @@ class TestFeatherPGSCaptureAllocation(unittest.TestCase):
             expected, actual = getattr(eager.out, field).numpy(), getattr(captured.out, field).numpy()
             self.assertTrue(np.isfinite(actual).all(), field)
             np.testing.assert_allclose(actual, expected, rtol=0.0, atol=2e-6, err_msg=field)
+
+    def test_a_cut_forest_steps_eagerly_after_a_captured_first_step(self):
+        """Step a cut forest (a four-bar closed by a loop joint) eagerly right after a capture that took its first step.
+
+        The solver steps mirrors of the caller's states and control in the forest's layout. Allocated at the first step
+        that sees them, inside the capture, they would belong to the graph, unmapped until its first replay: the eager
+        step would write through their addresses (CUDA 700). A state made before the solver and one made after it both
+        hold their mirrors before the capture, and the eager step matches a first step taken without any capture.
+        """
+        device = wp.get_device("cuda:0")
+        model = _build_four_bar().finalize(device=device)
+
+        def run(capture: bool):
+            state = model.state()
+            solver = newton.solvers.SolverFeatherPGS(model, pgs_iterations=16, pgs_beta=0.1)
+            out, control = model.state(), model.control()
+            if capture:
+                with wp.ScopedCapture(device=device) as captured:
+                    solver.step(state, out, control, None, DT)
+            solver.step(state, out, control, None, DT)
+            wp.synchronize_device(device)
+            if capture:
+                wp.capture_launch(captured.graph)
+                wp.synchronize_device(device)
+            return out
+
+        after_capture, eager = run(capture=True), run(capture=False)
+        for field in STATE_FIELDS:
+            actual = getattr(after_capture, field).numpy()
+            self.assertTrue(np.isfinite(actual).all(), field)
+            np.testing.assert_array_equal(actual, getattr(eager, field).numpy(), err_msg=field)
+
+    def test_a_capture_does_not_take_a_state_the_model_did_not_make(self):
+        """A state the model did not make takes its mirror at its first step outside capture; a capture that would be
+        the first to step it raises instead of allocating the mirror inside the graph."""
+        device = wp.get_device("cuda:0")
+        model = _build_four_bar().finalize(device=device)
+        solver = newton.solvers.SolverFeatherPGS(model, pgs_iterations=16, pgs_beta=0.1)
+        state, control = model.state(), model.control()
+        unknown = copy.copy(model.state())
+        with self.assertRaisesRegex(RuntimeError, "Model.state"):
+            with wp.ScopedCapture(device=device):
+                solver.step(state, unknown, control, None, DT)
+        solver.step(state, unknown, control, None, DT)
+        wp.synchronize_device(device)
+        self.assertTrue(np.isfinite(unknown.body_q.numpy()).all())
 
 
 if __name__ == "__main__":

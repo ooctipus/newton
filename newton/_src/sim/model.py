@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import operator
 import warnings
+import weakref
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field, replace
@@ -2109,6 +2110,10 @@ class Model:
         """Attribute keys containing labels for custom-frequency rows."""
 
         self._requested_state_attributes: set[str] = set()
+        self._states: weakref.WeakSet[State] = weakref.WeakSet()
+        """The states :meth:`state` made that are still alive (:meth:`follow_states`)."""
+        self._state_followers: list[weakref.WeakMethod] = []
+        """The callbacks :meth:`state` calls with each state it makes, held weakly (:meth:`follow_states`)."""
         self._collision_pipeline: CollisionPipeline | None = None
         # cached collision pipeline
         self._requested_contact_attributes: set[str] = set()
@@ -2932,7 +2937,25 @@ class Model:
         # attach custom attributes with assignment==STATE
         self._add_custom_attributes(s, Model.AttributeAssignment.STATE, requires_grad=requires_grad)
 
+        self._states.add(s)
+        self._state_followers = [follower for follower in self._state_followers if follower() is not None]
+        for follower in self._state_followers:
+            follower()(s)
         return s
+
+    def follow_states(self, follower: Callable[[State], None]) -> None:
+        """Call ``follower`` with each state :meth:`state` made that is still alive, now, and with each state it makes
+        from now on.
+
+        A solver that keeps data of its own for each state it steps allocates it here, where the state's own arrays
+        are allocated: outside any graph capture an application starts later, which may take the solver's first step.
+
+        Args:
+            follower: A bound method, held weakly: following ends with its object.
+        """
+        self._state_followers.append(weakref.WeakMethod(follower))
+        for state in list(self._states):
+            follower(state)
 
     def _add_requested_state_attributes(
         self,

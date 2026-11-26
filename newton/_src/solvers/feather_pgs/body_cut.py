@@ -60,6 +60,7 @@ import numpy as np
 import warp as wp
 
 from ...core import memory
+from ...core.contact_pool import capturing
 from ...core.execution import Shape, Work, launch, shape
 from ...sim import BodyFlags, Control, JointType, Model, ModelBuilder, State
 from ...sim.articulation import (
@@ -995,10 +996,17 @@ class BodyCut:
         self._components = (labels.size, *(indices(values) for values in (tree_start, trees, link_start, links)))
         self._seat_shape = shape(Work(labels.size), memory.device(device))
 
-        # The mirrors of the caller's states and controls, and the seat's model: a loop joint is a one-joint
-        # articulation to inverse kinematics.
-        self._states: weakref.WeakKeyDictionary[State, State] = weakref.WeakKeyDictionary()
-        self._controls: weakref.WeakKeyDictionary[Control, Control] = weakref.WeakKeyDictionary()
+        # The control's mirror, which every enter fills, and the seat's model: a loop joint is a one-joint articulation
+        # to inverse kinematics. An added root's control entries hold zero: no force, no target.
+        self._control_arrays = {
+            name: wp.zeros(count, dtype=wp.float32, device=device)
+            for name, count in (
+                ("joint_f", forest.joint_dof_count),
+                ("joint_target_q", forest.joint_coord_count),
+                ("joint_target_qd", forest.joint_dof_count),
+                ("joint_act", forest.joint_dof_count),
+            )
+        }
         self._seats = copy.copy(forest)
         self._seats.articulation_start = indices(position[loops])
         self._seats.articulation_end = indices(position[loops] + 1)
@@ -1006,6 +1014,9 @@ class BodyCut:
         self._seats.max_joints_per_articulation = 1
         self._shares()
         self._gather_model()
+        # The mirrors of the caller's states, one a state, allocated with the state (:meth:`_follow`).
+        self._states: weakref.WeakKeyDictionary[State, State] = weakref.WeakKeyDictionary()
+        caller.follow_states(self._follow)
 
     # --- the model's properties ---------------------------------------------------------------------------------
     def _shares(self) -> None:
@@ -1092,49 +1103,50 @@ class BodyCut:
         )
 
     # --- the step's boundary ------------------------------------------------------------------------------------
+    def _follow(self, state: State) -> None:
+        """Allocate ``state``'s mirror where the state is made (:meth:`~newton.Model.follow_states`): its own arrays in the
+        forest's layout, everything else shared. A step reads a mirror a captured graph may hold, so the mirror exists
+        before any capture: an allocation inside one would belong to the graph, unmapped until its first replay and
+        gone with it. The shadows' wrenches stay zero; every other entry is written before it is read."""
+        mirror = copy.copy(state)
+        count, device = self.model.body_count, self.model.device
+        mirror.body_q = wp.zeros(count, dtype=wp.transform, device=device)
+        mirror.body_qd = wp.zeros(count, dtype=wp.spatial_vector, device=device)
+        mirror.body_f = wp.zeros(count, dtype=wp.spatial_vector, device=device)
+        mirror.joint_q = wp.zeros(self.model.joint_coord_count, dtype=state.joint_q.dtype, device=device)
+        mirror.joint_qd = wp.zeros(self.model.joint_dof_count, dtype=state.joint_qd.dtype, device=device)
+        self._states[state] = mirror
+
     def mirror(self, state: State) -> State:
         """``state`` as the solver holds it: its mirror, with its own arrays in the forest's layout and everything else
-        shared, or ``state`` itself on a pure forest."""
+        shared, or ``state`` itself on a pure forest. A state the model did not make takes its mirror at its first step
+        outside capture.
+
+        Raises:
+            RuntimeError: A graph capture is the first to step a state the model did not make.
+        """
         if self.pure:
             return state
-        mirror = self._states.get(state)
-        if mirror is None:
-            mirror = copy.copy(state)
-            # Inside a graph capture wp.zeros would be a memset that replays every launch. Every entry here but the
-            # shadows' wrenches is written before it is read, and a shadow's wrench stays zero through a replayed fill.
-            count, device = self.model.body_count, self.model.device
-            mirror.body_q = wp.empty(count, dtype=wp.transform, device=device)
-            mirror.body_qd = wp.empty(count, dtype=wp.spatial_vector, device=device)
-            mirror.body_f = wp.empty(count, dtype=wp.spatial_vector, device=device)
-            mirror.body_f.zero_()
-            mirror.joint_q = wp.empty(self.model.joint_coord_count, dtype=state.joint_q.dtype, device=device)
-            mirror.joint_qd = wp.empty(self.model.joint_dof_count, dtype=state.joint_qd.dtype, device=device)
-            self._states[state] = mirror
-        return mirror
+        if state not in self._states:
+            if capturing(self.model.device):
+                raise RuntimeError(
+                    "SolverFeatherPGS: a graph capture is the first to step a state that Model.state() did not make; "
+                    "make the state with Model.state(), or step it once outside the capture."
+                )
+            self._follow(state)
+        return self._states[state]
 
     def trees(self, articulations: wp.array | None) -> wp.array | None:
         """The trees of the model's ``articulations``, which name them only on a pure forest: every tree otherwise."""
         return articulations if self.pure else None
 
     def _control(self, control: Control | None) -> Control | None:
-        """``control``'s mirror, which the enter's gather fills (:meth:`enter`)."""
+        """``control``'s mirror, the cut's one set of arrays, which the enter's gather fills (:meth:`enter`)."""
         if control is None:
             return None
-        mirror = self._controls.get(control)
-        if mirror is None:
-            mirror = copy.copy(control)
-            # An added root's entries hold zero: no force, no target.
-            for name, count in (
-                ("joint_f", self.model.joint_dof_count),
-                ("joint_target_q", self.model.joint_coord_count),
-                ("joint_target_qd", self.model.joint_dof_count),
-                ("joint_act", self.model.joint_dof_count),
-            ):
-                value = getattr(control, name)
-                setattr(
-                    mirror, name, None if value is None else wp.zeros(count, dtype=value.dtype, device=value.device)
-                )
-            self._controls[control] = mirror
+        mirror = copy.copy(control)
+        for name, array in self._control_arrays.items():
+            setattr(mirror, name, None if getattr(control, name) is None else array)
         return mirror
 
     def enter(
