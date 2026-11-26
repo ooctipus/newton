@@ -1054,8 +1054,9 @@ class Sweep:
         rows by) and the capacity's launch bound (its register line, :attr:`.sweep_routes.GeneralSweep.line_stage`),
         so the same arithmetic. The head is the longest of whole lines that keeps the resident blocks of one line of
         rows and the static stage (:data:`.memory.STATIC_SHARED_BYTES`, so the L1 stays); the worlds past it are the
-        capacity's launch's, and a capacity the head would hold keeps the one launch. The CPU's one thread holds the
-        whole stage: one launch.
+        capacity's launch's, and a capacity the head would hold keeps the one launch, as do worlds the capacity's stage
+        already keeps resident at once (a head buys resident worlds, nothing else: past them it only adds a launch). The
+        CPU's one thread holds the whole stage: one launch.
 
         Returns the launches in order, the capacity's last."""
         full = self._staged(config, items)
@@ -1077,7 +1078,10 @@ class Sweep:
             held_rows = layout(rows)
             return held_rows.blocks_per_sm >= resident and held_rows.staging.bytes <= ceiling
 
-        if keeps(capacity):
+        # A head buys resident worlds: where the capacity's stage already keeps every world resident at once, the head's
+        # launch would only add a launch (the bridge's one world: an empty second launch a sweep).
+        whole = shape(self._launch_work(full, items), found)
+        if keeps(capacity) or -(-items // whole.groups) <= whole.blocks_per_sm * found.sms:
             return (full,)
         low, high = 1, capacity // line
         while low < high:
