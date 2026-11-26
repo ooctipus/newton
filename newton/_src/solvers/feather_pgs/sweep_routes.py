@@ -1767,18 +1767,28 @@ GROUP_BARRIER = """        {{
 """
 
 
-def group_rows(loop: Callable[[str, str, str], str], pad: str, *, group: bool = False) -> str:
+def group_rows(
+    loop: Callable[..., str],
+    pad: str,
+    *,
+    group: bool = False,
+    sides: Callable[[str], tuple[str, str]] | None = None,
+) -> str:
     """A grouped world's dense rows (:class:`.row_slots.RowGroups`) by its block: the rows before its first group (the
     topology's: limits, links, mimics) in order on the first warp, then its colors in turn, a color's groups a warp
     each, its rows in order (``loop(begin, end, pad)``: the rows ``[begin, end)``), a barrier after each. A color's
     groups share no tree, so they write no coordinate another reads: the colors' order is the sweep's.
 
     Over a world's ``group`` of blocks (:func:`worlds`' ranks) the world's block (rank 0) runs the topology rows, then
-    opens the sweep (its job words, :data:`WIDE_JOB`), which the other blocks take, the world's end last. Every block
-    reads the colors (the group's tables): a color with more groups than a block's warps is the group's, its groups
-    spread over the blocks' warps (``warp * group + rank``), a narrow one the world's block's. The blocks meet
-    (:data:`GROUP_BARRIER`) after a color of the group and before one, the sweep's last with their exit votes, which
-    the world's block takes; between two narrow colors its own barrier suffices. The same visits in the same colors."""
+    opens the sweep (its job words, :data:`WIDE_JOB`), which the other blocks take, the world's end last. The world's
+    groups in their colors' order are spread over the group's warps (``warp * group + rank``, each warp's in turn),
+    and each runs once the groups before it on its trees ran, not once its color's every group did: a tree's count
+    (``tree_run``, at its first coordinate, ``sides(row)`` of a group's first row; from zero each launch) holds the
+    sweep's stamp (``wide_gen``) with the groups of the sweep that ran on it, and a group's places on its trees
+    (``group_follows``) are the counts it waits for, once its first row's operands are loading (``loop(begin, end, pad,
+    ready)``: ``ready`` before the run's first visit). Each tree takes its groups in the colors' order, the visits of
+    each the same: the colors' sweep. The groups past the world's rows (a suffix) run nothing. The blocks meet
+    (:data:`GROUP_BARRIER`) at the sweep's end with their exit votes, which the world's block takes."""
     inner = "        "
     topology = f"""    if (warp == 0{" && rank == 0" if group else ""}) {{
         const int row_begin = 0;
@@ -1786,28 +1796,36 @@ def group_rows(loop: Callable[[str, str, str], str], pad: str, *, group: bool = 
 {loop("row_begin", "row_end", inner)}
     }}
     __syncthreads();"""
-    run = loop("row_begin", "row_end", inner + "    ")
-
-    def visit(at: str, step: str) -> str:
-        return f"""        for (int row_group = {at}; row_group < color_end; row_group += {step}) {{
+    if not group:
+        run = loop("row_begin", "row_end", inner + "    ")
+        colors = f"""    for (int color = 0; color < group_colors; ++color) {{
+        const int color_first = group_offsets[color], color_end = group_offsets[color + 1];
+        for (int row_group = color_first + warp; row_group < color_end; row_group += {GROUP_WARPS}) {{
             const int row_begin = min(group_rows[row_group], m_dense);
             const int row_end = min(group_rows[row_group + 1], m_dense);
 {run}
-        }}"""
-
-    if not group:
-        colors = f"""    for (int color = 0; color < group_colors; ++color) {{
-        const int color_first = group_offsets[color], color_end = group_offsets[color + 1];
-{visit("color_first + warp", str(GROUP_WARPS))}
+        }}
         __syncthreads();
     }}"""
         return indent(f"{{\n{topology}\n{colors}\n}}", pad)
-    wide = f"group > 1 && group_offsets[{{c}} + 1] - group_offsets[{{c}}] > {GROUP_WARPS}"
+    if sides is None:
+        raise ValueError("a world's group of blocks runs its groups by their trees: give the rows' sides")
+    side_a, side_b = sides("row_begin")
+    # Lane 0 waits for the group's trees once its first row's operands are loading (they read neither tree).
+    ready = """if (lane == 0 && (before_a != 0 || before_b != 0)) {
+    const volatile int* const runs = tree_run;
+    if (before_a != 0) while (runs[tree_a] < (stamp | before_a)) { }
+    if (before_b != 0) while (runs[tree_b] < (stamp | before_b)) { }
+    asm volatile("fence.acq_rel.gpu;" ::: "memory");
+}
+__syncwarp();
+"""
+    run = loop("row_begin", "row_end", inner + "    ", ready)
     meet = GROUP_BARRIER.format(vote="__syncthreads_or(iteration_changed != 0)")
     colors = f"""    for (;;) {{
     // The world's block opens the sweep (its topology rows ran); the others take it, or the world's end.
+    ++wide_gen;
     if (group > 1) {{
-        ++wide_gen;
         if (rank == 0) {{
             if (tid == 0) {{
                 __threadfence();
@@ -1824,22 +1842,35 @@ def group_rows(loop: Callable[[str, str, str], str], pad: str, *, group: bool = 
             if (job[3] != 0) break;
         }}
     }}
-    for (int color = 0; color < group_colors; ++color) {{
-        const int color_first = group_offsets[color], color_end = group_offsets[color + 1];
-        const bool wide = {wide.format(c="color")};
-        if (wide || rank == 0) {{
-            const int place_at = wide ? warp * group + rank : warp;
-            const int place_step = wide ? {GROUP_WARPS} * group : {GROUP_WARPS};
-{visit("color_first + place_at", "place_step")}
-        }}
-        if (group > 1 && (wide || color + 1 == group_colors || ({wide.format(c="color + 1")}))) {{
-{indent(meet, "    ")}
-        }} else {{
-            __syncthreads();
+    // Each group once its trees' groups before it ran: lane 0 waits for their counts, the warp runs its rows and fences
+    // its stores, lane 0 counts it on its trees.
+    const int stamp = wide_gen << 8;
+    const int group_count = group_offsets[group_colors];
+    for (int row_group = warp * group + rank; row_group < group_count; row_group += {GROUP_WARPS} * group) {{
+        const int row_begin = min(group_rows[row_group], m_dense);
+        const int row_end = min(group_rows[row_group + 1], m_dense);
+        if (row_end <= row_begin) break;
+        const int follow = group_follows[row_group];
+        const int tree_a = {side_a}, tree_b = {side_b};
+        // Its places on its trees: the groups before it, and whether one follows it (a count to leave).
+        const int before_a = follow & 63, before_b = tree_b >= 0 ? (follow >> 8) & 63 : 0;
+        const bool leave_a = (follow & 64) != 0, leave_b = tree_b >= 0 && (follow & (64 << 8)) != 0;
+{run}
+        __syncwarp();
+        if (lane == 0 && (leave_a || leave_b)) {{
+            asm volatile("fence.acq_rel.gpu;" ::: "memory");
+            volatile int* const runs = tree_run;
+            if (leave_a) runs[tree_a] = stamp | (before_a + 1);
+            if (leave_b) runs[tree_b] = stamp | (before_b + 1);
         }}
     }}
-    // The world's block takes the group's votes (each counted in before the sweep's last meeting) and clears them for
-    // the next sweep, which it opens; the others reset theirs and take its next.
+    if (group > 1) {{
+{indent(meet, "    ")}
+    }} else {{
+        __syncthreads();
+    }}
+    // The world's block takes the group's votes (each counted in at the sweep's meeting) and clears them for the next
+    // sweep, which it opens; the others reset theirs and take its next.
     if (group > 1) {{
         if (rank == 0) {{
             if (tid == 0) {{
@@ -2056,6 +2087,13 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
             "(size_t)group_slot * row_group_offsets.shape[1];"
             "\n    const int* const group_rows = row_group_rows.data + (size_t)group_slot * row_group_rows.shape[1];"
         )
+        if sweep.world_blocks:
+            # Over a group of blocks: its groups' places on their trees and its trees' counts (group_rows).
+            offsets += (
+                "\n    const int* const group_follows = row_group_follows.data + "
+                "(size_t)group_slot * row_group_follows.shape[1];"
+                "\n    int* const tree_run = tree_runs.data + (size_t)world * tree_runs.shape[1];"
+            )
     else:
         violation = active_violation(dense, dense_op, count="m_dense") if sweep.active_rows else None
         # The world's own cycles (its cost class, sweep_levels.COST_CLASSES): read at each sweep's end inside the
@@ -2222,7 +2260,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
             if sweep.contact_units:
                 units = "\n".join(text for text in (skip, unit_text(run_rows, run_op)) if text)
         dense_phase = group_rows(
-            lambda begin, end, pad: rows_block(
+            lambda begin, end, pad, ready="": rows_block(
                 run_rows,
                 run_op,
                 laws,
@@ -2231,10 +2269,12 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
                 unit=units,
                 end=end,
                 begin=begin,
+                ready=ready,
                 pad=pad,
             ),
             "        ",
             group=sweep.world_blocks,
+            sides=run_rows.side_coordinates,
         )
     if units and sweep.contact_units:
         dense_phase = f"        int consumed_tangent = -1;\n{dense_phase}"
@@ -2317,11 +2357,17 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     if sweep.formed == "stage":
         seed, rest = "", ""
     # The rows' staging and the coordinates' clearing, a row and a coordinate a thread: a world a block's (its first
-    # block's, of a group), the warp mapping's lanes.
+    # block's, of a group), the warp mapping's lanes; a grouped world's group of blocks clears its trees' counts.
+    clear = f"    for (int d = {thread}; d < {D}; d += {threads}) s_v[d] = 0.0f;"
+    if grouped and sweep.world_blocks:
+        clear = f"""    for (int d = {thread}; d < {D}; d += {threads}) {{
+        s_v[d] = 0.0f;
+        tree_run[d] = 0;
+    }}"""
     start = f"""{alone}    for (int i = {thread}; i < m_dense; i += {threads}) {{
 {dense_loads}
     }}{free_loads}
-    for (int d = {thread}; d < {D}; d += {threads}) s_v[d] = 0.0f;
+{clear}
 {end_alone}"""
     records_stage = f"{alone + metric_stage + end_alone if grouped else first_warp + metric_stage + end_first_warp}"
     if block and sweep.formed == "stage":
@@ -2641,6 +2687,15 @@ class GeneralSweep(SweepConfig):
                     RowArgument("row_group_rows", wp.array2d[int], after="omega"),
                 )
                 if self.grouped
+                else ()
+            ),
+            # Over a world's group of blocks, its groups' places on their trees and its trees' counts (group_rows).
+            *(
+                (
+                    RowArgument("row_group_follows", wp.array2d[int], after="omega"),
+                    RowArgument("tree_runs", wp.array2d[int], after="omega"),
+                )
+                if self.grouped and self.world_blocks
                 else ()
             ),
             # Where the world's velocity change lives in global memory, its line a world (RowPlaces.velocity).

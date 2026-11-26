@@ -410,8 +410,10 @@ class Sweep:
         # Blocks a world of the colored launch (sweep_routes.worlds' ranks) and their job words (region_phase), where a
         # world's region levels may outgrow its block.
         self.world_blocks = 1
-        # Blocks a world of the grouped launch, where a world's colors of groups may outgrow its block.
+        # Blocks a world of the grouped launch, where a world's colors of groups may outgrow its block, and its trees'
+        # counts there (sweep_routes.group_rows: a line a world, a tree's at its first coordinate).
         self.grouped_blocks = 1
+        self.tree_runs = None
         self.wide_jobs = None
         self.claims_beside = None
         # The one writer's EMIT sink (walk_rows.RowSeeds): none until a tier walks its rows.
@@ -591,6 +593,9 @@ class Sweep:
                 )
                 if group > 1 and self.pins.world_group:
                     self.grouped_blocks = group
+                    self.tree_runs = wp.zeros(
+                        (self.forest.world_count, max(self.forest.max_world_dofs, 1)), dtype=int, device=model.device
+                    )
                     places = dataclasses.replace(
                         grouped_declared.places,
                         metadata=Place.STREAMED,
@@ -1162,6 +1167,8 @@ class Sweep:
             "row_group_colors": groups.colors,
             "row_group_offsets": groups.offsets,
             "row_group_rows": groups.rows,
+            "row_group_follows": groups.follows,
+            "tree_runs": self.tree_runs,
         }
         return {
             **self._walk(),

@@ -601,8 +601,8 @@ def _figure_pile(device, **options):
 
 def _drop_pile(model, solver, steps: int):
     """Step the pile ``steps`` times; return its last poses and velocities, the steps whose reservation took the colors
-    of groups, each step's largest joint gap and the most posts of the world's job words in a step (its colors wider
-    than its block and its end, sweep_routes.group_stage)."""
+    of groups, each step's largest joint gap and the most posts of the world's job words in a step (its sweeps and its
+    end, sweep_routes.group_rows)."""
     pipeline = newton.CollisionPipeline(model)
     contacts = pipeline.contacts()
     state_in, state_out, control = model.state(), model.state(), model.control()
@@ -623,8 +623,9 @@ def test_pile_of_figures_sweeps_by_colors_of_groups(test, device):
     sweeps its dense line by colors of groups (row_slots.RowGroups: up to four body pairs between the same trees,
     first-fit colors, a warp a group in the world's block), which its reservation takes once the pile holds enough
     groups; the pile lands finite, every joint closed, nothing sunk into the floor. Its trees outnumber the block's
-    warps, so a color wider than the block takes the device's other blocks beside the world's
-    (sweep_routes.group_stage): the same visits, so the same bits as the world's block alone."""
+    warps, so its sweeps take the device's other blocks beside the world's, each group run once its trees' groups
+    before it ran (sweep_routes.group_rows): each tree's groups in the colors' order, the same visits, so the same
+    bits as the world's block alone by colors."""
     model, solver = _figure_pile(device)
     test.assertIsNotNone(solver.sweep.mf_grouped_kernel, "a world of many trees builds the grouped sweep")
     test.assertGreater(solver.sweep.grouped_blocks, 1, "a world's colors may outgrow its block")
@@ -633,7 +634,7 @@ def test_pile_of_figures_sweeps_by_colors_of_groups(test, device):
     test.assertTrue(np.isfinite(poses).all())
     test.assertGreater(poses[:, 2].min(), 0.04, "no box sinks into the floor")
     test.assertLess(max(gaps), 1.0e-4, "every joint stays closed")
-    test.assertGreater(posts, 1, "a color wider than the block takes the group")
+    test.assertGreater(posts, 1, "the world's sweeps take the group")
     model, alone = _figure_pile(device, pins=newton.solvers.SolverFeatherPGS.Pins(world_group=False))
     test.assertEqual(alone.sweep.grouped_blocks, 1)
     poses_alone, velocities_alone, _, _, _ = _drop_pile(model, alone, 300)

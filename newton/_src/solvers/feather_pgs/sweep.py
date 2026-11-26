@@ -309,6 +309,15 @@ class WorldRows:
             return None
         return self.word(row, 0), self.word(row, self.side_b_word)
 
+    def side_coordinates(self, row: str) -> tuple[str, str]:
+        """Row ``row``'s sides' first world coordinates (the second -1 for none), of a split record or a packed one
+        (word 0's halves)."""
+        split = self.sides_of(row)
+        if split is not None:
+            return split
+        word = self.word(row, 0)
+        return f"(({word}) >> 16)", f"((({word}) << 16) >> 16)"
+
     def parent_of(self, packed: str) -> str:
         """A row's parent from its record's packed ``kind | parent << 16`` word."""
         return record_parent(packed, self.capacity)
@@ -2177,9 +2186,10 @@ class Pipelined:
     def inner(self, pad: str) -> str:
         return pad + "    "
 
-    def wrap(self, visit: str, pad: str) -> str:
+    def wrap(self, visit: str, pad: str, ready: str = "") -> str:
+        """The loop of ``visit``; ``ready`` (native lines at ``pad``) after the first row's loads, before its visit."""
         return (
-            f"{self.prologue(pad)}\n{pad}for (int i = {self.begin}; i < {self.end}; {self.step}) {{\n"
+            f"{self.prologue(pad)}\n{ready}{pad}for (int i = {self.begin}; i < {self.end}; {self.step}) {{\n"
             f"{self.consume('i', pad + '    ')}\n{visit}\n{pad}}}"
         )
 
@@ -2684,6 +2694,7 @@ def rows_block(
     triple_phase: bool = False,
     live: tuple[Velocity, str] | None = None,
     begin: str = "0",
+    ready: str = "",
     pad: str = "        ",
 ) -> str:
     """The Gauss-Seidel loop over a world's rows of one class ``[begin, end)`` in slot order (:class:`WorldRows`): the
@@ -2705,7 +2716,9 @@ def rows_block(
     rows read, its coordinates' count and the kinds ``admission`` passes): the dense rows step to the rows that can act
     (:class:`LiveOrder`), on a
     bound of the velocity formed at the loop's start (:func:`idle_reach`) and grown at each of its applies, which are
-    the only ones inside it.
+    the only ones inside it. ``ready``: what a pipelined run of dense rows waits for once its first row's operands are
+    loading, before its first visit (native lines at the loop's indent; a grouped run's trees,
+    :func:`.sweep_routes.group_rows`).
     """
     inner = pad + "    "
     if end is None:
@@ -2717,6 +2730,8 @@ def rows_block(
         raise ValueError("the live order bounds a dense loop whose own row applies are the only ones inside it")
     if begin != "0" and (live is not None or selected or rows.free):
         raise ValueError("a run of rows from a row past the first is a dense loop in slot order")
+    if ready and (live is not None or selected or rows.free or not rows.record):
+        raise ValueError("a run waits once its first row's operands are loading: a pipelined run of dense rows")
     if live is not None:
         order = LiveOrder(end, rows, "idle_reach", laws.torsion)
         visit = row_step(rows, op, laws, **step, reach="idle_reach", pad=order.inner(pad + "    "))
@@ -2733,7 +2748,8 @@ def rows_block(
         visit = row_step(rows, op, laws, **step, pipelined=rows.record, pad=inner)
         visit = f"{indent(unit, inner)}\n{visit}" if unit else visit
         if rows.record:
-            return f"{pad}{{\n{_visit_pipeline(rows, end, begin, laws.torsion, op).wrap(visit, pad)}\n{pad}}}"
+            pipeline = _visit_pipeline(rows, end, begin, laws.torsion, op)
+            return f"{pad}{{\n{pipeline.wrap(visit, pad, indent(ready, pad))}\n{pad}}}"
         visit = f"{inner}{_unit_hooks(rows)}\n{visit}" if unit else visit
         return SlotOrder(end, begin).wrap(visit, pad)
     ctx = RowContext(

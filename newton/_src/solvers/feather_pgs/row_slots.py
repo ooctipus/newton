@@ -492,7 +492,8 @@ class RowGroups:
 
     The tables a grouped world's sweep reads: its colors (``colors``, 0 where it is not grouped), each color's first
     group (``offsets``, the colors' count after), each group's first row (``rows``, its end after the last), rows of
-    the line. The reservation's scratch: each pair of the sequence's head, list, leader and place among its group's
+    the line, and each group's places on its trees (``follows``: on its first tree, bits 0-7, and on its second, bits
+    8-15, the groups before it in the colors' order, plus 64 where one follows it), which a sweep runs it after. The reservation's scratch: each pair of the sequence's head, list, leader and place among its group's
     (``pairs``), each leader's members' rows (``members``) and its color with its place in it (``places``), each
     color's groups and rows (``totals``), a key table over the groups' trees and lists (``keys``, ``open``: the pairs
     counted and the open group's leader), each tree's colors in use (``used``, zero between reservations), what the
@@ -503,6 +504,7 @@ class RowGroups:
     colors: wp.array[int]
     offsets: wp.array2d[int]
     rows: wp.array2d[int]
+    follows: wp.array2d[int]
     pairs: wp.array2d[wp.vec4i]
     members: wp.array2d[int]
     places: wp.array2d[wp.vec4i]
@@ -526,6 +528,7 @@ def row_groups(slot, slots: int, rows: int, trees: int, min_units: int, need: fl
     groups.colors = wp.zeros(slots, dtype=int, device=device)
     groups.offsets = wp.zeros((slots, int(GROUP_COLORS) + 1), dtype=int, device=device)
     groups.rows = wp.zeros((slots, rows + 1), dtype=int, device=device)
+    groups.follows = wp.zeros((slots, rows), dtype=int, device=device)
     groups.pairs = wp.zeros((slots, rows), dtype=wp.vec4i, device=device)
     groups.members = wp.zeros((slots, int(GROUP_MEMBERS) * rows), dtype=int, device=device)
     groups.places = wp.zeros((slots, rows), dtype=wp.vec4i, device=device)
@@ -810,6 +813,20 @@ def _first_free_color(used: wp.int64) -> int:
     return color
 
 
+@wp.func_native("""
+    const unsigned long long held = (unsigned long long)used, below = (1ull << color) - 1ull;
+#if defined(__CUDA_ARCH__)
+    const int before = __popcll(held & below);
+#else
+    const int before = __builtin_popcountll(held & below);
+#endif
+    return before | ((held & ~below & ~(1ull << color)) != 0ull ? 64 : 0);
+""")
+def _tree_place(used: wp.int64, color: int) -> int:
+    """A group's place on a tree whose colors are ``used``, its own ``color`` (``< 64``): the colors below it, plus 64
+    where a color above it follows."""
+
+
 @wp.func
 def _shares_tree(a: wp.vec2i, b: wp.vec2i) -> bool:
     """Whether two pairs' sides (:func:`.row_records.row_sides`, the second -1 for none) share a tree."""
@@ -1001,8 +1018,9 @@ def _group_rows(
     are 0 and the row order's places stand. ``line_first`` is the line's row of the world's first contact row.
 
     One pass over the sequence a batch of the lanes at a time forms the groups; one colors them, the largest first
-    (:func:`color_largest_first`, the groups its vertices); one over the leaders places each group in its color and
-    frees the trees' colors; one over the pairs places their rows.
+    (:func:`color_largest_first`, the groups its vertices); one over the leaders counts each group's places on its
+    trees (its trees' colors below its own); one over the leaders places each group in its color and frees the trees'
+    colors; one over the pairs places their rows and the groups' places on their trees (``follows``).
 
     Over ``warps`` warps of the block (warp ``warp``; one on the CPU, or where a warp is the world's), the warps take
     the passes' batches in turn, warp ``w`` the batches ``w``, ``w + warps``, ...: a batch's own loads and its keys'
@@ -1147,6 +1165,20 @@ def _group_rows(
         lane_sync(threads)
     else:
         lane_sync(RESERVE_LANES)
+    if takes:
+        # Each group's places on its trees, the groups before it on each in the colors' order (its tree's colors below
+        # its own), in its vertex's last word (its size is the members'), before the leaders' pass frees the colors.
+        for s in range(warp * lanes + lane, count, threads):
+            if groups.pairs[slot, s][3] == 0:
+                lead = groups.places[slot, s]
+                follow = _tree_place(groups.used[lead[1]], lead[0])
+                if lead[2] >= 0:
+                    follow = follow | (_tree_place(groups.used[lead[2]], lead[0]) << 8)
+                groups.places[slot, s] = wp.vec4i(lead[0], lead[1], lead[2], follow)
+        if warps > 1:
+            lane_sync(threads)
+        else:
+            lane_sync(RESERVE_LANES)
     # The leaders in order: each tree's colors freed for the next reservation; where the world takes the colors, each
     # group's place among its color's groups and rows (a batch at a time), and each color's groups and rows.
     rounds = (count + lanes - 1) // lanes
@@ -1154,6 +1186,7 @@ def _group_rows(
         s = g * lanes + lane
         color = int(-1 - lane)
         size = int(0)
+        follow = int(0)
         if s < count:
             if groups.pairs[slot, s][3] == 0:
                 lead = groups.places[slot, s]
@@ -1161,6 +1194,7 @@ def _group_rows(
                 if lead[2] >= 0:
                     groups.used[lead[2]] = wp.int64(0)
                 color = lead[0]
+                follow = lead[3]
                 for m in range(GROUP_MEMBERS):
                     size += groups.members[slot, GROUP_MEMBERS * s + m]
         if takes:
@@ -1177,7 +1211,7 @@ def _group_rows(
                 held = groups.totals[slot, color]
             lane_sync(RESERVE_LANES)
             if color >= 0:
-                at = wp.vec4i(color, held[0] + lane_below(peers, RESERVE_LANES), held[1] + below, size)
+                at = wp.vec4i(color, held[0] + lane_below(peers, RESERVE_LANES), held[1] + below, follow)
                 groups.places[slot, s] = at
                 if lane_last(peers, RESERVE_LANES) == lane:
                     groups.totals[slot, color] = wp.vec2i(
@@ -1219,6 +1253,7 @@ def _group_rows(
                 offset += groups.members[slot, GROUP_MEMBERS * pair[2] + m]
         if pair[3] == 0:
             groups.rows[slot, start[0] + lead[1]] = line_first + offset
+            groups.follows[slot, start[0] + lead[1]] = lead[3]
         b = order.rows_before[pair[0]]
         if pair[1] == 0:
             b[0] = offset
