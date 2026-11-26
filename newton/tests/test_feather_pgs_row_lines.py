@@ -122,19 +122,19 @@ class TestFeatherPGSRowLines(unittest.TestCase):
         self._check_short(conformance.cuda_groups(), wp.get_device("cuda"))
 
     def test_a_full_arena_drops_rows_with_status_cpu(self):
-        """Run a stack on lines that hold only its topology rows and no arena: its contact rows have no run, so they are
-        rejected past the line, the arena records the refused claims and the step fails closed on the dropped rows
-        instead of writing past its line."""
+        """Run a stack on lines that hold only its topology rows and an arena of one line, too short for its run: its
+        contact rows have no run, so they are rejected past its line, the arena records the refused claim and the step
+        fails closed on the dropped rows instead of writing past its line."""
         device = wp.get_device("cpu")
         group = next(group for group in conformance.cpu_groups() if group.name == "box_stack_patch")
         route = group.routes[0]
         _, held, topology, _worlds = _extent(group, route, device)
         rows = _quantum(topology)
-        self.assertGreater(held, rows, "the stack's contact rows pass its topology rows' line")
+        self.assertGreater(held, 2 * rows, "the stack's contact rows pass two of its topology rows' lines")
         placements = []
 
         def construct(self, *args, **kwargs):
-            _laid_out(rows, 0)(self, *args, **kwargs)
+            _laid_out(rows, 1)(self, *args, **kwargs)
             placements.append(self)
 
         with mock.patch.object(Placement, "__init__", construct):

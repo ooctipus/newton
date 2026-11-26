@@ -1465,13 +1465,15 @@ def reserve_world_rows_kernel(grouped: bool, warps: int = 1):
                 need = (extent + lines[0] - 1) // lines[0]
                 held_run = world_run[world]
                 if held_run[0] < 0 or held_run[1] < need:
-                    claim = wp.atomic_add(arena_cursor, 0, need)
-                    wp.atomic_max(arena_record, 0, claim + need)
                     held_run = wp.vec2i(-1, 0)
-                    if claim + need <= arena_lines[0]:
-                        held_run = wp.vec2i(lines[1] + claim, need)
-                    else:
-                        wp.atomic_add(arena_record, 1, 1)
+                    # A store without an arena (lines as long as the capacities) has no run to claim.
+                    if arena_lines[0] > 0:
+                        claim = wp.atomic_add(arena_cursor, 0, need)
+                        wp.atomic_max(arena_record, 0, claim + need)
+                        if claim + need <= arena_lines[0]:
+                            held_run = wp.vec2i(lines[1] + claim, need)
+                        else:
+                            wp.atomic_add(arena_record, 1, 1)
                     world_run[world] = held_run
             if wp.static(warps > 1):
                 lane_sync(threads)
