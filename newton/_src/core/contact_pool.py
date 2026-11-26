@@ -1181,7 +1181,8 @@ class ContactPool:
             self._followers.append(weakref.ref(other))
 
     def serve(self, service) -> None:
-        """Run ``service()`` in each :meth:`service` of this pool, outside capture.
+        """Run ``service()`` at the end of each :meth:`service` of this pool, outside capture: after the pool's own
+        growth, so a buffer that follows the ready rows covers the rows the next replay holds.
 
         A buffer whose own writers record their demand on the device (a solver's staging arena) grows between replays
         as the pool's rows do, from the one call an application makes a step
@@ -1572,7 +1573,6 @@ class ContactPool:
         """
         if capturing(self.device):
             return False
-        served = self._serve()
         while self._stale_status:
             offset, count = self._stale_status.pop()
             self._update_status[offset : offset + count].zero_()
@@ -1594,10 +1594,12 @@ class ContactPool:
                 if forecast > self.ready:
                     target = max(target, reserved_rows(forecast, self.bound))
             if target > self.ready:
-                return self._grow_logged(target, high_water) or served
+                grown = self._grow_logged(target, high_water)
+                # The buffers' services follow the rows the pool holds now (serve).
+                return self._serve() or grown
         if not self.fixed:
             self._consider_trim()
-        return served
+        return self._serve()
 
     def _watch(self) -> None:
         """Follow the demand: the high-water mark holds still once it stayed within :data:`TRIM_BAND` for
