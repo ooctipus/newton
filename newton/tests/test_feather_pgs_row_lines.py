@@ -177,6 +177,20 @@ class TestFeatherPGSRowLines(unittest.TestCase):
         """The topology rows' move on the device, as on the CPU."""
         self._check_moved_topology(wp.get_device("cuda"))
 
+    def test_the_arena_keeps_every_field_indexable(self):
+        """The arena's reserve keeps a run's last entry of every line field within int32 indices, the friction records'
+        sixteen floats a row among them (NIST at the model-sized default: 8,192 worlds of 35,136 rows a line)."""
+        from types import SimpleNamespace  # noqa: PLC0415
+
+        from newton._src.core.contact_pool import INDEX_LIMIT  # noqa: PLC0415
+        from newton._src.solvers.feather_pgs.sweep import FRICTION_METRIC_FLOATS  # noqa: PLC0415
+
+        for worlds, pitch, rows in ((8192, 35136, 96), (4096, 65504, 32), (16384, 512, 64)):
+            store = SimpleNamespace(forest=SimpleNamespace(world_count=worlds), row_pitch=pitch, packs_rows=False)
+            arena = Placement.arena_limit(store, rows)
+            reserved = (worlds + arena - 1) * rows + pitch
+            self.assertLessEqual(reserved * FRICTION_METRIC_FLOATS, INDEX_LIMIT, (worlds, pitch, rows))
+
     def test_a_full_arena_drops_rows_with_status_cpu(self):
         """Run a stack on lines that hold only its topology rows and an arena of one line, too short for its run: its
         contact rows have no run, so they are rejected past its line, the arena records the refused claim and the step

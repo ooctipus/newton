@@ -1371,9 +1371,13 @@ class Placement:
     def arena_limit(self, rows: int) -> int:
         """The arena's lines the store reserves with lines of ``rows`` rows: a run of the capacities' line for every
         world (the most every world can ask at once), and no more than a field's int32 indices reach at the widest
-        row's entries (a record's words, the packed rows' entries, :meth:`packed_width`)."""
+        row's entries (a record's words, a friction record's floats, the packed rows' entries, :meth:`packed_width`)."""
+        from .sweep import FRICTION_METRIC_FLOATS  # noqa: PLC0415
+
         worlds, line = self.forest.world_count, self.row_pitch
-        entries = max(int(self.packed_width()[0]) if self.packs_rows else 1, RECORD_WORDS + SPLIT_WORDS)
+        entries = max(
+            int(self.packed_width()[0]) if self.packs_rows else 1, RECORD_WORDS + SPLIT_WORDS, FRICTION_METRIC_FLOATS
+        )
         indexed = (INDEX_LIMIT // entries - line) // rows + 1 - worlds
         return max(min(worlds * -(-line // rows), indexed), 0)
 
