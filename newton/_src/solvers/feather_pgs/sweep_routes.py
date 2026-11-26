@@ -1918,6 +1918,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     # A packed row's coordinates decode from its staged sides, as a streamed record's do.
     sides = None if wide_rows else "classes" if sweep.support_classes else "widths"
     split = sweep.split
+    # A grouped world's rows are each a group's, which one warp runs and fences (group_rows): their impulses are fenced.
     dense = WorldRows(
         M_D,
         places.metadata,
@@ -1927,6 +1928,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         split=split,
         head=places.dense_rows,
         floor=places.dense_floor,
+        fenced=grouped,
     )
     free = WorldRows(
         M_MF,

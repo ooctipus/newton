@@ -144,6 +144,10 @@ class WorldRows:
     patch: int = 0
     """The normals of a patch ring a run's visit takes together (:func:`patch_run`): a ring that opens at the visited
     row and closes within them is visited whole, its rows' operands loaded at once; ``0``: a visit a row."""
+    fenced: bool = False
+    """In place (``stream``), each row's impulse is stored only by the warp whose run holds the row, and the runs' fences
+    (or the block's barriers) order every other reader: reads go through a cached view (:attr:`readings`), stores
+    through the strong one, which writes through at once, so no read of a line waits for a store's write-back."""
 
     VISITED: ClassVar[str] = "i"
     """The row a row loop visits, whose record the loop holds in registers."""
@@ -356,7 +360,12 @@ class WorldRows:
         """Row ``row``'s impulse read directly (every lane reads the staged value, or a spilled row's in place)."""
         if self.spilled:
             return f"{SPILL}[{row}]"
-        return f"{self.impulses}[{row}]"
+        return f"{self.readings}[{row}]"
+
+    @property
+    def readings(self) -> str:
+        """The view the impulses are read through: the cached one of :attr:`fenced` rows, else the impulses'."""
+        return f"{self.impulses}_cached" if self.stream and self.fenced else self.impulses
 
     def store(self, row: str, value: str) -> str:
         if self.spilled:
@@ -415,7 +424,10 @@ class WorldRows:
                 f"    float* {SPILL} = {STAGED_RUN} ? {self.impulses} : &world_impulses.data[{self.base}];"
             )
         if self.stream:
-            return f"    volatile float* {self.impulses} = (volatile float*)(&world_impulses.data[{self.base}]);"
+            view = f"    volatile float* {self.impulses} = (volatile float*)(&world_impulses.data[{self.base}]);"
+            if self.fenced:
+                view += f"\n    const float* const {self.readings} = &world_impulses.data[{self.base}];"
+            return view
         return ""
 
     def _staged(self, row: str, statement: str) -> str:
