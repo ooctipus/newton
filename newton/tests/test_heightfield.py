@@ -16,6 +16,7 @@ from newton._src.geometry.heightfield_features import HeightfieldFeatureContext,
 from newton._src.utils import is_graph_capture_allocation_enabled
 from newton._src.utils.heightfield import HeightfieldData, get_triangle_shape_from_heightfield
 from newton.solvers import SolverMuJoCo
+from newton.tests.terrain_law_test_utils import terrain_route_pipeline
 from newton.tests.unittest_utils import assert_np_equal
 
 _cuda_available = wp.is_cuda_available()
@@ -720,7 +721,9 @@ class TestHeightfield(unittest.TestCase):
         builder.add_shape_sphere(body=sphere_body, radius=1.1)
 
         model = builder.finalize()
-        pipeline = newton.CollisionPipeline(model, max_triangle_pairs=32)
+        # The terrain law writes the sphere's contacts by default without the triangle midphase: keep the terrain
+        # route, whose midphase this checks.
+        pipeline = terrain_route_pipeline(model, max_triangle_pairs=32)
         contacts = pipeline.contacts()
         pipeline.collide(model.state(), contacts)
 
@@ -748,7 +751,9 @@ class TestHeightfield(unittest.TestCase):
         builder.add_shape_sphere(body=sphere_body, radius=1.1)
 
         model = builder.finalize()
-        pipeline = newton.CollisionPipeline(model, max_triangle_pairs=32)
+        # The terrain law writes the sphere's contacts by default without the triangle midphase: keep the terrain
+        # route, whose midphase this checks.
+        pipeline = terrain_route_pipeline(model, max_triangle_pairs=32)
         contacts = pipeline.contacts()
         pipeline.collide(model.state(), contacts)
 

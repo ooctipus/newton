@@ -3,6 +3,7 @@
 
 """Check conservative terrain rejection against the original triangle pipeline."""
 
+import os
 import unittest
 from contextlib import nullcontext
 from unittest.mock import patch
@@ -18,6 +19,7 @@ from newton._src.utils.heightfield import (
     _heightfield_cell_below_query,
     heightfield_vs_convex_midphase,
 )
+from newton.tests.terrain_law_test_utils import terrain_route_pipeline
 from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices, get_test_devices
 
 
@@ -153,19 +155,22 @@ def _model(
 
 
 def _collide(model, *, legacy=False, speculative=False, packed=None, midphase=None):
-    pipeline = newton.CollisionPipeline(
-        model,
-        reduce_contacts=False,
-        rigid_contact_max=2048,
-        max_triangle_pairs=4096,
-        speculative_contact_gap_max=0.5 if speculative else None,
-    )
     if legacy:
         midphase = _unculled_heightfield_midphase
+    # The terrain law writes these pairs by default and never runs the triangle midphase; these checks are the terrain
+    # route's, so the pipeline keeps that route for every heightfield pair. A midphase stand-in replaces the full
+    # midphase's kernel, which a heightfield-only scene runs only with its cell rejection off.
+    environ = {"NEWTON_HEIGHTFIELD_CELL_REJECT": "0"} if midphase is not None else {}
+    with patch.dict(os.environ, environ):
+        pipeline = terrain_route_pipeline(
+            model,
+            reduce_contacts=False,
+            rigid_contact_max=2048,
+            max_triangle_pairs=4096,
+            speculative_contact_gap_max=0.5 if speculative else None,
+        )
     if packed is not None:
         pipeline.narrow_phase._heightfield_packed_pairs = packed
-    if midphase is not None:
-        pipeline.narrow_phase._heightfield_packed_pairs = False
     contacts = pipeline.contacts()
     state = model.state()
     if speculative:
@@ -591,7 +596,8 @@ def test_current_height_updates(test, device):
 def test_replay_height_withdrawal_and_regrowth(test, device):
     """Refresh live heights in one pipeline through captured withdrawal and regrowth."""
     model = _model(device=device, z=0.2)
-    pipeline = newton.CollisionPipeline(model, reduce_contacts=False, rigid_contact_max=2048, max_triangle_pairs=4096)
+    # The terrain route's triangle work is checked: the terrain law would write the box's contacts without it.
+    pipeline = terrain_route_pipeline(model, reduce_contacts=False, rigid_contact_max=2048, max_triangle_pairs=4096)
     contacts = pipeline.contacts()
     state = model.state()
     pipeline.collide(state, contacts)
