@@ -531,6 +531,86 @@ class TestColoredSweep(unittest.TestCase):
         # The boxes rest on the ground.
         self.assertGreater(float(runs[0][0][:, 2].min()), 0.05 - 1.0e-3)
 
+    def test_dense_runs_follow_their_sides(self):
+        """A colored world's dense rows (hinged pairs on the ground among free boxes, boxes on the pairs) run on the
+        block's warps by runs: the line's rows on the same sides one after another, each run after the latest earlier
+        run on each side, a run's warp its first side's. The runs the launch built are the line's, in row order, each
+        with its latest earlier run on each side as the host finds them, spread over more than one warp."""
+        model = _hinged_pairs(self.device, pairs=12)
+        solvers = []
+        with colored(1, solvers):
+            solver = SolverFeatherPGS(model)
+        pipeline = newton.CollisionPipeline(model)
+        contacts = pipeline.contacts()
+        states = [model.state(), model.state()]
+        newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+        control = model.control()
+        for i in range(30):
+            src, dst = states[i % 2], states[(i + 1) % 2]
+            pipeline.collide(src, contacts)
+            src.clear_forces()
+            solver.step(src, dst, control, contacts, 1.0 / 240.0)
+        self.assertIsNotNone(solver.sweep.colored_sweep)
+        placement = solver.placement
+        line = int(placement.dense_first.numpy()[0])
+        rows = int(placement.constraint_count.numpy()[0])
+        self.assertGreater(rows, 0)
+        first = solver.sweep.forest.articulation_world_dof_offset
+        first = first.numpy() if hasattr(first, "numpy") else np.asarray(first)
+        keys = []
+        for side_a, side_b in placement.row_sides.numpy()[line, :rows]:
+            a, b = (int(first[side_a]) if side_a >= 0 else -1), (int(first[side_b]) if side_b >= 0 else -1)
+            keys.append((a, -1 if b == a else b))
+        capacity = solver.sweep.colored_sweep.max_constraints
+        words = solver.sweep.dense_runs.numpy()[0]
+        runs = int(words[0])
+        starts = words[34 : runs + 35]
+        prev = words[capacity + 35 : capacity + 35 + 2 * runs].reshape(-1, 2)
+        warps = words[4 * capacity + 35 : 4 * capacity + 35 + runs]
+        expected = [0] + [i for i in range(1, rows) if keys[i] != keys[i - 1]] + [rows]
+        np.testing.assert_array_equal(starts, expected)
+        latest = {}
+        for run in range(runs):
+            sides = keys[starts[run]]
+            self.assertTrue(all(keys[i] == sides for i in range(starts[run], starts[run + 1])))
+            want = [latest.get(side, -1) if side >= 0 else -1 for side in sides]
+            np.testing.assert_array_equal(prev[run], want, err_msg=f"run {run}")
+            for side in sides:
+                if side >= 0:
+                    latest[side] = run
+        self.assertGreater(len(set(warps.tolist())), 1)
+        self.assertTrue(np.isfinite(states[0].body_q.numpy()).all())
+        self.assertGreater(float(states[0].body_q.numpy()[:, 2].min()), 0.0)
+
+
+def _hinged_pairs(device, pairs: int):
+    """One world of ``pairs`` hinged box pairs (an articulation: a free root and a hinged child) lying on the ground
+    apart, a free box on each pair's root and one between pairs."""
+    builder = newton.ModelBuilder()
+    builder.add_ground_plane()
+    half = 0.05
+    for k in range(pairs):
+        x = 0.5 * k
+        root = builder.add_link(xform=wp.transform((x, 0.0, half), wp.quat_identity()), mass=1.0)
+        builder.add_shape_box(root, hx=half, hy=half, hz=half)
+        child = builder.add_link(xform=wp.transform((x + 2.2 * half, 0.0, half), wp.quat_identity()), mass=1.0)
+        builder.add_shape_box(child, hx=half, hy=half, hz=half)
+        joints = [
+            builder.add_joint_free(root),
+            builder.add_joint_revolute(
+                root,
+                child,
+                axis=newton.Axis.Y,
+                parent_xform=wp.transform((1.1 * half, 0.0, 0.0), wp.quat_identity()),
+                child_xform=wp.transform((-1.1 * half, 0.0, 0.0), wp.quat_identity()),
+            ),
+        ]
+        builder.add_articulation(joints)
+        for position in ((x, 0.0, 3.0 * half + 0.001), (x + 0.25, 0.0, half)):
+            body = builder.add_body(xform=wp.transform(position, wp.quat_identity()))
+            builder.add_shape_box(body, hx=half, hy=half, hz=half)
+    return builder.finalize(device=device)
+
 
 def _box_floor(device, side: int):
     """One world of ``side`` x ``side`` free 0.1 m boxes resting on the ground, apart."""

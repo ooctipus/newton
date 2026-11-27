@@ -1793,6 +1793,159 @@ GROUP_BARRIER = """        {{
 """
 
 
+def run_words(max_constraints: int, max_world_dofs: int) -> int:
+    """Words of a world's line of :func:`dense_runs` (``dense_runs``): its runs' count, the build's scan (a warp's
+    count each, then the total), their first rows (and the end), each run's latest earlier runs on its sides, their
+    marks and their warps, and each side's latest run (by its first coordinate)."""
+    return 5 * int(max_constraints) + 35 + int(max_world_dofs)
+
+
+def dense_runs(visit: str, capacity: int, pad: str, *, group: bool = False) -> tuple[str, str]:
+    """A colored block's dense rows by their runs over the block's warps: the line's rows in order, a run the rows on
+    the same sides one after another (a contact's rows, a tree's limits), each run once the latest earlier run on each
+    of its sides ran. Rows on other sides share no coordinate, so every coordinate takes the same updates in the same
+    order as one warp walking the line: the same arithmetic, bit for bit. A run's sides are its first row's (their
+    first world coordinates, -1 for none, from the rows' sides, which a record packs and a stage may hold).
+
+    Returns the build (once a launch, before the sweeps: the block's threads find the runs' first rows by a block scan,
+    then its first warp takes the runs in order, 32 at a time, and finds each one's latest earlier run on each side,
+    within the 32 by shuffles, before them by each side's latest run; a run's warp is its first side's, so a tree's runs
+    follow one another on one warp and wait for no other) and the sweep's phase (each warp takes its runs in order; its
+    first lane waits for the latest earlier runs on the run's sides, the warp visits its rows (``visit``: the rows
+    ``[run_begin, run_end)``), and its first lane marks it with the sweep's stamp). Every run waits only for earlier
+    runs and every warp takes its runs in order, so the earliest run not yet run always runs. Over a world's ``group``
+    of blocks the world's block (rank 0) runs both."""
+    alone = "rank == 0 && " if group else ""
+    build = f"""    int* const run_line = dense_runs.data + (size_t)world * dense_runs.shape[1];
+    int* const run_scan = run_line + 1;
+    int* const run_first = run_line + 34;
+    int* const run_prev = run_line + {capacity + 35};
+    int* const run_done = run_line + {3 * capacity + 35};
+    int* const run_warp = run_line + {4 * capacity + 35};
+    int* const run_last = run_line + {5 * capacity + 35};
+    if ({alone}m_dense > 0) {{
+        // The rows that open a run (their sides differ from the row's before), a chunk of rows a thread, then their
+        // places by a block scan (each warp's count in the line's scan words).
+        const auto SIDES = [&](const int row) -> int2 {{
+            const wp::vec2i two = row_sides.data[off_dense + row];
+            const int a = two[0] >= 0 ? articulation_world_dof_offset.data[two[0]] : -1;
+            const int b = two[1] >= 0 ? articulation_world_dof_offset.data[two[1]] : -1;
+            return make_int2(a, b == a ? -1 : b);
+        }};
+        const int chunk = (m_dense + (int)blockDim.x - 1) / (int)blockDim.x;
+        const int lo = min(tid * chunk, m_dense), hi = min(lo + chunk, m_dense);
+        int opens = 0;
+        int2 before = lo > 0 && lo < hi ? SIDES(lo - 1) : make_int2(-2, -2);
+        for (int row = lo; row < hi; ++row) {{
+            const int2 here = SIDES(row);
+            opens += here.x != before.x || here.y != before.y;
+            before = here;
+        }}
+        int scan = opens;
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {{
+            const int y = __shfl_up_sync(0xffffffffu, scan, o);
+            if (lane >= o) scan += y;
+        }}
+        if (lane == 31) run_scan[warp] = scan;
+        __syncthreads();
+        if (tid == 0) {{
+            int total = 0;
+            for (int w = 0; w < ((int)blockDim.x >> 5); ++w) {{
+                const int t = run_scan[w];
+                run_scan[w] = total;
+                total += t;
+            }}
+            run_scan[32] = total;
+            run_line[0] = total;
+            run_first[total] = m_dense;
+        }}
+        __syncthreads();
+        int at = run_scan[warp] + scan - opens;
+        before = lo > 0 && lo < hi ? SIDES(lo - 1) : make_int2(-2, -2);
+        for (int row = lo; row < hi; ++row) {{
+            const int2 here = SIDES(row);
+            if (here.x != before.x || here.y != before.y) run_first[at++] = row;
+            before = here;
+        }}
+        const int runs = run_scan[32];
+        __syncthreads();
+        // No run yet on any of their sides, none marked; each run's warp: its first side's, by a hash of the side's
+        // first coordinate, so a tree's runs follow one another on one warp.
+        for (int k = tid; k < runs; k += (int)blockDim.x) {{
+            const int2 two = SIDES(run_first[k]);
+            if (two.x >= 0) run_last[two.x] = -1;
+            if (two.y >= 0) run_last[two.y] = -1;
+            run_done[k] = 0;
+            const unsigned side = (unsigned)(two.x >= 0 ? two.x : max(two.y, 0));
+            run_warp[k] = (int)(((unsigned long long)(side * 0x9E3779B1u) * (unsigned)(blockDim.x >> 5)) >> 32);
+        }}
+        __syncthreads();
+        // Each run's latest earlier run on each side, the runs in order 32 at a time.
+        if (warp == 0) {{
+            for (int base = 0; base < runs; base += 32) {{
+                const int k = base + lane;
+                const int2 two = k < runs ? SIDES(run_first[k]) : make_int2(-1, -1);
+                int prev_a = -1, prev_b = -1;
+                bool last_a = two.x >= 0, last_b = two.y >= 0;
+                for (int j = 0; j < 32; ++j) {{
+                    const int aj = __shfl_sync(0xffffffffu, two.x, j), bj = __shfl_sync(0xffffffffu, two.y, j);
+                    const bool on_a = two.x >= 0 && (aj == two.x || bj == two.x);
+                    const bool on_b = two.y >= 0 && (aj == two.y || bj == two.y);
+                    if (j < lane) {{
+                        if (on_a) prev_a = base + j;
+                        if (on_b) prev_b = base + j;
+                    }} else if (j > lane) {{
+                        if (on_a) last_a = false;
+                        if (on_b) last_b = false;
+                    }}
+                }}
+                if (k < runs) {{
+                    if (two.x >= 0 && prev_a < 0) prev_a = run_last[two.x];
+                    if (two.y >= 0 && prev_b < 0) prev_b = run_last[two.y];
+                    run_prev[2 * k] = prev_a;
+                    run_prev[2 * k + 1] = prev_b;
+                }}
+                __syncwarp();
+                if (last_a) run_last[two.x] = k;
+                if (last_b) run_last[two.y] = k;
+                __syncwarp();
+            }}
+        }}
+        __syncthreads();
+    }}
+"""
+    schedule = f"""{pad}if ({alone}m_dense > 0) {{
+{pad}    const int runs = run_line[0];
+{pad}    const int run_stamp = {ITERATION} + 1;
+{pad}    for (int base = 0; base < runs; base += 32) {{
+{pad}    // This warp's runs among the next 32, in order.
+{pad}    unsigned mine = __ballot_sync(0xffffffffu, base + lane < runs && run_warp[base + lane] == warp);
+{pad}    while (mine) {{
+{pad}        const int run = base + __ffs(mine) - 1;
+{pad}        mine &= mine - 1;
+{pad}        const int run_begin = run_first[run], run_end = run_first[run + 1];
+{pad}        // Its first lane waits for the latest earlier run on each of its sides, this sweep's.
+{pad}        if (lane == 0) {{
+{pad}            const int prev_a = run_prev[2 * run], prev_b = run_prev[2 * run + 1];
+{pad}            volatile const int* const done = run_done;
+{pad}            if (prev_a >= 0) while (done[prev_a] < run_stamp) {{ }}
+{pad}            if (prev_b >= 0) while (done[prev_b] < run_stamp) {{ }}
+{pad}            __threadfence_block();
+{pad}        }}
+{pad}        __syncwarp();
+{visit}
+{pad}        __syncwarp();
+{pad}        if (lane == 0) {{
+{pad}            __threadfence_block();
+{pad}            reinterpret_cast<volatile int*>(run_done)[run] = run_stamp;
+{pad}        }}
+{pad}    }}
+{pad}    }}
+{pad}}}"""
+    return build, schedule
+
+
 def group_rows(
     loop: Callable[..., str],
     pad: str,
@@ -2319,11 +2472,27 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         )
         dense_phase = f"        SYNC();\n{indent(scan, '        ')}\n{dense_phase}"
         metric_build += "\n" + active_selection(dense, count="m_dense", linked=True, pad="    ")
-    dense_sweep = (
-        dense_phase
-        if grouped
-        else f"{first_warp}{dense_phase}\n{end_first_warp}" + ("        __syncthreads();" if colored else "")
-    )
+    runs_build = ""
+    if colored:
+        # The colored block's dense rows by their runs over its warps (dense_runs), each run a loop of the rows in
+        # order.
+        run_visit = rows_block(
+            dense,
+            dense_op,
+            laws,
+            admission=admission,
+            metric=metric,
+            formed=dense_record,
+            begin="run_begin",
+            end="run_end",
+            pad=" " * 16,
+        )
+        runs_build, dense_sweep = dense_runs(run_visit, M_D, "        ", group=sweep.world_blocks)
+        dense_sweep += "\n        __syncthreads();"
+    elif grouped:
+        dense_sweep = dense_phase
+    else:
+        dense_sweep = f"{first_warp}{dense_phase}\n{end_first_warp}"
     sweeps = level_loop(
         (
             dense_sweep,
@@ -2381,7 +2550,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     # mapping's lanes.
     way_back = f"{alone}{add_back}{stores}{end_alone}"
     rest = f"""
-{budget_line}{sweeps}{world_end}
+{runs_build}{budget_line}{sweeps}{world_end}
 
     {barrier}
 {way_back}"""
@@ -2758,6 +2927,8 @@ class GeneralSweep(SweepConfig):
                 if self.colored and not self.regions and self.world_blocks
                 else ()
             ),
+            # A colored block's dense rows' runs, a line a world (dense_runs).
+            *((RowArgument("dense_runs", wp.array2d[int], after="omega"),) if self.colored else ()),
             # Where the world's velocity change lives in global memory, its line a world (RowPlaces.velocity).
             *(
                 (RowArgument("sweep_velocity", wp.array2d[float], after="omega"),)
