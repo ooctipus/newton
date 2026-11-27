@@ -53,6 +53,7 @@ def _contact_acts(
         normal=wp.array([wp.vec3(0.0, 0.0, -1.0)], dtype=wp.vec3, device=device),
         margin0=floats([0.0]),
         margin1=floats([0.0]),
+        point_share=floats([0.5]),
         body_q=wp.array(
             [wp.transform((0.0, 0.0, gap), wp.quat_identity()), wp.transform_identity()],
             dtype=wp.transform,

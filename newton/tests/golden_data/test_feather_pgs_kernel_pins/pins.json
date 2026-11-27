@@ -93,7 +93,7 @@
   "row_kernels.allocate_link_slots": "486e985b17405adbd3051190872d26f2d534932c4b2ecd98f50d915c769c8337",
   "row_kernels.prepare_fused_diagonal_joint_limits": "feb59355265de073af569080267decd828e5316e8cd1881d6da2dc08c4c9c881",
   "row_kernels.write_link_rows": "cd091df6caa3f349608cf6916f605b3c672c7bd041685d48a09bd964f52385c7",
-  "row_slots.admit_world_contacts": "fae440c6a86ee867063df45ec222324cd025ec8e2ff6af5d09c8362b7eae96be",
+  "row_slots.admit_world_contacts": "d88c6beb6d442824fdcf2874eac5d839ace789ecaab4588a5912faf8dfe71ee3",
   "row_slots.reserve_world_rows_kernel(False)": "220bca8d19b529720e6bede38e473a4a42105934d00222c0ff5c1e204dd26333",
   "row_slots.reserve_world_rows_kernel(True)": "3fa30dd0887c1e82333e488d67c0d760e471ab92d47ac6bdb968ecd167973b03",
   "sleep._contact_load": "8fb3200471e2391689a550db84c6b8a8acb57c5db63c45fca8d3c32a48cd8393",

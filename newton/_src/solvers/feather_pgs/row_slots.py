@@ -18,6 +18,7 @@ from .contact_laws import (
     contact_authored,
     contact_endpoints,
     contact_materials,
+    contact_point,
     contact_points,
     contact_responds,
     contact_tracked,
@@ -39,7 +40,7 @@ from .device_preludes import (
     lane_sum,
     lane_sync,
 )
-from .friction_patches import FrictionPatches, patch_spin_rows
+from .friction_patches import FrictionPatches, patch_spin_rows, region_normal
 from .row_laws import (
     authored_contact_law,
     contact_capped_beta,
@@ -106,6 +107,7 @@ def _admit_contact(
     contact_gap_gate: float,
     same_articulation_contact_gap_gate: float,
     articulation_pair_contact_gap_gate: float,
+    patches: FrictionPatches,
     twists: wp.array[wp.spatial_vector],
     kept: int,
 ):
@@ -118,8 +120,9 @@ def _admit_contact(
     endpoint has no world (-1): its body pair never takes rows. Nor does a contact on a tracking volume
     (:func:`.contact_laws.contact_tracked`): it is made and reported, and exerts nothing.
     Its normal row separates where its residual at the predictor (the body ``twists`` it publishes; none: never) does
-    (:func:`.row_laws.separates`), and its friction and spin rows, bounded by a finite non-negative coefficient of
-    its ring's load, keep zero with it. The residual's bias is the row's law: an authored material's rhs
+    (:func:`.row_laws.separates`), read in the row's own frame (:func:`.contact_input.contact_frame`): at its point and
+    along its direction, its region's normal (``patches``); its friction and spin rows, bounded by a finite
+    non-negative coefficient of its ring's load, keep zero with it. The residual's bias is the row's law: an authored material's rhs
     (:func:`.row_laws.authored_contact_law`, no restitution) where a shape authors one, else the hard law's.
     """
     body_a, body_b, art_a, art_b, world = contact_endpoints(
@@ -133,7 +136,7 @@ def _admit_contact(
     admitted = world >= 0
     separating = False
     if admitted:
-        normal, translation_a, offset_a, translation_b, offset_b, separation, phi = contact_points(
+        normal, translation_a, offset_a, _translation_b, _offset_b, separation, phi = contact_points(
             data.normal[c],
             data.point0[c],
             data.point1[c],
@@ -159,19 +162,21 @@ def _admit_contact(
             free = (not (art_a >= 0 and data.response_dofs[art_a] > 0) or not a_non_free) and (
                 not (art_b >= 0 and data.response_dofs[art_b] > 0) or not b_non_free
             )
-            lever_a = offset_a
-            lever_b = offset_b
+            # The normal row's own frame (.contact_input.contact_frame): its point, B's share of the separation from
+            # A's surface point (contact_point), and its direction, its region's normal where it is a region's member.
+            point = contact_point(translation_a, offset_a, separation, data.point_share[c])
+            direction = region_normal(patches, c, normal)
+            lever_a = point
+            lever_b = point
             if art_a >= 0:
-                lever_a += translation_a - data.origin[art_a]
+                lever_a = point - data.origin[art_a]
             if art_b >= 0:
-                lever_b += translation_b - data.origin[art_b]
-            lever_a -= 0.5 * separation
-            lever_b += 0.5 * separation
+                lever_b = point - data.origin[art_b]
             speed_a, known_a = _endpoint_speed(
-                data, twists, body_has_response_dofs, body_flags, body_a, art_a, free, normal, lever_a
+                data, twists, body_has_response_dofs, body_flags, body_a, art_a, free, direction, lever_a
             )
             speed_b, known_b = _endpoint_speed(
-                data, twists, body_has_response_dofs, body_flags, body_b, art_b, free, normal, lever_b
+                data, twists, body_has_response_dofs, body_flags, body_b, art_b, free, direction, lever_b
             )
             incident = speed_a - speed_b
             cap = contact_depenetration_cap(
@@ -284,6 +289,7 @@ def _admit_world_contact(
         contact_gap_gate,
         same_articulation_contact_gap_gate,
         articulation_pair_contact_gap_gate,
+        friction_patches,
         twists,
         kept,
     )
