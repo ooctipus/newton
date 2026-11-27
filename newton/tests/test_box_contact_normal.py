@@ -236,26 +236,20 @@ def test_convex_contact_near_plate_end(test, device, *, split=False):
     shape0 = contacts.rigid_contact_shape0.numpy()[:count]
     shape1 = contacts.rigid_contact_shape1.numpy()[:count]
     normals = contacts.rigid_contact_normal.numpy()[:count]
-    point0 = contacts.rigid_contact_point0.numpy()[:count]
-    point1 = contacts.rigid_contact_point1.numpy()[:count]
+    # A rounded side (a cylinder's or cone's curved side) holds its point inside and its radius as its margin: the
+    # depth is the contact's signed distance, points and margins.
+    distance = wp.empty(contacts.rigid_contact_max, dtype=float, device=device)
+    newton.eval_rigid_contact_kinematics(model, state, contacts, out_distance=distance)
+    distance = distance.numpy()[:count]
     poses = state.body_q.numpy()
-    for plate_shape, body, rotation, penetration, description in cases:
+    for plate_shape, _body, rotation, penetration, description in cases:
         with test.subTest(case=description, rotation=rotation, penetration=penetration):
             mask = (shape0 == plate_shape) | (shape1 == plate_shape)
             test.assertTrue(np.any(mask))
             signs = np.where(shape0[mask] == plate_shape, 1.0, -1.0)
             upward = np.asarray(wp.quat_rotate(rotation, wp.vec3(0.0, 0.0, 1.0)))
             np.testing.assert_allclose(normals[mask], signs[:, None] * upward, atol=1.0e-3)
-            partner0 = shape0[mask] != plate_shape
-            world0, world1 = point0[mask].copy(), point1[mask].copy()
-            pose = wp.transform(wp.vec3(*poses[body, :3]), wp.quat(*poses[body, 3:]))
-            for i in range(len(world0)):
-                if partner0[i]:
-                    world0[i] = np.asarray(wp.transform_point(pose, wp.vec3(world0[i])))
-                else:
-                    world1[i] = np.asarray(wp.transform_point(pose, wp.vec3(world1[i])))
-            depths = np.sum((world0 - world1) * normals[mask], axis=1)
-            np.testing.assert_allclose(depths, penetration, atol=2.0e-5)
+            np.testing.assert_allclose(-distance[mask], penetration, atol=2.0e-5)
     if device.is_cuda:
         # Cyclic GC can destroy SDF textures from earlier scenes during capture.
         gc_was_enabled = gc.isenabled()
@@ -471,12 +465,17 @@ def test_capsule_cylinder_tangent_contact(test, device, *, split=False):
             capsule_point = point1 if cylinder_first else point0
             # Oblique crossings amplify axial error in the deepest GJK witness.
             witness_tolerance = 1.0e-5 if angle == wp.pi / 2 else 1.0e-4
-            np.testing.assert_allclose(
-                cylinder_point, np.asarray(wp.transform_point(frame, wp.vec3(0.0, radius, 0.0))), atol=witness_tolerance
-            )
-            # The capsule's radius is stored as a separate friction-anchor offset.
-            np.testing.assert_allclose(capsule_point[[0, 2]], [0.0, 0.0], atol=witness_tolerance)
+            # Both sides are rounded: each holds its point inside, on its axis, and its radius as a separate
+            # friction-anchor offset along the normal.
             offset0, offset1 = contacts.rigid_contact_offset0.numpy()[0], contacts.rigid_contact_offset1.numpy()[0]
+            cylinder_offset = offset0 if cylinder_first else offset1
+            np.testing.assert_allclose(cylinder_offset, radius * expected_normal, atol=1.0e-6)
+            np.testing.assert_allclose(
+                cylinder_point + cylinder_offset,
+                np.asarray(wp.transform_point(frame, wp.vec3(0.0, radius, 0.0))),
+                atol=witness_tolerance,
+            )
+            np.testing.assert_allclose(capsule_point[[0, 2]], [0.0, 0.0], atol=witness_tolerance)
             capsule_offset = offset1 if cylinder_first else offset0
             np.testing.assert_allclose(capsule_offset, [0.0, -capsule_radius, 0.0], atol=1.0e-6)
 
