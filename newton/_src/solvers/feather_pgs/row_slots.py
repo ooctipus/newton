@@ -750,6 +750,13 @@ def _island_ranks_before(
 
 
 @wp.func
+def _rank_blocks(pairs: int, spread: int, threads: int) -> int:
+    """The blocks of a world's group that rank its islands' pairs: as many as its pairs give a thread each (a block
+    more pays the ranks' meets)."""
+    return wp.min(spread, wp.max((pairs + threads - 1) // threads, 1))
+
+
+@wp.func
 def _island_counts_clear(
     order: RowOrder, first: int, lo: int, hi: int, rank: int, threads: int, lanes: int, lane: int, warp: int
 ):
@@ -1480,12 +1487,16 @@ def reserve_group(worlds: int, device) -> int:
 
 
 TURN_MEETS = 8
-"""A world's ``RowOrder.turns`` words of its group's meets (ten): its other blocks' unions and shares of the frame's
-order done, its slots open, its other blocks' slots done, every block's frame sums in, the places open, every block's
-sums of its places in, every island's base known, every pair placed, every block's sums of the rows before each pair
-in, its other blocks' shares of them done (counts from zero; the first block clears them once its group met)."""
+"""A world's ``RowOrder.turns`` words of its group's meets (eleven): its other blocks' unions and shares of the frame's
+order done, its slots open, its other blocks' slots done, every block's frame sums in, the ranking blocks' counts of
+their shares in, every block's sums of its places in, every island's base known, every pair placed, every block's sums
+of the rows before each pair in, its other blocks' shares of them done, the islands' ranks done (the places open)
+(counts from zero; the first block clears them once its group met)."""
 
-TURN_CHUNKS = 18
+TURN_MEET_WORDS = 11
+"""The meets' words (:data:`TURN_MEETS`)."""
+
+TURN_CHUNKS = TURN_MEETS + TURN_MEET_WORDS
 """A world's ``RowOrder.turns`` words from which each block of its group keeps its share of an ordered pass
 (:data:`CHUNK_WORDS` a block): its sums (the frame order's rows of the four lists and pairs, then the rows before
 each pair's), then its turns' carries."""
@@ -1816,10 +1827,13 @@ def reserve_world_rows_kernel(grouped: bool, warps: int = 1):
                     order.turns[world, 0], order.turns[world, 1], order.turns[world, 2], order.turns[world, 3]
                 )
                 pairs = order.turns[world, 4]
-            # The blocks meet once every block's unions and share of the frame's order are in.
+            # Every block's unions and share of the frame's order in: the first block and the blocks that rank the
+            # islands' pairs (as many as the pairs give a thread each; each share's pairs read heads other blocks
+            # wrote) wait for them.
             if spread > 1:
                 _meet_arrive(order.turns, world, TURN_MEETS)
-                _meet_wait(order.turns, world, TURN_MEETS, spread)
+                if rank == 0 or (kept == 0 and rank < _rank_blocks(pairs, spread, threads)):
+                    _meet_wait(order.turns, world, TURN_MEETS, spread)
         else:
             _frame_turns(data, order, world, first, first, end, rows, pairs, 0, kept, lanes, lane, warp, warps)
             lane_sync(RESERVE_LANES)
@@ -1843,28 +1857,39 @@ def reserve_world_rows_kernel(grouped: bool, warps: int = 1):
                 sums = TURN_CHUNKS + rank * CHUNK_WORDS
                 if kept == 0:
                     trees = order.island_size.shape[0]
-                    ranked = _island_ranks(
-                        data,
-                        order,
-                        world,
-                        first,
-                        lo,
-                        hi,
-                        order.island_counts,
-                        rank * trees,
-                        sums + 5,
-                        lanes,
-                        lane,
-                        warp,
-                        warps,
-                    )
-                    if warp == 0 and lane == 0:
-                        order.turns[world, sums + 9] = ranked
-                    _meet_arrive(order.turns, world, TURN_MEETS + 4)
-                    _meet_wait(order.turns, world, TURN_MEETS + 4, spread)
-                    _island_ranks_before(order, first, lo, hi, rank, spread, threads, lanes, lane, warp)
+                    ranking = _rank_blocks(pairs, spread, threads)
+                    ranks_share = (pairs + ranking - 1) // ranking
+                    rank_lo = wp.min(rank * ranks_share, pairs)
+                    rank_hi = wp.min(rank_lo + ranks_share, pairs)
+                    if rank < ranking:
+                        ranked = _island_ranks(
+                            data,
+                            order,
+                            world,
+                            first,
+                            rank_lo,
+                            rank_hi,
+                            order.island_counts,
+                            rank * trees,
+                            sums + 5,
+                            lanes,
+                            lane,
+                            warp,
+                            warps,
+                        )
+                        if warp == 0 and lane == 0:
+                            order.turns[world, sums + 9] = ranked
+                        # The ranking blocks' counts in, then each its share's ranks among the world's; the places
+                        # (every block's share of the pairs) open once every rank is done.
+                        if ranking > 1:
+                            _meet_arrive(order.turns, world, TURN_MEETS + 4)
+                            _meet_wait(order.turns, world, TURN_MEETS + 4, ranking)
+                        _island_ranks_before(order, first, rank_lo, rank_hi, rank, ranking, threads, lanes, lane, warp)
+                        _meet_arrive(order.turns, world, TURN_MEETS + 10)
+                    if rank >= ranking or ranking > 1:
+                        _meet_wait(order.turns, world, TURN_MEETS + 10, ranking)
                     islanded = int(0)
-                    for r in range(lane, spread, lanes):
+                    for r in range(lane, ranking, lanes):
                         islanded += order.turns[world, TURN_CHUNKS + r * CHUNK_WORDS + 9]
                     islanded = lane_sum(islanded, RESERVE_LANES)
                     lane_sync(threads)
@@ -1874,7 +1899,8 @@ def reserve_world_rows_kernel(grouped: bool, warps: int = 1):
                     _place_sums(order, world, first, lo, hi, sums, threads, lanes, lane, warp)
                     _meet_arrive(order.turns, world, TURN_MEETS + 5)
                     _meet_wait(order.turns, world, TURN_MEETS + 5, spread)
-                    _island_counts_clear(order, first, lo, hi, rank, threads, lanes, lane, warp)
+                    if rank < ranking:
+                        _island_counts_clear(order, first, rank_lo, rank_hi, rank, threads, lanes, lane, warp)
                     placed = int(0)
                     loose = int(0)
                     for r in range(lane, rank, lanes):
@@ -2079,7 +2105,7 @@ def reserve_world_rows_kernel(grouped: bool, warps: int = 1):
             order.world_contact_first[world] = _NO_CONTACT
             order.world_contact_last[world] = -1
             if wp.static(warps > 1):
-                for m in range(10):
+                for m in range(TURN_MEET_WORDS):
                     order.turns[world, TURN_MEETS + m] = 0
             if wp.atomic_add(contact_worlds_listed, 1, 1) == listed - 1:
                 contact_worlds_listed[0] = 0
