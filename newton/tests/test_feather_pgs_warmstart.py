@@ -138,10 +138,12 @@ def gather_rows(
     match_indices,
     decay=1.0,
     dt_scale=1.0,
+    kept=False,
     device="cpu",
 ):
     """Carry a step's contacts (:func:`carry_of`), then launch the one identity gather over the next step's contacts,
-    at ``current_slots`` of world 0's line (either row class: one row index), and return the line it seeded."""
+    at ``current_slots`` of world 0's line (either row class: one row index), and return the line it seeded. ``kept``:
+    the next step keeps the carried step's contact set (a substep of the same collision pass)."""
     n = len(current_slots)
     impulses = wp.zeros((1, len(current_types)), dtype=wp.float32, device=device)
     wp.launch(
@@ -158,6 +160,7 @@ def gather_rows(
                 normal=wp.array([[0.0, 0.0, 1.0]] * n, dtype=wp.vec3, device=device),
             ),
             wp.array(match_indices, dtype=wp.int32, device=device),
+            wp.array([int(kept)], dtype=wp.int32, device=device),
             carry_of(prev_impulses, prev_types, prev_slots, device),
             row_lines(device),
             wp.array([current_types], dtype=wp.int32, device=device),
@@ -245,6 +248,21 @@ class TestFeatherPGSIdentityWarmstartKernel(unittest.TestCase):
             dt_scale=4.0,
         )
         np.testing.assert_array_equal(got, np.array([0.0, 110.0, 0.0, 0.0, 22.0], dtype=np.float32))
+
+    def test_kept_contact_set_reads_its_own_record(self):
+        """On a step that keeps the last step's contact set (a substep of the same collision pass), each contact reads
+        the record at its own index, whatever the pass's match index names (it names the last pass's contacts)."""
+        c, dead = ROW_CONTACT, -1
+        got = gather_rows(
+            prev_impulses=[55.0, 0.0, 0.0, 0.0, 11.0],
+            prev_types=[c, dead, dead, dead, c],
+            prev_slots=[4, 0],  # this pass's contacts A, B as the last substep left them
+            current_types=[c, dead, dead, dead, c],
+            current_slots=[4, 0],  # the same contacts, the same slots
+            match_indices=[1, -1],  # the pass's match into the previous pass
+            kept=True,
+        )
+        np.testing.assert_array_equal(got, np.array([55.0, 0.0, 0.0, 0.0, 11.0], dtype=np.float32))
 
     def test_constructor_layout_and_decay_validation(self):
         parameters = tuple(inspect.signature(newton.solvers.SolverFeatherPGS).parameters)
@@ -335,6 +353,54 @@ class TestFeatherPGSIdentityWarmstart(unittest.TestCase):
         impulses = solver.placement.impulses.numpy()[0]
         self.assertAlmostEqual(float(impulses[b_slot]), old_impulse, delta=1.0e-6)
         self.assertEqual(float(impulses[a_slot]), 0.0)
+
+    def test_substeps_of_one_pass_carry_by_own_index(self):
+        """Steps that share a collision pass carry each contact's impulse to itself. A lower-key contact inserted by
+        the pass shifts a persistent contact's index, so the pass's match index of the persistent contact names the
+        index the inserted contact holds within the pass: read on the pass's second step it would seed the inserted
+        contact's impulse there and none on the inserted contact."""
+        builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
+        body_a = builder.add_body(xform=wp.transform(wp.vec3(-0.5, 0.0, 1.0), wp.quat_identity()))
+        shape_a = builder.add_shape_sphere(body_a, radius=0.1, cfg=newton.ModelBuilder.ShapeConfig(density=3000.0))
+        body_b = builder.add_body(xform=wp.transform(wp.vec3(0.5, 0.0, 0.099), wp.quat_identity()))
+        shape_b = builder.add_shape_sphere(body_b, radius=0.1)
+        builder.add_ground_plane()
+        model = builder.finalize()
+        pipeline = newton.CollisionPipeline(model, broad_phase="nxn", contact_matching="sticky", growable_contacts=True)
+        contacts = pipeline.contacts()
+        solver = newton.solvers.SolverFeatherPGS(model, pgs_iterations=8, pgs_warmstart=True)
+        state_0, state_1 = model.state(), model.state()
+        control = model.control()
+        dt = 1.0 / 240.0
+
+        pipeline.collide(state_0, contacts)
+        solver.step(state_0, state_1, control, contacts, dt)
+        q = state_1.body_q.numpy()
+        q[body_a][2] = 0.099
+        state_1.body_q.assign(q)
+        # The pass that inserts A before B, and its first step.
+        pipeline.collide(state_1, contacts)
+        count = int(contacts.rigid_contact_count.numpy()[0])
+        self.assertEqual(count, 2)
+        shape0 = contacts.rigid_contact_shape0.numpy()[:count]
+        shape1 = contacts.rigid_contact_shape1.numpy()[:count]
+        a_contact = int(np.flatnonzero((shape0 == shape_a) | (shape1 == shape_a))[0])
+        b_contact = int(np.flatnonzero((shape0 == shape_b) | (shape1 == shape_b))[0])
+        match = contacts.rigid_contact_match_index.numpy()[:count]
+        self.assertEqual(int(match[b_contact]), a_contact, "test did not shift the persistent contact's index")
+        solver.step(state_1, state_0, control, contacts, dt)
+        carried = solver.placement.carry_impulse.numpy()[:count].copy()
+        self.assertGreater(carried[a_contact], 2.0 * carried[b_contact], "the two contacts' loads must differ")
+
+        # The pass's second step, seeded only (no sweep): each contact's normal row holds its own carried impulse.
+        solver.options = solver.laws.options = solver.factor.options = solver.placement.options = (
+            solver.sweep.options
+        ) = dataclasses.replace(solver.options, pgs_iterations=0)
+        solver.step(state_0, state_1, control, contacts, dt)
+        slots = solver.placement.contact_slot.numpy()[:count]
+        impulses = solver.placement.impulses.numpy()[0]
+        self.assertAlmostEqual(float(impulses[slots[a_contact]]), float(carried[a_contact]), delta=1.0e-6)
+        self.assertAlmostEqual(float(impulses[slots[b_contact]]), float(carried[b_contact]), delta=1.0e-6)
 
     def test_identity_warmstart_holds_static_press(self):
         """Identity warm start keeps a stalled press at the cold equilibrium.

@@ -81,9 +81,11 @@ ContactCarry = field_group.struct(
 )
 """What a step keeps for the next, by contact identity: each contact's normal and its converged normal impulse (zero
 where it held no normal row: a carried zero is the cold start). One record, written once a step by
-:func:`carry_contacts`; the next step's gather reads it through the contacts' match index. The contact pool's rows
-hold it (``carry_normal``, ``carry_impulse``). FeatherPGS consumes the sorted contacts, so a contact's index is its
-sorted index, by which the next frame's ``rigid_contact_match_index`` names it."""
+:func:`carry_contacts` at each contact's index in the step's contact set. The contact pool's rows hold it
+(``carry_normal``, ``carry_impulse``). FeatherPGS consumes the sorted contacts, so a contact's index is its sorted
+index: the next step reads a contact's record at that index while the contact set is the same (the steps that share a
+collision pass), and through ``rigid_contact_match_index``, which names it by its index in the last pass, after a
+collision pass (:func:`gather_carried_normals`)."""
 
 
 def bind_carry(placement):
@@ -161,6 +163,7 @@ def carried_normal(impulse: float, normal: wp.vec3, previous_normal: wp.vec3):
 def gather_carried_normals(
     routes: ContactRoutes,
     match_index: wp.array[int],  # rigid_contact_match_index (sorted-current -> prev-sorted idx)
+    kept: wp.array[int],
     carry: ContactCarry,
     first: wp.array[int],
     row_type: wp.array2d[int],
@@ -172,6 +175,12 @@ def gather_carried_normals(
     """Seed this step's contact normal rows from the previous step's carry (:data:`ContactCarry`), matched by contact
     identity: one thread a contact, which writes only its normal row, at its slot of its world's line (one row index
     for both row classes).
+
+    A contact's record is at its own index where the contact set is the last step's (``kept[0]``, the step's word
+    :meth:`.friction_patches.FrictionPatchState.kept_frame`: no collision pass wrote the contacts since, so the carry
+    was written in this set's order), else at its match index (the carry is the last pass's). The match index names
+    a contact of the last collision pass, not of the last step: read on a step that shares its pass, it would hand
+    each contact whatever contact the carry holds at that index.
 
     Runs in the warm-start stage, after the row pass wrote the rows' types and the clears zeroed every row of the line,
     so fresh contacts and every friction row stay cold (a carried zero writes the zero there). An accepted contact's
@@ -187,7 +196,9 @@ def gather_carried_normals(
     if c >= routes.count[0]:
         return
     slot = routes.slot[c]
-    mi = match_index[c]
+    mi = c
+    if kept[0] == 0:
+        mi = match_index[c]
     if slot < 0 or mi < 0:
         return
     line = first[routes.world[c]]

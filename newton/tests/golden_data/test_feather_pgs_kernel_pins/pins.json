@@ -390,7 +390,7 @@
   "walk_rows.write_free_body_rows('120')": "1e5b21f7824a7c7edb9635382e67395e79c0412e5e2bdf4e12b96353031c5e3f",
   "warm_start.carry_contacts": "3f7495842117f2aa0ab731c5d1b75a54dc3e1d9e6721b444b3d9246c9b8a770c",
   "warm_start.forget_carried_contacts": "b5f1b662d29016bfb5e58b9e9dca88dba7a3a3f65e975c07b5c6375322687311",
-  "warm_start.gather_carried_normals": "b933dada24b619638508aa30cca8d699ea6c0f5210f44899954d8fbb33feae52",
+  "warm_start.gather_carried_normals": "772b063a50435aad3ba466b7d3ba3786274882c77077300c2037e71e03061cb0",
   "warm_start.prepare_world_impulses": "b45c2587adf6b748a4962d496721529919de2ec67c8d11ca4988d90159eb4a3c",
   "warm_start.reset_world_impulses": "84edef2e2ab061e57491658415c4febee6fc2a5739a234ae2d41802e3b79c80b"
  },

@@ -903,7 +903,9 @@ class Sweep:
 
     def warm_start(self, contacts) -> None:
         """Gather the previous step's normal impulses by contact identity into both row classes' normal rows, one launch
-        over the contacts (:func:`.warm_start.gather_carried_normals`)."""
+        over the contacts (:func:`.warm_start.gather_carried_normals`): by the contacts' own index where the step keeps
+        the last step's contact set (the friction patches' word, which the row pass decided), else by their match
+        index."""
         if contacts is None:
             return
         placement = self.placement
@@ -914,6 +916,7 @@ class Sweep:
             inputs=[
                 bind_contact_routes(placement, contacts),
                 contacts.rigid_contact_match_index,
+                self.laws.friction_patches.kept_frame(),
                 bind_carry(placement),
                 placement.dense_first,
                 placement.row_type,
