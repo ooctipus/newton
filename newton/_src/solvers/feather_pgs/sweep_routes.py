@@ -507,7 +507,14 @@ _SLOTS = Operand("slots")
 
 
 def _colored_units(
-    free: WorldRows, laws: RowLaws, M_MF: int, units: str, record: Callable[[str], str], record_stride: str
+    free: WorldRows,
+    laws: RowLaws,
+    M_MF: int,
+    units: str,
+    record: Callable[[str], str],
+    record_stride: str,
+    *,
+    group: bool = False,
 ) -> str:
     """A sweep of the world's units in color order, each when its turn comes. The block takes the places in rounds of
     ``blockDim.x``, a thread a place; a unit loads its fields at once (:data:`.sweep_units.SLOT_FIELDS`, field by field
@@ -523,7 +530,16 @@ def _colored_units(
     longest chain of turns rather than a barrier and the slowest unit of every color. No unit waits forever: the
     units a unit waits for sit at earlier places, a warp takes its rounds in order and polls until its lanes ran, so
     the earliest unit not yet run always runs. A sweep's turns follow the last sweep's (``turn``, the sweep's index
-    times the colors), so ``s_ran`` needs no clearing between sweeps."""
+    times the colors), so ``s_ran`` needs no clearing between sweeps.
+
+    Over a world's ``group`` of blocks (:func:`worlds`' ranks) the world's block (rank 0) opens each sweep's units to
+    the others (its job words, :data:`WIDE_JOB`: the sweep's index, which sets the turns), the world's end last; the
+    places run in rounds of the group's threads, a block's share its run of ``blockDim.x`` places (the units' fields
+    load together), and the colors a unit publishes and waits for are its bodies' counts in global memory
+    (``body_run``, from -1 each launch), behind the device's acquire and release fences. The blocks meet at the
+    sweep's end with their exit votes, which the world's block takes. Every warp still takes its places in order, so
+    the earliest unit not yet run always runs: the group's blocks are resident together (the group is sized to the
+    device's resident blocks)."""
     unit_rows = WorldRows(
         M_MF, Place.STREAMED, free=True, stream=free.stream, lanes=Lanes(1), slots=free.slots, wide=free.wide
     )
@@ -637,21 +653,28 @@ const float mf_diag = __int_as_float(meta.y);"""
                     const float* const unit_record = {record("place")};
                     const float4 {", ".join(f"{name} = make_float4({', '.join('0.0f' if 4 * k + c == 3 else f'unit_record[{4 * k + c} * {record_stride}]' for c in range(4))})" for k, name in enumerate(FORMED_RECORD))};
 {indent(laws_text, " " * 20)}"""
+    # The bodies' counts and their fences: the block's stage and its fence, or over a group of blocks global memory and
+    # the device's (the velocity and impulses a unit reads were written on other multiprocessors).
+    ran, fence = (
+        ("body_run", 'asm volatile("fence.acq_rel.gpu;" ::: "memory");')
+        if group
+        else ("s_ran", "__threadfence_block();")
+    )
     turn_text = f"""                    // Its warp's rounds: each round its units whose turn came run (the latest earlier unit on each
-                    // of their bodies ran: their colors in s_ran), together.
+                    // of their bodies ran: their colors in {ran}), together.
                     while (__any_sync(0xffffffffu, pending)) {{
                         if (pending) {{
-                            volatile const int* const ran = s_ran;
+                            volatile const int* const ran = {ran};
                             const bool ready = (after.x < 0 || ran[dof_a / {RAN_SLOT}] == turn + after.x)
                                 && (after.y < 0 || ran[dof_b / {RAN_SLOT}] == turn + after.y);
                             if (ready) {{
-                                __threadfence_block();
+                                {fence}
 {indent(_unit_terms("", torsion=torsion), " " * 32)}
 {indent(dedent(unit), " " * 32)}
 {indent(_unit_apply("", torsion=torsion), " " * 32)}
                                 // Its color on its bodies, after its changes: the next unit on each may run.
-                                __threadfence_block();
-                                volatile int* const done = s_ran;
+                                {fence}
+                                volatile int* const done = {ran};
                                 const int color = turn + max(after.x, after.y) + 1;
                                 if (dof_a >= 0) done[dof_a / {RAN_SLOT}] = color;
                                 if (dof_b >= 0) done[dof_b / {RAN_SLOT}] = color;
@@ -659,16 +682,69 @@ const float mf_diag = __int_as_float(meta.y);"""
                             }}
                         }}
                     }}"""
-    return f"""{ring_sum}
-            const int colors = color_count.data[world];
-            const int units_end = color_offset.data[off_color + colors];
-            const int turn = {ITERATION} * colors;
-            for (int base = 0; base < units_end; base += blockDim.x) {{
+    rounds = f"""            for (int base = {"rank * (int)blockDim.x" if group else "0"}; base < units_end; base += {"(int)blockDim.x * group" if group else "blockDim.x"}) {{
                 // A warp's lanes take their places together (a lane past the end loads the last unit and skips it).
                 const int place = min(base + tid, units_end - 1);
                 bool pending = base + tid < units_end;
 {visit}
 {turn_text}
+            }}"""
+    if not group:
+        return f"""{ring_sum}
+            const int colors = color_count.data[world];
+            const int units_end = color_offset.data[off_color + colors];
+            const int turn = {ITERATION} * colors;
+{rounds}
+            __syncthreads();"""
+    return f"""{ring_sum}
+            const int colors = color_count.data[world];
+            const int units_end = color_offset.data[off_color + colors];
+            for (;;) {{
+            // The world's block opens the sweep's units (its dense rows ran); the others take them, or the world's end.
+            int sweep_at = {ITERATION};
+            ++wide_gen;
+            if (rank == 0) {{
+                if (tid == 0) {{
+                    volatile int* const job = wide_job;
+                    job[1] = sweep_at;
+                    __threadfence();
+                    atomicExch(wide_job, wide_gen);
+                }}
+            }} else {{
+                if (tid == 0) {{
+                    const volatile int* const job = wide_job;
+                    while (job[0] < wide_gen) {{ }}
+                    __threadfence();
+                }}
+                __syncthreads();
+                const volatile int* const job = wide_job;
+                if (job[3] != 0) break;
+                sweep_at = job[1];
+            }}
+            const int turn = sweep_at * colors;
+{rounds}
+            // The blocks meet: the others count in with their votes; the world's block waits for them and takes the
+            // votes, then goes on to its sweep's end (one pass a sweep).
+            if (rank == 0) {{
+                __syncthreads();
+                if (tid == 0) {{
+                    volatile int* const job = wide_job;
+                    while (job[4] < wide_gen * (group - 1)) {{ }}
+                    __threadfence();
+                    if (job[5] != 0) {{
+                        job[5] = 0;
+                        iteration_changed = 1;
+                    }}
+                }}
+                break;
+            }}
+            const bool voted = __syncthreads_or(iteration_changed != 0);
+            iteration_changed = 0;
+            if (tid == 0) {{
+                if (voted) atomicOr(wide_job + 5, 1);
+                __threadfence();
+                atomicAdd(wide_job + 4, 1);
+            }}
             }}
             __syncthreads();"""
 
@@ -1309,8 +1385,9 @@ def _region_flow(visit: str) -> str:
 __syncthreads();"""
 
 
-# A world's job words where it takes a group of blocks (region_phase): the generation of its last post, the level's
-# first and last places, the world's end, the blocks that joined, their exit votes.
+# A world's job words where it takes a group of blocks (region_phase, _colored_units, group_rows): the generation of
+# its last post, the level's first and last places (a colored world's units: the sweep's index), the world's end, the
+# blocks that joined, their exit votes.
 WIDE_JOB = 8
 
 _VERIFY_TURNS = 4
@@ -1989,11 +2066,16 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
                 f": {first} + ({place})))"
             )
 
-        free_phase = _colored_units(free, laws, M_MF, units, unit_metric("unit_row"), "record_stride")
+        free_phase = _colored_units(
+            free, laws, M_MF, units, unit_metric("unit_row"), "record_stride", group=sweep.world_blocks
+        )
         # The units' records at the line's stride, with the normal's couplings a unit moves its rows' terms by.
         listed = ("color_offset.data[off_color + color_count.data[world]]", COLOR_SLOT, "record_stride")
-        # No unit ran yet (turns are at least zero), before the records' barrier.
+        # No unit ran yet (turns are at least zero), before the records' barrier: in the block's stage, or over a group
+        # of blocks in the world's counts, which its block clears before it opens a sweep.
         ran = f"    for (int d = tid; d < {ran_slots(D)}; d += blockDim.x) s_ran[d] = -1;\n"
+        if sweep.world_blocks:
+            ran = f"    if (rank == 0) for (int d = tid; d < {ran_slots(D)}; d += blockDim.x) body_run[d] = -1;\n"
         unit_records = friction_record_stage(
             free,
             free_op,
@@ -2026,6 +2108,9 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
             "\n    float* const unit_record_line = friction_metric.data + static_cast<size_t>(line) * "
             f"{line_size('friction_metric')};"
         )
+        if sweep.world_blocks:
+            # Over a group of blocks: its bodies' counts (_colored_units).
+            offsets += "\n    int* const body_run = tree_runs.data + (size_t)world * tree_runs.shape[1];"
     elif grouped:
         # The world's groups (sweep_routes.group_rows): its colors' first groups and its groups' first rows.
         free_phase = ""
@@ -2424,7 +2509,7 @@ class GeneralSweep(SweepConfig):
         if self.world_blocks and not (
             self.places.velocity is not Place.SHARED
             and (
-                (self.colored and self.regions)
+                (self.colored and (self.regions or self.places.impulses is Place.GLOBAL))
                 or (
                     self.grouped
                     and self.places.dense_impulses is Place.GLOBAL
@@ -2433,8 +2518,8 @@ class GeneralSweep(SweepConfig):
             )
         ):
             raise ValueError(
-                "a world's blocks serve its region levels or its colors of groups past a block, every operand they "
-                "write or read in global memory"
+                "a world's blocks serve its region levels, its colored units or its colors of groups past a block, "
+                "every operand they write or read in global memory"
             )
         if self.places.metadata is Place.STREAMED and self.record_rows:
             raise ValueError("a sweep that streams its dense rows' records reads them from the line's first row")
@@ -2645,13 +2730,19 @@ class GeneralSweep(SweepConfig):
                 if self.grouped
                 else ()
             ),
-            # Over a world's group of blocks, its groups' places on their trees and its trees' counts (group_rows).
+            # Over a world's group of blocks, its groups' places on their trees and its trees' counts (group_rows); a
+            # colored world's units, its bodies' counts (one-node trees, _colored_units).
             *(
                 (
                     RowArgument("row_group_follows", wp.array2d[int], after="omega"),
                     RowArgument("tree_runs", wp.array2d[int], after="omega"),
                 )
                 if self.grouped and self.world_blocks
+                else ()
+            ),
+            *(
+                (RowArgument("tree_runs", wp.array2d[int], after="omega"),)
+                if self.colored and not self.regions and self.world_blocks
                 else ()
             ),
             # Where the world's velocity change lives in global memory, its line a world (RowPlaces.velocity).

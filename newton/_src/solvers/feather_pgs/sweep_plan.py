@@ -413,11 +413,12 @@ class Sweep:
         self.claims = None
         # The general sweep's velocity lines where it keeps its velocity change in global memory (_velocity_lines).
         self.sweep_velocity = None
-        # Blocks a world of the colored launch (sweep_routes.worlds' ranks) and their job words (region_phase), where a
-        # world's region levels may outgrow its block.
+        # Blocks a world of the colored launch (sweep_routes.worlds' ranks) and their job words (region_phase,
+        # _colored_units), where a world's region levels or colored units may outgrow its block.
         self.world_blocks = 1
-        # Blocks a world of the grouped launch, where a world's colors of groups may outgrow its block, and its trees'
-        # counts there (sweep_routes.group_rows: a line a world, a tree's at its first coordinate).
+        # Blocks a world of the grouped launch, where a world's colors of groups may outgrow its block, and the trees'
+        # counts of either launch's group (_tree_runs: a line a world, a tree's at its first coordinate, a free body's
+        # at its slot).
         self.grouped_blocks = 1
         self.tree_runs = None
         self.wide_jobs = None
@@ -544,24 +545,30 @@ class Sweep:
                 )
                 if reach:
                     colored_declared = dataclasses.replace(colored_declared, places=places)
-                if self.region_slot is not None:
-                    # A world's block flows its regions (_region_flow) with its velocity change and its bodies' marks
-                    # in its stage. Where its free bodies outnumber the block's threads (so a level can be wider than
-                    # its block: a level's regions share no body) a world past the block's reach takes the device's
-                    # blocks beside its own, as many each as the device holds over the worlds (their own form's
-                    # stage, which holds no marks); a world the block holds keeps it and takes a wide level in rounds
-                    # of its threads.
-                    found = device(model.device)
-                    grouped = dataclasses.replace(colored_declared, places=places, world_blocks=True)
-                    held = shape(grouped.work(), found).blocks_per_sm
-                    group = held * found.sms // int(capable.size)
-                    bodies = int(np.asarray(self.forest.free_rigid_per_world)[capable].max())
-                    if group > 1 and bodies > sweep_routes.COLORED_THREADS and reach and self.pins.world_group:
-                        self.world_blocks = group
-                        colored_declared = grouped
-                        self.wide_jobs = wp.zeros(
-                            self.forest.world_count * sweep_routes.WIDE_JOB, dtype=wp.int32, device=model.device
-                        )
+                # A world's block flows its regions (_region_flow) or runs its units (_colored_units) with its
+                # velocity change and its bodies' marks in its stage. Where its free bodies outnumber the block's
+                # threads (so a level of regions or a color of units can be wider than its block: neither shares a
+                # body) a world past the block's reach takes the device's blocks beside its own, as many each as the
+                # device holds over the worlds (their own form's stage, which holds no marks), every operand its
+                # blocks share in global memory (the units' impulses too, which any of them may visit; the regions
+                # publish theirs); a world the block holds keeps it and takes a wide level or color in rounds of its
+                # threads.
+                found = device(model.device)
+                if self.region_slot is None:
+                    places = dataclasses.replace(places, impulses=Place.GLOBAL, free_slots=0, wide_slots=0)
+                grouped = dataclasses.replace(colored_declared, places=places, world_blocks=True)
+                held = shape(grouped.work(), found).blocks_per_sm
+                group = held * found.sms // int(capable.size)
+                bodies = int(np.asarray(self.forest.free_rigid_per_world)[capable].max())
+                if group > 1 and bodies > sweep_routes.COLORED_THREADS and reach and self.pins.world_group:
+                    self.world_blocks = group
+                    colored_declared = grouped
+                    self.wide_jobs = wp.zeros(
+                        self.forest.world_count * sweep_routes.WIDE_JOB, dtype=wp.int32, device=model.device
+                    )
+                    if self.region_slot is None:
+                        # The units' bodies' counts (one-node trees: the grouped form's tree counts).
+                        self.tree_runs = self._tree_runs()
                 # The general sweep's lines where it keeps its own there, else the colored block's.
                 if reach and self.sweep_velocity.size < self.forest.world_count * self.forest.max_world_dofs:
                     self.sweep_velocity = self._velocity_lines(colored_declared)
@@ -590,9 +597,7 @@ class Sweep:
                 )
                 if group > 1 and self.pins.world_group:
                     self.grouped_blocks = group
-                    self.tree_runs = wp.zeros(
-                        (self.forest.world_count, max(self.forest.max_world_dofs, 1)), dtype=int, device=model.device
-                    )
+                    self.tree_runs = self._tree_runs()
                     places = dataclasses.replace(
                         grouped_declared.places,
                         metadata=Place.STREAMED,
@@ -1003,6 +1008,15 @@ class Sweep:
         """``config`` at the places the stage gives its operands on its launch over ``items`` (:func:`.memory.stage`)."""
         layout = shape(self._launch_work(config, items), device(self.model.device))
         return dataclasses.replace(config, places=config.places.placed(layout.staging))
+
+    def _tree_runs(self) -> wp.array:
+        """A group of blocks' counts a world (``tree_runs``): each tree's at its first coordinate, a free body's at its
+        slot (:data:`.sweep_routes.RAN_SLOT`); one array for both block forms, whose worlds differ."""
+        if self.tree_runs is None:
+            self.tree_runs = wp.zeros(
+                (self.forest.world_count, max(self.forest.max_world_dofs, 1)), dtype=int, device=self.model.device
+            )
+        return self.tree_runs
 
     def _block_records(self, form: str, config: SweepConfig, worlds: int, model) -> SweepConfig:
         """A block form's sweep (``form``: the colored units' or a grouped world's, over ``worlds`` worlds) with its friction

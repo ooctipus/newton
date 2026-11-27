@@ -30,6 +30,7 @@ from unittest import mock
 import numpy as np
 import warp as wp
 
+import newton
 from newton._src.core.memory import Place
 from newton._src.solvers.feather_pgs import sweep_plan, sweep_routes, sweep_units
 from newton._src.solvers.feather_pgs.row_laws import ROW_CONTACT, ROW_FRICTION, ROW_TORSION
@@ -495,6 +496,51 @@ class TestColoredSweep(unittest.TestCase):
         self.assertIsNone(plain[-1].sweep.colored_units)
         self.assertIsNotNone(plain[-1].sweep.regions)
         self.assertTrue(np.isfinite(thin.body_q).all())
+
+    def test_wide_colors_take_the_world_group(self):
+        """A world of more free bodies than the colored block's threads holds colors wider than the block (the
+        ground's color: a unit a box). Where the block holds the world's velocity change it takes such a color in
+        rounds of its threads; where it cannot (here pinned to global memory) the device's other blocks join its block
+        on its units, which wait for their bodies' earlier units across the blocks. Each body's units keep their row
+        order, so the published motion is the one block's bit for bit."""
+        model = _box_floor(self.device, side=18)
+        runs = []
+        for world_group in (True, False):
+            pins = SolverFeatherPGS.Pins(velocity="global", world_group=world_group)
+            solver = SolverFeatherPGS(model, pins=pins, mf_max_constraints=16_384)
+            self.assertEqual(solver.sweep.world_blocks > 1, world_group)
+            if world_group:
+                self.assertIn("_glambda", solver.sweep.colored_sweep.name)
+                self.assertIn("_group", solver.sweep.colored_sweep.name)
+            pipeline = newton.CollisionPipeline(model)
+            contacts = pipeline.contacts()
+            states = [model.state(), model.state()]
+            newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+            control = model.control()
+            for i in range(40):
+                src, dst = states[i % 2], states[(i + 1) % 2]
+                pipeline.collide(src, contacts)
+                src.clear_forces()
+                solver.step(src, dst, control, contacts, 1.0 / 240.0)
+            stats = solver.sweep.colored_units.stats()
+            self.assertTrue(stats[0]["colored"], stats)
+            self.assertGreater(stats[0]["largest_color"], sweep_routes.COLORED_THREADS, "a color wider than the block")
+            runs.append((states[0].body_q.numpy(), states[0].body_qd.numpy()))
+        for name, grouped, alone in zip(("body_q", "body_qd"), *runs, strict=True):
+            np.testing.assert_array_equal(grouped, alone, err_msg=name)
+        # The boxes rest on the ground.
+        self.assertGreater(float(runs[0][0][:, 2].min()), 0.05 - 1.0e-3)
+
+
+def _box_floor(device, side: int):
+    """One world of ``side`` x ``side`` free 0.1 m boxes resting on the ground, apart."""
+    builder = newton.ModelBuilder()
+    builder.add_ground_plane()
+    for i in range(side):
+        for j in range(side):
+            body = builder.add_body(xform=wp.transform((0.15 * i, 0.15 * j, 0.0505), wp.quat_identity()))
+            builder.add_shape_box(body, hx=0.05, hy=0.05, hz=0.05)
+    return builder.finalize(device=device)
 
 
 class TestSpilledImpulses(unittest.TestCase):

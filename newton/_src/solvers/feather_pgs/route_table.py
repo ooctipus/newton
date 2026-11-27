@@ -64,9 +64,9 @@ class Pins:
     """``False``: a world whose contacts are regions keeps the warp where the colored mapping's block would take them
     (:attr:`.sweep_plan.Sweep.region_slot`), so a test solves one state on both mappings."""
     world_group: bool = True
-    """``False``: a world whose stages (region levels, colors of groups) outgrow its block keeps its block alone, where
-    it would take the device's other blocks beside it (:func:`.sweep_routes.group_stage`), so a test solves one state
-    both ways."""
+    """``False``: a world whose stages (region levels, colored units, colors of groups) outgrow its block keeps its
+    block alone, where it would take the device's other blocks beside it (:func:`.sweep_routes.group_stage`), so a test
+    solves one state both ways."""
     velocity: str | None = None
     """``"global"``: the general sweep's velocity change in global memory (:class:`.sweep_routes.RowPlaces`), where a
     block would hold it."""
