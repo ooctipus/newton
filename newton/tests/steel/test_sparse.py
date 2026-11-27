@@ -2264,8 +2264,11 @@ class TestSteelSparseSolver(unittest.TestCase):
         Box feet and a box object rest on several contacts each, so their patch regions link normal
         rows on the articulated and the free-body rows; the free body slides so its friction carries load.
         """
-        dense = _case(False, free_count=1, boxes=True, friction_anchor_beta=0.2)
-        sparse = _case(True, free_count=1, boxes=True, friction_anchor_beta=0.2)
+        # Rows in contact-buffer order (RUN_TO_RUN): by default each world reserves its contact rows by atomics,
+        # whose order changes the Gauss-Seidel sweep's order from run to run and the two factors' results with it.
+        run_to_run = wp.DeterministicMode.RUN_TO_RUN
+        dense = _case(False, free_count=1, boxes=True, friction_anchor_beta=0.2, deterministic=run_to_run)
+        sparse = _case(True, free_count=1, boxes=True, friction_anchor_beta=0.2, deterministic=run_to_run)
         self.assertIsNone(dense[1]._sparse_mass_matrix_size)
         self.assertEqual(sparse[1]._sparse_mass_matrix_size, 9)
         self.assertTrue(sparse[1]._friction_anchors_enabled)
