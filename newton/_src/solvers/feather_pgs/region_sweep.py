@@ -30,8 +30,8 @@ sweep, as a region that holds nothing is (its closing bound, then the closing te
 of its regions once a sweep, so its scan tests a left-out region in place, as any region that holds nothing. The
 general sweep's region phase passes it, and the world's lanes test it at the sweep's end at the twist the sweep leaves
 (:func:`.sweep_routes.region_verify`): one that closes joins the next sweep, at most one sweep after the sweep of every
-region would have opened it (a sweep more where the budget is spent). So every region still left out at the end holds
-nothing at a twist where none of its candidates closes.
+region would have opened it, within the budget every route runs (one that closes after the last sweep waits for the
+next step, as a row that closes after its last visit does).
 """
 
 import dataclasses

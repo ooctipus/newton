@@ -1613,9 +1613,7 @@ _REGION_GROUP_STAGE = group_stage(
 )
 
 
-def region_verify(
-    iteration: str = ITERATION, budget: str = "sweep_budget", pad: str = "        ", *, block: bool = False
-) -> str:
+def region_verify(pad: str = "        ", *, block: bool = False) -> str:
     """Native statements of a sweep's end that test the world's left-out regions (:data:`.region_sweep.REGION_LEFT`:
     none of their candidates closed at the predictor): the world's lanes take its regions, each left-out one at its
     bodies' twists as the sweep leaves them (their walk coordinates ``s_v`` through their bases) by the phase's own
@@ -1623,9 +1621,9 @@ def region_verify(
     out). One that
     closes joins the next sweep as a region that holds nothing (:data:`.region_sweep.REGION_IDLE`) at its place in
     the order: where one joins, the world's walk and its levels are made anew over the regions that can act (the
-    statements of :func:`.region_sweep.level_acting`), and the sweeps may not stop; a sweep more where ``budget`` ends
-    at ``iteration``. So every region still left out at the end holds
-    nothing at a motion where none of its candidates closes."""
+    statements of :func:`.region_sweep.level_acting`), and the sweeps may not stop before the budget. The budget is
+    every route's: one that closes after the last sweep holds nothing until the next step, as a row that closes after
+    its last visit does."""
     twist = """const int first{s} = body_first.data[{f}];
 const wp::spatial_vector* const basis{s} = body_basis.data + (size_t){f} * 6;
 wp::spatial_vector u{s};
@@ -1791,7 +1789,6 @@ const wp::vec3 w{s}(wp::dot(basis{s}[3], u{s}), wp::dot(basis{s}[4], u{s}), wp::
 {tests}
     if ({voted}) {{
         iteration_changed = 1;
-        if ({iteration} + 1 == {budget}) {budget} += 1;
         // The opened regions take their places in the order: the walk and its levels anew (region_sweep.level_acting's
         // statements), so the next sweep takes the order on every region that can act, as it stands.
 {remake}
@@ -2316,7 +2313,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     mf_load = free.loads("i")
     mf_store = free.stores("i")
 
-    budget, left_verify = "iterations", ""
+    left_verify = ""
 
     # Where spin rows may appear, every friction contact's record (its Gram couplings and metric) is formed once per
     # launch before the sweeps (sweep.friction_record_stage), the dense rows' and the free bodies', and its visits only
@@ -2364,13 +2361,10 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     if block:
         # The block's vote: every warp's rows and units (a barrier); the first thread records the solve.
         quiet = "!__syncthreads_or(iteration_changed != 0)"
-        # Under regions a join where the budget ends takes a sweep more (region_verify).
-        budget = "sweep_budget" if sweep.regions else "iterations"
         sweep_end = sweep_exit(
             solve_policy,
             quiet=quiet,
             iteration=ITERATION,
-            iterations=budget,
             lane="tid",
             argmax="BLOCK_ARGMAX",
         )
@@ -2381,7 +2375,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         # The free bodies' contacts are regions: the world's open ones by their levels over the block, the sweeps' end
         # tests the left-out ones over it.
         free_phase = region_phase("    ", block=True, group=sweep.world_blocks)
-        left_verify = region_verify(budget=budget, block=True) + "\n"
+        left_verify = region_verify(block=True) + "\n"
         trace_reduction = ""
         if solve_policy.traces:
             trace_reduction = block_argmax(COLORED_THREADS // 32, warp="warp", lane="lane")[0]
@@ -2482,11 +2476,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         # The world's own cycles (its cost class, sweep_levels.COST_CLASSES): read at each sweep's end inside the
         # loop, where the world's lanes have not yet waited for a warp-mate at the loop's exit.
         owns = lanes > 1
-        # Under regions a join where the budget ends takes a sweep more (region_verify).
-        budget = "sweep_budget" if sweep.regions else "iterations"
-        sweep_end = (_OWN_CYCLES_END if owns else "") + end_sweep(
-            solve_policy, iteration=ITERATION, violation=violation, iterations=budget
-        )
+        sweep_end = (_OWN_CYCLES_END if owns else "") + end_sweep(solve_policy, iteration=ITERATION, violation=violation)
         head = "    const int lane = LANE;" + ("\n" + _OWN_CYCLES_START if owns else "")
         first_warp = end_first_warp = ""
         barrier = "SYNC();"
@@ -2495,7 +2485,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
             # The free bodies' contacts are regions: the world's open ones, by the one visit; the sweeps' end tests
             # the left-out ones.
             free_phase = region_phase("    ")
-            left_verify = region_verify(budget=budget) + "\n"
+            left_verify = region_verify() + "\n"
         elif free_rows:
             free_phase = rows_block(free, free_op, laws, metric=metric, formed=free_record, pad="    ")
         offsets = trace_reduction = metric_build = ""
@@ -2710,7 +2700,6 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
             indent(free_phase, "    "),
         ),
         exit=leave + sweep_vote + left_verify + sweep_end,
-        budget=budget,
     )
     # The streamed rows' records (row_record, row_metadata.record_layout). The row store's line (:mod:`.row_records`):
     # the dense rows, then the free bodies' from the line's body base (free_row0), at the store's line length; the
@@ -2746,7 +2735,6 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
         if wide_rows:
             velocity_view += f"\n    float* s_sweep_v = s_v + {D};"
     # The sweeps and the way back; the stage launch (``formed == "stage"``) forms the dense records and leaves.
-    budget_line = f"    int {budget} = iterations;\n" if budget != "iterations" else ""
     add_back = f"""    for (int d = {thread}; d < {D}; d += {threads}) {{
         int global_dof = world_dof_indices.data[dof_map_base + d];
         if (global_dof >= 0) walk.du.data[global_dof] += s_v[d];
@@ -2760,7 +2748,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
     # mapping's lanes.
     way_back = f"{alone}{add_back}{stores}{end_alone}"
     rest = f"""
-{runs_build}{budget_line}{sweeps}{world_end}
+{runs_build}{sweeps}{world_end}
 
     {barrier}
 {way_back}"""
