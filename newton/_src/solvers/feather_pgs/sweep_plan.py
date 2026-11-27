@@ -726,6 +726,7 @@ class Sweep:
                     buckets=(self.claim_candidate, self.claim_colored, self.claim_general),
                     world_cost=self.world_cost,
                     support=self.placement.packed_support,
+                    group=self.world_blocks,
                 )
             # The general sweep walks its bucket on a persistent grid, a warp a world (its work's shape); the colored
             # bucket a block a world of its slots, a color's units at once.

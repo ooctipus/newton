@@ -431,6 +431,7 @@ COLORED_ABI = kernel_template.params(
     ("color_after", wp.array2d[int]),
     ("slot_data", wp.array2d[float]),
     ("slot_words", wp.array2d[int]),
+    ("island_first", wp.array2d[int]),
     ("v_out", wp.array[float]),
 )
 """The colored mapping's native ABI: the matrix-free sweep's, then each world's storage slot and its slot's first entry
@@ -732,11 +733,25 @@ const float mf_diag = __int_as_float(meta.y);"""
                             }}
                         }}
                     }}"""
-    rounds = f"""            for (int base = {"rank * (int)blockDim.x" if group else "0"}; base < units_end; base += {"(int)blockDim.x * group" if group else "blockDim.x"}) {{
+    # Over a group: its places in runs of the block's threads, every group-th run, or where the world's islands take its
+    # blocks (the unit builder's island_first) the block's own places, its islands' units in color order.
+    if group:
+        rounds = """            const int* const island_line = island_first.data + (size_t)world * island_first.shape[1];
+            const bool by_island = island_line[group + 1] != 0;
+            const int places_end = by_island ? island_line[rank + 1] : units_end;
+            for (int base = by_island ? island_line[rank] : rank * (int)blockDim.x; base < places_end;
+                 base += by_island ? (int)blockDim.x : (int)blockDim.x * group) {
+                // A warp's lanes take their places together (a lane past the end loads the last unit and skips it).
+                const int place = min(base + tid, places_end - 1);
+                bool pending = base + tid < places_end;
+"""
+    else:
+        rounds = """            for (int base = 0; base < units_end; base += blockDim.x) {
                 // A warp's lanes take their places together (a lane past the end loads the last unit and skips it).
                 const int place = min(base + tid, units_end - 1);
                 bool pending = base + tid < units_end;
-{visit}
+"""
+    rounds += f"""{visit}
 {turn_text}
             }}"""
     if not group:
