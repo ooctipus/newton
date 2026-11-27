@@ -1158,10 +1158,13 @@ class TestSolverKaminoLOXJoints(_LOXTestCase):
         """Ignore contacts whose two incident bodies are prescribed."""
         model, _driven = _build_driven_link_with_grounded_fixed_base(device=self.default_device)
         shape_pairs = wp.array([(0, 1)], dtype=wp.vec2i, device=self.default_device)
+        # The pipeline drops pairs of shapes welded to the world unless asked to keep them: keep the base-ground
+        # contact, which the solver must ignore.
         collision_pipeline = newton.CollisionPipeline(
             model,
             broad_phase="explicit",
             shape_pairs_filtered=shape_pairs,
+            include_immobile_pairs=True,
         )
         contacts = collision_pipeline.contacts()
         config = self.make_config()
