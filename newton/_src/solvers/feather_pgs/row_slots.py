@@ -1320,7 +1320,7 @@ def _meet_arrive(words: wp.array2d[int], world: int, word: int):
 
 @wp.func_native("""
 #if defined(__CUDA_ARCH__)
-    if (threadIdx.x == 0) {
+    if (threadIdx.x == 0 && count > 0) {
         const volatile int* const met = &words.data[world * (words.strides[0] / sizeof(int)) + word];
         while (*met < count) { }
         __threadfence();
@@ -1332,7 +1332,7 @@ def _meet_arrive(words: wp.array2d[int], world: int, word: int):
 """)
 def _meet_wait(words: wp.array2d[int], world: int, word: int, count: int):
     """A block of a world's group waits until ``count`` blocks counted in at the meet ``word`` of its ``words``; what
-    they stored before is visible to its threads after."""
+    they stored before is visible to its threads after. A world of one block waits for none and fences nothing."""
 
 
 @wp.func
