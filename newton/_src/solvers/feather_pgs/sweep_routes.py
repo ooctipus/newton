@@ -394,18 +394,21 @@ RAN_SLOT = 6
 bodies of six coordinates each, so two bodies' first coordinates lie six apart at least and their slots differ."""
 
 
-def acquire_count(address: str) -> str:
-    """An acquire load of the count at ``address`` (global memory, the device's scope), once a relaxed poll saw its
-    turn: what the blocks wrote before releasing it is visible after it, with no full fence."""
-    return (
-        f'{{ int seen; asm volatile("ld.acquire.gpu.global.s32 %0, [%1];" : "=r"(seen) : "l"({address}) : "memory"); }}'
+def acquire_count(address: str, scope: str = "gpu", into: str = "") -> str:
+    """An acquire load of the count at ``address`` (global memory) at ``scope``: the device's (``gpu``), or the block's
+    (``cta``) where every writer of the count runs on the block. What its writers wrote before releasing it is visible
+    after it, with no full fence. Into ``into`` where a poll reads it, else (once a relaxed poll saw its turn) into a
+    register of its own."""
+    load = (
+        f'asm volatile("ld.acquire.{scope}.global.s32 %0, [%1];" : "=r"({into or "seen"}) : "l"({address}) : "memory");'
     )
+    return load if into else f"{{ int seen; {load} }}"
 
 
-def release_count(address: str, value: str) -> str:
-    """A release store of ``value`` to the count at ``address`` (global memory, the device's scope): what this thread
-    wrote, and saw its warp write, is visible to a block that acquires it, with no full fence."""
-    return f'asm volatile("st.release.gpu.global.s32 [%0], %1;" :: "l"({address}), "r"({value}) : "memory");'
+def release_count(address: str, value: str, scope: str = "gpu") -> str:
+    """A release store of ``value`` to the count at ``address`` (global memory) at ``scope`` (:func:`acquire_count`):
+    what this thread wrote, and saw its warp write, is visible to a thread that acquires it, with no full fence."""
+    return f'asm volatile("st.release.{scope}.global.s32 [%0], %1;" :: "l"({address}), "r"({value}) : "memory");'
 
 
 def ran_slots(dofs: int) -> int:
@@ -578,8 +581,10 @@ def _colored_units(
     Over a world's ``group`` of blocks (:func:`worlds`' ranks) the world's block (rank 0) opens each sweep's units to
     the others (its job words, :data:`WIDE_JOB`: the sweep's index, which sets the turns), the world's end last; the
     places run in rounds of the group's threads, a block's share its run of ``blockDim.x`` places (the units' fields
-    load together), and the colors a unit publishes and waits for are its bodies' counts in global memory
-    (``body_run``, from -1 each launch), behind the device's acquire and release fences. The blocks meet at the
+    load together), or where the world's islands take its blocks (the unit builder's ``island_first``) each block its
+    islands' places in color order; the colors a unit publishes and waits for are its bodies' counts in global memory
+    (``body_run``, from -1 each launch), polled by acquire loads and published by release stores: at the block's scope
+    where the islands take the blocks (each body's units on one block), else the device's. The blocks meet at the
     sweep's end with their exit votes, which the world's block takes. Every warp still takes its places in order, so
     the earliest unit not yet run always runs: the group's blocks are resident together (the group is sized to the
     device's resident blocks). The world's dense rows go first, by their runs (``dense_share``, :func:`dense_runs`):
@@ -698,30 +703,45 @@ const float mf_diag = __int_as_float(meta.y);"""
                     const float* const unit_record = {record("place")};
                     const float4 {", ".join(f"{name} = make_float4({', '.join('0.0f' if 4 * k + c == 3 else f'unit_record[{4 * k + c} * {record_stride}]' for c in range(4))})" for k, name in enumerate(FORMED_RECORD))};
 {indent(laws_text, " " * 20)}"""
-    # The bodies' counts: the block's stage and its fences, or over a group of blocks global memory, polled relaxed, then
-    # an acquire load of each count and a release store of each (the velocity and impulses a unit reads were written on
-    # other multiprocessors).
+    # The bodies' counts: the block's stage, polled, then its fences; or over a group of blocks global memory, each
+    # count polled by acquire loads and released by a store, at the block's scope where the world's islands take its
+    # blocks (``by_island``: every unit of a body runs on one block), else the device's (the velocity and impulses a
+    # unit reads were written on other multiprocessors). The poll reads what its acquire loads: ptxas predicated a
+    # branch between two acquires that nothing read on the enclosing branch's predicate, so the device's acquire
+    # (its invalidation of the multiprocessor's cache) never ran.
     ran = "body_run" if group else "s_ran"
     pad = " " * 32
     sides = (("dof_a", "after.x"), ("dof_b", "after.y"))
     color = "const int color = turn + max(after.x, after.y) + 1;"
     if group:
-        acquire = f"\n{pad}".join(
-            f"if ({after} >= 0) {acquire_count(f'&body_run[{dof} / {RAN_SLOT}]')}" for dof, after in sides
-        )
-        stores = [f"if ({dof} >= 0) {release_count(f'&body_run[{dof} / {RAN_SLOT}]', 'color')}" for dof, _ in sides]
+
+        def scoped(text: Callable[[str], str]) -> str:
+            return f"if (by_island) {{ {text('cta')} }} else {{ {text('gpu')} }}"
+
+        poll = f"""const auto RAN = [&](const int body) -> int {{
+    int seen;
+    {scoped(lambda scope: acquire_count("&body_run[body]", scope, "seen"))}
+    return seen;
+}};"""
+        acquire = ""
+        stores = [
+            f"if ({dof} >= 0) {{ {scoped(lambda scope, d=dof: release_count(f'&body_run[{d} / {RAN_SLOT}]', 'color', scope))} }}"
+            for dof, _ in sides
+        ]
         release = f"\n{pad}".join([color, *stores])
     else:
+        poll = f"volatile const int* const ran = {ran};"
         acquire = "__threadfence_block();"
         stores = [f"if ({dof} >= 0) done[{dof} / {RAN_SLOT}] = color;" for dof, _ in sides]
         release = f"\n{pad}".join(["__threadfence_block();", "volatile int* const done = s_ran;", color, *stores])
+    count = (lambda body: f"RAN({body})") if group else (lambda body: f"ran[{body}]")
     turn_text = f"""                    // Its warp's rounds: each round its units whose turn came run (the latest earlier unit on each
                     // of their bodies ran: their colors in {ran}), together.
                     while (__any_sync(0xffffffffu, pending)) {{
                         if (pending) {{
-                            volatile const int* const ran = {ran};
-                            const bool ready = (after.x < 0 || ran[dof_a / {RAN_SLOT}] == turn + after.x)
-                                && (after.y < 0 || ran[dof_b / {RAN_SLOT}] == turn + after.y);
+{indent(poll, " " * 28)}
+                            const bool ready = (after.x < 0 || {count(f"dof_a / {RAN_SLOT}")} == turn + after.x)
+                                && (after.y < 0 || {count(f"dof_b / {RAN_SLOT}")} == turn + after.y);
                             if (ready) {{
                                 {acquire}
 {indent(_unit_terms("", torsion=torsion), " " * 32)}
