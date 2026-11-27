@@ -13,7 +13,6 @@ import warp as wp
 
 from ....core.memory import Buffer, Place, Staging
 from ..device_preludes import SHARED_STORAGE, dual_native, lane_group, substitute
-from ..projection_laws import BILATERAL_PIVOT
 from ..row_laws import LINK_ROWS
 from ..row_records import UNIT_LINK, UNIT_MIMIC, UNIT_SHIFT
 from .fields import Preelim
@@ -21,25 +20,29 @@ from .fields import Preelim
 # The bilateral rows of a linked component of trees (:mod:`.body_cut`), its mimics and its links, form a block ``B``:
 # the block primitive's second phase, the closure, after the slips' release (FL3_design §1.4), in the one writer's
 # block phase (:mod:`.walk_rows`). On the packed rows (:mod:`.packed_rows`, ``Z_i = L^-1 P J_i^T`` on each side), wide
-# over the world's coordinates, the transform makes the block's rows orthonormal in place by modified Gram-Schmidt, the right-hand sides following:
-# ``Q^T Q = I``, a linear combination of the same constraints. A row whose remainder falls to
-# :data:`.projection_laws.BILATERAL_PIVOT` of its own norm depends on the rows before it (a planar loop's out-of-plane
-# axis, a mimic a closure fixes): it leaves the block, inert. With ``Pi = I - Q Q^T`` the exact projector onto the
-# closures:
+# over the world's coordinates, the transform factors the block's Gram matrix regularized by the rows' ``cfm``,
+# ``B B^T + cfm I`` (the diagonal every other row carries), by modified Gram-Schmidt in place, the right-hand sides
+# following: each row carries ``sqrt(cfm)`` on a coordinate of its own (its augmented part), the rows made orthonormal
+# with it, ``Q`` their part on the world's coordinates and ``Q Q^T + A A^T = I``. No row's remainder vanishes, so the
+# block makes no rank decision: a row the rows before it span (a planar loop's out-of-plane axis, a mimic a closure
+# fixes) or one no coordinate moves (a planar loop's rotation about its plane's normal, whose norm is only its hinges'
+# float rounding) keeps its augmented part, and its ``Q`` stays at its remainder over ``sqrt(cfm)``. With
+# ``Pi = I - Q^T Q`` the regularized projector onto the closures:
 #
-# - correct: every other row touching the block becomes ``Pi Z_i = Z_i - Q Q^T Z_i``, which reaches every tree of the
+# - correct: every other row touching the block becomes ``Pi Z_i = Z_i - Q^T Q Z_i``, which reaches every tree of the
 #   block, its diagonal ``|Pi Z_i|^2 + cfm`` (the closed-loop effective mass); its right-hand side takes back
-#   ``(Q^T Z_i)^T r_Q``, ``r_Q = J_Q v_hat + b_Q`` being the block rows' residual at zero change;
-# - project: the velocity change starts at ``du = -Q r_Q``, the block rows' impulses at ``-r_Q`` (the sweeps' seed,
-#   :func:`.sweep.impulse_seed`).
+#   ``(Q Z_i)^T r_Q``, ``r_Q`` being the block rows' residual at zero change ``J_Q v_hat + b_Q`` carried through the
+#   factor;
+# - project: the velocity change starts at ``du = -Q^T r_Q``, the block rows' impulses at ``-r_Q`` (the sweeps' seed,
+#   :func:`.sweep.impulse_seed`): ``du = -B^T (B B^T + cfm I)^-1 (J_B v_hat + b_B)``.
 #
-# Then ``Q^T (u_hat + du) = -b_Q`` and a sweep's impulse, ``du += Pi Z_i delta``, keeps it. A corrected row's residual
-# at zero change is ``(Pi Z_i)^T u_hat`` and its right-hand side, which the transform folds: its ``J_i v_hat + b_i``
-# less ``(Q^T Z_i)^T r_Q``. ``Pi`` is idempotent, so the
-# contacts solve on the closed-loop Delassus ``Z^T Pi Z`` exactly (no compliance). The block's rows stay in the sweep:
-# they hold in exact arithmetic, and their visits absorb the corrected rows' float32 leakage, without which collinear
-# contact rows of a jammed loop drift in their null space and never meet the exit law. Being orthonormal, each absorbs
-# its share in one visit, where rows that couple would pass it among themselves at their Gauss-Seidel rate.
+# A corrected row's residual at zero change is ``(Pi Z_i)^T u_hat`` and its right-hand side, which the transform
+# folds: its ``J_i v_hat + b_i`` less ``(Q Z_i)^T r_Q``. The contacts solve on the closed-loop Delassus
+# ``Z^T Pi Z``, the block's constraints held to the rows' ``cfm`` (a row the block's coordinates move holds within
+# ``cfm`` over its squared norm). The block's rows stay in the sweep: they hold to that, and their visits absorb the
+# corrected rows' float32 leakage, without which collinear contact rows of a jammed loop drift in their null space and
+# never meet the exit law. Orthonormal with their augmented parts, each absorbs its share in one visit, where rows that
+# couple would pass it among themselves at their Gauss-Seidel rate.
 
 
 def closure_lanes(entries: int) -> int:
@@ -69,6 +72,12 @@ def closure_staging(capacity: int, entries: int, block: int) -> Staging:
 # dot product a lane sum, and written back once; a lane a row then corrects every other row whose sides touch the
 # block against the staged kept rows over the span, its own sums in entry order (its norm over every entry).
 _CLOSE = """    const int M = $capacity, W = $entries, S = Z.shape[2];
+#if defined(__CUDA_ARCH__)
+    // A lane's share of a row's augmented part: the coordinates it strides over, at least closure_lanes apart.
+    const int AJ = (M + $least - 1) / $least;
+#else
+    const int AJ = M;
+#endif
 $stage
     float* const stage = $rows;
     float* const z = Z.data + (size_t)line * (Z.strides[0] / (int)sizeof(*Z.data));
@@ -91,40 +100,67 @@ $stage
         const int first = preelim.span.data[pe][0], n = preelim.span.data[pe][1] - first;
         for (int p = 0; p < m; ++p)
             for (int e = LANE; e < n; e += STRIDE) stage[p * W + e] = z[(size_t)row[p] * S + first + e];
-        // Each row takes out the rows kept before it, then joins them unit, or leaves the block inert where nothing of
-        // it remains (BILATERAL_PIVOT of its own norm); its right-hand side follows, its incident velocity joined to
-        // it first, and its diagonal is |Q_i|^2 + cfm. Every lane holds the same sums, so the same rows.
+        // Each row takes out the rows kept before it, then joins them unit with its augmented part (sqrt(cfm) on its
+        // own coordinate, zero past its own place): the lanes stride over its coordinates as over the span, each
+        // holding its own (aug: a row's coordinates LANE, LANE + STRIDE, ... at 0, 1, ...). A row whose remainder is
+        // nothing at all (no coordinate, and cfm zero) leaves the block inert. Its right-hand side follows, its incident
+        // velocity joined to it first, and its diagonal is |Q_i|^2 + |A_i|^2 + cfm. Every lane holds the same sums, so
+        // the same rows.
+        float aug[M * AJ];
+        const float root = wp::sqrt(cfm);
         int keep[M], kept = 0;
         float q[M];
         for (int p = 0; p < m; ++p) {
             float* const zp = stage + p * W;
+            float* const ap = aug + p * AJ;
+            for (int j = LANE, h = 0; j <= p; j += STRIDE, ++h) ap[h] = j == p ? root : 0.0f;
             float rp = r[row[p]] + v[row[p]];
-            float own = 0.0f;
-            for (int e = LANE; e < n; e += STRIDE) own += zp[e] * zp[e];
-            SUM(own);
             for (int k = 0; k < kept; ++k) {
                 const float* const zk = stage + keep[k] * W;
+                const float* const ak = aug + keep[k] * AJ;
                 float along = 0.0f;
                 for (int e = LANE; e < n; e += STRIDE) along += zk[e] * zp[e];
+                for (int j = LANE, h = 0; j <= keep[k]; j += STRIDE, ++h) along += ak[h] * ap[h];
                 SUM(along);
                 for (int e = LANE; e < n; e += STRIDE) zp[e] -= along * zk[e];
+                for (int j = LANE, h = 0; j <= keep[k]; j += STRIDE, ++h) ap[h] -= along * ak[h];
                 rp -= along * q[keep[k]];
             }
             float rest = 0.0f;
             for (int e = LANE; e < n; e += STRIDE) rest += zp[e] * zp[e];
+            for (int j = LANE, h = 0; j <= p; j += STRIDE, ++h) rest += ap[h] * ap[h];
             SUM(rest);
             float scale = 0.0f;
-            if (rest > $pivot * own) {
+            if (rest > 0.0f) {
                 scale = 1.0f / wp::sqrt(rest);
                 keep[kept++] = p;
             }
             for (int e = LANE; e < n; e += STRIDE) zp[e] *= scale;
+            for (int j = LANE, h = 0; j <= p; j += STRIDE, ++h) ap[h] *= scale;
             q[p] = rp * scale;
             if (LANE == 0) {
                 r[row[p]] = q[p];
-                v[row[p]] = 0.0f;
                 d[row[p]] = scale * scale * rest + cfm;
             }
+        }
+        // The seed starts the block's impulses at -q (from the right-hand sides), so du = -Q^T q. The sweeps read a
+        // block row's residual as Q_i . du + r_i + v_i: its incident velocity takes -(A A^T q)_i, so the seeded state
+        // is its fixed point (Q Q^T + A A^T = I), the regularized closure's rather than the unregularized one, which a
+        // row no coordinate moves could only approach without bound. A^T q, a lane's own coordinates of it, then each
+        // row's dot with it.
+        float aq[AJ];
+        for (int j = LANE, h = 0; j < m; j += STRIDE, ++h) {
+            float sum = 0.0f;
+            for (int k = 0; k < kept; ++k)
+                if (keep[k] >= j) sum += aug[keep[k] * AJ + h] * q[keep[k]];
+            aq[h] = sum;
+        }
+        for (int p = 0; p < m; ++p) {
+            const float* const ap = aug + p * AJ;
+            float held = 0.0f;
+            for (int j = LANE, h = 0; j <= p; j += STRIDE, ++h) held += ap[h] * aq[h];
+            SUM(held);
+            if (LANE == 0) v[row[p]] = -held;
         }
         for (int p = 0; p < m; ++p)
             for (int e = LANE; e < n; e += STRIDE) z[(size_t)row[p] * S + first + e] = stage[p * W + e];
@@ -199,7 +235,7 @@ def close_world(
         link=int(UNIT_LINK),
         mimic=int(UNIT_MIMIC),
         mimics=int(bool(mimic_blocks)),
-        pivot=f"{float(BILATERAL_PIVOT)!r}f",
+        least=int(closure_lanes(entries)),
     )
 
     def close(

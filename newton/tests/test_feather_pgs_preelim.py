@@ -116,8 +116,9 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
 
     def test_blocks_are_sized_from_the_model(self):
         """A block takes every bilateral row of its trees, however many: a link's six rows and six mimics (twelve
-        rows, past the former capacity of eight) are eliminated, and the pivot keeps one of the six identical mimics,
-        which depend on each other."""
+        rows, past the former capacity of eight) are eliminated together. The closure is regularized by the rows' cfm
+        and makes no rank decision: the six identical mimics, which depend on each other, all stay and share their
+        load."""
         model = _build_overcapacity_mixed_bilateral_model()
         solver = newton.solvers.SolverFeatherPGS(model, pgs_iterations=8)
         self.assertTrue(solver.factor.eliminates)
@@ -131,8 +132,9 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
         self.assertTrue(np.isfinite(state_0.body_q.numpy()).all())
         count = int(solver.factor._preelim_nB.numpy()[0])
         kept = solver.placement.row_type.numpy()[0, solver.factor._preelim_slots.numpy()[:count]]
-        self.assertEqual(int(np.count_nonzero(kept == ROW_MIMIC)), 1)
-        self.assertGreater(int(np.count_nonzero(kept == ROW_LINK)), 0)
+        self.assertEqual(count, 12)
+        self.assertEqual(int(np.count_nonzero(kept == ROW_MIMIC)), 6)
+        self.assertEqual(int(np.count_nonzero(kept == ROW_LINK)), 6)
 
     def test_prescribed_parent_closures_are_eliminated(self):
         """A load pinned to a moving kinematic carrier by three ball closures (nine rows, the carrier's velocity in
@@ -314,9 +316,10 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
         self.assertLess(float(np.abs(Q @ rows[others].T).max()), 1.0e-4)
 
     def test_a_rows_scale_does_not_decide_its_rank(self):
-        """Rank is each row's own remainder: on a rocker of 1e-7 kg m^2, whose angular rows are a thousand times its
-        linear ones, the link keeps all five independent rows and the anchors hold at 2 sweeps. Measured against the
-        block's largest row the same model keeps three, and leaves the closure to iterate at 3.5e-4 m."""
+        """No row's scale decides whether it holds: on a rocker of 1e-7 kg m^2, whose angular rows are a thousand times
+        its linear ones, the regularized closure keeps all six rows of the link (five independent, one their
+        combination) and the anchors hold at 2 sweeps. A rank rule measured against the block's largest row kept three
+        and left the closure to iterate at 3.5e-4 m."""
         builder, coupler, rocker = _four_bar_bars()
         builder.body_inertia[rocker] = wp.mat33(1.0e-7 * np.eye(3))
         builder.add_joint_ball(parent=coupler, child=rocker, **_LOOP_FRAMES)
@@ -332,7 +335,7 @@ class TestFeatherPGSPreelimination(unittest.TestCase):
             solver.step(state_0, state_1, control, None, 1.0 / 240.0)
             state_0, state_1 = state_1, state_0
             worst = max(worst, _loop_anchor_gap(model, state_0))
-        self.assertEqual(solver.factor._preelim_nB.numpy().tolist(), [5])
+        self.assertEqual(solver.factor._preelim_nB.numpy().tolist(), [6])
         self.assertLess(worst, 1.0e-6)
 
     def _jammed_sweeps(self, *, warm: bool) -> float:

@@ -740,6 +740,56 @@ class TestLoopsInScenes(unittest.TestCase):
         b.joint_qd[6 : 6 + len(velocities)] = velocities
         return b.finalize(), loop, bar
 
+    def test_a_planar_loop_falls_as_one_body(self):
+        """A floating parallelogram closed by a revolute loop joint, each joint's frames turned off the bodies' axes (the
+        hinges stay parallel, float32 rounds them through the frames), falls from rest: the rows of its link that no
+        coordinate moves (its plane's out-of-plane axes) take no impulse, and the mechanism falls as one body."""
+        b = newton.ModelBuilder(up_axis=newton.Axis.Z)
+        turns = iter(
+            wp.quat_from_axis_angle(wp.normalize(wp.vec3(*axis)), angle)
+            for axis, angle in (
+                ((0.3, -0.5, 0.8), 0.9),
+                ((-0.6, 0.2, 0.7), 2.1),
+                ((0.9, 0.4, -0.1), 1.3),
+                ((0.1, -0.9, -0.4), 2.7),
+            )
+        )
+
+        def revolute(parent, child, at_parent, at_child):
+            turn = next(turns)
+            return b.add_joint_revolute(
+                parent=parent,
+                child=child,
+                axis=wp.quat_rotate_inv(turn, wp.vec3(0.0, 1.0, 0.0)),
+                parent_xform=wp.transform(wp.vec3(*at_parent), turn),
+                child_xform=wp.transform(wp.vec3(*at_child), turn),
+            )
+
+        base = b.add_link(xform=wp.transform(wp.vec3(0.2, 0.0, 1.0), wp.quat_identity()))
+        b.add_shape_box(base, hx=0.25, hy=0.05, hz=0.05)
+        joints, tips = [b.add_joint_free(child=base)], []
+        for x in (-0.2, 0.2):
+            link = b.add_link(xform=wp.transform(wp.vec3(0.2 + x, 0.0, 0.8), wp.quat_identity()))
+            b.add_shape_box(link, hx=0.02, hy=0.02, hz=0.15)
+            joints.append(revolute(base, link, (x, 0.0, 0.0), (0.0, 0.0, 0.2)))
+            tips.append(link)
+        bar = b.add_link(xform=wp.transform(wp.vec3(0.2, 0.0, 0.6), wp.quat_identity()))
+        b.add_shape_box(bar, hx=0.2, hy=0.02, hz=0.02)
+        joints.append(revolute(tips[0], bar, (0.0, 0.0, -0.2), (-0.2, 0.0, 0.0)))
+        b.add_articulation(joints)
+        loop = revolute(tips[1], bar, (0.0, 0.0, -0.2), (0.2, 0.0, 0.0))
+        model = b.finalize()
+        solver = newton.solvers.SolverFeatherPGS(model)
+        state_0, state_1, control = model.state(), model.state(), model.control()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state_0)
+        for _ in range(6):
+            state_0.clear_forces()
+            solver.step(state_0, state_1, control, None, 1.0 / 240.0)
+            state_0, state_1 = state_1, state_0
+        self.assertLess(_gap(model, state_0, loop), 1.0e-5)
+        # Free fall moves the root's translation alone; every turning coordinate stays at rest within rounding.
+        self.assertLess(float(np.abs(state_0.joint_qd.numpy()[3:]).max()), 1.0e-3)
+
     def test_a_state_that_breaks_the_closure_lands_on_it(self):
         """A reset's velocities can violate the closure, and then have no unique continuation: the first step lands on
         the closure, and the momentum holds from then on."""
