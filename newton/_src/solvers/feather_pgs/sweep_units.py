@@ -459,14 +459,14 @@ SHARED_DECLARATIONS
     if (pass_words.data[0] != 0) {
         // A later step of the collision pass: the world's units and colors are the pass's (its rows' slots are), and
         // only its claim is the step's, as the build below claims it.
-        if (tid == 0) {
+        if (rank == 0 && tid == 0) {
             const int units = unit_count.data[world];
             APPEND_CLAIM(end >= MIN_UNITS && units <= room && COLORED(units, color_count.data[world]) ? colored_bucket : GENERAL_CLAIM)
         }
         return;
     }
     if (end < MIN_UNITS) {
-        if (tid == 0) {
+        if (rank == 0 && tid == 0) {
             unit_count.data[world] = 0;
             color_count.data[world] = 0;
             APPEND_CLAIM(GENERAL_CLAIM)
@@ -474,19 +474,72 @@ SHARED_DECLARATIONS
         return;
     }
 
-    for (int w = tid; w < WORDS; w += THREADS) used_bits[w] = 0u;
-    for (int n = tid; n < NODES; n += THREADS) node_level[n] = -1;
+    // The world's group: as many of its blocks as its rows give a thread each, at most its ``group`` (``spread``),
+    // each a run of the rows (the others return). They count their units, then take their places in row order and
+    // their bodies' coordinates (the world's bitmap in global memory past one block); the world's block levels them,
+    // then the group places them. They meet through counts (``unit_meets``: the counts in, the units written, the
+    // places open, the units placed; then each block's count).
+    const int spread = min(group, max((end + THREADS - 1) / THREADS, 1));
+    if (rank >= spread) return;
+    int* const meets = unit_meets.data + (size_t)slot * unit_meets.shape[1];
+    unsigned* const bits = reinterpret_cast<unsigned*>(unit_bits.data + (size_t)slot * unit_bits.shape[1]);
+    const auto MEET = [&](const int word, const int count) {
+        __syncthreads();
+        if (tid == 0) {
+            __threadfence();
+            atomicAdd(&meets[word], 1);
+            const volatile int* const met = &meets[word];
+            while (*met < count) { }
+            __threadfence();
+        }
+        __syncthreads();
+    };
+    const int share = (end + spread - 1) / spread;
+    const int lo = min(rank * share, end), hi = min(lo + share, end);
+    if (rank == 0) {
+        for (int w = tid; w < WORDS; w += THREADS) used_bits[w] = 0u;
+        for (int n = tid; n < NODES; n += THREADS) node_level[n] = -1;
+    }
+    int units = 0, all = 0;
+    if (spread > 1) {
+        // Each block's units, then the units before its run.
+        int counted = 0;
+        for (int row = lo + tid; row < hi; row += THREADS)
+            counted += (row_record.data[off_meta + row * HEADER_WORDS + 3] & 0xFFFF) == CONTACT;
+        counted = __reduce_add_sync(0xffffffffu, counted);
+        if (lane == 0) warp_count[warp] = counted;
+        __syncthreads();
+        if (tid == 0) {
+            int total = 0;
+            for (int w = 0; w < WARPS; ++w) total += warp_count[w];
+            meets[4 + rank] = total;
+        }
+        MEET(0, spread);
+        int before = 0, total = 0;
+        for (int r = lane; r < spread; r += 32) {
+            const int count = reinterpret_cast<volatile int*>(meets)[4 + r];
+            total += count;
+            if (r < rank) before += count;
+        }
+        units = __reduce_add_sync(0xffffffffu, before);
+        all = __reduce_add_sync(0xffffffffu, total);
+        // A world past the pool's room: none written (the world's block records it below).
+        if (all > room) {
+            if (rank > 0) return;
+            units = all;
+        }
+    }
     __syncthreads();
 
     // Units in row order: a contact normal row and the friction rows after it whose parent it is. Each warp takes
     // 32 rows of a chunk; the warps' counts give each its first slot.
-    int units = 0;
-    for (int base = 0; base < end; base += THREADS) {
+    if (units <= room) {
+    for (int base = lo; base < hi; base += THREADS) {
         const int row = base + tid;
         bool head = false;
-        if (row < end) head = (row_record.data[off_meta + row * HEADER_WORDS + 3] & 0xFFFF) == CONTACT;
+        if (row < hi) head = (row_record.data[off_meta + row * HEADER_WORDS + 3] & 0xFFFF) == CONTACT;
         int counted = 0;
-        const int rank = ORDERED(counted, head);
+        const int order = ORDERED(counted, head);
         if (lane == 0) warp_count[warp] = counted;
         __syncthreads();
         int first = units, total = 0;
@@ -496,8 +549,8 @@ SHARED_DECLARATIONS
         }
         // The pool holds the world's units within its room: a world with more counts them and keeps the one-warp
         // sweep.
-        if (head && first + rank < room) {
-            const int unit = first + rank;
+        if (head && first + order < room) {
+            const int unit = first + order;
             int rows = 1;
             while (row + rows < end && rows < 3) {
                 const int packed = row_record.data[off_meta + (row + rows) * HEADER_WORDS + 3];
@@ -509,13 +562,38 @@ SHARED_DECLARATIONS
             unit_rows.data[off_mf + unit] = rows;
             unit_dofs.data[off_mf + unit] = dofs;
             const int dof_a = dofs >> 16, dof_b = (dofs << 16) >> 16;
-            if (dof_a >= 0) atomicOr(&used_bits[dof_a >> 5], 1u << (dof_a & 31));
-            if (dof_b >= 0) atomicOr(&used_bits[dof_b >> 5], 1u << (dof_b & 31));
+            unsigned* const used = spread > 1 ? bits : used_bits;
+            if (dof_a >= 0) atomicOr(&used[dof_a >> 5], 1u << (dof_a & 31));
+            if (dof_b >= 0) atomicOr(&used[dof_b >> 5], 1u << (dof_b & 31));
         }
         units += total;
         __syncthreads();
     }
-    if (units > room) {
+    }
+    if (spread > 1) {
+        // The world's block: the units' count and the group's bitmap (cleared for the next build) once every block
+        // wrote; the others wait for the places to open.
+        if (rank > 0) {
+            MEET(1, spread);
+            if (tid == 0) {
+                const volatile int* const open = &meets[2];
+                while (*open == 0) { }
+                __threadfence();
+            }
+            __syncthreads();
+            if (reinterpret_cast<volatile int*>(meets)[2] != 1) return;
+            units = reinterpret_cast<volatile int*>(meets)[3];
+        } else {
+            if (units <= room) MEET(1, spread);
+            units = all;
+            for (int w = tid; w < WORDS; w += THREADS) {
+                used_bits[w] = bits[w];
+                bits[w] = 0u;
+            }
+            __syncthreads();
+        }
+    }
+    if (rank == 0 && units > room) {
         // Past the pool's end: the one-warp sweep keeps the world, and the units' capacity status records it once.
         if (tid == 0) {
             unit_count.data[world] = units;
@@ -524,9 +602,12 @@ SHARED_DECLARATIONS
             if (atomicOr(&unit_status.data[0], 1) == 0)
                 printf("Warning: FeatherPGS colored sweep: world %d has %d contact units, past the unit pool's %d "
                        "entries from its first; the one-warp mapping keeps it.\n", world, units, max(room, 0));
+            for (int w = 0; w < 4 + spread; ++w) meets[w] = 0;
         }
         return;
     }
+    int colors = 0;
+    if (rank == 0) {
     // A unit's level is at most its index: the counts of colors [0, units] start at zero.
     for (int c = tid; c <= units; c += THREADS) color_offset.data[off_color + c] = 0;
     // Compact body ids: the rank of a body's first coordinate among the used ones (a scan of the bitmap's counts).
@@ -553,10 +634,20 @@ LEVEL_PASS
         if (tid == 0) color_count.data[world] = levels;
     }
     // Color offsets: an exclusive scan of the counts, in place; offset `colors` is the unit count.
-    const int colors = colors_s[0];
+    colors = colors_s[0];
 LEVEL_OFFSETS
+    }
+    if (spread > 1 && rank == 0) {
+        // The places open to the group, with the units' count.
+        __syncthreads();
+        if (tid == 0) {
+            meets[3] = units;
+            __threadfence();
+            atomicExch(&meets[2], 1);
+        }
+    }
     // Each color's units in row order: a unit's position is its color's offset plus its rank.
-    for (int unit = tid; unit < units; unit += THREADS) {
+    for (int unit = rank * THREADS + tid; unit < units; unit += spread * THREADS) {
         const int color = unit_color.data[off_mf + unit];
         const int position = color_offset.data[off_color + color] + unit_rank.data[off_mf + unit];
         const int dofs = unit_dofs.data[off_mf + unit];
@@ -567,6 +658,24 @@ LEVEL_OFFSETS
         color_slot.data[at + 3] = (dofs << 16) >> 16;
         color_after.data[(off_mf + position) * 2] = unit_after.data[(off_mf + unit) * 2];
         color_after.data[(off_mf + position) * 2 + 1] = unit_after.data[(off_mf + unit) * 2 + 1];
+    }
+    if (spread > 1) {
+        // The others count in and return; the world's block waits for them and clears the meets.
+        if (rank > 0) {
+            __syncthreads();
+            if (tid == 0) {
+                __threadfence();
+                atomicAdd(&meets[1], 1);
+            }
+            return;
+        }
+        __syncthreads();
+        if (tid == 0) {
+            const volatile int* const met = &meets[1];
+            while (*met < 2 * spread - 1) { }
+            __threadfence();
+            for (int w = 0; w < 4 + spread; ++w) meets[w] = 0;
+        }
     }
     if (tid == 0) {
         unit_count.data[world] = units;
@@ -648,9 +757,10 @@ def build_units_kernel(
     """The unit builder of worlds with ``mf_rows`` free-body rows and ``dofs`` coordinates, each world's units in the
     pool from its slot's first entry (:data:`SLOT_PLACES`); under contact ``torsion`` a unit's spin row follows its pair.
 
-    One block of :data:`BUILD_WARPS` warps per world of the claims' candidate bucket (a world with a slot,
-    :func:`.sweep_levels.claim_worlds`): launch tiled over the bucket's capacity, the slots, with ``block_dim=32 *
-    BUILD_WARPS``. Inputs: ``mf_constraint_count``, ``mf_contact_rows_end`` and the free bodies' records
+    A group of ``unit_blocks`` blocks of :data:`BUILD_WARPS` warps per world of the claims' candidate bucket (a world
+    with a slot, :func:`.sweep_levels.claim_worlds`; :func:`unit_blocks`): launch tiled over the bucket's capacity, the
+    slots, times the group, with ``block_dim=32 * BUILD_WARPS``. A world takes as many of its group's blocks as its rows
+    give a thread each: they count and write its units in row order and place them; its first block levels them. Inputs: ``mf_constraint_count``, ``mf_contact_rows_end`` and the free bodies' records
     (``row_record`` after the line's dense rows' records, ``dense_record_words`` a row to its body base ``body_base``,
     :func:`.row_metadata.record_layout`); outputs:
     :data:`WORLD_FIELDS` (``world_slot`` is read) and its :data:`UNIT_FIELDS` in the pool, and each world appended to the
@@ -708,17 +818,31 @@ def build_units_kernel(
         ("world_cost", wp.array[wp.int32]),
         ("acts", wp.array[wp.int32]),
         ("pass_words", wp.array[wp.int32]),
+        # A world's group of blocks (``unit_blocks`` a world): their meets and its coordinates' bitmap.
+        ("unit_meets", wp.array2d[wp.int32]),
+        ("unit_bits", wp.array2d[wp.int32]),
     )
     return KernelTemplate(
         f"sweep_units_{mf_rows}_{dofs}_{rule.name}_w{BUILD_WARPS}" + ("_torsion" if torsion else ""),
         params,
         cuda_native(source, preludes=(lane_group(32), SHARED_STORAGE)),
-        dispatch=kernel_template.items("world", queue=("candidate_count", "candidate_stride", "candidate_worlds")),
+        dispatch=kernel_template.items(
+            "world", queue=("candidate_count", "candidate_stride", "candidate_worlds"), ranks="unit_blocks"
+        ),
         composed=True,
         native_name="sweep_units_native",
         launch_bounds=(32 * BUILD_WARPS, 1),
         stage=staging.dynamic_bytes(device_arch),
     ).kernel()
+
+
+def unit_blocks(slots: int, device) -> int:
+    """Blocks a world of the unit builder (:func:`build_units_kernel`): as many as the device's multiprocessors hold
+    over the slots' worlds, a block each, so a group's blocks are resident together; one on the CPU."""
+    device = wp.get_device(device)
+    if not device.is_cuda:
+        return 1
+    return max(int(device.sm_count) // max(int(slots), 1), 1)
 
 
 PLACE_THREADS = 256
@@ -876,6 +1000,11 @@ class ColoredUnits:
         }
         # Sticky: 1 once a world's units passed its slot's (the build's device status).
         self.status = wp.zeros(1, dtype=wp.int32, device=device)
+        # Each slot's group of blocks (unit_blocks): their meets (four counts, then each block's units) and the world's
+        # coordinates' bitmap past one block.
+        self.blocks = unit_blocks(self.slot_count, device)
+        self.meets = wp.zeros((self.slot_count, 4 + self.blocks), dtype=wp.int32, device=device)
+        self.bits = wp.zeros((self.slot_count, (int(dofs) + 31) // 32), dtype=wp.int32, device=device)
         self.rule = rule
         self.stage_kernel = stage_slots(bool(weighted))
         self.build_kernel = build_units_kernel(
@@ -945,8 +1074,9 @@ class ColoredUnits:
         )
         wp.launch_tiled(
             self.build_kernel,
-            dim=[self.slot_count],
+            dim=[self.slot_count * self.blocks],
             inputs=[
+                self.blocks,
                 candidates,
                 self.slot_count,
                 candidate_worlds,
@@ -970,6 +1100,8 @@ class ColoredUnits:
                 self.world_cost,
                 world_acts,
                 pass_words,
+                self.meets,
+                self.bits,
             ],
             block_dim=32 * BUILD_WARPS,
             device=self.device,
