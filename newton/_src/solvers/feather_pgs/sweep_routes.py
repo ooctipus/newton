@@ -516,6 +516,32 @@ def _unit_apply(pad: str, *, torsion: bool = False) -> str:
     return indent("\n".join(lines), pad)
 
 
+_UNIT_OWN = {
+    "i": "(r == 0 ? unit_h0 : unit_h1)",
+    "i + 1": "(r == 0 ? unit_h1 : unit_h2)",
+    "sib": "unit_h2",
+    "spin": "unit_h3",
+}
+"""A colored unit's own rows' impulses as its visit reads them (row ``r`` 0 its normal, 1 its pair): the registers
+:func:`_unit_impulses` read before its turn."""
+
+
+def _unit_impulses(unit_rows: WorldRows) -> str:
+    """A colored unit's own rows' impulses, read with its fields before its turn (``unit_h0`` its normal's, ``unit_h1``
+    to ``unit_h3`` its pair's and spin row's): each row has one writer, its unit (a ring's other normals, which the
+    pair pools, are other units' and read at the turn), so they hold the last sweep's values until the turn."""
+    return "\n".join(
+        [
+            f"float unit_h0 = {unit_rows.load('unit_row')}, unit_h1 = 0.0f, unit_h2 = 0.0f, unit_h3 = 0.0f;",
+            "if (rows >= 3) {",
+            f"    unit_h1 = {unit_rows.load('unit_row + 1')};",
+            f"    unit_h2 = {unit_rows.load('unit_row + 2')};",
+            "}",
+            f"if (rows > 3) unit_h3 = {unit_rows.load('unit_row + 3')};",
+        ]
+    )
+
+
 # The colored units' slots (sweep_units.SlotLayout): the unit builder writes them a launch before the sweep, and no thread
 # of the sweep does, so the memory toolkit's read rule reads them by LDG.
 _SLOTS = Operand("slots")
@@ -534,10 +560,10 @@ def _colored_units(
 ) -> str:
     """A sweep of the world's units in color order, each when its turn comes. The block takes the places in rounds of
     ``blockDim.x``, a thread a place; a unit loads its fields at once (:data:`.sweep_units.SLOT_FIELDS`, field by field
-    across the pool's ``units`` entries) and its contact's ``record`` (:func:`.sweep.friction_record_stage`), then its
-    warp polls: each pass runs together the lanes whose turn came, where the latest earlier unit on each of their bodies
-    ran (:data:`COLOR_AFTER`: those units' colors, which they published in ``s_ran`` at their bodies' slots,
-    :data:`RAN_SLOT`). A unit runs the free-body row law, unrolled over its rows, on the world's staged velocity, and
+    across the pool's ``units`` entries), its own rows' impulses (:func:`_unit_impulses`) and its contact's ``record``
+    (:func:`.sweep.friction_record_stage`), then its warp polls: each pass runs together the lanes whose turn came,
+    where the latest earlier unit on each of their bodies ran (:data:`COLOR_AFTER`: those units' colors, which they
+    published in ``s_ran`` at their bodies' slots, :data:`RAN_SLOT`). A unit runs the free-body row law, unrolled over its rows, on the world's staged velocity, and
     publishes its own color on its bodies.
 
     Every unit thus reads the velocities and impulses that the units before it in row order on its bodies left, as the
@@ -587,7 +613,7 @@ def _colored_units(
         diagonal=Diagonal(
             inverse=lambda row: "mf_diag" if row == "i" else f"__int_as_float(W[{unit_offset(row)} * 3])"
         ),
-        load=unit_rows.load,
+        load=lambda row: _UNIT_OWN.get(row) or unit_rows.load(row),
         store=unit_rows.store,
         rhs=lambda row: "__int_as_float(meta.z)" if row == "i" else f"__int_as_float(W[{unit_offset(row)} * 3 + 1])",
         mu=lambda row: f"E[{layout.spin_mu if row == 'spin' else layout.mu}]",
@@ -665,6 +691,7 @@ const float mf_diag = __int_as_float(meta.y);"""
                     for (int f = 0; f < {fields}; ++f) E[f] = slot_data.data[{fields} * off_unit + f * {units} + place];
 #pragma unroll
                     for (int f = 0; f < {words}; ++f) W[f] = slot_words.data[{words} * off_unit + f * {units} + place];
+{indent(_unit_impulses(unit_rows), " " * 20)}
                     // Its contact's record by place, beside the slot (sweep.friction_record_stage): the friction
                     // metric, then the normal's couplings with its friction rows; unread without a friction pair.
                     const float* const unit_record = {record("place")};
