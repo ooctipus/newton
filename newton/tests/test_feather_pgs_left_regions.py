@@ -273,10 +273,11 @@ class TestFeatherPGSLeftRegions(unittest.TestCase):
 
     @unittest.skipUnless(wp.is_cuda_available(), "CUDA")
     def test_split_records_take_the_colored_block(self):
-        # A line past 65,535 rows makes split records: the world's contacts are regions, and its regions take the
-        # colored mapping's block by their levels rather than one warp. Both mappings sweep the order by its levels (a
-        # level's regions share no body), so the published motion is the warp's to its rounding.
-        model = _columns("cuda:0")
+        # A world past a unit's 16-bit coordinate halves (more than 32,767 coordinates) makes split records and takes
+        # no units: its contacts are regions, and its regions take the colored mapping's block by their levels rather
+        # than one warp. Both mappings sweep the order by its levels (a level's regions share no body), so the
+        # published motion is the warp's to its rounding.
+        model = _columns("cuda:0", columns=24, height=10)
         poses = []
         for region_block in (True, False):
             solver = SolverFeatherPGS(
@@ -304,9 +305,9 @@ class TestFeatherPGSLeftRegions(unittest.TestCase):
     @unittest.skipUnless(wp.is_cuda_available(), "CUDA")
     def test_split_records_take_colored_units(self):
         # The colored mapping's units read a split line's records as a packed one's (each side's first coordinate and
-        # the parent in words of their own): with the contacts kept rows (the pin), a line past 65,535 rows takes the
-        # same units, colors and staged rows as a packed line, so the published motion is the packed line's. Under the
-        # warm start the units' seed (sweep_routes._colored_seed) walks the same units from the impulses carried.
+        # the parent in words of their own): a line past 65,535 rows takes the same units, colors and staged rows as a
+        # packed line, so the published motion is the packed line's. Under the warm start the units' seed
+        # (sweep_routes._colored_seed) walks the same units from the impulses carried.
         model = _columns("cuda:0")
         for warm in (False, True):
             with self.subTest(warm=warm):
@@ -315,9 +316,7 @@ class TestFeatherPGSLeftRegions(unittest.TestCase):
     def _split_records_take_colored_units(self, model, warm: bool):
         poses = []
         for rows in (65_535, 65_536):
-            solver = SolverFeatherPGS(
-                model, pins=SolverFeatherPGS.Pins(regions=False), mf_max_constraints=rows, pgs_warmstart=warm
-            )
+            solver = SolverFeatherPGS(model, mf_max_constraints=rows, pgs_warmstart=warm)
             self.assertEqual(solver.placement.split_records, rows > 65_535)
             self.assertIsNone(solver.sweep.regions)
             self.assertIsNotNone(solver.sweep.mf_colored_kernel)
@@ -338,11 +337,11 @@ class TestFeatherPGSLeftRegions(unittest.TestCase):
     @unittest.skipUnless(wp.is_cuda_available(), "the colored mapping's block runs on CUDA")
     def test_wide_levels_take_the_world_group(self):
         # A world of more free bodies than the colored block's threads holds levels wider than the block (the ground
-        # level: a region a bottom box). Where the block holds the world's velocity change it takes such a level in
-        # rounds of its threads; where it cannot (here pinned to global memory) the device's other blocks join its
-        # block on those levels. Every mapping sweeps the order by its levels, so the published motion is the warp's
-        # to its rounding.
-        model = _columns("cuda:0", columns=18, height=2)
+        # level: a region a bottom box); past a unit's 16-bit coordinate halves its contacts are regions. Where the
+        # block holds the world's velocity change it takes such a level in rounds of its threads; where it cannot (pinned
+        # to global memory here, or past the device's block budget) the device's other blocks join its block on those
+        # levels. Every mapping sweeps the order by its levels, so the published motion is the warp's to its rounding.
+        model = _columns("cuda:0", columns=24, height=10)
         poses = []
         for region_block, velocity in ((True, None), (True, "global"), (False, None)):
             solver = SolverFeatherPGS(
@@ -351,7 +350,8 @@ class TestFeatherPGSLeftRegions(unittest.TestCase):
                 mf_max_constraints=65_536,
             )
             self.assertTrue(solver.placement.split_records)
-            self.assertEqual(solver.sweep.world_blocks > 1, velocity == "global")
+            if velocity == "global":
+                self.assertGreater(solver.sweep.world_blocks, 1)
             pipeline = newton.CollisionPipeline(model)
             contacts = pipeline.contacts()
             states = [model.state(), model.state()]
