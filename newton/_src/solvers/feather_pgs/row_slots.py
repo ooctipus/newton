@@ -448,10 +448,11 @@ class RowOrder:
     of the pairs before it in the row order
     (``rows_before``); and by articulation, the islands' union-find parents, sizes, and first places in the row order
     with their strides' inverses (``island_parent``, ``island_size``, ``island_base``), each tree its own root and
-    size zero between reservations; whether the contact frame is the last build's (``frame_kept``, the patch
-    builder's word), whose islands' order the last reservation left in ``row_pairs``; and by world, what a batch of the
-    frame order leaves the next in a world's block of warps (``turns``: the rows of the lists and the pairs before
-    it, :func:`_frame_turns`)."""
+    size zero between reservations; over a world's group of blocks each block's counts of each island's pairs in its
+    share (``island_counts``, a row of the trees a block, zero between reservations); whether the contact frame is the
+    last build's (``frame_kept``, the patch builder's word), whose islands' order the last reservation left in
+    ``row_pairs``; and by world, what a batch of the frame order leaves the next in a world's block of warps
+    (``turns``: the rows of the lists and the pairs before it, :func:`_frame_turns`)."""
 
     pair_keys: wp.array[wp.int64]
     world_contact_first: wp.array[int]
@@ -467,6 +468,7 @@ class RowOrder:
     island_parent: wp.array[wp.int32]
     island_size: wp.array[int]
     island_base: wp.array[wp.vec2i]
+    island_counts: wp.array[int]
     frame_kept: wp.array[int]
     turns: wp.array2d[int]
 
@@ -645,14 +647,21 @@ def _island_ranks(
     order: RowOrder,
     world: int,
     first: int,
-    pairs: int,
+    lo: int,
+    hi: int,
+    size: wp.array[int],
+    base: int,
+    carry: int,
     lanes: int,
     lane: int,
     warp: int,
     warps: int,
 ) -> int:
-    """The world's row order over its ``pairs`` body pairs (``order.pairs`` from ``first``), by its group's ``lanes``:
-    ``order.row_pairs[first + q]`` the index of the pair the order visits ``q``-th.
+    """Each of the world's body pairs ``lo`` to ``hi`` (``order.pairs`` from ``first``) its island and its rank there
+    among those pairs in frame order, by its group's ``lanes``; each island's count of them in ``size`` from ``base``
+    (zero before), the warps' turns carrying the pairs in islands in ``turns`` word ``carry``. Returns the pairs in
+    islands. Over all the world's pairs (with ``order.island_size``) it gives the world's row order
+    (:func:`_order_islands`): ``order.row_pairs[first + q]`` the index of the pair the order visits ``q``-th.
 
     An island is a component of the world's pairs joined by the trees they touch (:func:`.row_records.row_sides`, the
     sweeps' resources): the frame's pass joined each pair's trees (:mod:`~newton._src.core.union_find`), so each
@@ -668,43 +677,89 @@ def _island_ranks(
     does (a batch's loads before its turn; the islands' sizes, the pairs placed and the loose ones carried through the
     turns, ``turns``), every place the one warp's."""
     parent = order.island_parent
-    size = order.island_size
-    batches = (pairs + lanes - 1) // lanes
+    batches = (hi - lo + lanes - 1) // lanes
     # Each pair's island and its rank there in frame order; each island's size.
     grouped = int(0)
     for g in range(warp, batches, warps):
-        j = g * lanes + lane
+        j = lo + g * lanes + lane
         island = int(-2)
-        if j < pairs:
+        if j < hi:
             island = order.pair_sides[first + j][0]
             if island >= 0:
                 island = union_find.root_now(parent, island)
         peers = lane_match(island, RESERVE_LANES)
         if warps > 1 and g > 0:
             _turn_wait(_turn(warp, warps))
-            grouped = order.turns[world, 5]
+            grouped = order.turns[world, carry]
         held = int(0)
         if island >= 0:
-            held = size[island]
+            held = size[base + island]
         lane_sync(RESERVE_LANES)
         if island >= 0:
             order.pair_island[first + j] = island
             order.pair_rank[first + j] = held + lane_below(peers, RESERVE_LANES)
             if lane_last(peers, RESERVE_LANES) == lane:
-                size[island] = held + lane_count(peers, RESERVE_LANES)
+                size[base + island] = held + lane_count(peers, RESERVE_LANES)
         elif island == -1:
             order.pair_island[first + j] = -1
         grouped += lane_sum(wp.where(island >= 0, 1, 0), RESERVE_LANES)
         lane_sync(RESERVE_LANES)
         if warps > 1:
             if lane == 0:
-                order.turns[world, 5] = grouped
+                order.turns[world, carry] = grouped
             if g + 1 < batches:
                 _turn_pass(_turn(warp + 1, warps))
     if warps > 1:
         lane_sync(lanes * warps)
-        grouped = order.turns[world, 5]
+        if batches > 0:
+            grouped = order.turns[world, carry]
     return grouped
+
+
+@wp.func
+def _island_ranks_before(
+    order: RowOrder,
+    first: int,
+    lo: int,
+    hi: int,
+    rank: int,
+    spread: int,
+    threads: int,
+    lanes: int,
+    lane: int,
+    warp: int,
+):
+    """A block's share of the islands' pairs (pairs ``lo`` to ``hi``, which :func:`_island_ranks` ranked among the
+    share): each pair's rank among its island's pairs of the world, its rank in the share after its island's pairs of
+    the shares before it (``order.island_counts``, a row of trees a block of the ``spread``); an island's first pair
+    of the world its island's size, its pairs of every share."""
+    trees = order.island_size.shape[0]
+    for j in range(lo + warp * lanes + lane, hi, threads):
+        island = order.pair_island[first + j]
+        if island >= 0:
+            own = order.pair_rank[first + j]
+            before = int(0)
+            for r in range(rank):
+                before += order.island_counts[r * trees + island]
+            order.pair_rank[first + j] = before + own
+            if before + own == 0:
+                size = int(0)
+                for r in range(spread):
+                    size += order.island_counts[r * trees + island]
+                order.island_size[island] = size
+
+
+@wp.func
+def _island_counts_clear(
+    order: RowOrder, first: int, lo: int, hi: int, rank: int, threads: int, lanes: int, lane: int, warp: int
+):
+    """A block's row of ``order.island_counts`` back to zero at its share's islands (pairs ``lo`` to ``hi``), once every
+    block read it (:func:`_island_ranks_before`)."""
+    trees = order.island_size.shape[0]
+    for j in range(lo + warp * lanes + lane, hi, threads):
+        island = order.pair_island[first + j]
+        if island >= 0:
+            order.island_counts[rank * trees + island] = 0
 
 
 @wp.func
@@ -830,7 +885,7 @@ def _order_islands(
 ):
     """The world's row order over its ``pairs`` body pairs on one block or warp: its islands' ranks
     (:func:`_island_ranks`), then each pair's place (:func:`_island_places`)."""
-    grouped = _island_ranks(data, order, world, first, pairs, lanes, lane, warp, warps)
+    grouped = _island_ranks(data, order, world, first, 0, pairs, order.island_size, 0, 5, lanes, lane, warp, warps)
     _island_places(order, world, first, pairs, grouped, 0, pairs, 0, 0, 6, False, lanes, lane, warp, warps)
 
 
@@ -1761,12 +1816,10 @@ def reserve_world_rows_kernel(grouped: bool, warps: int = 1):
                     order.turns[world, 0], order.turns[world, 1], order.turns[world, 2], order.turns[world, 3]
                 )
                 pairs = order.turns[world, 4]
-            # The other blocks count in and wait for the world's rows (its first block's ordered passes); the first
-            # waits for their unions and their shares of the frame's order.
-            if rank > 0:
+            # The blocks meet once every block's unions and share of the frame's order are in.
+            if spread > 1:
                 _meet_arrive(order.turns, world, TURN_MEETS)
-            else:
-                _meet_wait(order.turns, world, TURN_MEETS, spread - 1)
+                _meet_wait(order.turns, world, TURN_MEETS, spread)
         else:
             _frame_turns(data, order, world, first, first, end, rows, pairs, 0, kept, lanes, lane, warp, warps)
             lane_sync(RESERVE_LANES)
@@ -1775,31 +1828,53 @@ def reserve_world_rows_kernel(grouped: bool, warps: int = 1):
                     order.turns[world, 0], order.turns[world, 1], order.turns[world, 2], order.turns[world, 3]
                 )
                 pairs = order.turns[world, 4]
-        # The row order (_order_islands) and each pair's rows before it (_rows_before). Over the world's group the
-        # first block ranks the islands' pairs (_island_ranks) and opens the rest: each block takes a share of the
-        # pairs' places (_island_places, after the shares' sums before it, _place_sums; the islands' pairs once every
-        # island's base is known, _island_rows), then a share of the pairs in the row order (after the sums before
-        # it, _pair_sums); every share's sums met by every block. On one block its turns.
+        # The row order (_order_islands) and each pair's rows before it (_rows_before). Over the world's group each
+        # block takes a share of the pairs: their ranks in their islands among the share's (_island_ranks, its counts
+        # its row of island_counts), then once every share's counts are in, their ranks among the world's
+        # (_island_ranks_before: after the shares before it); the pairs' places (_island_places, after the shares' sums
+        # before it, _place_sums; the islands' pairs once every island's base is known, _island_rows), then a share of
+        # the pairs in the row order (after the sums before it, _pair_sums); every share's sums met by every block. On
+        # one block its turns.
         if wp.static(warps > 1):
             if spread > 1:
-                if rank == 0 and kept == 0:
-                    _island_ranks(data, order, world, first, pairs, lanes, lane, warp, warps)
-                if rank == 0:
-                    _meet_arrive(order.turns, world, TURN_MEETS + 4)
-                else:
-                    _meet_wait(order.turns, world, TURN_MEETS + 4, 1)
                 share = (pairs + spread - 1) // spread
                 lo = wp.min(rank * share, pairs)
                 hi = wp.min(lo + share, pairs)
                 sums = TURN_CHUNKS + rank * CHUNK_WORDS
                 if kept == 0:
-                    islanded = order.turns[world, 5]
+                    trees = order.island_size.shape[0]
+                    ranked = _island_ranks(
+                        data,
+                        order,
+                        world,
+                        first,
+                        lo,
+                        hi,
+                        order.island_counts,
+                        rank * trees,
+                        sums + 5,
+                        lanes,
+                        lane,
+                        warp,
+                        warps,
+                    )
+                    if warp == 0 and lane == 0:
+                        order.turns[world, sums + 9] = ranked
+                    _meet_arrive(order.turns, world, TURN_MEETS + 4)
+                    _meet_wait(order.turns, world, TURN_MEETS + 4, spread)
+                    _island_ranks_before(order, first, lo, hi, rank, spread, threads, lanes, lane, warp)
+                    islanded = int(0)
+                    for r in range(lane, spread, lanes):
+                        islanded += order.turns[world, TURN_CHUNKS + r * CHUNK_WORDS + 9]
+                    islanded = lane_sum(islanded, RESERVE_LANES)
+                    lane_sync(threads)
                     if warp == 0 and lane < 2:
                         order.turns[world, sums + lane] = 0
                     lane_sync(threads)
                     _place_sums(order, world, first, lo, hi, sums, threads, lanes, lane, warp)
                     _meet_arrive(order.turns, world, TURN_MEETS + 5)
                     _meet_wait(order.turns, world, TURN_MEETS + 5, spread)
+                    _island_counts_clear(order, first, lo, hi, rank, threads, lanes, lane, warp)
                     placed = int(0)
                     loose = int(0)
                     for r in range(lane, rank, lanes):

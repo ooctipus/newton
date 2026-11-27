@@ -1588,6 +1588,7 @@ def allocate_contacts(operands, device) -> None:
     wp.launch(_own_roots, dim=trees, outputs=[order.island_parent], device=device)
     order.island_size = wp.zeros(trees, dtype=wp.int32, device=device)
     order.island_base = wp.zeros(trees, dtype=wp.vec2i, device=device)
+    order.island_counts = wp.zeros(0, dtype=wp.int32, device=device)
     order.frame_kept = wp.zeros(1, dtype=int, device=device)
     order.turns = wp.zeros((worlds, turn_words(1)), dtype=wp.int32, device=device)
     values["order"] = order

@@ -770,7 +770,10 @@ class Placement:
         # What a batch of a world's frame order leaves the next in its block of warps (row_slots._frame_turns), its
         # rows, its group's meets and its blocks' shares of the frame order (row_slots.turn_words).
         held = max(int(self.forest.world_count), 1)
-        self.reserve_turns = wp.zeros((held, turn_words(reserve_group(held, device))), dtype=wp.int32, device=device)
+        group = reserve_group(held, device)
+        self.reserve_turns = wp.zeros((held, turn_words(group)), dtype=wp.int32, device=device)
+        # Over a world's group of blocks, each block's counts of each island's pairs in its share (a row of the trees).
+        self.island_counts = wp.zeros(trees * group if group > 1 else 0, dtype=wp.int32, device=device)
         # No world's dense line by colors of groups until the sweep takes them (allocate_row_groups).
         self.row_groups = self._row_groups(np.full(0, -1, dtype=np.int32), 0, 0, 0.0)
         # Allocated once here: per-step allocation is forbidden under CUDA graph capture.
@@ -817,7 +820,7 @@ class Placement:
             "rows_before",
         ):
             setattr(order, name, getattr(self, f"contact_{name}"))
-        for name in ("island_parent", "island_size", "island_base"):
+        for name in ("island_parent", "island_size", "island_base", "island_counts"):
             setattr(order, name, getattr(self, name))
         order.turns = self.reserve_turns
         return order
