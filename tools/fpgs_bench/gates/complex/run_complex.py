@@ -413,8 +413,10 @@ def snapshot(scene, metric_worlds, sim_time, model_np, metrics, kernels, metric_
     ):
         if types is None or counts is None or len(types.shape) != 2:
             continue
-        t = types.numpy()[:metric_worlds]
-        c = counts.numpy()[:metric_worlds]
+        # Only the metric worlds' home lines cross to the host: the store's arena lines past them are reserved
+        # address space, mapped as the contact pool grows (most of it never is).
+        t = types[:metric_worlds].numpy()
+        c = counts[:metric_worlds].numpy()
         live = np.arange(t.shape[1])[None, :] < c[:, None]
         normal = int(np.count_nonzero(live & (t == kernels.ROW_CONTACT)))
         friction = int(np.count_nonzero(live & (t == kernels.ROW_FRICTION)))
