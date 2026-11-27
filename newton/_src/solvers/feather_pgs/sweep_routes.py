@@ -1793,14 +1793,22 @@ GROUP_BARRIER = """        {{
 """
 
 
-def run_words(max_constraints: int, max_world_dofs: int) -> int:
-    """Words of a world's line of :func:`dense_runs` (``dense_runs``): its runs' count, the build's scan (a warp's
-    count each, then the total), their first rows (and the end), each run's latest earlier runs on its sides, their
-    marks and their warps, and each side's latest run (by its first coordinate)."""
-    return 5 * int(max_constraints) + 35 + int(max_world_dofs)
+RUN_HEAD = 34
+"""Words of a world's head of :func:`dense_runs` (``dense_runs``) before its sides' latest runs: its runs' count and
+the build's scan (a warp's count each, then the total)."""
+
+RUN_WORDS = 5
+"""Words of a run's record in the row store (``dense_run_rows``, a row's slot a run): its first row, its latest
+earlier runs on its two sides, its mark and its warp."""
 
 
-def dense_runs(visit: str, capacity: int, pad: str, *, group: bool = False) -> tuple[str, str]:
+def run_head_words(max_world_dofs: int) -> int:
+    """Words of a world's head of :func:`dense_runs`: :data:`RUN_HEAD`, then each side's latest run (by its first
+    coordinate). The runs' records are the row store's (:data:`RUN_WORDS` a row), so the head holds no capacity's."""
+    return RUN_HEAD + int(max_world_dofs)
+
+
+def dense_runs(visit: str, pad: str, *, group: bool = False) -> tuple[str, str]:
     """A colored block's dense rows by their runs over the block's warps: the line's rows in order, a run the rows on
     the same sides one after another (a contact's rows, a tree's limits), each run once the latest earlier run on each
     of its sides ran. Rows on other sides share no coordinate, so every coordinate takes the same updates in the same
@@ -1818,11 +1826,11 @@ def dense_runs(visit: str, capacity: int, pad: str, *, group: bool = False) -> t
     alone = "rank == 0 && " if group else ""
     build = f"""    int* const run_line = dense_runs.data + (size_t)world * dense_runs.shape[1];
     int* const run_scan = run_line + 1;
-    int* const run_first = run_line + 34;
-    int* const run_prev = run_line + {capacity + 35};
-    int* const run_done = run_line + {3 * capacity + 35};
-    int* const run_warp = run_line + {4 * capacity + 35};
-    int* const run_last = run_line + {5 * capacity + 35};
+    int* const run_last = run_line + {RUN_HEAD};
+    // The runs' records, a row's slot a run of the world's line in the row store (its run of the arena where its rows
+    // pass its home line): the store maps the lines the rows take, not the capacity's.
+    int* const run_rec = dense_run_rows.data + (size_t)line * {line_size("dense_run_rows")};
+    const auto RUN = [&](const int run, const int word) -> int& {{ return run_rec[run * {RUN_WORDS} + word]; }};
     if ({alone}m_dense > 0) {{
         // The rows that open a run (their sides differ from the row's before), a chunk of rows a thread, then their
         // places by a block scan (each warp's count in the line's scan words).
@@ -1858,14 +1866,13 @@ def dense_runs(visit: str, capacity: int, pad: str, *, group: bool = False) -> t
             }}
             run_scan[32] = total;
             run_line[0] = total;
-            run_first[total] = m_dense;
         }}
         __syncthreads();
         int at = run_scan[warp] + scan - opens;
         before = lo > 0 && lo < hi ? SIDES(lo - 1) : make_int2(-2, -2);
         for (int row = lo; row < hi; ++row) {{
             const int2 here = SIDES(row);
-            if (here.x != before.x || here.y != before.y) run_first[at++] = row;
+            if (here.x != before.x || here.y != before.y) RUN(at++, 0) = row;
             before = here;
         }}
         const int runs = run_scan[32];
@@ -1873,19 +1880,19 @@ def dense_runs(visit: str, capacity: int, pad: str, *, group: bool = False) -> t
         // No run yet on any of their sides, none marked; each run's warp: its first side's, by a hash of the side's
         // first coordinate, so a tree's runs follow one another on one warp.
         for (int k = tid; k < runs; k += (int)blockDim.x) {{
-            const int2 two = SIDES(run_first[k]);
+            const int2 two = SIDES(RUN(k, 0));
             if (two.x >= 0) run_last[two.x] = -1;
             if (two.y >= 0) run_last[two.y] = -1;
-            run_done[k] = 0;
+            RUN(k, 3) = 0;
             const unsigned side = (unsigned)(two.x >= 0 ? two.x : max(two.y, 0));
-            run_warp[k] = (int)(((unsigned long long)(side * 0x9E3779B1u) * (unsigned)(blockDim.x >> 5)) >> 32);
+            RUN(k, 4) = (int)(((unsigned long long)(side * 0x9E3779B1u) * (unsigned)(blockDim.x >> 5)) >> 32);
         }}
         __syncthreads();
         // Each run's latest earlier run on each side, the runs in order 32 at a time.
         if (warp == 0) {{
             for (int base = 0; base < runs; base += 32) {{
                 const int k = base + lane;
-                const int2 two = k < runs ? SIDES(run_first[k]) : make_int2(-1, -1);
+                const int2 two = k < runs ? SIDES(RUN(k, 0)) : make_int2(-1, -1);
                 int prev_a = -1, prev_b = -1;
                 bool last_a = two.x >= 0, last_b = two.y >= 0;
                 for (int j = 0; j < 32; ++j) {{
@@ -1903,8 +1910,8 @@ def dense_runs(visit: str, capacity: int, pad: str, *, group: bool = False) -> t
                 if (k < runs) {{
                     if (two.x >= 0 && prev_a < 0) prev_a = run_last[two.x];
                     if (two.y >= 0 && prev_b < 0) prev_b = run_last[two.y];
-                    run_prev[2 * k] = prev_a;
-                    run_prev[2 * k + 1] = prev_b;
+                    RUN(k, 1) = prev_a;
+                    RUN(k, 2) = prev_b;
                 }}
                 __syncwarp();
                 if (last_a) run_last[two.x] = k;
@@ -1920,17 +1927,16 @@ def dense_runs(visit: str, capacity: int, pad: str, *, group: bool = False) -> t
 {pad}    const int run_stamp = {ITERATION} + 1;
 {pad}    for (int base = 0; base < runs; base += 32) {{
 {pad}    // This warp's runs among the next 32, in order.
-{pad}    unsigned mine = __ballot_sync(0xffffffffu, base + lane < runs && run_warp[base + lane] == warp);
+{pad}    unsigned mine = __ballot_sync(0xffffffffu, base + lane < runs && RUN(base + lane, 4) == warp);
 {pad}    while (mine) {{
 {pad}        const int run = base + __ffs(mine) - 1;
 {pad}        mine &= mine - 1;
-{pad}        const int run_begin = run_first[run], run_end = run_first[run + 1];
+{pad}        const int run_begin = RUN(run, 0), run_end = run + 1 < runs ? RUN(run + 1, 0) : m_dense;
 {pad}        // Its first lane waits for the latest earlier run on each of its sides, this sweep's.
 {pad}        if (lane == 0) {{
-{pad}            const int prev_a = run_prev[2 * run], prev_b = run_prev[2 * run + 1];
-{pad}            volatile const int* const done = run_done;
-{pad}            if (prev_a >= 0) while (done[prev_a] < run_stamp) {{ }}
-{pad}            if (prev_b >= 0) while (done[prev_b] < run_stamp) {{ }}
+{pad}            const int prev_a = RUN(run, 1), prev_b = RUN(run, 2);
+{pad}            if (prev_a >= 0) while (*reinterpret_cast<volatile const int*>(&RUN(prev_a, 3)) < run_stamp) {{ }}
+{pad}            if (prev_b >= 0) while (*reinterpret_cast<volatile const int*>(&RUN(prev_b, 3)) < run_stamp) {{ }}
 {pad}            __threadfence_block();
 {pad}        }}
 {pad}        __syncwarp();
@@ -1938,7 +1944,7 @@ def dense_runs(visit: str, capacity: int, pad: str, *, group: bool = False) -> t
 {pad}        __syncwarp();
 {pad}        if (lane == 0) {{
 {pad}            __threadfence_block();
-{pad}            reinterpret_cast<volatile int*>(run_done)[run] = run_stamp;
+{pad}            *reinterpret_cast<volatile int*>(&RUN(run, 3)) = run_stamp;
 {pad}        }}
 {pad}    }}
 {pad}    }}
@@ -2487,7 +2493,7 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
             end="run_end",
             pad=" " * 16,
         )
-        runs_build, dense_sweep = dense_runs(run_visit, M_D, "        ", group=sweep.world_blocks)
+        runs_build, dense_sweep = dense_runs(run_visit, "        ", group=sweep.world_blocks)
         dense_sweep += "\n        __syncthreads();"
     elif grouped:
         dense_sweep = dense_phase
@@ -2932,8 +2938,15 @@ class GeneralSweep(SweepConfig):
                 if self.colored and not self.regions and self.world_blocks
                 else ()
             ),
-            # A colored block's dense rows' runs, a line a world (dense_runs).
-            *((RowArgument("dense_runs", wp.array2d[int], after="omega"),) if self.colored else ()),
+            # A colored block's dense rows' runs: a head a world and the runs' records in the row store (dense_runs).
+            *(
+                (
+                    RowArgument("dense_runs", wp.array2d[int], after="omega"),
+                    RowArgument("dense_run_rows", wp.array3d[int], after="omega"),
+                )
+                if self.colored
+                else ()
+            ),
             # Where the world's velocity change lives in global memory, its line a world (RowPlaces.velocity).
             *(
                 (RowArgument("sweep_velocity", wp.array2d[float], after="omega"),)

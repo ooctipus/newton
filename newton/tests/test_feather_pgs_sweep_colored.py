@@ -561,12 +561,13 @@ class TestColoredSweep(unittest.TestCase):
         for side_a, side_b in placement.row_sides.numpy()[line, :rows]:
             a, b = (int(first[side_a]) if side_a >= 0 else -1), (int(first[side_b]) if side_b >= 0 else -1)
             keys.append((a, -1 if b == a else b))
-        capacity = solver.sweep.colored_sweep.max_constraints
-        words = solver.sweep.dense_runs.numpy()[0]
-        runs = int(words[0])
-        starts = words[34 : runs + 35]
-        prev = words[capacity + 35 : capacity + 35 + 2 * runs].reshape(-1, 2)
-        warps = words[4 * capacity + 35 : 4 * capacity + 35 + runs]
+        runs = int(solver.sweep.dense_runs.numpy()[0, 0])
+        # The runs' records, a row's slot a run of the world's line in the row store: first row, latest earlier runs
+        # on the two sides, mark, warp.
+        records = solver.sweep.dense_run_rows.numpy()[line, :runs]
+        starts = np.append(records[:, 0], rows)
+        prev = records[:, 1:3]
+        warps = records[:, 4]
         expected = [0] + [i for i in range(1, rows) if keys[i] != keys[i - 1]] + [rows]
         np.testing.assert_array_equal(starts, expected)
         latest = {}

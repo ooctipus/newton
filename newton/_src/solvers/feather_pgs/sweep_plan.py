@@ -422,8 +422,9 @@ class Sweep:
         self.grouped_blocks = 1
         self.tree_runs = None
         self.wide_jobs = None
-        # A colored block's dense rows' runs, a line a world (sweep_routes.dense_runs).
-        self.dense_runs = None
+        # A colored block's dense rows' runs: a head a world, and the runs' records in the row store
+        # (sweep_routes.dense_runs).
+        self.dense_runs = self.dense_run_rows = None
         self.claims_beside = None
         # The one writer's EMIT sink (walk_rows.RowSeeds): none until a tier walks its rows.
         self.placement.row_seeds = walk_rows.row_seeds(self.placement, 0, 0, sweep_routes_tiers.TIER_ROWS)
@@ -575,14 +576,7 @@ class Sweep:
                 if reach and self.sweep_velocity.size < self.forest.world_count * self.forest.max_world_dofs:
                     self.sweep_velocity = self._velocity_lines(colored_declared)
                 colored_sweep = self._staged(colored_declared, capable.size)
-                self.dense_runs = wp.zeros(
-                    (
-                        self.forest.world_count,
-                        sweep_routes.run_words(colored_sweep.max_constraints, colored_sweep.max_world_dofs),
-                    ),
-                    dtype=int,
-                    device=model.device,
-                )
+                self.dense_runs, self.dense_run_rows = self._dense_runs(colored_sweep)
             # A world of many trees on the dense line: its contact rows by colors of groups (row_slots.RowGroups), a
             # block a world, a color's groups a warp each, for the worlds whose trees can meet the colored mapping's
             # rule (a color holds a group of the busiest tree: at least groups / trees share one), each taking it at
@@ -972,6 +966,7 @@ class Sweep:
             "sweep_velocity": self.sweep_velocity,
             "wide_jobs": self.wide_jobs,
             "dense_runs": self.dense_runs,
+            "dense_run_rows": self.dense_run_rows,
             "iterations": self.options.pgs_iterations,
             "omega": self.options.pgs_omega,
             "friction_metric": placement.friction_metric,
@@ -1029,6 +1024,25 @@ class Sweep:
                 (self.forest.world_count, max(self.forest.max_world_dofs, 1)), dtype=int, device=self.model.device
             )
         return self.tree_runs
+
+    def _dense_runs(self, colored: SweepConfig) -> tuple[wp.array, wp.array]:
+        """A colored block's dense rows' runs (:func:`.sweep_routes.dense_runs`): each world's head (its runs' count,
+        the build's scan and its sides' latest runs, :func:`.sweep_routes.run_head_words`), and the runs' records, a
+        row's slot a run, laid out by line as the row store's fields are (its lines at the store's line length, the
+        arena's mapped as the store grows): a world's runs are at most its live dense rows, so a capacity past them
+        holds addresses, not memory."""
+        placement = self.placement
+        head = wp.zeros(
+            (self.forest.world_count, sweep_routes.run_head_words(colored.max_world_dofs)),
+            dtype=int,
+            device=self.model.device,
+        )
+        strides = placement.arrays.line_strides
+        if "row" in strides:
+            strides["run"] = strides["row"]
+        field = Field("dense_run_rows", wp.int32, ("line", "run", "word"))
+        sizes = {"line": placement.lines, "run": placement.dense_max_constraints, "word": sweep_routes.RUN_WORDS}
+        return head, placement.arrays.array(field, sizes)
 
     def _block_records(self, form: str, config: SweepConfig, worlds: int, model) -> SweepConfig:
         """A block form's sweep (``form``: the colored units' or a grouped world's, over ``worlds`` worlds) with its friction
