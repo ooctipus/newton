@@ -1732,7 +1732,7 @@ def test_bound_graph_follows_growth_without_recapture(test, device):
             overflowed.append(frame)
         counts.append(int(contacts.rigid_contact_count.numpy()[0]))
         with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
+            warnings.simplefilter("ignore", newton.NewtonWarning)
             if pipeline.service_capacity():
                 asked += 1
                 if reallocates:
@@ -1808,7 +1808,7 @@ def test_sorted_matched_graph_follows_growth(test, device):
             match = contacts.rigid_contact_match_index.numpy()[:count]
             np.testing.assert_array_equal(match, np.arange(count), "each contact matches itself a replay before")
         with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
+            warnings.simplefilter("ignore", newton.NewtonWarning)
             if pipeline.service_capacity():
                 recaptures += 1
                 graph = capture()

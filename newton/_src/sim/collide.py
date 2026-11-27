@@ -2858,7 +2858,7 @@ class CollisionPipeline:
         self._environment_record = record_newton_environment()
         retired_warning = retired_notice(self._environment_record)
         if retired_warning is not None:
-            warnings.warn(retired_warning, UserWarning, stacklevel=2)
+            warnings.warn(retired_warning, NewtonWarning, stacklevel=2)
         pair_shape_prep = os.environ.get("NEWTON_NARROW_PHASE_PAIR_SHAPE_PREP", "0")
         if pair_shape_prep not in ("0", "1"):
             raise ValueError("NEWTON_NARROW_PHASE_PAIR_SHAPE_PREP must be 0 or 1")

@@ -26,6 +26,7 @@ import warp as wp
 from ...core import execution
 from ...core.contact_pool import FORECAST_QUEUE, capturing
 from ...core.types import override
+from ...exceptions import NewtonWarning
 from ...sim import Contacts, Control, Model, ModelBuilder, ModelFlags, State, StateFlags
 from ..semi_implicit.kernels_contact import (
     eval_particle_body_contact_forces,
@@ -683,7 +684,7 @@ class SolverFeatherPGS(SolverBase):
                 f"{asked[0]} dense and {asked[1]} free-body rows a world against {placement.dense_max_constraints} and "
                 f"{placement.mf_max_constraints}); the capacities grow to {options.dense_max_constraints} dense and "
                 f"{options.mf_max_constraints} free-body contact rows a world from the next step",
-                RuntimeWarning,
+                NewtonWarning,
                 stacklevel=3,
             )
         # The replays in flight read the old plan: it is planned anew once they finish. Retired, the old placement no

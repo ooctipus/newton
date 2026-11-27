@@ -54,6 +54,7 @@ from ...core.contact_pool import (
 )
 from ...core.execution import Work, shape
 from ...core.ordered_reserve import OrderedTiles, ordered_scan, ordered_tile
+from ...exceptions import NewtonWarning
 from ...geometry.flags import ShapeFlags
 from .contact_input import ContactFrame, ContactInput, contact_frame
 from .device_preludes import (
@@ -2663,7 +2664,7 @@ class Regions:
             warnings.warn(
                 f"The blocks' arena ({self.arena.rows} words) was short of {short - self._short_seen} listing(s), up to "
                 f"{demand} words: their last worlds formed no block; it grows for the next",
-                RuntimeWarning,
+                NewtonWarning,
                 stacklevel=2,
             )
             self._short_seen = short

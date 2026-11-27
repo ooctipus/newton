@@ -137,6 +137,7 @@ from typing import Any
 
 import warp as wp
 
+from ..exceptions import NewtonWarning
 from .live_sort import publish_sort_extent
 
 logger = logging.getLogger(__name__)
@@ -1637,7 +1638,7 @@ class ContactPool:
                     if self.fixed
                     else "the buffers grow for the next replay."
                 ),
-                RuntimeWarning,
+                NewtonWarning,
                 stacklevel=3,
             )
             self._drops_seen = drops.passes

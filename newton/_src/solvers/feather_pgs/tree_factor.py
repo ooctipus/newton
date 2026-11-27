@@ -29,6 +29,7 @@ import warp as wp
 
 from ...core import execution, memory
 from ...core.host_unique import row_ids
+from ...exceptions import NewtonWarning
 from ...sim import BodyFlags, JointType, ModelBuilder, ModelFlags
 from ...sim.articulation import eval_articulation_ik
 from . import field_group, host_index, walk_rows
@@ -464,6 +465,7 @@ class TreeFactor:
                         f"SolverFeatherPGS: passive joint springs on {int(bad.sum())} DOF(s) of "
                         "unsupported joint types (only REVOLUTE/PRISMATIC/D6 are supported); "
                         "those springs are ignored.",
+                        NewtonWarning,
                         stacklevel=3,
                     )
                     k_np = k_np.copy()

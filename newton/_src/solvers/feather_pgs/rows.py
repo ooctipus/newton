@@ -30,6 +30,7 @@ import warp as wp
 
 from ...core import memory
 from ...core.execution import Shape, Work, launch, shape
+from ...exceptions import NewtonWarning
 from ...geometry.flags import ShapeFlags
 from ...sim import Contacts, Model, State
 from ...sim.enums import JointType
@@ -446,16 +447,20 @@ class RowLaws:
                 warnings.warn(
                     f"SolverFeatherPGS: {what} spans articulations ({int(a0[k])} vs {int(a1[k])}); "
                     "cross-articulation mimic is unsupported and the constraint is ignored.",
+                    NewtonWarning,
                     stacklevel=2,
                 )
             elif not mimics.supported[k]:
                 warnings.warn(
                     f"SolverFeatherPGS: {what} references a non-1-DoF "
                     "joint (only REVOLUTE/PRISMATIC are supported); the constraint is ignored.",
+                    NewtonWarning,
                     stacklevel=2,
                 )
             else:
-                warnings.warn(f"SolverFeatherPGS: {what} couples a DOF to itself; ignored.", stacklevel=2)
+                warnings.warn(
+                    f"SolverFeatherPGS: {what} couples a DOF to itself; ignored.", NewtonWarning, stacklevel=2
+                )
 
         valid_indices = np.flatnonzero(valid).astype(np.int32, copy=False)
         art_start, order = host_index.group_by(art[valid_indices], model.articulation_count)
