@@ -1053,10 +1053,10 @@ class Sweep:
         capacity (D1: a capacity costs only memory).
 
         A head's launch is the capacity's but for its dense operands (:meth:`dense_head`): their length, and the dense
-        impulses at the place the head's own stage gives them, so a capacity whose stage declines them (in place) costs
-        the worlds a head holds nothing; every other operand at the capacity's place (the metadata's form decides how a
-        row is read: streamed records carry the idle keys the live order passes rows by) and the capacity's launch
-        bound (its register line, :attr:`.sweep_routes.GeneralSweep.line_stage`), so the same arithmetic. The heads
+        impulses and metadata at the places the head's own stage gives them, so a capacity whose stage declines them
+        (impulses in place, records streamed) costs the worlds a head holds nothing; every other operand at the
+        capacity's place and the capacity's launch bound (its register line,
+        :attr:`.sweep_routes.GeneralSweep.line_stage`), so the same arithmetic. The heads
         climb from one line of rows: each is the longest of whole lines whose stage holds the dense impulses, keeps
         the static stage (:data:`.memory.STATIC_SHARED_BYTES`, so the L1 stays) and its resident blocks, the first
         one line's, each later half the one's before it, so a world runs at no less than half the resident blocks its
@@ -1118,8 +1118,9 @@ class Sweep:
     def dense_head(self, full: SweepConfig, items: int, rows: int, floor: int = 0) -> SweepConfig:
         """The launch of ``full`` (a sweep at the capacity, its stage given) whose stage holds ``rows`` dense rows (0:
         the capacity's) for the worlds whose live dense rows pass ``floor`` (:meth:`_dense_heads`): the same
-        arithmetic on a shorter stage, the dense impulses where the head's own stage over ``items`` places them beside
-        the capacity's other operands, within the device's budget (:meth:`.sweep_routes.GeneralSweep.head_stage`)."""
+        arithmetic on a shorter stage, the dense impulses and metadata where the head's own stage over ``items`` places
+        them beside the capacity's other operands, within the device's budget
+        (:meth:`.sweep_routes.GeneralSweep.head_stage`)."""
         head = full.with_head(rows, floor)
         work = self._launch_work(head, items, head.head_stage())
         return head.head_placed(shape(work, device(self.model.device)).staging)

@@ -523,12 +523,15 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
                 solver.check_constraint_capacity()
 
 
-def _sprawl_run(device, capacity: int, heads=None, steps: int = 30, in_place: bool = False):
+def _sprawl_run(
+    device, capacity: int, heads=None, steps: int = 30, in_place: bool = False, streamed: bool = False
+):
     """Step two worlds of the sprawled tree (scenes.sprawl: a free torso and its limbs resting on the ground, one contact
     a link: dense contact rows) at ``capacity`` dense rows; with ``heads`` (first, second), the general sweep's launches
     are dense heads at those rows and the capacity's (:meth:`.sweep_plan.Sweep.dense_head`, forced on any device); with
-    ``in_place``, the capacity's dense impulses in place, as where its stage declines them (each head places its own).
-    Returns the poses and velocities, the most live dense rows a world held and the solver."""
+    ``in_place``, the capacity's dense impulses in place, as where its stage declines them, and with ``streamed`` its
+    dense metadata streamed from the rows' records too (each head places its own). Returns the poses and velocities,
+    the most live dense rows a world held and the solver."""
     from newton._src.solvers.feather_pgs import sweep_plan  # noqa: PLC0415
     from newton._src.solvers.feather_pgs.sweep_routes import Place  # noqa: PLC0415
     from newton.tests import feather_pgs_scenes as scenes  # noqa: PLC0415
@@ -537,6 +540,8 @@ def _sprawl_run(device, capacity: int, heads=None, steps: int = 30, in_place: bo
         full = plan._staged(config, items)
         if in_place:
             full = dataclasses.replace(full, places=dataclasses.replace(full.places, dense_impulses=Place.GLOBAL))
+        if streamed:
+            full = dataclasses.replace(full, places=dataclasses.replace(full.places, metadata=Place.STREAMED))
         if heads is None:
             return (full,)
         first, wide = heads
@@ -550,7 +555,7 @@ def _sprawl_run(device, capacity: int, heads=None, steps: int = 30, in_place: bo
     model = scene.build(device)
     pipeline = newton.CollisionPipeline(model, rigid_contact_max=scene.rigid_contact_max)
     contacts = pipeline.contacts()
-    forcing = heads or in_place
+    forcing = heads or in_place or streamed
     patch = mock.patch.object(sweep_plan.Sweep, "_dense_heads", forced) if forcing else contextlib.nullcontext()
     with patch:
         # The dense storage's route: the matrix-free sweep over the world's dense line.
@@ -605,6 +610,32 @@ class TestDenseHeads(unittest.TestCase):
                 for head in heads:
                     self.assertNotIn("_gline", keys[head], keys)
                 self.assertIn("_gline", keys[0], keys)
+                np.testing.assert_array_equal(q, q_h)
+                np.testing.assert_array_equal(qd, qd_h)
+
+    def test_heads_stage_the_dense_metadata_a_capacity_streams(self):
+        """A capacity whose stage streams the dense rows' records and keeps their impulses in place (a capacity far past
+        the live rows) costs the worlds a head holds nothing: each head's launch stages their metadata, read from the
+        rows as a staged capacity's is, and their impulses, and a world steps bit for bit as at the capacity alone."""
+        devices = ["cpu"] + (["cuda:0"] if wp.is_cuda_available() else [])
+        for device in devices:
+            q, qd, rows, _solver = _sprawl_run(device, 256, heads=None)
+            q_s, qd_s, _rows, solver = _sprawl_run(device, 256, heads=None, in_place=True, streamed=True)
+            self.assertTrue(any("_gmeta" in launch.kernel.key for launch in solver.sweep.launches))
+            np.testing.assert_array_equal(q, q_s)
+            np.testing.assert_array_equal(qd, qd_s)
+            heads = (32, rows + 32)
+            with self.subTest(device=device, heads=heads):
+                q_h, qd_h, _rows, solver = _sprawl_run(device, 256, heads=heads, in_place=True, streamed=True)
+                keys = {
+                    launch.config.places.dense_rows: launch.kernel.key
+                    for launch in solver.sweep.launches
+                    if launch.kernel.key.startswith("sweep_mf_gs") and "_records" not in launch.kernel.key
+                }
+                for head in heads:
+                    self.assertNotIn("_gmeta", keys[head], keys)
+                    self.assertNotIn("_gline", keys[head], keys)
+                self.assertIn("_gmeta", keys[0], keys)
                 np.testing.assert_array_equal(q, q_h)
                 np.testing.assert_array_equal(qd, qd_h)
 

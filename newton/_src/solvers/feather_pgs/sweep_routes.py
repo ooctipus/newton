@@ -2823,33 +2823,38 @@ class GeneralSweep(SweepConfig):
     def with_head(self, rows: int, floor: int = 0) -> GeneralSweep:
         """This mapping at the capacity, its stage given, with a stage of ``rows`` dense rows (``0``: the capacity's)
         for the worlds whose live dense rows pass ``floor`` (:meth:`.sweep_plan.Sweep.dense_head`), at the capacity's
-        launch bound: every operand at the capacity's place but a head's dense impulses, which it offers its own stage
-        (:meth:`head_placed`)."""
+        launch bound: every operand at the capacity's place but a head's dense operands, its impulses and metadata,
+        which it offers its own stage (:meth:`head_placed`)."""
         places = dataclasses.replace(self.places, dense_rows=int(rows), dense_floor=int(floor))
         if rows:
-            places = dataclasses.replace(places, dense_impulses=Place.SHARED)
+            places = dataclasses.replace(places, dense_impulses=Place.SHARED, metadata=Place.SHARED)
         return dataclasses.replace(self, places=places, line_stage=self.staging().bytes if rows else 0)
 
     def head_stage(self) -> Staging:
-        """The working set a dense head (:meth:`with_head`) offers its stage: its dense impulses with their alternative,
-        every other operand held at the capacity's place (staged, or not in the stage), so the stage gives the impulses
-        only what the capacity's operands leave within the device's budget (:func:`.memory.stage`)."""
-        offered = _ROW_BUFFERS["dense_impulses"]
+        """The working set a dense head (:meth:`with_head`) offers its stage: its dense impulses and metadata with their
+        alternatives, every other operand held at the capacity's place (staged, or not in the stage), so the stage
+        gives the head's dense operands only what the capacity's operands leave within the device's budget
+        (:func:`.memory.stage`)."""
+        offered = (_ROW_BUFFERS["dense_impulses"], _ROW_BUFFERS["metadata"])
         staging = self.staging()
         held = tuple(
-            buffer if buffer.name == offered else dataclasses.replace(buffer, alternative=None, spill=False)
+            buffer if buffer.name in offered else dataclasses.replace(buffer, alternative=None, spill=False)
             for buffer in staging.buffers
         )
         return dataclasses.replace(staging, buffers=held)
 
     def head_placed(self, staging: Staging) -> GeneralSweep:
-        """A dense head (:meth:`with_head`) with its dense impulses at the place its own stage ``staging`` gives them
-        (:meth:`head_stage`, :func:`.memory.stage`): staged where the head holds what the capacity's stage declines,
-        the same values at either place. The metadata keeps the capacity's form, the records' layout every sweep
-        reads."""
+        """A dense head (:meth:`with_head`) with its dense impulses and metadata at the places its own stage
+        ``staging`` gives them (:meth:`head_stage`, :func:`.memory.stage`): staged where the head holds what the
+        capacity's stage declines, the same values at either place. The metadata a head stages is read from the rows
+        themselves, as a staged capacity's is; the line's records keep the layout every sweep reads."""
         if not self.places.dense_rows:
             return self
-        places = dataclasses.replace(self.places, dense_impulses=staging.place(_ROW_BUFFERS["dense_impulses"]))
+        places = dataclasses.replace(
+            self.places,
+            dense_impulses=staging.place(_ROW_BUFFERS["dense_impulses"]),
+            metadata=staging.place(_ROW_BUFFERS["metadata"]),
+        )
         return dataclasses.replace(self, places=places)
 
     def staging(self) -> Staging:
