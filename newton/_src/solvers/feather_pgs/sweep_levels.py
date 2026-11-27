@@ -49,6 +49,7 @@ def level_pass(
     after: bool = False,
     ahead: tuple[str, str] = ("", ""),
     turns: str = "",
+    counted: str = "",
 ) -> str:
     """Return CUDA source that levels a world's ``units`` units in row order (Cartier-Foata), by one warp, a batch of
     32 at a time.
@@ -66,7 +67,8 @@ def level_pass(
     a unit that takes no level), its resources ``node_a`` and ``node_b``: compact ids into the warp's ``node_level``
     (-1, or any other value no level overwrites), or -1 for none. ``counts`` formats an index into the units of each
     level so far: zero at the start for levels ``[0, units]``, and the batch's counts added; with none the pass levels
-    alone (no ``rank``). ``store`` keeps a valid unit's ``level`` and ``rank``; with ``after`` it may also read
+    alone (no ``rank``), and with ``counted`` (a native condition, the same on every thread) only where it holds (else
+    ``rank`` is 0). ``store`` keeps a valid unit's ``level`` and ``rank``; with ``after`` it may also read
     ``after_a`` and ``after_b``, the levels its resources held before it (its latest earlier unit's on each, -1 for
     none or no resource). The fragment runs on every lane of
     the warp, uses the lane group, ``lane`` and the names ``resources`` and ``store`` read, and declares ``levels``, the
@@ -167,7 +169,21 @@ def level_pass(
             const int held_b = res_b >= 0 ? {load("node_level[res_b]")} : -1;
 """
     # The batch's counts of each level and each unit's rank among its level's units in row order, where counted.
-    if counts is not None:
+    if counts is not None and counted:
+        ranked = f"""            int earlier = 0, below = 0;
+            unsigned same = 0u;
+            if ({counted}) {{
+                same = {same};
+                below = {below};
+                earlier = valid ? {load(count_at)} : 0;
+            }}
+            SYNC();
+            if (({counted}) && valid && below == 0) {put(count_at, f"earlier + {count}")};{release}
+            if (valid) {{
+                const int rank = earlier + below;
+                {store}
+            }}"""
+    elif counts is not None:
         ranked = f"""            const unsigned same = {same};
             const int below = {below};
             const int earlier = valid ? {load(count_at)} : 0;

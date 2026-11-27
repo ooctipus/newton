@@ -734,45 +734,54 @@ SHARED_DECLARATIONS
     // The islands' first places in root order (the islands' order); the largest island's units.
     const int largest = GROUP_SCAN(sizes, NODES);
     const auto ISLAND_UNITS = [&](const int n) -> int { return (n + 1 < NODES ? sizes[n + 1] : units) - sizes[n]; };
-    // Each island's units in row order (``unit_order``): each block ranks its run's units in their islands (its counts
-    // its row of ``shares``); a unit's place is its island's first, then its island's units in the runs before, then
-    // its rank. Each block levels the islands whose first places fall in its share of the places (whole islands,
-    // balanced by units): the first and the end of its places (``meets``, the least first place at or past it).
-    if (tid == 0) meets[4 + rank] = units;
-    const int unit_lo = (int)((long long)rank * units / passes), unit_hi = (int)((long long)(rank + 1) * units / passes);
-    RUN_RANKS(unit_lo, unit_hi, [&](const int unit) { return unit_block.data[off_mf + unit]; }, shares + rank * NODES,
-              unit_rank.data + off_mf);
-    GROUP_MEET();
-    for (int n = first; n < NODES; n += stride) {
-        if (ISLAND_UNITS(n) == 0) continue;
-        int before = 0;
-        for (int r = 0; r < passes; ++r) {
-            const int count = shares[r * NODES + n];
-            shares[r * NODES + n] = before;
-            before += count;
-        }
-        if (passes > 1) atomicMin(&meets[4 + (int)((long long)sizes[n] * passes / units)], sizes[n]);
-    }
-    GROUP_MEET();
-    for (int unit = unit_lo + tid; unit < unit_hi; unit += THREADS) {
-        const int root = unit_block.data[off_mf + unit];
-        unit_order.data[off_mf + sizes[root] + shares[rank * NODES + root] + unit_rank.data[off_mf + unit]] = unit;
-    }
+    // Where one block takes the passes (``row_order``) it levels every unit in row order, counting each color's units
+    // and ranking each unit among them as it goes (the islands share no body: any order of whole islands gives the same
+    // levels). Over more blocks each island's units in row order (``unit_order``): each block ranks its run's units in
+    // their islands (its counts its row of ``shares``); a unit's place is its island's first, then its island's units
+    // in the runs before, then its rank. Each block levels the islands whose first places fall in its share of the
+    // places (whole islands, balanced by units): the first and the end of its places (``meets``, the least first place
+    // at or past it).
+    const bool row_order = passes == 1;
     int span_lo = 0, span_hi = units;
-    if (passes > 1) {
-        int from = units, to = units;
-        for (int r = lane; r < passes; r += 32) {
-            const int at = reinterpret_cast<volatile int*>(meets)[4 + r];
-            if (r >= rank) from = min(from, at);
-            if (r > rank) to = min(to, at);
+    if (row_order) {
+        for (int c = tid; c <= units; c += THREADS) color_offset.data[off_color + c] = 0;
+        __syncthreads();
+    } else {
+        if (tid == 0) meets[4 + rank] = units;
+        const int unit_lo = (int)((long long)rank * units / passes), unit_hi = (int)((long long)(rank + 1) * units / passes);
+        RUN_RANKS(unit_lo, unit_hi, [&](const int unit) { return unit_block.data[off_mf + unit]; }, shares + rank * NODES,
+                  unit_rank.data + off_mf);
+        GROUP_MEET();
+        for (int n = first; n < NODES; n += stride) {
+            if (ISLAND_UNITS(n) == 0) continue;
+            int before = 0;
+            for (int r = 0; r < passes; ++r) {
+                const int count = shares[r * NODES + n];
+                shares[r * NODES + n] = before;
+                before += count;
+            }
+            if (passes > 1) atomicMin(&meets[4 + (int)((long long)sizes[n] * passes / units)], sizes[n]);
         }
-        span_lo = __reduce_min_sync(0xffffffffu, from);
-        span_hi = __reduce_min_sync(0xffffffffu, to);
+        GROUP_MEET();
+        for (int unit = unit_lo + tid; unit < unit_hi; unit += THREADS) {
+            const int root = unit_block.data[off_mf + unit];
+            unit_order.data[off_mf + sizes[root] + shares[rank * NODES + root] + unit_rank.data[off_mf + unit]] = unit;
+        }
+        {
+            int from = units, to = units;
+            for (int r = lane; r < passes; r += 32) {
+                const int at = reinterpret_cast<volatile int*>(meets)[4 + r];
+                if (r >= rank) from = min(from, at);
+                if (r > rank) to = min(to, at);
+            }
+            span_lo = __reduce_min_sync(0xffffffffu, from);
+            span_hi = __reduce_min_sync(0xffffffffu, to);
+        }
+        GROUP_MEET();
+        for (int n = first; n < NODES; n += stride)
+            if (ISLAND_UNITS(n) != 0)
+                for (int r = 0; r < passes; ++r) shares[r * NODES + n] = 0;
     }
-    GROUP_MEET();
-    for (int n = first; n < NODES; n += stride)
-        if (ISLAND_UNITS(n) != 0)
-            for (int r = 0; r < passes; ++r) shares[r * NODES + n] = 0;
     // Levels by islands (the level pass on the block's places, its warps in turn): a unit's color is one past the
     // latest color of its bodies, so units on a body keep their row order; islands share no body, so each island's
     // levels are the world's.
@@ -790,9 +799,10 @@ LEVEL_PASS
         colors = __reduce_max_sync(0xffffffffu, most);
     }
     if (rank == 0 && tid == 0) color_count.data[world] = colors;
-    // Each unit's rank among its color's units in row order, as the islands' (``keys_at``, a row of the colors a run,
-    // as many runs as the world's units hold rows of its colors); then the colors' first places.
-    const int runs = min(passes, units / max(colors, 1));
+    // Over more blocks, each unit's rank among its color's units in row order, as the islands' (``keys_at``, a row of
+    // the colors a run, as many runs as the world's units hold rows of its colors); then the colors' first places.
+    const int runs = row_order ? 0 : min(passes, units / max(colors, 1));
+    if (!row_order) {
     for (int k = first; k < runs * colors; k += stride) keys_at[k] = 0;
     for (int c = first; c <= colors; c += stride) color_offset.data[off_color + c] = 0;
     GROUP_MEET();
@@ -814,6 +824,7 @@ LEVEL_PASS
     if (rank < runs)
         for (int unit = run_lo + tid; unit < run_hi; unit += THREADS)
             unit_rank.data[off_mf + unit] += keys_at[rank * colors + unit_color.data[off_mf + unit]];
+    }
     // Color offsets: an exclusive scan of the counts, in place; offset ``colors`` is the unit count.
     GROUP_SCAN(color_offset.data + off_color, colors + 1);
     const int world_colors = colors;
@@ -887,7 +898,7 @@ LEVEL_PASS
 """
 
 
-_UNIT_RESOURCES = """            const int id = valid ? unit_order.data[off_mf + span_lo + unit] : 0;
+_UNIT_RESOURCES = """            const int id = !valid ? 0 : row_order ? unit : unit_order.data[off_mf + span_lo + unit];
             const int dofs = valid ? unit_dofs.data[off_mf + id] : 0;
             const int dof_a = valid ? dofs >> 16 : -1;
             int dof_b = valid ? (dofs << 16) >> 16 : -1;
@@ -900,11 +911,13 @@ coordinates' slots."""
 _LEVEL_PASS = sweep_levels.level_pass(
     units="span",
     resources=_UNIT_RESOURCES,
-    counts=None,
+    counts="color_offset.data[off_color + {}]",
     store="unit_color.data[off_mf + id] = level;"
+    "\n                if (row_order) unit_rank.data[off_mf + id] = rank;"
     "\n                unit_after.data[(off_mf + id) * 2] = after_a;\n                unit_after.data[(off_mf + id) * 2 + 1] = after_b;",
     after=True,
     turns="colors_s[0]",
+    counted="row_order",
 )
 
 
