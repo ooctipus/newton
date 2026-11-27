@@ -64,6 +64,7 @@ from .row_slots import (
     RESERVE_BLOCK,
     RESERVE_LANES,
     admit_world_contacts,
+    reserve_group,
     reserve_warps,
     reserve_world_rows_kernel,
 )
@@ -773,8 +774,10 @@ class RowLaws:
             # contacts together), each contact's rows reserved in it and each world's counters advanced: a world with
             # contacts a lane group, one launch.
             placement = solver.placement
-            # A warp a world where the worlds fill the device, else a block of warps a world (reserve_warps).
+            # A warp a world where the worlds fill the device, else a block of warps a world (reserve_warps) and a
+            # group of blocks (reserve_group).
             warps = reserve_warps(solver.forest.world_count, model.device)
+            group = reserve_group(solver.forest.world_count, model.device)
             lanes = int(RESERVE_LANES) * warps if model.device.is_cuda else 1
             # A replay runs a lane group a contact, at most a world's (the contact count, known at the pass's
             # updater, bounds the worlds the admission lists after it): none on a step without contacts, nor on a
@@ -783,12 +786,13 @@ class RowLaws:
             # so it cannot size the launch.
             pool.launch(
                 reserve_world_rows_kernel(placement.row_groups.colors.shape[0] > 0, warps),
-                solver.forest.world_count * lanes,
+                solver.forest.world_count * lanes * group,
                 inputs=[
                     contact_input,
                     max_constraints,
                     placement.mf_max_constraints,
                     1,
+                    group,
                     placement.line_geometry,
                     placement.arena_bound,
                     placement.row_order(self.friction_patches.current.keys, self.friction_patches.kept_frame()),
@@ -810,7 +814,7 @@ class RowLaws:
                     placement.contact_rows_kept,
                 ],
                 extent=placement.pass_words[1:2],
-                scale=lanes,
+                scale=lanes * group,
                 clamp=True,
                 block_dim=lanes if warps > 1 else RESERVE_BLOCK,
             )

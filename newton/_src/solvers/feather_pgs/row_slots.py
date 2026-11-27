@@ -1280,6 +1280,61 @@ def reserve_warps(worlds: int, device) -> int:
     return fill_lanes(worlds, device, least=lanes, most=lanes * RESERVE_WARPS) // lanes
 
 
+def reserve_group(worlds: int, device) -> int:
+    """Blocks a world of the reservation where a world takes a block (:func:`reserve_warps` past one): as many as the
+    device's multiprocessors hold over the worlds, a block each, so a group's blocks are resident together; one where
+    worlds take a warp, and on the CPU. A world takes as many of its group's blocks as its contacts give a thread each
+    (:func:`reserve_world_rows_kernel`)."""
+    device = wp.get_device(device)
+    if not device.is_cuda or reserve_warps(worlds, device) == 1:
+        return 1
+    return max(int(device.sm_count) // max(int(worlds), 1), 1)
+
+
+TURN_ROWS = 8
+"""A world's ``RowOrder.turns`` words of its rows by list (four), which its first block publishes to its group's."""
+
+TURN_MEETS = 12
+"""A world's ``RowOrder.turns`` words of its group's meets: its other blocks' unions done, its slots open, its other
+blocks' slots done (counts from zero; the first block clears them once its group met)."""
+
+TURN_WORDS = 15
+"""Words of a world's ``RowOrder.turns``: its turns' carries (eight), its rows (:data:`TURN_ROWS`) and its group's
+meets (:data:`TURN_MEETS`)."""
+
+
+@wp.func_native("""
+#if defined(__CUDA_ARCH__)
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence();
+        atomicAdd(&words.data[world * (words.strides[0] / sizeof(int)) + word], 1);
+    }
+#else
+    (void)words, (void)world, (void)word;  // one thread runs the world: no group
+#endif
+""")
+def _meet_arrive(words: wp.array2d[int], world: int, word: int):
+    """A block of a world's group counts in at the meet ``word`` of its ``words``, after its threads' stores."""
+
+
+@wp.func_native("""
+#if defined(__CUDA_ARCH__)
+    if (threadIdx.x == 0) {
+        const volatile int* const met = &words.data[world * (words.strides[0] / sizeof(int)) + word];
+        while (*met < count) { }
+        __threadfence();
+    }
+    __syncthreads();
+#else
+    (void)words, (void)world, (void)word, (void)count;  // one thread runs the world: no group
+#endif
+""")
+def _meet_wait(words: wp.array2d[int], world: int, word: int, count: int):
+    """A block of a world's group waits until ``count`` blocks counted in at the meet ``word`` of its ``words``; what
+    they stored before is visible to its threads after."""
+
+
 @wp.func
 def _frame_turns(
     data: ContactInput,
@@ -1357,7 +1412,9 @@ def reserve_world_rows_kernel(grouped: bool, warps: int = 1):
     without, the kernel holds none of the grouping's code (a one-warp walk over a world's pairs that the others never
     take, whose code alone cost the cube pile's one-world reservation 70% more time). ``warps`` (:func:`reserve_warps`)
     a world, a world a block of them past one: the passes whose contacts are their threads' own (the heads' unions,
-    the slots) take every warp, the ordered passes the first."""
+    the slots) take every warp, the ordered passes the first. A world of a block takes its group's (``group``,
+    :func:`reserve_group`) for the passes whose contacts are their threads' own, as many of its blocks as its
+    contacts give a thread each."""
 
     @wp.kernel(enable_backward=False, module="unique")
     def reserve_world_rows(
@@ -1365,6 +1422,7 @@ def reserve_world_rows_kernel(grouped: bool, warps: int = 1):
         max_constraints: int,
         mf_max_constraints: int,
         row_capacity_telemetry: int,
+        group: int,
         lines: wp.vec2i,
         arena_lines: wp.array[int],
         order: RowOrder,
@@ -1437,10 +1495,13 @@ def reserve_world_rows_kernel(grouped: bool, warps: int = 1):
         item = wp.tid() // lanes
         warp = int(0)
         threads = lanes
+        rank = int(0)
         if wp.static(warps > 1):
-            # A world a block of warps.
+            # A world a block of warps, a group of blocks a world.
             threads = lanes * warps
-            item = wp.tid() // threads
+            block = wp.tid() // threads
+            item = block // group
+            rank = block - item * group
             warp = (wp.tid() // lanes) % warps
         if item >= listed:
             return
@@ -1449,42 +1510,69 @@ def reserve_world_rows_kernel(grouped: bool, warps: int = 1):
         kept = order.frame_kept[0]
         first = order.world_contact_first[world]
         end = wp.min(order.world_contact_last[world] + 1, data.count[0])
+        # The passes whose contacts are their threads' own take the world's blocks its contacts give a thread each, at
+        # most its group (``spread``); the others return. Its first block takes the ordered passes between.
+        spread = int(1)
         if wp.static(warps > 1):
-            # Each pair's head joins its trees' islands (_order_islands), a contact a thread of the block: the union
+            spread = wp.min(group, wp.max((end - first + threads - 1) // threads, 1))
+            if rank >= spread:
+                return
+        own = first + rank * threads + warp * lanes + lane
+        stride = spread * threads
+        if wp.static(warps > 1):
+            # Each pair's head joins its trees' islands (_order_islands), a contact a thread of the group: the union
             # by lowest id gives every island the same root whatever order the unions run in.
             if kept == 0:
-                for c in range(first + warp * lanes + lane, end, threads):
+                for c in range(own, end, stride):
                     if data.world[c] == world:
                         if c == first or order.pair_keys[c] != order.pair_keys[c - 1]:
                             sides = row_sides(data.art0[c], data.art1[c], data.response_dofs)
                             if sides[1] >= 0:
                                 union_find.union(order.island_parent, sides[0], sides[1])
-            lane_sync(threads)
-        # The frame's order (_frame_turns): each contact's rows before it and its pair, each pair's head.
-        _frame_turns(data, order, world, first, end, kept, lanes, lane, warp, warps)
-        if wp.static(warps > 1):
-            lane_sync(threads)
-        else:
-            lane_sync(RESERVE_LANES)
+            # The other blocks count in and wait for the world's rows (its first block's ordered passes); the first
+            # waits for their unions.
+            if rank > 0:
+                _meet_arrive(order.turns, world, TURN_MEETS)
+                _meet_wait(order.turns, world, TURN_MEETS + 1, 1)
+            else:
+                _meet_wait(order.turns, world, TURN_MEETS, spread - 1)
+        # The world's first block: the frame's order (_frame_turns: each contact's rows before it and its pair, each
+        # pair's head), the row order (_order_islands), each pair's rows before it (_rows_before), a world of many
+        # trees' dense contact rows by colors of groups (RowGroups), then its line; its rows to its group.
         rows = wp.vec4i(0)
-        pairs = int(0)
-        if end > first:
-            rows = wp.vec4i(order.turns[world, 0], order.turns[world, 1], order.turns[world, 2], order.turns[world, 3])
-            pairs = order.turns[world, 4]
-        # The row order (_order_islands), then each pair's rows before it (_rows_before).
-        if kept == 0:
-            _order_islands(data, order, world, first, pairs, lanes, lane, warp, warps)
-        _rows_before(order, world, first, pairs, rows, lanes, lane, warp, warps)
-        if wp.static(warps > 1):
-            lane_sync(threads)
-        # A world of many trees: its dense contact rows by colors of groups, where it takes them (RowGroups), over the
-        # world's warps in turn.
-        if wp.static(grouped):
-            group_slot = groups.slot[world]
-            if group_slot >= 0:
-                _group_rows(
-                    order, groups, group_slot, first, pairs, rows, world_slot_counter[world], lanes, lane, warp, warps
+        if rank == 0:
+            _frame_turns(data, order, world, first, end, kept, lanes, lane, warp, warps)
+            if wp.static(warps > 1):
+                lane_sync(threads)
+            else:
+                lane_sync(RESERVE_LANES)
+            pairs = int(0)
+            if end > first:
+                rows = wp.vec4i(
+                    order.turns[world, 0], order.turns[world, 1], order.turns[world, 2], order.turns[world, 3]
                 )
+                pairs = order.turns[world, 4]
+            if kept == 0:
+                _order_islands(data, order, world, first, pairs, lanes, lane, warp, warps)
+            _rows_before(order, world, first, pairs, rows, lanes, lane, warp, warps)
+            if wp.static(warps > 1):
+                lane_sync(threads)
+            if wp.static(grouped):
+                group_slot = groups.slot[world]
+                if group_slot >= 0:
+                    _group_rows(
+                        order,
+                        groups,
+                        group_slot,
+                        first,
+                        pairs,
+                        rows,
+                        world_slot_counter[world],
+                        lanes,
+                        lane,
+                        warp,
+                        warps,
+                    )
         # The world's line (``lines``: the store's line length and its home lines; ``arena_lines``, the arena's lines
         # mapped): its home where its rows fit the line, else a run of the arena's lines, one claim (the run it holds
         # this frame where that holds them), which it keeps while it holds its slots; its free rows from its body base,
@@ -1494,31 +1582,53 @@ def reserve_world_rows_kernel(grouped: bool, warps: int = 1):
         # would cross the host bus once a world.
         dense_total = world_slot_counter[world] + rows[0] + rows[2]
         free_total = mf_slot_counter[world] + rows[1] + rows[3]
-        base = wp.min(dense_total, max_constraints)
         extent = dense_total
         if free_total > 0:
-            extent = base + free_total
+            extent = wp.min(dense_total, max_constraints) + free_total
+        if rank == 0:
+            if extent > lines[0]:
+                if warp == 0 and lane == 0:
+                    need = (extent + lines[0] - 1) // lines[0]
+                    held_run = world_run[world]
+                    if held_run[0] < 0 or held_run[1] < need:
+                        held_run = wp.vec2i(-1, 0)
+                        # A store without an arena (lines as long as the capacities) has no run to claim.
+                        if arena_lines[0] > 0:
+                            claim = wp.atomic_add(arena_cursor, 0, need)
+                            if claim + need <= arena_lines[0]:
+                                held_run = wp.vec2i(lines[1] + claim, need)
+                            else:
+                                wp.atomic_add(arena_cursor, 1, 1)
+                        world_run[world] = held_run
+            elif warp == 0 and lane == 0:
+                world_run[world] = wp.vec2i(-1, 0)
+            if wp.static(warps > 1):
+                # Its rows to its group, then the slots open.
+                if warp == 0 and lane < 4:
+                    order.turns[world, TURN_ROWS + lane] = rows[lane]
+                if spread > 1:
+                    _meet_arrive(order.turns, world, TURN_MEETS + 1)
+                else:
+                    lane_sync(threads)
+            else:
+                lane_sync(RESERVE_LANES)
+        else:
+            rows = wp.vec4i(
+                order.turns[world, TURN_ROWS],
+                order.turns[world, TURN_ROWS + 1],
+                order.turns[world, TURN_ROWS + 2],
+                order.turns[world, TURN_ROWS + 3],
+            )
+            dense_total = world_slot_counter[world] + rows[0] + rows[2]
+            free_total = mf_slot_counter[world] + rows[1] + rows[3]
+            extent = dense_total
+            if free_total > 0:
+                extent = wp.min(dense_total, max_constraints) + free_total
+        base = wp.min(dense_total, max_constraints)
         line = data.first[world]
         dense_cap = max_constraints
         free_cap = mf_max_constraints
         if extent > lines[0]:
-            if warp == 0 and lane == 0:
-                need = (extent + lines[0] - 1) // lines[0]
-                held_run = world_run[world]
-                if held_run[0] < 0 or held_run[1] < need:
-                    held_run = wp.vec2i(-1, 0)
-                    # A store without an arena (lines as long as the capacities) has no run to claim.
-                    if arena_lines[0] > 0:
-                        claim = wp.atomic_add(arena_cursor, 0, need)
-                        if claim + need <= arena_lines[0]:
-                            held_run = wp.vec2i(lines[1] + claim, need)
-                        else:
-                            wp.atomic_add(arena_cursor, 1, 1)
-                    world_run[world] = held_run
-            if wp.static(warps > 1):
-                lane_sync(threads)
-            else:
-                lane_sync(RESERVE_LANES)
             run = world_run[world][0]
             if run >= 0:
                 line = run
@@ -1526,12 +1636,11 @@ def reserve_world_rows_kernel(grouped: bool, warps: int = 1):
                 dense_cap = wp.min(max_constraints, lines[0])
                 base = wp.min(base, dense_cap)
                 free_cap = wp.min(mf_max_constraints, wp.max(lines[0] - base, 0))
-        elif warp == 0 and lane == 0:
-            world_run[world] = wp.vec2i(-1, 0)
-        if warp == 0 and lane == 0:
+        if rank == 0 and warp == 0 and lane == 0:
             body_base[line] = base
-        # Each admitted contact's slot; each pair's head restores its trees (_order_islands' starting state).
-        for c in range(first + warp * lanes + lane, end, threads):
+        # Each admitted contact's slot, a contact a thread of the group; each pair's head restores its trees
+        # (_order_islands' starting state).
+        for c in range(own, end, stride):
             if data.world[c] != world:
                 continue
             pair = first + order.pairs_before[c]
@@ -1578,12 +1687,16 @@ def reserve_world_rows_kernel(grouped: bool, warps: int = 1):
                         for r in range(n):
                             units[line, slot + r] = unit_source(UNIT_CONTACT, 4 * c + r)
         if wp.static(warps > 1):
-            lane_sync(threads)
+            # The other blocks count in and return; the first waits for them.
+            if rank > 0:
+                _meet_arrive(order.turns, world, TURN_MEETS + 2)
+                return
+            _meet_wait(order.turns, world, TURN_MEETS + 2, spread - 1)
         else:
             lane_sync(RESERVE_LANES)
         if warp == 0 and lane == 0:
-            # The world's counters, rejected rows included, and its run cleared for the next step; the last listed world
-            # to finish clears the list (every listed world read its count before).
+            # The world's counters, rejected rows included, and its run cleared for the next step (its group's meets
+            # too); the last listed world to finish clears the list (every listed world read its count before).
             world_slot_counter[world] += rows[0] + rows[2]
             mf_slot_counter[world] += rows[1] + rows[3]
             dense = rows[0] + rows[2]
@@ -1594,6 +1707,9 @@ def reserve_world_rows_kernel(grouped: bool, warps: int = 1):
             contact_rows_kept[1, world] = rows[1] + rows[3]
             order.world_contact_first[world] = _NO_CONTACT
             order.world_contact_last[world] = -1
+            if wp.static(warps > 1):
+                for m in range(3):
+                    order.turns[world, TURN_MEETS + m] = 0
             if wp.atomic_add(contact_worlds_listed, 1, 1) == listed - 1:
                 contact_worlds_listed[0] = 0
                 contact_worlds_listed[1] = 0

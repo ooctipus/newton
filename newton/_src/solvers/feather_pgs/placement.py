@@ -39,7 +39,7 @@ from .route_table import first_failed
 from .row_laws import LINK_ROWS
 from .row_metadata import RECORD_WORDS, SPLIT_WORDS, record_layout, record_words, split_records
 from .row_records import DENSE_ROWS, ROW_RECORDS, RowSupport
-from .row_slots import ROW_SLOT_UNBOUNDED, RowGroups, RowOrder, row_groups
+from .row_slots import ROW_SLOT_UNBOUNDED, TURN_WORDS, RowGroups, RowOrder, row_groups
 from .warm_start import ContactCarry, prepare_world_impulses, row_lanes
 
 # FeatherPGS takes no gradients: its kernels compile no adjoints.
@@ -767,8 +767,9 @@ class Placement:
         self.island_parent = wp.array(np.arange(trees, dtype=np.int32), dtype=wp.int32, device=device)
         self.island_size = wp.zeros(trees, dtype=wp.int32, device=device)
         self.island_base = wp.zeros(trees, dtype=wp.vec2i, device=device)
-        # What a batch of a world's frame order leaves the next in its block of warps (row_slots._frame_turns).
-        self.reserve_turns = wp.zeros((max(int(self.forest.world_count), 1), 8), dtype=wp.int32, device=device)
+        # What a batch of a world's frame order leaves the next in its block of warps (row_slots._frame_turns), its
+        # rows and its group's meets (row_slots.TURN_WORDS).
+        self.reserve_turns = wp.zeros((max(int(self.forest.world_count), 1), TURN_WORDS), dtype=wp.int32, device=device)
         # No world's dense line by colors of groups until the sweep takes them (allocate_row_groups).
         self.row_groups = self._row_groups(np.full(0, -1, dtype=np.int32), 0, 0, 0.0)
         # Allocated once here: per-step allocation is forbidden under CUDA graph capture.
