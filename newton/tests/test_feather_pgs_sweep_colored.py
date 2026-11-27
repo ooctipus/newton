@@ -503,16 +503,26 @@ class TestColoredSweep(unittest.TestCase):
         rounds of its threads; where it cannot (here pinned to global memory) the device's other blocks join its block
         on its units, which wait for their bodies' earlier units across the blocks. Each body's units keep their row
         order, so the published motion is the one block's bit for bit."""
+        self._wide_colors(warm=False)
+
+    def test_a_warm_start_seeds_wide_colors(self):
+        """The warm start's seed by colors (:func:`.sweep_routes._colored_seed`) on colors wider than the block: the
+        world's block seeds a color's units in rounds of its threads, alone or beside the device's other blocks, each
+        body's rows in row order, so both forms step bit for bit and the boxes rest."""
+        self._wide_colors(warm=True)
+
+    def _wide_colors(self, warm: bool):
         model = _box_floor(self.device, side=18)
         runs = []
         for world_group in (True, False):
             pins = SolverFeatherPGS.Pins(velocity="global", world_group=world_group)
-            solver = SolverFeatherPGS(model, pins=pins, mf_max_constraints=16_384)
+            solver = SolverFeatherPGS(model, pins=pins, mf_max_constraints=16_384, pgs_warmstart=warm)
             self.assertEqual(solver.sweep.world_blocks > 1, world_group)
+            self.assertEqual("_seeded" in solver.sweep.colored_sweep.name, warm)
             if world_group:
                 self.assertIn("_glambda", solver.sweep.colored_sweep.name)
                 self.assertIn("_group", solver.sweep.colored_sweep.name)
-            pipeline = newton.CollisionPipeline(model)
+            pipeline = newton.CollisionPipeline(model, **({"contact_matching": "sticky"} if warm else {}))
             contacts = pipeline.contacts()
             states = [model.state(), model.state()]
             newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])

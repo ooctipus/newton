@@ -857,6 +857,33 @@ const float mf_diag = __int_as_float(meta.y);"""
             __syncthreads();"""
 
 
+def _colored_seed(free: WorldRows, support: int, pad: str) -> str:
+    """The warm start's seed of a colored world's units (:func:`.sweep.impulse_seed`'s ``du += Z_i lambda_i``) color
+    by color: every unit of a color at once, a thread a unit, each adding its rows' responses in row order, and one
+    barrier a color. A color's units share no body and a body's units keep their row order in the colors
+    (:mod:`.sweep_units`), so every coordinate takes its rows' responses in row order, as the row-by-row seed adds them:
+    the same arithmetic. The units are the world's free rows up to ``mf_contact_end``; the rows after them follow
+    (:func:`mf_gs_source`)."""
+    apply = free_body_rows(Lanes(1), support).axpy((("row", "seed"),), "", row="i")
+    return indent(
+        f"""for (int c = 0, colors = color_count.data[world]; c < colors; ++c) {{
+    const int color_end = color_offset.data[off_color + c + 1];
+    for (int place = color_offset.data[off_color + c] + tid; place < color_end; place += blockDim.x) {{
+        const int4 slot = {COLOR_SLOT.format("place")};
+        const int dof_a = slot.z, dof_b = slot.w;
+        for (int i = slot.x; i < slot.x + slot.y; ++i) {{
+            const float seed = {free.peek("i")};
+            if (seed != 0.0f) {{
+{indent(apply, " " * 16)}
+            }}
+        }}
+    }}
+    __syncthreads();
+}}""",
+        pad,
+    )
+
+
 def dense_units(
     dense: WorldRows, op: SparseFactor, laws: RowLaws, *, active: bool, record: Callable[[str], str] | None, pad: str
 ) -> str:
@@ -2507,35 +2534,42 @@ def mf_gs_source(sweep: GeneralSweep) -> tuple[str, Staging]:
                 pad=pad,
             )
 
-        seeds = (group_rows(dense_seed, "    ") if grouped else dense_seed("0", "m_dense", "    "),)
-        seeds += (
-            (
-                impulse_seed(
-                    "m_mf",
-                    free.load("i"),
-                    free_op.axpy((("row", "seed"),), "        ", row="i"),
-                    row_lanes.sync(),
-                    declare=(
-                        *free.visit("i").split("\n"),
-                        *(
-                            ("const int dof_a = rec_a.x, dof_b = rec_b.x;",)
-                            if split
-                            else (
-                                "const int packed_dofs = rec_a.x;",
-                                "const int dof_a = packed_dofs >> 16, dof_b = (packed_dofs << 16) >> 16;",
-                            )
-                        ),
+        def free_seed(begin: str) -> str:
+            return impulse_seed(
+                "m_mf",
+                free.load("i"),
+                free_op.axpy((("row", "seed"),), "        ", row="i"),
+                row_lanes.sync(),
+                declare=(
+                    *free.visit("i").split("\n"),
+                    *(
+                        ("const int dof_a = rec_a.x, dof_b = rec_b.x;",)
+                        if split
+                        else (
+                            "const int packed_dofs = rec_a.x;",
+                            "const int dof_a = packed_dofs >> 16, dof_b = (packed_dofs << 16) >> 16;",
+                        )
                     ),
                 ),
+                begin=begin,
             )
-            if free_rows and not sweep.regions
-            else ()
-        )
-        seed = (
-            f"{alone}{seeds[0]}\n{end_alone}"
-            if grouped
-            else f"{first_warp}{chr(10).join(seeds)}\n{end_first_warp}    {barrier}\n"
-        )
+
+        seeds = (group_rows(dense_seed, "    ") if grouped else dense_seed("0", "m_dense", "    "),)
+        if grouped:
+            seed = f"{alone}{seeds[0]}\n{end_alone}"
+        elif colored and free_rows and not sweep.regions:
+            # The units color by color over the block (_colored_seed), between the dense rows and the free rows after
+            # the units, which the first warp seeds row by row: every coordinate's rows in row order.
+            units = _colored_seed(free, max_row_dofs, "    ")
+            tail = free_seed("mf_contact_end")
+            seed = (
+                f"{first_warp}{seeds[0]}\n{end_first_warp}    {barrier}\n{alone}{units}\n{end_alone}"
+                f"{first_warp}{tail}\n{end_first_warp}    {barrier}\n"
+            )
+        else:
+            if free_rows and not sweep.regions:
+                seeds += (free_seed("0"),)
+            seed = f"{first_warp}{chr(10).join(seeds)}\n{end_first_warp}    {barrier}\n"
     # Wide rows, which the bilateral block corrected, can be collinear (a jammed loop), and collinear rows can trade
     # impulses forever with no effect on the velocity, each loud alone. The velocity is the solve's answer, so a wide
     # sweep also ends when no coordinate moved past the exit law's floor of the largest one: factor coordinates share

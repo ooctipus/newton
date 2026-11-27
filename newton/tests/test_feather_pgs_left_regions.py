@@ -305,15 +305,23 @@ class TestFeatherPGSLeftRegions(unittest.TestCase):
     def test_split_records_take_colored_units(self):
         # The colored mapping's units read a split line's records as a packed one's (each side's first coordinate and
         # the parent in words of their own): with the contacts kept rows (the pin), a line past 65,535 rows takes the
-        # same units, colors and staged rows as a packed line, so the published motion is the packed line's.
+        # same units, colors and staged rows as a packed line, so the published motion is the packed line's. Under the
+        # warm start the units' seed (sweep_routes._colored_seed) walks the same units from the impulses carried.
         model = _columns("cuda:0")
+        for warm in (False, True):
+            with self.subTest(warm=warm):
+                self._split_records_take_colored_units(model, warm)
+
+    def _split_records_take_colored_units(self, model, warm: bool):
         poses = []
         for rows in (65_535, 65_536):
-            solver = SolverFeatherPGS(model, pins=SolverFeatherPGS.Pins(regions=False), mf_max_constraints=rows)
+            solver = SolverFeatherPGS(
+                model, pins=SolverFeatherPGS.Pins(regions=False), mf_max_constraints=rows, pgs_warmstart=warm
+            )
             self.assertEqual(solver.placement.split_records, rows > 65_535)
             self.assertIsNone(solver.sweep.regions)
             self.assertIsNotNone(solver.sweep.mf_colored_kernel)
-            pipeline = newton.CollisionPipeline(model)
+            pipeline = newton.CollisionPipeline(model, **({"contact_matching": "sticky"} if warm else {}))
             contacts = pipeline.contacts()
             states = [model.state(), model.state()]
             newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
