@@ -895,7 +895,8 @@ def test_graph_replays_template_broad_phase(test, device):
     """Capture the template broad phase in a CUDA graph and replay the flat kernel's candidates on live state."""
     for global_order, model, state in _global_order_models(test, device):
         with test.subTest(global_order=global_order):
-            templated = _pipeline(model, "1")
+            # Only a pool whose rows grow forecasts: a fixed pool's passes launch the plain kernel alone.
+            templated = _pipeline(model, "1", growable_contacts=True)
             flat = _pipeline(model, "0")
             test.assertEqual(_kernel_record(templated)["kernel"], "world_templates")
             contacts = _contacts(templated, model, state)  # load modules before capture
