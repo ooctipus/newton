@@ -394,6 +394,20 @@ RAN_SLOT = 6
 bodies of six coordinates each, so two bodies' first coordinates lie six apart at least and their slots differ."""
 
 
+def acquire_count(address: str) -> str:
+    """An acquire load of the count at ``address`` (global memory, the device's scope), once a relaxed poll saw its
+    turn: what the blocks wrote before releasing it is visible after it, with no full fence."""
+    return (
+        f'{{ int seen; asm volatile("ld.acquire.gpu.global.s32 %0, [%1];" : "=r"(seen) : "l"({address}) : "memory"); }}'
+    )
+
+
+def release_count(address: str, value: str) -> str:
+    """A release store of ``value`` to the count at ``address`` (global memory, the device's scope): what this thread
+    wrote, and saw its warp write, is visible to a block that acquires it, with no full fence."""
+    return f'asm volatile("st.release.gpu.global.s32 [%0], %1;" :: "l"({address}), "r"({value}) : "memory");'
+
+
 def ran_slots(dofs: int) -> int:
     """Slots of ``s_ran`` for a world of ``dofs`` coordinates (:data:`RAN_SLOT`)."""
     return int(dofs) // RAN_SLOT + 1
@@ -656,13 +670,23 @@ const float mf_diag = __int_as_float(meta.y);"""
                     const float* const unit_record = {record("place")};
                     const float4 {", ".join(f"{name} = make_float4({', '.join('0.0f' if 4 * k + c == 3 else f'unit_record[{4 * k + c} * {record_stride}]' for c in range(4))})" for k, name in enumerate(FORMED_RECORD))};
 {indent(laws_text, " " * 20)}"""
-    # The bodies' counts and their fences: the block's stage and its fence, or over a group of blocks global memory and
-    # the device's (the velocity and impulses a unit reads were written on other multiprocessors).
-    ran, fence = (
-        ("body_run", 'asm volatile("fence.acq_rel.gpu;" ::: "memory");')
-        if group
-        else ("s_ran", "__threadfence_block();")
-    )
+    # The bodies' counts: the block's stage and its fences, or over a group of blocks global memory, polled relaxed, then
+    # an acquire load of each count and a release store of each (the velocity and impulses a unit reads were written on
+    # other multiprocessors).
+    ran = "body_run" if group else "s_ran"
+    pad = " " * 32
+    sides = (("dof_a", "after.x"), ("dof_b", "after.y"))
+    color = "const int color = turn + max(after.x, after.y) + 1;"
+    if group:
+        acquire = f"\n{pad}".join(
+            f"if ({after} >= 0) {acquire_count(f'&body_run[{dof} / {RAN_SLOT}]')}" for dof, after in sides
+        )
+        stores = [f"if ({dof} >= 0) {release_count(f'&body_run[{dof} / {RAN_SLOT}]', 'color')}" for dof, _ in sides]
+        release = f"\n{pad}".join([color, *stores])
+    else:
+        acquire = "__threadfence_block();"
+        stores = [f"if ({dof} >= 0) done[{dof} / {RAN_SLOT}] = color;" for dof, _ in sides]
+        release = f"\n{pad}".join(["__threadfence_block();", "volatile int* const done = s_ran;", color, *stores])
     turn_text = f"""                    // Its warp's rounds: each round its units whose turn came run (the latest earlier unit on each
                     // of their bodies ran: their colors in {ran}), together.
                     while (__any_sync(0xffffffffu, pending)) {{
@@ -671,16 +695,12 @@ const float mf_diag = __int_as_float(meta.y);"""
                             const bool ready = (after.x < 0 || ran[dof_a / {RAN_SLOT}] == turn + after.x)
                                 && (after.y < 0 || ran[dof_b / {RAN_SLOT}] == turn + after.y);
                             if (ready) {{
-                                {fence}
+                                {acquire}
 {indent(_unit_terms("", torsion=torsion), " " * 32)}
 {indent(dedent(unit), " " * 32)}
 {indent(_unit_apply("", torsion=torsion), " " * 32)}
                                 // Its color on its bodies, after its changes: the next unit on each may run.
-                                {fence}
-                                volatile int* const done = {ran};
-                                const int color = turn + max(after.x, after.y) + 1;
-                                if (dof_a >= 0) done[dof_a / {RAN_SLOT}] = color;
-                                if (dof_b >= 0) done[dof_b / {RAN_SLOT}] = color;
+                                {release}
                                 pending = false;
                             }}
                         }}
@@ -1854,7 +1874,15 @@ def dense_runs(visit: str, pad: str, *, ranks: bool = False, group: bool = False
     alone."""
     alone = "rank == 0 && " if ranks or group else ""
     warps = "(int)(blockDim.x >> 5)"
-    fence = 'asm volatile("fence.acq_rel.gpu;" ::: "memory");' if group else "__threadfence_block();"
+    # A run's marks: over the group acquire loads and release stores at the device's scope, in a block its fences.
+    if group:
+        acquire = " ".join(f"if (prev_{s} >= 0) {acquire_count(f'&RUN(prev_{s}, 3)')}" for s in "ab")
+        release = release_count("&RUN(run, 3)", "run_stamp")
+    else:
+        acquire = "__threadfence_block();"
+        release = (
+            f"__threadfence_block();\n{pad}            *reinterpret_cast<volatile int*>(&RUN(run, 3)) = run_stamp;"
+        )
     spread = f"(run_line[1] != 0 ? group * {warps} : {warps})" if group else warps
     build = f"""    int* const run_line = dense_runs.data + (size_t)world * dense_runs.shape[1];
     int* const run_scan = run_line + 3;
@@ -1999,14 +2027,13 @@ def dense_runs(visit: str, pad: str, *, ranks: bool = False, group: bool = False
 {pad}            const int prev_a = RUN(run, 1), prev_b = RUN(run, 2);
 {pad}            if (prev_a >= 0) while (*reinterpret_cast<volatile const int*>(&RUN(prev_a, 3)) < run_stamp) {{ }}
 {pad}            if (prev_b >= 0) while (*reinterpret_cast<volatile const int*>(&RUN(prev_b, 3)) < run_stamp) {{ }}
-{pad}            {fence}
+{pad}            {acquire}
 {pad}        }}
 {pad}        __syncwarp();
 {visit}
 {pad}        __syncwarp();
 {pad}        if (lane == 0) {{
-{pad}            {fence}
-{pad}            *reinterpret_cast<volatile int*>(&RUN(run, 3)) = run_stamp;
+{pad}            {release}
 {pad}        }}
 {pad}    }}
 {pad}    }}
