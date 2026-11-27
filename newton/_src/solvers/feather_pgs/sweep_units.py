@@ -53,7 +53,7 @@ from .device_preludes import SHARED_STORAGE, cuda_native, lane_group
 from .field_group import Field, FieldGroup
 from .kernel_template import KernelTemplate
 from .row_laws import ROW_CONTACT, ROW_FRICTION, ROW_TORSION
-from .row_metadata import HEADER_WORDS, record_parent
+from .row_metadata import record_parent, record_words, split_word
 from .sweep_levels import COST_CLASSES
 
 BUILD_WARPS = 8
@@ -183,7 +183,6 @@ def slot_layout(torsion: bool) -> SlotLayout:
 
 
 _RING_MEMBERS = wp.constant(RING_MEMBERS)
-_HEADER_WORDS = wp.constant(HEADER_WORDS)
 _ROW_CONTACT = wp.constant(int(ROW_CONTACT))
 
 SLOT_FIELDS = FieldGroup(
@@ -199,9 +198,21 @@ its entries."""
 
 
 @cache
-def stage_slots(weighted: bool) -> wp.Kernel:
+def stage_slots(weighted: bool, split: bool = False) -> wp.Kernel:
     """The slot staging kernel of the laws (``weighted``: contact rows step by their weights, a constant of the plan
-    that every sweep compiles in, :class:`.sweep.RowLaws`)."""
+    that every sweep compiles in, :class:`.sweep.RowLaws`) and of the line's record form (``split``,
+    :func:`.row_metadata.split_records`: a free row's record holds its parent in a word of its last quad)."""
+    free_words = record_words(True, split)
+    parent_word = split_word(free_words, 1) if split else 3
+
+    @wp.func
+    def ring_link(row_record: wp.array2d[wp.int32], mf_line: int, record: int) -> int:
+        # A row's parent from its record (-1 for none): a packed record's kind word's high half (0xFFFF none), a split
+        # record's word of its own.
+        if wp.static(split):
+            return row_record[mf_line, record + wp.static(parent_word)]
+        link = (row_record[mf_line, record + 3] >> 16) & 0xFFFF
+        return wp.where(link == 0xFFFF, -1, link)
 
     @wp.func
     def stage_unit(
@@ -233,7 +244,7 @@ def stage_slots(weighted: bool) -> wp.Kernel:
             if r < rows:
                 for k in range(12):
                     slot_data[data + (r * 12 + k) * need + p] = packed_Z[mf_line, body_base + row + r, k]
-                record = free_records + (row + r) * _HEADER_WORDS
+                record = free_records + (row + r) * wp.static(free_words)
                 slot_words[words_at + (r * 3) * need + p] = row_record[mf_line, record + 1]
                 slot_words[words_at + (r * 3 + 1) * need + p] = row_record[mf_line, record + 2]
                 slot_words[words_at + (r * 3 + 2) * need + p] = row_record[mf_line, record + 3]
@@ -258,15 +269,16 @@ def stage_slots(weighted: bool) -> wp.Kernel:
                 spin_mu = mf_row_mu[mf_line, body_base + row + 3]
             slot_data[data + (entries + 2) * need + p] = spin_mu
         if rows >= 3:
-            # The friction pair's patch ring: its normal's ring successors in ring order (the pooled load's walk).
+            # The friction pair's patch ring: its normal's ring successors in ring order (the pooled load's walk). A
+            # ring the slot cannot hold (more members than it has halves, or a member past a half's 16 bits) is
+            # walked by the sweep (members -1).
             words = wp.vec4i(-1, -1, -1, -1)
             members = int(0)
             hop = int(0)
-            rows_cap = (row_record.shape[1] - free_records) // _HEADER_WORDS
-            link = (row_record[mf_line, free_records + row * _HEADER_WORDS + 3] >> 16) & 0xFFFF
-            r = wp.where(link == 0xFFFF, -1, link)
+            rows_cap = (row_record.shape[1] - free_records) // wp.static(free_words)
+            r = ring_link(row_record, mf_line, free_records + row * wp.static(free_words))
             while r >= 0 and r != row and hop < rows_cap:
-                if members == _RING_MEMBERS:
+                if members == _RING_MEMBERS or r >= 0xFFFF:
                     members = -1
                     break
                 # Two 16-bit rows a word, low half first; an unused half stays 0xFFFF.
@@ -276,8 +288,7 @@ def stage_slots(weighted: bool) -> wp.Kernel:
                     words[members // 2] = (words[members // 2] & 0xFFFF) | (r << 16)
                 members += 1
                 hop += 1
-                link = (row_record[mf_line, free_records + r * _HEADER_WORDS + 3] >> 16) & 0xFFFF
-                r = wp.where(link == 0xFFFF, -1, link)
+                r = ring_link(row_record, mf_line, free_records + r * wp.static(free_words))
             ring = layout_rows * 3
             for k in range(_RING_MEMBERS // 2):
                 slot_words[words_at + (ring + k) * need + p] = words[k]
@@ -509,7 +520,7 @@ SHARED_DECLARATIONS
         // Each block's units, then the units before its run.
         int counted = 0;
         for (int row = lo + tid; row < hi; row += THREADS)
-            counted += (row_record.data[off_meta + row * HEADER_WORDS + 3] & 0xFFFF) == CONTACT;
+            counted += (row_record.data[off_meta + row * FREE_WORDS + 3] & 0xFFFF) == CONTACT;
         counted = __reduce_add_sync(0xffffffffu, counted);
         if (lane == 0) warp_count[warp] = counted;
         __syncthreads();
@@ -541,7 +552,7 @@ SHARED_DECLARATIONS
     for (int base = lo; base < hi; base += THREADS) {
         const int row = base + tid;
         bool head = false;
-        if (row < hi) head = (row_record.data[off_meta + row * HEADER_WORDS + 3] & 0xFFFF) == CONTACT;
+        if (row < hi) head = (row_record.data[off_meta + row * FREE_WORDS + 3] & 0xFFFF) == CONTACT;
         int counted = 0;
         const int order = ORDERED(counted, head);
         if (lane == 0) warp_count[warp] = counted;
@@ -557,11 +568,11 @@ SHARED_DECLARATIONS
             const int unit = first + order;
             int rows = 1;
             while (row + rows < end && rows < 3) {
-                const int packed = row_record.data[off_meta + (row + rows) * HEADER_WORDS + 3];
-                if ((packed & 0xFFFF) != FRICTION || (PARENT(packed)) != row) break;
+                const int packed = row_record.data[off_meta + (row + rows) * FREE_WORDS + 3];
+                if ((packed & 0xFFFF) != FRICTION || ROW_PARENT(row + rows, packed) != row) break;
                 ++rows;
             }
-            const int dofs = row_record.data[off_meta + row * HEADER_WORDS];
+            const int dofs = ROW_DOFS(row);
             unit_row.data[off_mf + unit] = row;
             unit_rows.data[off_mf + unit] = rows;
             unit_dofs.data[off_mf + unit] = dofs;
@@ -826,13 +837,13 @@ def build_staging(dofs: int) -> Staging:
 
 
 _UNIT_ROWS = """            while (row + rows < end && rows < 3) {
-                const int packed = row_record.data[off_meta + (row + rows) * HEADER_WORDS + 3];
-                if ((packed & 0xFFFF) != FRICTION || (PARENT(packed)) != row) break;"""
+                const int packed = row_record.data[off_meta + (row + rows) * FREE_WORDS + 3];
+                if ((packed & 0xFFFF) != FRICTION || ROW_PARENT(row + rows, packed) != row) break;"""
 """The unit builder's rows of a unit after its normal: its friction pair."""
 
 _SPIN_UNIT_ROWS = """            while (row + rows < end && rows < 4) {
-                const int packed = row_record.data[off_meta + (row + rows) * HEADER_WORDS + 3];
-                if ((packed & 0xFFFF) != (rows < 3 ? FRICTION : TORSION) || (PARENT(packed)) != row) break;"""
+                const int packed = row_record.data[off_meta + (row + rows) * FREE_WORDS + 3];
+                if ((packed & 0xFFFF) != (rows < 3 ? FRICTION : TORSION) || ROW_PARENT(row + rows, packed) != row) break;"""
 """Under contact torsion: its friction pair, then its spin row."""
 
 
@@ -856,9 +867,11 @@ def build_units_kernel(
     rule: ColoredRule = COLORED_RULE,
     device_arch=REFERENCE_ARCH,
     torsion: bool = False,
+    split: bool = False,
 ) -> wp.Kernel:
     """The unit builder of worlds with ``mf_rows`` free-body rows and ``dofs`` coordinates, each world's units in the
-    pool from its slot's first entry (:data:`SLOT_PLACES`); under contact ``torsion`` a unit's spin row follows its pair.
+    pool from its slot's first entry (:data:`SLOT_PLACES`); under contact ``torsion`` a unit's spin row follows its pair;
+    the free rows' records packed or ``split`` (:func:`.row_metadata.split_records`).
 
     A group of ``unit_blocks`` blocks of :data:`BUILD_WARPS` warps per world of the claims' candidate bucket (a world
     with a slot, :func:`.sweep_levels.claim_worlds`; :func:`unit_blocks`): launch tiled over the bucket's capacity, the
@@ -875,18 +888,29 @@ def build_units_kernel(
     """
     staging = build_staging(dofs)
     staging.check("the unit builder", arch_budget(device_arch))
-    parent = record_parent("PACKED_WORD", mf_rows)
+    free_words = record_words(True, split)
+    if split:
+        # A split record (row_metadata.pack_row_record): its first side's coordinate whole in its first word, the
+        # second's and its parent in its last quad; a unit's sides take the packed halves the units hold.
+        row_parent = f"row_record.data[off_meta + (ROW) * FREE_WORDS + {split_word(free_words, 1)}]"
+        row_dofs = (
+            f"((row_record.data[off_meta + (ROW) * FREE_WORDS] << 16)"
+            f" | (row_record.data[off_meta + (ROW) * FREE_WORDS + {split_word(free_words, 0)}] & 0xFFFF))"
+        )
+    else:
+        row_parent = f"({record_parent('PACKED_WORD', mf_rows)})"
+        row_dofs = "row_record.data[off_meta + (ROW) * FREE_WORDS]"
     words = (dofs + 31) // 32
     body = _BUILD_SOURCE
     if torsion:
         body = f"#define TORSION {int(ROW_TORSION)}\n" + body.replace(_UNIT_ROWS, _SPIN_UNIT_ROWS)
         body = body.replace("#endif", "#undef TORSION\n#endif")
     source = (
-        f"#define MF_ROWS {mf_rows}\n#define HEADER_WORDS {HEADER_WORDS}\n#define MIN_UNITS {int(rule.min_units)}\n"
+        f"#define MF_ROWS {mf_rows}\n#define FREE_WORDS {free_words}\n#define MIN_UNITS {int(rule.min_units)}\n"
         f"#define WARPS {BUILD_WARPS}\n#define COLORED(N_UNITS, N_COLORS) {rule.condition('(N_UNITS)', '(N_COLORS)')}\n"
         f"#define THREADS {32 * BUILD_WARPS}\n#define NODES {dofs // 6 + 1}\n#define WORDS {words}\n"
         f"#define CONTACT {int(ROW_CONTACT)}\n#define FRICTION {int(ROW_FRICTION)}\n"
-        f"#define PARENT(PACKED_WORD) ({parent})\n"
+        f"#define ROW_PARENT(ROW, PACKED_WORD) {row_parent}\n#define ROW_DOFS(ROW) {row_dofs}\n"
         # The general sweep's cost class of the world (sweep_levels.cost_bucket), from the general one on.
         f"#define GENERAL_CLAIM (general_bucket + {COST_CLASSES - 1} - min(max(world_cost.data[world], 0), {COST_CLASSES - 1}))\n"
         + body.replace("SHARED_DECLARATIONS", staging.declarations())
@@ -894,9 +918,9 @@ def build_units_kernel(
         .replace("LEVEL_OFFSETS", _LEVEL_OFFSETS)
         .replace(
             "#endif",
-            "#undef MF_ROWS\n#undef HEADER_WORDS\n#undef MIN_UNITS\n#undef COLORED\n#undef WARPS\n#undef THREADS\n#undef NODES\n"
+            "#undef MF_ROWS\n#undef FREE_WORDS\n#undef MIN_UNITS\n#undef COLORED\n#undef WARPS\n#undef THREADS\n#undef NODES\n"
             "#undef WORDS\n"
-            "#undef CONTACT\n#undef FRICTION\n#undef PARENT\n#undef GENERAL_CLAIM\n#endif",
+            "#undef CONTACT\n#undef FRICTION\n#undef ROW_PARENT\n#undef ROW_DOFS\n#undef GENERAL_CLAIM\n#endif",
         )
     )
     # The appends last: their statements hold a preprocessor branch of their own.
@@ -929,7 +953,7 @@ def build_units_kernel(
         ("island_first", wp.array2d[wp.int32]),
     )
     return KernelTemplate(
-        f"sweep_units_{mf_rows}_{dofs}_{rule.name}_w{BUILD_WARPS}" + ("_torsion" if torsion else ""),
+        f"sweep_units_{mf_rows}_{dofs}_{rule.name}_w{BUILD_WARPS}" + ("_torsion" if torsion else "") + ("_split" if split else ""),
         params,
         cuda_native(source, preludes=(lane_group(32), SHARED_STORAGE)),
         dispatch=kernel_template.items(
@@ -967,6 +991,7 @@ def count_units(
     row_record: wp.array2d[int],
     dense_record_words: int,
     body_base: wp.array[int],
+    free_words: int,
     mf_rows: int,
     min_units: int,
     chunks: int,
@@ -993,7 +1018,7 @@ def count_units(
     line = mf_first[world]
     free_records = body_base[line] * dense_record_words
     while row < end:
-        if (row_record[line, free_records + row * _HEADER_WORDS + 3] & 0xFFFF) == _ROW_CONTACT:
+        if (row_record[line, free_records + row * free_words + 3] & 0xFFFF) == _ROW_CONTACT:
             head += 1
         row += chunks * wp.block_dim()
     total = wp.tile_sum(wp.tile(head))
@@ -1060,6 +1085,8 @@ class ColoredUnits:
         world_cost: The bits of each world's own cycles in the general sweep's last call (its cost class).
         support: The line's packed rows' entries (:func:`.packed_rows.support_width`): twelve or more, since a capable
             world holds two free bodies (:func:`capable_worlds`); :func:`stage_slots` reads twelve unguarded.
+        group: The sweep's blocks a world.
+        split: The free rows' records are split (:func:`.row_metadata.split_records`).
     """
 
     def __init__(
@@ -1078,6 +1105,7 @@ class ColoredUnits:
         world_cost: wp.array,
         support: int = 12,
         group: int = 1,
+        split: bool = False,
     ):
         if int(support) < 12:
             raise ValueError(f"a colored world's line holds two free bodies' twelve entries, not {support}")
@@ -1117,13 +1145,17 @@ class ColoredUnits:
         self.group = int(group)
         self.island_first = wp.zeros((self.world_count, self.group + 2), dtype=wp.int32, device=device)
         self.rule = rule
-        self.stage_kernel = stage_slots(bool(weighted))
+        # The free rows' records, packed or split (row_metadata.split_records): the builder, the count and the stage
+        # read either.
+        self.free_words = record_words(True, bool(split))
+        self.stage_kernel = stage_slots(bool(weighted), bool(split))
         self.build_kernel = build_units_kernel(
             self.mf_rows,
             int(dofs),
             rule=rule,
             device_arch=device.arch,
             torsion=torsion,
+            split=bool(split),
         )
         self.device = device
 
@@ -1166,6 +1198,7 @@ class ColoredUnits:
                 row_record,
                 int(dense_record_words),
                 body_base,
+                self.free_words,
                 self.mf_rows,
                 int(self.rule.min_units),
                 self.count_chunks,

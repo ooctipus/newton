@@ -590,7 +590,14 @@ def _colored_units(
     device's resident blocks). The world's dense rows go first, by their runs (``dense_share``, :func:`dense_runs`):
     posted to the group the same way where they take it, else on the world's block alone."""
     unit_rows = WorldRows(
-        M_MF, Place.STREAMED, free=True, stream=free.stream, lanes=Lanes(1), slots=free.slots, wide=free.wide
+        M_MF,
+        Place.STREAMED,
+        free=True,
+        stream=free.stream,
+        lanes=Lanes(1),
+        split=free.split,
+        slots=free.slots,
+        wide=free.wide,
     )
     torsion = laws.torsion
     layout = sweep_units.slot_layout(torsion)
@@ -672,7 +679,6 @@ meta.x = 0;
 meta.y = W[r * 3];
 meta.z = W[r * 3 + 1];
 meta.w = W[r * 3 + 2];
-const int packed_tp = meta.w;
 // The unit builder's rows: a contact, then its friction pair (each copy knows its kind).
 const int mf_rt = r == 0 ? {ROW_CONTACT} : {ROW_FRICTION};
 const float mf_diag = __int_as_float(meta.y);"""
@@ -681,7 +687,8 @@ const float mf_diag = __int_as_float(meta.y);"""
         laws,
         rows="rows",
         declare=declare,
-        parent=unit_rows.parent_of("packed_tp"),
+        # A unit's friction rows' parent is its normal (the unit builder's rule), whatever the record's form.
+        parent="unit_row",
         check="mf_diag",
         pad=" " * 20,
     )
@@ -2875,8 +2882,6 @@ class GeneralSweep(SweepConfig):
             raise ValueError("the general sweep's free bodies step in order or by exact levels (colored)")
         if self.colored and not self.free_rows:
             raise ValueError("the colored mapping sweeps the free bodies' run: it needs free_rows")
-        if self.split and self.colored and not self.regions:
-            raise ValueError("the colored mapping's unit builder reads packed records, not split ones")
         if self.material and not self.weighted:
             raise ValueError("material contacts step by their weights: their sweeps are weighted")
         if self.formed not in ("inline", "ahead", "stage"):

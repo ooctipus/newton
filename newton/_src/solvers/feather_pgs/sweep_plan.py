@@ -47,6 +47,7 @@ from .field_group import Field, FieldGroup
 from .friction_patches import patch_routes
 from .path_selection import json_value, kernel_key
 from .region_sweep import PAIR_SIDE, Regions
+from .row_metadata import split_records
 from .solve_policy import QUIET_UNITS, UNIT_ROUNDOFF, SolvePolicy, SolveReadoutRecord
 from .sweep import EXACT, FREE_HEAD, FRICTION_METRIC_FLOATS, LevelLaw, SweepConfig, sweep_kernel
 from .sweep_levels import (
@@ -497,17 +498,23 @@ class Sweep:
                 )
             if model.device.is_cuda and capable.size > 0:
                 found = device(model.device)
-                # The block's shape (a split line's block takes regions, the unit builder reading packed records).
+                # The block's shape (a split line's block takes regions where its contacts may be regions).
                 colored_work = dataclasses.replace(
-                    self.general_sweep, regions=bool(self.placement.split_records), **_COLORED
+                    self.general_sweep, regions=bool(self.placement.split_records and self.pins.regions), **_COLORED
                 ).work()
                 rule = rule.at_scale(capable.size, shape(colored_work, found).blocks_per_sm * found.sms)
                 capable = sweep_units.capable_worlds(
                     self.forest.free_rigid_per_world, self.placement.mf_max_constraints, rule
                 )
-            # Its contact units' builder reads packed records, so a split line (a world past a block's reach) takes
-            # none: those worlds' contacts are regions.
-            colored = bool(model.device.is_cuda and capable.size > 0 and not self.placement.split_records)
+            # Its contact units' builder reads packed or split records; a unit holds its sides' first coordinates in
+            # 16-bit halves, so a world past them takes none. A split line (a world past a packed record's reach)
+            # keeps its contacts regions where they may be regions (the pin keeps them rows: its units).
+            colored = bool(
+                model.device.is_cuda
+                and capable.size > 0
+                and not split_records(self.forest.max_world_dofs, 0)
+                and not (self.placement.split_records and self.pins.regions)
+            )
             # The free bodies' contacts are regions where no world can take the colored mapping's contact units; the
             # sweeps then start from rest (the warm start by contact identity seeds rows).
             if (
@@ -727,6 +734,7 @@ class Sweep:
                     world_cost=self.world_cost,
                     support=self.placement.packed_support,
                     group=self.world_blocks,
+                    split=self.placement.split_records,
                 )
             # The general sweep walks its bucket on a persistent grid, a warp a world (its work's shape); the colored
             # bucket a block a world of its slots, a color's units at once.
