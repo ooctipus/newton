@@ -43,7 +43,7 @@ def level_pass(
     *,
     units: str,
     resources: str,
-    counts: str,
+    counts: str | None,
     store: str,
     lanes: int | str = 32,
     after: bool = False,
@@ -65,9 +65,10 @@ def level_pass(
     ``resources`` declares, for lane's ``unit`` (``valid`` when it is below ``units``; ``resources`` may clear it for
     a unit that takes no level), its resources ``node_a`` and ``node_b``: compact ids into the warp's ``node_level``
     (-1, or any other value no level overwrites), or -1 for none. ``counts`` formats an index into the units of each
-    level so far: zero at the start for levels ``[0, units]``, and the batch's counts added. ``store`` keeps a valid
-    unit's ``level`` and ``rank``; with ``after`` it may also read ``after_a`` and ``after_b``, the levels its resources
-    held before it (its latest earlier unit's on each, -1 for none or no resource). The fragment runs on every lane of
+    level so far: zero at the start for levels ``[0, units]``, and the batch's counts added; with none the pass levels
+    alone (no ``rank``). ``store`` keeps a valid unit's ``level`` and ``rank``; with ``after`` it may also read
+    ``after_a`` and ``after_b``, the levels its resources held before it (its latest earlier unit's on each, -1 for
+    none or no resource). The fragment runs on every lane of
     the warp, uses the lane group, ``lane`` and the names ``resources`` and ``store`` read, and declares ``levels``, the
     world's level count, on every lane. ``lanes`` is the group: a warp, the CPU's one thread (a batch of one unit), or a
     lane group of a native expression's lanes (``STRIDE``), whose words are the lane group's (``MATCH``, ``BELOW``,
@@ -114,7 +115,7 @@ def level_pass(
         else ""
     )
     before, during = ahead
-    count_at = counts.format("level")
+    count_at = counts.format("level") if counts is not None else ""
     if turns:
         # The block's warps in turn: a batch's warp finds its predecessors, then takes its turn from the warp before
         # it by a named barrier of the two warps (1 + its warp; 0 is the block's); the held levels and the counts are
@@ -165,6 +166,22 @@ def level_pass(
             const int held_a = res_a >= 0 ? {load("node_level[res_a]")} : -1;
             const int held_b = res_b >= 0 ? {load("node_level[res_b]")} : -1;
 """
+    # The batch's counts of each level and each unit's rank among its level's units in row order, where counted.
+    if counts is not None:
+        ranked = f"""            const unsigned same = {same};
+            const int below = {below};
+            const int earlier = valid ? {load(count_at)} : 0;
+            SYNC();
+            if (valid && below == 0) {put(count_at, f"earlier + {count}")};{release}
+            if (valid) {{
+                const int rank = earlier + below;
+                {store}
+            }}"""
+    else:
+        ranked = f"""{release.lstrip(chr(10))}
+            if (valid) {{
+                {store}
+            }}"""
     # One warp reads the held levels first (their loads in flight with the batch's own work); a turn reads them last.
     # A turn's next loads follow its hand-off: the hand-off's fence would wait for a load in flight.
     early, late = ("", wait + held_levels) if turns else (held_levels + during, "")
@@ -200,15 +217,7 @@ def level_pass(
             }}{held}
             if (res_a >= 0 && last_a) {put("node_level[res_a]", "level")};
             if (res_b >= 0 && last_b) {put("node_level[res_b]", "level")};
-            const unsigned same = {same};
-            const int below = {below};
-            const int earlier = valid ? {load(count_at)} : 0;
-            SYNC();
-            if (valid && below == 0) {put(count_at, f"earlier + {count}")};{release}
-            if (valid) {{
-                const int rank = earlier + below;
-                {store}
-            }}
+{ranked}
             levels = max(levels, level + 1);
         }}
 {end}"""

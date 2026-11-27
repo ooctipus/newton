@@ -129,14 +129,16 @@ UNIT_FIELDS = FieldGroup(
     # Packed first coordinates of the unit's bodies (``dof_a << 16 | dof_b``, as the rows' packed word).
     Field("unit_dofs", wp.int32, ("pool",)),
     Field("unit_color", wp.int32, ("pool",)),
-    # The unit's place among its color's units, in row order, and the colors of its latest earlier unit on each of its
-    # bodies (-1 for none) (the builder's scratch).
+    # The unit's place among its color's units in row order (first its place among its island's units of its block's
+    # run), and the colors of its latest earlier unit on each of its bodies (-1 for none) (the builder's scratch).
     Field("unit_rank", wp.int32, ("pool",)),
     Field("unit_after", wp.int32, ("pool", 2)),
-    # Where a world's islands take the sweep's group of blocks: each unit's island (its root body), then its block, and
-    # the units of each (block, color), then their first places (the builder's scratch).
+    # Each unit's island (its root body), then where a world's islands take the sweep's group of blocks its block; each
+    # run's units of each color, then the units of each (block, color) and their first places (the builder's scratch).
     Field("unit_block", wp.int32, ("pool",)),
     Field("unit_keys", wp.int32, ("pool",)),
+    # Each island's units in row order, the islands in root order (the builder's scratch: the level pass's order).
+    Field("unit_order", wp.int32, ("pool",)),
     # Colors: offsets into color_slot (count + 1 of them; at most one color per unit), and the units of each color in
     # row order, each as the record the sweep reads: first row, row count and its bodies' first coordinates.
     Field("color_offset", wp.int32, ("pool",)),
@@ -450,8 +452,7 @@ def capable_worlds(free_bodies, mf_rows: int, rule: ColoredRule = COLORED_RULE):
 
 
 _BUILD_SOURCE = r"""
-    // Shared scratch (declared by build_staging): a bitmap of the body coordinates the units use and its word prefix
-    // (compact body ids), per body its latest level and its owner in a leveling round, and the warps' counts.
+    // Shared scratch (declared by build_staging): the warps' counts and the level pass's turn word.
 SHARED_DECLARATIONS
     const int lane = LANE;
     const int tid = (int)threadIdx.x;
@@ -490,15 +491,13 @@ SHARED_DECLARATIONS
     }
 
     // The world's group: as many of its blocks as its rows give a thread each, at most its ``group`` (``spread``),
-    // each a run of the rows (the others return). They count their units, then take their places in row order and
-    // their bodies' coordinates (the world's bitmap in global memory past one block); the world's block levels them,
-    // then the group finds their islands and places them. They meet through counts (``unit_meets``: the counts in and
-    // the islands' passes, the units written, the places open, the units placed; then each block's count or share of
-    // an ordered pass, and its largest value).
+    // each a run of the rows (the others return). They count their units, take their places in row order, then find
+    // their islands, level them and place them. They meet through counts (``unit_meets``: the counts in and every
+    // later pass, the units written, the units placed; then each block's count or share of an ordered pass, and its
+    // largest value).
     const int spread = min(group, max((end + THREADS - 1) / THREADS, 1));
     if (rank >= spread) return;
     int* const meets = unit_meets.data + (size_t)slot * unit_meets.shape[1];
-    unsigned* const bits = reinterpret_cast<unsigned*>(unit_bits.data + (size_t)slot * unit_bits.shape[1]);
     const auto MEET = [&](const int word, const int count) {
         __syncthreads();
         if (tid == 0) {
@@ -512,10 +511,6 @@ SHARED_DECLARATIONS
     };
     const int share = (end + spread - 1) / spread;
     const int lo = min(rank * share, end), hi = min(lo + share, end);
-    if (rank == 0) {
-        for (int w = tid; w < WORDS; w += THREADS) used_bits[w] = 0u;
-        for (int n = tid; n < NODES; n += THREADS) node_level[n] = -1;
-    }
     int units = 0, all = 0;
     if (spread > 1) {
         // Each block's units, then the units before its run.
@@ -577,37 +572,15 @@ SHARED_DECLARATIONS
             unit_row.data[off_mf + unit] = row;
             unit_rows.data[off_mf + unit] = rows;
             unit_dofs.data[off_mf + unit] = dofs;
-            const int dof_a = dofs >> 16, dof_b = (dofs << 16) >> 16;
-            unsigned* const used = spread > 1 ? bits : used_bits;
-            if (dof_a >= 0) atomicOr(&used[dof_a >> 5], 1u << (dof_a & 31));
-            if (dof_b >= 0) atomicOr(&used[dof_b >> 5], 1u << (dof_b & 31));
         }
         units += total;
         __syncthreads();
     }
     }
+    // The world's units once every block wrote its run (the others returned past the pool's room).
     if (spread > 1) {
-        // The world's block: the units' count and the group's bitmap (cleared for the next build) once every block
-        // wrote; the others wait for the places to open.
-        if (rank > 0) {
-            MEET(1, spread);
-            if (tid == 0) {
-                const volatile int* const open = &meets[2];
-                while (*open == 0) { }
-                __threadfence();
-            }
-            __syncthreads();
-            if (reinterpret_cast<volatile int*>(meets)[2] != 1) return;
-            units = reinterpret_cast<volatile int*>(meets)[3];
-        } else {
-            if (units <= room) MEET(1, spread);
-            units = all;
-            for (int w = tid; w < WORDS; w += THREADS) {
-                used_bits[w] = bits[w];
-                bits[w] = 0u;
-            }
-            __syncthreads();
-        }
+        if (all <= room) MEET(1, spread);
+        units = all;
     }
     if (rank == 0 && units > room) {
         // Past the pool's end: the one-warp sweep keeps the world, and the units' capacity status records it once.
@@ -622,158 +595,239 @@ SHARED_DECLARATIONS
         }
         return;
     }
-    int colors = 0;
-    if (rank == 0) {
-    // A unit's level is at most its index: the counts of colors [0, units] start at zero.
-    for (int c = tid; c <= units; c += THREADS) color_offset.data[off_color + c] = 0;
-    // Compact body ids: the rank of a body's first coordinate among the used ones (a scan of the bitmap's counts).
-    if (warp == 0) {
-        int carry = 0;
-        for (int base = 0; base < WORDS; base += 32) {
-            const int w = base + lane;
-            const int count = w < WORDS ? __popc(used_bits[w]) : 0;
-            const int below = SCAN(count);
-            if (w < WORDS) used_prefix[w] = carry + below;
-            carry += READ(below + count, 31);
-        }
-    }
-    __syncthreads();
-    const auto NODE = [&](int dof) -> int {
-        return used_prefix[dof >> 5] + __popc(used_bits[dof >> 5] & ((1u << (dof & 31)) - 1u));
-    };
-
-    // Levels in row order (the level builder's pass, the block's warps in turn): a unit's color is one past the latest
-    // color of its bodies, so units on a body keep their row order. The counts of colors [0, units] start at zero; a
-    // unit's rank is its place among its color's units in row order.
-    {
-LEVEL_PASS
-        if (tid == 0) color_count.data[world] = levels;
-    }
-    // Color offsets: an exclusive scan of the counts, in place; offset `colors` is the unit count.
-    colors = colors_s[0];
-LEVEL_OFFSETS
-    }
-    if (spread > 1 && rank == 0) {
-        // The places open to the group, with the units' count.
+    // The passes over the units take as many of the group's blocks as the units give a thread each (``passes``; the
+    // others count in and return): a block more pays the passes' meets. They meet at word 0 (which the units' count
+    // met at once where the group is more than one block); a world of one block meets at its barrier.
+    const int passes = min(spread, max((units + THREADS - 1) / THREADS, 1));
+    if (rank >= passes) {
         __syncthreads();
         if (tid == 0) {
-            meets[3] = units;
             __threadfence();
-            atomicExch(&meets[2], 1);
+            atomicAdd(&meets[1], 1);
         }
+        return;
     }
-    const int world_colors = color_count.data[world];
-    // Islands to blocks, where the sweep takes a group of ``sweep_blocks`` blocks a world, over the builder's group: the
-    // units' islands (their bodies joined by union-find on their slots in global memory, the lowest root wins whatever
-    // order the unions run in), each island's units, and where every island's units fit a block's threads at each of
-    // the world's colors, each island a block by its first place among the islands in root order (whole islands,
-    // balanced by units) and the units placed by (block, color), each block's first place in ``island_first`` (its last
-    // word: whether the world's islands take blocks). The group's blocks meet between the passes; an ordered pass (a
-    // scan) is each block's share summed, a meet, then each share scanned after the sums of the shares before it.
-    bool by_island = false;
-    if (sweep_blocks > 1) {
-        int* const parent = unit_nodes.data + (size_t)slot * unit_nodes.shape[1];
-        int* const sizes = parent + NODES;
-        int* const keys_at = unit_keys.data + off_mf;
-        const int keys = sweep_blocks * world_colors;
-        // The group's meets (word 0, which the units' count met at once).
-        int met = 1;
-        const auto GROUP_MEET = [&]() {
-            if (spread > 1) MEET(0, ++met * spread);
-            else __syncthreads();
-        };
-        const int first = rank * THREADS + tid, stride = spread * THREADS;
-        for (int n = first; n < NODES; n += stride) {
-            parent[n] = n;
-            sizes[n] = 0;
+    int met = spread > 1 ? spread : 0;
+    const auto GROUP_MEET = [&]() {
+        if (passes > 1) MEET(0, met += passes);
+        else __syncthreads();
+    };
+    const int first = rank * THREADS + tid, stride = passes * THREADS;
+    // An exclusive scan in place of ``n`` values over the group, each block a run of them (its largest value too).
+    const auto GROUP_SCAN = [&](int* const values, const int n) -> int {
+        const int share = (n + passes - 1) / passes;
+        const int lo = min(rank * share, n), hi = min(lo + share, n);
+        const int chunk = (hi - lo + THREADS - 1) / THREADS;
+        const int a = min(lo + tid * chunk, hi), b = min(a + chunk, hi);
+        int sum = 0, most = 0;
+        for (int k = a; k < b; ++k) {
+            sum += values[k];
+            most = max(most, values[k]);
         }
-        if (keys <= units)
-            for (int k = first; k < keys; k += stride) keys_at[k] = 0;
-        GROUP_MEET();
-        // A body's island root, halving its path on the way (a node only ever moves closer to its root).
-        const auto FIND = [&](int x) -> int {
-            volatile int* const up = parent;
-            for (;;) {
-                const int p = up[x];
-                if (p == x) return x;
-                const int g = up[p];
-                if (g != p) up[x] = g;
-                x = g;
-            }
-        };
-        for (int unit = first; unit < units; unit += stride) {
-            const int dofs = unit_dofs.data[off_mf + unit];
-            const int dof_a = dofs >> 16, dof_b = (dofs << 16) >> 16;
-            if (dof_a < 0 || dof_b < 0 || dof_a == dof_b) continue;
-            int a = dof_a / 6, b = dof_b / 6;
-            for (;;) {
-                a = FIND(a);
-                b = FIND(b);
-                if (a == b) break;
-                if (a > b) { const int t = a; a = b; b = t; }
-                if (atomicCAS(&parent[b], b, a) == b) break;
-            }
+        const int below = SCAN(sum);
+        MAXIMUM(most);
+        if (lane == 31) warp_count[warp] = below + sum;
+        if (lane == 0) warp_count[WARPS + warp] = most;
+        __syncthreads();
+        int carry = below, total = 0;
+        most = 0;
+        for (int w = 0; w < WARPS; ++w) {
+            if (w < warp) carry += warp_count[w];
+            total += warp_count[w];
+            most = max(most, warp_count[WARPS + w]);
         }
-        GROUP_MEET();
-        for (int unit = first; unit < units; unit += stride) {
-            const int dofs = unit_dofs.data[off_mf + unit];
-            const int dof_a = dofs >> 16, dof_b = (dofs << 16) >> 16;
-            const int root = FIND((dof_a >= 0 ? dof_a : dof_b) / 6);
-            unit_block.data[off_mf + unit] = root;
-            atomicAdd(&sizes[root], 1);
-        }
-        GROUP_MEET();
-        // An exclusive scan in place of ``n`` values over the group, each block a run of them (its largest value too).
-        const auto GROUP_SCAN = [&](int* const values, const int n) -> int {
-            const int share = (n + spread - 1) / spread;
-            const int lo = min(rank * share, n), hi = min(lo + share, n);
-            const int chunk = (hi - lo + THREADS - 1) / THREADS;
-            const int a = min(lo + tid * chunk, hi), b = min(a + chunk, hi);
-            int sum = 0, most = 0;
-            for (int k = a; k < b; ++k) {
-                sum += values[k];
-                most = max(most, values[k]);
-            }
-            const int below = SCAN(sum);
-            MAXIMUM(most);
-            if (lane == 31) warp_count[warp] = below + sum;
-            if (lane == 0) warp_count[WARPS + warp] = most;
-            __syncthreads();
-            int carry = below, total = 0;
-            most = 0;
-            for (int w = 0; w < WARPS; ++w) {
-                if (w < warp) carry += warp_count[w];
-                total += warp_count[w];
-                most = max(most, warp_count[WARPS + w]);
-            }
-            if (spread > 1) {
-                if (tid == 0) {
-                    meets[4 + rank] = total;
-                    meets[4 + spread + rank] = most;
-                }
-                GROUP_MEET();
-                int before = 0;
-                most = 0;
-                for (int r = lane; r < spread; r += 32) {
-                    const volatile int* const shares = meets;
-                    if (r < rank) before += shares[4 + r];
-                    most = max(most, shares[4 + spread + r]);
-                }
-                carry += __reduce_add_sync(0xffffffffu, before);
-                most = __reduce_max_sync(0xffffffffu, most);
-            }
-            for (int k = a; k < b; ++k) {
-                const int value = values[k];
-                values[k] = carry;
-                carry += value;
+        if (passes > 1) {
+            if (tid == 0) {
+                meets[4 + rank] = total;
+                meets[4 + passes + rank] = most;
             }
             GROUP_MEET();
-            return most;
-        };
-        // The islands' first places: their units in root order; the largest island's units.
-        const int largest = GROUP_SCAN(sizes, NODES);
+            int before = 0;
+            most = 0;
+            for (int r = lane; r < passes; r += 32) {
+                const volatile int* const shares = meets;
+                if (r < rank) before += shares[4 + r];
+                most = max(most, shares[4 + passes + r]);
+            }
+            carry += __reduce_add_sync(0xffffffffu, before);
+            most = __reduce_max_sync(0xffffffffu, most);
+        }
+        for (int k = a; k < b; ++k) {
+            const int value = values[k];
+            values[k] = carry;
+            carry += value;
+        }
+        GROUP_MEET();
+        return most;
+    };
+    // Each of a run's items ``lo`` to ``hi`` (in order) its rank among the run's items of its key, by the block's
+    // warps in turn, a batch of 32 a turn (a warp finds its batch's peers, then in its turn reads the key's count so
+    // far and leaves it with its batch's added): ``ranks[item]``, and the run's count of each key in ``counts`` (zero
+    // before). The turns are the level pass's: named barriers of two warps, the counts relaxed at the block's scope.
+    const auto RUN_RANKS = [&](const int lo, const int hi, const auto& key_of, int* const counts, int* const ranks) {
+        const int batches = (hi - lo + 31) / 32;
+        for (int g = warp; g < batches; g += WARPS) {
+            const int item = lo + g * 32 + lane;
+            const bool valid = item < hi;
+            const int key = valid ? key_of(item) : -1;
+            const unsigned peers = __match_any_sync(0xffffffffu, key);
+            if (g > 0) asm volatile("bar.sync %0, 64;" ::"r"(1 + warp) : "memory");
+            int held = 0;
+            if (valid) asm volatile("ld.relaxed.cta.s32 %0, [%1];" : "=r"(held) : "l"(&counts[key]) : "memory");
+            __syncwarp();
+            if (valid && (peers >> lane) == 1u)
+                asm volatile("st.relaxed.cta.s32 [%0], %1;" ::"l"(&counts[key]), "r"(held + __popc(peers)) : "memory");
+            if (valid) ranks[item] = held + __popc(peers & ((1u << lane) - 1u));
+            __threadfence_block();
+            if (g + 1 < batches) asm volatile("bar.arrive %0, 64;" ::"r"(1 + (warp + 1) % WARPS) : "memory");
+        }
+        __syncthreads();
+    };
+    // The world's bodies by their first coordinate's slot (dof / 6): their island parents and sizes, then the islands'
+    // first places; their latest levels; and each block's count of each island's units in its run (zero between
+    // builds).
+    int* const parent = unit_nodes.data + (size_t)slot * unit_nodes.shape[1];
+    int* const sizes = parent + NODES;
+    int* const node_level = sizes + NODES;
+    int* const shares = node_level + NODES;
+    int* const keys_at = unit_keys.data + off_mf;
+    for (int n = first; n < NODES; n += stride) {
+        parent[n] = n;
+        sizes[n] = 0;
+        node_level[n] = -1;
+    }
+    GROUP_MEET();
+    // Islands: the units' bodies joined by union-find (the lowest root wins whatever order the unions run in), each
+    // unit's island its root, each island's units.
+    const auto FIND = [&](int x) -> int {
+        volatile int* const up = parent;
+        for (;;) {
+            const int p = up[x];
+            if (p == x) return x;
+            const int g = up[p];
+            if (g != p) up[x] = g;  // halving: a node only ever moves closer to its root
+            x = g;
+        }
+    };
+    for (int unit = first; unit < units; unit += stride) {
+        const int dofs = unit_dofs.data[off_mf + unit];
+        const int dof_a = dofs >> 16, dof_b = (dofs << 16) >> 16;
+        if (dof_a < 0 || dof_b < 0 || dof_a == dof_b) continue;
+        int a = dof_a / 6, b = dof_b / 6;
+        for (;;) {
+            a = FIND(a);
+            b = FIND(b);
+            if (a == b) break;
+            if (a > b) { const int t = a; a = b; b = t; }
+            if (atomicCAS(&parent[b], b, a) == b) break;
+        }
+    }
+    GROUP_MEET();
+    for (int unit = first; unit < units; unit += stride) {
+        const int dofs = unit_dofs.data[off_mf + unit];
+        const int dof_a = dofs >> 16, dof_b = (dofs << 16) >> 16;
+        const int root = FIND((dof_a >= 0 ? dof_a : dof_b) / 6);
+        unit_block.data[off_mf + unit] = root;
+        atomicAdd(&sizes[root], 1);
+    }
+    GROUP_MEET();
+    // The islands' first places in root order (the islands' order); the largest island's units.
+    const int largest = GROUP_SCAN(sizes, NODES);
+    const auto ISLAND_UNITS = [&](const int n) -> int { return (n + 1 < NODES ? sizes[n + 1] : units) - sizes[n]; };
+    // Each island's units in row order (``unit_order``): each block ranks its run's units in their islands (its counts
+    // its row of ``shares``); a unit's place is its island's first, then its island's units in the runs before, then
+    // its rank. Each block levels the islands whose first places fall in its share of the places (whole islands,
+    // balanced by units): the first and the end of its places (``meets``, the least first place at or past it).
+    if (tid == 0) meets[4 + rank] = units;
+    const int unit_lo = (int)((long long)rank * units / passes), unit_hi = (int)((long long)(rank + 1) * units / passes);
+    RUN_RANKS(unit_lo, unit_hi, [&](const int unit) { return unit_block.data[off_mf + unit]; }, shares + rank * NODES,
+              unit_rank.data + off_mf);
+    GROUP_MEET();
+    for (int n = first; n < NODES; n += stride) {
+        if (ISLAND_UNITS(n) == 0) continue;
+        int before = 0;
+        for (int r = 0; r < passes; ++r) {
+            const int count = shares[r * NODES + n];
+            shares[r * NODES + n] = before;
+            before += count;
+        }
+        if (passes > 1) atomicMin(&meets[4 + (int)((long long)sizes[n] * passes / units)], sizes[n]);
+    }
+    GROUP_MEET();
+    for (int unit = unit_lo + tid; unit < unit_hi; unit += THREADS) {
+        const int root = unit_block.data[off_mf + unit];
+        unit_order.data[off_mf + sizes[root] + shares[rank * NODES + root] + unit_rank.data[off_mf + unit]] = unit;
+    }
+    int span_lo = 0, span_hi = units;
+    if (passes > 1) {
+        int from = units, to = units;
+        for (int r = lane; r < passes; r += 32) {
+            const int at = reinterpret_cast<volatile int*>(meets)[4 + r];
+            if (r >= rank) from = min(from, at);
+            if (r > rank) to = min(to, at);
+        }
+        span_lo = __reduce_min_sync(0xffffffffu, from);
+        span_hi = __reduce_min_sync(0xffffffffu, to);
+    }
+    GROUP_MEET();
+    for (int n = first; n < NODES; n += stride)
+        if (ISLAND_UNITS(n) != 0)
+            for (int r = 0; r < passes; ++r) shares[r * NODES + n] = 0;
+    // Levels by islands (the level pass on the block's places, its warps in turn): a unit's color is one past the
+    // latest color of its bodies, so units on a body keep their row order; islands share no body, so each island's
+    // levels are the world's.
+    const int span = span_hi - span_lo;
+    int colors = 0;
+    {
+LEVEL_PASS
+        if (tid == 0) meets[4 + passes + rank] = levels;
+        colors = levels;
+    }
+    GROUP_MEET();
+    if (passes > 1) {
+        int most = 0;
+        for (int r = lane; r < passes; r += 32) most = max(most, reinterpret_cast<volatile int*>(meets)[4 + passes + r]);
+        colors = __reduce_max_sync(0xffffffffu, most);
+    }
+    if (rank == 0 && tid == 0) color_count.data[world] = colors;
+    // Each unit's rank among its color's units in row order, as the islands' (``keys_at``, a row of the colors a run,
+    // as many runs as the world's units hold rows of its colors); then the colors' first places.
+    const int runs = min(passes, units / max(colors, 1));
+    for (int k = first; k < runs * colors; k += stride) keys_at[k] = 0;
+    for (int c = first; c <= colors; c += stride) color_offset.data[off_color + c] = 0;
+    GROUP_MEET();
+    const int run_lo = (int)((long long)rank * units / max(runs, 1)), run_hi = (int)((long long)(rank + 1) * units / max(runs, 1));
+    if (rank < runs)
+        RUN_RANKS(run_lo, run_hi, [&](const int unit) { return unit_color.data[off_mf + unit]; }, keys_at + rank * colors,
+                  unit_rank.data + off_mf);
+    GROUP_MEET();
+    for (int c = first; c < colors; c += stride) {
+        int before = 0;
+        for (int r = 0; r < runs; ++r) {
+            const int count = keys_at[r * colors + c];
+            keys_at[r * colors + c] = before;
+            before += count;
+        }
+        color_offset.data[off_color + c] = before;
+    }
+    GROUP_MEET();
+    if (rank < runs)
+        for (int unit = run_lo + tid; unit < run_hi; unit += THREADS)
+            unit_rank.data[off_mf + unit] += keys_at[rank * colors + unit_color.data[off_mf + unit]];
+    // Color offsets: an exclusive scan of the counts, in place; offset ``colors`` is the unit count.
+    GROUP_SCAN(color_offset.data + off_color, colors + 1);
+    const int world_colors = colors;
+    // Islands to blocks, where the sweep takes a group of ``sweep_blocks`` blocks a world: where every island's units
+    // fit a block's threads at each of the world's colors, each island a block by its first place (whole islands,
+    // balanced by units) and the units placed by (block, color), each block's first place in ``island_first`` (its
+    // last word: whether the world's islands take blocks).
+    bool by_island = false;
+    if (sweep_blocks > 1) {
+        const int keys = sweep_blocks * world_colors;
         by_island = largest <= THREADS * world_colors && keys <= units;
         if (by_island) {
+            for (int k = first; k < keys; k += stride) keys_at[k] = 0;
+            GROUP_MEET();
             for (int unit = first; unit < units; unit += stride) {
                 const int block = (int)((long long)sizes[unit_block.data[off_mf + unit]] * sweep_blocks / units);
                 unit_block.data[off_mf + unit] = block;
@@ -793,10 +847,10 @@ LEVEL_OFFSETS
     // Each color's units in row order: a unit's position is its color's offset plus its rank; where the world's islands
     // take blocks, its (block, color)'s first place and a ticket (units of one color share no body: their order is
     // free).
-    for (int unit = rank * THREADS + tid; unit < units; unit += spread * THREADS) {
+    for (int unit = first; unit < units; unit += stride) {
         const int color = unit_color.data[off_mf + unit];
         const int position = by_island
-            ? atomicAdd(&unit_keys.data[off_mf + unit_block.data[off_mf + unit] * world_colors + color], 1)
+            ? atomicAdd(&keys_at[unit_block.data[off_mf + unit] * world_colors + color], 1)
             : color_offset.data[off_color + color] + unit_rank.data[off_mf + unit];
         const int dofs = unit_dofs.data[off_mf + unit];
         const int at = (off_mf + position) * 4;
@@ -833,36 +887,32 @@ LEVEL_OFFSETS
 """
 
 
-_UNIT_RESOURCES = """            const int dofs = valid ? unit_dofs.data[off_mf + unit] : 0;
+_UNIT_RESOURCES = """            const int id = valid ? unit_order.data[off_mf + span_lo + unit] : 0;
+            const int dofs = valid ? unit_dofs.data[off_mf + id] : 0;
             const int dof_a = valid ? dofs >> 16 : -1;
             int dof_b = valid ? (dofs << 16) >> 16 : -1;
             if (dof_b == dof_a) dof_b = -1;
-            const int node_a = dof_a >= 0 ? NODE(dof_a) : -1;
-            const int node_b = dof_b >= 0 ? NODE(dof_b) : -1;"""
-"""A unit's resources: its bodies, by the compact ids of their first coordinates."""
+            const int node_a = dof_a >= 0 ? dof_a / 6 : -1;
+            const int node_b = dof_b >= 0 ? dof_b / 6 : -1;"""
+"""A unit's resources: the unit at its place among the block's island-ordered places, its bodies by their first
+coordinates' slots."""
 
 _LEVEL_PASS = sweep_levels.level_pass(
-    units="units",
+    units="span",
     resources=_UNIT_RESOURCES,
-    counts="color_offset.data[off_color + {}]",
-    store="unit_color.data[off_mf + unit] = level;\n                unit_rank.data[off_mf + unit] = rank;"
-    "\n                unit_after.data[(off_mf + unit) * 2] = after_a;\n                unit_after.data[(off_mf + unit) * 2 + 1] = after_b;",
+    counts=None,
+    store="unit_color.data[off_mf + id] = level;"
+    "\n                unit_after.data[(off_mf + id) * 2] = after_a;\n                unit_after.data[(off_mf + id) * 2 + 1] = after_b;",
     after=True,
     turns="colors_s[0]",
 )
-_LEVEL_OFFSETS = sweep_levels.level_offsets(levels="colors", counts="color_offset.data[off_color + {}]")
 
 
 @cache
 def build_staging(dofs: int) -> Staging:
     """The unit builder's shared working set for a world of ``dofs`` coordinates."""
-    nodes = dofs // 6 + 1
-    words = (dofs + 31) // 32
     return Staging(
         (
-            Buffer("used_bits", "unsigned", words),
-            Buffer("used_prefix", "int", words),
-            Buffer("node_level", "int", nodes),
             Buffer("warp_count", "int", 2 * BUILD_WARPS),
             Buffer("colors_s", "int", 1),
         ),
@@ -934,7 +984,6 @@ def build_units_kernel(
     else:
         row_parent = f"({record_parent('PACKED_WORD', mf_rows)})"
         row_dofs = "row_record.data[off_meta + (ROW) * FREE_WORDS]"
-    words = (dofs + 31) // 32
     body = _BUILD_SOURCE
     if torsion:
         body = f"#define TORSION {int(ROW_TORSION)}\n" + body.replace(_UNIT_ROWS, _SPIN_UNIT_ROWS)
@@ -942,18 +991,16 @@ def build_units_kernel(
     source = (
         f"#define MF_ROWS {mf_rows}\n#define FREE_WORDS {free_words}\n#define MIN_UNITS {int(rule.min_units)}\n"
         f"#define WARPS {BUILD_WARPS}\n#define COLORED(N_UNITS, N_COLORS) {rule.condition('(N_UNITS)', '(N_COLORS)')}\n"
-        f"#define THREADS {32 * BUILD_WARPS}\n#define NODES {dofs // 6 + 1}\n#define WORDS {words}\n"
+        f"#define THREADS {32 * BUILD_WARPS}\n#define NODES {dofs // 6 + 1}\n"
         f"#define CONTACT {int(ROW_CONTACT)}\n#define FRICTION {int(ROW_FRICTION)}\n"
         f"#define ROW_PARENT(ROW, PACKED_WORD) {row_parent}\n#define ROW_DOFS(ROW) {row_dofs}\n"
         # The general sweep's cost class of the world (sweep_levels.cost_bucket), from the general one on.
         f"#define GENERAL_CLAIM (general_bucket + {COST_CLASSES - 1} - min(max(world_cost.data[world], 0), {COST_CLASSES - 1}))\n"
         + body.replace("SHARED_DECLARATIONS", staging.declarations())
         .replace("LEVEL_PASS", _LEVEL_PASS)
-        .replace("LEVEL_OFFSETS", _LEVEL_OFFSETS)
         .replace(
             "#endif",
             "#undef MF_ROWS\n#undef FREE_WORDS\n#undef MIN_UNITS\n#undef COLORED\n#undef WARPS\n#undef THREADS\n#undef NODES\n"
-            "#undef WORDS\n"
             "#undef CONTACT\n#undef FRICTION\n#undef ROW_PARENT\n#undef ROW_DOFS\n#undef GENERAL_CLAIM\n#endif",
         )
     )
@@ -979,17 +1026,18 @@ def build_units_kernel(
         ("world_cost", wp.array[wp.int32]),
         ("acts", wp.array[wp.int32]),
         ("pass_words", wp.array[wp.int32]),
-        # A world's group of blocks (``unit_blocks`` a world): their meets, its coordinates' bitmap and its bodies'
-        # island parents and sizes (by their first coordinate's slot, ``dof // 6``).
+        # A world's group of blocks (``unit_blocks`` a world): their meets, and by its bodies' first coordinates' slots
+        # (``dof // 6``) their island parents, sizes and latest levels, then each block's count of each island's units.
         ("unit_meets", wp.array2d[wp.int32]),
-        ("unit_bits", wp.array2d[wp.int32]),
         ("unit_nodes", wp.array2d[wp.int32]),
         # The sweep's blocks a world and, where its islands take them, each block's first place (island_first).
         ("sweep_blocks", int),
         ("island_first", wp.array2d[wp.int32]),
     )
     return KernelTemplate(
-        f"sweep_units_{mf_rows}_{dofs}_{rule.name}_w{BUILD_WARPS}" + ("_torsion" if torsion else "") + ("_split" if split else ""),
+        f"sweep_units_{mf_rows}_{dofs}_{rule.name}_w{BUILD_WARPS}"
+        + ("_torsion" if torsion else "")
+        + ("_split" if split else ""),
         params,
         cuda_native(source, preludes=(lane_group(32), SHARED_STORAGE)),
         dispatch=kernel_template.items(
@@ -1172,12 +1220,13 @@ class ColoredUnits:
         # Sticky: 1 once a world's units passed its slot's (the build's device status).
         self.status = wp.zeros(1, dtype=wp.int32, device=device)
         # Each slot's group of blocks (unit_blocks): their meets (four counts, then each block's units or share of an
-        # ordered pass, then its largest value), the world's coordinates' bitmap past one block and its bodies' island
-        # parents and sizes.
+        # ordered pass, then its largest value) and, by the world's bodies, their island parents, sizes and latest
+        # levels, then each block's count of each island's units (zero between builds).
         self.blocks = unit_blocks(self.slot_count, device)
         self.meets = wp.zeros((self.slot_count, 4 + 2 * self.blocks), dtype=wp.int32, device=device)
-        self.bits = wp.zeros((self.slot_count, (int(dofs) + 31) // 32), dtype=wp.int32, device=device)
-        self.nodes = wp.zeros((self.slot_count, 2 * (int(dofs) // 6 + 1)), dtype=wp.int32, device=device)
+        self.nodes = wp.zeros(
+            (self.slot_count, (3 + self.blocks) * (int(dofs) // 6 + 1)), dtype=wp.int32, device=device
+        )
         # The sweep's blocks a world (its group) and, where a world's islands take them, each block's first place and
         # whether they do (the builder's, the sweep reads it).
         self.group = int(group)
@@ -1283,7 +1332,6 @@ class ColoredUnits:
                 world_acts,
                 pass_words,
                 self.meets,
-                self.bits,
                 self.nodes,
                 self.group,
                 self.island_first,
