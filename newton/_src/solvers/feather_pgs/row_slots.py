@@ -640,7 +640,7 @@ def _world_sync(lanes: int, warps: int):
 
 
 @wp.func
-def _order_islands(
+def _island_ranks(
     data: ContactInput,
     order: RowOrder,
     world: int,
@@ -650,7 +650,7 @@ def _order_islands(
     lane: int,
     warp: int,
     warps: int,
-):
+) -> int:
     """The world's row order over its ``pairs`` body pairs (``order.pairs`` from ``first``), by its group's ``lanes``:
     ``order.row_pairs[first + q]`` the index of the pair the order visits ``q``-th.
 
@@ -704,15 +704,39 @@ def _order_islands(
     if warps > 1:
         lane_sync(lanes * warps)
         grouped = order.turns[world, 5]
-    # Each pair's place: an island's first pair takes the island's first place (its base and stride's inverse), then
-    # every pair its own; the pairs without rows after the islands.
-    placed = int(0)
-    loose = int(0)
+    return grouped
+
+
+@wp.func
+def _island_places(
+    order: RowOrder,
+    world: int,
+    first: int,
+    pairs: int,
+    grouped: int,
+    lo: int,
+    hi: int,
+    placed: int,
+    loose: int,
+    carry: int,
+    defer: bool,
+    lanes: int,
+    lane: int,
+    warp: int,
+    warps: int,
+):
+    """Each pair's place in the row order (:func:`_island_ranks` ranked them): an island's first pair takes the
+    island's first place (its base and stride's inverse), then every pair its own; the pairs without rows after the
+    islands (``grouped`` pairs in islands). Its pairs ``lo`` to ``hi``, after the ``placed`` places and ``loose`` pairs
+    before them, its turns' carries in ``turns`` from word ``carry``; ``defer`` leaves the islands' pairs' places to
+    :func:`_island_rows` (an island's first pair may be another block's)."""
+    size = order.island_size
+    batches = (hi - lo + lanes - 1) // lanes
     for g in range(warp, batches, warps):
-        j = g * lanes + lane
+        j = lo + g * lanes + lane
         island = int(-2)
         rank = int(0)
-        if j < pairs:
+        if j < hi:
             island = order.pair_island[first + j]
             rank = order.pair_rank[first + j]
         span = int(0)
@@ -721,8 +745,8 @@ def _order_islands(
         lone = wp.where(island == -1, 1, 0)
         if warps > 1 and g > 0:
             _turn_wait(_turn(warp, warps))
-            placed = order.turns[world, 6]
-            loose = order.turns[world, 7]
+            placed = order.turns[world, carry]
+            loose = order.turns[world, carry + 1]
         start = placed + lane_scan(span, RESERVE_LANES)
         lone_rank = loose + lane_scan(lone, RESERVE_LANES)
         if span > 0:
@@ -732,17 +756,82 @@ def _order_islands(
         lane_sync(RESERVE_LANES)
         if warps > 1:
             if lane == 0:
-                order.turns[world, 6] = placed
-                order.turns[world, 7] = loose
+                order.turns[world, carry] = placed
+                order.turns[world, carry + 1] = loose
             if g + 1 < batches:
                 _turn_pass(_turn(warp + 1, warps))
         if island >= 0:
-            at = order.island_base[island]
-            q = at[0] + int((wp.int64(rank) * wp.int64(at[1])) % wp.int64(size[island]))
-            order.row_pairs[first + q] = j
+            if not defer:
+                at = order.island_base[island]
+                q = at[0] + int((wp.int64(rank) * wp.int64(at[1])) % wp.int64(size[island]))
+                order.row_pairs[first + q] = j
         elif island == -1:
             order.row_pairs[first + grouped + lone_rank] = j
     _world_sync(lanes, warps)
+
+
+@wp.func
+def _place_sums(
+    order: RowOrder,
+    world: int,
+    first: int,
+    lo: int,
+    hi: int,
+    sums: int,
+    threads: int,
+    lanes: int,
+    lane: int,
+    warp: int,
+):
+    """A block's share of the pairs' places (pairs ``lo`` to ``hi``): its islands' places (their first pairs' islands'
+    sizes) and its pairs without rows, added into ``turns`` from word ``sums`` (cleared before)."""
+    span = int(0)
+    lone = int(0)
+    for j in range(lo + warp * lanes + lane, hi, threads):
+        island = order.pair_island[first + j]
+        if island >= 0 and order.pair_rank[first + j] == 0:
+            span += order.island_size[island]
+        elif island == -1:
+            lone += 1
+    span = lane_sum(span, RESERVE_LANES)
+    lone = lane_sum(lone, RESERVE_LANES)
+    if lane == 0:
+        if span != 0:
+            wp.atomic_add(order.turns, world, sums, span)
+        if lone != 0:
+            wp.atomic_add(order.turns, world, sums + 1, lone)
+
+
+@wp.func
+def _island_rows(order: RowOrder, first: int, lo: int, hi: int, threads: int, lanes: int, lane: int, warp: int):
+    """The places of a block's share of the islands' pairs (pairs ``lo`` to ``hi``), once every island's base is known
+    (:func:`_island_places` deferred them)."""
+    for j in range(lo + warp * lanes + lane, hi, threads):
+        island = order.pair_island[first + j]
+        if island >= 0:
+            at = order.island_base[island]
+            q = at[0] + int(
+                (wp.int64(order.pair_rank[first + j]) * wp.int64(at[1])) % wp.int64(order.island_size[island])
+            )
+            order.row_pairs[first + q] = j
+
+
+@wp.func
+def _order_islands(
+    data: ContactInput,
+    order: RowOrder,
+    world: int,
+    first: int,
+    pairs: int,
+    lanes: int,
+    lane: int,
+    warp: int,
+    warps: int,
+):
+    """The world's row order over its ``pairs`` body pairs on one block or warp: its islands' ranks
+    (:func:`_island_ranks`), then each pair's place (:func:`_island_places`)."""
+    grouped = _island_ranks(data, order, world, first, pairs, lanes, lane, warp, warps)
+    _island_places(order, world, first, pairs, grouped, 0, pairs, 0, 0, 6, False, lanes, lane, warp, warps)
 
 
 @wp.func
@@ -1336,12 +1425,12 @@ def reserve_group(worlds: int, device) -> int:
 
 
 TURN_MEETS = 8
-"""A world's ``RowOrder.turns`` words of its group's meets (seven): its other blocks' unions and shares of the frame's
-order done, its slots open, its other blocks' slots done, every block's frame sums in, the rows before each pair
-open, every block's sums of them in, its other blocks' shares of them done (counts from zero; the first block clears
-them once its group met)."""
+"""A world's ``RowOrder.turns`` words of its group's meets (ten): its other blocks' unions and shares of the frame's
+order done, its slots open, its other blocks' slots done, every block's frame sums in, the places open, every block's
+sums of its places in, every island's base known, every pair placed, every block's sums of the rows before each pair
+in, its other blocks' shares of them done (counts from zero; the first block clears them once its group met)."""
 
-TURN_CHUNKS = 16
+TURN_CHUNKS = 18
 """A world's ``RowOrder.turns`` words from which each block of its group keeps its share of an ordered pass
 (:data:`CHUNK_WORDS` a block): its sums (the frame order's rows of the four lists and pairs, then the rows before
 each pair's), then its turns' carries."""
@@ -1686,13 +1775,15 @@ def reserve_world_rows_kernel(grouped: bool, warps: int = 1):
                     order.turns[world, 0], order.turns[world, 1], order.turns[world, 2], order.turns[world, 3]
                 )
                 pairs = order.turns[world, 4]
-        # The world's first block: the row order (_order_islands). Each pair's rows before it (_rows_before): over the
-        # world's group each block a share of the pairs in the row order after the shares before it (their sums,
-        # _pair_sums, met by every block), once the first block opens them; on one block its turns.
-        if rank == 0 and kept == 0:
-            _order_islands(data, order, world, first, pairs, lanes, lane, warp, warps)
+        # The row order (_order_islands) and each pair's rows before it (_rows_before). Over the world's group the
+        # first block ranks the islands' pairs (_island_ranks) and opens the rest: each block takes a share of the
+        # pairs' places (_island_places, after the shares' sums before it, _place_sums; the islands' pairs once every
+        # island's base is known, _island_rows), then a share of the pairs in the row order (after the sums before
+        # it, _pair_sums); every share's sums met by every block. On one block its turns.
         if wp.static(warps > 1):
             if spread > 1:
+                if rank == 0 and kept == 0:
+                    _island_ranks(data, order, world, first, pairs, lanes, lane, warp, warps)
                 if rank == 0:
                     _meet_arrive(order.turns, world, TURN_MEETS + 4)
                 else:
@@ -1701,12 +1792,50 @@ def reserve_world_rows_kernel(grouped: bool, warps: int = 1):
                 lo = wp.min(rank * share, pairs)
                 hi = wp.min(lo + share, pairs)
                 sums = TURN_CHUNKS + rank * CHUNK_WORDS
+                if kept == 0:
+                    islanded = order.turns[world, 5]
+                    if warp == 0 and lane < 2:
+                        order.turns[world, sums + lane] = 0
+                    lane_sync(threads)
+                    _place_sums(order, world, first, lo, hi, sums, threads, lanes, lane, warp)
+                    _meet_arrive(order.turns, world, TURN_MEETS + 5)
+                    _meet_wait(order.turns, world, TURN_MEETS + 5, spread)
+                    placed = int(0)
+                    loose = int(0)
+                    for r in range(lane, rank, lanes):
+                        at = TURN_CHUNKS + r * CHUNK_WORDS
+                        placed += order.turns[world, at]
+                        loose += order.turns[world, at + 1]
+                    placed = lane_sum(placed, RESERVE_LANES)
+                    loose = lane_sum(loose, RESERVE_LANES)
+                    _island_places(
+                        order,
+                        world,
+                        first,
+                        pairs,
+                        islanded,
+                        lo,
+                        hi,
+                        placed,
+                        loose,
+                        sums + 5,
+                        True,
+                        lanes,
+                        lane,
+                        warp,
+                        warps,
+                    )
+                    _meet_arrive(order.turns, world, TURN_MEETS + 6)
+                    _meet_wait(order.turns, world, TURN_MEETS + 6, spread)
+                    _island_rows(order, first, lo, hi, threads, lanes, lane, warp)
+                    _meet_arrive(order.turns, world, TURN_MEETS + 7)
+                    _meet_wait(order.turns, world, TURN_MEETS + 7, spread)
                 if warp == 0 and lane < 4:
                     order.turns[world, sums + lane] = 0
                 lane_sync(threads)
                 _pair_sums(order, world, first, pairs, rows, lo, hi, sums, threads, lanes, lane, warp)
-                _meet_arrive(order.turns, world, TURN_MEETS + 5)
-                _meet_wait(order.turns, world, TURN_MEETS + 5, spread)
+                _meet_arrive(order.turns, world, TURN_MEETS + 8)
+                _meet_wait(order.turns, world, TURN_MEETS + 8, spread)
                 before = wp.vec4i(0)
                 for r in range(lane, rank, lanes):
                     at = TURN_CHUNKS + r * CHUNK_WORDS
@@ -1719,9 +1848,11 @@ def reserve_world_rows_kernel(grouped: bool, warps: int = 1):
                 before = _lane_sum4(before)
                 _rows_before(order, world, first, pairs, rows, lo, hi, before, sums + 5, lanes, lane, warp, warps)
                 if rank > 0:
-                    _meet_arrive(order.turns, world, TURN_MEETS + 6)
+                    _meet_arrive(order.turns, world, TURN_MEETS + 9)
                 else:
-                    _meet_wait(order.turns, world, TURN_MEETS + 6, spread - 1)
+                    _meet_wait(order.turns, world, TURN_MEETS + 9, spread - 1)
+        if spread == 1 and rank == 0 and kept == 0:
+            _order_islands(data, order, world, first, pairs, lanes, lane, warp, warps)
         if spread == 1 and rank == 0:
             _rows_before(order, world, first, pairs, rows, 0, pairs, wp.vec4i(0), 0, lanes, lane, warp, warps)
         # The world's first block: a world of many trees' dense contact rows by colors of groups (RowGroups), then its
@@ -1873,7 +2004,7 @@ def reserve_world_rows_kernel(grouped: bool, warps: int = 1):
             order.world_contact_first[world] = _NO_CONTACT
             order.world_contact_last[world] = -1
             if wp.static(warps > 1):
-                for m in range(7):
+                for m in range(10):
                     order.turns[world, TURN_MEETS + m] = 0
             if wp.atomic_add(contact_worlds_listed, 1, 1) == listed - 1:
                 contact_worlds_listed[0] = 0
