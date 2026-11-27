@@ -3,10 +3,27 @@
 
 """Four compact Franka contact scenes with low-polygon CAD and cyclic motion.
 
-Run ``python -m newton.examples robot_clutter --scene hardware``. Other scenes
-are ``coins``, ``dishes`` and ``cube``. These are contact demos, not trained
-pick-and-place policies. The cube follows MuJoCo's contact-coupled cubie model,
-not commercial internal tracks. No object poses are prescribed at runtime.
+A Franka pinches a container's handle and shakes it, moving its loose contents
+only through contact (``hardware``: CAD hardware in a bin; ``coins`` in a tray;
+``dishes``), or works a 57 mm cube of 26 contact-coupled cubies on a pedestal
+(``cube``). These are contact demos, not trained pick-and-place policies. The
+cube follows MuJoCo's contact-coupled cubie model, not commercial internal
+tracks. No object poses are prescribed at runtime.
+
+Success criteria:
+- The objects settle in their container (or the cubies on the pedestal), then
+  move with it as the arm shakes it; none sinks through another or leaves the
+  tabletop.
+- Every body's state stays finite and no contact or row capacity overflows over
+  the rollout (the example's per-step and final checks).
+
+Runs:
+- `python -m newton.examples robot_clutter --scene hardware`
+- `python -m newton.examples robot_clutter --scene coins`
+- `python -m newton.examples robot_clutter --scene dishes`
+- `python -m newton.examples robot_clutter --scene cube`
+- `python -m newton.examples robot_clutter --scene hardware --world-count 4`
+  - Four worlds side by side, each its own arm and bin.
 """
 
 import argparse
