@@ -614,7 +614,8 @@ class Placement:
         # The row store's line: the dense class's rows, then (with free rigid bodies) the free bodies' from the line's
         # body base (lay_out_lines), at most the capacities' line.
         self.row_pitch = spec.capacities.row_pitch
-        self.topology_bound = 0
+        # The most topology rows (mimics, links, joint limits) a world can hold in one step: the model's exact bound.
+        self.topology_bound = self.internal_rows_per_world(model, at_once=True)
         self.lay_out_lines(self.row_pitch, 0)
         self.lay_out_live_lines(model)
         # All inactive weight arguments alias this one element. Their producer kernels skip stores and their consumer
@@ -1400,11 +1401,9 @@ class Placement:
         an arena that covers the rows the contact pool's ready contacts can take (:meth:`arena_cover`), reserved in CUDA
         virtual memory for the most the capacities can ask (:meth:`arena_limit`) and mapped as the pool grows
         (:meth:`serve_lines`). Where the capacities' line is no longer, the store keeps it."""
-        topology = self.internal_rows_per_world(model, at_once=True)
-        rows = min(self.row_pitch, -(-max(topology, 1) // LINE_QUANTUM) * LINE_QUANTUM)
+        rows = min(self.row_pitch, -(-max(self.topology_bound, 1) // LINE_QUANTUM) * LINE_QUANTUM)
         if rows >= self.row_pitch or not self.forest.world_count:
             return
-        self.topology_bound = topology
         pool = model_contact_pool(self.forest.cut.source, model.device)
         limit = self.arena_limit(rows)
         self.lay_out_lines(rows, min(self.arena_cover(pool.ready, rows), limit), limit)
@@ -1526,8 +1525,9 @@ class Placement:
         """Before the one writer walks the rows past the topology rows, copy each world whose rows run in the arena its
         topology rows from its home line (:func:`_move_topology`), in every field of :meth:`hold_runs`' table: their
         families wrote them there before the reservation, and the writer's topology part, which runs beside the contact
-        pass, while the claims take the worlds to their runs. None without an arena."""
-        if not self.arena_lines or not self.forest.world_count:
+        pass, while the claims take the worlds to their runs. None without an arena, nor where no world holds a topology
+        row (:attr:`topology_bound`, the model's exact bound): there is nothing to move."""
+        if not self.arena_lines or not self.forest.world_count or not self.topology_bound:
             return
         if self._run_fields is None or self._run_fields[0] != len(self.arrays.line_fields):
             raise RuntimeError("FeatherPGS: the row store's fields changed after their runs' table was built")
