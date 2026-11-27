@@ -608,6 +608,32 @@ class TestDenseHeads(unittest.TestCase):
                 np.testing.assert_array_equal(q, q_h)
                 np.testing.assert_array_equal(qd, qd_h)
 
+    def test_a_head_stages_within_the_device_budget(self):
+        """A head offers its stage the dense impulses beside the capacity's other operands, held at their places: where
+        the free rows' heads take the budget (65,504 free rows a world on a GB300), no head declares a stage past the
+        device's budget (the clutter at its model-sized rows declared 304,316 bytes against 231,424)."""
+        from newton._src.core import memory  # noqa: PLC0415
+        from newton._src.solvers.feather_pgs import sweep_plan  # noqa: PLC0415
+        from newton._src.solvers.feather_pgs.sweep_routes import GeneralSweep  # noqa: PLC0415
+
+        arch = 103
+        found = memory.Device.of(arch, 160, memory._opt_in(arch))
+        budget = memory.arch_budget(str(arch))
+        plan = SimpleNamespace(
+            model=SimpleNamespace(device=SimpleNamespace(is_cuda=True)), classes=SimpleNamespace(tier_rows=0)
+        )
+        plan._launch_work = lambda config, items, staging=None: sweep_plan.Sweep._launch_work(
+            plan, config, items, staging
+        )
+        plan.dense_head = lambda *args: sweep_plan.Sweep.dense_head(plan, *args)
+        with mock.patch.object(sweep_plan, "device", lambda _device: found):
+            for rows, free, lanes in ((65_504, 65_504, 32), (65_504, 65_504, 16), (7_520, 27_616, 16)):
+                with self.subTest(rows=rows, free=free, lanes=lanes):
+                    declared = GeneralSweep(rows, free, 50, str(arch), torsion=True, lanes_per_world=lanes)
+                    full = sweep_plan.Sweep._staged(plan, declared, 128)
+                    for head in sweep_plan.Sweep._dense_heads(plan, full, 128):
+                        self.assertTrue(head.staging().fits(budget), (head.places, head.staging().bytes))
+
     def test_a_diagonal_world_steps_alike_in_every_dense_head(self):
         """The sparse diagonal's stage follows the live rows too: with its launches at dense heads (forced on any
         device), a world swept by the launch whose head holds its live rows (the first head's, the second's, or past

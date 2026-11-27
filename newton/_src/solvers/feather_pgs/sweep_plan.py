@@ -29,7 +29,7 @@ import numpy as np
 import warp as wp
 
 from ...core.execution import Beside, Buckets, Queue, shape, staged_launch
-from ...core.memory import L1_LINE_BYTES, STATIC_SHARED_BYTES, Place, arch_budget, device
+from ...core.memory import L1_LINE_BYTES, STATIC_SHARED_BYTES, Place, Staging, arch_budget, device
 from . import (
     class_plan,
     packed_rows,
@@ -995,11 +995,12 @@ class Sweep:
         worlds = self.forest.articulation_world[self.forest.response_dof_count > 0]
         return worlds.size == 0 or int(np.bincount(worlds).max()) <= 1
 
-    def _launch_work(self, config: SweepConfig, items: int):
-        """A matrix-free mapping's work over ``items`` (its bucket's capacity) with its stage: beside the tiers, which claim
-        their worlds first (none of its own is sure to be live), persistent, so the tiers' launches start without waiting
-        for its exiting blocks; alone, a full grid, which the device balances as blocks finish."""
-        work = config.work(items, config.staging())
+    def _launch_work(self, config: SweepConfig, items: int, staging: Staging | None = None):
+        """A matrix-free mapping's work over ``items`` (its bucket's capacity) with its stage (``staging``, by default its
+        working set): beside the tiers, which claim their worlds first (none of its own is sure to be live),
+        persistent, so the tiers' launches start without waiting for its exiting blocks; alone, a full grid, which the
+        device balances as blocks finish."""
+        work = config.work(items, config.staging() if staging is None else staging)
         return (
             dataclasses.replace(work, live=0) if self.classes.tier_rows else dataclasses.replace(work, persistent=False)
         )
@@ -1036,9 +1037,9 @@ class Sweep:
     def _dense_heads(self, full: SweepConfig, items: int) -> tuple[SweepConfig, ...]:
         """The launches of a sweep that stages a world's dense rows (the warp mapping ``full`` at the places its stage
         gives, :meth:`_staged`, or the sparse diagonal's), by the dense rows' head: where a head's stage holds the
-        dense operands (staged metadata at the head's word stride, impulses, the active enumeration's bitsets and the
-        levels' marks), it holds them for the worlds whose live dense rows fit it, so their stage follows their live
-        rows, not the capacity (D1: a capacity costs only memory).
+        dense operands (staged metadata at the head's word stride, impulses and the active enumeration's bitsets), it
+        holds them for the worlds whose live dense rows fit it, so their stage follows their live rows, not the
+        capacity (D1: a capacity costs only memory).
 
         A head's launch is the capacity's but for its dense operands (:meth:`dense_head`): their length, and the dense
         impulses at the place the head's own stage gives them, so a capacity whose stage declines them (in place) costs
@@ -1106,10 +1107,11 @@ class Sweep:
     def dense_head(self, full: SweepConfig, items: int, rows: int, floor: int = 0) -> SweepConfig:
         """The launch of ``full`` (a sweep at the capacity, its stage given) whose stage holds ``rows`` dense rows (0:
         the capacity's) for the worlds whose live dense rows pass ``floor`` (:meth:`_dense_heads`): the same
-        arithmetic on a shorter stage, the dense impulses where the head's own stage over ``items`` places them
-        (:meth:`.sweep_routes.GeneralSweep.head_placed`)."""
+        arithmetic on a shorter stage, the dense impulses where the head's own stage over ``items`` places them beside
+        the capacity's other operands, within the device's budget (:meth:`.sweep_routes.GeneralSweep.head_stage`)."""
         head = full.with_head(rows, floor)
-        return head.head_placed(shape(self._launch_work(head, items), device(self.model.device)).staging)
+        work = self._launch_work(head, items, head.head_stage())
+        return head.head_placed(shape(work, device(self.model.device)).staging)
 
     def _head_kernels(self, head: SweepConfig) -> tuple:
         """A dense head's launch of the warp mapping (:meth:`_dense_heads`): its configuration and kernel, which counts its
