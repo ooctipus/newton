@@ -575,8 +575,9 @@ def test_pile_of_d6_figures_follows_the_ball_jointed_pile(test, device):
     )
 
 
-def _figure_pile(device, **options):
-    """Forty-eight figures on ball joints (a tree each) dropped in two layers onto the floor, and its solver."""
+def _figure_pile(device, rows: int = 8192, **options):
+    """Forty-eight figures on ball joints (a tree each) dropped in two layers onto the floor, and its solver at ``rows``
+    dense rows a world."""
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, -_G))
     builder.add_ground_plane(cfg=newton.ModelBuilder.ShapeConfig(mu=_MU))
     for figure in range(48):
@@ -596,7 +597,7 @@ def _figure_pile(device, **options):
                 child_xform=wp.transform(wp.vec3(*np.subtract(pivot, _FIGURE[limb][1])), wp.quat_identity()),
             )
     model = builder.finalize(device=device, skip_validation_joints=True)
-    return model, newton.solvers.SolverFeatherPGS(model, dense_max_constraints=8192, **options)
+    return model, newton.solvers.SolverFeatherPGS(model, dense_max_constraints=rows, **options)
 
 
 def _drop_pile(model, solver, steps: int):
@@ -640,6 +641,22 @@ def test_pile_of_figures_sweeps_by_colors_of_groups(test, device):
     poses_alone, velocities_alone, _, _, _ = _drop_pile(model, alone, 300)
     np.testing.assert_array_equal(poses, poses_alone)
     np.testing.assert_array_equal(velocities, velocities_alone)
+
+
+def test_pile_of_figures_steps_alike_on_split_records(test, device):
+    """Past the rows a packed record holds (65,535) a line's records split (:func:`.row_metadata.split_records`: a
+    side's first coordinate and the row's parent in words of their own). The pile's grouped run takes a patch ring's
+    normals together, finding the ring from their parents: a split record's from its parent word. At 65,568 dense rows
+    the pile steps bit for bit as at 8,192, whose records are packed."""
+    runs = []
+    for rows in (8192, 65_568):
+        model, solver = _figure_pile(device, rows)
+        test.assertEqual(solver.placement.split_records, rows > 65_535)
+        poses, velocities, grouped, _gaps, _posts = _drop_pile(model, solver, 120)
+        test.assertGreater(grouped, 0, "the pile's reservation takes the colors of groups")
+        runs.append((poses, velocities))
+    np.testing.assert_array_equal(runs[0][0], runs[1][0])
+    np.testing.assert_array_equal(runs[0][1], runs[1][1])
 
 
 class TestFeatherPGSLooseBodies(unittest.TestCase):
@@ -748,12 +765,13 @@ for _fn in (
     test_pile_of_d6_figures_follows_the_ball_jointed_pile,
 ):
     add_function_test(TestFeatherPGSLooseBodies, _fn.__name__, _fn, devices=devices)
-add_function_test(
-    TestFeatherPGSLooseBodies,
-    test_pile_of_figures_sweeps_by_colors_of_groups.__name__,
-    test_pile_of_figures_sweeps_by_colors_of_groups,
-    devices=[device for device in devices if wp.get_device(device).is_cuda],
-)
+for _fn in (test_pile_of_figures_sweeps_by_colors_of_groups, test_pile_of_figures_steps_alike_on_split_records):
+    add_function_test(
+        TestFeatherPGSLooseBodies,
+        _fn.__name__,
+        _fn,
+        devices=[device for device in devices if wp.get_device(device).is_cuda],
+    )
 for _fn in (
     test_hinge_carries_a_hanging_load,
     test_hinge_wrench_of_a_released_rod,

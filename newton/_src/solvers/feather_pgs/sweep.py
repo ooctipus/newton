@@ -2717,6 +2717,15 @@ def patch_run(rows: WorldRows, op, laws: RowLaws, step: dict, *, end: str, pad: 
     def word(r: int) -> str:
         return f"held_w{r}" if r in words else (f"patch_a{r}.w" if r < window else f"patch_w{r}")
 
+    def parent(r: int) -> str:
+        """Normal ``r``'s parent: its kind word's high half, or a split record's parent word (read where the test
+        reaches it)."""
+        return rows.word(f"patch_head + {r}", rows.parent_word) if rows.split else f"({rows.parent_of(word(r))})"
+
+    def quads(r: int) -> tuple[str, ...]:
+        """Normal ``r``'s record registers, a quad each, as the visited row's (:attr:`WorldRows.registers`)."""
+        return tuple(f"patch_{name[-1]}{r}" for name in rows.registers)
+
     # A ring's later normals step on the support its first normal's visit carries (Velocity.kept), their diagonals
     # tested where the ring is taken whole (``one``).
     kept_op = dataclasses.replace(op, velocity=dataclasses.replace(op.velocity, kept=True))
@@ -2753,7 +2762,7 @@ def patch_run(rows: WorldRows, op, laws: RowLaws, step: dict, *, end: str, pad: 
         bind = (
             [
                 f"const int i = patch_head + {r};",
-                f"const int4 rec_a = patch_a{r}, rec_b = patch_b{r};",
+                f"const int4 {', '.join(f'{name} = {quad}' for name, quad in zip(rows.registers, quads(r), strict=True))};",
                 f"const float held_row = {impulse};",
                 f"float held_z0[{op.entries}];",
                 op.entries_loop(f"held_z0[q] = {z};", "", entry=False),
@@ -2772,10 +2781,10 @@ def patch_run(rows: WorldRows, op, laws: RowLaws, step: dict, *, end: str, pad: 
         member = f"patch_head + {r} < ({end}) && ({w} & 0xFFFF) == {contact}"
         lines += [
             "if (patch_open) {",
-            f"    if ({member} && ({w} >> 16) == patch_head) {{",
+            f"    if ({member} && {parent(r)} == patch_head) {{",
             f"        patch_anchor = {r};",
             "        patch_open = false;",
-            f"    }} else if (!({member} && ({w} >> 16) == patch_head + {r + 1})) {{",
+            f"    }} else if (!({member} && {parent(r)} == patch_head + {r + 1})) {{",
             "        patch_open = false;",
             "    }",
             "}",
@@ -2786,13 +2795,14 @@ def patch_run(rows: WorldRows, op, laws: RowLaws, step: dict, *, end: str, pad: 
     lines.append(f"const int4 {loaded};")
     for r in range(2, window):
         at = f"patch_head + {r}"
-        lines.append(f"int4 patch_a{r} = make_int4(0, 0, 0, -1), patch_b{r} = make_int4(0, 0, 0, 0);")
+        empty = ("make_int4(0, 0, 0, -1)", *("make_int4(0, 0, 0, 0)" for _ in quads(r)[1:]))
+        lines.append(f"int4 {', '.join(f'{quad} = {value}' for quad, value in zip(quads(r), empty, strict=True))};")
         if r not in held_impulse:
             lines.append(f"float patch_impulse{r} = 0.0f;")
         if r not in held_z:
             lines.append(f"float patch_z{r}[{op.entries}] = {{{', '.join('0.0f' for _ in range(op.entries))}}};")
         lines.append(f"if ({r} <= patch_anchor) {{")
-        lines.append(rows.load_record((f"patch_a{r}", f"patch_b{r}"), at, "    "))
+        lines.append(rows.load_record(quads(r), at, "    "))
         if r not in held_impulse:
             lines.append(f"    patch_impulse{r} = {rows.peek(at)};")
         if r not in held_z:
