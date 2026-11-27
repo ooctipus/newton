@@ -746,26 +746,70 @@ def _order_islands(
 
 
 @wp.func
+def _pair_sums(
+    order: RowOrder,
+    world: int,
+    first: int,
+    pairs: int,
+    rows: wp.vec4i,
+    lo: int,
+    hi: int,
+    sums: int,
+    threads: int,
+    lanes: int,
+    lane: int,
+    warp: int,
+):
+    """A block's share of the row order's pairs (places ``lo`` to ``hi``): their rows of the four lists, added into
+    ``turns`` from word ``sums`` (cleared before, integers: any order of the adds gives the same sums)."""
+    own = wp.vec4i(0)
+    for q in range(lo + warp * lanes + lane, hi, threads):
+        own = own + _pair_rows(order, first, pairs, rows, order.row_pairs[first + q])
+    own = _lane_sum4(own)
+    if lane == 0:
+        for k in range(4):
+            if own[k] != 0:
+                wp.atomic_add(order.turns, world, sums + k, own[k])
+
+
+@wp.func
 def _rows_before(
-    order: RowOrder, world: int, first: int, pairs: int, rows: wp.vec4i, lanes: int, lane: int, warp: int, warps: int
+    order: RowOrder,
+    world: int,
+    first: int,
+    pairs: int,
+    rows: wp.vec4i,
+    lo: int,
+    hi: int,
+    seen: wp.vec4i,
+    carry: int,
+    lanes: int,
+    lane: int,
+    warp: int,
+    warps: int,
 ):
     """The row order's rows before each pair (``rows_before`` at its head), the pairs in the row order a batch of the
     lanes at a time, over a block of ``warps`` warps in turns as :func:`_frame_turns` does (the rows seen carried
-    through the turns, ``turns``)."""
-    batches = (pairs + lanes - 1) // lanes
-    seen = wp.vec4i(0)
+    through the turns, ``turns`` from word ``carry``): its places ``lo`` to ``hi``, after the ``seen`` rows before
+    them."""
+    batches = (hi - lo + lanes - 1) // lanes
     for g in range(warp, batches, warps):
-        q = g * lanes + lane
+        q = lo + g * lanes + lane
         own = wp.vec4i(0)
         head = int(-1)
-        if q < pairs:
+        if q < hi:
             j = order.row_pairs[first + q]
             head = order.pairs[first + j]
             own = _pair_rows(order, first, pairs, rows, j)
         lower = _lane_scan4(own)
         if warps > 1 and g > 0:
             _turn_wait(_turn(warp, warps))
-            seen = wp.vec4i(order.turns[world, 0], order.turns[world, 1], order.turns[world, 2], order.turns[world, 3])
+            seen = wp.vec4i(
+                order.turns[world, carry],
+                order.turns[world, carry + 1],
+                order.turns[world, carry + 2],
+                order.turns[world, carry + 3],
+            )
         if head >= 0:
             order.rows_before[head] = seen + lower
         seen = seen + _lane_sum4(own)
@@ -773,7 +817,7 @@ def _rows_before(
             lane_sync(RESERVE_LANES)
             if lane == 0:
                 for k in range(4):
-                    order.turns[world, k] = seen[k]
+                    order.turns[world, carry + k] = seen[k]
             if g + 1 < batches:
                 _turn_pass(_turn(warp + 1, warps))
     _world_sync(lanes, warps)
@@ -1291,16 +1335,26 @@ def reserve_group(worlds: int, device) -> int:
     return max(int(device.sm_count) // max(int(worlds), 1), 1)
 
 
-TURN_ROWS = 8
-"""A world's ``RowOrder.turns`` words of its rows by list (four), which its first block publishes to its group's."""
+TURN_MEETS = 8
+"""A world's ``RowOrder.turns`` words of its group's meets (seven): its other blocks' unions and shares of the frame's
+order done, its slots open, its other blocks' slots done, every block's frame sums in, the rows before each pair
+open, every block's sums of them in, its other blocks' shares of them done (counts from zero; the first block clears
+them once its group met)."""
 
-TURN_MEETS = 12
-"""A world's ``RowOrder.turns`` words of its group's meets: its other blocks' unions done, its slots open, its other
-blocks' slots done (counts from zero; the first block clears them once its group met)."""
+TURN_CHUNKS = 16
+"""A world's ``RowOrder.turns`` words from which each block of its group keeps its share of an ordered pass
+(:data:`CHUNK_WORDS` a block): its sums (the frame order's rows of the four lists and pairs, then the rows before
+each pair's), then its turns' carries."""
 
-TURN_WORDS = 15
-"""Words of a world's ``RowOrder.turns``: its turns' carries (eight), its rows (:data:`TURN_ROWS`) and its group's
-meets (:data:`TURN_MEETS`)."""
+CHUNK_WORDS = 10
+"""Words of a block's share of an ordered pass in ``RowOrder.turns`` (:data:`TURN_CHUNKS`): five sums, five carries."""
+
+
+def turn_words(group: int) -> int:
+    """Words of a world's ``RowOrder.turns`` for a group of ``group`` blocks (:func:`reserve_group`): its turns'
+    carries (eight), its group's meets (:data:`TURN_MEETS`) and its blocks' shares of the ordered passes
+    (:data:`TURN_CHUNKS`)."""
+    return TURN_CHUNKS + CHUNK_WORDS * max(int(group), 1)
 
 
 @wp.func_native("""
@@ -1336,12 +1390,50 @@ def _meet_wait(words: wp.array2d[int], world: int, word: int, count: int):
 
 
 @wp.func
+def _frame_sums(
+    data: ContactInput,
+    order: RowOrder,
+    world: int,
+    first: int,
+    lo: int,
+    hi: int,
+    sums: int,
+    threads: int,
+    lanes: int,
+    lane: int,
+    warp: int,
+):
+    """A block's share of the frame's order (positions ``lo`` to ``hi`` of the world's from its ``first``): its
+    contacts' rows of the four lists and its pairs (heads), added into ``turns`` from word ``sums`` (cleared before,
+    integers: any order of the adds gives the same sums)."""
+    own = wp.vec4i(0)
+    heads = int(0)
+    for c in range(lo + warp * lanes + lane, hi, threads):
+        if data.world[c] == world:
+            own = own + _contact_rows(data, c)
+            if c == first or order.pair_keys[c] != order.pair_keys[c - 1]:
+                heads += 1
+    own = _lane_sum4(own)
+    heads = lane_sum(heads, RESERVE_LANES)
+    if lane == 0:
+        for k in range(4):
+            if own[k] != 0:
+                wp.atomic_add(order.turns, world, sums + k, own[k])
+        if heads != 0:
+            wp.atomic_add(order.turns, world, sums + 4, heads)
+
+
+@wp.func
 def _frame_turns(
     data: ContactInput,
     order: RowOrder,
     world: int,
     first: int,
-    end: int,
+    lo: int,
+    hi: int,
+    rows: wp.vec4i,
+    pairs: int,
+    carry: int,
     kept: int,
     lanes: int,
     lane: int,
@@ -1350,23 +1442,23 @@ def _frame_turns(
 ):
     """The frame's order: each contact's rows before it and its pair (``rows_frame``, ``pairs_before``), each pair's
     head and, where the frame is new, its trees (``pairs``, ``pair_sides``), a batch of the world's lanes at a time;
-    the frame's rows and pairs in ``turns`` after it.
+    the frame's rows and pairs in ``turns`` after it. It takes the world's positions ``lo`` to ``hi`` (from its
+    ``first``), after ``rows`` and ``pairs`` before them, its carries in ``turns`` from word ``carry`` (a block of the
+    world's group its own: :func:`_frame_sums`).
 
     Over a block of ``warps`` warps, warp ``w`` takes the batches ``w``, ``w + warps``, ...: a batch's loads and its own
     sums come before its turn (the warp before it passed it, :func:`_turn_wait`), which reads what the batches before it
     left (the rows of the lists and the pairs before it, ``turns``), writes the batch's places, leaves its own, and
     passes it on: every place is the one warp's. A world's one warp carries them itself and joins each new pair's trees
     (:func:`_order_islands`; a block's warps joined them before)."""
-    batches = (end - first + lanes - 1) // lanes
-    rows = wp.vec4i(0)
-    pairs = int(0)
+    batches = (hi - lo + lanes - 1) // lanes
     for g in range(warp, batches, warps):
-        c = first + g * lanes + lane
+        c = lo + g * lanes + lane
         mine = bool(False)
         heads = bool(False)
         own = wp.vec4i(0)
         sides = wp.vec2i(-1, -1)
-        if c < end:
+        if c < hi:
             if data.world[c] == world:
                 mine = True
                 heads = c == first or order.pair_keys[c] != order.pair_keys[c - 1]
@@ -1379,8 +1471,13 @@ def _frame_turns(
         lower = _lane_scan4(own)
         if warps > 1 and g > 0:
             _turn_wait(_turn(warp, warps))
-            rows = wp.vec4i(order.turns[world, 0], order.turns[world, 1], order.turns[world, 2], order.turns[world, 3])
-            pairs = order.turns[world, 4]
+            rows = wp.vec4i(
+                order.turns[world, carry],
+                order.turns[world, carry + 1],
+                order.turns[world, carry + 2],
+                order.turns[world, carry + 3],
+            )
+            pairs = order.turns[world, carry + 4]
         if mine:
             pair = pairs + lane_below(votes, RESERVE_LANES) + wp.where(heads, 1, 0) - 1
             order.pairs_before[c] = pair
@@ -1395,14 +1492,14 @@ def _frame_turns(
             lane_sync(RESERVE_LANES)
             if lane == 0:
                 for k in range(4):
-                    order.turns[world, k] = rows[k]
-                order.turns[world, 4] = pairs
+                    order.turns[world, carry + k] = rows[k]
+                order.turns[world, carry + 4] = pairs
             if g + 1 < batches:
                 _turn_pass(_turn(warp + 1, warps))
     if warps == 1 and lane == 0:
         for k in range(4):
-            order.turns[world, k] = rows[k]
-        order.turns[world, 4] = pairs
+            order.turns[world, carry + k] = rows[k]
+        order.turns[world, carry + 4] = pairs
 
 
 @cache
@@ -1529,32 +1626,107 @@ def reserve_world_rows_kernel(grouped: bool, warps: int = 1):
                             sides = row_sides(data.art0[c], data.art1[c], data.response_dofs)
                             if sides[1] >= 0:
                                 union_find.union(order.island_parent, sides[0], sides[1])
+        # The frame's order (_frame_turns: each contact's rows before it and its pair, each pair's head): over the
+        # world's group each block takes a share of its positions in turn order after the shares before it (their
+        # sums, _frame_sums, met by every block), the world's rows and pairs their sums; on one block its turns.
+        rows = wp.vec4i(0)
+        pairs = int(0)
+        if wp.static(warps > 1):
+            if spread > 1:
+                share = (end - first + spread - 1) // spread
+                lo = wp.min(first + rank * share, end)
+                hi = wp.min(lo + share, end)
+                sums = TURN_CHUNKS + rank * CHUNK_WORDS
+                if warp == 0 and lane < 5:
+                    order.turns[world, sums + lane] = 0
+                lane_sync(threads)
+                _frame_sums(data, order, world, first, lo, hi, sums, threads, lanes, lane, warp)
+                _meet_arrive(order.turns, world, TURN_MEETS + 3)
+                _meet_wait(order.turns, world, TURN_MEETS + 3, spread)
+                before = wp.vec4i(0)
+                before_pairs = int(0)
+                for r in range(lane, spread, lanes):
+                    at = TURN_CHUNKS + r * CHUNK_WORDS
+                    held = wp.vec4i(
+                        order.turns[world, at],
+                        order.turns[world, at + 1],
+                        order.turns[world, at + 2],
+                        order.turns[world, at + 3],
+                    )
+                    rows = rows + held
+                    pairs += order.turns[world, at + 4]
+                    if r < rank:
+                        before = before + held
+                        before_pairs += order.turns[world, at + 4]
+                rows = _lane_sum4(rows)
+                pairs = lane_sum(pairs, RESERVE_LANES)
+                before = _lane_sum4(before)
+                before_pairs = lane_sum(before_pairs, RESERVE_LANES)
+                _frame_turns(
+                    data, order, world, first, lo, hi, before, before_pairs, sums + 5, kept, lanes, lane, warp, warps
+                )
+            elif end > first:
+                _frame_turns(data, order, world, first, first, end, rows, pairs, 0, kept, lanes, lane, warp, warps)
+                lane_sync(threads)
+                rows = wp.vec4i(
+                    order.turns[world, 0], order.turns[world, 1], order.turns[world, 2], order.turns[world, 3]
+                )
+                pairs = order.turns[world, 4]
             # The other blocks count in and wait for the world's rows (its first block's ordered passes); the first
-            # waits for their unions.
+            # waits for their unions and their shares of the frame's order.
             if rank > 0:
                 _meet_arrive(order.turns, world, TURN_MEETS)
-                _meet_wait(order.turns, world, TURN_MEETS + 1, 1)
             else:
                 _meet_wait(order.turns, world, TURN_MEETS, spread - 1)
-        # The world's first block: the frame's order (_frame_turns: each contact's rows before it and its pair, each
-        # pair's head), the row order (_order_islands), each pair's rows before it (_rows_before), a world of many
-        # trees' dense contact rows by colors of groups (RowGroups), then its line; its rows to its group.
-        rows = wp.vec4i(0)
-        if rank == 0:
-            _frame_turns(data, order, world, first, end, kept, lanes, lane, warp, warps)
-            if wp.static(warps > 1):
-                lane_sync(threads)
-            else:
-                lane_sync(RESERVE_LANES)
-            pairs = int(0)
+        else:
+            _frame_turns(data, order, world, first, first, end, rows, pairs, 0, kept, lanes, lane, warp, warps)
+            lane_sync(RESERVE_LANES)
             if end > first:
                 rows = wp.vec4i(
                     order.turns[world, 0], order.turns[world, 1], order.turns[world, 2], order.turns[world, 3]
                 )
                 pairs = order.turns[world, 4]
-            if kept == 0:
-                _order_islands(data, order, world, first, pairs, lanes, lane, warp, warps)
-            _rows_before(order, world, first, pairs, rows, lanes, lane, warp, warps)
+        # The world's first block: the row order (_order_islands). Each pair's rows before it (_rows_before): over the
+        # world's group each block a share of the pairs in the row order after the shares before it (their sums,
+        # _pair_sums, met by every block), once the first block opens them; on one block its turns.
+        if rank == 0 and kept == 0:
+            _order_islands(data, order, world, first, pairs, lanes, lane, warp, warps)
+        if wp.static(warps > 1):
+            if spread > 1:
+                if rank == 0:
+                    _meet_arrive(order.turns, world, TURN_MEETS + 4)
+                else:
+                    _meet_wait(order.turns, world, TURN_MEETS + 4, 1)
+                share = (pairs + spread - 1) // spread
+                lo = wp.min(rank * share, pairs)
+                hi = wp.min(lo + share, pairs)
+                sums = TURN_CHUNKS + rank * CHUNK_WORDS
+                if warp == 0 and lane < 4:
+                    order.turns[world, sums + lane] = 0
+                lane_sync(threads)
+                _pair_sums(order, world, first, pairs, rows, lo, hi, sums, threads, lanes, lane, warp)
+                _meet_arrive(order.turns, world, TURN_MEETS + 5)
+                _meet_wait(order.turns, world, TURN_MEETS + 5, spread)
+                before = wp.vec4i(0)
+                for r in range(lane, rank, lanes):
+                    at = TURN_CHUNKS + r * CHUNK_WORDS
+                    before = before + wp.vec4i(
+                        order.turns[world, at],
+                        order.turns[world, at + 1],
+                        order.turns[world, at + 2],
+                        order.turns[world, at + 3],
+                    )
+                before = _lane_sum4(before)
+                _rows_before(order, world, first, pairs, rows, lo, hi, before, sums + 5, lanes, lane, warp, warps)
+                if rank > 0:
+                    _meet_arrive(order.turns, world, TURN_MEETS + 6)
+                else:
+                    _meet_wait(order.turns, world, TURN_MEETS + 6, spread - 1)
+        if spread == 1 and rank == 0:
+            _rows_before(order, world, first, pairs, rows, 0, pairs, wp.vec4i(0), 0, lanes, lane, warp, warps)
+        # The world's first block: a world of many trees' dense contact rows by colors of groups (RowGroups), then its
+        # line; its group's slots open after.
+        if rank == 0:
             if wp.static(warps > 1):
                 lane_sync(threads)
             if wp.static(grouped):
@@ -1603,9 +1775,7 @@ def reserve_world_rows_kernel(grouped: bool, warps: int = 1):
             elif warp == 0 and lane == 0:
                 world_run[world] = wp.vec2i(-1, 0)
             if wp.static(warps > 1):
-                # Its rows to its group, then the slots open.
-                if warp == 0 and lane < 4:
-                    order.turns[world, TURN_ROWS + lane] = rows[lane]
+                # The slots open (each block of the group holds the world's rows: their sums).
                 if spread > 1:
                     _meet_arrive(order.turns, world, TURN_MEETS + 1)
                 else:
@@ -1613,12 +1783,7 @@ def reserve_world_rows_kernel(grouped: bool, warps: int = 1):
             else:
                 lane_sync(RESERVE_LANES)
         else:
-            rows = wp.vec4i(
-                order.turns[world, TURN_ROWS],
-                order.turns[world, TURN_ROWS + 1],
-                order.turns[world, TURN_ROWS + 2],
-                order.turns[world, TURN_ROWS + 3],
-            )
+            _meet_wait(order.turns, world, TURN_MEETS + 1, 1)
             dense_total = world_slot_counter[world] + rows[0] + rows[2]
             free_total = mf_slot_counter[world] + rows[1] + rows[3]
             extent = dense_total
@@ -1708,7 +1873,7 @@ def reserve_world_rows_kernel(grouped: bool, warps: int = 1):
             order.world_contact_first[world] = _NO_CONTACT
             order.world_contact_last[world] = -1
             if wp.static(warps > 1):
-                for m in range(3):
+                for m in range(7):
                     order.turns[world, TURN_MEETS + m] = 0
             if wp.atomic_add(contact_worlds_listed, 1, 1) == listed - 1:
                 contact_worlds_listed[0] = 0

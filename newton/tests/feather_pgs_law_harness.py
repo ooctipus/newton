@@ -50,11 +50,11 @@ from newton._src.solvers.feather_pgs.row_records import UNIT_MIMIC, UNIT_SHIFT, 
 from newton._src.solvers.feather_pgs.row_slots import (
     RESERVE_BLOCK,
     RESERVE_LANES,
-    TURN_WORDS,
     RowOrder,
     admit_world_contacts,
     reserve_world_rows_kernel,
     row_groups,
+    turn_words,
 )
 from newton._src.solvers.feather_pgs.tree_scan import WalkClass
 from newton.tests.unittest_utils import add_function_test, get_test_devices
@@ -1589,7 +1589,7 @@ def allocate_contacts(operands, device) -> None:
     order.island_size = wp.zeros(trees, dtype=wp.int32, device=device)
     order.island_base = wp.zeros(trees, dtype=wp.vec2i, device=device)
     order.frame_kept = wp.zeros(1, dtype=int, device=device)
-    order.turns = wp.zeros((worlds, TURN_WORDS), dtype=wp.int32, device=device)
+    order.turns = wp.zeros((worlds, turn_words(1)), dtype=wp.int32, device=device)
     values["order"] = order
     # No world's dense line by colors of groups (row_slots.RowGroups: the sweep plan's grouped worlds).
     values["groups"] = row_groups(np.zeros(0, dtype=np.int32), 0, 0, 0, 0, 0.0, device)
