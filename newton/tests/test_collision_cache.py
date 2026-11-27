@@ -117,6 +117,7 @@ class TestCollisionCache(unittest.TestCase):
                 "boundary_flags",
                 "convex_support_cells",
                 "edge_clusters",
+                "mesh_cell_size",
                 "mesh_edges",
                 "mesh_grid",
                 "mesh_topology",
