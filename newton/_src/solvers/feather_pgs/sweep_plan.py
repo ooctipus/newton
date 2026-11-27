@@ -553,12 +553,19 @@ class Sweep:
                 # threads (so a level of regions or a color of units can be wider than its block: neither shares a
                 # body) a world past the block's reach takes the device's blocks beside its own, as many each as the
                 # device holds over the worlds (their own form's stage, which holds no marks), every operand its
-                # blocks share in global memory (the units' impulses too, which any of them may visit; the regions
-                # publish theirs); a world the block holds keeps it and takes a wide level or color in rounds of its
-                # threads.
+                # blocks share in global memory (the units' impulses too, which any of them may visit, and the dense
+                # rows' records and impulses, whose runs they may take; the regions publish theirs); a world the
+                # block holds keeps it and takes a wide level or color in rounds of its threads.
                 found = device(model.device)
                 if self.region_slot is None:
-                    places = dataclasses.replace(places, impulses=Place.GLOBAL, free_slots=0, wide_slots=0)
+                    places = dataclasses.replace(
+                        places,
+                        metadata=Place.STREAMED,
+                        impulses=Place.GLOBAL,
+                        dense_impulses=Place.GLOBAL,
+                        free_slots=0,
+                        wide_slots=0,
+                    )
                 grouped = dataclasses.replace(colored_declared, places=places, world_blocks=True)
                 held = shape(grouped.work(), found).blocks_per_sm
                 group = held * found.sms // int(capable.size)

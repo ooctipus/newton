@@ -561,7 +561,8 @@ class TestColoredSweep(unittest.TestCase):
         for side_a, side_b in placement.row_sides.numpy()[line, :rows]:
             a, b = (int(first[side_a]) if side_a >= 0 else -1), (int(first[side_b]) if side_b >= 0 else -1)
             keys.append((a, -1 if b == a else b))
-        runs = int(solver.sweep.dense_runs.numpy()[0, 0])
+        words = solver.sweep.dense_runs.numpy()[0]
+        runs = int(words[0])
         # The runs' records, a row's slot a run of the world's line in the row store: first row, latest earlier runs
         # on the two sides, mark, warp.
         records = solver.sweep.dense_run_rows.numpy()[line, :runs]
@@ -570,18 +571,51 @@ class TestColoredSweep(unittest.TestCase):
         warps = records[:, 4]
         expected = [0] + [i for i in range(1, rows) if keys[i] != keys[i - 1]] + [rows]
         np.testing.assert_array_equal(starts, expected)
-        latest = {}
+        latest, ends = {}, []
         for run in range(runs):
             sides = keys[starts[run]]
             self.assertTrue(all(keys[i] == sides for i in range(starts[run], starts[run + 1])))
             want = [latest.get(side, -1) if side >= 0 else -1 for side in sides]
             np.testing.assert_array_equal(prev[run], want, err_msg=f"run {run}")
+            ends.append(max([ends[p] for p in want if p >= 0] or [0]) + starts[run + 1] - starts[run])
             for side in sides:
                 if side >= 0:
                     latest[side] = run
+        # Each run's chain ends where its latest earlier runs' end, plus its rows; the longest is the critical path.
+        self.assertEqual(int(words[2]), max(ends))
+        self.assertEqual(int(words[1]), 0, "a world's block alone takes its runs")
         self.assertGreater(len(set(warps.tolist())), 1)
         self.assertTrue(np.isfinite(states[0].body_q.numpy()).all())
         self.assertGreater(float(states[0].body_q.numpy()[:, 2].min()), 0.0)
+
+    def test_dense_runs_take_the_world_group(self):
+        """A world past the block's reach (velocity pinned to global memory) with more free bodies than the block's
+        threads takes the device's blocks for its units, and where its dense rows' runs can run more at once than the
+        block holds warps (their rows past the critical path times the warps) for its runs too. Each tree's and each
+        body's rows keep their order, so the published motion is the world's block alone's, bit for bit."""
+        model = _hinged_pairs(self.device, pairs=150)
+        runs = []
+        for world_group in (True, False):
+            pins = SolverFeatherPGS.Pins(velocity="global", world_group=world_group)
+            solver = SolverFeatherPGS(model, pins=pins, mf_max_constraints=16_384, dense_max_constraints=4_096)
+            self.assertEqual(solver.sweep.world_blocks > 1, world_group)
+            pipeline = newton.CollisionPipeline(model)
+            contacts = pipeline.contacts()
+            states = [model.state(), model.state()]
+            newton.eval_fk(model, states[0].joint_q, states[0].joint_qd, states[0])
+            control = model.control()
+            for i in range(30):
+                src, dst = states[i % 2], states[(i + 1) % 2]
+                pipeline.collide(src, contacts)
+                src.clear_forces()
+                solver.step(src, dst, control, contacts, 1.0 / 240.0)
+            words = solver.sweep.dense_runs.numpy()[0]
+            rows = int(solver.placement.constraint_count.numpy()[0])
+            self.assertGreater(rows, int(words[2]) * 8, "the runs' rows pass their critical path times the warps")
+            self.assertEqual(int(words[1]), int(world_group), "the runs take the group only beside it")
+            runs.append((states[0].body_q.numpy(), states[0].body_qd.numpy()))
+        for name, grouped, alone in zip(("body_q", "body_qd"), *runs, strict=True):
+            np.testing.assert_array_equal(grouped, alone, err_msg=name)
 
 
 def _hinged_pairs(device, pairs: int):
