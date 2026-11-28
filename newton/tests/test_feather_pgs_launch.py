@@ -22,7 +22,7 @@ import warp as wp
 from newton._src.core import execution, memory
 from newton._src.core.execution import Queue, Use, Work, shape
 from newton._src.core.memory import CPU, Buffer, Device, Place, Staging, carveout, carveout_share
-from newton._src.solvers.feather_pgs import kernel_template, sweep_routes, tree_kinetic_state, walk_rows
+from newton._src.solvers.feather_pgs import kernel_template, sweep_plan, sweep_routes, tree_kinetic_state, walk_rows
 from newton._src.solvers.feather_pgs.device_preludes import SHARED_STORAGE, DevicePrelude, dual_native, lane_group
 from newton._src.solvers.feather_pgs.factor import walk as factor_walk
 from newton._src.solvers.feather_pgs.sweep import EXACT, LevelLaw
@@ -490,6 +490,43 @@ class TestLaunch(unittest.TestCase):
                 np.testing.assert_array_equal(target_words.numpy()[:8], words[:8])
                 np.testing.assert_array_equal(target_words.numpy()[8:], -1.0)
                 np.testing.assert_array_equal(source_words.numpy(), words)
+
+
+class TestResidentGroup(unittest.TestCase):
+    """A world's group of blocks meets at barriers, so the launch holds at most the blocks its loaded code keeps resident
+    (the driver's occupancy), whatever the layer's estimate sized the group to."""
+
+    def _group(self, group: int, worlds: int, resident: int) -> tuple[int, mock.MagicMock]:
+        stub = types.SimpleNamespace(
+            model=types.SimpleNamespace(device="cuda:0"), _launch_work=lambda config, items: None
+        )
+        occupancy = mock.MagicMock(return_value=resident)
+        with (
+            mock.patch.object(sweep_plan, "device", return_value=GB300),
+            mock.patch.object(sweep_plan, "shape", return_value=types.SimpleNamespace(block=256)),
+            mock.patch.object(sweep_plan, "resident_blocks", occupancy),
+        ):
+            return sweep_plan.Sweep._resident_group(stub, None, "kernel", worlds, group), occupancy
+
+    def test_a_group_holds_only_the_resident_blocks(self):
+        # The 4,000-figure ragdoll pile's grouped sweep: 252 registers a thread keep one 256-thread block a
+        # multiprocessor, where the estimate sized a world's group at two a multiprocessor.
+        held, occupancy = self._group(2 * GB300.sms, 1, 1)
+        self.assertEqual(held, GB300.sms)
+        occupancy.assert_called_once_with("kernel", 256, "cuda:0")
+        self.assertEqual(self._group(76, 4, 1)[0], GB300.sms // 4)
+        self.assertEqual(self._group(1, 1, 0)[0], 1)
+
+    def test_a_resident_group_keeps_its_size(self):
+        self.assertEqual(self._group(64, 1, 1)[0], 64)
+        self.assertEqual(self._group(2 * GB300.sms, 1, 2)[0], 2 * GB300.sms)
+
+    def test_the_cpu_keeps_a_block(self):
+        @wp.kernel
+        def noop(x: wp.array[float]):
+            x[wp.tid()] = 0.0
+
+        self.assertEqual(memory.resident_blocks(noop, 256, "cpu"), 1)
 
 
 if __name__ == "__main__":

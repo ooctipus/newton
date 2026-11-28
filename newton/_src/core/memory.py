@@ -306,25 +306,13 @@ def _call(name: str, *args) -> None:
         raise RuntimeError(f"{name} failed with CUresult {status}")
 
 
-def fit_carveout(kernel: wp.Kernel, block: int, device=None, shared: int | None = None) -> int:
-    """Prefer for ``kernel`` (the one launched: a generic kernel's overload), launched in blocks of ``block`` threads
-    on ``device``, the carveout step that holds the blocks its loaded code keeps resident (:func:`carveout`, the
-    driver's occupancy: its registers, its static and dynamic shared memory, or ``shared`` dynamic bytes where its
-    launches stage less than it declares), once a kernel and device, and return the step [KiB]; 0 on the CPU. The
-    kernel's module is loaded here if its launch has not loaded it yet. The preference is the step's share of the
-    unified memory (:func:`carveout_share`), on which the driver lands this step; a launch that needs more shared
-    memory than the step holds takes the step that holds it."""
-    found = wp.get_device(device)
-    if not found.is_cuda:
-        return 0
-    key = (kernel, int(block), int(found.context))
-    if key in _fitted:
-        return _fitted[key]
+def _occupancy(kernel: wp.Kernel, block: int, found, shared: int | None) -> tuple[ctypes.c_void_p, int, int]:
+    """``kernel``'s loaded function on the CUDA device ``found`` (its module loaded here if its launch has not loaded it
+    yet), the blocks of ``block`` threads a multiprocessor keeps resident of it (the driver's occupancy: its registers,
+    its static and dynamic shared memory, or ``shared`` dynamic bytes) and its shared bytes a block."""
     loaded = kernel.module.load(found, int(block))
     if loaded is None:
-        raise RuntimeError(
-            f"the module of kernel {kernel.key} did not load on {found}: no function to set a carveout on"
-        )
+        raise RuntimeError(f"the module of kernel {kernel.key} did not load on {found}: no function to read")
     hooks = loaded.get_kernel_hooks(kernel)
     if not hooks.forward:
         raise RuntimeError(f"Warp gives no CUDA function for kernel {kernel.key} on {found}")
@@ -341,8 +329,36 @@ def fit_carveout(kernel: wp.Kernel, block: int, device=None, shared: int | None 
             ctypes.c_int(int(block)),
             ctypes.c_size_t(dynamic),
         )
+    return function, resident.value, static.value + dynamic
+
+
+def resident_blocks(kernel: wp.Kernel, block: int, device=None, shared: int | None = None) -> int:
+    """The blocks of ``block`` threads a multiprocessor keeps resident of ``kernel``'s loaded code (the driver's
+    occupancy: its registers, its static and dynamic shared memory, or ``shared`` dynamic bytes where its launches
+    stage less than it declares); 1 on the CPU. A launch whose blocks meet at barriers holds at most this many a
+    multiprocessor, whatever the layer's estimate of the code (:func:`~.execution.shape`) holds."""
+    found = wp.get_device(device)
+    if not found.is_cuda:
+        return 1
+    return _occupancy(kernel, block, found, shared)[1]
+
+
+def fit_carveout(kernel: wp.Kernel, block: int, device=None, shared: int | None = None) -> int:
+    """Prefer for ``kernel`` (the one launched: a generic kernel's overload), launched in blocks of ``block`` threads
+    on ``device``, the carveout step that holds the blocks its loaded code keeps resident (:func:`carveout`, the
+    driver's occupancy, :func:`resident_blocks`), once a kernel and device, and return the step [KiB]; 0 on the CPU.
+    The preference is the step's share of the unified memory (:func:`carveout_share`), on which the driver lands this
+    step; a launch that needs more shared memory than the step holds takes the step that holds it."""
+    found = wp.get_device(device)
+    if not found.is_cuda:
+        return 0
+    key = (kernel, int(block), int(found.context))
+    if key in _fitted:
+        return _fitted[key]
+    function, resident, shared_bytes = _occupancy(kernel, block, found, shared)
+    with wp.ScopedDevice(found):
         spec = _read(found.alias)
-        step = carveout(spec, resident.value, static.value + dynamic)
+        step = carveout(spec, resident, shared_bytes)
         share = carveout_share(spec, step)
         _call(
             "cuFuncSetAttribute",

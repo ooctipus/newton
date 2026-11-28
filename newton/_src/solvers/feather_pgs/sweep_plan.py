@@ -29,7 +29,7 @@ import numpy as np
 import warp as wp
 
 from ...core.execution import Beside, Buckets, Queue, shape, staged_launch
-from ...core.memory import L1_LINE_BYTES, STATIC_SHARED_BYTES, Place, Staging, arch_budget, device
+from ...core.memory import L1_LINE_BYTES, STATIC_SHARED_BYTES, Place, Staging, arch_budget, device, resident_blocks
 from . import (
     class_plan,
     packed_rows,
@@ -663,10 +663,16 @@ class Sweep:
                 colored_sweep = self._block_records("colored", colored_sweep, capable.size, model)
                 self.colored_sweep = colored_sweep
                 self.mf_colored_kernel = self.sweep("mf_colored", self.colored_sweep)
+                self.world_blocks = self._resident_group(
+                    self.colored_sweep, self.mf_colored_kernel, int(capable.size), self.world_blocks
+                )
             if grouped_sweep is not None:
                 grouped_sweep = dataclasses.replace(grouped_sweep, records=self.placement.record_first)
                 self.grouped_sweep = self._block_records("grouped", grouped_sweep, grouped_worlds.size, model)
                 self.mf_grouped_kernel = self.sweep("mf_grouped", self.grouped_sweep)
+                self.grouped_blocks = self._resident_group(
+                    self.grouped_sweep, self.mf_grouped_kernel, int(grouped_worlds.size), self.grouped_blocks
+                )
             if parallel_rows > 0:
                 # The producer's sink, a tier's by data and the device (sweep_routes_tiers.emits): a tier that takes EMIT
                 # walks its rows from their seeds in its prologue.
@@ -1072,8 +1078,23 @@ class Sweep:
         held = shape(self._launch_work(records, int(worlds)), found).blocks_per_sm
         rows = self.placement.mf_max_constraints if config.colored else self.placement.dense_max_constraints
         ranks = max(min(held * found.sms // max(int(worlds), 1), -(-int(rows) // sweep_routes.COLORED_THREADS)), 1)
-        self.block_records[form] = (records, sweep_kernel(records), ranks)
+        kernel = sweep_kernel(records)
+        self.block_records[form] = (records, kernel, self._resident_group(records, kernel, int(worlds), ranks))
         return dataclasses.replace(config, formed="ahead")
+
+    def _resident_group(self, config: SweepConfig, kernel: wp.Kernel, worlds: int, group: int) -> int:
+        """A world's ``group`` of blocks of ``kernel`` (``config``'s, over ``worlds`` worlds), at most as many as its
+        loaded code keeps resident over the worlds (:func:`~newton._src.core.memory.resident_blocks`): a group's blocks
+        meet at barriers (:data:`.sweep_routes.GROUP_BARRIER`), so every block of the launch runs at once or none
+        passes them. The layer's estimate of the code (:func:`~newton._src.core.execution.shape`) sized the group; the
+        driver's occupancy of the code bounds it (the 4,000-figure ragdoll pile's grouped sweep holds 252 registers a
+        thread, one block a multiprocessor, where the estimate held more)."""
+        if group <= 1:
+            return group
+        found = device(self.model.device)
+        block = shape(self._launch_work(config, worlds), found).block
+        held = resident_blocks(kernel, block, self.model.device)
+        return max(min(group, held * found.sms // max(worlds, 1)), 1)
 
     def _dense_heads(self, full: SweepConfig, items: int) -> tuple[SweepConfig, ...]:
         """The launches of a sweep that stages a world's dense rows (the warp mapping ``full`` at the places its stage
