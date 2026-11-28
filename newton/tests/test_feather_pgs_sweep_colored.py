@@ -545,7 +545,8 @@ class TestColoredSweep(unittest.TestCase):
         """A colored world's dense rows (hinged pairs on the ground among free boxes, boxes on the pairs) run on the
         block's warps by runs: the line's rows on the same sides one after another, each run after the latest earlier
         run on each side, a run's warp its first side's. The runs the launch built are the line's, in row order, each
-        with its latest earlier run on each side as the host finds them, spread over more than one warp."""
+        with its latest earlier run on each side as the host finds them where that run is on another warp (one on its
+        own warp ran before it there: none), spread over more than one warp."""
         model = _hinged_pairs(self.device, pairs=12)
         solvers = []
         with colored(1, solvers):
@@ -585,9 +586,10 @@ class TestColoredSweep(unittest.TestCase):
         for run in range(runs):
             sides = keys[starts[run]]
             self.assertTrue(all(keys[i] == sides for i in range(starts[run], starts[run + 1])))
-            want = [latest.get(side, -1) if side >= 0 else -1 for side in sides]
+            earlier = [latest.get(side, -1) if side >= 0 else -1 for side in sides]
+            want = [p if p >= 0 and warps[p] != warps[run] else -1 for p in earlier]
             np.testing.assert_array_equal(prev[run], want, err_msg=f"run {run}")
-            ends.append(max([ends[p] for p in want if p >= 0] or [0]) + starts[run + 1] - starts[run])
+            ends.append(max([ends[p] for p in earlier if p >= 0] or [0]) + starts[run + 1] - starts[run])
             for side in sides:
                 if side >= 0:
                     latest[side] = run

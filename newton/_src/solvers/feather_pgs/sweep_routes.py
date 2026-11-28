@@ -1932,7 +1932,8 @@ total)."""
 
 RUN_WORDS = 5
 """Words of a run's record in the row store (``dense_run_rows``, a row's slot a run): its first row, its latest
-earlier runs on its two sides, its mark and its warp (during the build, its chain's end)."""
+earlier runs on its two sides (-1 for none, or one on its own warp, which ran before it there), its mark and its warp
+(during the build, its chain's end)."""
 
 
 def run_head_words(max_world_dofs: int) -> int:
@@ -1954,9 +1955,10 @@ def dense_runs(visit: str, pad: str, *, ranks: bool = False, group: bool = False
     then its first warp takes the runs in order, 32 at a time, and finds each one's latest earlier run on each side,
     within the 32 by shuffles, before them by each side's latest run, and the end of each run's longest chain of runs
     in rows: the critical path) and a run's share (each warp takes its runs in order; its first lane waits for the
-    latest earlier runs on the run's sides, the warp visits its rows (``visit``: the rows ``[run_begin, run_end)``),
-    its first lane marks it with the sweep's stamp; ``sweep_at`` the sweep). Every run waits only for earlier runs and
-    every warp takes its runs in order, so the earliest run not yet run always runs.
+    latest earlier runs on the run's sides that ran on another warp (one on its own warp ran before it there), the
+    warp visits its rows (``visit``: the rows ``[run_begin, run_end)``), its first lane marks it with the sweep's
+    stamp; ``sweep_at`` the sweep). Every run waits only for earlier runs and every warp takes its runs in order, so
+    the earliest run not yet run always runs.
 
     A world's block takes its runs over its warps. Over a world's ``group`` of blocks (whose dense operands live in
     global memory) the world's block builds and the runs' data choose: a sweep of the runs takes about the larger of
@@ -2099,6 +2101,13 @@ def dense_runs(visit: str, pad: str, *, ranks: bool = False, group: bool = False
             const int2 two = SIDES(RUN(k, 0));
             const unsigned side = (unsigned)(two.x >= 0 ? two.x : max(two.y, 0));
             RUN(k, 4) = (int)(((unsigned long long)(side * 0x9E3779B1u) * (unsigned){spread}) >> 32);
+        }}
+        __syncthreads();
+        // A latest earlier run on the run's own warp ran before it there, in order: the run waits only for the others.
+        for (int k = tid; k < runs; k += (int)blockDim.x) {{
+            const int own = RUN(k, 4), prev_a = RUN(k, 1), prev_b = RUN(k, 2);
+            if (prev_a >= 0 && RUN(prev_a, 4) == own) RUN(k, 1) = -1;
+            if (prev_b >= 0 && RUN(prev_b, 4) == own) RUN(k, 2) = -1;
         }}
         __syncthreads();
     }}
