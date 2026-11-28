@@ -2031,15 +2031,14 @@ def level_regions(
     world_order_end: wp.array[int],
     blk_members: wp.array[wp.vec2i],
 ):
-    """A world's open regions in their order from the free end down (the contact graph's), a world a lane group
+    """A world's open regions in their order up from the supports (the contact graph's), a world a lane group
     (:data:`_WORLD_LANES`); each step takes the exact levels of that order over the regions that can act
     (:func:`level_acting`).
 
     The order: a body's depth is its distance on the contact graph from the immovable partners (one for a body
     with a region against one, one more for each region between two movable bodies on the way), a region's the
-    larger of its bodies', and the regions are taken by decreasing depth (a part the graph does not reach comes
-    first), in their stream order within a depth: a cold sweep then carries a pile's weight down to its supports
-    within the sweep, where the order up from the supports carries it one interface a sweep.
+    larger of its bodies', and the regions are taken by increasing depth (a part the graph does not reach comes
+    last), in their stream order within a depth: each region's visit reads supports that answered the sweep already.
 
     The order is the contact frame's (``reg_order``, the world's span ``[s, world_order_end)``, the pair blocks'
     members after it): it is made where the step lists its regions anew, whose listing then stands for the frame's
@@ -2089,7 +2088,7 @@ def level_regions(
         deepest = wp.max(deepest, lane_read(deepest, lane ^ (1 << step), _WORLD_LANES))
         unreached = wp.max(unreached, lane_read(unreached, lane ^ (1 << step), _WORLD_LANES))
     kept = lane_sum(kept, _WORLD_LANES)
-    # By decreasing depth (unreached first), stable: a counting sort on the span's slots. A body at depth d has d
+    # By increasing depth (unreached last), stable: a counting sort on the span's slots. A body at depth d has d
     # regions on its way down, so the keys (the depths, and the unreached where some are) are at most e - s.
     top = deepest + unreached
     for k in range(lane, top, lanes):
@@ -2097,7 +2096,7 @@ def level_regions(
     lane_sync(_WORLD_LANES)
     for g in range(s + lane, e, lanes):
         if (reg_kind[g] & KIND_MEMBER) == 0:
-            key = top - wp.min(reg_level[g], deepest + 1)
+            key = wp.min(reg_level[g], deepest + 1) - 1
             reg_level[g] = key
             wp.atomic_add(level_end, s + key, 1)
     lane_sync(_WORLD_LANES)
