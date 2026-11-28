@@ -1049,6 +1049,9 @@ class SolverFeatherPGS(SolverBase):
         static, kinematic and asleep shapes are then not made, and its coordinates are held; it wakes at the pass
         whose grown boxes join it to an awake body or a moving kinematic one, before its contacts are made, and at a
         reset or a notified state write of its world. A tree joined to another by a loop or a mimic never rests.
+
+        Only a pass that filters by these arrays puts a tree to sleep, so the law holds and counts from this call on:
+        a solver whose pipeline never filters by it pays nothing for it.
         """
         return None if self.sleep is None else self.sleep.collision_sleep_filter()
 

@@ -440,6 +440,9 @@ class Sleep:
             self.moving = wp.zeros(slots, dtype=wp.int32)
             self._no_forces = wp.zeros(0, dtype=wp.float32)
             self._no_wrenches = wp.zeros(0, dtype=wp.spatial_vector)
+        # Whether a collision pipeline filters by the law (:meth:`collision_sleep_filter` handed its arrays out): a tree
+        # falls asleep only at a pass that filters by it, so without one the law neither holds nor counts.
+        self.filtered = False
 
     @classmethod
     def build(cls, solver) -> Sleep | None:
@@ -544,11 +547,16 @@ class Sleep:
         }
 
     def collision_sleep_filter(self) -> tuple[wp.array, wp.array]:
-        """The shapes' sleep index and the live sleep state, for :meth:`~newton.CollisionPipeline.configure_sleep_filter`."""
+        """The shapes' sleep index and the live sleep state, for :meth:`~newton.CollisionPipeline.configure_sleep_filter`:
+        from here on the law holds and counts (``filtered``)."""
+        self.filtered = True
         return self.shape_sleep_index, self.tree_asleep
 
     def hold(self, v_out: wp.array) -> None:
-        """Zero the solved velocity of every asleep tree (after the sweep, before the finish)."""
+        """Zero the solved velocity of every asleep tree (after the sweep, before the finish), where a pipeline filters
+        by the law: elsewhere no tree is asleep."""
+        if not self.filtered:
+            return
         wp.launch(
             _hold,
             dim=self.dof_slot.shape[0],
@@ -558,7 +566,10 @@ class Sleep:
         )
 
     def test(self, state_in, state_out, control, contacts, dt: float) -> None:
-        """After the finish: lump the substep's contact forces on the trees, then count each tree's quiet substeps."""
+        """After the finish: lump the substep's contact forces on the trees, then count each tree's quiet substeps, where
+        a pipeline filters by the law: elsewhere no count is read."""
+        if not self.filtered:
+            return
         solver = self.solver
         model, placement = solver.model, solver.placement
         device = model.device

@@ -97,6 +97,18 @@ class TestFeatherPGSSleep(unittest.TestCase):
         self.assertFalse(asleep.any())
         np.testing.assert_array_equal(bound, unbound)
 
+    def test_an_unfiltered_law_counts_nothing(self):
+        """Without a pipeline that filters by the rest law no tree can fall asleep: the law neither holds nor counts,
+        so every tree keeps its starting state while the boxes rest (bound, they fall asleep)."""
+        model = _boxes()
+        start = SolverFeatherPGS(model).sleep.tree_asleep.numpy()
+        _, _, unbound = _run(model, 60, bind=False)
+        self.assertFalse(unbound.sleep.filtered)
+        np.testing.assert_array_equal(unbound.sleep.tree_asleep.numpy(), start)
+        _, asleep, bound = _run(model, 60)
+        self.assertTrue(bound.sleep.filtered)
+        self.assertTrue(asleep[-1].all())
+
     def test_a_driven_tree_never_sleeps(self):
         builder = newton.ModelBuilder()
         link = builder.add_link(xform=wp.transform(wp.vec3(0.0, 0.0, 1.0), wp.quat_identity()))
