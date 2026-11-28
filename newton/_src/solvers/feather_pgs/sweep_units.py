@@ -845,15 +845,17 @@ LEVEL_PASS
     // Islands to blocks, where the sweep takes a group of ``sweep_blocks`` blocks a world: where every island's units
     // fit a block's threads at each of the world's colors, each island a block by its first place (whole islands,
     // balanced by units) and the units placed by (block, color), each block's first place in ``island_first`` (its
-    // last word: whether the world's islands take blocks).
+    // last word: whether the world's islands take blocks). The islands take as many of the group's blocks as their
+    // (block, color) keys fit the world's units' scratch (a key a unit at most); the blocks past them take no places.
     bool by_island = false;
     if (sweep_blocks > 1) {
-        const int keys = sweep_blocks * world_colors;
-        by_island = largest <= THREADS * world_colors && keys <= units;
+        const int island_blocks = min(sweep_blocks, units / max(world_colors, 1));
+        const int keys = island_blocks * world_colors;
+        by_island = largest <= THREADS * world_colors && island_blocks > 0;
         if (by_island) {
             // The keys are zero (the build's start, each run's row cleared after its ranks).
             for (int unit = first; unit < units; unit += stride) {
-                const int block = (int)((long long)sizes[unit_block.data[off_mf + unit]] * sweep_blocks / units);
+                const int block = (int)((long long)sizes[unit_block.data[off_mf + unit]] * island_blocks / units);
                 unit_block.data[off_mf + unit] = block;
                 atomicAdd(&keys_at[block * world_colors + unit_color.data[off_mf + unit]], 1);
             }
@@ -861,7 +863,7 @@ LEVEL_PASS
             // The (block, color) keys' first places; each block's first, its color 0's, written as the scan places
             // it, so the scan's last meet orders every first before a ticket moves the keys.
             int* const firsts = island_first.data + (size_t)world * island_first.shape[1];
-            if (rank == 0 && tid == 0) firsts[sweep_blocks] = units;
+            for (int b = island_blocks + first; b <= sweep_blocks; b += stride) firsts[b] = units;
             GROUP_SCAN(keys_at, keys, [&](const int k, const int place) {
                 if (k % world_colors == 0) firsts[k / world_colors] = place;
             });
