@@ -299,7 +299,7 @@ class TestColoredSweep(unittest.TestCase):
         self._simulate(tray(), law, solvers)
         solver = solvers[-1]
         self.assertIsNotNone(solver.sweep.colored_units, "the tray's worlds take the colored mapping")
-        host = {name: array.numpy() for name, array in solver.sweep.colored_units.units.items()}
+        host = solver.sweep.colored_units.host()
         # The free bodies' records (row_metadata.pack_row_header).
         placement = solver.placement
         free_first = placement.body_base.numpy() * placement.dense_record_words
@@ -344,16 +344,16 @@ class TestColoredSweep(unittest.TestCase):
         units = solver.sweep.colored_units
         self.assertEqual(record["capable_worlds"], solver.forest.world_count)
         self.assertEqual(record["waves"], 1, "the tray's worlds fit one wave on the device's SMs")
-        arrays = (*units.units.values(), *units.slots.values(), units.status)
-        self.assertEqual(record["storage_bytes"], sum(array.capacity for array in arrays))
+        self.assertEqual(record["storage_bytes"], units.nbytes)
         self.assertGreater(record["storage_bytes"], 0)
-        # The pool holds every slot's share (a unit for every three rows of the row capacity) and its colors' one more,
-        # and one world's every row past its share.
-        rows = solver.placement.mf_max_constraints
-        share = sweep_units.unit_capacity(rows)
-        pool = units.slot_count * (share + 1) + rows - share
-        self.assertEqual(sweep_units.pool_capacity(units.slot_count, rows), pool)
-        self.assertEqual(units.slots["slot_data"].shape, (units.layout.fields, pool))
+        # The pool is rows of the contact pool: an entry for every contact it holds now and one for every slot (a unit
+        # is a contact's normal row), its fields at their reserved entries.
+        contacts = solver.placement.contact_pool
+        mapped = units.host()
+        self.assertEqual(mapped["unit_row"].shape, (contacts.ready + units.slot_count,))
+        self.assertEqual(mapped["slot_data"].shape, (units.layout.fields, contacts.ready + units.slot_count))
+        self.assertEqual(units.slots["slot_data"].shape, (units.layout.fields, units.pool))
+        self.assertGreaterEqual(units.pool, contacts.ready + units.slot_count)
 
     def test_a_color_never_shares_a_body_or_a_patch(self):
         """No two units of a color touch the same body, and a patch's contacts never share a color."""
@@ -393,9 +393,15 @@ class TestColoredSweep(unittest.TestCase):
         status: bitwise the world the rule refuses (both are the one-warp mapping beside a built colored one, today's
         rows). A model with no colored mapping solves its free bodies' contacts as regions, another law, until the
         colored route's unit is the region too."""
-        # The tray's 76 units in a pool of one entry a slot.
+        # The tray's 76 units in a pool of one entry a slot: the contact pool's rows cut to their slots' entries.
         solvers = []
-        with mock.patch.object(sweep_units, "pool_capacity", lambda slots, rows: slots):
+        shaped = sweep_units.ColoredUnits._shaped
+
+        def slots_only(units, views):
+            entries = {field.name: entry for field, entry in units._pooled}
+            return shaped(units, {name: view[: entries[name] * units.slot_count] for name, view in views.items()})
+
+        with mock.patch.object(sweep_units.ColoredUnits, "_shaped", slots_only):
             over = self._simulate(tray(), "patch", solvers)
         units = solvers[-1].sweep.colored_units
         self.assertIsNotNone(units)

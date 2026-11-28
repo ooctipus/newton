@@ -721,6 +721,7 @@ class Sweep:
                     self.placement.mf_max_constraints,
                     self.forest.max_world_dofs,
                     model.device,
+                    contact_pool=self.placement.contact_pool,
                     worlds=capable,
                     rule=rule,
                     torsion=self.laws.spin_rows,
