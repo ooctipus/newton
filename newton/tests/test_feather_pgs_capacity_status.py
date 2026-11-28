@@ -467,6 +467,66 @@ class TestFeatherPGSCapacityStatus(unittest.TestCase):
         solver.check_constraint_capacity()
 
     @staticmethod
+    def _limbs(count, device):
+        """``count`` boxes on ball joints (:meth:`_box_on_ball`), side by side in one world, 1 m above the floor."""
+        builder = newton.ModelBuilder()
+        builder.add_ground_plane()
+        for i in range(count):
+            anchor = builder.add_link(xform=wp.transform(wp.vec3(0.0, 0.6 * i, 1.0), wp.quat_identity()))
+            builder.add_shape_box(anchor, hx=0.2, hy=0.2, hz=0.05)
+            limb = builder.add_link(xform=wp.transform(wp.vec3(0.3, 0.6 * i, 1.0), wp.quat_identity()))
+            builder.add_shape_box(limb, hx=0.1, hy=0.2, hz=0.05)
+            free = builder.add_joint_free(anchor)
+            ball = builder.add_joint_ball(
+                anchor,
+                limb,
+                parent_xform=wp.transform(wp.vec3(0.2, 0.0, 0.0), wp.quat_identity()),
+                child_xform=wp.transform(wp.vec3(-0.1, 0.0, 0.0), wp.quat_identity()),
+            )
+            builder.add_articulation([free, ball])
+        return builder.finalize(device=device)
+
+    @unittest.skipUnless(wp.is_cuda_available(), "graph replays are CUDA's")
+    def test_a_replay_past_its_capacity_keeps_the_rows_it_holds(self):
+        """A replay whose world asks past its dense capacity, where that capacity is longer than the world's home line
+        (so its rows run in the arena), drops only the rows past the capacity: the world keeps a run of the arena as
+        long as its capacity, never its home line alone."""
+        device = wp.get_cuda_device()
+        model = self._limbs(12, device)
+        solver = SolverFeatherPGS(model, dense_max_constraints=144)
+        placement = solver.placement
+        self.assertGreater(placement.dense_max_constraints, placement.line_rows)
+        pipeline = newton.CollisionPipeline(model)
+        contacts = pipeline.contacts()
+        states, control = (model.state(), model.state()), model.control()
+
+        def step(source, target):
+            pipeline.collide(states[source], contacts)
+            solver.step(states[source], states[target], control, contacts, 1.0 / 200.0)
+
+        for k in range(10):
+            step(k % 2, 1 - k % 2)
+        graphs = []
+        for source in (0, 1):
+            with wp.ScopedCapture(device) as scope:
+                step(source, 1 - source)
+            graphs.append(scope.graph)
+        for k in range(160):
+            wp.capture_launch(graphs[k % 2])
+            wp.synchronize_device(device)
+            if placement.rows_asked()[0] > 0:
+                break
+        else:
+            self.fail("no replay asked past the capacity")
+        asked = int(placement.slot_counter.numpy()[0])
+        kept = int(placement.constraint_count.numpy()[0])
+        self.assertGreater(asked, 2 * placement.line_rows)
+        # A contact's rows are reserved whole: the world keeps every row its capacity holds but a contact's last.
+        self.assertGreater(kept, placement.dense_max_constraints - 4)
+        self.assertLessEqual(kept, placement.dense_max_constraints)
+        self.assertTrue(np.isfinite(states[0].body_q.numpy()).all())
+
+    @staticmethod
     def _box_stack(levels=4):
         """A 2 x 2 x ``levels`` stack of free boxes resting on a ground plane."""
         builder = newton.ModelBuilder()

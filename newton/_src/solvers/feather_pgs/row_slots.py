@@ -1657,6 +1657,14 @@ def _frame_turns(
         order.turns[world, carry + 4] = pairs
 
 
+@wp.func
+def _line_extent(dense: int, free: int, dense_capacity: int, free_capacity: int) -> int:
+    """The rows a world's line holds of its ``dense`` rows and its ``free`` rows (which start at the dense rows' end):
+    each class's rows up to its capacity. A world that asks past a capacity claims the run its capacities fill, so only
+    the rows past the capacity are rejected, never the rows the capacity holds."""
+    return wp.min(dense, dense_capacity) + wp.min(free, free_capacity)
+
+
 @cache
 def reserve_world_rows_kernel(grouped: bool, warps: int = 1):
     """The reservation kernel (:func:`reserve_world_rows`, its body below): ``grouped`` where the model holds worlds
@@ -1978,17 +1986,15 @@ def reserve_world_rows_kernel(grouped: bool, warps: int = 1):
                         warps,
                     )
         # The world's line (``lines``: the store's line length and its home lines; ``arena_lines``, the arena's lines
-        # mapped): its home where its rows fit the line, else a run of the arena's lines, one claim (the run it holds
-        # this frame where that holds them), which it keeps while it holds its slots; its free rows from its body base,
-        # its dense rows' end. Where the arena holds no run, the rows past its home line are rejected (the capacity
-        # status). The claims count in device memory (``arena_cursor``: the lines taken, then the claims refused), which
-        # the arena's one writer publishes (:func:`.placement._take_runs`): an atomic a claim on the pinned record
-        # would cross the host bus once a world.
+        # mapped): its home where its rows fit the line, else a run of the arena's lines as long as its capacities hold
+        # (_line_extent), one claim (the run it holds this frame where that holds them), which it keeps while it holds
+        # its slots; its free rows from its body base, its dense rows' end. Where the arena holds no run, the rows past
+        # its home line are rejected (the capacity status). The claims count in device memory (``arena_cursor``: the
+        # lines taken, then the claims refused), which the arena's one writer publishes (:func:`.placement._take_runs`):
+        # an atomic a claim on the pinned record would cross the host bus once a world.
         dense_total = world_slot_counter[world] + rows[0] + rows[2]
         free_total = mf_slot_counter[world] + rows[1] + rows[3]
-        extent = dense_total
-        if free_total > 0:
-            extent = wp.min(dense_total, max_constraints) + free_total
+        extent = _line_extent(dense_total, free_total, max_constraints, mf_max_constraints)
         if rank == 0:
             if extent > lines[0]:
                 if warp == 0 and lane == 0:
@@ -2018,9 +2024,7 @@ def reserve_world_rows_kernel(grouped: bool, warps: int = 1):
             _meet_wait(order.turns, world, TURN_MEETS + 1, 1)
             dense_total = world_slot_counter[world] + rows[0] + rows[2]
             free_total = mf_slot_counter[world] + rows[1] + rows[3]
-            extent = dense_total
-            if free_total > 0:
-                extent = wp.min(dense_total, max_constraints) + free_total
+            extent = _line_extent(dense_total, free_total, max_constraints, mf_max_constraints)
         base = wp.min(dense_total, max_constraints)
         line = data.first[world]
         dense_cap = max_constraints
