@@ -867,7 +867,8 @@ class BodyCut:
         # No primitive reads these, and a stale share must not be read: a reader fails loudly.
         forest.body_inv_mass = forest.body_inv_inertia = None
         for name, spec in source.attribute_specs.items():
-            value = getattr(source, name, None)
+            # Only the attributes of a gathered frequency are read: some others (the shape pairs) are built on first
+            # read, at the size of every pair the model admits.
             if spec.frequency not in self._orders or name in _DERIVED:
                 continue
             if spec.frequency == _F.BODY and name not in _LIVE and name not in _BODY_DEFAULTS:
@@ -875,7 +876,9 @@ class BodyCut:
             if name.endswith("_world_start"):
                 # Per-world index ranges do not hold over shadows past every world's bodies; no primitive reads them.
                 setattr(forest, name, None)
-            elif isinstance(value, wp.array | list) and len(value) == source.attribute_frequency_count(spec.frequency):
+                continue
+            value = getattr(source, name, None)
+            if isinstance(value, wp.array | list) and len(value) == source.attribute_frequency_count(spec.frequency):
                 setattr(forest, name, _gathered(value, self._orders[spec.frequency]))
 
         def indices(values):
