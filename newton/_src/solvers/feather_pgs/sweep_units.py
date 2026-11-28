@@ -25,7 +25,12 @@ none. The slots share one pool: at every pack each world's units are counted
 and the worlds take their units and their colors' offsets in slot order
 (:func:`place_slots`), so a world past its share (a unit is a contact's normal
 row, and under friction patches most contacts carry no friction pair) keeps
-its units where lighter worlds leave room. A world past the pool's end keeps
+its units where lighter worlds leave room. The pool is rows of a pool that
+follows the contact pool (:meth:`~newton._src.core.contact_pool.ContactPool.follow`):
+an entry for every contact the contact pool holds and one for every slot,
+since a unit is a contact's normal row, so the worlds' units and one more each
+never pass it, and it grows with the contacts behind fixed addresses without
+bounding the contact rows the pool publishes. A world past the pool's end keeps
 the one-warp mapping and sets the capacity status
 (:meth:`ColoredUnits.capacity_status`). A world never takes more colors than
 it has units, so its colors fit wherever its units do.
@@ -46,6 +51,7 @@ from typing import NamedTuple
 import numpy as np
 import warp as wp
 
+from ...core.contact_pool import ContactField, ContactPool
 from ...core.execution import Queue, appended, fill_lanes
 from ...core.memory import REFERENCE_ARCH, Buffer, Staging, arch_budget, device
 from . import kernel_template, sweep_levels
@@ -149,7 +155,7 @@ UNIT_FIELDS = FieldGroup(
     Field("color_after", wp.int32, ("pool", 2)),
 )
 """The units and colors of every slot's world, in one pool: a world's units and its colors' offsets from its slot's
-first entry (:data:`SLOT_PLACES`; ``pool``: :func:`pool_capacity`)."""
+first entry (:data:`SLOT_PLACES`; ``pool``: the contact pool's rows, :class:`ColoredUnits`)."""
 
 RING_MEMBERS = 8
 """Other normals of a patch ring a slot stages for its friction pair's pooled load; a larger ring walks its links."""
@@ -372,25 +378,18 @@ friction pair."""
 
 
 def unit_capacity(mf_rows: int) -> int:
-    """A slot's share of the unit pool for worlds of ``mf_rows`` free-body rows: one unit per :data:`UNIT_ROWS` rows. A
-    unit is a contact's normal row, and under friction patches only a patch's anchor carries a friction pair, so a world
-    may hold up to ``mf_rows`` units: a world past its share takes the entries lighter worlds leave
-    (:func:`pool_capacity`)."""
+    """A slot's share for worlds of ``mf_rows`` free-body rows, the stride of its units' staged records in its line
+    and the stage's lanes a slot: one unit per :data:`UNIT_ROWS` rows. A unit is a contact's normal row, and under
+    friction patches only a patch's anchor carries a friction pair, so a world may hold up to ``mf_rows`` units: a world
+    past its share takes the pool's entries lighter worlds leave (:class:`ColoredUnits`)."""
     return max(int(mf_rows) // UNIT_ROWS, 1)
-
-
-def pool_capacity(slots: int, mf_rows: int) -> int:
-    """The unit pool's entries: every slot's share and its colors' one more, and one world's every free row past its
-    share, so any one world may make every row a unit. Each world takes its counted units and one more, in slot order
-    (:func:`place_slots`); a world past the pool's end keeps the one-warp mapping and sets the capacity status."""
-    share = unit_capacity(mf_rows)
-    return int(slots) * (share + 1) + max(int(mf_rows) - share, 0)
 
 
 @dataclasses.dataclass(frozen=True)
 class UnitPlan:
     """Shapes of the unit data: every world's counts, per slot (a world that can take the colored mapping) its place in
-    the pool, and the pool of every slot's units and colors (:func:`pool_capacity`), in its ``layout``."""
+    the pool, and the pool of every slot's units and colors (``pool`` entries: :class:`ColoredUnits`), in its
+    ``layout``."""
 
     worlds: int
     slots: int
@@ -1178,14 +1177,19 @@ class ColoredUnits:
 
     Only the capable worlds (:func:`capable_worlds`) hold storage, a slot each; the others always keep the one-warp
     mapping. Every world holds its slot and counts (:data:`WORLD_FIELDS`). The slots' worlds keep their units in one
-    pool of :func:`pool_capacity` entries, each from its slot's first entry (:data:`SLOT_PLACES`); a world past the
-    pool's end keeps the one-warp mapping and sets the capacity status (:meth:`capacity_status`). The mapping is
+    pool, each from its slot's first entry (:data:`SLOT_PLACES`): rows of a pool that follows the contact pool
+    (``contact_pool``), an entry a contact and one a slot (a unit is a contact's normal row, so every world's units and
+    one more fit), which grow with the contacts behind fixed addresses (CUDA virtual memory), so a graph that captured
+    the build replays on, and which never bound the contact rows the contact pool publishes; a
+    world past the pool's end keeps the one-warp mapping and sets the capacity status (:meth:`capacity_status`). The
+    mapping is
     a claim: the builder walks the claims' candidate bucket (the worlds with rows and a slot,
     :func:`.sweep_levels.claim_worlds`) and appends each to the colored bucket or the general one.
 
     Args:
         world_count: Worlds of the solver.
-        mf_rows: Free-body row capacity per world (it sizes the pool: :func:`pool_capacity`).
+        mf_rows: Free-body row capacity per world (a slot's share: :func:`unit_capacity`).
+        contact_pool: The contact pool the units' own pool follows (:meth:`.ContactPool.follow`).
         dofs: Coordinates per world.
         device: The solver's CUDA device.
         worlds: The capable worlds, in world order: slot ``k`` holds world ``worlds[k]``.
@@ -1208,6 +1212,7 @@ class ColoredUnits:
         dofs: int,
         device,
         *,
+        contact_pool,
         worlds,
         rule: ColoredRule = COLORED_RULE,
         torsion: bool = False,
@@ -1232,19 +1237,31 @@ class ColoredUnits:
         # stride over the slot's live rows.
         rows = -(-max(self.mf_rows, 1) // PLACE_THREADS) * PLACE_THREADS
         self.count_chunks = fill_lanes(self.slot_count, device, least=PLACE_THREADS, most=rows) // PLACE_THREADS
-        self.pool = pool_capacity(self.slot_count, self.mf_rows)
         self.layout = slot_layout(torsion)
-        sizes = UnitPlan(self.world_count, self.slot_count, self.pool, self.layout).sizes
+        sizes = UnitPlan(self.world_count, self.slot_count, 1, self.layout).sizes
         self.units = {
             field.name: wp.zeros(field.shape(sizes), dtype=field.dtype, device=device)
-            for field in (*WORLD_FIELDS, *SLOT_PLACES, *UNIT_FIELDS)
+            for field in (*WORLD_FIELDS, *SLOT_PLACES)
         }
         world_slot = np.full(self.world_count, -1, dtype=np.int32)
         world_slot[slot_world] = np.arange(self.slot_count, dtype=np.int32)
         self.units["world_slot"] = wp.array(world_slot, dtype=wp.int32, device=device)
-        self.slots = {
-            field.name: wp.zeros(field.shape(sizes), dtype=field.dtype, device=device) for field in SLOT_FIELDS
-        }
+        self.slots = {}
+        # The pool's fields as rows of a pool of their own that follows the contact pool (ContactPool.follow): a
+        # field's values an entry (its other dimensions) per contact, and as many past them for the slots' one more
+        # each. A member of the contact pool would bound the rows it publishes by the units' few rows a granule (276
+        # bytes a row); a follower grows to them instead. Its views are published by _on_unit_rows.
+        self._pooled = tuple((field, int(np.prod(field.shape(sizes)))) for field in (*UNIT_FIELDS, *SLOT_FIELDS))
+        self.pool = 0
+        self._contacts = ContactPool(device=device, rows=contact_pool.ready, fixed=contact_pool.fixed)
+        contact_pool.follow(self._contacts)
+        self._unit_rows = self._contacts.rows(
+            tuple(
+                ContactField(field.name, field.dtype, per_contact=entry, extra=entry * self.slot_count)
+                for field, entry in self._pooled
+            ),
+            on_rows=self._on_unit_rows,
+        )
         # Sticky: 1 once a world's units passed its slot's (the build's device status).
         self.status = wp.zeros(1, dtype=wp.int32, device=device)
         # Each slot's group of blocks (unit_blocks): their meets (four counts, then each block's units or share of an
@@ -1396,11 +1413,35 @@ class ColoredUnits:
             device=self.device,
         )
 
+    def _shaped(self, views: dict[str, wp.array]) -> dict[str, wp.array]:
+        """The pool's fields of ``views`` (flat rows of the contact pool) in their fields' shapes, by name."""
+        shaped = {}
+        for field, entry in self._pooled:
+            flat = views[field.name]
+            sizes = UnitPlan(self.world_count, self.slot_count, int(flat.shape[0]) // entry, self.layout).sizes
+            shaped[field.name] = wp.array(ptr=flat.ptr, dtype=field.dtype, shape=field.shape(sizes), device=flat.device)
+        return shaped
+
+    def _on_unit_rows(self, rows) -> None:
+        """Publish the pool's fields at their reserved entries (:attr:`.ContactRows.reserved`: fixed addresses in CUDA
+        virtual memory, of which the contacts' and the slots' entries are mapped; elsewhere the current arrays), each in
+        its field's shape. A unit is a contact's normal row, so no world's units pass the mapped entries."""
+        staged = {field.name for field in SLOT_FIELDS}
+        for name, view in self._shaped(rows.reserved).items():
+            (self.slots if name in staged else self.units)[name] = view
+        self.pool = int(self.units["unit_row"].shape[0])
+
+    def host(self) -> dict[str, np.ndarray]:
+        """The units' arrays on the host (a readback): every world's and slot's, and the pool's mapped entries."""
+        mapped = self._shaped(self._unit_rows.views)
+        return {name: mapped.get(name, array).numpy() for name, array in {**self.units, **self.slots}.items()}
+
     @property
     def nbytes(self) -> int:
-        """Device memory of the units, colors and staged slots [B]."""
-        arrays = (*self.units.values(), *self.slots.values(), self.status)
-        return sum(array.capacity for array in arrays)
+        """Device memory of the units, colors and staged slots [B]: the pool's mapped rows and the per-world arrays."""
+        pooled = {field.name for field, _ in self._pooled}
+        arrays = [array for name, array in self.units.items() if name not in pooled]
+        return sum(array.capacity for array in (*arrays, self.status)) + int(self._unit_rows.mapped_bytes())
 
     def capacity_status(self) -> bool:
         """Whether a world's units passed the pool's end since construction: the one-warp mapping kept that world at
@@ -1420,11 +1461,9 @@ class ColoredUnits:
             count, items = self.claims.bucket(b)
             return items.numpy()[: int(count.numpy()[0])]
 
-        counts = self.units["unit_count"].numpy()
-        colors = self.units["color_count"].numpy()
-        offsets = self.units["color_offset"].numpy()
-        slots = self.units["world_slot"].numpy()
-        firsts = self.units["slot_first"].numpy()
+        host = self.host()
+        counts, colors, offsets = host["unit_count"], host["color_count"], host["color_offset"]
+        slots, firsts = host["world_slot"], host["slot_first"]
         colored = set(bucket(self.colored).tolist())
         worlds = []
         for world in sorted(bucket(self.candidate).tolist()):
